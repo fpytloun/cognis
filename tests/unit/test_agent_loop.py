@@ -46,6 +46,7 @@ from cognis.models.workflow import (
     WorkflowState,
 )
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
+from cognis.tools.builtin.image import IMAGE_EDIT_TOOL
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -1113,6 +1114,8 @@ class _NoopSessionManager:
 class _NoopSessionCache:
     def __init__(self) -> None:
         self.tool_runtime_info: dict[str, object] | None = None
+        self.activated_skill_tool_ids: set[str] = set()
+        self.skill_tool_classifications: dict[str, list[str]] = {}
 
     def get_model_override(self, _: str) -> None:
         return None
@@ -1131,6 +1134,20 @@ class _NoopSessionCache:
 
     def get_tool_runtime_info(self, _: str) -> dict[str, object] | None:
         return self.tool_runtime_info
+
+    def get_activated_skill_tool_ids(self, _: str) -> set[str]:
+        return set(self.activated_skill_tool_ids)
+
+    def activate_skill_tools(self, _: str, skill_id: str, tool_ids: set[str]) -> None:
+        del skill_id
+        self.activated_skill_tool_ids.update(tool_ids)
+
+    def get_skill_tool_classification(self, _: str, cache_key: str) -> list[str] | None:
+        cached = self.skill_tool_classifications.get(cache_key)
+        return list(cached) if cached is not None else None
+
+    def set_skill_tool_classification(self, _: str, cache_key: str, tool_ids: list[str]) -> None:
+        self.skill_tool_classifications[cache_key] = list(tool_ids)
 
     async def append_recorded_events(self, *_: object, **__: object) -> None:
         return None
@@ -1304,6 +1321,7 @@ class _ExplicitProjectContextLLM:
 
 class _ExistingProjectSessionCache(_NoopSessionCache):
     def __init__(self) -> None:
+        super().__init__()
         self.project_contexts = {
             "/workspace/current": ProjectContextEntry(
                 project_root="/workspace/current",
@@ -1389,7 +1407,9 @@ async def test_project_context_is_not_loaded_from_ambient_workdir_only() -> None
         session_cache=_NoopSessionCache(),
         context_assembler=fake_context,
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable),
+        tool_router=SimpleNamespace(
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+        ),
         remember_queue=_NoopRememberQueue(),
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
@@ -1506,7 +1526,9 @@ async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
         session_cache=_ExistingProjectSessionCache(),
         context_assembler=fake_context,
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(_is_non_bypassable=lambda _name, non_bypassable: non_bypassable),
+        tool_router=SimpleNamespace(
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+        ),
         remember_queue=_NoopRememberQueue(),
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
@@ -2199,9 +2221,73 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
     assert all(name != "tool_search" for name in fake_llm.tool_sets[0])
     assert "search_tools" in fake_llm.tool_sets[1]
     assert all(name != "tool_search" for name in fake_llm.tool_sets[1])
-    assert all(not name.startswith("mcp_") for name in fake_llm.tool_sets[1])
     assert session_cache.tool_runtime_info is not None
     assert session_cache.tool_runtime_info["strategy"] == "generic_search_tools"
+
+
+@pytest.mark.asyncio
+async def test_skill_load_classifier_activates_tools_for_session() -> None:
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {"choices": [{"message": {"content": '{"tool_ids": ["builtin:image_edit"]}'}}]}
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=IMAGE_EDIT_TOOL, handler=None))
+    session_cache = _NoopSessionCache()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-skill", intaris_session_id="sess-skill"),
+        conversation=SimpleNamespace(conversation_id="conv-skill"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    activated_tool_ids: set[str] = set()
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_daily_brief",
+                "name": "daily-brief",
+                "description": "Morning briefing skill",
+                "instructions": "Edit an existing image for the brief hero card.",
+                "content_hash": "hash-1",
+            },
+            "discovered_tool_ids": [],
+        },
+        discovered_tool_ids=set(),
+        activated_tool_ids=activated_tool_ids,
+    )
+
+    assert stable_tool_id(IMAGE_EDIT_TOOL) in activated_tool_ids
+    assert stable_tool_id(IMAGE_EDIT_TOOL) in session_cache.activated_skill_tool_ids
+    assert session_cache.skill_tool_classifications["skill_daily_brief:hash-1"] == [
+        stable_tool_id(IMAGE_EDIT_TOOL)
+    ]
 
 
 @pytest.mark.asyncio
@@ -2713,9 +2799,19 @@ def test_filter_model_inventory_tools_hides_unattached_skill_tools_until_discove
         [attached_tool, unattached_tool],
         {"skill:unattached-skill:run_unattached"},
     )
+    activated = _filter_model_inventory_tools(
+        agent,
+        [attached_tool, unattached_tool],
+        set(),
+        {"skill:unattached-skill:run_unattached"},
+    )
 
     assert [tool.name for tool in filtered] == ["skill_attached-skill__run_attached"]
     assert [tool.name for tool in discovered] == [
+        "skill_attached-skill__run_attached",
+        "skill_unattached-skill__run_unattached",
+    ]
+    assert [tool.name for tool in activated] == [
         "skill_attached-skill__run_attached",
         "skill_unattached-skill__run_unattached",
     ]

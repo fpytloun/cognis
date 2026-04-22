@@ -480,6 +480,7 @@ class ContextAssembler:
                 executor_environment=executor_environment,
                 workspace_root=workspace_root,
                 effective_working_directory=effective_working_directory,
+                include_project_context=include_project_context,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -965,6 +966,7 @@ class ContextAssembler:
         executor_environment: ExecutorEnvironmentSnapshot | None = None,
         workspace_root: str | None = None,
         effective_working_directory: str | None = None,
+        include_project_context: bool = True,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -1072,7 +1074,8 @@ class ContextAssembler:
                 {"role": "system", "content": immutable_prefix, "_immutable_prefix": True}
             )
 
-        messages.extend(self._project_context_messages(session.session_id))
+        if include_project_context:
+            messages.extend(self._project_context_messages(session.session_id))
 
         messages.append(
             {

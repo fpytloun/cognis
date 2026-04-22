@@ -367,6 +367,17 @@ def build_step_runtime_factory(
                     agent.skills["_attached_skill_tool_ids"] = sorted(
                         attached_skill_tool_ids(resolved_skills)
                     )
+                    agent.skills["_runtime_skill_summaries"] = [
+                        {
+                            "skill_id": skill.skill_id,
+                            "name": skill.name,
+                            "description": skill.description,
+                            "attached": skill.attached,
+                            "auto_load": skill.auto_load,
+                            "tags": list(getattr(skill, "tags", []) or []),
+                        }
+                        for skill in resolved_skills.skills
+                    ]
 
                 # Add executable skill tools to the agent tool set
                 skill_tool_defs = discoverable_skill_tools_to_definitions(resolved_skills)

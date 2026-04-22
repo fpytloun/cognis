@@ -621,6 +621,17 @@ async def _handle_skill_load(
                     tools,
                 )
             ),
+            "skill_activation": {
+                "skill_id": row.skill_id,
+                "name": row.name,
+                "description": row.description,
+                "instructions": instructions,
+                "content_hash": (
+                    version_row.content_hash
+                    if version_row is not None and isinstance(version_row.content_hash, str)
+                    else ""
+                ),
+            },
         },
     )
 
@@ -654,7 +665,9 @@ async def _handle_skill_get(
                 "steps": getattr(current_version, "steps", None),
                 "prompt_templates": current_version.prompt_templates,
                 "secret_placeholders": current_version.secret_placeholders,
-                "decomposition_source_hash": getattr(current_version, "decomposition_source_hash", None),
+                "decomposition_source_hash": getattr(
+                    current_version, "decomposition_source_hash", None
+                ),
                 "source_url": current_version.source_url,
                 "resolved_url": current_version.resolved_url,
                 "import_checksum": current_version.import_checksum,
@@ -753,7 +766,11 @@ async def _handle_skill_write(
     if decomposition_source_hash is not None:
         decomposition_source_hash = str(decomposition_source_hash).strip() or None
     current_source_hash = compute_decomposition_source_hash(instructions)
-    if steps is not None and decomposition_source_hash is not None and decomposition_source_hash != current_source_hash:
+    if (
+        steps is not None
+        and decomposition_source_hash is not None
+        and decomposition_source_hash != current_source_hash
+    ):
         return ToolResult(
             output=(
                 "steps do not match the current instructions; decomposition_source_hash is stale. "
@@ -820,15 +837,23 @@ async def _handle_skill_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
-                steps=steps if steps is not None else (getattr(current_version, "steps", None) if current_version is not None else None),
+                steps=steps
+                if steps is not None
+                else (
+                    getattr(current_version, "steps", None) if current_version is not None else None
+                ),
                 assets=assets,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
                 resolved_url=current_version.resolved_url if current_version is not None else None,
                 commit_sha=current_version.commit_sha if current_version is not None else None,
-                import_checksum=current_version.import_checksum if current_version is not None else None,
+                import_checksum=current_version.import_checksum
+                if current_version is not None
+                else None,
                 imported_at=current_version.imported_at if current_version is not None else None,
-                import_format=current_version.import_format if current_version is not None else None,
+                import_format=current_version.import_format
+                if current_version is not None
+                else None,
                 decomposition_source_hash=(
                     decomposition_source_hash
                     if steps is not None and decomposition_source_hash is not None
@@ -866,7 +891,9 @@ async def _handle_skill_write(
         "version_id": version_row.version_id,
         "version_number": next_num,
         "content_hash": version_row.content_hash,
-        "step_count": len(steps if steps is not None else getattr(version_row, "steps", None) or []),
+        "step_count": len(
+            steps if steps is not None else getattr(version_row, "steps", None) or []
+        ),
     }
     return ToolResult(output=json.dumps(result, indent=2), metadata=metadata or None)
 
@@ -908,14 +935,20 @@ async def _handle_skill_asset_write(
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
         current_version = await resolve_current_skill_version(session, row)
         current_assets = (
-            await load_skill_asset_refs(session, current_version) if current_version is not None else []
+            await load_skill_asset_refs(session, current_version)
+            if current_version is not None
+            else []
         )
         retained_assets = [item for item in current_assets if item.filename != filename]
         asset_inputs = [*asset_refs_to_inputs(retained_assets), asset_payload]
-        instructions = current_version.instructions if current_version is not None else row.instructions
+        instructions = (
+            current_version.instructions if current_version is not None else row.instructions
+        )
         tools = current_version.tools if current_version is not None else row.tools
         templates = (
-            current_version.prompt_templates if current_version is not None else row.prompt_templates
+            current_version.prompt_templates
+            if current_version is not None
+            else row.prompt_templates
         )
         placeholders = current_version.secret_placeholders if current_version is not None else None
         try:
@@ -929,15 +962,21 @@ async def _handle_skill_asset_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
-                steps=getattr(current_version, "steps", None) if current_version is not None else None,
+                steps=getattr(current_version, "steps", None)
+                if current_version is not None
+                else None,
                 assets=asset_inputs,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
                 resolved_url=current_version.resolved_url if current_version is not None else None,
                 commit_sha=current_version.commit_sha if current_version is not None else None,
-                import_checksum=current_version.import_checksum if current_version is not None else None,
+                import_checksum=current_version.import_checksum
+                if current_version is not None
+                else None,
                 imported_at=current_version.imported_at if current_version is not None else None,
-                import_format=current_version.import_format if current_version is not None else None,
+                import_format=current_version.import_format
+                if current_version is not None
+                else None,
                 decomposition_source_hash=(
                     getattr(current_version, "decomposition_source_hash", None)
                     if current_version is not None
@@ -1001,15 +1040,23 @@ async def _handle_skill_asset_delete(
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
         current_version = await resolve_current_skill_version(session, row)
         current_assets = (
-            await load_skill_asset_refs(session, current_version) if current_version is not None else []
+            await load_skill_asset_refs(session, current_version)
+            if current_version is not None
+            else []
         )
         retained_assets = [item for item in current_assets if item.filename != filename]
         if len(retained_assets) == len(current_assets):
-            return ToolResult(output=f"Asset '{filename}' not found on skill '{skill_id}'", is_error=True)
-        instructions = current_version.instructions if current_version is not None else row.instructions
+            return ToolResult(
+                output=f"Asset '{filename}' not found on skill '{skill_id}'", is_error=True
+            )
+        instructions = (
+            current_version.instructions if current_version is not None else row.instructions
+        )
         tools = current_version.tools if current_version is not None else row.tools
         templates = (
-            current_version.prompt_templates if current_version is not None else row.prompt_templates
+            current_version.prompt_templates
+            if current_version is not None
+            else row.prompt_templates
         )
         placeholders = current_version.secret_placeholders if current_version is not None else None
         version_row = await create_skill_version_with_assets(
@@ -1028,7 +1075,9 @@ async def _handle_skill_asset_delete(
             source_url=current_version.source_url if current_version is not None else None,
             resolved_url=current_version.resolved_url if current_version is not None else None,
             commit_sha=current_version.commit_sha if current_version is not None else None,
-            import_checksum=current_version.import_checksum if current_version is not None else None,
+            import_checksum=current_version.import_checksum
+            if current_version is not None
+            else None,
             imported_at=current_version.imported_at if current_version is not None else None,
             import_format=current_version.import_format if current_version is not None else None,
             decomposition_source_hash=(
@@ -1167,7 +1216,9 @@ async def _handle_skill_import_url(
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 steps=steps,
-                assets=skill_data.get("assets") if isinstance(skill_data.get("assets"), list) else None,
+                assets=skill_data.get("assets")
+                if isinstance(skill_data.get("assets"), list)
+                else None,
                 allow_binary_assets=False,
                 source_url=provenance.source_url,
                 resolved_url=provenance.resolved_url,
@@ -1243,7 +1294,9 @@ async def _handle_skill_export(
         asset_manifest = []
         asset_bytes: dict[str, bytes] = {}
         if version_row is not None:
-            asset_manifest, asset_bytes = await load_export_assets(session, artifact_store, version_row)
+            asset_manifest, asset_bytes = await load_export_assets(
+                session, artifact_store, version_row
+            )
 
     provenance = None
     if version_row and version_row.source_url:

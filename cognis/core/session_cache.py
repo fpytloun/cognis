@@ -91,6 +91,8 @@ class CachedSessionState:
     model_override: str | None = None
     reasoning_effort_override: str | None = None
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
+    activated_skill_tool_ids: set[str] = field(default_factory=set)
+    skill_tool_classifications: dict[str, list[str]] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
 
@@ -636,6 +638,33 @@ class SessionCache:
         if entry is None or not entry.last_tool_runtime_info:
             return None
         return dict(entry.last_tool_runtime_info)
+
+    def get_activated_skill_tool_ids(self, session_id: str) -> set[str]:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return set()
+        return set(entry.activated_skill_tool_ids)
+
+    def activate_skill_tools(self, session_id: str, skill_id: str, tool_ids: set[str]) -> None:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        entry.activated_skill_tool_ids.update(tool_ids)
+
+    def get_skill_tool_classification(self, session_id: str, cache_key: str) -> list[str] | None:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return None
+        cached = entry.skill_tool_classifications.get(cache_key)
+        return list(cached) if cached is not None else None
+
+    def set_skill_tool_classification(
+        self, session_id: str, cache_key: str, tool_ids: list[str]
+    ) -> None:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        entry.skill_tool_classifications[cache_key] = list(tool_ids)
 
     def note_context_reserve_clamp(self, session_id: str) -> bool:
         """Return ``True`` the first time a session clamps output reserve."""

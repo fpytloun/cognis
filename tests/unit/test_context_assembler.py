@@ -1496,13 +1496,21 @@ def test_direct_default_profile_keeps_delegate_visible() -> None:
         _profile_tool("create_task", category="orchestration", read_only=False),
         profile,
     )
-    assert not step_profile_visible_by_default(
+    assert step_profile_visible_by_default(
         _profile_tool("bash", category="shell", read_only=False),
+        profile,
+    )
+    assert step_profile_visible_by_default(
+        _profile_tool("image_edit", category="image", read_only=True),
+        profile,
+    )
+    assert not step_profile_visible_by_default(
+        _profile_tool("get_status", category="system", read_only=True),
         profile,
     )
 
 
-def test_general_task_profile_uses_pinned_helpers_and_core_tools_only() -> None:
+def test_general_task_profile_uses_soft_visibility_for_eligible_tools() -> None:
     profile = resolve_step_profile(
         StepDefinition(
             name="task",
@@ -1524,8 +1532,12 @@ def test_general_task_profile_uses_pinned_helpers_and_core_tools_only() -> None:
         _profile_tool("read_tool_output", category="context", read_only=True),
         profile,
     )
-    assert not step_profile_visible_by_default(
+    assert step_profile_visible_by_default(
         _profile_tool("mcp_googleworkspace__search_messages", category="mcp", read_only=True),
+        profile,
+    )
+    assert not step_profile_visible_by_default(
+        _profile_tool("get_status", category="system", read_only=True),
         profile,
     )
 

@@ -53,6 +53,7 @@ from cognis.core.harness_guards import (
     loop_guard_rejection_payload,
     record_tool_call,
 )
+from cognis.core.json_utils import extract_json_object
 from cognis.core.project_context import (
     PROJECT_CONTEXT_STATUS_LOADED,
     ProjectContextEntry,
@@ -75,6 +76,7 @@ from cognis.core.tool_exposure import (
     ToolExposureContract,
     prepare_tool_exposure,
 )
+from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
 from cognis.core.truncation import middle_truncate
 from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
@@ -604,13 +606,18 @@ def _tool_id_for_call(tool_name: str, registry: Any | None) -> str:
 
 
 def _filter_model_inventory_tools(
-    agent: AgentDefinition, tools: list[ToolDefinition], discovered_tool_ids: set[str] | None = None
+    agent: AgentDefinition,
+    tools: list[ToolDefinition],
+    discovered_tool_ids: set[str] | None = None,
+    activated_tool_ids: set[str] | None = None,
 ) -> list[ToolDefinition]:
     filtered: list[ToolDefinition] = []
     permissions = agent.permissions
     visible_skill_tool_ids = _attached_skill_tool_ids(agent)
     if discovered_tool_ids:
         visible_skill_tool_ids.update(discovered_tool_ids)
+    if activated_tool_ids:
+        visible_skill_tool_ids.update(activated_tool_ids)
     for tool in tools:
         if tool.name in CONTROLLER_TOOLS or is_orchestration_tool(tool.name):
             continue
@@ -635,6 +642,15 @@ def _attached_skill_tool_ids(agent: AgentDefinition) -> set[str]:
     if not isinstance(raw_ids, list):
         return set()
     return {str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()}
+
+
+def _runtime_skill_summaries(agent: AgentDefinition) -> list[dict[str, Any]]:
+    if not isinstance(agent.skills, dict):
+        return []
+    raw = agent.skills.get("_runtime_skill_summaries")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) -> bool:
@@ -2092,14 +2108,25 @@ class AgentLoop:
         _MAX_OPENAI_TOOL_SEARCH_RETRIES = 1
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
+        activated_tool_ids = self._get_initial_activated_tool_ids(ctx)
         queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
         collected_attachments: list[dict[str, Any]] = []
         pending_assistant_attachments: list[dict[str, Any]] = []
         continued_assistant_content = ""
         continuation_message_index: int | None = None
         continuation_reminder_index: int | None = None
+        relevant_skills_message_added = False
         while True:
             self._raise_if_cancelled(ctx)
+
+            if not relevant_skills_message_added:
+                relevant_skills_message = self._build_relevant_skills_message(
+                    ctx,
+                    user_message=effective_user_message,
+                )
+                if relevant_skills_message is not None:
+                    messages.append(relevant_skills_message)
+                relevant_skills_message_added = True
 
             resolved_model = getattr(context_result, "resolved_model", "")
             model_messages = self._project_model_messages(
@@ -2229,16 +2256,19 @@ class AgentLoop:
                     ctx.agent,
                     classified_inventory,
                     discovered_tool_ids,
+                    activated_tool_ids,
                 )
                 searchable_inventory_tools = [
                     tool
                     for tool in full_inventory_tools
                     if step_profile_allows_tool(tool, resolved_profile)
+                    or stable_tool_id(tool) in activated_tool_ids
                 ]
                 default_visible_tool_ids = {
                     stable_tool_id(tool)
                     for tool in searchable_inventory_tools
                     if step_profile_visible_by_default(tool, resolved_profile)
+                    or stable_tool_id(tool) in activated_tool_ids
                 }
             exposure = prepare_tool_exposure(
                 inventory_tools=searchable_inventory_tools,
@@ -2738,6 +2768,7 @@ class AgentLoop:
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
                             discovered_tool_ids=discovered_tool_ids,
+                            activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
                         )
@@ -2780,6 +2811,7 @@ class AgentLoop:
                                 collected_attachments=collected_attachments,
                                 pending_assistant_attachments=pending_assistant_attachments,
                                 discovered_tool_ids=discovered_tool_ids,
+                                activated_tool_ids=activated_tool_ids,
                                 on_token=on_token,
                                 on_tool_result=on_tool_result,
                             )
@@ -2822,6 +2854,7 @@ class AgentLoop:
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
                             discovered_tool_ids=discovered_tool_ids,
+                            activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
                         )
@@ -2944,6 +2977,7 @@ class AgentLoop:
                         collected_attachments=collected_attachments,
                         pending_assistant_attachments=pending_assistant_attachments,
                         discovered_tool_ids=discovered_tool_ids,
+                        activated_tool_ids=activated_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
                     )
@@ -4197,6 +4231,7 @@ class AgentLoop:
                         collected_attachments=collected_attachments,
                         pending_assistant_attachments=pending_assistant_attachments,
                         discovered_tool_ids=discovered_tool_ids,
+                        activated_tool_ids=activated_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
                     )
@@ -4210,6 +4245,7 @@ class AgentLoop:
                     collected_attachments=collected_attachments,
                     pending_assistant_attachments=pending_assistant_attachments,
                     discovered_tool_ids=discovered_tool_ids,
+                    activated_tool_ids=activated_tool_ids,
                     on_token=on_token,
                     on_tool_result=on_tool_result,
                 )
@@ -7164,6 +7200,7 @@ class AgentLoop:
         collected_attachments: list[dict[str, Any]],
         pending_assistant_attachments: list[dict[str, Any]],
         discovered_tool_ids: set[str],
+        activated_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
     ) -> None:
@@ -7245,6 +7282,12 @@ class AgentLoop:
         if result.metadata:
             self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
+            await self._apply_skill_activation(
+                ctx,
+                metadata=result.metadata,
+                discovered_tool_ids=discovered_tool_ids,
+                activated_tool_ids=activated_tool_ids,
+            )
         messages.append(
             {
                 "role": "tool",
@@ -7501,6 +7544,7 @@ class AgentLoop:
         collected_attachments: list[dict[str, Any]],
         pending_assistant_attachments: list[dict[str, Any]],
         discovered_tool_ids: set[str],
+        activated_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
     ) -> None:
@@ -7563,6 +7607,7 @@ class AgentLoop:
                 collected_attachments=collected_attachments,
                 pending_assistant_attachments=pending_assistant_attachments,
                 discovered_tool_ids=discovered_tool_ids,
+                activated_tool_ids=activated_tool_ids,
                 on_token=on_token,
                 on_tool_result=on_tool_result,
             )
@@ -8740,6 +8785,184 @@ class AgentLoop:
         if not isinstance(raw_ids, list):
             return set()
         return {str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()}
+
+    def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
+        getter = getattr(self.session_cache, "get_activated_skill_tool_ids", None)
+        if not callable(getter):
+            return set()
+        return set(getter(ctx.session.session_id))
+
+    def _build_relevant_skills_message(
+        self,
+        ctx: StepContext,
+        *,
+        user_message: str,
+    ) -> dict[str, Any] | None:
+        skills = _runtime_skill_summaries(ctx.agent)
+        if not skills:
+            return None
+        relevant = retrieve_relevant_skills(
+            user_message,
+            skills,
+            loaded_skill_ids=set(),
+            limit=5,
+        )
+        if not relevant:
+            return None
+        lines = [
+            "<relevant_skills>",
+            "These skills look relevant to the current task. Load one if it matches the user's intent.",
+        ]
+        for item in relevant:
+            lines.append(
+                f"- {item.name} ({item.skill_id}): {item.description or 'No description provided.'}"
+            )
+        lines.append("</relevant_skills>")
+        return {"role": "system", "content": "\n".join(lines)}
+
+    async def _classify_skill_activation_tool_ids(
+        self,
+        ctx: StepContext,
+        *,
+        activation: dict[str, Any],
+        candidate_tools: list[ToolDefinition],
+    ) -> set[str]:
+        cache_key = f"{activation.get('skill_id', '')}:{activation.get('content_hash', '')}".strip(
+            ":"
+        ) or str(activation.get("skill_id") or "")
+        get_cached = getattr(self.session_cache, "get_skill_tool_classification", None)
+        if callable(get_cached):
+            cached = get_cached(ctx.session.session_id, cache_key)
+            if isinstance(cached, list):
+                return {
+                    str(tool_id)
+                    for tool_id in cached
+                    if isinstance(tool_id, str) and tool_id.strip()
+                }
+
+        ranked_tools = retrieve_relevant_tools(
+            " ".join(
+                part
+                for part in (
+                    str(activation.get("name") or "").strip(),
+                    str(activation.get("description") or "").strip(),
+                    str(activation.get("instructions") or "")[:2000].strip(),
+                )
+                if part
+            ),
+            candidate_tools,
+            already_visible_tool_ids=set(),
+            limit=20,
+        )
+        if not ranked_tools:
+            return set()
+
+        candidate_lines = []
+        tool_by_id = {stable_tool_id(tool): tool for tool in candidate_tools}
+        for item in ranked_tools:
+            tool = tool_by_id.get(item.tool_id)
+            if tool is None:
+                continue
+            candidate_lines.append(f"- {item.tool_id}: {tool.name} — {tool.description}")
+        if not candidate_lines:
+            return set()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You classify which tools a loaded skill needs. Return strict JSON with key "
+                    "'tool_ids' as an array of stable tool ids. Return an empty array when no tool "
+                    "is clearly relevant. Be conservative and only choose high-confidence matches."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Skill id: {activation.get('skill_id')}\n"
+                    f"Name: {activation.get('name')}\n"
+                    f"Description: {activation.get('description')}\n"
+                    f"Instructions:\n{str(activation.get('instructions') or '')[:4000]}\n\n"
+                    "Candidate tools:\n" + "\n".join(candidate_lines) + "\n\nReturn JSON only."
+                ),
+            },
+        ]
+        try:
+            response = await self.providers.llm.generate(
+                messages,
+                task_type="classifier",
+                response_format={"type": "json_object"},
+            )
+            content = (
+                response.get("choices", [{}])[0].get("message", {}).get("content")
+                if isinstance(response, dict)
+                else None
+            )
+            payload = extract_json_object(str(content or "{}"), label="skill_tool_classifier")
+            raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []
+        except Exception:
+            logger.warning(
+                "skill tool classifier failed",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "skill_id": activation.get("skill_id"),
+                    }
+                },
+                exc_info=True,
+            )
+            return set()
+
+        resolved = {
+            str(tool_id)
+            for tool_id in raw_ids
+            if isinstance(tool_id, str) and tool_id.strip() and tool_id in tool_by_id
+        }
+        set_cached = getattr(self.session_cache, "set_skill_tool_classification", None)
+        if callable(set_cached):
+            set_cached(ctx.session.session_id, cache_key, sorted(resolved))
+        return resolved
+
+    async def _apply_skill_activation(
+        self,
+        ctx: StepContext,
+        *,
+        metadata: dict[str, Any],
+        discovered_tool_ids: set[str],
+        activated_tool_ids: set[str],
+    ) -> None:
+        activation = metadata.get("skill_activation")
+        if not isinstance(activation, dict):
+            return
+        skill_id = str(activation.get("skill_id") or "").strip()
+        if not skill_id:
+            return
+
+        raw_declared_tool_ids = metadata.get("discovered_tool_ids")
+        resolved_tool_ids = {
+            str(tool_id)
+            for tool_id in raw_declared_tool_ids
+            if isinstance(tool_id, str) and tool_id.strip()
+        }
+        if not resolved_tool_ids and ctx.tool_registry is not None:
+            candidate_tools = _filter_model_inventory_tools(
+                ctx.agent,
+                classify_tool_definitions_sync(ctx.tool_registry.list_tools()),
+                discovered_tool_ids,
+                activated_tool_ids,
+            )
+            resolved_tool_ids = await self._classify_skill_activation_tool_ids(
+                ctx,
+                activation=activation,
+                candidate_tools=candidate_tools,
+            )
+        if not resolved_tool_ids:
+            return
+
+        activated_tool_ids.update(resolved_tool_ids)
+        activate = getattr(self.session_cache, "activate_skill_tools", None)
+        if callable(activate):
+            activate(ctx.session.session_id, skill_id, resolved_tool_ids)
 
     def _merge_discovered_tool_ids(
         self, discovered_tool_ids: set[str], metadata: dict[str, Any]

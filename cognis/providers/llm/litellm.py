@@ -1052,7 +1052,7 @@ class LiteLLMProvider:
 
         provider: LLMProviderRow | None = None
         if provider_id is not None:
-            async with self._session_factory() as session:
+            async with self.session_factory() as session:
                 provider = await session.get(LLMProviderRow, provider_id)
 
         use_responses_api = self._should_use_responses_api(

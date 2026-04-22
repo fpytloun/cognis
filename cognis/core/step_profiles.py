@@ -20,72 +20,6 @@ from cognis.models.workflow import (
     StepToolOverrides,
 )
 
-_DIRECT_DEFAULT_CORE_TOOL_IDS = [
-    "memory_search",
-    "memory_add",
-    "read",
-    "grep",
-    "glob",
-    "web_search",
-]
-
-_GENERAL_TASK_CORE_TOOL_IDS = [
-    "memory_search",
-    "memory_add",
-    "memory_update",
-    "read",
-    "grep",
-    "glob",
-    "bash",
-    "web_search",
-    "web_fetch",
-]
-
-_CODING_CORE_TOOL_IDS = [
-    "memory_search",
-    "memory_add",
-    "read",
-    "grep",
-    "glob",
-    "bash",
-    "edit",
-    "multiedit",
-    "patch",
-    "write",
-    "lsp",
-    "web_search",
-    "web_fetch",
-]
-
-_RESEARCH_CORE_TOOL_IDS = [
-    "memory_search",
-    "memory_add",
-    "read",
-    "grep",
-    "glob",
-    "web_search",
-    "web_fetch",
-]
-
-_REVIEW_CORE_TOOL_IDS = [
-    "memory_search",
-    "memory_add",
-    "read",
-    "grep",
-    "glob",
-    "web_search",
-]
-
-_PINNED_DEFAULT_VISIBLE_TOOL_IDENTIFIERS = (
-    "skill_load",
-    "read_tool_output",
-    "search_tool_output",
-    "list_tool_output_anchors",
-    "read_tool_output_anchor",
-    "get_current_datetime",
-    "convert_timezone",
-)
-
 STEP_PROFILE_OVERRIDES_SETTING_KEY = "workflow.step_profile_overrides"
 STEP_PROFILE_CUSTOM_SETTING_KEY = "workflow.step_profiles_custom"
 LEGACY_PROFILE_GROUP_MAP: dict[str, str] = {
@@ -138,8 +72,10 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "web": _caps(ToolCapability.READ),
                 "development": _caps(ToolCapability.READ),
             },
-            tool_overrides=StepToolOverrides(include=["delegate", "create_task"]),
-            core_tool_ids=_DIRECT_DEFAULT_CORE_TOOL_IDS,
+            tool_overrides=StepToolOverrides(
+                include=["delegate", "create_task"],
+                exclude=["get_status", "list_agents"],
+            ),
         ),
     ),
     "system:general-task": StepProfileDefinition(
@@ -159,8 +95,10 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "office": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "personal": _caps(ToolCapability.READ, ToolCapability.WRITE),
             },
-            tool_overrides=StepToolOverrides(include=["delegate"]),
-            core_tool_ids=_GENERAL_TASK_CORE_TOOL_IDS,
+            tool_overrides=StepToolOverrides(
+                include=["delegate"],
+                exclude=["get_status", "list_agents"],
+            ),
         ),
     ),
     "system:research": StepProfileDefinition(
@@ -179,8 +117,10 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "communication": _caps(ToolCapability.READ),
                 "personal": _caps(ToolCapability.READ),
             },
-            tool_overrides=StepToolOverrides(include=["delegate"]),
-            core_tool_ids=_RESEARCH_CORE_TOOL_IDS,
+            tool_overrides=StepToolOverrides(
+                include=["delegate"],
+                exclude=["get_status", "list_agents"],
+            ),
         ),
     ),
     "system:coding": StepProfileDefinition(
@@ -201,8 +141,10 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                     ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED
                 ),
             },
-            tool_overrides=StepToolOverrides(include=["delegate"]),
-            core_tool_ids=_CODING_CORE_TOOL_IDS,
+            tool_overrides=StepToolOverrides(
+                include=["delegate"],
+                exclude=["get_status", "list_agents"],
+            ),
         ),
     ),
     "system:review": StepProfileDefinition(
@@ -217,8 +159,10 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                 "web": _caps(ToolCapability.READ),
                 "development": _caps(ToolCapability.READ),
             },
-            tool_overrides=StepToolOverrides(include=["delegate"]),
-            core_tool_ids=_REVIEW_CORE_TOOL_IDS,
+            tool_overrides=StepToolOverrides(
+                include=["delegate"],
+                exclude=["get_status", "list_agents"],
+            ),
         ),
     ),
 }
@@ -374,28 +318,7 @@ def step_profile_allows_tool(tool: ToolDefinition, profile: ResolvedStepProfile)
 def step_profile_visible_by_default(tool: ToolDefinition, profile: ResolvedStepProfile) -> bool:
     """Return whether a tool should be pre-exposed before search discovery."""
 
-    if profile.config is None:
-        return True
-    if any(
-        tool_matches_identifier(tool, identifier)
-        for identifier in profile.config.tool_overrides.exclude
-    ):
-        return False
-    if any(
-        tool_matches_identifier(tool, identifier)
-        for identifier in _PINNED_DEFAULT_VISIBLE_TOOL_IDENTIFIERS
-    ):
-        return True
-    if any(
-        tool_matches_identifier(tool, identifier)
-        for identifier in profile.config.tool_overrides.include
-    ):
-        return True
-    if profile.config.core_tool_ids:
-        return profile_matches_tool(tool, profile) and any(
-            tool_matches_identifier(tool, identifier) for identifier in profile.config.core_tool_ids
-        )
-    return profile_matches_tool(tool, profile)
+    return step_profile_allows_tool(tool, profile)
 
 
 def _merge_profile_config(
@@ -417,7 +340,6 @@ def _merge_profile_config(
             exclude=[*base.tool_overrides.exclude, *override.tool_overrides.exclude],
         ),
         allow_tool_search=override.allow_tool_search,
-        core_tool_ids=[*base.core_tool_ids, *override.core_tool_ids],
     )
 
 
@@ -486,19 +408,4 @@ def _normalize_profile_config(config: StepProfileConfig) -> StepProfileConfig:
         matrix=merged,
         tool_overrides=config.tool_overrides,
         allow_tool_search=config.allow_tool_search,
-        core_tool_ids=_dedupe_identifiers(config.core_tool_ids),
     )
-
-
-def _dedupe_identifiers(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        normalized = value.strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        deduped.append(normalized)
-    return deduped

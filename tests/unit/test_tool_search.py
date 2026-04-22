@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
 from cognis.models.tool import ToolDefinition, ToolSource
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 
@@ -86,3 +87,44 @@ def test_search_inventory_uses_bm25_for_multi_term_mcp_queries() -> None:
     )
 
     assert matches[0]["name"] == "mcp_googleworkspace__search_messages"
+
+
+def test_retrieve_relevant_skills_returns_exact_skill_match() -> None:
+    skills = [
+        {
+            "skill_id": "skill_daily_brief",
+            "name": "daily-brief",
+            "description": "Build a Czech morning briefing with agenda, news, markets, and weather.",
+            "tags": ["briefing", "news"],
+        },
+        {
+            "skill_id": "skill_shopping",
+            "name": "rohlik-smart-shopping",
+            "description": "Handle smart grocery shopping tasks.",
+            "tags": ["shopping"],
+        },
+    ]
+
+    matches = retrieve_relevant_skills(
+        "Load and run the daily-brief skill for today's morning briefing",
+        skills,
+        loaded_skill_ids=set(),
+    )
+
+    assert len(matches) == 1
+    assert matches[0].skill_id == "skill_daily_brief"
+
+
+def test_retrieve_relevant_tools_drops_already_visible_tools() -> None:
+    tools = [
+        _tool("image_edit", "Edit image artifacts using a text prompt", "image"),
+        _tool("web_search", "Search the web for information", "web"),
+    ]
+
+    matches = retrieve_relevant_tools(
+        "edit this image",
+        tools,
+        already_visible_tool_ids={"builtin:image_edit"},
+    )
+
+    assert matches == []
