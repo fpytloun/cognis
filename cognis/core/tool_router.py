@@ -605,9 +605,12 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
 
+        guardrails_tool_call = tool_call
         try:
             if route is ToolRoute.LOCAL:
-                tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
+                guardrails_tool_call = await self._prepare_guardrails_tool_call(
+                    tool_call, session, agent
+                )
         except CredentialAccessError as exc:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
             return self._sanitize_result(
@@ -618,7 +621,7 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
 
-        decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+        decision = await self.evaluate_tool_call(guardrails_tool_call, agent, session, registry)
         eval_meta: dict[str, Any] = {
             "decision": decision.decision,
             "reasoning": decision.reasoning,
@@ -652,6 +655,19 @@ class ToolRouter:
             return self._sanitize_result(
                 tool_call.name,
                 escalated_result,
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+
+        try:
+            if route is ToolRoute.LOCAL:
+                tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
+        except CredentialAccessError as exc:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+            return self._sanitize_result(
+                tool_call.name,
+                self._credential_error_result(exc),
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
@@ -864,6 +880,40 @@ class ToolRouter:
             output = str(result)
         return ToolResult(output=output, duration_ms=duration_ms)
 
+    async def _prepare_guardrails_tool_call(
+        self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
+    ) -> ToolCall:
+        arguments = dict(tool_call.arguments)
+        if tool_call.name == "artifact_save":
+            arguments.pop("source_artifact_content_b64", None)
+            if artifact_id := arguments.get("source_artifact_id"):
+                row = await self._get_accessible_artifact_record(
+                    str(artifact_id), session.user_email
+                )
+                arguments.setdefault("source_artifact_filename", row.filename)
+                arguments.setdefault("source_artifact_mime_type", row.mime_type)
+                arguments.setdefault("source_artifact_size_bytes", row.size_bytes)
+        assets = arguments.get("assets") if tool_call.name == "document_generate" else None
+        if isinstance(assets, list):
+            sanitized_assets: list[dict[str, Any]] = []
+            for raw in assets:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                item.pop("content_b64", None)
+                if artifact_id := item.get("artifact_id"):
+                    row = await self._get_accessible_artifact_record(
+                        str(artifact_id), session.user_email
+                    )
+                    item.setdefault("filename", row.filename)
+                    item.setdefault("mime_type", row.mime_type)
+                    item.setdefault("size_bytes", row.size_bytes)
+                sanitized_assets.append(item)
+            arguments["assets"] = sanitized_assets
+        if self.credentials_provider is not None:
+            arguments = await self._resolve_credential_refs(arguments, session, agent)
+        return tool_call.model_copy(update={"arguments": arguments})
+
     async def _prepare_local_tool_call(
         self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
     ) -> ToolCall:
@@ -1035,14 +1085,9 @@ class ToolRouter:
         return ToolResult(output=output, is_error=True, metadata=metadata)
 
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
-        if self._session_factory is None or self.artifact_store is None:
+        if self.artifact_store is None:
             raise ValueError("Artifact support not available")
-        async with self._session_factory() as db_session:
-            row = await get_artifact_record(db_session, artifact_id)
-        if row is None or row.status == "deleted":
-            raise ValueError(f"Artifact not found: {artifact_id}")
-        if row.owner_email and row.owner_email != user_email:
-            raise ValueError(f"Artifact access denied: {artifact_id}")
+        row = await self._get_accessible_artifact_record(artifact_id, user_email)
         content, _content_type = await self.artifact_store.async_load(
             row.namespace, row.object_id, row.filename
         )
@@ -1051,7 +1096,16 @@ class ToolRouter:
     async def _load_binary_artifact(
         self, artifact_id: str, user_email: str
     ) -> tuple[bytes, str, str]:
-        if self._session_factory is None or self.artifact_store is None:
+        if self.artifact_store is None:
+            raise ValueError("Artifact support not available")
+        row = await self._get_accessible_artifact_record(artifact_id, user_email)
+        content, content_type = await self.artifact_store.async_load(
+            row.namespace, row.object_id, row.filename
+        )
+        return content, content_type, row.filename
+
+    async def _get_accessible_artifact_record(self, artifact_id: str, user_email: str) -> Any:
+        if self._session_factory is None:
             raise ValueError("Artifact support not available")
         async with self._session_factory() as db_session:
             row = await get_artifact_record(db_session, artifact_id)
@@ -1059,10 +1113,7 @@ class ToolRouter:
             raise ValueError(f"Artifact not found: {artifact_id}")
         if row.owner_email and row.owner_email != user_email:
             raise ValueError(f"Artifact access denied: {artifact_id}")
-        content, content_type = await self.artifact_store.async_load(
-            row.namespace, row.object_id, row.filename
-        )
-        return content, content_type, row.filename
+        return row
 
     async def _materialize_inline_attachments(
         self,

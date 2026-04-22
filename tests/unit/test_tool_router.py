@@ -28,13 +28,14 @@ class _Guardrails:
         self.evaluate_calls = 0
         self.mcp_calls = 0
         self.last_mcp_call: tuple[str, str] | None = None
+        self.last_evaluate_call: tuple[str, str, dict, dict] | None = None
         self.mcp_result = ToolResult(output="remote result")
 
     async def evaluate(
         self, session_id: str, tool_name: str, arguments: dict, context: dict
     ) -> object:
-        del session_id, tool_name, arguments, context
         self.evaluate_calls += 1
+        self.last_evaluate_call = (session_id, tool_name, dict(arguments), dict(context))
         return type(
             "Evaluation",
             (),
@@ -909,6 +910,7 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
                 object_id="att_1",
                 filename="photo.png",
                 mime_type="image/png",
+                size_bytes=9,
             )
         ),
     )
@@ -933,9 +935,10 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
         )
     )
 
+    guardrails = _Guardrails()
     executor = _CapturingExecutor()
     router = ToolRouter(
-        guardrails=_Guardrails(),
+        guardrails=guardrails,
         artifact_store=_Store(),
         session_factory=_session_factory(),
     )
@@ -947,12 +950,21 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
             arguments={"file_path": "/tmp/photo.png", "source_artifact_id": "att_1"},
         ),
         _session(),
-        _agent(),
+        _agent({"*": Permission.EVALUATE}),
         registry,
         executor,
     )
 
     assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert evaluate_arguments == {
+        "file_path": "/tmp/photo.png",
+        "source_artifact_id": "att_1",
+        "source_artifact_filename": "photo.png",
+        "source_artifact_mime_type": "image/png",
+        "source_artifact_size_bytes": 9,
+    }
     assert executor.seen_call is not None
     assert executor.seen_call.arguments["source_artifact_filename"] == "photo.png"
     assert executor.seen_call.arguments["source_artifact_mime_type"] == "image/png"
@@ -960,6 +972,111 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
         base64.b64decode(executor.seen_call.arguments["source_artifact_content_b64"])
         == b"png-bytes"
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_omits_document_asset_binary_payloads_from_guardrails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CapturingExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(ToolResult(output="generated"))
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self, tool_call: ToolCall, timeout_seconds: int | None = None
+        ) -> ToolResult:
+            del timeout_seconds
+            self.seen_call = tool_call
+            return self.result
+
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    artifact_id="asset_1",
+                    status="attached",
+                    owner_email="user@example.com",
+                    namespace="attachments",
+                    object_id="asset_1",
+                    filename="diagram.png",
+                    mime_type="image/png",
+                    size_bytes=11,
+                ),
+                SimpleNamespace(
+                    artifact_id="asset_1",
+                    status="attached",
+                    owner_email="user@example.com",
+                    namespace="attachments",
+                    object_id="asset_1",
+                    filename="diagram.png",
+                    mime_type="image/png",
+                    size_bytes=11,
+                ),
+            ]
+        ),
+    )
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"image-bytes", "image/png"
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="document_generate",
+                description="document generate",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+
+    guardrails = _Guardrails()
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_Store(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="document-generate-1",
+            name="document_generate",
+            arguments={
+                "content": "![diag](asset:diag)",
+                "assets": [{"name": "diag", "artifact_id": "asset_1"}],
+            },
+        ),
+        _session(),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert evaluate_arguments["assets"] == [
+        {
+            "name": "diag",
+            "artifact_id": "asset_1",
+            "filename": "diagram.png",
+            "mime_type": "image/png",
+            "size_bytes": 11,
+        }
+    ]
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["assets"][0]["filename"] == "diagram.png"
+    assert executor.seen_call.arguments["assets"][0]["mime_type"] == "image/png"
+    assert base64.b64decode(executor.seen_call.arguments["assets"][0]["content_b64"]) == b"image-bytes"
 
 
 @pytest.mark.asyncio
