@@ -4117,6 +4117,11 @@ class AgentLoop:
                             else None
                         ),
                         limit=int(tc.arguments.get("limit", 10) or 10),
+                        log_context={
+                            "reason": "search_tools_builtin",
+                            "session_id": ctx.session.session_id,
+                            **self._step_log_metadata(ctx),
+                        },
                     )
                     discovered_tool_ids.update(
                         {
@@ -4125,14 +4130,19 @@ class AgentLoop:
                             if isinstance(match.get("tool_id"), str)
                         }
                     )
-                    logger.debug(
-                        "Tool discovery updated",
+                    logger.info(
+                        "tool discovery updated",
                         extra={
                             "extra_data": {
                                 "session_id": ctx.session.session_id,
                                 "query_length": len(str(tc.arguments.get("query", ""))),
                                 "match_count": len(matches),
                                 "discovered_tool_count": len(discovered_tool_ids),
+                                "match_tool_ids": [
+                                    str(match["tool_id"])
+                                    for match in matches
+                                    if isinstance(match.get("tool_id"), str)
+                                ],
                             }
                         },
                     )
@@ -8792,6 +8802,17 @@ class AgentLoop:
             return set()
         return set(getter(ctx.session.session_id))
 
+    def _step_log_metadata(self, ctx: StepContext) -> dict[str, Any]:
+        workflow = getattr(ctx, "workflow", None)
+        step = getattr(ctx, "step", None)
+        step_definition = getattr(ctx, "step_definition", None)
+        return {
+            "workflow_id": getattr(workflow, "workflow_id", None),
+            "step_id": getattr(step, "step_id", None)
+            or getattr(step_definition, "step_id", None)
+            or getattr(step_definition, "name", None),
+        }
+
     def _build_relevant_skills_message(
         self,
         ctx: StepContext,
@@ -8806,9 +8827,25 @@ class AgentLoop:
             skills,
             loaded_skill_ids=set(),
             limit=5,
+            log_context={
+                "reason": "relevant_skill_suggestions",
+                "session_id": ctx.session.session_id,
+                **self._step_log_metadata(ctx),
+            },
         )
         if not relevant:
             return None
+        logger.info(
+            "agent: relevant skills injected",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "skill_ids": [item.skill_id for item in relevant],
+                    "skill_count": len(relevant),
+                }
+            },
+        )
         lines = [
             "<relevant_skills>",
             "These skills look relevant to the current task. Load one if it matches the user's intent.",
@@ -8830,15 +8867,45 @@ class AgentLoop:
         cache_key = f"{activation.get('skill_id', '')}:{activation.get('content_hash', '')}".strip(
             ":"
         ) or str(activation.get("skill_id") or "")
+        cache_key_label = cache_key[:16]
         get_cached = getattr(self.session_cache, "get_skill_tool_classification", None)
         if callable(get_cached):
             cached = get_cached(ctx.session.session_id, cache_key)
             if isinstance(cached, list):
+                logger.info(
+                    "skill tool classifier cache hit",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            **self._step_log_metadata(ctx),
+                            "skill_id": activation.get("skill_id"),
+                            "cache_key": cache_key_label,
+                            "tool_ids": sorted(
+                                str(tool_id)
+                                for tool_id in cached
+                                if isinstance(tool_id, str) and tool_id.strip()
+                            ),
+                        }
+                    },
+                )
                 return {
                     str(tool_id)
                     for tool_id in cached
                     if isinstance(tool_id, str) and tool_id.strip()
                 }
+
+        logger.info(
+            "skill tool classifier started",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "skill_id": activation.get("skill_id"),
+                    "cache_key": cache_key_label,
+                    "candidate_inventory_count": len(candidate_tools),
+                }
+            },
+        )
 
         ranked_tools = retrieve_relevant_tools(
             " ".join(
@@ -8853,8 +8920,26 @@ class AgentLoop:
             candidate_tools,
             already_visible_tool_ids=set(),
             limit=20,
+            log_context={
+                "reason": "skill_tool_classifier_candidates",
+                "session_id": ctx.session.session_id,
+                **self._step_log_metadata(ctx),
+                "skill_id": activation.get("skill_id"),
+                "cache_key": cache_key_label,
+            },
         )
         if not ranked_tools:
+            logger.info(
+                "skill tool classifier found no BM25 candidates",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "skill_id": activation.get("skill_id"),
+                        "cache_key": cache_key_label,
+                    }
+                },
+            )
             return set()
 
         candidate_lines = []
@@ -8865,6 +8950,17 @@ class AgentLoop:
                 continue
             candidate_lines.append(f"- {item.tool_id}: {tool.name} — {tool.description}")
         if not candidate_lines:
+            logger.info(
+                "skill tool classifier candidate list empty",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "skill_id": activation.get("skill_id"),
+                        "cache_key": cache_key_label,
+                    }
+                },
+            )
             return set()
 
         messages = [
@@ -8921,6 +9017,20 @@ class AgentLoop:
         set_cached = getattr(self.session_cache, "set_skill_tool_classification", None)
         if callable(set_cached):
             set_cached(ctx.session.session_id, cache_key, sorted(resolved))
+        logger.info(
+            "skill tool classifier resolved",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "skill_id": activation.get("skill_id"),
+                    "cache_key": cache_key_label,
+                    "candidate_count": len(candidate_lines),
+                    "resolved_count": len(resolved),
+                    "resolved_tool_ids": sorted(resolved),
+                }
+            },
+        )
         return resolved
 
     async def _apply_skill_activation(
@@ -8944,7 +9054,9 @@ class AgentLoop:
             for tool_id in raw_declared_tool_ids
             if isinstance(tool_id, str) and tool_id.strip()
         }
+        resolution_path = "declared"
         if not resolved_tool_ids and ctx.tool_registry is not None:
+            resolution_path = "classified"
             candidate_tools = _filter_model_inventory_tools(
                 ctx.agent,
                 classify_tool_definitions_sync(ctx.tool_registry.list_tools()),
@@ -8957,12 +9069,36 @@ class AgentLoop:
                 candidate_tools=candidate_tools,
             )
         if not resolved_tool_ids:
+            logger.info(
+                "skill activation resolved no tools",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "skill_id": skill_id,
+                        "resolution_path": resolution_path,
+                    }
+                },
+            )
             return
 
         activated_tool_ids.update(resolved_tool_ids)
         activate = getattr(self.session_cache, "activate_skill_tools", None)
         if callable(activate):
             activate(ctx.session.session_id, skill_id, resolved_tool_ids)
+        logger.info(
+            "skill activation resolved tools",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "skill_id": skill_id,
+                    "resolution_path": resolution_path,
+                    "tool_count": len(resolved_tool_ids),
+                    "tool_ids": sorted(resolved_tool_ids),
+                }
+            },
+        )
 
     def _merge_discovered_tool_ids(
         self, discovered_tool_ids: set[str], metadata: dict[str, Any]

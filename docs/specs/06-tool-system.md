@@ -544,9 +544,11 @@ model_facing_tools = tool_exposure.prepare(
 # Returns: core tools (always loaded) + deferred tools (provider-specific)
 ```
 
-The LLM sees a flat list of core tools.  It can discover deferred tools via
-provider-native tool search or the generic ``search_tools`` builtin.  See
-the "Tool Exposure Architecture" section for details.
+The LLM sees a model-facing tool set derived from the step profile and provider
+capabilities. It can discover additional eligible tools via provider-native
+tool search, the generic ``search_tools`` builtin, or ``skill_load`` when a
+skill activates deferred tool ids. See the "Tool Exposure Architecture"
+section for details.
 
 ## Tool Permission Evaluation
 
@@ -867,9 +869,10 @@ search_tools = ToolDefinition(
 )
 ```
 
-The handler searches the full effective inventory (including deferred tools)
-and returns matching tool definitions.  The agent loop then injects discovered
-tools into the next turn's ``tools`` array.
+The handler searches the current step's eligible inventory (including deferred
+tools that survived profile filtering) and returns matching tool definitions.
+The agent loop then injects discovered tools into the next turn's ``tools``
+array.
 
 ``search_tools`` is a controller-managed, read-only system builtin.  It does
 not execute arbitrary tools itself; it only reveals the already effective,
@@ -885,17 +888,34 @@ provider-specific discovery strategy.  The profile decides two things:
 
 Mode semantics:
 
-- `soft` narrows default visibility but keeps the searchable inventory broad
-  (except explicit excludes)
+- `soft` makes all profile-eligible tools visible by default; discovery is still
+  available for additional eligible tools introduced through deferred loading or
+  skill activation
 - `hard` narrows the searchable inventory too, so discovery cannot escape the
   hard-approved subset
 - agent/executor/runtime tool assignment remains the outer hard boundary in all
   cases
 
-Deferred tools are tools Cognis keeps out of the default visible surface until
-the model searches for them or explicitly loads a skill that exposes them.
-Typical deferred candidates are MCP tools, Intaris MCP tools, and skill-defined
-tools that are not attached by default.
+Deferred tools are tools Cognis may keep out of the current visible surface
+until the model searches for them or explicitly loads a skill that exposes
+them. Typical deferred candidates are MCP tools, Intaris MCP tools, and
+skill-defined tools that are not attached by default.
+
+### Skill Activation Discovery
+
+`skill_load` is a controller-managed discovery path in its own right.
+
+1. The model loads a skill summary into protected context with ``skill_load``.
+2. If the skill version declares tool summaries that resolve to tool ids,
+   Cognis activates those ids immediately.
+3. If the skill has no declared tool ids, Cognis retrieves BM25-ranked tool
+   candidates from the current eligible inventory and asks the configured
+   ``classifier`` model to choose zero or more tool ids.
+4. Activated tool ids are cached for the current session and included in later
+   model-facing visibility calculations.
+
+The classifier path is conservative by design. Empty results are valid and are
+cached per session by ``(skill_id, content_hash)``.
 
 | Provider / Setup | Strategy | Hidden tool discovery | Implications | Preferred |
 |---|---|---|---|---|
@@ -925,7 +945,7 @@ provider configuration is updated.
    - Deferred: MCP, Intaris MCP, overflow → loaded on demand
 
 3. Resolve the step profile:
-   - Filter the eligible inventory (`hard` narrows search, `soft` usually does not)
+   - Filter the eligible inventory (`hard` narrows search, `soft` keeps eligible tools visible)
    - Compute the default-visible subset for the step
 
 4. Detect provider capabilities:

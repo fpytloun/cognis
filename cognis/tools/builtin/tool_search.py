@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import math
 import re
 from typing import Any
 
+from cognis.logging import get_logger
 from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id, tool_profile_group
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
+
+logger = get_logger(__name__)
 
 SEARCH_TOOLS_TOOL = ToolDefinition(
     name="search_tools",
@@ -51,6 +56,7 @@ def search_inventory(
     *,
     category: str | None = None,
     limit: int = 10,
+    log_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Search a permission-filtered tool inventory and return ranked matches."""
 
@@ -60,6 +66,17 @@ def search_inventory(
     normalized_category = category.strip().lower() if isinstance(category, str) else None
     limit = max(1, min(limit, 20))
     query_terms = _tokenize(normalized_query)
+    extra_data = {
+        "target": "search_tools",
+        "query_hash": hashlib.sha256(
+            normalized_query.encode("utf-8", errors="ignore")
+        ).hexdigest()[:12],
+        "query_length": len(normalized_query),
+        "query_token_count": len(query_terms),
+        "category": normalized_category,
+        "limit": limit,
+        **(dict(log_context) if log_context else {}),
+    }
     candidates: list[tuple[ToolDefinition, str, str, str]] = []
     for tool in tools:
         if tool.name == SEARCH_TOOLS_TOOL.name:
@@ -83,6 +100,7 @@ def search_inventory(
         query_terms,
     )
     matches: list[tuple[float, dict[str, Any]]] = []
+    scored_candidates: list[dict[str, Any]] = []
     for (tool, display_name, profile_group, haystack), bm25_score in zip(
         candidates,
         bm25_scores,
@@ -98,6 +116,15 @@ def search_inventory(
         if normalized_query in profile_group.lower():
             score += 10.0
         score += sum(2.0 for term in query_terms if term in haystack)
+        scored_candidates.append(
+            {
+                "tool_id": stable_tool_id(tool),
+                "name": display_name,
+                "profile_group": profile_group,
+                "score": round(score, 3),
+                "accepted": score > 0,
+            }
+        )
         if score <= 0:
             continue
         matches.append(
@@ -114,7 +141,44 @@ def search_inventory(
             )
         )
     matches.sort(key=lambda item: (-item[0], item[1]["name"], item[1]["tool_id"]))
-    return [item for _, item in matches[:limit]]
+    final_matches = [item for _, item in matches[:limit]]
+    logger.info(
+        "search_tools retrieval completed",
+        extra={
+            "extra_data": {
+                **extra_data,
+                "candidate_count": len(candidates),
+                "accepted_count": len(final_matches),
+                "accepted_tools": [
+                    {
+                        "tool_id": item["tool_id"],
+                        "name": item["name"],
+                        "profile_group": item["profile_group"],
+                    }
+                    for item in final_matches
+                ],
+            }
+        },
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "search_tools retrieval payload",
+            extra={
+                "extra_data": {
+                    **extra_data,
+                    "candidate_count": len(candidates),
+                    "candidates": sorted(
+                        scored_candidates,
+                        key=lambda item: (
+                            -float(item.get("score", 0.0)),
+                            str(item.get("name") or ""),
+                            str(item.get("tool_id") or ""),
+                        ),
+                    )[:10],
+                }
+            },
+        )
+    return final_matches
 
 
 def _tokenize(text: str) -> list[str]:

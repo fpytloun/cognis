@@ -595,6 +595,37 @@ async def _handle_skill_load(
         )
     protected_context_parts.append("</loaded_skill>")
 
+    declared_tool_ids = sorted(
+        _resolved_skill_tool_ids(
+            row.skill_id,
+            row.name,
+            row.description,
+            row.auto_load,
+            instructions,
+            tools,
+        )
+    )
+    logger.info(
+        "skill loaded",
+        extra={
+            "extra_data": {
+                "skill_id": row.skill_id,
+                "name": row.name,
+                "declared_tool_count": len(declared_tool_ids),
+                "declared_tool_ids": declared_tool_ids,
+                "requires_classifier": not declared_tool_ids,
+                "step_count": len(steps or []),
+                "template_count": len(templates or {}),
+                "asset_count": len(asset_refs),
+                "content_hash": (
+                    version_row.content_hash
+                    if version_row is not None and isinstance(version_row.content_hash, str)
+                    else ""
+                )[:16],
+            }
+        },
+    )
+
     result = {
         "skill_id": row.skill_id,
         "name": row.name,
@@ -611,16 +642,7 @@ async def _handle_skill_load(
         output=json.dumps(result, indent=2, default=str),
         metadata={
             "protected_context": "\n".join(protected_context_parts),
-            "discovered_tool_ids": sorted(
-                _resolved_skill_tool_ids(
-                    row.skill_id,
-                    row.name,
-                    row.description,
-                    row.auto_load,
-                    instructions,
-                    tools,
-                )
-            ),
+            "discovered_tool_ids": declared_tool_ids,
             "skill_activation": {
                 "skill_id": row.skill_id,
                 "name": row.name,

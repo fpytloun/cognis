@@ -42,7 +42,7 @@ Builtins and executor-native tools declare classification in code. Skills can de
 
 ### 4. Soft and hard modes are separate
 
-`soft` mode narrows default exposure only. The step can still discover additional allowed tools through tool search. `hard` mode also narrows the searchable inventory for that step.
+`soft` mode makes every profile-eligible tool visible by default. Discovery can still surface additional eligible tools that are not already visible, such as skill-activated tools or provider-deferred tools. `hard` mode narrows both the visible surface and the searchable inventory for that step.
 
 ### 5. Per-step overrides, exclude wins
 
@@ -77,19 +77,21 @@ The capability columns are:
 
 These presets are intentionally agent-oriented rather than classical automation-oriented. They describe the default tool surface for an agent working inside a workflow step.
 
-Typical hidden tools:
+Typical tools hidden by current presets:
 
-- `edit`, `multiedit`, `patch`, `write` (filesystem)
-- `bash` / shell
-- MCP tools classified as `destructive` or `write` outside `memory`
+- tools outside the profile matrix for the current preset
+- tools explicitly excluded by `tool_overrides.exclude` such as `get_status` and `list_agents`
+- tools filtered out by `hard` mode or not re-admitted by `tool_overrides.include`
 
 ### `system:direct-default`
 
 The shipped direct-chat preset is intentionally soft. It includes:
 
-- read access to common context and retrieval groups such as `filesystem`, `web`, and `datetime`
-- read and write access to `memory`
-- controller and workflow categories needed for normal chat execution
+- every tool currently eligible under the preset matrix, including read-only `filesystem`, `web`, `datetime`, `system`, and `development` groups plus read/write `memory`
+- explicit includes for `delegate` and `create_task`
+- explicit excludes for noisy meta-tools such as `get_status` and `list_agents`
+
+Because the preset runs in `soft` mode, eligible tools are visible by default instead of being held back behind discovery.
 
 ### `system:research`
 
@@ -102,6 +104,39 @@ Coding presets extend research-style access with `filesystem`, `shell`, `lsp`, a
 ### `system:review`
 
 Review presets are read-heavy like research, but include code-inspection categories such as `filesystem` and `lsp` without default write-heavy implementation access.
+
+## Skill Activation
+
+`skill_load` is a first-class tool-surface mutation point.
+
+1. The model loads a skill with `skill_load`.
+2. Cognis injects the skill instructions into protected context for the current turn.
+3. Cognis resolves tool exposure for the skill using one of two paths:
+   - declared path: if the skill manifest or version declares tool summaries that resolve to tool ids, those ids are activated directly
+   - classified path: if the skill has no declared tool ids, Cognis retrieves BM25-ranked candidate tools from the current eligible inventory and asks the configured `classifier` model to conservatively choose zero or more tool ids
+4. The resolved tool ids are activated for the session and become part of subsequent model-facing visibility.
+
+Classification is cached per session by `(skill_id, content_hash)`.
+
+- Empty classifier results are cached and treated as a valid no-match outcome.
+- The cache is intentionally session-local only. It is not persisted to Redis because tool inventories can change across runtime contexts.
+- Out-of-profile tools are never activated even if the classifier tries to select them, because candidate generation only uses the current eligible inventory.
+
+## Per-Turn Relevant Retrieval
+
+Before the first model call of a turn, Cognis runs BM25 retrieval over the runtime skill summaries and injects a `<relevant_skills>` system block when the scores clear a conservative threshold. This is a suggestion mechanism, not an automatic skill load.
+
+Current behavior:
+
+- `retrieve_relevant_skills()` ranks skill summaries for the current user message
+- already-loaded skills are excluded from the suggestion set
+- empty results are allowed and preferred over low-confidence noise
+- `retrieve_relevant_tools()` is also used as the first-stage candidate generator for the skill-tool classifier path described above
+
+Current thresholds in code:
+
+- tool candidate retrieval: `8.0`
+- skill suggestion retrieval: `10.0`
 
 ## Tool Classification Taxonomy
 
@@ -183,7 +218,10 @@ Order of operations in `cognis.core.tool_exposure.prepare_tool_exposure`:
 1. Start with the agent's effective tool inventory (builtins + executor-provided + skill + MCP).
 2. Attach classification to every tool (declared, annotation, heuristic, override).
 3. If `step_profile == "unrestricted"` → skip filtering; proceed to step 6.
-4. Apply profile rule set: drop tools not matching allowed `(category, side_effect)` cells, keeping in mind unclassified-under-restrictive → hidden.
+4. Apply profile rule set:
+   - `soft`: keep every tool that matches the allowed `(category, side_effect)` cells as default-visible
+   - `hard`: drop tools outside the allowed cells so they are neither visible nor searchable
+   - in both modes, unclassified-under-restrictive remains hidden unless re-admitted explicitly
 5. Apply `tool_overrides.include` (re-admit) then `tool_overrides.exclude` (remove). Exclude wins.
 6. Feed the resulting set to existing deferred-loading / tool-search logic (Anthropic `cache_control`, OpenAI `tool_search`, generic fallback). This spec does not change that layer.
 
@@ -203,15 +241,19 @@ Shipped mapping for v1 (see [`21-workflow-deliverables.md`](21-workflow-delivera
 
 | Workflow | Step | step_profile |
 |---|---|---|
-| `system:direct` | `execute` | `unrestricted` |
-| `system:general-task` | `execute` | `unrestricted` |
+| `system:direct` | `execute` | `system:direct-default` |
+| `system:general-task` | `execute` | `system:general-task` |
 | `system:research` | all three | `research` |
-| `system:software-development` | all seven | `coding` |
+| `system:software-development` | `plan` | `research` |
+| `system:software-development` | `architect_review`, `code_review` | `review` |
+| `system:software-development` | `implement`, `update_docs`, `commit` | `coding` |
+| `system:software-development` | `remember` | `system:direct-default` |
+| `system:software-development` | `final_summary` | `research` |
 | `system:bug-fix` | all four | `coding` |
 | `system:code-research` | both steps | `coding` |
-| `system:creative` | `generate` | `unrestricted` |
+| `system:creative` | `generate` | `system:general-task` |
 
-Rationale: `direct`/`general-task`/`creative` remain fully permissive so user MCPs work out of the box. `research` and `software-development` are the two cases where a tight surface is a clear win, and both are system-authored, so the restriction is scoped to shipped behavior.
+Rationale: direct and general-purpose system workflows now use named soft presets instead of `unrestricted`. This still keeps the default experience broad, but lets the controller hide noisy meta-tools and keep workflow behavior consistent across direct chat, general tasks, creative work, and memory-heavy follow-up steps.
 
 ## Storage
 
@@ -247,6 +289,20 @@ Prometheus counters:
 - `cognis_step_profile_unclassified_hidden_total{profile}` — unclassified tools hidden under restrictive profile.
 
 Telemetry never logs tool arguments, contents, or server credentials — only counts, categories, and ids.
+
+Runtime logs should also record:
+
+- BM25 skill suggestion outcomes, including accepted skill ids and scores
+- BM25 tool-candidate retrieval outcomes for skill activation and `search_tools`
+- skill activation resolution path (`declared` vs `classified`) and the activated tool ids
+- skill-tool classifier cache hits, misses, and empty-result decisions
+
+These logs must continue to avoid raw user message content, skill instructions, tool arguments, tool results, and secrets.
+
+## Known Limitations
+
+- Current BM25 tokenization is ASCII-oriented, so multilingual retrieval remains weaker than English retrieval.
+- Skill suggestion and skill-tool classification deliberately prefer empty results over weak matches. This keeps false positives down, but some low-signal skills may require explicit `skill_load`.
 
 ## UI Surface
 
