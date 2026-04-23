@@ -263,6 +263,38 @@ def test_skill_decompose_preview_returns_gateway_timeout_on_timeout(
         assert response.json()["error"]["code"] == "timeout"
 
 
+def test_skill_decompose_preview_returns_provider_error_on_invalid_output(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    async def _invalid_output(*args: object, **kwargs: object) -> SkillDecompositionResult:
+        raise ValueError("Empty content")
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_composition.decompose_skill_material",
+        _invalid_output,
+    )
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={"name": "Invalid Skill", "instructions": "hello"},
+        )
+        assert created.status_code == 201
+
+        response = client.post(
+            f"/api/v1/skills/{created.json()['skill_id']}/decompose-preview",
+            headers=headers,
+        )
+
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "provider_error"
+        assert "invalid output" in response.json()["error"]["message"]
+
+
 def test_skill_update_with_identical_content_does_not_create_new_version(
     monkeypatch: object, tmp_path: Path
 ) -> None:

@@ -632,12 +632,16 @@ async def decompose_skill_preview_route(
             prompt_templates=prompt_templates,
         )
     except ValueError as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
+        raise api_exception(
+            502,
+            "provider_error",
+            f"Skill decomposition returned invalid output: {exc}",
+        ) from exc
     except TimeoutError as exc:
         raise api_exception(
             504,
             "timeout",
-            "Timed out while generating the decomposition preview. Try again, or shorten the skill instructions.",
+            "Timed out while generating the decomposition preview. Try again, or use a faster classifier model.",
         ) from exc
 
     return SkillDecompositionPreviewResponse(

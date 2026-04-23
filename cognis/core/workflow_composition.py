@@ -40,8 +40,12 @@ def _split_json_generation_timeout(total_timeout: float) -> tuple[float, float]:
     if total_timeout <= 6.0:
         structured_timeout = max(1.5, total_timeout * 0.5)
         return structured_timeout, max(1.5, total_timeout - structured_timeout)
-    structured_timeout = min(12.0, max(4.0, total_timeout * 0.4))
-    return structured_timeout, max(2.0, total_timeout - structured_timeout)
+
+    # Keep a small reserve for a plain-text retry, but avoid forcing larger
+    # classifier models through an artificial early timeout.
+    plain_timeout = max(2.0, min(10.0, total_timeout * 0.2))
+    structured_timeout = max(4.0, total_timeout - plain_timeout)
+    return structured_timeout, plain_timeout
 
 
 async def _generate_json_response(
@@ -235,7 +239,7 @@ async def decompose_skill_material(
     instructions: str,
     tools: list[dict[str, Any]],
     prompt_templates: dict[str, Any],
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float = 60.0,
 ) -> SkillDecompositionResult:
     """Decompose a skill into reusable workflow steps."""
 

@@ -128,6 +128,51 @@ def test_decompose_skill_material_retries_without_response_format_after_timeout(
     assert "max_tokens" not in llm.calls[1]
 
 
+def test_decompose_skill_material_gives_most_time_to_structured_attempt(
+    monkeypatch: object,
+) -> None:
+    recorded_timeouts: list[float] = []
+    original_wait_for = asyncio.wait_for
+
+    async def _record_wait_for(awaitable: object, timeout: float) -> object:
+        recorded_timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_composition.asyncio.wait_for",
+        _record_wait_for,
+    )
+
+    llm = _FallbackLLM(
+        {
+            "rationale": "Split the skill into gather and summary.",
+            "steps": [
+                {
+                    "name": "gather",
+                    "type": "run",
+                    "prompt": "Gather the required inputs.",
+                    "require_deliverable": False,
+                }
+            ],
+        }
+    )
+
+    asyncio.run(
+        decompose_skill_material(
+            llm=llm,
+            skill_id="skill_daily_brief",
+            name="Daily Brief",
+            description="Prepare a daily brief.",
+            instructions="Gather updates and summarize them.",
+            tools=[],
+            prompt_templates={},
+            timeout_seconds=60.0,
+        )
+    )
+
+    assert recorded_timeouts == [50.0, 10.0]
+
+
 def test_decompose_skill_material_assigns_step_profiles_for_skill_tools() -> None:
     llm = _FallbackLLM(
         {
