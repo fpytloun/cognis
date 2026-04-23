@@ -180,6 +180,7 @@ def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
 
     filtered = dict(request_kwargs)
     filtered.pop("cognis_llm_api", None)
+    reasoning_effort = filtered.pop("reasoning_effort", None)
     response_format = filtered.pop("response_format", None)
     if response_format is not None and "text" not in filtered and "text_format" not in filtered:
         normalized_format = _normalize_response_format(response_format)
@@ -189,6 +190,20 @@ def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
         filtered["max_output_tokens"] = filtered.pop("max_tokens")
     if "max_completion_tokens" in filtered and "max_output_tokens" not in filtered:
         filtered["max_output_tokens"] = filtered.pop("max_completion_tokens")
+    reasoning = filtered.get("reasoning")
+    if isinstance(reasoning, dict):
+        normalized_reasoning = dict(reasoning)
+    else:
+        normalized_reasoning = {}
+    if isinstance(reasoning_effort, str) and reasoning_effort.strip():
+        normalized_reasoning["effort"] = reasoning_effort.strip()
+    if normalized_reasoning and "summary" not in normalized_reasoning:
+        # GPT-5 reasoning summaries are opt-in on the Responses API. Enable them
+        # by default whenever a reasoning request is being made so user-visible
+        # assistant_thinking blocks can be emitted and persisted.
+        normalized_reasoning["summary"] = "auto"
+    if normalized_reasoning:
+        filtered["reasoning"] = normalized_reasoning
     tools = filtered.get("tools")
     if isinstance(tools, list):
         filtered["tools"] = [_tool_to_responses_tool(tool) for tool in tools]

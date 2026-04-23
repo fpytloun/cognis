@@ -1696,6 +1696,60 @@ async def test_litellm_provider_responses_bridge_maps_response_format_to_text_fo
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_responses_bridge_enables_reasoning_summary_by_default(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": "ok"},
+                        ],
+                    }
+                ],
+            }
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        reasoning_effort="low",
+    )
+
+    assert captured["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert "reasoning_effort" not in captured
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_generate_preserves_reasoning_only_payload(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,

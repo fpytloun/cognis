@@ -273,6 +273,21 @@ def test_responses_request_kwargs_ignores_unsupported_string_response_format() -
     assert "text" not in result
 
 
+def test_responses_request_kwargs_maps_reasoning_effort_to_reasoning_summary_auto() -> None:
+    result = responses_request_kwargs({"reasoning_effort": "low"})
+
+    assert "reasoning_effort" not in result
+    assert result["reasoning"] == {"effort": "low", "summary": "auto"}
+
+
+def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None:
+    result = responses_request_kwargs(
+        {"reasoning_effort": "medium", "reasoning": {"summary": "detailed"}}
+    )
+
+    assert result["reasoning"] == {"effort": "medium", "summary": "detailed"}
+
+
 def test_responses_to_chat_response_prefers_input_output_usage_fields() -> None:
     payload = {
         "status": "completed",
