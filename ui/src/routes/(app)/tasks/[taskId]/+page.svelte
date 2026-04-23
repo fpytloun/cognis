@@ -984,7 +984,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     width and let only explicitly wide children (workflow diagram,
     chip rows, code/table blocks) own horizontal scrolling.
   -->
-  <section class="min-h-0 min-w-0 w-full max-w-full flex-1 space-y-5 overflow-y-auto overflow-x-hidden overscroll-contain px-3 py-4 sm:px-5 sm:py-6">
+  <section class="min-h-0 min-w-0 w-full max-w-full space-y-5 overflow-x-hidden px-3 py-4 sm:px-5 sm:py-6">
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div class="min-w-0 space-y-3">
         <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>

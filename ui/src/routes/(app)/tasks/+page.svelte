@@ -468,7 +468,7 @@
     <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
   {/if}
 {:else}
-  <section class="min-w-0 space-y-5">
+  <section class={`min-w-0 space-y-5 ${selectedCount > 0 ? 'pb-[calc(var(--app-shell-bottom-offset,0px)+5.5rem)]' : ''}`}>
     {#if agents.length === 0}
       <Card class="p-5">
         <p class="text-sm font-medium text-white">Create an agent before using the task board.</p>
