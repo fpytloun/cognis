@@ -2631,6 +2631,84 @@ async def test_relevant_skill_suggestions_use_classifier() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relevant_skill_suggestions_use_raw_intent_not_expanded_prompt() -> None:
+    """The skill suggestion classifier must see only raw intent — task title,
+    task description, and user message — not the full expanded workflow prompt.
+
+    Regression: a daily-brief general-task included boilerplate like
+    "For coding work, prefer the smallest correct change…" which misled the
+    classifier into picking cognis-coding for a briefing task.
+    """
+    captured: list[list[dict[str, object]]] = []
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            captured.append(messages)
+            return {"choices": [{"message": {"content": '{"skill_ids": []}'}}]}
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-intent", intaris_session_id="sess-intent"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-intent"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_evening",
+                        "name": "evening-summary",
+                        "description": "Summarize the evening.",
+                        "tags": ["summary"],
+                    }
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Prepare the daily brief.",
+        task_title="Daily brief",
+        task_description="Prepare today's morning briefing.",
+    )
+
+    expanded_boilerplate = (
+        "For coding work, prefer the smallest correct change, preserve "
+        "existing patterns, and update directly affected docs only when needed. "
+        "When you have completed the objective, call write_deliverable…"
+    )
+    await agent_loop._build_relevant_skills_message(
+        ctx,
+        user_message=expanded_boilerplate,
+    )
+
+    assert captured, "classifier was never invoked"
+    user_prompt = str(captured[0][-1].get("content") or "")
+    # Raw intent must appear.
+    assert "Daily brief" in user_prompt
+    assert "Prepare today's morning briefing." in user_prompt
+    assert "Prepare the daily brief." in user_prompt
+    # Expanded workflow boilerplate must NOT appear.
+    assert "For coding work" not in user_prompt
+    assert "write_deliverable" not in user_prompt
+
+
+@pytest.mark.asyncio
 async def test_step_complete_validation_reprompts_and_accepts_corrected_payload() -> None:
     fake_llm = _StepCompleteValidationLLM()
     agent_loop = AgentLoop(

@@ -226,6 +226,91 @@ def test_promoted_tool_wins_slots_over_irrelevant_mcp_under_cap() -> None:
     assert stable_tool_id(get_drive) not in result.visible_tool_ids
 
 
+def test_promoted_tool_surfaces_when_policy_visible_but_cap_hidden() -> None:
+    """Regression: a tool that is policy-visible but excluded from the cap-limited
+    visible set must still surface when promoted via search_tools.
+
+    This was the bug behind the daily-brief failure: search_tools correctly
+    found get_events among hidden policy-visible tools, added it to
+    promoted_tool_ids, but prepare_tool_exposure filtered it out of
+    promoted_visible because it was in visible_defaults. Under the OpenAI
+    fallback slot cap the tool therefore never surfaced.
+    """
+    read = _tool("read", source_type="executor", category="filesystem")
+    # Many policy-visible MCP tools saturate the slot cap.
+    filler = [_mcp("ws", f"tool_{i:03d}") for i in range(20)]
+    get_events = _mcp("googleworkspace", "get_events")
+    all_policy = [read, *filler, get_events]
+
+    controller_schema_count = 1  # just search_tools
+    max_tools = controller_schema_count + 10  # 10 inventory slots available
+    result = prepare_tool_exposure(
+        inventory_tools=all_policy,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(
+            model_id="gpt-5.4", supports_responses_api=True, max_tools=max_tools
+        ),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids={stable_tool_id(get_events)},
+        # All of them are policy-visible — no hidden bucket.
+        default_visible_tool_ids={stable_tool_id(tool) for tool in all_policy},
+    )
+
+    assert stable_tool_id(get_events) in result.visible_tool_ids
+    assert result.debug_metadata["promoted_requested_count"] == 1
+    assert result.debug_metadata["promoted_visible_count"] == 1
+    # Cap-hidden policy tools are not reported as hidden_searchable — that set
+    # only covers tools outside policy.  This keeps the semantics clean.
+    assert stable_tool_id(get_events) not in result.hidden_searchable_tool_ids
+
+
+def test_promoted_metric_exposes_cap_pressure_divergence() -> None:
+    """When the slot cap drops some promoted tools, the metrics must show it."""
+    read = _tool("read", source_type="executor", category="filesystem")
+    filler = [_mcp("ws", f"filler_{i:03d}") for i in range(20)]
+    get_events = _mcp("googleworkspace", "get_events")
+    get_mail = _mcp("googleworkspace", "search_gmail_messages")
+    # A tool that is not policy-visible — ensures we hit the controller-search
+    # fallback path which actually enforces the slot cap.
+    hidden_mcp = _mcp("hidden", "tool")
+    all_tools = [read, *filler, get_events, get_mail, hidden_mcp]
+    policy_visible_ids = {stable_tool_id(tool) for tool in all_tools if tool is not hidden_mcp}
+
+    # Enough slots for both promoted tools.
+    result_both_fit = prepare_tool_exposure(
+        inventory_tools=all_tools,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=20),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids={stable_tool_id(get_events), stable_tool_id(get_mail)},
+        default_visible_tool_ids=policy_visible_ids,
+    )
+    assert (
+        result_both_fit.debug_metadata["strategy"]
+        == "openai_responses_controller_search_fallback"
+    )
+    assert result_both_fit.debug_metadata["promoted_requested_count"] == 2
+    assert result_both_fit.debug_metadata["promoted_visible_count"] == 2
+
+    # Tight cap — only 2 inventory slots (max_tools=3, controller=1).  Both
+    # promoted tools still fit because they are prioritized over filler.
+    result_under_pressure = prepare_tool_exposure(
+        inventory_tools=all_tools,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=3),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids={stable_tool_id(get_events), stable_tool_id(get_mail)},
+        default_visible_tool_ids=policy_visible_ids,
+    )
+    assert result_under_pressure.debug_metadata["promoted_requested_count"] == 2
+    # Both promoted tools survive because the packer prioritises promoted over
+    # unrelated policy-visible filler tools.
+    assert result_under_pressure.debug_metadata["promoted_visible_count"] == 2
+    # And filler tools get dropped instead.
+    for filler_tool in filler:
+        assert stable_tool_id(filler_tool) not in result_under_pressure.visible_tool_ids
+
+
 def test_hidden_searchable_tool_ids_excludes_visible_tools() -> None:
     """hidden_searchable_tool_ids must not overlap with visible_tool_ids."""
     get_events = _mcp("googleworkspace", "get_events")

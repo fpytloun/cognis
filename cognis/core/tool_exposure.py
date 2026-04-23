@@ -113,12 +113,16 @@ def prepare_tool_exposure(
         tool for tool in sorted_inventory if stable_tool_id(tool) not in visible_defaults
     ]
 
-    # Promoted tools may come from either set — they must be visible next turn.
+    # Promoted tools must be actually visible next turn regardless of policy
+    # status.  A tool can be in ``visible_defaults`` (policy-visible) yet still
+    # be hidden in practice because a provider slot cap truncated the visible
+    # set.  We therefore include every inventory tool that is in
+    # ``promoted_tool_ids`` — provider packing and ``_unique_tools`` handle
+    # dedup against ``policy_visible_tools`` below.
     promoted_visible = [
         tool
         for tool in sorted_inventory
         if stable_tool_id(tool) in promoted_tool_ids
-        and stable_tool_id(tool) not in visible_defaults
     ]
 
     # search_tools lives in the controller schemas, not the inventory.
@@ -245,6 +249,8 @@ def prepare_tool_exposure(
         for tool in hidden_searchable_tools
         if stable_tool_id(tool) not in visible_tool_ids
     }
+    promoted_inventory_ids = {stable_tool_id(tool) for tool in promoted_visible}
+    promoted_visible_ids = visible_tool_ids & promoted_inventory_ids
     final_tool_schemas = _strip_internal_schema_metadata(tool_schemas)
     return ToolExposureResult(
         tools=[*filtered_controller_tool_schemas, *final_tool_schemas],
@@ -260,7 +266,11 @@ def prepare_tool_exposure(
             "inventory_tool_count": len(sorted_inventory),
             "policy_visible_count": len(policy_visible_tools),
             "hidden_searchable_count": len(hidden_searchable_tools),
-            "promoted_count": len(promoted_visible),
+            # Tools the caller asked us to surface this turn.
+            "promoted_requested_count": len(promoted_inventory_ids),
+            # Tools that actually made it into the visible surface.  A drop
+            # here indicates slot-cap pressure.
+            "promoted_visible_count": len(promoted_visible_ids),
             "visible_tool_count": len(visible_tools),
             "max_tools": max_tools,
         },

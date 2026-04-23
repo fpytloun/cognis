@@ -2557,7 +2557,12 @@ class AgentLoop:
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
                         "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
                         "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
-                        "promoted_count": exposure.debug_metadata.get("promoted_count"),
+                        "promoted_requested_count": exposure.debug_metadata.get(
+                            "promoted_requested_count"
+                        ),
+                        "promoted_visible_count": exposure.debug_metadata.get(
+                            "promoted_visible_count"
+                        ),
                     },
                 )
             logger.info(
@@ -2575,7 +2580,12 @@ class AgentLoop:
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
                         "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
                         "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
-                        "promoted_count": exposure.debug_metadata.get("promoted_count"),
+                        "promoted_requested_count": exposure.debug_metadata.get(
+                            "promoted_requested_count"
+                        ),
+                        "promoted_visible_count": exposure.debug_metadata.get(
+                            "promoted_visible_count"
+                        ),
                         "activated_tool_count": len(activated_tool_ids),
                     }
                 },
@@ -9151,7 +9161,20 @@ class AgentLoop:
         if not skills:
             return []
 
-        query_text = str(ctx.user_message or user_message or "").strip() or user_message
+        # Build the classifier query from raw intent only — task title,
+        # task description, and user message.  Avoid the full expanded
+        # step prompt because it contains generic workflow boilerplate
+        # (for example "For coding work, prefer the smallest correct
+        # change…") that misleads the classifier into picking unrelated
+        # skills such as ``cognis-coding`` for a daily briefing task.
+        intent_parts = [
+            str(getattr(ctx, "task_title", None) or "").strip(),
+            str(getattr(ctx, "task_description", None) or "").strip(),
+            str(ctx.user_message or "").strip(),
+        ]
+        query_text = "\n\n".join(part for part in intent_parts if part)
+        if not query_text:
+            query_text = user_message.strip()
         sorted_skills = sorted(
             (
                 skill
