@@ -642,6 +642,19 @@ def _filter_model_inventory_tools(
 def _attached_skill_tool_ids(agent: AgentDefinition) -> set[str]:
     if not isinstance(agent.skills, dict):
         return set()
+    raw_by_skill = agent.skills.get("_attached_skill_tool_ids_by_skill")
+    if isinstance(raw_by_skill, dict):
+        attached_ids: set[str] = set()
+        for raw_tool_ids in raw_by_skill.values():
+            if not isinstance(raw_tool_ids, list):
+                continue
+            attached_ids.update(
+                str(tool_id)
+                for tool_id in raw_tool_ids
+                if isinstance(tool_id, str) and tool_id.strip()
+            )
+        if attached_ids:
+            return attached_ids
     raw_ids = agent.skills.get("_attached_skill_tool_ids")
     if not isinstance(raw_ids, list):
         return set()
@@ -2657,6 +2670,11 @@ class AgentLoop:
             if mid_stream_retries > 0:
                 accumulator.restore_tool_call_state(saved_partial_tool_calls)
             mid_stream_error: str | None = None
+            # Multiple assistant_message segments can be produced within a single turn
+            # (for example after tool calls or reprompts). The live WebSocket stream
+            # reuses one message_id for the whole turn, so inject a paragraph break
+            # before the first token of each later visible segment.
+            needs_stream_separator = bool(assistant_content_parts) and not continued_assistant_content
             await self._record_outgoing_audit_messages(
                 ctx,
                 pending_audit_messages,
@@ -2677,6 +2695,9 @@ class AgentLoop:
                         break
                     text_delta = accumulator.feed(chunk)
                     if text_delta and on_token:
+                        if needs_stream_separator:
+                            await on_token("\n\n")
+                            needs_stream_separator = False
                         await on_token(text_delta)
                     # Drain thinking events accumulated during this chunk
                     if on_thinking:
@@ -9980,6 +10001,23 @@ class AgentLoop:
         ):
             items.append({"skill_id": attached_skill_id, "enabled": True})
 
+        attached_tool_ids_by_skill = ctx.agent.skills.get("_attached_skill_tool_ids_by_skill")
+        if not isinstance(attached_tool_ids_by_skill, dict):
+            attached_tool_ids_by_skill = {}
+
+        raw_discovered_tool_ids = metadata.get("discovered_tool_ids")
+        discovered_tool_ids_list = (
+            raw_discovered_tool_ids if isinstance(raw_discovered_tool_ids, list) else []
+        )
+        if isinstance(attached_skill_id, str) and attached_skill_id.strip():
+            discovered_tool_ids = [
+                str(tool_id)
+                for tool_id in discovered_tool_ids_list
+                if isinstance(tool_id, str) and tool_id.strip()
+            ]
+            if discovered_tool_ids:
+                attached_tool_ids_by_skill[attached_skill_id] = discovered_tool_ids
+
         deleted_skill_id = metadata.get("deleted_skill_id")
         if isinstance(deleted_skill_id, str) and deleted_skill_id.strip():
             items = [
@@ -9987,12 +10025,22 @@ class AgentLoop:
                 for item in items
                 if not (isinstance(item, dict) and item.get("skill_id") == deleted_skill_id)
             ]
-            attached_tool_ids = _attached_skill_tool_ids(ctx.agent)
-            ctx.agent.skills["_attached_skill_tool_ids"] = [
-                tool_id
-                for tool_id in attached_tool_ids
-                if not tool_id.startswith(f"skill:{deleted_skill_id}:")
-            ]
+            attached_tool_ids_by_skill.pop(deleted_skill_id, None)
+
+        if attached_tool_ids_by_skill:
+            ctx.agent.skills["_attached_skill_tool_ids_by_skill"] = attached_tool_ids_by_skill
+            ctx.agent.skills["_attached_skill_tool_ids"] = sorted(
+                {
+                    tool_id
+                    for raw_tool_ids in attached_tool_ids_by_skill.values()
+                    if isinstance(raw_tool_ids, list)
+                    for tool_id in raw_tool_ids
+                    if isinstance(tool_id, str) and tool_id.strip()
+                }
+            )
+        elif "_attached_skill_tool_ids_by_skill" in ctx.agent.skills:
+            ctx.agent.skills.pop("_attached_skill_tool_ids_by_skill", None)
+            ctx.agent.skills["_attached_skill_tool_ids"] = []
 
         ctx.agent.skills["items"] = items
 
