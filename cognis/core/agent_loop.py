@@ -127,6 +127,7 @@ from cognis.tools.builtin.orchestration import (
     is_task_tool,
     is_workflow_tool,
 )
+from cognis.tools.builtin.tool_output import is_tool_output_tool
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 from cognis.tools.classification import classify_tool_definitions_sync, resolve_tool_classifications
 from cognis.tools.executor.project_context import INTERNAL_PROJECT_CONTEXT_PROBE_TOOL
@@ -7566,11 +7567,17 @@ class AgentLoop:
         original_size = result.metadata.get("original_size") if result.metadata else None
         eval_meta = result.metadata.get("evaluation") if result.metadata else None
         has_saved_output = bool(raw_output or stored_output)
+        source_call_id = None
         recovery_call_id = None
         if result.metadata:
+            candidate_source_call_id = result.metadata.get("source_call_id")
+            if isinstance(candidate_source_call_id, str) and candidate_source_call_id.strip():
+                source_call_id = candidate_source_call_id
             candidate_recovery_call_id = result.metadata.get("recovery_call_id")
             if isinstance(candidate_recovery_call_id, str) and candidate_recovery_call_id.strip():
                 recovery_call_id = candidate_recovery_call_id
+        if is_tool_output_tool(tc.name) and has_saved_output:
+            recovery_call_id = tc.call_id
         if recovery_call_id is None and has_saved_output:
             recovery_call_id = tc.call_id
         normalized_result_attachments = normalize_attachment_refs(result.attachments or [])
@@ -7591,6 +7598,7 @@ class AgentLoop:
                     "output_size": original_size or len(result.output),
                     "has_full_output": has_saved_output,
                     "recovery_call_id": recovery_call_id,
+                    "source_call_id": source_call_id,
                     "evaluation": eval_meta,
                     "attachments": safe_result_attachments,
                     "protect_from_pruning": bool(
@@ -7642,6 +7650,7 @@ class AgentLoop:
                 ),
                 "_has_full_output": has_saved_output,
                 "_recovery_call_id": recovery_call_id,
+                "_source_call_id": source_call_id,
                 "_output_size": original_size or len(result.output),
             }
         )

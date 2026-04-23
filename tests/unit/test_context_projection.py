@@ -59,21 +59,26 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
     assert result.messages[6]["content"] == "recent 2"
 
 
-def test_project_messages_uses_original_recovery_call_id_for_helper_results() -> None:
+def test_project_messages_uses_helper_recovery_call_id_for_helper_results() -> None:
     messages = [
         _assistant_tool_call("helper-call", "read_tool_output", {"call_id": "source-call"}),
-        _tool_result(
-            "helper-call",
-            "helper output",
-            tool_name="read_tool_output",
-            recovery_call_id="source-call",
-        ),
+        {
+            **_tool_result(
+                "helper-call",
+                "helper output",
+                tool_name="read_tool_output",
+                recovery_call_id="helper-call",
+            ),
+            "_source_call_id": "source-call",
+        },
     ]
 
     result = project_messages(messages, preserve_recent_completed_tool_groups=0)
 
-    assert "call_id 'source-call'" in str(result.messages[1]["content"])
-    assert "call_id 'helper-call'" not in str(result.messages[1]["content"])
+    placeholder = str(result.messages[1]["content"])
+    assert "call_id 'helper-call'" in placeholder
+    assert "source call_id 'source-call'" in placeholder
+    assert "anchor='result:1'" not in placeholder
 
 
 def test_project_messages_preserves_recent_groups_until_byte_budget_is_hit() -> None:

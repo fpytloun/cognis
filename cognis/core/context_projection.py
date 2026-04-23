@@ -33,24 +33,30 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
     if not isinstance(recovery_call_id, str) or not recovery_call_id.strip():
         recovery_call_id = None
     original_call_id = str(message.get("tool_call_id") or "unknown")
+    source_call_id = message.get("_source_call_id")
+    if not isinstance(source_call_id, str) or not source_call_id.strip():
+        source_call_id = None
     output_size = message.get("_output_size")
     size_note = (
         f" Original preview size: {int(output_size):,} chars."
         if isinstance(output_size, int) and output_size > 0
         else ""
     )
+    source_note = ""
+    if source_call_id is not None and source_call_id not in {original_call_id, recovery_call_id}:
+        source_note = f" This helper output was derived from source call_id '{source_call_id}'."
     if recovery_call_id is None:
         return (
             "[Tool result cleared from context. Older tool result compacted from prompt. "
-            f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note} "
+            f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
             "No saved output handle is available for re-query from this placeholder.]"
         )
     return (
         "[Tool result cleared from context. Older tool result compacted from prompt. "
-        f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note} "
+        f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
         f"Full saved output remains queryable via call_id '{recovery_call_id}'. "
-        f"Use list_tool_output_anchors(call_id='{recovery_call_id}') for structured sections, "
-        f"read_tool_output_anchor(call_id='{recovery_call_id}', anchor='result:1') for one anchored section, "
+        f"Use list_tool_output_anchors(call_id='{recovery_call_id}') to inspect available structured sections, "
+        f"read_tool_output_anchor(call_id='{recovery_call_id}', anchor='<anchor>') after listing anchors to read one structured section, "
         f"search_tool_output(call_id='{recovery_call_id}', pattern='error|timeout|keyword') for targeted lookup, "
         f"or read_tool_output(call_id='{recovery_call_id}') for sequential inspection.]"
     )

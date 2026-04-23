@@ -1885,6 +1885,7 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                         "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
                         "_has_full_output": bool(event_data.get("has_full_output")),
                         "_recovery_call_id": event_data.get("recovery_call_id"),
+                        "_source_call_id": event_data.get("source_call_id"),
                         "_output_size": event_data.get("output_size"),
                     }
                 )

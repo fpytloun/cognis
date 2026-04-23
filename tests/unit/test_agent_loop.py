@@ -4722,6 +4722,68 @@ async def test_controller_tool_output_store_persists_anchored_outputs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_output_helper_results_recover_via_helper_call_id() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+    tc = ToolCall(
+        call_id="helper-call",
+        name="read_tool_output",
+        arguments={"call_id": "source-call", "offset": 1, "limit": 40},
+    )
+    result = ToolResult(
+        output="<tool_result name=\"read_tool_output\" trust=\"untrusted\">\n1: line\n</tool_result>",
+        metadata={
+            "_raw_output": "1: line",
+            "original_size": 7,
+            "source_call_id": "source-call",
+        },
+    )
+    events: list[SessionEvent] = []
+    messages: list[dict[str, object]] = []
+
+    await agent_loop._finalize_regular_tool_result(
+        ctx,
+        tc=tc,
+        tool_id="builtin:read_tool_output",
+        result=result,
+        events_to_record=events,
+        messages=messages,
+        collected_attachments=[],
+        pending_assistant_attachments=[],
+        promoted_tool_ids=set(),
+        activated_tool_ids=set(),
+        on_token=None,
+        on_tool_result=None,
+    )
+
+    assert messages[-1]["tool_call_id"] == "helper-call"
+    assert messages[-1]["_recovery_call_id"] == "helper-call"
+    assert messages[-1]["_source_call_id"] == "source-call"
+
+
+@pytest.mark.asyncio
 async def test_get_task_step_output_returns_anchored_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

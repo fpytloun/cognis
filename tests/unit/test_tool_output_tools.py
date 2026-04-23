@@ -38,7 +38,7 @@ async def test_list_tool_output_anchors_returns_saved_anchors(store: ToolOutputS
     assert not result.is_error
     assert "result:1" in result.output
     assert "search_result" in result.output
-    assert result.metadata == {"recovery_call_id": "call_1", "original_size": len(result.output)}
+    assert result.metadata == {"source_call_id": "call_1", "original_size": len(result.output)}
 
 
 @pytest.mark.asyncio

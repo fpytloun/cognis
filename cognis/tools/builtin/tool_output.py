@@ -194,10 +194,10 @@ def is_tool_output_tool(name: str) -> bool:
 
 
 def _recovery_metadata(call_id: str, output: str) -> dict[str, Any]:
-    """Metadata that lets compacted helper results point back to the source output."""
+    """Metadata that records which source output a helper result came from."""
 
     return {
-        "recovery_call_id": call_id,
+        "source_call_id": call_id,
         "original_size": len(output),
     }
 
