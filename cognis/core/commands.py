@@ -439,14 +439,14 @@ class CommandDispatcher:
                 lines.append(f"Tool search: {'enabled' if allow_tool_search else 'disabled'}")
             inventory_tool_count = tool_runtime.get("inventory_tool_count")
             visible_tool_count = tool_runtime.get("visible_tool_count")
-            deferred_tool_count = tool_runtime.get("deferred_tool_count")
-            discovered_tool_count = tool_runtime.get("discovered_tool_count")
+            hidden_searchable_count = tool_runtime.get("hidden_searchable_count")
+            promoted_count = tool_runtime.get("promoted_count")
             if isinstance(visible_tool_count, int) and isinstance(inventory_tool_count, int):
                 tool_summary = [f"{visible_tool_count} visible", f"{inventory_tool_count} eligible"]
-                if isinstance(deferred_tool_count, int):
-                    tool_summary.append(f"{deferred_tool_count} deferred")
-                if isinstance(discovered_tool_count, int):
-                    tool_summary.append(f"{discovered_tool_count} discovered")
+                if isinstance(hidden_searchable_count, int):
+                    tool_summary.append(f"{hidden_searchable_count} hidden")
+                if isinstance(promoted_count, int) and promoted_count > 0:
+                    tool_summary.append(f"{promoted_count} promoted")
                 lines.append(f"Tools: {', '.join(tool_summary)}")
 
         # Intaris session stats

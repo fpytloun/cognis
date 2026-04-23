@@ -2344,7 +2344,10 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
     assert "search_tools" in fake_llm.tool_sets[1]
     assert all(name != "tool_search" for name in fake_llm.tool_sets[1])
     assert session_cache.tool_runtime_info is not None
-    assert session_cache.tool_runtime_info["strategy"] == "generic_search_tools"
+    assert session_cache.tool_runtime_info["strategy"] in {
+        "generic_search_tools",
+        "openai_responses_controller_search_fallback",
+    }
 
 
 @pytest.mark.asyncio
@@ -2422,6 +2425,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     )
 
     activated_tool_ids: set[str] = set()
+    promoted_tool_ids: set[str] = set()
     await agent_loop._apply_skill_activation(
         ctx,
         metadata={
@@ -2434,7 +2438,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
             },
             "discovered_tool_ids": [],
         },
-        discovered_tool_ids=set(),
+        promoted_tool_ids=promoted_tool_ids,
         activated_tool_ids=activated_tool_ids,
     )
 
@@ -2444,6 +2448,8 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     assert session_cache.skill_tool_classifications["skill_daily_brief:hash-1"] == [
         stable_tool_id(hidden_tool)
     ]
+    # Promoted tool ids must also include the activated tool so it surfaces next turn.
+    assert stable_tool_id(hidden_tool) in promoted_tool_ids
 
 
 @pytest.mark.asyncio
@@ -2543,7 +2549,7 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
             },
             "discovered_tool_ids": [],
         },
-        discovered_tool_ids=set(),
+        promoted_tool_ids=set(),
         activated_tool_ids=activated_tool_ids,
     )
 

@@ -900,8 +900,8 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
                 "allow_tool_search": True,
                 "inventory_tool_count": 12,
                 "visible_tool_count": 4,
-                "deferred_tool_count": 8,
-                "discovered_tool_count": 1,
+                "hidden_searchable_count": 8,
+                "promoted_count": 1,
             },
         ),
         compaction_strategy=None,
@@ -958,7 +958,7 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert "Tool exposure mode: openai_responses_controller_search_fallback" in result.text
     assert "Step profile: system:direct-default (soft)" in result.text
     assert "Tool search: enabled" in result.text
-    assert "Tools: 4 visible, 12 eligible, 8 deferred, 1 discovered" in result.text
+    assert "Tools: 4 visible, 12 eligible, 8 hidden, 1 promoted" in result.text
 
 
 @pytest.mark.asyncio

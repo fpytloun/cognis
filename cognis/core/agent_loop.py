@@ -93,6 +93,7 @@ from cognis.models.tool import (
     stable_tool_id,
     tool_display_name,
     tool_matches_identifier,
+    tool_profile_group,
 )
 from cognis.models.workflow import (
     CompletionDeliveryPolicy,
@@ -608,14 +609,14 @@ def _tool_id_for_call(tool_name: str, registry: Any | None) -> str:
 def _filter_model_inventory_tools(
     agent: AgentDefinition,
     tools: list[ToolDefinition],
-    discovered_tool_ids: set[str] | None = None,
+    promoted_tool_ids: set[str] | None = None,
     activated_tool_ids: set[str] | None = None,
 ) -> list[ToolDefinition]:
     filtered: list[ToolDefinition] = []
     permissions = agent.permissions
     visible_skill_tool_ids = _attached_skill_tool_ids(agent)
-    if discovered_tool_ids:
-        visible_skill_tool_ids.update(discovered_tool_ids)
+    if promoted_tool_ids:
+        visible_skill_tool_ids.update(promoted_tool_ids)
     if activated_tool_ids:
         visible_skill_tool_ids.update(activated_tool_ids)
     for tool in tools:
@@ -2107,7 +2108,7 @@ class AgentLoop:
         openai_tool_search_retries = 0
         _MAX_OPENAI_TOOL_SEARCH_RETRIES = 1
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
-        discovered_tool_ids = self._get_initial_discovered_tool_ids(ctx)
+        promoted_tool_ids = self._get_initial_promoted_tool_ids(ctx)
         activated_tool_ids = self._get_initial_activated_tool_ids(ctx)
         queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
         collected_attachments: list[dict[str, Any]] = []
@@ -2255,7 +2256,7 @@ class AgentLoop:
                 full_inventory_tools = _filter_model_inventory_tools(
                     ctx.agent,
                     classified_inventory,
-                    discovered_tool_ids,
+                    promoted_tool_ids,
                     activated_tool_ids,
                 )
                 searchable_inventory_tools = [
@@ -2275,7 +2276,7 @@ class AgentLoop:
                 controller_tool_schemas=controller_tool_schemas,
                 model_info=model_info,
                 contract=exposure_contract,
-                discovered_tool_ids=discovered_tool_ids,
+                promoted_tool_ids=promoted_tool_ids,
                 default_visible_tool_ids=default_visible_tool_ids,
                 allow_tool_search=allow_tool_search,
             )
@@ -2308,10 +2309,9 @@ class AgentLoop:
                         ),
                         "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
-                        "deferred_tool_count": exposure.debug_metadata.get("deferred_tool_count"),
-                        "discovered_tool_count": exposure.debug_metadata.get(
-                            "discovered_tool_count"
-                        ),
+                        "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
+                        "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
+                        "promoted_count": exposure.debug_metadata.get("promoted_count"),
                     },
                 )
             logger.info(
@@ -2327,8 +2327,9 @@ class AgentLoop:
                         ),
                         "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
-                        "deferred_tool_count": exposure.debug_metadata.get("deferred_tool_count"),
-                        "discovered_tool_count": exposure.debug_metadata.get("discovered_tool_count"),
+                        "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
+                        "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
+                        "promoted_count": exposure.debug_metadata.get("promoted_count"),
                         "activated_tool_count": len(activated_tool_ids),
                     }
                 },
@@ -2786,7 +2787,7 @@ class AgentLoop:
                             messages=messages,
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
-                            discovered_tool_ids=discovered_tool_ids,
+                            promoted_tool_ids=promoted_tool_ids,
                             activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
@@ -2829,7 +2830,7 @@ class AgentLoop:
                                 messages=messages,
                                 collected_attachments=collected_attachments,
                                 pending_assistant_attachments=pending_assistant_attachments,
-                                discovered_tool_ids=discovered_tool_ids,
+                                promoted_tool_ids=promoted_tool_ids,
                                 activated_tool_ids=activated_tool_ids,
                                 on_token=on_token,
                                 on_tool_result=on_tool_result,
@@ -2872,7 +2873,7 @@ class AgentLoop:
                             messages=messages,
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
-                            discovered_tool_ids=discovered_tool_ids,
+                            promoted_tool_ids=promoted_tool_ids,
                             activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
@@ -2995,7 +2996,7 @@ class AgentLoop:
                         messages=messages,
                         collected_attachments=collected_attachments,
                         pending_assistant_attachments=pending_assistant_attachments,
-                        discovered_tool_ids=discovered_tool_ids,
+                        promoted_tool_ids=promoted_tool_ids,
                         activated_tool_ids=activated_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
@@ -4143,13 +4144,12 @@ class AgentLoop:
                             **self._step_log_metadata(ctx),
                         },
                     )
-                    discovered_tool_ids.update(
-                        {
-                            str(match["tool_id"])
-                            for match in matches
-                            if isinstance(match.get("tool_id"), str)
-                        }
-                    )
+                    new_promoted = {
+                        str(match["tool_id"])
+                        for match in matches
+                        if isinstance(match.get("tool_id"), str)
+                    }
+                    promoted_tool_ids.update(new_promoted)
                     logger.info(
                         "tool discovery updated",
                         extra={
@@ -4157,12 +4157,8 @@ class AgentLoop:
                                 "session_id": ctx.session.session_id,
                                 "query_length": len(str(tc.arguments.get("query", ""))),
                                 "match_count": len(matches),
-                                "discovered_tool_count": len(discovered_tool_ids),
-                                "match_tool_ids": [
-                                    str(match["tool_id"])
-                                    for match in matches
-                                    if isinstance(match.get("tool_id"), str)
-                                ],
+                                "promoted_tool_count": len(promoted_tool_ids),
+                                "match_tool_ids": sorted(new_promoted),
                             }
                         },
                     )
@@ -4248,7 +4244,7 @@ class AgentLoop:
                             messages=messages,
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
-                            discovered_tool_ids=discovered_tool_ids,
+                            promoted_tool_ids=promoted_tool_ids,
                             activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
@@ -4261,7 +4257,7 @@ class AgentLoop:
                         messages=messages,
                         collected_attachments=collected_attachments,
                         pending_assistant_attachments=pending_assistant_attachments,
-                        discovered_tool_ids=discovered_tool_ids,
+                        promoted_tool_ids=promoted_tool_ids,
                         activated_tool_ids=activated_tool_ids,
                         on_token=on_token,
                         on_tool_result=on_tool_result,
@@ -4275,7 +4271,7 @@ class AgentLoop:
                     messages=messages,
                     collected_attachments=collected_attachments,
                     pending_assistant_attachments=pending_assistant_attachments,
-                    discovered_tool_ids=discovered_tool_ids,
+                    promoted_tool_ids=promoted_tool_ids,
                     activated_tool_ids=activated_tool_ids,
                     on_token=on_token,
                     on_tool_result=on_tool_result,
@@ -7230,7 +7226,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         collected_attachments: list[dict[str, Any]],
         pending_assistant_attachments: list[dict[str, Any]],
-        discovered_tool_ids: set[str],
+        promoted_tool_ids: set[str],
         activated_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
@@ -7315,12 +7311,12 @@ class AgentLoop:
             collected_attachments.extend(normalized_attachments)
             pending_assistant_attachments.extend(normalized_attachments)
         if result.metadata:
-            self._merge_discovered_tool_ids(discovered_tool_ids, result.metadata)
+            self._merge_promoted_tool_ids(promoted_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
             await self._apply_skill_activation(
                 ctx,
                 metadata=result.metadata,
-                discovered_tool_ids=discovered_tool_ids,
+                promoted_tool_ids=promoted_tool_ids,
                 activated_tool_ids=activated_tool_ids,
             )
         messages.append(
@@ -7579,7 +7575,7 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         collected_attachments: list[dict[str, Any]],
         pending_assistant_attachments: list[dict[str, Any]],
-        discovered_tool_ids: set[str],
+        promoted_tool_ids: set[str],
         activated_tool_ids: set[str],
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
@@ -7642,7 +7638,7 @@ class AgentLoop:
                 messages=messages,
                 collected_attachments=collected_attachments,
                 pending_assistant_attachments=pending_assistant_attachments,
-                discovered_tool_ids=discovered_tool_ids,
+                promoted_tool_ids=promoted_tool_ids,
                 activated_tool_ids=activated_tool_ids,
                 on_token=on_token,
                 on_tool_result=on_tool_result,
@@ -8812,8 +8808,13 @@ class AgentLoop:
             return ctx.tool_registry
         return getattr(self.providers, "_tool_registry", None)
 
-    def _get_initial_discovered_tool_ids(self, ctx: StepContext) -> set[str]:
-        """Return tool ids that should be visible before any discovery calls."""
+    def _get_initial_promoted_tool_ids(self, ctx: StepContext) -> set[str]:
+        """Return tool ids that should be promoted visible before any discovery calls.
+
+        Skill-attached tool ids are pre-promoted so they survive from the
+        previous session into the current step without requiring a fresh
+        ``search_tools`` call.
+        """
 
         if not isinstance(ctx.agent.skills, dict):
             return set()
@@ -9098,7 +9099,16 @@ class AgentLoop:
         candidate_lines = []
         tool_by_id = {stable_tool_id(tool): tool for tool in candidate_tools}
         for tool_id, tool in sorted(tool_by_id.items(), key=lambda item: (item[1].name.lower(), item[0])):
-            candidate_lines.append(f"- {tool_id}: {tool.name} — {str(tool.description or '')[:160]}")
+            source_label = tool.source.type
+            if tool.source.server_name:
+                source_label = f"{tool.source.type}:{tool.source.server_name}"
+            candidate_lines.append(
+                f"- {tool_id}: {tool.name}"
+                f" [category={tool.category}, profile={tool_profile_group(tool)}"
+                f", source={source_label}"
+                f", read_only={tool.read_only}]"
+                f" — {str(tool.description or '')[:160]}"
+            )
         if not candidate_lines:
             logger.info(
                 "skill tool classifier found no hidden candidates",
@@ -9149,9 +9159,18 @@ class AgentLoop:
                 {
                     "role": "system",
                     "content": (
-                        "You classify which tools a loaded skill needs. Return strict JSON with key "
-                        "'tool_ids' as an array of stable tool ids. Return an empty array when no tool "
-                        "is clearly relevant. Be conservative and only choose high-confidence matches."
+                        "You classify which hidden tools a loaded skill needs to activate. "
+                        "Return strict JSON with key 'tool_ids' as an array of stable tool ids. "
+                        "Return an empty array when no tool is clearly required.\n\n"
+                        "Rules:\n"
+                        "- Choose the MINIMAL set of tools the skill genuinely needs.\n"
+                        "- Prefer domain/data tools (mcp, web, memory, filesystem) over "
+                        "generic controller/system/admin tools.\n"
+                        "- Avoid tools whose category or profile group is 'system' unless "
+                        "the skill explicitly requires controller operations.\n"
+                        "- Avoid tools marked read_only=False unless the skill explicitly "
+                        "performs write operations.\n"
+                        "- Be conservative: an empty result is better than a wrong result."
                     ),
                 },
                 {
@@ -9162,6 +9181,8 @@ class AgentLoop:
                         f"Description: {activation.get('description')}\n"
                         f"Instructions:\n{str(activation.get('instructions') or '')[:4000]}\n\n"
                         f"Candidate chunk: {chunk_index}/{len(candidate_chunks)}\n"
+                        "Each candidate line format: "
+                        "- tool_id: name [category=X, profile=Y, source=Z, read_only=T/F] — description\n"
                         "Candidate tools:\n"
                         + "\n".join(candidate_chunk)
                         + "\n\nReturn JSON only."
@@ -9231,7 +9252,7 @@ class AgentLoop:
         ctx: StepContext,
         *,
         metadata: dict[str, Any],
-        discovered_tool_ids: set[str],
+        promoted_tool_ids: set[str],
         activated_tool_ids: set[str],
     ) -> None:
         activation = metadata.get("skill_activation")
@@ -9241,6 +9262,9 @@ class AgentLoop:
         if not skill_id:
             return
 
+        # Wire protocol: skill management tools emit "discovered_tool_ids" in their
+        # metadata dicts.  The internal variable is promoted_tool_ids, but the key
+        # name is kept stable so existing skill tool metadata round-trips correctly.
         raw_declared_tool_ids = metadata.get("discovered_tool_ids")
         resolved_tool_ids = {
             str(tool_id)
@@ -9254,7 +9278,7 @@ class AgentLoop:
             full_inventory_tools = _filter_model_inventory_tools(
                 ctx.agent,
                 classify_tool_definitions_sync(ctx.tool_registry.list_tools()),
-                discovered_tool_ids,
+                promoted_tool_ids,
                 activated_tool_ids,
             )
             searchable_tool_ids = {
@@ -9269,7 +9293,7 @@ class AgentLoop:
                 if stable_tool_id(tool) in searchable_tool_ids
                 and (
                     step_profile_visible_by_default(tool, resolved_profile)
-                    or stable_tool_id(tool) in discovered_tool_ids
+                    or stable_tool_id(tool) in promoted_tool_ids
                     or stable_tool_id(tool) in activated_tool_ids
                 )
             }
@@ -9298,6 +9322,8 @@ class AgentLoop:
             )
             return
 
+        # Promote the resolved tool ids so they become visible next turn.
+        promoted_tool_ids.update(resolved_tool_ids)
         activated_tool_ids.update(resolved_tool_ids)
         activate = getattr(self.session_cache, "activate_skill_tools", None)
         if callable(activate):
@@ -9316,20 +9342,28 @@ class AgentLoop:
             },
         )
 
-    def _merge_discovered_tool_ids(
-        self, discovered_tool_ids: set[str], metadata: dict[str, Any]
+    def _merge_promoted_tool_ids(
+        self, promoted_tool_ids: set[str], metadata: dict[str, Any]
     ) -> None:
-        """Merge newly discovered tool ids from tool metadata."""
+        """Merge newly promoted tool ids from tool metadata.
 
+        ``discovered_tool_ids`` in tool metadata carries tool ids that a tool
+        result wants to promote into the visible surface (e.g. skill-write
+        auto-binding a newly created skill).  ``removed_tool_ids`` revokes
+        promotion (e.g. skill deletion).
+        """
+
+        # Wire protocol key — intentionally kept as "discovered_tool_ids" to match
+        # what skill management tools emit in their metadata dicts.
         raw_ids = metadata.get("discovered_tool_ids")
         if not isinstance(raw_ids, list):
             raw_ids = []
-        discovered_tool_ids.update(
+        promoted_tool_ids.update(
             str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()
         )
         removed_ids = metadata.get("removed_tool_ids")
         if isinstance(removed_ids, list):
-            discovered_tool_ids.difference_update(
+            promoted_tool_ids.difference_update(
                 str(tool_id)
                 for tool_id in removed_ids
                 if isinstance(tool_id, str) and tool_id.strip()

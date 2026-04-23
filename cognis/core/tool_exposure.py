@@ -14,6 +14,10 @@ from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_VISIBLE_TOOL_NAME_LENGTH = 64
+
+# Tools that must always be visible when present in the inventory, regardless
+# of provider slot caps.  These are the model's essential recovery and
+# navigation primitives.
 _CRITICAL_GENERIC_TOOL_NAMES = frozenset(
     {
         "skill_load",
@@ -33,6 +37,7 @@ class ToolExposureResult:
     alias_map: dict[str, str]
     request_kwargs: dict[str, Any] = field(default_factory=dict)
     visible_tool_ids: set[str] = field(default_factory=set)
+    hidden_searchable_tool_ids: set[str] = field(default_factory=set)
     debug_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -58,11 +63,31 @@ def prepare_tool_exposure(
     controller_tool_schemas: list[dict[str, Any]],
     model_info: ModelInfo,
     contract: ToolExposureContract,
-    discovered_tool_ids: set[str],
+    promoted_tool_ids: set[str],
     default_visible_tool_ids: set[str] | None = None,
     allow_tool_search: bool = True,
 ) -> ToolExposureResult:
-    """Prepare provider-specific model-facing tool schemas."""
+    """Prepare provider-specific model-facing tool schemas.
+
+    The inventory is split into three logical sets:
+
+    - **policy_visible**: tools that should be visible by default according to
+      the step profile (``default_visible_tool_ids``).
+    - **hidden_searchable**: tools in the searchable inventory that are not
+      currently policy-visible.  These are the candidates for ``search_tools``
+      discovery.
+    - **promoted**: tools explicitly surfaced by ``search_tools`` or skill
+      activation (``promoted_tool_ids``).  They must become visible on the next
+      turn regardless of which hidden bucket they came from.
+
+    Provider packing then decides how to fit these sets into the model-facing
+    tool list given any slot cap.  The invariant is:
+
+    - critical helpers always win slots
+    - promoted tools always win slots after critical helpers
+    - ``search_tools`` is included whenever hidden tools remain
+    - remaining slots go to policy-visible non-MCP tools first, then MCP
+    """
     controller_tool_schemas_with_search = list(controller_tool_schemas)
     controller_tool_schemas_without_search = [
         schema
@@ -70,41 +95,58 @@ def prepare_tool_exposure(
         if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
     ]
     request_kwargs: dict[str, Any] = {}
+
     sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
-    visible_defaults = (
+
+    # Resolve policy-visible set.
+    visible_defaults: set[str] = (
         default_visible_tool_ids
         if default_visible_tool_ids is not None
         else {stable_tool_id(tool) for tool in sorted_inventory if not _is_deferred_tool(tool)}
     )
-    core_tools = [tool for tool in sorted_inventory if stable_tool_id(tool) in visible_defaults]
-    deferred_tools = [
+
+    # Build the three logical sets.
+    policy_visible_tools = [
+        tool for tool in sorted_inventory if stable_tool_id(tool) in visible_defaults
+    ]
+    hidden_searchable_tools = [
         tool for tool in sorted_inventory if stable_tool_id(tool) not in visible_defaults
     ]
-    search_tool = next((tool for tool in core_tools if tool.name == SEARCH_TOOLS_TOOL.name), None)
-    core_without_search = [tool for tool in core_tools if tool.name != SEARCH_TOOLS_TOOL.name]
-    discovered_visible = [
-        tool for tool in deferred_tools if stable_tool_id(tool) in discovered_tool_ids
+
+    # Promoted tools may come from either set — they must be visible next turn.
+    promoted_visible = [
+        tool
+        for tool in sorted_inventory
+        if stable_tool_id(tool) in promoted_tool_ids
+        and stable_tool_id(tool) not in visible_defaults
     ]
+
+    # search_tools lives in the controller schemas, not the inventory.
+    search_tool_schema_present = any(
+        schema.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+        for schema in controller_tool_schemas_with_search
+    )
+
     max_tools = model_info.max_tools
     use_responses_api = contract.llm_api == LLMApiMode.RESPONSES
     discovery_enabled = (
         allow_tool_search and contract.discovery_mode == ToolDiscoveryMode.CONTROLLER_SEARCH
     )
+    has_hidden = bool(hidden_searchable_tools)
+
     use_anthropic_defer = bool(
         not use_responses_api
         and discovery_enabled
         and model_info.supports_defer_loading
-        and deferred_tools
+        and has_hidden
     )
     use_openai_controller_search_fallback = bool(
         use_responses_api
         and discovery_enabled
-        and any(
-            schema.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
-            for schema in controller_tool_schemas_with_search
-        )
-        and deferred_tools
+        and search_tool_schema_present
+        and has_hidden
     )
+
     if not allow_tool_search:
         filtered_controller_tool_schemas = controller_tool_schemas_without_search
     elif not use_responses_api or use_openai_controller_search_fallback:
@@ -112,89 +154,180 @@ def prepare_tool_exposure(
     else:
         filtered_controller_tool_schemas = controller_tool_schemas_without_search
 
-    alias_map = {
+    alias_map: dict[str, str] = {
         schema.get("function", {}).get("name", ""): schema.get("function", {}).get("name", "")
         for schema in filtered_controller_tool_schemas
         if isinstance(schema.get("function", {}).get("name"), str)
     }
     controller_count = len(filtered_controller_tool_schemas)
     available_slots = None if max_tools is None else max(0, max_tools - controller_count)
+
     if use_anthropic_defer:
+        # Anthropic: all tools in the array; hidden ones carry defer_loading=True.
+        # Promoted tools (explicitly surfaced by search or skill activation) must not
+        # be deferred — they should be immediately usable without a search call.
+        # We place them between policy-visible and the remaining hidden tools so the
+        # Anthropic cache breakpoint (placed at the last policy-visible tool) still
+        # covers the stable prefix correctly.
         strategy = "anthropic_defer_loading"
-        visible_tools = core_without_search + deferred_tools
+        deferred_tool_ids = {stable_tool_id(tool) for tool in hidden_searchable_tools}
+        deferred_tool_ids -= promoted_tool_ids
+        promoted_non_policy = [
+            tool
+            for tool in hidden_searchable_tools
+            if stable_tool_id(tool) in promoted_tool_ids
+        ]
+        remaining_hidden = [
+            tool
+            for tool in hidden_searchable_tools
+            if stable_tool_id(tool) not in promoted_tool_ids
+        ]
+        visible_tools = policy_visible_tools + promoted_non_policy + remaining_hidden
         tool_schemas = _build_inventory_schemas(
             visible_tools,
             alias_map,
-            deferred_tool_ids={stable_tool_id(tool) for tool in deferred_tools},
+            deferred_tool_ids=deferred_tool_ids,
         )
         _mark_anthropic_cache_breakpoint(
             tool_schemas,
-            stable_anchor_tool_ids={stable_tool_id(tool) for tool in core_without_search},
+            stable_anchor_tool_ids={stable_tool_id(tool) for tool in policy_visible_tools},
         )
         request_kwargs = {
             "extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"},
             "disable_parallel_tool_use": False,
         }
+
     elif use_openai_controller_search_fallback:
+        # OpenAI Responses fallback: controller search_tools is the discovery
+        # mechanism.  Under slot pressure we keep:
+        #   1. critical helpers (always)
+        #   2. promoted tools (always — they were explicitly requested)
+        #   3. search_tools (always when hidden tools remain)
+        #   4. remaining policy-visible non-MCP tools
+        #   5. remaining policy-visible MCP tools
         strategy = "openai_responses_controller_search_fallback"
-        base_tools, overflowed = _select_generic_visible_tools(
-            core_tools=core_without_search,
-            discovered_tools=discovered_visible,
-            search_tool=search_tool,
+        visible_tools = _select_fallback_visible_tools(
+            policy_visible_tools=policy_visible_tools,
+            promoted_tools=promoted_visible,
             available_slots=available_slots,
-            deferred_present=bool(deferred_tools),
+            has_hidden=has_hidden,
         )
-        visible_tools = base_tools
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
-        if overflowed and tool_schemas and max_tools is not None:
-            tool_schemas = tool_schemas[:available_slots]
+
     elif use_responses_api:
+        # OpenAI Responses without discovery: show policy-visible + promoted.
         strategy = "openai_responses_visible_only"
-        visible_tools = core_without_search + discovered_visible
+        visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
+
+    elif discovery_enabled:
+        # Generic chat-completions with controller search_tools.
+        strategy = "generic_search_tools"
+        visible_tools = _select_fallback_visible_tools(
+            policy_visible_tools=policy_visible_tools,
+            promoted_tools=promoted_visible,
+            available_slots=available_slots,
+            has_hidden=has_hidden,
+        )
+        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
+
     else:
-        if discovery_enabled:
-            strategy = "generic_search_tools"
-            base_tools, overflowed = _select_generic_visible_tools(
-                core_tools=core_without_search,
-                discovered_tools=discovered_visible,
-                search_tool=search_tool,
-                available_slots=available_slots,
-                deferred_present=bool(deferred_tools),
-            )
-            visible_tools = base_tools
-            tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
-            request_kwargs = {}
-            if overflowed and tool_schemas and max_tools is not None:
-                tool_schemas = tool_schemas[:available_slots]
-        else:
-            strategy = "chat_visible_only"
-            visible_tools = core_without_search + discovered_visible
-            tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
-            request_kwargs = {}
+        # No discovery: show policy-visible + promoted only.
+        strategy = "chat_visible_only"
+        visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
+        tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
+    hidden_searchable_tool_ids = {
+        stable_tool_id(tool)
+        for tool in hidden_searchable_tools
+        if stable_tool_id(tool) not in visible_tool_ids
+    }
     final_tool_schemas = _strip_internal_schema_metadata(tool_schemas)
     return ToolExposureResult(
         tools=[*filtered_controller_tool_schemas, *final_tool_schemas],
         alias_map=alias_map,
         request_kwargs=request_kwargs,
         visible_tool_ids=visible_tool_ids,
+        hidden_searchable_tool_ids=hidden_searchable_tool_ids,
         debug_metadata={
             "strategy": strategy,
             "llm_api": str(contract.llm_api),
             "discovery_mode": str(contract.discovery_mode),
             "controller_tool_count": controller_count,
             "inventory_tool_count": len(sorted_inventory),
-            "core_tool_count": len(core_tools),
-            "deferred_tool_count": len(deferred_tools),
+            "policy_visible_count": len(policy_visible_tools),
+            "hidden_searchable_count": len(hidden_searchable_tools),
+            "promoted_count": len(promoted_visible),
             "visible_tool_count": len(visible_tools),
-            "discovered_tool_count": len(discovered_visible),
             "max_tools": max_tools,
         },
     )
+
+
+def _select_fallback_visible_tools(
+    *,
+    policy_visible_tools: list[ToolDefinition],
+    promoted_tools: list[ToolDefinition],
+    available_slots: int | None,
+    has_hidden: bool,
+) -> list[ToolDefinition]:
+    """Select the actual visible tool set under a controller-search fallback cap.
+
+    Priority order (highest first):
+    1. Critical helpers (``skill_load``, ``read_tool_output*``)
+    2. Promoted tools (explicitly surfaced by search or skill activation)
+    3. Non-MCP policy-visible tools (builtins, executor tools)
+    4. MCP policy-visible tools
+
+    ``search_tools`` is handled by the controller schema layer, not here.
+    The slot budget passed in already excludes the controller schema count.
+    """
+    if available_slots is None:
+        return _unique_tools(policy_visible_tools + promoted_tools)
+
+    critical = [t for t in policy_visible_tools if _is_critical_generic_tool(t)]
+    promoted_set = {stable_tool_id(t) for t in promoted_tools}
+    non_critical_policy = [
+        t
+        for t in policy_visible_tools
+        if not _is_critical_generic_tool(t) and stable_tool_id(t) not in promoted_set
+    ]
+    non_mcp_policy = [t for t in non_critical_policy if not _is_mcp_tool(t)]
+    mcp_policy = [t for t in non_critical_policy if _is_mcp_tool(t)]
+
+    # Reserve one slot for search_tools when hidden tools remain.
+    search_reserve = 1 if has_hidden else 0
+
+    visible: list[ToolDefinition] = []
+
+    for tool in critical:
+        if len(visible) >= available_slots:
+            break
+        visible.append(tool)
+
+    for tool in promoted_tools:
+        if len(visible) >= available_slots:
+            break
+        visible.append(tool)
+
+    remaining = max(0, available_slots - len(visible) - search_reserve)
+
+    for tool in non_mcp_policy:
+        if len(visible) >= available_slots - search_reserve:
+            break
+        visible.append(tool)
+        remaining -= 1
+
+    for tool in mcp_policy:
+        if remaining <= 0 or len(visible) >= available_slots - search_reserve:
+            break
+        visible.append(tool)
+        remaining -= 1
+
+    return _unique_tools(visible)
 
 
 def _build_inventory_schemas(
@@ -336,58 +469,6 @@ def _openai_namespace_description(tool: ToolDefinition) -> str:
     return f"Deferred tools loaded from MCP server '{server_name}'."
 
 
-def _select_generic_visible_tools(
-    *,
-    core_tools: list[ToolDefinition],
-    discovered_tools: list[ToolDefinition],
-    search_tool: ToolDefinition | None,
-    available_slots: int | None,
-    deferred_present: bool,
-) -> tuple[list[ToolDefinition], bool]:
-    if available_slots is None:
-        all_visible = list(core_tools)
-        if deferred_present and search_tool is not None:
-            all_visible.append(search_tool)
-        all_visible.extend(discovered_tools)
-        return _unique_tools(all_visible), False
-
-    visible: list[ToolDefinition] = []
-    overflowed = False
-    critical_core = [tool for tool in core_tools if _is_critical_generic_tool(tool)]
-    regular_core = [tool for tool in core_tools if not _is_critical_generic_tool(tool)]
-    must_include_search = (
-        deferred_present or len(core_tools) + len(discovered_tools) > available_slots
-    )
-    for tool in critical_core:
-        if len(visible) >= available_slots:
-            overflowed = True
-            break
-        visible.append(tool)
-    remaining_slots = max(0, available_slots - len(visible))
-    reserved_for_search = (
-        1 if must_include_search and search_tool is not None and remaining_slots > 0 else 0
-    )
-    core_budget = max(0, remaining_slots - reserved_for_search)
-    noncritical_used = 0
-    for tool in discovered_tools:
-        if noncritical_used >= core_budget:
-            overflowed = True
-            break
-        visible.append(tool)
-        noncritical_used += 1
-    for tool in regular_core:
-        if noncritical_used >= core_budget:
-            overflowed = True
-            break
-        visible.append(tool)
-        noncritical_used += 1
-    if reserved_for_search and search_tool is not None:
-        visible.append(search_tool)
-    if len(core_tools) + len(discovered_tools) > len(visible):
-        overflowed = True
-    return _unique_tools(visible), overflowed
-
-
 def _unique_tools(tools: list[ToolDefinition]) -> list[ToolDefinition]:
     seen: set[str] = set()
     unique: list[ToolDefinition] = []
@@ -413,6 +494,10 @@ def _dedupe_visible_name(name: str, tool_id: str, used_names: set[str]) -> str:
 
 def _is_deferred_tool(tool: ToolDefinition) -> bool:
     return tool.source.type in {"skill", "local_mcp", "intaris_mcp"}
+
+
+def _is_mcp_tool(tool: ToolDefinition) -> bool:
+    return tool.source.type in {"local_mcp", "intaris_mcp"}
 
 
 def _tool_visible_name(tool: ToolDefinition) -> str:
