@@ -9,6 +9,7 @@ import ChevronUp from 'lucide-svelte/icons/chevron-up';
 import Clock3 from 'lucide-svelte/icons/clock-3';
 import GitBranch from 'lucide-svelte/icons/git-branch';
 import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+import MoreVertical from 'lucide-svelte/icons/more-vertical';
 import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
 import PlayCircle from 'lucide-svelte/icons/play-circle';
 import Settings2 from 'lucide-svelte/icons/settings-2';
@@ -23,13 +24,14 @@ import Target from 'lucide-svelte/icons/target';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
-  import { registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
   import {
     isTaskRerunnable,
@@ -58,7 +60,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let selectedStepName = $state('');
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
-  let configModalOverlayCleanup: (() => void) | null = null;
+  let taskActionsOpen = $state(false);
   let outputModalStepRun = $state<StepRun | null>(null);
   let taskEscalations = $state<Escalation[]>([]);
   let taskEscalationBusyCallId = $state<string | null>(null);
@@ -112,20 +114,6 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
   let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
   let isRerunnable = $derived(isTaskRerunnable(task));
-
-  $effect(() => {
-    if (configModalOpen) {
-      const handle = registerOverlay({ kind: 'blocking', blocksChrome: true });
-      configModalOverlayCleanup = handle.unregister;
-      return () => {
-        handle.unregister();
-        configModalOverlayCleanup = null;
-      };
-    }
-
-    configModalOverlayCleanup?.();
-    configModalOverlayCleanup = null;
-  });
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -215,6 +203,24 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
 
   function closeConfigModal(): void {
     configModalOpen = false;
+  }
+
+  function mobilePrimaryActionLabel(): string {
+    if (isRerunnable) return 'Re-run task';
+    if (isEditable) return 'Configure';
+    return 'Actions';
+  }
+
+  function openMobilePrimaryAction(): void {
+    if (isRerunnable) {
+      void rerunTask();
+      return;
+    }
+    if (isEditable) {
+      configModalOpen = true;
+      return;
+    }
+    taskActionsOpen = true;
   }
 
   function openOutputModal(stepRun: StepRun): void {
@@ -1004,22 +1010,31 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           </div>
         </div>
       </div>
-      <div class="flex items-center gap-3">
-        {#if isRerunnable}
-          <Button size="sm" disabled={rerunBusy} onclick={rerunTask}>
-            Re-run task
-          </Button>
-        {/if}
-        <Button size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
-          <Settings2 class="mr-1.5 h-3.5 w-3.5" />
-          Configure
-        </Button>
-        {#if isCancellable}
-          <Button size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
-        {/if}
+      <div class="flex w-full flex-col items-start gap-3 sm:w-auto sm:items-end">
         <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-slate-700 text-slate-200'}">
           {completionModeLabel(task)}
         </span>
+        <div class="flex w-full flex-wrap gap-2 sm:w-auto sm:justify-end">
+          <Button class="flex-1 justify-center sm:flex-none lg:hidden" size="sm" disabled={rerunBusy} onclick={openMobilePrimaryAction}>
+            {mobilePrimaryActionLabel()}
+          </Button>
+          <Button class="lg:hidden" aria-label="More task actions" size="sm" variant="secondary" onclick={() => (taskActionsOpen = true)}>
+            <MoreVertical class="h-3.5 w-3.5" />
+          </Button>
+
+          {#if isRerunnable}
+            <Button class="hidden lg:inline-flex" size="sm" disabled={rerunBusy} onclick={rerunTask}>
+              Re-run task
+            </Button>
+          {/if}
+          <Button class="hidden lg:inline-flex" size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
+            <Settings2 class="mr-1.5 h-3.5 w-3.5" />
+            Configure
+          </Button>
+          {#if isCancellable}
+            <Button class="hidden lg:inline-flex" size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
+          {/if}
+        </div>
       </div>
     </div>
 
@@ -1203,8 +1218,11 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           </Card>
         {/if}
 
-        <!-- Workflow progress / step runs -->
-        <Card class="overflow-hidden p-0">
+        <!--
+          Desktop-only inline step detail. On mobile we rely on the dedicated
+          bottom sheet so the page keeps one clear detail pattern.
+        -->
+        <Card class="hidden overflow-hidden p-0 lg:block">
           <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -1711,9 +1729,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   </section>
 
   {#if mobileStepDetailOpen && selectedStepGroup}
-    <div class="app-viewport-overlay z-40 lg:hidden" role="presentation">
-      <button class="absolute inset-0 bg-slate-950/80" onclick={closeMobileStepDetail} type="button" aria-label="Close step detail"></button>
-      <div class="absolute inset-x-0 bottom-0 max-h-full overflow-y-auto rounded-t-[2rem] border-t border-slate-700 bg-slate-950 p-5 shadow-2xl overscroll-contain">
+    <Sheet open={mobileStepDetailOpen} onClose={closeMobileStepDetail} side="bottom" label={`Step detail for ${selectedStepGroup.stepName}`} maxHeight="88dvh">
+      {#snippet header()}
         <div class="flex items-start justify-between gap-3">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
@@ -1722,13 +1739,15 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           </div>
           <Button size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
         </div>
+      {/snippet}
 
+      {#snippet children()}
         {#if selectedStepGroup.latest}
           {@const latestAttempt = selectedStepGroup.latest}
           {@const summary = stepOutputSummary(latestAttempt)}
           {@const claims = stepOutputClaims(latestAttempt)}
           {@const visibleStatus = displayStepStatus(latestAttempt)}
-          <div class="mt-4 rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
+          <div class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
             <div class="flex items-center justify-between gap-3">
               <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
               {#if latestAttempt.output?.session_id || latestAttempt.session_id}
@@ -1758,26 +1777,27 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             </div>
           </div>
         {:else}
-          <div class="mt-4 rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
+          <div class="rounded-3xl border border-dashed border-slate-700 px-4 py-8 text-center text-sm text-slate-400">This step has not produced an attempt yet.</div>
         {/if}
-      </div>
-    </div>
+      {/snippet}
+    </Sheet>
   {/if}
 
   {#if configModalOpen}
-    <div class="app-viewport-overlay z-50 flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/85 p-4" role="presentation">
-      <button class="absolute inset-0" onclick={closeConfigModal} type="button" aria-label="Close configuration"></button>
-      <div class="relative z-10 max-h-full w-full max-w-4xl overflow-y-auto rounded-[2rem] border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain">
-        <div class="flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
+    <BlockingDialog open={configModalOpen} onClose={closeConfigModal} label="Task configuration" titleId="task-config-title" panelClass="max-w-4xl">
+      {#snippet header()}
+        <div class="flex items-start justify-between gap-4">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Task configuration</p>
-            <h2 class="mt-1 text-xl font-semibold text-white">{task.title}</h2>
+            <h2 class="mt-1 text-xl font-semibold text-white" id="task-config-title">{task?.title ?? 'Task configuration'}</h2>
             <p class="mt-2 text-sm text-slate-400">Configuration is secondary to live execution, so edits live here while the main page stays focused on workflow progress.</p>
           </div>
           <Button size="sm" variant="secondary" onclick={closeConfigModal}>Close</Button>
         </div>
+      {/snippet}
 
-        <div class="mt-5 grid gap-4 md:grid-cols-2">
+      {#snippet children()}
+        <div class="grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Title</span>
             <Input bind:value={editForm.title} disabled={!isEditable} />
@@ -1861,7 +1881,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             </div>
           </div>
           <div class="mt-4 space-y-3">
-            {#each task.dependencies as dependency}
+            {#each task?.dependencies ?? [] as dependency}
               <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
                 <button class="min-w-0 truncate text-left text-sm text-slate-200 hover:text-white" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
                 {#if isEditable}
@@ -1869,7 +1889,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 {/if}
               </div>
             {/each}
-            {#if task.dependencies.length === 0}
+            {#if (task?.dependencies?.length ?? 0) === 0}
               <p class="text-sm text-slate-400">No dependencies configured.</p>
             {/if}
             {#if isEditable}
@@ -1886,13 +1906,36 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           </div>
         </div>
 
-        <div class="mt-6 flex justify-end gap-3 border-t border-slate-800 pt-4">
+      {/snippet}
+
+      {#snippet footer()}
+        <div class="flex flex-col-reverse justify-end gap-3 sm:flex-row">
           <Button variant="secondary" onclick={closeConfigModal}>Close</Button>
           <Button disabled={saving || !isEditable} onclick={async () => { if (await saveTask()) closeConfigModal(); }}>{saving ? 'Saving...' : 'Save task'}</Button>
         </div>
-      </div>
-    </div>
+      {/snippet}
+    </BlockingDialog>
   {/if}
+
+  <Sheet open={taskActionsOpen} onClose={() => (taskActionsOpen = false)} side="bottom" label="Task actions">
+    {#snippet children()}
+      <div class="space-y-2">
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; configModalOpen = true; }} disabled={!isEditable}>
+          Configure task
+        </Button>
+        {#if isRerunnable}
+          <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; void rerunTask(); }} disabled={rerunBusy}>
+            Re-run task
+          </Button>
+        {/if}
+        {#if isCancellable}
+          <Button class="w-full justify-center" variant="danger" onclick={() => { taskActionsOpen = false; void cancelTask(); }}>
+            Cancel task
+          </Button>
+        {/if}
+      </div>
+    {/snippet}
+  </Sheet>
 
   {#if outputModalStepRun}
     <StepOutputModal

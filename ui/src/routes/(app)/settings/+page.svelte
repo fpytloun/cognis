@@ -1,6 +1,6 @@
 <script lang="ts">
   import { beforeNavigate, goto } from '$app/navigation';
-  import { onMount } from 'svelte';
+import { onMount, tick } from 'svelte';
 
   import type { MCPEnvVar } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
@@ -136,6 +136,9 @@
   }
 
   let activeTab = $state<SettingsTab>('providers');
+  let settingsPanelAnchor = $state<HTMLDivElement | null>(null);
+  let mobileTabListEl = $state<HTMLDivElement | null>(null);
+  let providerEditorEl = $state<HTMLElement | null>(null);
   let loading = $state(true);
   let busy = $state(false);
   let savingExecutorIds = $state<string[]>([]);
@@ -353,6 +356,10 @@
     url.searchParams.set('tab', tab);
     window.history.replaceState({}, '', url);
     initialSnapshot = snapshotState();
+    await tick();
+    settingsPanelAnchor?.scrollIntoView({ block: 'start' });
+    const activeTabButton = mobileTabListEl?.querySelector<HTMLElement>(`[data-settings-tab="${tab}"]`);
+    activeTabButton?.scrollIntoView({ inline: 'center', block: 'nearest' });
   }
 
   function groupedSettings(): Setting[] {
@@ -515,6 +522,10 @@
     }
     applySelectedProvider(provider);
     initialSnapshot = snapshotState();
+    await tick();
+    if (window.innerWidth < 1024) {
+      providerEditorEl?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
   }
 
   function clearProviderSelection(): void {
@@ -1586,6 +1597,13 @@
   });
 
   $effect(() => {
+    void activeTab;
+    void mobileTabListEl;
+    const activeTabButton = mobileTabListEl?.querySelector<HTMLElement>(`[data-settings-tab="${activeTab}"]`);
+    activeTabButton?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  });
+
+  $effect(() => {
     if (executorPollTimer) {
       clearInterval(executorPollTimer);
       executorPollTimer = null;
@@ -1611,12 +1629,14 @@
   <LoadingState label="Loading settings" description="Fetching providers, routing, secrets, diagnostics, and account data." />
 {:else}
   <section class="space-y-5">
+    <div bind:this={settingsPanelAnchor}></div>
     <!-- Mobile: horizontally scrollable pill strip. Desktop: flex-wrap.
          Previously 9 buttons wrapped to 3 lines on phones. -->
-    <div class="sticky top-0 z-10 -mx-2 overflow-x-auto px-2 py-1 sm:mx-0 sm:px-0 md:hidden">
-      <div class="flex gap-2 pb-1" role="tablist" aria-label="Settings sections">
+    <div class="sticky top-0 z-10 -mx-2 overflow-x-auto border-b border-slate-800/80 bg-slate-950/95 px-2 py-1 backdrop-blur sm:mx-0 sm:px-0 md:hidden">
+      <div bind:this={mobileTabListEl} class="flex gap-2 pb-1" role="tablist" aria-label="Settings sections">
         {#each tabs as tab}
           <Button
+            data-settings-tab={tab}
             class="shrink-0 snap-start"
             variant={activeTab === tab ? 'primary' : 'secondary'}
             size="sm"
@@ -1652,7 +1672,7 @@
               <p class="text-sm text-slate-400">Provider management is available to admin users only.</p>
             {:else}
               {#each providers as provider}
-                <button class="w-full rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-left" onclick={() => selectProvider(provider)}>
+                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
                   <div class="flex items-center justify-between gap-3">
                     <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
                     <ProviderStatusBadge status={provider.status} />
@@ -1668,6 +1688,7 @@
           </div>
         </Card>
 
+        <div bind:this={providerEditorEl}>
         <Card class="space-y-5 p-5">
           <!-- Identity -->
           <div class="grid gap-4 md:grid-cols-2">
@@ -1872,7 +1893,7 @@
           {/if}
 
           <!-- Actions -->
-          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
+          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4 pb-20 md:pb-0">
             <Button onclick={saveProvider} disabled={!isAdmin || busy}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
             <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
             {#if selectedProviderId}
@@ -1893,7 +1914,21 @@
             </div>
           {/if}
         </Card>
+        </div>
       </div>
+      {#if isAdmin}
+        <div
+          class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur md:hidden"
+          style="bottom: calc(var(--app-shell-bottom-offset, 0px) + env(safe-area-inset-bottom, 0px));"
+        >
+          <div class="flex items-center gap-2">
+            <Button class="flex-1 justify-center" onclick={saveProvider} disabled={!isAdmin || busy}>
+              {selectedProviderId ? 'Save provider' : 'Create provider'}
+            </Button>
+            <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
+          </div>
+        </div>
+      {/if}
     {:else if activeTab === 'routing'}
       <Card class="p-5">
         <div class="flex items-center justify-between gap-3">

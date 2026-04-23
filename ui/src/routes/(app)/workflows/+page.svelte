@@ -1175,7 +1175,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
          behind an overflow menu in a Sheet. -->
     <div
       class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur lg:hidden"
-      style="bottom: calc(env(safe-area-inset-bottom, 0px) + 56px); padding-bottom: 6px;"
+      style="bottom: calc(var(--app-shell-bottom-offset, 0px) + env(safe-area-inset-bottom, 0px)); padding-bottom: 6px;"
     >
       <div class="flex items-center gap-2">
         <Button
