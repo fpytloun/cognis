@@ -20,7 +20,7 @@ from cognis.core.agent_loop import PauseResolution
 from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationModel, SessionModel
+from cognis.models.session import ConversationContext, ConversationModel, SessionModel
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
     reasoning_efforts_for_model,
@@ -28,6 +28,17 @@ from cognis.providers.llm.reasoning import (
 )
 
 logger = get_logger(__name__)
+
+_EXECUTION_PATH_CONTEXT_KEYS = frozenset({"workspace_root", "working_directory"})
+
+
+def _without_execution_paths(platform_data: dict[str, Any] | None) -> dict[str, Any]:
+    """Return conversation platform data without persisted execution paths."""
+
+    payload = dict(platform_data or {})
+    return {
+        key: value for key, value in payload.items() if key not in _EXECUTION_PATH_CONTEXT_KEYS
+    }
 
 
 def _find_gate_revise_action(pause: Any) -> str | None:
@@ -281,7 +292,14 @@ class CommandDispatcher:
                 ) = await self._session_manager.create_conversation_with_root_session(
                     user_email=user_email,
                     agent_id=agent.agent_id,
-                    context=conversation.context,
+                    context=ConversationContext(
+                        type=conversation.context.type,
+                        ref=conversation.context.ref,
+                        platform_data=_without_execution_paths(
+                            conversation.context.platform_data,
+                        ),
+                        memory_labels=dict(conversation.context.memory_labels),
+                    ),
                     intention=f"New conversation with {agent.name}",
                 )
             except Exception:
@@ -315,6 +333,7 @@ class CommandDispatcher:
                     intention=f"Conversation with {agent.name}",
                     completion_reason="user_reset",
                 )
+                await self._clear_conversation_execution_paths(conversation)
             except Exception:
                 logger.exception("Command /new failed to rotate session")
                 return CommandResult(
@@ -331,6 +350,35 @@ class CommandDispatcher:
                     "previous_session_id": session.session_id,
                 },
             )
+
+    async def _clear_conversation_execution_paths(self, conversation: ConversationModel) -> None:
+        """Remove persisted execution paths from one conversation context."""
+
+        updated_platform_data = _without_execution_paths(conversation.context.platform_data)
+        if updated_platform_data == conversation.context.platform_data:
+            return
+
+        conversation.context.platform_data = updated_platform_data
+        if self._session_factory is None:
+            return
+
+        from cognis.store.queries import update_conversation_context_data
+
+        async with self._session_factory() as db_session:
+            try:
+                await update_conversation_context_data(
+                    db_session,
+                    conversation.conversation_id,
+                    context_data=updated_platform_data,
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                logger.debug(
+                    "Command /new failed to clear conversation execution paths",
+                    extra={"extra_data": {"conversation_id": conversation.conversation_id}},
+                    exc_info=True,
+                )
 
     async def _handle_context(self, session: SessionModel) -> CommandResult:
         """Handle /context — display context window usage."""

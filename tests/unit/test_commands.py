@@ -116,6 +116,36 @@ class _SessionFactory:
         return self._Context()
 
 
+class _DBSession:
+    def __init__(self) -> None:
+        self.commits = 0
+        self.rollbacks = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
+
+
+class _DBSessionFactory:
+    class _Context:
+        def __init__(self, session: _DBSession) -> None:
+            self._session = session
+
+        async def __aenter__(self) -> _DBSession:
+            return self._session
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    def __init__(self, session: _DBSession | None = None) -> None:
+        self.session = session or _DBSession()
+
+    def __call__(self) -> _Context:
+        return self._Context(self.session)
+
+
 def _conversation() -> ConversationModel:
     return ConversationModel(
         conversation_id="conv-1",
@@ -123,6 +153,36 @@ def _conversation() -> ConversationModel:
         agent_id="agent-1",
         context=ConversationContext(type="web"),
     )
+
+
+class _SessionManager:
+    def __init__(self) -> None:
+        self.create_conversation_with_root_session = AsyncMock(
+            return_value=(
+                ConversationModel(
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context=ConversationContext(type="web"),
+                    active_session_id="sess-2",
+                ),
+                SessionModel(
+                    session_id="sess-2",
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                ),
+            )
+        )
+        self.rotate_session = AsyncMock(
+            return_value=SessionModel(
+                session_id="sess-2",
+                conversation_id="conv-1",
+                user_email="user@example.com",
+                agent_id="agent-1",
+            )
+        )
+        self.mark_completed = AsyncMock(return_value=True)
 
 
 def _session() -> SessionModel:
@@ -136,6 +196,119 @@ def _session() -> SessionModel:
 
 def _agent() -> AgentDefinition:
     return AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+
+
+@pytest.mark.asyncio
+async def test_new_web_conversation_does_not_clone_execution_paths() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    conversation = ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="web",
+            ref="web:user:user@example.com:default",
+            platform_data={
+                "workspace_root": "/home/riker/src/esphome",
+                "working_directory": "/home/riker/src/esphome",
+                "draft_id": "draft-1",
+            },
+            memory_labels={"origin": "chat"},
+        ),
+    )
+
+    result = await dispatcher.dispatch(
+        "/new",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    context = manager.create_conversation_with_root_session.await_args.kwargs["context"]
+    assert isinstance(context, ConversationContext)
+    assert context.platform_data == {"draft_id": "draft-1"}
+    assert context.memory_labels == {"origin": "chat"}
+    manager.mark_completed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_channel_session_clears_execution_paths_but_preserves_routing(monkeypatch) -> None:
+    import cognis.store.queries as store_queries
+
+    manager = _SessionManager()
+    session_factory = _DBSessionFactory()
+    update_context_data = AsyncMock(return_value=True)
+    monkeypatch.setattr(store_queries, "update_conversation_context_data", update_context_data)
+    dispatcher = CommandDispatcher(
+        session_factory=session_factory,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    conversation = ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="signal",
+            ref="signal:acct-1:chat-1",
+            platform_data={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+                "thread_id": None,
+                "workspace_root": "/home/riker/src/esphome",
+                "working_directory": "/home/riker/src/esphome",
+            },
+        ),
+    )
+
+    result = await dispatcher.dispatch(
+        "/new",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "session_reset"
+    manager.rotate_session.assert_awaited_once()
+    update_context_data.assert_awaited_once_with(
+        session_factory.session,
+        "conv-1",
+        context_data={
+            "channel_type": "signal",
+            "account_id": "acct-1",
+            "chat_id": "chat-1",
+            "thread_id": None,
+        },
+    )
+    assert conversation.context.platform_data == {
+        "channel_type": "signal",
+        "account_id": "acct-1",
+        "chat_id": "chat-1",
+        "thread_id": None,
+    }
+    assert session_factory.session.commits == 1
+    assert session_factory.session.rollbacks == 0
 
 
 @pytest.mark.asyncio
