@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -249,6 +250,9 @@ def test_tool_router_classifies_routes() -> None:
 
     assert router.classify("delegate", registry) is ToolRoute.ORCHESTRATION
     assert router.classify("artifact_read", registry) is ToolRoute.ARTIFACT
+    assert router.classify("artifact_list_recent", registry) is ToolRoute.ARTIFACT
+    assert router.classify("artifact_search", registry) is ToolRoute.ARTIFACT
+    assert router.classify("artifact_get_metadata", registry) is ToolRoute.ARTIFACT
     assert (
         router.classify(sanitize_mcp_tool_name("github", "search"), registry)
         is ToolRoute.INTARIS_MCP
@@ -734,7 +738,9 @@ async def test_tool_router_handles_artifact_read_with_current_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Store(_ArtifactStore):
-        async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
             del namespace, object_id, filename
             return b"png-bytes", "image/png"
 
@@ -748,7 +754,9 @@ async def test_tool_router_handles_artifact_read_with_current_model(
                 supports_file_input=False,
             )
 
-        async def generate(self, messages: list[dict[str, object]], **kwargs: object) -> dict[str, object]:
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
             del messages, kwargs
             return {"choices": [{"message": {"content": "It is a blue square."}}]}
 
@@ -804,11 +812,178 @@ async def test_tool_router_handles_artifact_read_with_current_model(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_handles_artifact_list_recent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.list_recent_artifact_records",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    artifact_id="doc_2",
+                    filename="report-final.pdf",
+                    kind="pdf",
+                    mime_type="application/pdf",
+                    purpose="tool_output",
+                    size_bytes=128,
+                    status="attached",
+                    created_at=datetime(2026, 4, 23, 12, 0, tzinfo=UTC),
+                    conversation_id="conv-1",
+                    session_id="sess-1",
+                )
+            ]
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(call_id="art-list", name="artifact_list_recent", arguments={"limit": 5}),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["count"] == 1
+    assert "report-final.pdf" in result.metadata["_raw_output"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_handles_artifact_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.search_artifact_records",
+        AsyncMock(
+            return_value=[
+                SimpleNamespace(
+                    artifact_id="doc_3",
+                    filename="weekly-report.pdf",
+                    kind="pdf",
+                    mime_type="application/pdf",
+                    purpose="tool_output",
+                    size_bytes=256,
+                    status="attached",
+                    created_at=datetime(2026, 4, 22, 12, 0, tzinfo=UTC),
+                    conversation_id="conv-2",
+                    session_id="sess-2",
+                )
+            ]
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-search",
+            name="artifact_search",
+            arguments={"query": "weekly report", "kind": "pdf"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["count"] == 1
+    assert "weekly-report.pdf" in result.metadata["_raw_output"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_handles_artifact_get_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="doc_4",
+                namespace="documents",
+                object_id="doc_4",
+                filename="summary.pdf",
+                owner_email="user@example.com",
+                conversation_id="conv-3",
+                session_id="sess-3",
+                message_role="assistant",
+                purpose="tool_output",
+                kind="pdf",
+                mime_type="application/pdf",
+                size_bytes=512,
+                status="attached",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                expires_at=None,
+                deleted_at=None,
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-meta",
+            name="artifact_get_metadata",
+            arguments={"artifact_id": "doc_4"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["artifact_id"] == "doc_4"
+    assert '"namespace": "documents"' in result.metadata["_raw_output"]
+
+
+@pytest.mark.asyncio
 async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Store(_ArtifactStore):
-        async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
             del namespace, object_id, filename
             return b"png-bytes", "image/png"
 
@@ -822,7 +997,9 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
                 supports_file_input=False,
             )
 
-        async def generate(self, messages: list[dict[str, object]], **kwargs: object) -> dict[str, object]:
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
             del messages, kwargs
             return {
                 "choices": [{"message": {"content": None}, "finish_reason": "stop"}],
@@ -1076,7 +1253,9 @@ async def test_tool_router_omits_document_asset_binary_payloads_from_guardrails(
     assert executor.seen_call is not None
     assert executor.seen_call.arguments["assets"][0]["filename"] == "diagram.png"
     assert executor.seen_call.arguments["assets"][0]["mime_type"] == "image/png"
-    assert base64.b64decode(executor.seen_call.arguments["assets"][0]["content_b64"]) == b"image-bytes"
+    assert (
+        base64.b64decode(executor.seen_call.arguments["assets"][0]["content_b64"]) == b"image-bytes"
+    )
 
 
 @pytest.mark.asyncio
@@ -1084,7 +1263,9 @@ async def test_tool_router_postprocesses_binary_read_with_attachment_analysis_ro
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Store(_ArtifactStore):
-        async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
             del namespace, object_id, filename
             return b"png-bytes", "image/png"
 
@@ -1105,7 +1286,9 @@ async def test_tool_router_postprocesses_binary_read_with_attachment_analysis_ro
                 supports_file_input=False,
             )
 
-        async def generate(self, messages: list[dict[str, object]], **kwargs: object) -> dict[str, object]:
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
             del messages, kwargs
             return {"choices": [{"message": {"content": "It is a generated banner."}}]}
 

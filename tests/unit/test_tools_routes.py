@@ -33,9 +33,15 @@ def test_list_tools_includes_executor_and_controller_tools(
     tools = response.json()
     names = {tool["name"] for tool in tools}
     assert "artifact_read" in names
+    assert "artifact_list_recent" in names
+    assert "artifact_search" in names
+    assert "artifact_get_metadata" in names
     assert "artifact_publish" in names
     assert "artifact_save" in names
     sources = {tool["name"]: tool["source"]["type"] for tool in tools}
     assert sources["artifact_read"] == "builtin"
+    assert sources["artifact_list_recent"] == "builtin"
+    assert sources["artifact_search"] == "builtin"
+    assert sources["artifact_get_metadata"] == "builtin"
     assert sources["artifact_publish"] == "executor"
     assert sources["artifact_save"] == "executor"

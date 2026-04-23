@@ -358,9 +358,7 @@ async def create_browser_session(
     return row, raw_token
 
 
-async def get_browser_session_by_token(
-    session: AsyncSession, token: str
-) -> BrowserSession | None:
+async def get_browser_session_by_token(session: AsyncSession, token: str) -> BrowserSession | None:
     """Look up a browser session from an opaque session token."""
 
     token_hash = hash_browser_session_token(token)
@@ -2261,7 +2259,9 @@ async def list_workflows(
     if conditions:
         query = query.where(sa.or_(*conditions))
     if not include_ephemeral:
-        query = query.where(WorkflowRow.lifecycle == "persistent", WorkflowRow.archived_at.is_(None))
+        query = query.where(
+            WorkflowRow.lifecycle == "persistent", WorkflowRow.archived_at.is_(None)
+        )
     result = await session.execute(query)
     return list(result.scalars().all())
 
@@ -3671,6 +3671,100 @@ async def get_artifact_record(session: AsyncSession, artifact_id: str) -> Artifa
         select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id == artifact_id)
     )
     return result.scalar_one_or_none()
+
+
+def _artifact_discovery_stmt(
+    *,
+    owner_email: str,
+    kind: str | None = None,
+    purpose: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+) -> sa.Select[tuple[ArtifactRecordRow]]:
+    stmt = select(ArtifactRecordRow).where(
+        ArtifactRecordRow.owner_email == owner_email,
+        ArtifactRecordRow.status != "deleted",
+    )
+    if kind is not None:
+        stmt = stmt.where(ArtifactRecordRow.kind == kind)
+    if purpose is not None:
+        stmt = stmt.where(ArtifactRecordRow.purpose == purpose)
+    if conversation_id is not None:
+        stmt = stmt.where(ArtifactRecordRow.conversation_id == conversation_id)
+    if session_id is not None:
+        stmt = stmt.where(ArtifactRecordRow.session_id == session_id)
+    if created_after is not None:
+        stmt = stmt.where(ArtifactRecordRow.created_at >= created_after)
+    if created_before is not None:
+        stmt = stmt.where(ArtifactRecordRow.created_at <= created_before)
+    return stmt
+
+
+async def list_recent_artifact_records(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    limit: int = 10,
+    kind: str | None = None,
+    purpose: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+) -> list[ArtifactRecordRow]:
+    result = await session.execute(
+        _artifact_discovery_stmt(
+            owner_email=owner_email,
+            kind=kind,
+            purpose=purpose,
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+        .order_by(ArtifactRecordRow.created_at.desc(), ArtifactRecordRow.artifact_id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def search_artifact_records(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    query: str | None = None,
+    limit: int = 10,
+    kind: str | None = None,
+    purpose: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+) -> list[ArtifactRecordRow]:
+    stmt = _artifact_discovery_stmt(
+        owner_email=owner_email,
+        kind=kind,
+        purpose=purpose,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        created_after=created_after,
+        created_before=created_before,
+    )
+    normalized_query = " ".join((query or "").strip().lower().split())
+    if normalized_query:
+        for token in normalized_query.split():
+            pattern = f"%{token}%"
+            stmt = stmt.where(
+                sa.or_(
+                    sa.func.lower(ArtifactRecordRow.filename).like(pattern),
+                    sa.func.lower(ArtifactRecordRow.artifact_id).like(pattern),
+                    sa.func.lower(ArtifactRecordRow.purpose).like(pattern),
+                )
+            )
+    result = await session.execute(
+        stmt.order_by(
+            ArtifactRecordRow.created_at.desc(), ArtifactRecordRow.artifact_id.desc()
+        ).limit(limit)
+    )
+    return list(result.scalars().all())
 
 
 async def mark_artifacts_attached(
