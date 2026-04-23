@@ -106,7 +106,6 @@
         <AgentAvatar name={agentLabel(current)} avatarUrl={current.avatar_url ?? null} class="h-6 w-6 rounded-lg text-[10px]" />
         <span class="truncate">{agentLabel(current)}</span>
       {:else if allowAll && value === allValue}
-        <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-[10px] font-semibold text-slate-300">All</span>
         <span class="truncate">{allLabel}</span>
       {:else}
         <span class="truncate text-slate-400">{agents.length === 0 ? emptyLabel : placeholder}</span>

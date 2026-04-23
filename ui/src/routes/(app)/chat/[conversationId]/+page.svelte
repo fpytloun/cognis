@@ -2337,10 +2337,18 @@ import X from 'lucide-svelte/icons/x';
       buffer on top of `env(safe-area-inset-top)` so notification
       banners and the status bar always have room above the card.
     -->
+    <!--
+      On mobile, the conversation list is a floating card. When closed it is
+      translated off-screen. We also mark it `inert` so assistive technologies
+      skip it entirely while it is hidden — this prevents the aside from
+      appearing as an active landmark in the accessibility tree when the
+      conversation is in focus.
+    -->
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
       class={`fixed left-3 top-[calc(1rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      inert={(!mobileListOpen && Boolean(currentConversation)) || undefined}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->

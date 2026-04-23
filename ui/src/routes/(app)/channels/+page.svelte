@@ -16,8 +16,8 @@
   } from '$lib/channels';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Card from '$lib/components/ui/Card.svelte';
+  import Sheet from '$lib/components/ui/Sheet.svelte';
   import { confirmAction } from '$lib/stores/confirm';
-  import { registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, ExecutorConfig, PairingRequest } from '$lib/types/api';
 
@@ -58,7 +58,6 @@
   let initialDraftSnapshot = $state('');
   let mobileEditorOpen = $state(false);
   let editorPreviouslyFocused = $state<HTMLElement | null>(null);
-  let mobileEditorOverlayCleanup: (() => void) | null = null;
 
   let webhookInfo = $state<{ url: string; secret: string | null; channelType: string } | null>(null);
   let webhookInfoDismissed = $state(false);
@@ -116,6 +115,7 @@
   function openEditor(): void {
     editorPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     mobileEditorOpen = usesMobileEditorOverlay();
+    // Desktop editor opens inline (no overlay state needed).
   }
 
   function closeEditor(): void {
@@ -129,20 +129,6 @@
     editorPreviouslyFocused?.focus();
     editorPreviouslyFocused = null;
   }
-
-  $effect(() => {
-    if (mobileEditorOpen) {
-      const handle = registerOverlay({ kind: 'sheet', blocksChrome: false });
-      mobileEditorOverlayCleanup = handle.unregister;
-      return () => {
-        handle.unregister();
-        mobileEditorOverlayCleanup = null;
-      };
-    }
-
-    mobileEditorOverlayCleanup?.();
-    mobileEditorOverlayCleanup = null;
-  });
 
   function handleTabChange(tab: ChannelsTab): void {
     activeTab = tab;
@@ -517,8 +503,6 @@
       }
     }, 10_000);
     return () => {
-      mobileEditorOverlayCleanup?.();
-      mobileEditorOverlayCleanup = null;
       window.clearInterval(interval);
     };
   });
@@ -576,8 +560,45 @@
     </div>
 
     {#if activeTab === 'accounts'}
+      <!--
+        On mobile: account list is always visible; editor opens as a Sheet.
+        On desktop (lg+): side-by-side grid.
+      -->
+
+      <!-- Mobile sheet editor -->
+      {#if mobileEditorOpen && editorMode !== 'closed'}
+        <Sheet
+          open={mobileEditorOpen}
+          onClose={closeEditor}
+          side="bottom"
+          label={editorMode === 'create' ? 'Create channel account' : 'Edit channel account'}
+          maxHeight="92dvh"
+          dismissible={!isDirty}
+        >
+          {#snippet children()}
+            <ChannelAccountEditor
+              mode={editorMode}
+              {selectedType}
+              {channelTypes}
+              {draft}
+              {credentialOverrides}
+              {agents}
+              {executors}
+              guide={selectedGuide()}
+              {busy}
+              mobile={true}
+              {isDirty}
+              onClose={closeEditor}
+              onSelectType={beginCreate}
+              onSave={() => void (editorMode === 'edit' ? saveAccountChanges() : saveAccount())}
+            />
+          {/snippet}
+        </Sheet>
+      {/if}
+
       <div class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-        <div class={`${mobileEditorOpen ? 'hidden lg:block' : 'block'}`}>
+        <!-- Account list: always visible on mobile, always visible on desktop -->
+        <div>
           <ChannelAccountsView
             accounts={accounts}
             metas={metaMap}
@@ -592,7 +613,8 @@
           />
         </div>
 
-        <div class={`${mobileEditorOpen || editorMode !== 'closed' ? 'block' : 'hidden lg:block'}`}>
+        <!-- Desktop-only inline editor -->
+        <div class="hidden lg:block">
           {#if editorMode === 'closed'}
             <Card class="p-6 text-sm text-slate-300">
               <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Account editor</p>
@@ -611,7 +633,7 @@
               {executors}
               guide={selectedGuide()}
               {busy}
-              mobile={mobileEditorOpen}
+              mobile={false}
               {isDirty}
               onClose={closeEditor}
               onSelectType={beginCreate}

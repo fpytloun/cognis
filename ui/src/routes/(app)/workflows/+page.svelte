@@ -50,6 +50,10 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let initialSnapshot = JSON.stringify(form);
   let mobileWorkflowActionsOpen = false;
   let showEphemeral = false;
+  // On mobile, the registry list and editor are mutually exclusive screens.
+  // `mobileShowEditor` is true when the editor is the active view.
+  // Plain `let` — this file uses Svelte legacy reactivity, not runes.
+  let mobileShowEditor = false;
 
   function canEditSystemWorkflowField(field: 'stepReasoning' | 'stepMaxAttempts'): boolean {
     if (!selectedWorkflow?.is_system) return true;
@@ -131,6 +135,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       form = nextForm;
       error = '';
       initialSnapshot = JSON.stringify(form);
+      // On mobile, selecting a workflow transitions to the editor screen.
+      mobileShowEditor = true;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to open workflow');
@@ -145,6 +151,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     form = createEmptyWorkflowForm();
     error = '';
     initialSnapshot = JSON.stringify(form);
+    // Open the editor screen on mobile for a new workflow too.
+    mobileShowEditor = true;
   }
 
   async function loadDraftFromQuery(): Promise<void> {
@@ -508,10 +516,16 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
-    <!-- Two-column layout at lg+. Below lg the workflow list stacks above
-         the editor for a usable single-column mobile flow. -->
+    <!--
+      Two-column layout at lg+.
+      On mobile: registry and editor are mutually exclusive screens.
+        - mobileShowEditor=false → registry list is visible, editor hidden.
+        - mobileShowEditor=true  → editor is visible, registry hidden.
+      A "Back" breadcrumb appears in the editor on mobile.
+    -->
     <div class="grid gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
-      <aside class="space-y-5">
+      <!-- Registry column: hidden on mobile when editor is open -->
+      <aside class={`space-y-5 ${mobileShowEditor ? 'hidden lg:block' : 'block'}`}>
         <Card class="p-4">
           <label class="flex items-center justify-between gap-3 text-sm text-slate-200">
             <span>Show ephemeral workflows</span>
@@ -534,13 +548,25 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         </Card>
 
         <Card class="p-4">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Import YAML</p>
-          <textarea bind:value={importText} class="mt-3 min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+          <label class="text-xs uppercase tracking-[0.25em] text-slate-400" for="import-yaml-input">Import YAML</label>
+          <textarea id="import-yaml-input" bind:value={importText} class="mt-3 min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
           <Button class="mt-3 w-full justify-center" variant="secondary" onclick={importYaml}>Import into editor</Button>
         </Card>
       </aside>
 
-      <div class="space-y-5">
+      <!-- Editor column: hidden on mobile when registry is the active screen -->
+      <div class={`space-y-5 ${mobileShowEditor ? 'block' : 'hidden lg:block'}`}>
+        <!-- Mobile back breadcrumb -->
+        {#if mobileShowEditor}
+          <button
+            class="flex items-center gap-2 text-sm text-slate-400 transition hover:text-white lg:hidden"
+            onclick={() => (mobileShowEditor = false)}
+            type="button"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            <span>All workflows</span>
+          </button>
+        {/if}
         {#if selectedWorkflow?.is_system}
           <Card class="border border-sky-500/30 bg-sky-500/10 p-4 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">

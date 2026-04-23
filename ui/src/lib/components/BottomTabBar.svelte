@@ -33,6 +33,9 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
     return pathname.startsWith(href);
   }
 
+  // True when the current route is represented by one of the four tabs.
+  const isOnTabRoute = $derived(tabs.some((tab) => isActive(tab.href, $page.url.pathname)));
+
   function setBottomOffset(value: number): void {
     if (typeof document === 'undefined') return;
     document.documentElement.style.setProperty('--app-shell-bottom-offset', `${Math.max(0, Math.round(value))}px`);
@@ -88,7 +91,13 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
         {@const Icon = tab.icon}
         <li class="contents">
           <a
-            class={`flex min-h-[56px] flex-col items-center justify-center gap-0.5 px-2 py-1.5 text-[11px] transition ${active ? 'text-sky-300' : 'text-slate-400 hover:text-white'}`}
+            class={`flex min-h-[56px] flex-col items-center justify-center gap-0.5 px-2 py-1.5 text-[11px] transition ${
+              active
+                ? 'text-sky-300'
+                : isOnTabRoute
+                  ? 'text-slate-400 hover:text-white'
+                  : 'text-slate-500 hover:text-slate-300'
+            }`}
             href={tab.href}
             aria-current={active ? 'page' : undefined}
           >
@@ -98,5 +107,8 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
         </li>
       {/each}
     </ul>
+    {#if !isOnTabRoute}
+      <p class="pb-0.5 text-center text-[10px] text-slate-600">Use ☰ for more pages</p>
+    {/if}
   </nav>
 {/if}
