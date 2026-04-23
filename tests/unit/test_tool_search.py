@@ -39,6 +39,23 @@ def test_search_inventory_limits_results() -> None:
     assert len(matches) == 20
 
 
+def test_search_inventory_omits_already_visible_tools() -> None:
+    tools = [
+        _tool("get_cart", "Get current cart contents", "mcp"),
+        _tool("repeat_order", "Repeat a previous order", "mcp"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "repeat order",
+        category="mcp",
+        already_visible_tool_ids={"builtin:get_cart"},
+        limit=5,
+    )
+
+    assert [match["name"] for match in matches] == ["repeat_order"]
+
+
 def test_search_inventory_accepts_profile_group_alias_categories() -> None:
     tools = [
         _tool("skill_load", "Load a named skill", "skill"),

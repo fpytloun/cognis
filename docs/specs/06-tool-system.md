@@ -869,10 +869,10 @@ search_tools = ToolDefinition(
 )
 ```
 
-The handler searches the current step's eligible inventory (including deferred
-tools that survived profile filtering) and returns matching tool definitions.
-The agent loop then injects discovered tools into the next turn's ``tools``
-array.
+The handler searches the current step's hidden eligible inventory (including
+deferred tools that survived profile filtering but excluding tools already
+visible to the model) and returns matching tool definitions. The agent loop
+then injects discovered tools into the next turn's ``tools`` array.
 
 ``search_tools`` is a controller-managed, read-only system builtin.  It does
 not execute arbitrary tools itself; it only reveals the already effective,
@@ -907,9 +907,9 @@ skill-defined tools that are not attached by default.
 1. The model loads a skill summary into protected context with ``skill_load``.
 2. If the skill version declares tool summaries that resolve to tool ids,
    Cognis activates those ids immediately.
-3. If the skill has no declared tool ids, Cognis retrieves BM25-ranked tool
-   candidates from the current hidden searchable inventory and asks the configured
-   ``classifier`` model to choose zero or more tool ids.
+3. If the skill has no declared tool ids, Cognis asks the configured
+   ``classifier`` model to choose zero or more tool ids from the current hidden
+   searchable inventory.
 4. Activated tool ids are cached for the current session and included in later
    model-facing visibility calculations.
 

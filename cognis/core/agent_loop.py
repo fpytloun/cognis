@@ -9112,6 +9112,11 @@ class AgentLoop:
                 },
             )
             return set()
+        chunk_size = 100
+        candidate_chunks = [
+            candidate_lines[index : index + chunk_size]
+            for index in range(0, len(candidate_lines), chunk_size)
+        ]
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "skill tool classifier payload",
@@ -9121,6 +9126,8 @@ class AgentLoop:
                         **self._step_log_metadata(ctx),
                         "skill_id": activation.get("skill_id"),
                         "cache_key": cache_key_label,
+                        "chunk_count": len(candidate_chunks),
+                        "chunk_size": chunk_size,
                         "candidate_tools": [
                             {
                                 "tool_id": tool_id,
@@ -9136,57 +9143,69 @@ class AgentLoop:
                 },
             )
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You classify which tools a loaded skill needs. Return strict JSON with key "
-                    "'tool_ids' as an array of stable tool ids. Return an empty array when no tool "
-                    "is clearly relevant. Be conservative and only choose high-confidence matches."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Skill id: {activation.get('skill_id')}\n"
-                    f"Name: {activation.get('name')}\n"
-                    f"Description: {activation.get('description')}\n"
-                    f"Instructions:\n{str(activation.get('instructions') or '')[:4000]}\n\n"
-                    "Candidate tools:\n" + "\n".join(candidate_lines) + "\n\nReturn JSON only."
-                ),
-            },
-        ]
-        try:
-            response = await self.providers.llm.generate(
-                messages,
-                task_type="classifier",
-                response_format={"type": "json_object"},
-            )
-            content = (
-                response.get("choices", [{}])[0].get("message", {}).get("content")
-                if isinstance(response, dict)
-                else None
-            )
-            payload = extract_json_object(str(content or "{}"), label="skill_tool_classifier")
-            raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []
-        except Exception:
-            logger.warning(
-                "skill tool classifier failed",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        "skill_id": activation.get("skill_id"),
-                    }
+        resolved: set[str] = set()
+        for chunk_index, candidate_chunk in enumerate(candidate_chunks, start=1):
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You classify which tools a loaded skill needs. Return strict JSON with key "
+                        "'tool_ids' as an array of stable tool ids. Return an empty array when no tool "
+                        "is clearly relevant. Be conservative and only choose high-confidence matches."
+                    ),
                 },
-                exc_info=True,
-            )
-            return set()
+                {
+                    "role": "user",
+                    "content": (
+                        f"Skill id: {activation.get('skill_id')}\n"
+                        f"Name: {activation.get('name')}\n"
+                        f"Description: {activation.get('description')}\n"
+                        f"Instructions:\n{str(activation.get('instructions') or '')[:4000]}\n\n"
+                        f"Candidate chunk: {chunk_index}/{len(candidate_chunks)}\n"
+                        "Candidate tools:\n"
+                        + "\n".join(candidate_chunk)
+                        + "\n\nReturn JSON only."
+                    ),
+                },
+            ]
+            try:
+                response = await self.providers.llm.generate(
+                    messages,
+                    task_type="classifier",
+                    response_format={"type": "json_object"},
+                )
+                content = (
+                    response.get("choices", [{}])[0].get("message", {}).get("content")
+                    if isinstance(response, dict)
+                    else None
+                )
+                payload = extract_json_object(
+                    str(content or "{}"),
+                    label="skill_tool_classifier",
+                )
+                raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []
+            except Exception:
+                logger.warning(
+                    "skill tool classifier failed",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "skill_id": activation.get("skill_id"),
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(candidate_chunks),
+                        }
+                    },
+                    exc_info=True,
+                )
+                return set()
 
-        resolved = {
-            str(tool_id)
-            for tool_id in raw_ids
-            if isinstance(tool_id, str) and tool_id.strip() and tool_id in tool_by_id
-        }
+            resolved.update(
+                {
+                    str(tool_id)
+                    for tool_id in raw_ids
+                    if isinstance(tool_id, str) and tool_id.strip() and tool_id in tool_by_id
+                }
+            )
         set_cached = getattr(self.session_cache, "set_skill_tool_classification", None)
         if callable(set_cached):
             set_cached(ctx.session.session_id, cache_key, sorted(resolved))
@@ -9199,6 +9218,7 @@ class AgentLoop:
                     "skill_id": activation.get("skill_id"),
                     "cache_key": cache_key_label,
                     "candidate_count": len(candidate_lines),
+                    "chunk_count": len(candidate_chunks),
                     "resolved_count": len(resolved),
                     "resolved_tool_ids": sorted(resolved),
                 }

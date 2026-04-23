@@ -56,6 +56,7 @@ def search_inventory(
     *,
     category: str | None = None,
     limit: int = 10,
+    already_visible_tool_ids: set[str] | None = None,
     log_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Search a permission-filtered tool inventory and return ranked matches."""
@@ -66,6 +67,7 @@ def search_inventory(
     normalized_category = category.strip().lower() if isinstance(category, str) else None
     limit = max(1, min(limit, 20))
     query_terms = _tokenize(normalized_query)
+    already_visible_tool_ids = already_visible_tool_ids or set()
     extra_data = {
         "target": "search_tools",
         "query_hash": hashlib.sha256(
@@ -80,6 +82,8 @@ def search_inventory(
     candidates: list[tuple[ToolDefinition, str, str, str]] = []
     for tool in tools:
         if tool.name == SEARCH_TOOLS_TOOL.name:
+            continue
+        if stable_tool_id(tool) in already_visible_tool_ids:
             continue
         profile_group = tool_profile_group(tool)
         if normalized_category and normalized_category not in {
@@ -148,6 +152,7 @@ def search_inventory(
             "extra_data": {
                 **extra_data,
                 "candidate_count": len(candidates),
+                "already_visible_count": len(already_visible_tool_ids),
                 "accepted_count": len(final_matches),
                 "accepted_tools": [
                     {
@@ -167,6 +172,7 @@ def search_inventory(
                 "extra_data": {
                     **extra_data,
                     "candidate_count": len(candidates),
+                    "already_visible_count": len(already_visible_tool_ids),
                     "candidates": sorted(
                         scored_candidates,
                         key=lambda item: (

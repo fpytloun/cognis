@@ -113,7 +113,7 @@ Review presets are read-heavy like research, but include code-inspection categor
 2. Cognis injects the skill instructions into protected context for the current turn.
 3. Cognis resolves tool exposure for the skill using one of two paths:
    - declared path: if the skill manifest or version declares tool summaries that resolve to tool ids, those ids are activated directly
-   - classified path: if the skill has no declared tool ids, Cognis retrieves BM25-ranked candidate tools from the current hidden searchable inventory and asks the configured `classifier` model to conservatively choose zero or more tool ids
+   - classified path: if the skill has no declared tool ids, Cognis asks the configured `classifier` model to conservatively choose zero or more tool ids from the current hidden searchable inventory
 4. The resolved tool ids are activated for the session and become part of subsequent model-facing visibility.
 
 Classification is cached per session by `(skill_id, content_hash)`.
@@ -130,11 +130,7 @@ Current behavior:
 
 - the classifier evaluates the current task against the available runtime skill summaries
 - empty results are allowed and preferred over low-confidence noise
-- `retrieve_relevant_tools()` is still used as the first-stage candidate generator for the skill-tool classifier path described above
-
-Current threshold in code:
-
-- tool candidate retrieval: `8.0`
+- `search_tools` remains available for hidden-tool discovery when the model needs capabilities beyond the default-visible subset
 
 ## Tool Classification Taxonomy
 
@@ -291,15 +287,16 @@ Telemetry never logs tool arguments, contents, or server credentials — only co
 Runtime logs should also record:
 
 - skill suggestion classifier outcomes, including accepted skill ids
-- BM25 tool-candidate retrieval outcomes for skill activation and `search_tools`
+- hidden-tool discovery outcomes for `search_tools`
 - skill activation resolution path (`declared` vs `classified`) and the activated tool ids
 - skill-tool classifier cache hits, misses, and empty-result decisions
+- per-turn tool exposure summaries, including visible, deferred, discovered, and activated counts
 
 These logs must continue to avoid raw user message content, skill instructions, tool arguments, tool results, and secrets.
 
 ## Known Limitations
 
-- Current BM25 tokenization is ASCII-oriented, so multilingual retrieval remains weaker than English retrieval.
+- Current `search_tools` BM25 tokenization is ASCII-oriented, so multilingual hidden-tool discovery remains weaker than English discovery.
 - Skill suggestion and skill-tool classification deliberately prefer empty results over weak matches. This keeps false positives down, but some low-signal skills may require explicit `skill_load`.
 
 ## UI Surface

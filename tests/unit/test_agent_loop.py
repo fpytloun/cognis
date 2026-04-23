@@ -2377,7 +2377,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
 
     hidden_tool = ToolDefinition(
         name="browser_snapshot",
-        description="Edit an existing image for the brief hero card.",
+        description="Capture the current browser state.",
         parameters={"type": "object", "properties": {}},
         source=ToolSource(type="builtin"),
         category="browser",
@@ -2443,6 +2443,114 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     assert stable_tool_id(hidden_tool) in session_cache.activated_skill_tool_ids
     assert session_cache.skill_tool_classifications["skill_daily_brief:hash-1"] == [
         stable_tool_id(hidden_tool)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
+    class _ClassifierLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            self.calls += 1
+            content = str(messages[-1].get("content") or "")
+            if "builtin:zzz_target_tool" in content:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"tool_ids": ["builtin:zzz_target_tool"]}'
+                            }
+                        }
+                    ]
+                }
+            return {"choices": [{"message": {"content": '{"tool_ids": []}'}}]}
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+    registry = ToolRegistry()
+    for index in range(204):
+        registry.register(
+            RegisteredTool(
+                definition=ToolDefinition(
+                    name=f"tool_{index:03d}",
+                    description="Generic hidden tool.",
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(type="builtin"),
+                    category="browser",
+                    read_only=True,
+                ),
+                handler=None,
+            )
+        )
+    target_tool = ToolDefinition(
+        name="zzz_target_tool",
+        description="Target tool in a later classifier chunk.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=True,
+    )
+    registry.register(RegisteredTool(definition=target_tool, handler=None))
+
+    fake_llm = _ClassifierLLM()
+    session_cache = _NoopSessionCache()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
+        session=SimpleNamespace(session_id="sess-skill-chunk", intaris_session_id="sess-skill-chunk"),
+        conversation=SimpleNamespace(conversation_id="conv-skill-chunk"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    activated_tool_ids: set[str] = set()
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_chunked",
+                "name": "chunked-skill",
+                "description": "Skill requiring a later hidden tool.",
+                "instructions": "Use the target tool if available.",
+                "content_hash": "hash-chunked",
+            },
+            "discovered_tool_ids": [],
+        },
+        discovered_tool_ids=set(),
+        activated_tool_ids=activated_tool_ids,
+    )
+
+    assert fake_llm.calls == 3
+    assert stable_tool_id(target_tool) in activated_tool_ids
+    assert session_cache.skill_tool_classifications["skill_chunked:hash-chunked"] == [
+        stable_tool_id(target_tool)
     ]
 
 
