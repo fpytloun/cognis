@@ -363,6 +363,129 @@ def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_run_step_flushes_parallel_batch_before_serial_regular_tool() -> None:
+    read_tool = ToolDefinition(
+        name="web_fetch",
+        description="Fetch a URL",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="web",
+        read_only=True,
+    )
+    write_tool = ToolDefinition(
+        name="memory_write_note",
+        description="Write a note",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="memory",
+        read_only=False,
+    )
+
+    class _LLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+            del messages
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_read",
+                                        "function": {"name": "web_fetch", "arguments": "{}"},
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "call_write",
+                                        "function": {
+                                            "name": "memory_write_note",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return
+            yield {"choices": [{"delta": {"content": "done"}}]}
+
+    executed: list[str] = []
+
+    class _ToolRouter:
+        def _is_non_bypassable(self, _name: str, non_bypassable: bool) -> bool:
+            return non_bypassable
+
+        async def execute(self, tool_call: ToolCall, *args: object, **kwargs: object) -> SimpleNamespace:
+            del args, kwargs
+            executed.append(tool_call.name)
+            return SimpleNamespace(
+                output=json.dumps({"tool": tool_call.name, "status": "ok"}),
+                is_error=False,
+                duration_ms=1,
+                metadata={},
+                attachments=[],
+            )
+
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=read_tool, handler=None))
+    registry.register(RegisteredTool(definition=write_tool, handler=None))
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_LLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-batch-flush",
+            intaris_session_id="sess-batch-flush",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-batch-flush",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="fetch something and then save it",
+        user_attachments=[],
+        system_initiated=False,
+        tool_registry=registry,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "done"
+    assert executed == ["web_fetch", "memory_write_note"]
+
+
 # ---------------------------------------------------------------------------
 # SessionLock tests
 # ---------------------------------------------------------------------------

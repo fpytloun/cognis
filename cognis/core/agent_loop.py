@@ -4229,6 +4229,7 @@ class AgentLoop:
                             collected_attachments=collected_attachments,
                             pending_assistant_attachments=pending_assistant_attachments,
                             discovered_tool_ids=discovered_tool_ids,
+                            activated_tool_ids=activated_tool_ids,
                             on_token=on_token,
                             on_tool_result=on_tool_result,
                         )
