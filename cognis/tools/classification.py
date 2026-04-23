@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -76,23 +77,22 @@ _DESTRUCTIVE_PREFIXES = (
 )
 
 _BROWSER_HINTS = (
-    "browser",
-    "page",
-    "click",
     "screenshot",
     "dom",
-    "tab",
     "navigate",
     "playwright",
     "devtools",
+    "webdriver",
+    "selector",
+    "browser automation",
 )
 _COMMUNICATION_HINTS = (
     "slack",
-    "email",
-    "mail",
+    "gmail",
     "message",
     "channel",
     "thread",
+    "chat",
     "discord",
     "telegram",
     "signal",
@@ -112,7 +112,8 @@ _OFFICE_HINTS = (
     "document",
     "drive",
     "slides",
-    "workspace",
+    "presentation",
+    "form",
     "todo",
     "task",
 )
@@ -222,7 +223,9 @@ async def classify_tool_definitions(
         current = by_id.get(tool_id)
         if current is None:
             continue
-        profile_group = str(payload.get("profile_group") or tool_profile_group(current)).strip() or tool_profile_group(current)
+        profile_group = str(
+            payload.get("profile_group") or tool_profile_group(current)
+        ).strip() or tool_profile_group(current)
         capabilities = _normalize_capabilities(payload.get("capabilities")) or current.capabilities
         if not capabilities:
             capabilities = sorted(tool_capabilities(current), key=str)
@@ -282,7 +285,9 @@ def apply_persisted_classifications(
             overlaid.append(
                 tool.model_copy(
                     update={
-                        "profile_group": str(getattr(override, "profile_group", None) or tool_profile_group(tool)),
+                        "profile_group": str(
+                            getattr(override, "profile_group", None) or tool_profile_group(tool)
+                        ),
                         "capabilities": capabilities,
                         "classification_status": "ready",
                         "classification_source": "override",
@@ -299,10 +304,15 @@ def apply_persisted_classifications(
                 overlaid.append(tool)
             continue
         stored_profile_group = str(getattr(row, "category", None) or "").strip()
-        capabilities = _normalize_capabilities(getattr(row, "capabilities", None)) or tool.capabilities
+        capabilities = (
+            _normalize_capabilities(getattr(row, "capabilities", None)) or tool.capabilities
+        )
         if not capabilities:
             capabilities = sorted(tool_capabilities(tool), key=str)
-        if str(getattr(row, "status", "")) != "ready" or _validate_profile_group(tool, stored_profile_group, capabilities) is not None:
+        if (
+            str(getattr(row, "status", "")) != "ready"
+            or _validate_profile_group(tool, stored_profile_group, capabilities) is not None
+        ):
             overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
             continue
         overlaid.append(
@@ -367,15 +377,7 @@ async def llm_classification_outcomes(
 def _heuristic_profile_group(tool: ToolDefinition) -> str:
     if tool.source.type in {"builtin", "executor"}:
         return tool_profile_group(tool)
-    haystack = " ".join(
-        part
-        for part in (
-            tool.name,
-            tool.source.raw_tool_name or "",
-            tool.description,
-        )
-        if part
-    ).lower()
+    haystack = _tool_haystack(tool)
     if _contains_any(haystack, _BROWSER_HINTS):
         return "browser"
     if _contains_any(haystack, _COMMUNICATION_HINTS):
@@ -398,15 +400,7 @@ def _heuristic_profile_group(tool: ToolDefinition) -> str:
 def _heuristic_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
     if tool.capabilities:
         return {ToolCapability(capability) for capability in tool.capabilities}
-    haystack = " ".join(
-        part
-        for part in (
-            tool.name,
-            tool.source.raw_tool_name or "",
-            tool.description,
-        )
-        if part
-    ).lower()
+    haystack = _tool_haystack(tool)
     if any(haystack.startswith(prefix) for prefix in _DESTRUCTIVE_PREFIXES) or any(
         token in haystack for token in ("delete", "destroy", "purge", "drop", "wipe")
     ):
@@ -481,6 +475,7 @@ async def _classify_with_llm(
         },
     ]
     try:
+
         async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
             return await llm.generate(
                 messages,
@@ -534,7 +529,10 @@ async def _classify_with_llm(
             continue
         seen_ids.add(tool_id)
         normalized = {
-            "profile_group": str(item.get("profile_group") or item.get("category") or "development").strip() or "development",
+            "profile_group": str(
+                item.get("profile_group") or item.get("category") or "development"
+            ).strip()
+            or "development",
             "capabilities": _normalize_capabilities(item.get("capabilities")),
             "confidence": float(item.get("confidence") or 0.75),
         }
@@ -545,7 +543,7 @@ async def _classify_with_llm(
         )
         if error is not None:
             logger.warning(
-                "Rejected cached LLM tool classification",
+                "Rejected LLM tool classification",
                 extra={"extra_data": {"tool_id": tool_id, "reason": error}},
             )
             rejected[tool_id] = error
@@ -588,7 +586,19 @@ def _validate_profile_group(
     if normalized_group not in AUTO_PROFILE_GROUPS:
         if normalized_group in RESERVED_PROFILE_GROUPS:
             return "reserved_profile_group"
-        if normalized_group in {"mcp", "skill", "general", "workflow", "orchestration", "lsp", "datetime", "context", "artifact", "schedule", "deliverable"}:
+        if normalized_group in {
+            "mcp",
+            "skill",
+            "general",
+            "workflow",
+            "orchestration",
+            "lsp",
+            "datetime",
+            "context",
+            "artifact",
+            "schedule",
+            "deliverable",
+        }:
             return "non_profile_group_category"
         return "unknown_profile_group"
     if not capabilities:
@@ -607,7 +617,7 @@ def _validate_profile_group(
         return "browser_group_without_browser_signal"
     if normalized_group == "web" and is_browser:
         return "web_group_for_browser_tool"
-    if is_communication and normalized_group != "communication":
+    if is_communication and not is_office and normalized_group != "communication":
         return "communication_tool_misclassified"
     if is_office and normalized_group not in {"office", "communication"}:
         return "office_tool_misclassified"
@@ -619,21 +629,40 @@ def _validate_profile_group(
 
 
 def _tool_haystack(tool: ToolDefinition) -> str:
-    return " ".join(
-        part
-        for part in (
-            tool.name,
-            tool.source.raw_tool_name or "",
-            tool.description,
-            tool.source.server_name or "",
-            tool.source.server_id or "",
+    return _normalize_for_matching(
+        " ".join(
+            part
+            for part in (
+                tool.name,
+                tool.source.raw_tool_name or "",
+                _classification_description(tool.description),
+            )
+            if part
         )
-        if part
-    ).lower()
+    )
+
+
+def _classification_description(description: str) -> str:
+    sections = ("Args:", "Returns:", "Examples:", "Example:")
+    summary = description
+    for marker in sections:
+        summary = summary.split(marker, 1)[0]
+    return summary.strip()
+
+
+def _normalize_for_matching(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 def _contains_any(haystack: str, tokens: tuple[str, ...]) -> bool:
-    return any(token in haystack for token in tokens)
+    return any(_contains_token(haystack, token) for token in tokens)
+
+
+def _contains_token(haystack: str, token: str) -> bool:
+    normalized_token = _normalize_for_matching(token)
+    if not normalized_token:
+        return False
+    return re.search(rf"(?:^| ){re.escape(normalized_token)}(?: |$)", haystack) is not None
 
 
 def _tool_fingerprint(tool: ToolDefinition) -> str:

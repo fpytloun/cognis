@@ -94,13 +94,12 @@ class ToolClassificationQueue:
             result = await session.execute(
                 sa.select(ToolClassificationRow).where(
                     ToolClassificationRow.scope_key == scope_key,
-                    ToolClassificationRow.tool_id.in_([stable_tool_id(tool) for tool in dynamic_tools]),
+                    ToolClassificationRow.tool_id.in_(
+                        [stable_tool_id(tool) for tool in dynamic_tools]
+                    ),
                 )
             )
-            existing = {
-                row.tool_id: row
-                for row in result.scalars().all()
-            }
+            existing = {row.tool_id: row for row in result.scalars().all()}
             override_rows = await get_tool_classification_override_rows(
                 session,
                 scope_key=scope_key,
@@ -109,6 +108,7 @@ class ToolClassificationQueue:
             overridden_ids = {row.tool_id for row in override_rows}
             for tool in dynamic_tools:
                 tool_id = stable_tool_id(tool)
+                fingerprint = tool_fingerprint(tool)
                 if tool_id in overridden_ids:
                     continue
                 row = existing.get(tool_id)
@@ -125,22 +125,33 @@ class ToolClassificationQueue:
                     is None
                 ):
                     continue
-                if row is not None and row.status in {"pending", "running"}:
+                fingerprint_changed = row is not None and row.fingerprint != fingerprint
+                if (
+                    row is not None
+                    and row.status in {"pending", "running"}
+                    and not fingerprint_changed
+                ):
                     continue
-                attempts = row.attempts if row is not None else 0
-                next_retry_at = row.next_retry_at if row is not None else now
+                attempts = 0 if fingerprint_changed else (row.attempts if row is not None else 0)
+                next_retry_at = (
+                    now if fingerprint_changed else (row.next_retry_at if row is not None else now)
+                )
                 await upsert_tool_classification(
                     session,
                     scope_key=scope_key,
                     owner_email=owner_email,
                     tool_id=tool_id,
                     source_type=tool.source.type,
-                    fingerprint=tool_fingerprint(tool),
+                    fingerprint=fingerprint,
                     tool_payload=tool.model_dump(mode="json"),
                     status="pending",
                     attempts=attempts,
                     next_retry_at=next_retry_at,
-                    last_error=(row.last_error if row is not None else None),
+                    last_error=(
+                        None
+                        if fingerprint_changed
+                        else (row.last_error if row is not None else None)
+                    ),
                 )
             await session.commit()
         self._wake_event.set()
@@ -259,7 +270,9 @@ class ToolClassificationQueue:
         grouped: dict[tuple[str, str, str], list[_ClaimedClassification]] = {}
         for item in claimed:
             payload = item.tool_payload
-            source = str(payload.get("source", {}).get("type") or payload.get("source_type") or "unknown")
+            source = str(
+                payload.get("source", {}).get("type") or payload.get("source_type") or "unknown"
+            )
             server = str(
                 payload.get("source", {}).get("server_name")
                 or payload.get("source", {}).get("server_id")
