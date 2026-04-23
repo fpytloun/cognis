@@ -71,10 +71,44 @@ def test_search_inventory_accepts_profile_group_alias_categories() -> None:
         limit=5,
     )
 
-    assert [match["name"] for match in skill_matches] == ["skill_load"]
-    assert [match["name"] for match in output_matches] == ["read_tool_output"]
+    assert skill_matches[0]["name"] == "skill_load"
+    assert output_matches[0]["name"] == "read_tool_output"
     assert skill_matches[0]["profile_group"] == "system"
     assert output_matches[0]["profile_group"] == "system"
+
+
+def test_search_inventory_treats_category_as_hint_not_hard_filter() -> None:
+    tools = [
+        _tool("bash", "Run shell commands in a terminal", "shell"),
+        _tool("read_tool_output", "Read saved tool output", "context"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "bash shell command execution terminal tool",
+        category="system",  # wrong hint from the model
+        limit=5,
+    )
+
+    assert matches
+    assert matches[0]["name"] == "bash"
+
+
+def test_search_inventory_category_hint_still_boosts_matching_tools() -> None:
+    tools = [
+        _tool("bash", "Run shell commands in a terminal", "shell"),
+        _tool("task_list", "List system tasks and runtime state", "system"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "tasks",
+        category="system",
+        limit=5,
+    )
+
+    assert matches
+    assert matches[0]["name"] == "task_list"
 
 
 def test_search_inventory_uses_bm25_for_multi_term_mcp_queries() -> None:

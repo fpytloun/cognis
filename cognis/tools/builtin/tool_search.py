@@ -19,7 +19,10 @@ SEARCH_TOOLS_TOOL = ToolDefinition(
     name="search_tools",
     description=(
         "Search for additional tools available in this session. "
-        "Use when you need a capability not in your current tool set."
+        "Use when you need a capability not in your current tool set. "
+        "The optional category is only a hint; omit it unless you are confident. "
+        "Examples: shell for terminal/bash tools, filesystem for file tools, "
+        "mcp for external service tools."
     ),
     parameters={
         "type": "object",
@@ -86,11 +89,6 @@ def search_inventory(
         if stable_tool_id(tool) in already_visible_tool_ids:
             continue
         profile_group = tool_profile_group(tool)
-        if normalized_category and normalized_category not in {
-            tool.category.lower(),
-            profile_group.lower(),
-        }:
-            continue
         display_name = (
             tool.source.raw_tool_name
             if tool.source.type == "skill" and tool.source.raw_tool_name
@@ -119,6 +117,13 @@ def search_inventory(
             score += 10.0
         if normalized_query in profile_group.lower():
             score += 10.0
+        if normalized_category:
+            category_match = normalized_category == tool.category.lower()
+            profile_match = normalized_category == profile_group.lower()
+            if category_match:
+                score += 2.0
+            if profile_match:
+                score += 2.0
         score += sum(2.0 for term in query_terms if term in haystack)
         scored_candidates.append(
             {
@@ -127,6 +132,10 @@ def search_inventory(
                 "profile_group": profile_group,
                 "score": round(score, 3),
                 "accepted": score > 0,
+                "category_hint_match": bool(
+                    normalized_category
+                    and normalized_category in {tool.category.lower(), profile_group.lower()}
+                ),
             }
         )
         if score <= 0:
