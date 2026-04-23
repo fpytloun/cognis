@@ -291,6 +291,41 @@ async def responses_stream_to_chat_chunks(
                     reasoning_chunk = state.final_text_delta(part_text, field="reasoning")
                     if reasoning_chunk is not None:
                         yield reasoning_chunk
+                # Emit part boundary markers so the agent loop can detect
+                # block transitions for assistant_thinking event recording.
+                if event_type == "response.reasoning_summary_part.added":
+                    part = event.get("part") or {}
+                    provider_title = (
+                        _extract_text_value(part.get("title")) if isinstance(part, dict) else None
+                    )
+                    yield {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "reasoning_part_boundary": {
+                                        "part_index": state.reasoning_part_count,
+                                        "title": provider_title or None,
+                                        "complete": False,
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                    state.reasoning_part_count += 1
+                elif event_type == "response.reasoning_summary_part.done":
+                    yield {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "reasoning_part_boundary": {
+                                        "part_index": max(0, state.reasoning_part_count - 1),
+                                        "title": None,
+                                        "complete": True,
+                                    }
+                                }
+                            }
+                        ]
+                    }
                 continue
             if event_type in {"response.refusal.delta", "response.refusal.done"}:
                 refusal_text = _extract_text_value(
@@ -396,6 +431,8 @@ class _ResponsesStreamState:
         self.tool_call_emissions = 0
         self.completed_fallback_used = False
         self.completed_seen = False
+        # Counter for reasoning summary parts (used for boundary markers)
+        self.reasoning_part_count = 0
 
     def note_event(self, event_type: str) -> None:
         self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1

@@ -249,6 +249,17 @@ class TurnObserver(Protocol):
         attachments: list[dict[str, Any]] | None = None,
     ) -> None: ...
 
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+    ) -> None: ...
+
     async def on_turn_complete(self, result: TurnResult) -> None: ...
 
     async def on_turn_error(self, conversation_id: str, error: TurnError) -> None: ...
@@ -1356,7 +1367,7 @@ class TurnScheduler:
                 return
 
             # Build streaming callbacks from observers
-            on_token, on_tool_call, on_tool_result = self._build_callbacks(
+            on_token, on_thinking, on_tool_call, on_tool_result = self._build_callbacks(
                 conversation_id, session.session_id, message_id, turn_observers=turn_observers
             )
 
@@ -1372,6 +1383,7 @@ class TurnScheduler:
                 system_initiated=system_initiated,
                 follow_up=follow_up,
                 on_progress=on_token,
+                on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
@@ -1580,7 +1592,7 @@ class TurnScheduler:
         message_id: str,
         *,
         turn_observers: tuple[TurnObserver, ...] = (),
-    ) -> tuple[Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
@@ -1594,6 +1606,32 @@ class TurnScheduler:
                         session_id,
                         message_id,
                         delta,
+                    )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                )
+            )
+
+        async def on_thinking(
+            block_id: str,
+            delta: str,
+            title: str | None,
+            complete: bool,
+        ) -> None:
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_thinking,
+                        conversation_id,
+                        session_id,
+                        message_id,
+                        block_id,
+                        delta,
+                        title,
+                        complete,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1655,7 +1693,7 @@ class TurnScheduler:
                 )
             )
 
-        return on_token, on_tool_call, on_tool_result
+        return on_token, on_thinking, on_tool_call, on_tool_result
 
     def _iter_observers(
         self,

@@ -35,7 +35,7 @@ Cognis DB                  Session Cache (L1 memory)   Intaris Event Store
 │ mnemory_session_id │    │ intention            │    │   delegation          │
 │ delegation_mode    │    │                      │    │   compaction_summary  │
 │ delegation_task    │    │ (ephemeral, rebuilt   │    │   evaluation          │
-│ started_at         │    │  from Intaris on miss)│    │                      │
+│ started_at         │    │  from Intaris on miss)│    │   assistant_thinking  │
 └────────────────────┘    └──────────────────────┘    └──────────────────────┘
 ```
 

@@ -151,6 +151,48 @@ class SSETurnObserver:
             }
         )
 
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+    ) -> None:
+        if conversation_id != self._conversation_id or self._done:
+            return
+        if delta:
+            await self._queue.put(
+                {
+                    "event": "thinking",
+                    "data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session_id,
+                        "message_id": message_id,
+                        "block_id": block_id,
+                        "delta": delta,
+                        "title": title,
+                        "complete": complete,
+                    },
+                }
+            )
+        if complete:
+            await self._queue.put(
+                {
+                    "event": "thinking_block",
+                    "data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session_id,
+                        "message_id": message_id,
+                        "block_id": block_id,
+                        "title": title,
+                        "complete": True,
+                    },
+                }
+            )
+
     async def on_turn_complete(self, result: TurnResult) -> None:
         if result.conversation_id != self._conversation_id or self._done:
             return

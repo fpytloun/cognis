@@ -24,6 +24,7 @@ import X from 'lucide-svelte/icons/x';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
+  import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
@@ -65,6 +66,7 @@ import X from 'lucide-svelte/icons/x';
     optimisticallyResolveStepRequestInput,
     applyWebSocketEvent,
     normalizeHistory,
+    type ThinkingTimelineItem,
     type TimelineItem,
     type ToolCallTimelineItem
   } from '$lib/chat';
@@ -2073,7 +2075,13 @@ import X from 'lucide-svelte/icons/x';
     }
 
     timeline = applyWebSocketEvent(timeline, event);
-    if (event.type !== 'tool_call' && event.type !== 'tool_result' && event.type !== 'reasoning') {
+    // Skip syncVisibleWindow for high-frequency streaming events to avoid
+    // triggering a full virtual-scroll recalculation on every delta.
+    if (
+      event.type !== 'tool_call' &&
+      event.type !== 'tool_result' &&
+      event.type !== 'assistant_thinking_chunk'
+    ) {
       syncVisibleWindow();
     }
 
@@ -2887,6 +2895,8 @@ import X from 'lucide-svelte/icons/x';
                   <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
                   </div>
+                {:else if item.kind === 'thinking'}
+                  <div><ThinkingBlock item={item as ThinkingTimelineItem} /></div>
                 {:else if item.kind === 'tool_call'}
                   <div><ToolCallBlock {item} /></div>
                 {:else if item.kind === 'delegation'}
@@ -3252,6 +3262,8 @@ import X from 'lucide-svelte/icons/x';
                   <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
                   </div>
+                {:else if item.kind === 'thinking'}
+                  <ThinkingBlock item={item as ThinkingTimelineItem} />
                 {:else if item.kind === 'tool_call'}
                   <ToolCallBlock {item} />
                 {:else if item.kind === 'delegation'}

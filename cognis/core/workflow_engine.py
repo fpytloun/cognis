@@ -168,6 +168,7 @@ class WorkflowEngine:
         system_initiated: bool = False,
         follow_up: FollowUpMetadata | None = None,
         on_progress: ProgressCallback | None = None,
+        on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
         cancel_event: asyncio.Event | None = None,
@@ -227,6 +228,7 @@ class WorkflowEngine:
                 return await self._agent_loop.run_step(
                     ctx,
                     on_token=on_progress,
+                    on_thinking=on_thinking,
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )

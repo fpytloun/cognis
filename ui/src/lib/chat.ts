@@ -8,6 +8,8 @@ import type { AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/typ
  * re-parsed while earlier blocks stay memoized. See createMarkdownStreamer().
  */
 const streamers = new Map<string, MarkdownStreamer>();
+/** Per-thinking-block markdown streamers (keyed by block_id). */
+const thinkingStreamers = new Map<string, MarkdownStreamer>();
 
 function getStreamer(messageId: string): MarkdownStreamer {
   let streamer = streamers.get(messageId);
@@ -18,8 +20,23 @@ function getStreamer(messageId: string): MarkdownStreamer {
   return streamer;
 }
 
+function getThinkingStreamer(blockId: string): MarkdownStreamer {
+  let streamer = thinkingStreamers.get(blockId);
+  if (!streamer) {
+    streamer = createMarkdownStreamer();
+    thinkingStreamers.set(blockId, streamer);
+  }
+  return streamer;
+}
+
 export function releaseStreamer(messageId: string): void {
   streamers.delete(messageId);
+}
+
+export function releaseThinkingStreamers(blockIds: string[]): void {
+  for (const blockId of blockIds) {
+    thinkingStreamers.delete(blockId);
+  }
 }
 
 export type TimelineItem =
@@ -29,7 +46,31 @@ export type TimelineItem =
   | WorkflowComposedTimelineItem
   | NoticeTimelineItem
   | SystemMessageTimelineItem
-  | CompactionTimelineItem;
+  | CompactionTimelineItem
+  | ThinkingTimelineItem;
+
+export interface ThinkingBlock {
+  block_id: string;
+  title: string;
+  content: string;
+  html: string;
+  source: string;
+  complete: boolean;
+}
+
+export interface ThinkingTimelineItem {
+  id: string;
+  kind: 'thinking';
+  /** Message (turn) ID that owns these blocks */
+  messageId: string;
+  /** Ordered list of thinking blocks for this turn */
+  blocks: ThinkingBlock[];
+  /** True while at least one block is still streaming */
+  streaming: boolean;
+  /** Derived: title of the most recently active (incomplete) block */
+  activeTitle: string | null;
+  timestamp: string | null;
+}
 
 export interface MessageTimelineItem {
   id: string;
@@ -263,6 +304,22 @@ function finalizeInFlightAssistantItems(items: TimelineItem[]): TimelineItem[] {
         streaming: false,
       } satisfies MessageTimelineItem;
     }
+    if (item.kind === 'thinking' && item.streaming) {
+      changed = true;
+      const blocks = item.blocks.map((block) => {
+        if (block.complete) return block;
+        const streamer = getThinkingStreamer(block.block_id);
+        const finalHtml = streamer.finalize(block.content);
+        thinkingStreamers.delete(block.block_id);
+        return { ...block, html: finalHtml, complete: true } satisfies ThinkingBlock;
+      });
+      return {
+        ...item,
+        blocks,
+        streaming: false,
+        activeTitle: null,
+      } satisfies ThinkingTimelineItem;
+    }
     return item;
   });
   return changed ? next : items;
@@ -319,6 +376,44 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           : [],
         timestamp: event.timestamp
       });
+      continue;
+    }
+
+    if (event.type === 'assistant_thinking') {
+      const messageId = typeof event.data.message_id === 'string' ? event.data.message_id
+        : typeof event.data.turn_id === 'string' ? event.data.turn_id
+        : eid;
+      const thinkingId = `thinking:${messageId}`;
+      const blockId = typeof event.data.block_id === 'string' ? event.data.block_id : `thk_${eid}`;
+      const title = typeof event.data.title === 'string' && event.data.title ? event.data.title : 'Thinking';
+      const blockContent = typeof event.data.content === 'string' ? event.data.content : '';
+      const block: ThinkingBlock = {
+        block_id: blockId,
+        title,
+        content: blockContent,
+        html: renderMarkdown(blockContent),
+        source: typeof event.data.reasoning_source === 'string' ? event.data.reasoning_source : 'summary',
+        complete: true,
+      };
+      const existingIdx = items.findIndex((i) => i.id === thinkingId && i.kind === 'thinking');
+      if (existingIdx >= 0) {
+        const existing = items[existingIdx] as ThinkingTimelineItem;
+        items[existingIdx] = {
+          ...existing,
+          blocks: [...existing.blocks, block],
+          activeTitle: null,
+        };
+      } else {
+        items.push({
+          id: thinkingId,
+          kind: 'thinking',
+          messageId,
+          blocks: [block],
+          streaming: false,
+          activeTitle: null,
+          timestamp: event.timestamp,
+        });
+      }
       continue;
     }
 
@@ -789,6 +884,146 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     }
 
     // No chunks were received for this message — skip creating empty bubble
+    return next;
+  }
+
+  if (event.type === 'assistant_thinking_chunk') {
+    const thinkingId = `thinking:${event.message_id}`;
+    const blockId = event.block_id;
+    const delta = event.delta ?? '';
+    const index = next.findIndex((item) => item.id === thinkingId && item.kind === 'thinking');
+    if (index >= 0) {
+      const existing = next[index] as ThinkingTimelineItem;
+      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+      if (blockIdx >= 0) {
+        const blocks = existing.blocks.slice();
+        const block = blocks[blockIdx];
+        const newContent = block.content + delta;
+        const streamer = getThinkingStreamer(blockId);
+        blocks[blockIdx] = {
+          ...block,
+          content: newContent,
+          html: streamer.render(newContent),
+          title: event.title ?? block.title,
+        };
+        next[index] = {
+          ...existing,
+          blocks,
+          streaming: true,
+          activeTitle: event.title ?? existing.activeTitle,
+        };
+      } else {
+        // New block within existing thinking item
+        const streamer = getThinkingStreamer(blockId);
+        const blocks = [
+          ...existing.blocks,
+          {
+            block_id: blockId,
+            title: event.title ?? 'Thinking',
+            content: delta,
+            html: streamer.render(delta),
+            source: 'summary',
+            complete: false,
+          } satisfies ThinkingBlock,
+        ];
+        next[index] = {
+          ...existing,
+          blocks,
+          streaming: true,
+          activeTitle: event.title ?? existing.activeTitle,
+        };
+      }
+    } else {
+      // First chunk for this turn — insert before trailing streaming assistant
+      const streamer = getThinkingStreamer(blockId);
+      const item: ThinkingTimelineItem = {
+        id: thinkingId,
+        kind: 'thinking',
+        messageId: event.message_id,
+        blocks: [
+          {
+            block_id: blockId,
+            title: event.title ?? 'Thinking',
+            content: delta,
+            html: streamer.render(delta),
+            source: 'summary',
+            complete: false,
+          },
+        ],
+        streaming: true,
+        activeTitle: event.title ?? null,
+        timestamp: new Date().toISOString(),
+      };
+      insertBeforeTrailingStreamingAssistant(next, item);
+    }
+    return next;
+  }
+
+  if (event.type === 'assistant_thinking_block') {
+    const messageId = event.message_id;
+    const thinkingId = `thinking:${messageId}`;
+    const blockId = event.block_id;
+    const index = next.findIndex((item) => item.id === thinkingId && item.kind === 'thinking');
+
+    if (event.content) {
+      // Replay frame with full content (no prior chunks)
+      const html = renderMarkdown(event.content);
+      const block: ThinkingBlock = {
+        block_id: blockId,
+        title: event.title ?? 'Thinking',
+        content: event.content,
+        html,
+        source: 'summary',
+        complete: true,
+      };
+      if (index >= 0) {
+        const existing = next[index] as ThinkingTimelineItem;
+        const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+        const blocks =
+          blockIdx >= 0
+            ? existing.blocks.map((b, i) => (i === blockIdx ? block : b))
+            : [...existing.blocks, block];
+        next[index] = {
+          ...existing,
+          blocks,
+          streaming: blocks.some((b) => !b.complete),
+          activeTitle: null,
+        };
+      } else {
+        insertBeforeTrailingStreamingAssistant(next, {
+          id: thinkingId,
+          kind: 'thinking',
+          messageId,
+          blocks: [block],
+          streaming: false,
+          activeTitle: null,
+          timestamp: new Date().toISOString(),
+        } satisfies ThinkingTimelineItem);
+      }
+    } else if (index >= 0) {
+      // Complete signal for streaming block
+      const existing = next[index] as ThinkingTimelineItem;
+      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+      const blocks = existing.blocks.slice();
+      if (blockIdx >= 0) {
+        const block = blocks[blockIdx];
+        const streamer = getThinkingStreamer(blockId);
+        const finalHtml = streamer.finalize(block.content);
+        thinkingStreamers.delete(blockId);
+        blocks[blockIdx] = {
+          ...block,
+          html: finalHtml,
+          title: event.title ?? block.title,
+          complete: true,
+        };
+      }
+      next[index] = {
+        ...existing,
+        blocks,
+        streaming: blocks.some((b) => !b.complete),
+        activeTitle: null,
+      };
+    }
     return next;
   }
 

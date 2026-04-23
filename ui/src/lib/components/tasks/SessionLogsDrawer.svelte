@@ -11,12 +11,13 @@
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
-  import { normalizeHistory, type TimelineItem, type ToolCallTimelineItem } from '$lib/chat';
+  import { normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type ToolCallTimelineItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import type { Escalation, MessageEvent } from '$lib/types/api';
@@ -385,6 +386,8 @@
               <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                 <ChatMessage {item} compact />
               </div>
+            {:else if item.kind === 'thinking'}
+              <ThinkingBlock item={item as ThinkingTimelineItem} compact />
             {:else if item.kind === 'tool_call'}
               <ToolCallBlock {item} />
             {:else if item.kind === 'delegation'}

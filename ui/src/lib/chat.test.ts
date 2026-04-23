@@ -7,6 +7,7 @@ import {
   findPendingStepRequestInputCall,
   normalizeHistory,
   optimisticallyResolveStepRequestInput,
+  type ThinkingTimelineItem,
   type ToolCallTimelineItem
 } from '$lib/chat';
 
@@ -271,32 +272,158 @@ describe('chat timeline helpers', () => {
     });
   });
 
-  it('ignores legacy internal reasoning events in persisted history', () => {
+  it('normalizes persisted assistant_thinking events into ThinkingTimelineItem', () => {
     const items = normalizeHistory([
       {
         seq: 6,
-        type: 'reasoning',
+        type: 'assistant_thinking',
         data: {
-          message_id: 'msg_internal_1',
-          content: 'internal session reasoning'
+          message_id: 'msg_turn_1',
+          block_id: 'thk_1',
+          title: 'Considering the migration strategy',
+          content: 'For the migration and to address long-term drift...',
+          reasoning_source: 'summary',
+          turn_id: 'turn_abc',
         },
         timestamp: '2026-04-07T00:00:00Z'
       }
     ]);
 
-    expect(items).toEqual([]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'thinking',
+      messageId: 'msg_turn_1',
+      streaming: false,
+      blocks: [
+        {
+          block_id: 'thk_1',
+          title: 'Considering the migration strategy',
+          complete: true,
+        },
+      ],
+    });
   });
 
-  it('ignores live legacy internal reasoning events', () => {
-    const items = applyWebSocketEvent([], {
-      type: 'reasoning',
+  it('groups multiple assistant_thinking events for the same message into one item', () => {
+    const items = normalizeHistory([
+      {
+        seq: 5,
+        type: 'assistant_thinking',
+        data: {
+          message_id: 'msg_turn_2',
+          block_id: 'thk_1',
+          title: 'First thought',
+          content: 'Initial analysis here.',
+          reasoning_source: 'summary',
+        },
+        timestamp: '2026-04-07T00:00:00Z'
+      },
+      {
+        seq: 6,
+        type: 'assistant_thinking',
+        data: {
+          message_id: 'msg_turn_2',
+          block_id: 'thk_2',
+          title: 'Second thought',
+          content: 'Further analysis here.',
+          reasoning_source: 'summary',
+        },
+        timestamp: '2026-04-07T00:00:01Z'
+      }
+    ]);
+
+    expect(items).toHaveLength(1);
+    const thinking = items[0] as ThinkingTimelineItem;
+    expect(thinking.kind).toBe('thinking');
+    expect(thinking.blocks).toHaveLength(2);
+    expect(thinking.blocks[0].block_id).toBe('thk_1');
+    expect(thinking.blocks[1].block_id).toBe('thk_2');
+  });
+
+  it('accumulates live assistant_thinking_chunk events into a ThinkingTimelineItem', () => {
+    const after1 = applyWebSocketEvent([], {
+      type: 'assistant_thinking_chunk',
       conversation_id: 'conv_1',
       session_id: 'sess_1',
-      message_id: 'msg_internal_1',
-      content: 'internal session reasoning'
+      message_id: 'msg_live',
+      block_id: 'thk_live_1',
+      delta: 'Considering',
+      title: 'Considering the problem',
+      complete: false,
     });
 
-    expect(items).toEqual([]);
+    expect(after1).toHaveLength(1);
+    expect(after1[0]).toMatchObject({ kind: 'thinking', streaming: true });
+    const thinking = after1[0] as ThinkingTimelineItem;
+    expect(thinking.blocks[0].content).toBe('Considering');
+    expect(thinking.activeTitle).toBe('Considering the problem');
+
+    const after2 = applyWebSocketEvent(after1, {
+      type: 'assistant_thinking_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      block_id: 'thk_live_1',
+      delta: ' further options',
+      title: 'Considering the problem',
+      complete: false,
+    });
+
+    const thinking2 = after2[0] as ThinkingTimelineItem;
+    expect(thinking2.blocks[0].content).toBe('Considering further options');
+  });
+
+  it('finalizes a thinking block on assistant_thinking_block complete event', () => {
+    const withChunk = applyWebSocketEvent([], {
+      type: 'assistant_thinking_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      block_id: 'thk_1',
+      delta: 'Some analysis.',
+      title: 'Some analysis',
+      complete: false,
+    });
+
+    const withBlock = applyWebSocketEvent(withChunk, {
+      type: 'assistant_thinking_block',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      block_id: 'thk_1',
+      title: 'Some analysis',
+      complete: true,
+    });
+
+    const thinking = withBlock[0] as ThinkingTimelineItem;
+    expect(thinking.streaming).toBe(false);
+    expect(thinking.blocks[0].complete).toBe(true);
+  });
+
+  it('interleaves thinking before tool calls in timeline order', () => {
+    const withThinking = applyWebSocketEvent([], {
+      type: 'assistant_thinking_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      block_id: 'thk_1',
+      delta: 'Deciding which tool to call.',
+      title: 'Deciding which tool to call',
+      complete: false,
+    });
+
+    const withTool = applyWebSocketEvent(withThinking, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      arguments: { command: 'ls' },
+    });
+
+    expect(withTool[0]).toMatchObject({ kind: 'thinking' });
+    expect(withTool[1]).toMatchObject({ kind: 'tool_call' });
   });
 
   it('keeps the assistant draft trailing behind live tool calls until completion', () => {

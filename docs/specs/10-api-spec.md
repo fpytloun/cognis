@@ -519,7 +519,9 @@ socket authenticates so stalled connections are detected proactively.
 // Streaming
 {type: "chunk", conversation_id, session_id, message_id, content, index}
 {type: "message_complete", conversation_id, message_id, seq, token_usage, queued_count}
-{type: "reasoning", conversation_id, session_id, message_id, content}
+// Thinking (reasoning-capable models only)
+{type: "assistant_thinking_chunk", conversation_id, session_id, message_id, block_id, delta, title?, complete}
+{type: "assistant_thinking_block", conversation_id, session_id, message_id, block_id, title?, complete}
 
 // Tool calls
 {type: "tool_call", conversation_id, session_id, call_id, tool_name,

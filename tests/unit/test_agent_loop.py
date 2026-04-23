@@ -587,10 +587,11 @@ async def test_run_step_uses_step_local_pending_events_on_concurrent_failures(
         ctx: StepContext,
         *,
         on_token: object = None,
+        on_thinking: object = None,
         on_tool_call: object = None,
         on_tool_result: object = None,
     ) -> None:
-        del on_token, on_tool_call, on_tool_result
+        del on_token, on_thinking, on_tool_call, on_tool_result
         ctx.pending_events = [
             SessionEvent(
                 type="lifecycle",

@@ -179,6 +179,7 @@ def _task_log_anchor_kind(event_type: str) -> str:
 
     mapping = {
         "assistant_message": "assistant",
+        "assistant_thinking": "thinking",
         "user_message": "user",
         "reasoning": "reasoning",
         "tool_call": "tool_call",
@@ -670,6 +671,89 @@ def _controller_builtin_enabled(agent: AgentDefinition, tool: ToolDefinition) ->
 
 
 # ---------------------------------------------------------------------------
+# Thinking block helpers
+# ---------------------------------------------------------------------------
+
+_THINKING_TITLE_MAX_CHARS = 60
+_THINKING_TITLE_STOP_CHARS = frozenset(".!?\n")
+
+
+def _derive_thinking_title(text: str, max_chars: int = _THINKING_TITLE_MAX_CHARS) -> str:
+    """Derive a short display title from the start of a thinking block.
+
+    Looks for the first sentence-ending punctuation or newline within
+    *max_chars*, then truncates with an ellipsis if the full text is longer.
+    """
+    if not text:
+        return "Thinking"
+    # Walk forward to find first natural stop within the char budget
+    stop_idx: int | None = None
+    for i, char in enumerate(text[:max_chars]):
+        if char in _THINKING_TITLE_STOP_CHARS:
+            stop_idx = i + 1
+            break
+    if stop_idx is not None:
+        title = text[:stop_idx].strip()
+    else:
+        title = text[:max_chars].rstrip()
+        if len(text) > max_chars:
+            title += "…"
+    return title or "Thinking"
+
+
+class ThinkingBlockState:
+    """Mutable state for one in-progress or completed reasoning block."""
+
+    __slots__ = ("block_id", "title", "content_parts", "source", "provider_block_index", "complete")
+
+    def __init__(
+        self,
+        *,
+        block_id: str,
+        title: str | None,
+        source: str,
+        provider_block_index: int | None,
+    ) -> None:
+        self.block_id = block_id
+        self.title = title
+        self.content_parts: list[str] = []
+        self.source = source
+        self.provider_block_index = provider_block_index
+        self.complete = False
+
+    def get_content(self) -> str:
+        """Return accumulated content as a single string."""
+        return "".join(self.content_parts)
+
+    def get_title(self) -> str:
+        """Return the best available title for this block."""
+        if self.title:
+            return self.title
+        return _derive_thinking_title(self.get_content())
+
+
+class ThinkingEvent:
+    """A reasoning delta event produced by ``StreamAccumulator.pop_thinking_events``."""
+
+    __slots__ = ("block_id", "delta", "title", "source", "complete")
+
+    def __init__(
+        self,
+        *,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        source: str,
+        complete: bool,
+    ) -> None:
+        self.block_id = block_id
+        self.delta = delta
+        self.title = title
+        self.source = source
+        self.complete = complete
+
+
+# ---------------------------------------------------------------------------
 # Stream accumulator
 # ---------------------------------------------------------------------------
 
@@ -679,6 +763,11 @@ class StreamAccumulator:
 
     Handles LiteLLM's streaming format where tool calls arrive
     incrementally across chunks.
+
+    Also accumulates reasoning/thinking blocks emitted by reasoning-capable
+    models.  Call ``pop_thinking_events()`` after each ``feed()`` to drain
+    pending ``ThinkingEvent`` objects, and ``finalize_thinking()`` at the end
+    of the stream to close any still-open block.
     """
 
     def __init__(self) -> None:
@@ -686,6 +775,12 @@ class StreamAccumulator:
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.usage: dict[str, int] | None = None
         self.finish_reason: str = "stop"
+        # Thinking-block state
+        self._current_thinking_block: ThinkingBlockState | None = None
+        self._completed_thinking_blocks: list[ThinkingBlockState] = []
+        self._thinking_block_counter: int = 0
+        self._last_reasoning_source: str | None = None
+        self._pending_thinking_events: list[ThinkingEvent] = []
 
     def clone_tool_call_state(self) -> dict[int, dict[str, Any]]:
         """Return a shallow copy of the accumulated tool-call state."""
@@ -694,6 +789,73 @@ class StreamAccumulator:
     def restore_tool_call_state(self, state: dict[int, dict[str, Any]] | None) -> None:
         """Restore accumulated tool-call state from a previous attempt."""
         self.tool_calls = {idx: dict(entry) for idx, entry in (state or {}).items()}
+
+    # ------------------------------------------------------------------
+    # Thinking-block internals
+    # ------------------------------------------------------------------
+
+    def _open_thinking_block(
+        self,
+        *,
+        source: str,
+        provider_block_index: int | None,
+        provider_title: str | None,
+    ) -> ThinkingBlockState:
+        """Open a new thinking block, closing any open one first."""
+        self._close_thinking_block(reason="new_block_started")
+        self._thinking_block_counter += 1
+        block = ThinkingBlockState(
+            block_id=f"thk_{self._thinking_block_counter}",
+            title=provider_title,
+            source=source,
+            provider_block_index=provider_block_index,
+        )
+        self._current_thinking_block = block
+        return block
+
+    def _close_thinking_block(self, reason: str) -> None:
+        """Finalize the current thinking block (if any) and queue a complete event."""
+        block = self._current_thinking_block
+        if block is None:
+            return
+        if not block.content_parts:
+            # Empty block — discard silently
+            self._current_thinking_block = None
+            return
+        block.complete = True
+        self._completed_thinking_blocks.append(block)
+        self._current_thinking_block = None
+        self._pending_thinking_events.append(
+            ThinkingEvent(
+                block_id=block.block_id,
+                delta="",
+                title=block.get_title(),
+                source=block.source,
+                complete=True,
+            )
+        )
+
+    def pop_thinking_events(self) -> list[ThinkingEvent]:
+        """Return and clear all pending thinking events accumulated since last call."""
+        events = list(self._pending_thinking_events)
+        self._pending_thinking_events.clear()
+        return events
+
+    def finalize_thinking(self) -> list[ThinkingBlockState]:
+        """Close any open thinking block and return all completed blocks.
+
+        Must be called once after the stream ends.
+        """
+        self._close_thinking_block(reason="stream_end")
+        return list(self._completed_thinking_blocks)
+
+    def get_completed_thinking_blocks(self) -> list[ThinkingBlockState]:
+        """Return the list of completed thinking blocks (read-only snapshot)."""
+        return list(self._completed_thinking_blocks)
+
+    # ------------------------------------------------------------------
+    # Main feed
+    # ------------------------------------------------------------------
 
     def feed(self, chunk: dict[str, Any]) -> str | None:
         """Feed a stream chunk. Returns text delta if present."""
@@ -710,14 +872,42 @@ class StreamAccumulator:
         if isinstance(finish_reason, str) and finish_reason:
             self.finish_reason = finish_reason
 
-        # Text content
+        # ---------------------------------------------------------------
+        # Reasoning part boundary markers from responses_bridge
+        # ---------------------------------------------------------------
+        reasoning_boundary = delta.get("reasoning_part_boundary") if isinstance(delta, dict) else None
+        if isinstance(reasoning_boundary, dict):
+            is_complete = bool(reasoning_boundary.get("complete", False))
+            part_index = reasoning_boundary.get("part_index")
+            provider_title = reasoning_boundary.get("title") or None
+            if is_complete:
+                self._close_thinking_block(reason="part_done")
+            else:
+                # New provider part is starting
+                self._open_thinking_block(
+                    source="summary",
+                    provider_block_index=part_index,
+                    provider_title=provider_title,
+                )
+            # No text or tool content in boundary-only chunks
+            return None
+
+        # ---------------------------------------------------------------
+        # Regular text content — heuristic: close thinking block
+        # ---------------------------------------------------------------
         text_delta: str | None = delta.get("content")
         if text_delta:
+            # Assistant text starting means the model finished thinking
+            self._close_thinking_block(reason="content_started")
             self.content_parts.append(text_delta)
 
-        # Tool call deltas
+        # ---------------------------------------------------------------
+        # Tool call deltas — heuristic: close thinking block
+        # ---------------------------------------------------------------
         tc_deltas = delta.get("tool_calls")
         if tc_deltas:
+            # Tool call starting means the model finished thinking
+            self._close_thinking_block(reason="tool_call_started")
             for tc_delta in tc_deltas:
                 idx = tc_delta.get("index", 0)
                 if idx not in self.tool_calls:
@@ -744,6 +934,54 @@ class StreamAccumulator:
                         raise ValueError(
                             f"Tool call arguments exceeded {_MAX_TOOL_CALL_ARGUMENT_CHARS} characters"
                         )
+
+        # ---------------------------------------------------------------
+        # Reasoning / thinking deltas
+        # ---------------------------------------------------------------
+        reasoning_summary = delta.get("reasoning")
+        reasoning_content = delta.get("reasoning_content")
+
+        if reasoning_summary is not None or reasoning_content is not None:
+            # Determine source — prefer summary (display-ready), fall back to raw CoT
+            if isinstance(reasoning_summary, str) and reasoning_summary:
+                source = "summary"
+                reasoning_text = reasoning_summary
+            elif isinstance(reasoning_content, str) and reasoning_content:
+                source = "content"
+                reasoning_text = reasoning_content
+            else:
+                reasoning_text = ""
+                source = "summary"
+
+            if reasoning_text:
+                # Source switch → heuristic block boundary
+                if self._last_reasoning_source and self._last_reasoning_source != source:
+                    self._open_thinking_block(
+                        source=source,
+                        provider_block_index=None,
+                        provider_title=None,
+                    )
+                self._last_reasoning_source = source
+
+                # Open a block if none is in-flight
+                if self._current_thinking_block is None:
+                    self._open_thinking_block(
+                        source=source,
+                        provider_block_index=None,
+                        provider_title=None,
+                    )
+                block = self._current_thinking_block
+                assert block is not None  # always set above
+                block.content_parts.append(reasoning_text)
+                self._pending_thinking_events.append(
+                    ThinkingEvent(
+                        block_id=block.block_id,
+                        delta=reasoning_text,
+                        title=block.get_title(),
+                        source=source,
+                        complete=False,
+                    )
+                )
 
         return text_delta
 
@@ -809,6 +1047,11 @@ class StreamAccumulator:
         self.content_parts.clear()
         self.tool_calls.clear()
         self.usage = None
+        self._current_thinking_block = None
+        self._completed_thinking_blocks.clear()
+        self._thinking_block_counter = 0
+        self._last_reasoning_source = None
+        self._pending_thinking_events.clear()
 
 
 def _normalize_token_usage(usage: Any) -> dict[str, int]:
@@ -1326,6 +1569,7 @@ class AgentLoop:
         ctx: StepContext,
         *,
         on_token: TokenCallback | None = None,
+        on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
@@ -1354,6 +1598,7 @@ class AgentLoop:
                 self._execute_step(
                     ctx,
                     on_token=on_token,
+                    on_thinking=on_thinking,
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 ),
@@ -1842,6 +2087,7 @@ class AgentLoop:
         ctx: StepContext,
         *,
         on_token: TokenCallback | None = None,
+        on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
@@ -2420,6 +2666,15 @@ class AgentLoop:
                     text_delta = accumulator.feed(chunk)
                     if text_delta and on_token:
                         await on_token(text_delta)
+                    # Drain thinking events accumulated during this chunk
+                    if on_thinking:
+                        for thinking_evt in accumulator.pop_thinking_events():
+                            await on_thinking(
+                                thinking_evt.block_id,
+                                thinking_evt.delta,
+                                thinking_evt.title,
+                                thinking_evt.complete,
+                            )
             except OpenAIToolSearchFallbackRequired as exc:
                 if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
                     raise
@@ -2507,6 +2762,39 @@ class AgentLoop:
                     ctx.session.session_id,
                     accumulator.usage,
                 )
+
+            # ---------------------------------------------------------------
+            # Finalize thinking blocks and drain any remaining events
+            # ---------------------------------------------------------------
+            completed_thinking_blocks = accumulator.finalize_thinking()
+            # Drain any remaining thinking events (e.g. the final close event)
+            if on_thinking:
+                for thinking_evt in accumulator.pop_thinking_events():
+                    await on_thinking(
+                        thinking_evt.block_id,
+                        thinking_evt.delta,
+                        thinking_evt.title,
+                        thinking_evt.complete,
+                    )
+            # Record completed thinking blocks to Intaris
+            if completed_thinking_blocks and mid_stream_error is None:
+                for block in completed_thinking_blocks:
+                    if block.content_parts:  # skip empty blocks
+                        events_to_record.append(
+                            SessionEvent(
+                                type="assistant_thinking",
+                                data={
+                                    "message_id": ctx.turn_id,
+                                    "block_id": block.block_id,
+                                    "title": block.get_title(),
+                                    "content": block.get_content(),
+                                    "reasoning_source": block.source,
+                                    "provider_block_index": block.provider_block_index,
+                                    "turn_id": ctx.turn_id,
+                                },
+                            )
+                        )
+
             content = continued_assistant_content + accumulator.get_content()
             tool_calls = accumulator.get_tool_calls()
             if continuation_reminder_index is not None and continuation_reminder_index < len(
@@ -5946,6 +6234,8 @@ class AgentLoop:
                 label_parts.append(str(data.get("name")))
             elif event_type in {"assistant_message", "user_message", "reasoning"}:
                 label_parts.append(f"#{counts[kind]}")
+            elif event_type == "assistant_thinking" and data.get("title"):
+                label_parts.append(str(data.get("title"))[:40])
             label = " - ".join(label_parts)
             compact_lines = [f"Event: {event_type}"]
             stored_lines = [f"Event: {event_type}"]
@@ -5990,6 +6280,16 @@ class AgentLoop:
                     compact_lines.append(f"Result: {compact_snippet(result_text, max_chars=900)}")
                     stored_lines.append("Result:")
                     stored_lines.extend(_indent_block(result_text, prefix=""))
+            elif event_type == "assistant_thinking":
+                block_title = str(data.get("title") or "Thinking")
+                label_parts = ["assistant_thinking", block_title[:40]]
+                label = " - ".join(label_parts)
+                compact_lines.append(f"Thinking: {block_title}")
+                stored_lines.append(f"Thinking: {block_title}")
+                thinking_content = str(data.get("content") or "").strip()
+                if thinking_content:
+                    compact_lines.append(compact_snippet(thinking_content, max_chars=900))
+                    stored_lines.extend(_indent_block(thinking_content, prefix=""))
             elif event_type in {"assistant_message", "user_message", "reasoning"}:
                 content = str(data.get("content") or "").strip()
                 if content:

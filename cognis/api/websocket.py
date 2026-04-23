@@ -129,14 +129,17 @@ class AuthenticatedWebSocket:
         msg_type = data.get("type", "")
         message_id = data.get("message_id")
 
+        # Droppable message types when the outbound buffer is full
+        _DROPPABLE_TYPES = ("chunk", "assistant_thinking_chunk")
+
         # Drop non-critical chunks when buffer is full
-        if msg_type == "chunk" and self.pending_sends >= DEFAULT_OUTBOUND_BUFFER:
+        if msg_type in _DROPPABLE_TYPES and self.pending_sends >= DEFAULT_OUTBOUND_BUFFER:
             if message_id:
                 self.dropped_chunks[message_id] = self.dropped_chunks.get(message_id, 0) + 1
             return
 
         # Emit chunk_gap frame before non-chunk messages if chunks were dropped
-        if msg_type != "chunk" and message_id and message_id in self.dropped_chunks:
+        if msg_type not in _DROPPABLE_TYPES and message_id and message_id in self.dropped_chunks:
             gap_count = self.dropped_chunks.pop(message_id)
             gap_payload = WebSocketChunkGap(
                 conversation_id=data.get("conversation_id", ""),
@@ -282,6 +285,53 @@ class WebSocketTurnObserver:
                 detail=error.detail,
             ).model_dump(),
         )
+
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+    ) -> None:
+        """Emit assistant thinking chunk or block boundary frame.
+
+        Streaming deltas → ``assistant_thinking_chunk`` (droppable under
+        backpressure, same as regular ``chunk`` frames).
+        Block-boundary signals (``complete=True`` with empty delta) →
+        ``assistant_thinking_block`` to let the UI finalize the block.
+        """
+        if delta:
+            # Streaming chunk — droppable under backpressure
+            await self._manager.send_to_conversation(
+                conversation_id,
+                {
+                    "type": "assistant_thinking_chunk",
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "block_id": block_id,
+                    "delta": delta,
+                    "title": title,
+                    "complete": complete,
+                },
+            )
+        if complete:
+            # Block boundary — always deliver
+            await self._manager.send_to_conversation(
+                conversation_id,
+                {
+                    "type": "assistant_thinking_block",
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "block_id": block_id,
+                    "title": title,
+                    "complete": True,
+                },
+            )
 
     async def on_system_message(self, conversation_id: str, text: str) -> None:
         await self._manager.send_to_conversation(
@@ -598,6 +648,23 @@ class WebSocketConnectionManager:
                             "duration_ms": data.get("duration_ms"),
                             "evaluation": data.get("evaluation"),
                             "attachments": attachments,
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "assistant_thinking":
+                    # Replay as a single completed block frame (no streaming chunks on replay)
+                    block_id = data.get("block_id") or f"thk_replay_{item.get('seq', 0)}"
+                    await connection.send_json(
+                        {
+                            "type": "assistant_thinking_block",
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "message_id": data.get("message_id") or data.get("turn_id"),
+                            "block_id": block_id,
+                            "title": data.get("title"),
+                            "content": data.get("content", ""),
+                            "complete": True,
+                            "seq": item.get("seq"),
                         }
                     )
                     replayed += 1

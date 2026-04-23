@@ -74,6 +74,34 @@ begins:
 This card is the user's proof that the agent chose structured execution rather
 than a generic background task.
 
+### Thinking Blocks
+
+When a reasoning-capable model (e.g., OpenAI o3, Anthropic Claude with extended
+thinking) produces a thinking trace, the turn shows one collapsible thinking
+item in the timeline, interleaved with tool calls at the position it was emitted:
+
+```
+[brain] Thinking: Considering calibration for migration   ▾
+```
+
+While thinking is streaming, the header title mutates live as the model
+generates new subject lines. Three animated dots indicate that thinking is in
+progress. Clicking the header expands the card to show each thinking block:
+
+```
+Thinking: Considering calibration for migration
+For the migration and to address long-term drift, I think having
+a manual current level calibration helper could be valuable…
+
+Thinking: Something else
+Lorem ipsum dolor sit amet…
+```
+
+Each block has a distinct header. Thinking blocks are always collapsed by
+default; they are persisted to Intaris and replayed when the conversation is
+reloaded. Thinking is never delivered to external channels (Signal, Slack, etc.)
+and is not re-fed into the model prompt in subsequent turns.
+
 ### Tool Call Indicators
 ```
 [wrench] read_file("src/auth.py")  Approved | 0.3s
@@ -217,7 +245,8 @@ Server → Client:
 {type: "chunk_gap", conversation_id, dropped_count}
 {type: "tool_call", conversation_id, session_id, call_id, tool_name, status}
 {type: "tool_result", conversation_id, call_id, tool_name, result, is_error, duration_ms, evaluation}
-{type: "reasoning", conversation_id, message_id, content}
+{type: "assistant_thinking_chunk", conversation_id, session_id, message_id, block_id, delta, title, complete}
+{type: "assistant_thinking_block", conversation_id, session_id, message_id, block_id, title, complete}
 {type: "conversation_updated", conversation_id, title}
 {type: "delegation_started", conversation_id, child_session_id, mode, task}
 {type: "delegation_progress", conversation_id, child_session_id, step, progress}

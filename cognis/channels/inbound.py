@@ -1077,6 +1077,18 @@ class ChannelTurnObserver:
                 )
             )
 
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+    ) -> None:
+        """No-op — thinking blocks are not delivered to channels."""
+
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         """No-op for queue notifications."""
 

@@ -1368,13 +1368,29 @@ export interface WebSocketToolResultEvent {
   };
 }
 
-export interface WebSocketReasoningEvent {
-  type: 'reasoning';
+export interface WebSocketAssistantThinkingChunkEvent {
+  type: 'assistant_thinking_chunk';
   conversation_id?: string;
   session_id?: string;
+  message_id: string;
+  block_id: string;
+  delta: string;
+  title?: string | null;
+  complete: boolean;
+}
+
+export interface WebSocketAssistantThinkingBlockEvent {
+  type: 'assistant_thinking_block';
+  conversation_id?: string;
+  session_id?: string;
+  /** seq present on replay frames only */
   seq?: number;
   message_id: string;
-  content: string;
+  block_id: string;
+  title?: string | null;
+  /** Full content — present on replay frames */
+  content?: string;
+  complete: boolean;
 }
 
 export interface WebSocketErrorEvent {
@@ -1466,7 +1482,8 @@ export type CognisWebSocketEvent =
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
   | WebSocketToolResultEvent
-  | WebSocketReasoningEvent
+  | WebSocketAssistantThinkingChunkEvent
+  | WebSocketAssistantThinkingBlockEvent
   | WebSocketConversationUpdatedEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
