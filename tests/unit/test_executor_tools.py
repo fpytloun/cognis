@@ -173,6 +173,28 @@ class TestReadTool:
         assert result.metadata is not None
         assert "attachment_analysis_request" in result.metadata
 
+    @pytest.mark.asyncio()
+    async def test_read_svg_file_returns_text(self, tmp_path: Path) -> None:
+        target = tmp_path / "icon.svg"
+        target.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg">\n'
+            '  <text x="0" y="12">hello</text>\n'
+            "</svg>\n",
+            encoding="utf-8",
+        )
+
+        result = await handle_read(
+            {"file_path": str(target), "offset": 1, "limit": 2},
+            _context(),
+        )
+
+        assert result.is_error is False
+        assert result.attachments is None
+        assert result.metadata is not None
+        assert "attachment_analysis_request" not in result.metadata
+        assert "1: <svg xmlns=\"http://www.w3.org/2000/svg\">" in result.output
+        assert "2:   <text x=\"0\" y=\"12\">hello</text>" in result.output
+
 
 class TestWriteTool:
     """Test the write filesystem tool."""

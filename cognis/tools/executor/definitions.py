@@ -61,7 +61,8 @@ READ_TOOL = ToolDefinition(
     name="read",
     description=(
         "Read a file or directory from the filesystem. Text files return line-numbered "
-        "content; supported binary files are routed through attachment analysis."
+        "content; offset and limit apply to text files only. Supported binary files are "
+        "routed through attachment analysis."
     ),
     parameters={
         "type": "object",
@@ -72,11 +73,11 @@ READ_TOOL = ToolDefinition(
             },
             "offset": {
                 "type": "integer",
-                "description": "Line number to start from (1-indexed, default 1)",
+                "description": "Line number to start from for text files (1-indexed, default 1)",
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to read (default 2000)",
+                "description": "Maximum number of lines to read for text files (default 2000)",
             },
         },
         "required": ["file_path"],

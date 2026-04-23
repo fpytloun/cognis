@@ -608,8 +608,20 @@ async def analyze_attachment_ref(
             "Attachment analysis returned empty response",
             extra={"extra_data": diagnostics},
         )
+        if used_fallback_route and selected_model:
+            message = (
+                f"Attachment analysis route model '{selected_model}' returned no content for "
+                f"'{attachment.filename}'."
+            )
+        elif selected_model:
+            message = (
+                f"Current model '{selected_model}' returned no content while inspecting "
+                f"'{attachment.filename}'."
+            )
+        else:
+            message = "Attachment analysis returned no content."
         return ToolResult(
-            output="Attachment analysis returned no content.",
+            output=message,
             is_error=True,
             metadata=diagnostics,
         )
@@ -752,10 +764,10 @@ def _extract_pdf_text(content: bytes, filename: str) -> str | None:
 
 def _is_text_artifact(mime_type: str, content: bytes) -> bool:
     normalized = mime_type.lower()
-    if normalized.startswith(("image/", "audio/", "video/")) or normalized == "application/pdf":
-        return False
     if normalized.startswith("text/") or normalized in _TEXT_MIME_TYPES:
         return True
+    if normalized.startswith(("image/", "audio/", "video/")) or normalized == "application/pdf":
+        return False
     if b"\x00" in content:
         return False
     try:

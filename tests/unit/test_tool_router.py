@@ -812,6 +812,124 @@ async def test_tool_router_handles_artifact_read_with_current_model(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_postprocesses_binary_read_with_current_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"jpeg-bytes", "image/jpeg"
+
+    class _Llm:
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            del model_id, provider_id
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
+            del messages, kwargs
+            return {"choices": [{"message": {"content": "It is a generated banner."}}]}
+
+    class _Session:
+        attachment_analysis_lookups = 0
+
+        async def commit(self) -> None:
+            return None
+
+        async def get(self, model: object, key: str) -> object | None:
+            del model
+            if key == "attachment_analysis":
+                self.attachment_analysis_lookups += 1
+                return SimpleNamespace(model="gpt-4o", provider_id="openai")
+            return None
+
+    session = _Session()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield session
+
+    monkeypatch.setattr("cognis.core.tool_router.create_artifact_record", AsyncMock())
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="att_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="att_1",
+                filename="photo.jpg",
+                mime_type="image/jpeg",
+                kind="image",
+                size_bytes=10,
+            )
+        ),
+    )
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="read",
+                description="read",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=_Llm(),
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="read-current-model",
+            name="read",
+            arguments={"file_path": "/tmp/photo.jpg"},
+            runtime_metadata={"resolved_model": "gpt-5.4", "resolved_provider_id": "openai"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(
+            ToolResult(
+                output="Prepared binary file.",
+                metadata={"attachment_analysis_request": {"source": "read"}},
+                attachments=[
+                    {
+                        "filename": "photo.jpg",
+                        "mime_type": "image/jpeg",
+                        "content_b64": base64.b64encode(b"jpeg-bytes").decode("ascii"),
+                    }
+                ],
+            )
+        ),
+    )
+
+    assert result.is_error is False
+    assert result.attachments is None
+    assert result.metadata is not None
+    assert result.metadata["_raw_output"] == "It is a generated banner."
+    assert result.metadata["analysis_model"] == "gpt-5.4"
+    assert result.metadata["used_attachment_analysis_route"] is False
+    assert session.attachment_analysis_lookups == 0
+
+
+@pytest.mark.asyncio
 async def test_tool_router_handles_artifact_list_recent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1054,10 +1172,81 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
 
     assert result.is_error is True
     assert result.metadata is not None
+    assert (
+        result.metadata["_raw_output"]
+        == "Current model 'gpt-4o-mini' returned no content while inspecting 'image.png'."
+    )
     assert result.metadata["response_status"] == "completed"
     assert result.metadata["finish_reason"] == "stop"
     assert result.metadata["has_content"] is False
     assert result.metadata["analysis_model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_handles_artifact_read_svg_as_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return (
+                b'<svg xmlns="http://www.w3.org/2000/svg">\n<text>hello</text>\n</svg>\n',
+                "image/svg+xml",
+            )
+
+    class _Session:
+        async def get(self, model: object, key: str) -> object | None:
+            del model, key
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="svg_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="svg_1",
+                filename="icon.svg",
+                mime_type="image/svg+xml",
+                kind="image",
+                size_bytes=64,
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=None,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-svg",
+            name="artifact_read",
+            arguments={"artifact_id": "svg_1", "offset": 2, "limit": 1},
+            runtime_metadata={"resolved_model": "gpt-5.4"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["mime_type"] == "image/svg+xml"
+    assert result.metadata["kind"] == "image"
+    assert "2: <text>hello</text>" in result.metadata["_raw_output"]
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
 _MAX_INLINE_BINARY_READ_BYTES = 10 * 1024 * 1024
+_TEXTUAL_BINARY_MIME_TYPES = {"image/svg+xml"}
 
 
 def _resolve_path(raw: str, context: ToolExecutionContext) -> Path:
@@ -285,7 +286,7 @@ def _find_prettier_binary(start_dir: Path) -> str | None:
 
 
 async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-    """Read a file or directory, returning line-numbered content."""
+    """Read a file or directory, returning line-numbered content for text."""
     file_path = arguments.get("file_path", "")
     offset = max(1, int(arguments.get("offset", 1)))
     limit = int(arguments.get("limit", _MAX_READ_LINES))
@@ -337,6 +338,8 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
 
 def _should_route_binary_read(path: Path, content: bytes, mime_type: str) -> bool:
     normalized_mime = mime_type.lower()
+    if normalized_mime in _TEXTUAL_BINARY_MIME_TYPES:
+        return False
     if normalized_mime.startswith(("image/", "audio/", "video/")):
         return True
     if normalized_mime == "application/pdf":
