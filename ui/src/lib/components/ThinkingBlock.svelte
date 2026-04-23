@@ -13,6 +13,15 @@
     expanded = !expanded;
   }
 
+  function displayTitle(raw: string | null | undefined): string {
+    const cleaned = String(raw ?? '')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/[*_`~>#]+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return cleaned || 'Thinking';
+  }
+
   /**
    * Derive the display title shown in the collapsed header.
    * While streaming: use the activeTitle (mutates as the model thinks).
@@ -20,10 +29,10 @@
    */
   const headerTitle = $derived.by(() => {
     if (item.streaming && item.activeTitle) {
-      return item.activeTitle;
+      return displayTitle(item.activeTitle);
     }
     if (item.blocks.length > 0) {
-      return item.blocks[item.blocks.length - 1].title;
+      return displayTitle(item.blocks[item.blocks.length - 1].title);
     }
     return 'Thinking';
   });
@@ -70,7 +79,7 @@
         <div class="px-3 py-2.5">
           {#if item.blocks.length > 1 || block.title !== headerTitle}
             <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-violet-400/60">
-              Thinking: {block.title}
+              Thinking: {displayTitle(block.title)}
             </p>
           {/if}
           <!-- Markdown-rendered thinking content -->
