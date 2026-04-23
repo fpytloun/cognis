@@ -2446,7 +2446,8 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     assert stable_tool_id(hidden_tool) in activated_tool_ids
     assert stable_tool_id(visible_tool) not in activated_tool_ids
     assert stable_tool_id(hidden_tool) in session_cache.activated_skill_tool_ids
-    assert session_cache.skill_tool_classifications["skill_daily_brief:hash-1"] == [
+    assert len(session_cache.skill_tool_classifications) == 1
+    assert next(iter(session_cache.skill_tool_classifications.values())) == [
         stable_tool_id(hidden_tool)
     ]
     # Promoted tool ids must also include the activated tool so it surfaces next turn.
@@ -2556,9 +2557,102 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
 
     assert fake_llm.calls == 3
     assert stable_tool_id(target_tool) in activated_tool_ids
-    assert session_cache.skill_tool_classifications["skill_chunked:hash-chunked"] == [
+    assert len(session_cache.skill_tool_classifications) == 1
+    assert next(iter(session_cache.skill_tool_classifications.values())) == [
         stable_tool_id(target_tool)
     ]
+
+
+@pytest.mark.asyncio
+async def test_skill_activation_cache_key_changes_when_tags_change() -> None:
+    """Tag-only edits must invalidate the cached activation decision."""
+
+    class _ClassifierLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            self.calls += 1
+            # No activations needed — we're only checking cache behaviour.
+            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+
+    hidden_tool = ToolDefinition(
+        name="browser_open",
+        description="Open a URL in the browser.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=hidden_tool, handler=None))
+
+    fake_llm = _ClassifierLLM()
+    session_cache = _NoopSessionCache()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
+        session=SimpleNamespace(session_id="sess-cache", intaris_session_id="sess-cache"),
+        conversation=SimpleNamespace(conversation_id="conv-cache"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_cache",
+                "name": "daily-brief",
+                "description": "Morning briefing skill.",
+                "instructions": "Open URLs in a browser.",
+                "tags": ["browser"],
+                "content_hash": "same-hash",
+            },
+            "discovered_tool_ids": [],
+        },
+        promoted_tool_ids=set(),
+        activated_tool_ids=set(),
+    )
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_cache",
+                "name": "daily-brief",
+                "description": "Morning briefing skill.",
+                "instructions": "Open URLs in a browser.",
+                "tags": ["calendar"],
+                "content_hash": "same-hash",
+            },
+            "discovered_tool_ids": [],
+        },
+        promoted_tool_ids=set(),
+        activated_tool_ids=set(),
+    )
+
+    # The classifier must be invoked twice because the cache key changed.
+    assert fake_llm.calls == 2
+    assert len(session_cache.skill_tool_classifications) == 2
 
 
 @pytest.mark.asyncio
@@ -2572,7 +2666,7 @@ async def test_relevant_skill_suggestions_use_classifier() -> None:
                 "choices": [
                     {
                         "message": {
-                            "content": '{"skill_ids": ["skill_evening", "skill_unknown"]}'
+                            "content": '{"skill_ids": ["skill_evening", "skill_unknown"], "confidence": {"skill_evening": "high", "skill_unknown": "low"}}'
                         }
                     }
                 ]
@@ -2706,6 +2800,581 @@ async def test_relevant_skill_suggestions_use_raw_intent_not_expanded_prompt() -
     # Expanded workflow boilerplate must NOT appear.
     assert "For coding work" not in user_prompt
     assert "write_deliverable" not in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_skill_activation_classifier_scopes_to_policy_hidden_tools_only() -> None:
+    """B1 — classifier candidates must exclude policy-visible tools.
+
+    Even if a policy-visible tool is cap-hidden in practice, the classifier
+    should only unlock tools that the step profile would NOT normally show.
+    Cap-hidden policy-visible tools are reachable via search_tools.
+    """
+    class _ClassifierLLM:
+        def __init__(self) -> None:
+            self.received_candidates: list[str] = []
+
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            user_msg = str(messages[-1].get("content") or "")
+            self.received_candidates.append(user_msg)
+            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+
+    # visible_tool: policy-visible under system:general-task (system group, READ).
+    visible_tool = ToolDefinition(
+        name="read_tool_output",
+        description="Read prior tool output.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="context",
+        read_only=True,
+    )
+    # hidden_tool: browser category — NOT in general-task matrix, so policy-hidden.
+    hidden_tool = ToolDefinition(
+        name="browser_open",
+        description="Open a URL in the browser.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=visible_tool, handler=None))
+    registry.register(RegisteredTool(definition=hidden_tool, handler=None))
+
+    fake_llm = _ClassifierLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
+        session=SimpleNamespace(session_id="sess-b1", intaris_session_id="sess-b1"),
+        conversation=SimpleNamespace(conversation_id="conv-b1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    activated_tool_ids: set[str] = set()
+    promoted_tool_ids: set[str] = set()
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_test",
+                "name": "test",
+                "description": "Test skill",
+                "instructions": "Test instructions",
+                "tags": ["browser"],
+                "content_hash": "hash-b1",
+            },
+            "discovered_tool_ids": [],
+        },
+        promoted_tool_ids=promoted_tool_ids,
+        activated_tool_ids=activated_tool_ids,
+    )
+
+    # The classifier must have been called with only the policy-hidden tool.
+    assert fake_llm.received_candidates, "classifier was never invoked"
+    candidate_text = " ".join(fake_llm.received_candidates)
+    assert "browser_open" in candidate_text
+    # read_tool_output is policy-visible and must NOT appear as a candidate.
+    assert "read_tool_output" not in candidate_text
+
+
+@pytest.mark.asyncio
+async def test_skill_activation_classifier_receives_tags_and_referenced_services() -> None:
+    """A1+A3 — classifier prompt must include skill tags and referenced services."""
+    from cognis.core.agent_loop import AgentLoop
+
+    class _ClassifierLLM:
+        def __init__(self) -> None:
+            self.user_prompts: list[str] = []
+
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            self.user_prompts.append(str(messages[-1].get("content") or ""))
+            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+
+    hidden_tool = ToolDefinition(
+        name="browser_open",
+        description="Open a URL in the browser.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=hidden_tool, handler=None))
+
+    fake_llm = _ClassifierLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
+        session=SimpleNamespace(session_id="sess-a1", intaris_session_id="sess-a1"),
+        conversation=SimpleNamespace(conversation_id="conv-a1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    activated_tool_ids: set[str] = set()
+    promoted_tool_ids: set[str] = set()
+    await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_brief",
+                "name": "daily-brief",
+                "description": "Morning briefing with Gmail and Calendar.",
+                "instructions": "Fetch calendar events from Google Calendar and inbox from Gmail.",
+                "tags": ["briefing", "gmail", "calendar"],
+                "content_hash": "hash-a1",
+            },
+            "discovered_tool_ids": [],
+        },
+        promoted_tool_ids=promoted_tool_ids,
+        activated_tool_ids=activated_tool_ids,
+    )
+
+    assert fake_llm.user_prompts, "classifier was never invoked"
+    prompt_text = " ".join(fake_llm.user_prompts)
+    # Tags must appear in the prompt.
+    assert "gmail" in prompt_text.lower()
+    assert "calendar" in prompt_text.lower()
+    # Referenced services derived from the instructions must appear.
+    assert "googleworkspace" in prompt_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_skill_activation_emits_transparency_notice_to_model() -> None:
+    """B2 — a <skill_activation> system message must be injected into messages
+    after classifier-based activation so the model can self-correct."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"tool_ids": ["builtin:browser_open"], "reasons": {"builtin:browser_open": "skill tag browser"}}'
+                        }
+                    }
+                ]
+            }
+
+    hidden_tool = ToolDefinition(
+        name="browser_open",
+        description="Open a URL in the browser.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=hidden_tool, handler=None))
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
+        session=SimpleNamespace(session_id="sess-b2", intaris_session_id="sess-b2"),
+        conversation=SimpleNamespace(conversation_id="conv-b2"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        tool_registry=registry,
+        policy=CHAT_POLICY,
+    )
+
+    activated_tool_ids: set[str] = set()
+    promoted_tool_ids: set[str] = set()
+    notice = await agent_loop._apply_skill_activation(
+        ctx,
+        metadata={
+            "skill_activation": {
+                "skill_id": "skill_browser",
+                "name": "browser-skill",
+                "description": "Browser automation skill.",
+                "instructions": "Open URLs in a browser.",
+                "tags": ["browser"],
+                "content_hash": "hash-b2",
+            },
+            "discovered_tool_ids": [],
+        },
+        promoted_tool_ids=promoted_tool_ids,
+        activated_tool_ids=activated_tool_ids,
+    )
+
+    assert notice is not None, "expected an activation notice"
+    assert "<skill_activation" in notice
+    assert "browser_open" in notice
+    assert "search_tools" in notice  # self-correction hint
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_suppress_low_confidence_singleton() -> None:
+    """Confidence threshold — a single low-confidence skill pick must be suppressed."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"skill_ids": ["skill_coding"], "confidence": {"skill_coding": "low"}}'
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-conf", intaris_session_id="sess-conf"),
+        conversation=SimpleNamespace(conversation_id="conv-conf"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_coding",
+                        "name": "cognis-coding",
+                        "description": "Cognis coding helper.",
+                        "tags": ["coding"],
+                    }
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Prepare the daily brief.",
+        task_title="Daily brief",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(
+        ctx,
+        user_message="irrelevant expanded prompt",
+    )
+    # Low-confidence singleton should be suppressed.
+    assert message is None
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_keep_high_confidence_pick() -> None:
+    """Confidence threshold — a single high-confidence pick must be kept."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"skill_ids": ["skill_brief"], "confidence": {"skill_brief": "high"}}'
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-conf2", intaris_session_id="sess-conf2"),
+        conversation=SimpleNamespace(conversation_id="conv-conf2"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_brief",
+                        "name": "daily-brief",
+                        "description": "Morning briefing skill.",
+                        "tags": ["briefing"],
+                    }
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Prepare the daily brief.",
+        task_title="Daily brief",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(
+        ctx,
+        user_message="irrelevant expanded prompt",
+    )
+    assert message is not None
+    assert "daily-brief" in str(message["content"])
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_keep_two_medium_picks() -> None:
+    """Confidence threshold — two medium picks together meet the threshold."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"skill_ids": ["skill_a", "skill_b"], '
+                                '"confidence": {"skill_a": "medium", "skill_b": "medium"}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-med", intaris_session_id="sess-med"),
+        conversation=SimpleNamespace(conversation_id="conv-med"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_a",
+                        "name": "skill-alpha",
+                        "description": "Alpha skill.",
+                        "tags": [],
+                    },
+                    {
+                        "skill_id": "skill_b",
+                        "name": "skill-beta",
+                        "description": "Beta skill.",
+                        "tags": [],
+                    },
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Do something.",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(
+        ctx,
+        user_message="irrelevant",
+    )
+    assert message is not None
+    assert "skill-alpha" in str(message["content"])
+    assert "skill-beta" in str(message["content"])
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_suppress_duplicate_medium_singleton() -> None:
+    """Duplicate medium-confidence IDs must not bypass the singleton suppression."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"skill_ids": ["skill_a", "skill_a"], '
+                                '"confidence": {"skill_a": "medium"}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-meddup", intaris_session_id="sess-meddup"),
+        conversation=SimpleNamespace(conversation_id="conv-meddup"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_a",
+                        "name": "skill-alpha",
+                        "description": "Alpha skill.",
+                        "tags": [],
+                    }
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Do something.",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(ctx, user_message="irrelevant")
+    assert message is None
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_suppress_missing_confidence_singleton() -> None:
+    """Missing confidence is treated conservatively, not as high confidence."""
+
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"skill_ids": ["skill_a"]}'
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-noconf", intaris_session_id="sess-noconf"),
+        conversation=SimpleNamespace(conversation_id="conv-noconf"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_a",
+                        "name": "skill-alpha",
+                        "description": "Alpha skill.",
+                        "tags": [],
+                    }
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Do something.",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(ctx, user_message="irrelevant")
+    assert message is None
 
 
 @pytest.mark.asyncio

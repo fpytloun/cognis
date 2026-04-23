@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -7620,10 +7621,11 @@ class AgentLoop:
             normalized_attachments = normalized_result_attachments
             collected_attachments.extend(normalized_attachments)
             pending_assistant_attachments.extend(normalized_attachments)
+        activation_notice: str | None = None
         if result.metadata:
             self._merge_promoted_tool_ids(promoted_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
-            await self._apply_skill_activation(
+            activation_notice = await self._apply_skill_activation(
                 ctx,
                 metadata=result.metadata,
                 promoted_tool_ids=promoted_tool_ids,
@@ -7653,6 +7655,16 @@ class AgentLoop:
                 {
                     "role": "system",
                     "content": protected_context,
+                    "_prior_context": True,
+                }
+            )
+        # B2 — inject the skill activation transparency notice after the
+        # skill instructions so the model can self-correct bad tool picks.
+        if isinstance(activation_notice, str) and activation_notice.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": activation_notice,
                     "_prior_context": True,
                 }
             )
@@ -9234,9 +9246,16 @@ class AgentLoop:
             {
                 "role": "system",
                 "content": (
-                    "You select which skills are relevant to a task. Return strict JSON with key "
-                    "'skill_ids' as an array of skill ids. Return an empty array when none clearly "
-                    "match. Be conservative and choose at most 5 skill ids."
+                    "You select which skills are relevant to a task. "
+                    "Return strict JSON with keys:\n"
+                    "  'skill_ids' — array of skill ids (max 5, empty when none clearly match)\n"
+                    "  'confidence' — object mapping skill_id to 'high', 'medium', or 'low'\n\n"
+                    "Confidence guide:\n"
+                    "  high   — the skill directly matches the task (e.g. task mentions the skill by name or "
+                    "tag, or the skill description is an exact fit)\n"
+                    "  medium — the skill is plausibly related but may not be required\n"
+                    "  low    — tenuous relevance; only matches by broad keyword\n\n"
+                    "Be conservative. Only 'high' confidence picks are guaranteed to be surfaced."
                 ),
             },
             {
@@ -9285,6 +9304,13 @@ class AgentLoop:
             )
             payload = extract_json_object(str(content or "{}"), label="relevant_skill_classifier")
             raw_ids = payload.get("skill_ids") if isinstance(payload, dict) else []
+            raw_confidence: dict[str, str] = {}
+            if isinstance(payload, dict) and isinstance(payload.get("confidence"), dict):
+                raw_confidence = {
+                    str(k): str(v).lower()
+                    for k, v in payload["confidence"].items()
+                    if isinstance(k, str) and isinstance(v, str)
+                }
         except Exception:
             logger.warning(
                 "skill suggestion classifier failed",
@@ -9304,16 +9330,68 @@ class AgentLoop:
             for skill in sorted_skills
             if isinstance(skill.get("skill_id"), str)
         }
-        selected_ids: list[str] = []
+
+        # Apply confidence threshold: suppress low-confidence singletons.
+        # A single low/medium match is likely a false positive; multiple
+        # medium matches signal a real pattern and are kept.
+        medium_ids: list[str] = []
+        high_ids: list[str] = []
+        confidence_fallback_count = 0
         for skill_id in raw_ids if isinstance(raw_ids, list) else []:
             if not isinstance(skill_id, str):
                 continue
             normalized = skill_id.strip()
-            if not normalized or normalized not in skills_by_id or normalized in selected_ids:
+            if not normalized or normalized not in skills_by_id:
                 continue
-            selected_ids.append(normalized)
-            if len(selected_ids) >= limit:
-                break
+            confidence = raw_confidence.get(normalized, "medium")
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "medium"
+            if normalized not in raw_confidence:
+                confidence_fallback_count += 1
+            if confidence == "low":
+                continue
+            if confidence == "medium":
+                medium_ids.append(normalized)
+            else:
+                high_ids.append(normalized)
+
+        # High-confidence picks always surface.
+        # Medium picks surface only when there are ≥ 2 (reduces single false positives).
+        selected_ids: list[str] = []
+        seen: set[str] = set()
+        for sid in high_ids:
+            if sid not in seen and len(selected_ids) < limit:
+                selected_ids.append(sid)
+                seen.add(sid)
+        unique_medium_ids = []
+        unique_medium_seen: set[str] = set()
+        for sid in medium_ids:
+            if sid not in unique_medium_seen:
+                unique_medium_seen.add(sid)
+                unique_medium_ids.append(sid)
+
+        if len(unique_medium_ids) >= 2:
+            for sid in unique_medium_ids:
+                if sid not in seen and len(selected_ids) < limit:
+                    selected_ids.append(sid)
+                    seen.add(sid)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "skill suggestion classifier confidence detail",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "raw_ids": list(raw_ids) if isinstance(raw_ids, list) else [],
+                        "confidence": raw_confidence,
+                        "medium_count": len(unique_medium_ids),
+                        "high_count": len(high_ids),
+                        "confidence_fallback_count": confidence_fallback_count,
+                        "selected_ids": selected_ids,
+                    }
+                },
+            )
 
         logger.info(
             "skill suggestion classifier resolved",
@@ -9324,6 +9402,8 @@ class AgentLoop:
                     "candidate_count": len(sorted_skills),
                     "resolved_count": len(selected_ids),
                     "resolved_skill_ids": selected_ids,
+                    "suppressed_medium_singleton": len(unique_medium_ids) == 1 and not high_ids,
+                    "confidence_fallback_count": confidence_fallback_count,
                 }
             },
         )
@@ -9369,6 +9449,64 @@ class AgentLoop:
         lines.append("</relevant_skills>")
         return {"role": "system", "content": "\n".join(lines)}
 
+    # ---------------------------------------------------------------------------
+    # Skill activation helpers
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _scan_referenced_services(
+        tags: list[str],
+        instructions: str,
+    ) -> list[str]:
+        """Return a deduplicated list of service/server names referenced by the skill.
+
+        The scan is deterministic and cheap: it lowercases the instructions once
+        and looks for any of the tag tokens plus a small fixed set of common
+        service keywords.  Matched tokens are normalised to the canonical server
+        name so the classifier can directly compare against ``source.server_name``.
+        """
+        fixed_services = {
+            "googleworkspace": "googleworkspace",
+            "google workspace": "googleworkspace",
+            "gmail": "googleworkspace",
+            "google calendar": "googleworkspace",
+            "google drive": "googleworkspace",
+            "google docs": "googleworkspace",
+            "google sheets": "googleworkspace",
+            "todoist": "todoist",
+            "notion": "notion",
+            "slack": "slack",
+            "github": "github",
+            "jira": "jira",
+            "linear": "linear",
+            "obsidian": "obsidian",
+            "home assistant": "hass",
+            "hass": "hass",
+            "oura": "oura",
+            "rohlik": "rohlik",
+            "browser": "browser",
+            "web": "web",
+            "ainews": "ainews",
+            "weather": "weather",
+        }
+        text = (instructions or "").lower()
+        found: list[str] = []
+        seen: set[str] = set()
+        # Tags are the highest-signal source, but only when they map to a known
+        # canonical service. Keep raw tags separate in the prompt; do not treat
+        # every arbitrary tag as a service hint.
+        for tag in tags:
+            canonical = fixed_services.get(tag.lower())
+            if canonical is not None and canonical not in seen:
+                seen.add(canonical)
+                found.append(canonical)
+        # Fixed service names.
+        for keyword, canonical in fixed_services.items():
+            if keyword in text and canonical not in seen:
+                seen.add(canonical)
+                found.append(canonical)
+        return found[:10]
+
     async def _classify_skill_activation_tool_ids(
         self,
         ctx: StepContext,
@@ -9376,14 +9514,39 @@ class AgentLoop:
         activation: dict[str, Any],
         candidate_tools: list[ToolDefinition],
     ) -> set[str]:
-        cache_key = f"{activation.get('skill_id', '')}:{activation.get('content_hash', '')}".strip(
-            ":"
-        ) or str(activation.get("skill_id") or "")
+        """Classify which policy-hidden tools the skill needs.
+
+        Returns the minimal set of tool ids that should be activated.
+        Results are cached per session by a prompt-shaping signature built from
+        the skill id, content hash, tags, name, and description so tag-only
+        edits cannot reuse stale activations.
+        """
+        cache_material = {
+            "skill_id": str(activation.get("skill_id") or "").strip(),
+            "content_hash": str(activation.get("content_hash") or "").strip(),
+            "name": str(activation.get("name") or "").strip(),
+            "description": str(activation.get("description") or "").strip(),
+            "tags": sorted(
+                str(tag).strip()
+                for tag in (activation.get("tags") or [])
+                if isinstance(tag, str) and str(tag).strip()
+            ),
+        }
+        cache_key = (
+            f"{cache_material['skill_id']}:"
+            f"{hashlib.sha1(json.dumps(cache_material, sort_keys=True).encode('utf-8')).hexdigest()[:16]}"
+        ).strip(":") or str(activation.get("skill_id") or "")
         cache_key_label = cache_key[:16]
         get_cached = getattr(self.session_cache, "get_skill_tool_classification", None)
         if callable(get_cached):
             cached = get_cached(ctx.session.session_id, cache_key)
             if isinstance(cached, list):
+                valid_tool_ids = {stable_tool_id(tool) for tool in candidate_tools}
+                revalidated = {
+                    str(tool_id)
+                    for tool_id in cached
+                    if isinstance(tool_id, str) and tool_id.strip() and tool_id in valid_tool_ids
+                }
                 logger.info(
                     "skill tool classifier cache hit",
                     extra={
@@ -9392,19 +9555,11 @@ class AgentLoop:
                             **self._step_log_metadata(ctx),
                             "skill_id": activation.get("skill_id"),
                             "cache_key": cache_key_label,
-                            "tool_ids": sorted(
-                                str(tool_id)
-                                for tool_id in cached
-                                if isinstance(tool_id, str) and tool_id.strip()
-                            ),
+                            "tool_ids": sorted(revalidated),
                         }
                     },
                 )
-                return {
-                    str(tool_id)
-                    for tool_id in cached
-                    if isinstance(tool_id, str) and tool_id.strip()
-                }
+                return revalidated
 
         logger.info(
             "skill tool classifier started",
@@ -9419,22 +9574,24 @@ class AgentLoop:
             },
         )
 
+        # Build structured candidate lines with rich metadata.
         candidate_lines = []
         tool_by_id = {stable_tool_id(tool): tool for tool in candidate_tools}
         for tool_id, tool in sorted(tool_by_id.items(), key=lambda item: (item[1].name.lower(), item[0])):
             source_label = tool.source.type
             if tool.source.server_name:
                 source_label = f"{tool.source.type}:{tool.source.server_name}"
+            description = re.sub(r"\s+", " ", str(tool.description or "")).strip()[:160]
             candidate_lines.append(
                 f"- {tool_id}: {tool.name}"
                 f" [category={tool.category}, profile={tool_profile_group(tool)}"
                 f", source={source_label}"
                 f", read_only={tool.read_only}]"
-                f" — {str(tool.description or '')[:160]}"
+                f" — {description}"
             )
         if not candidate_lines:
             logger.info(
-                "skill tool classifier found no hidden candidates",
+                "skill tool classifier found no policy-hidden candidates",
                 extra={
                     "extra_data": {
                         "session_id": ctx.session.session_id,
@@ -9445,6 +9602,7 @@ class AgentLoop:
                 },
             )
             return set()
+
         chunk_size = 100
         candidate_chunks = [
             candidate_lines[index : index + chunk_size]
@@ -9452,7 +9610,7 @@ class AgentLoop:
         ]
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "skill tool classifier payload",
+                "skill tool classifier candidates",
                 extra={
                     "extra_data": {
                         "session_id": ctx.session.session_id,
@@ -9461,50 +9619,74 @@ class AgentLoop:
                         "cache_key": cache_key_label,
                         "chunk_count": len(candidate_chunks),
                         "chunk_size": chunk_size,
-                        "candidate_tools": [
-                            {
-                                "tool_id": tool_id,
-                                "name": tool.name,
-                                "description": str(tool.description or "")[:160],
-                            }
-                            for tool_id, tool in sorted(
-                                tool_by_id.items(),
-                                key=lambda item: (item[1].name.lower(), item[0]),
-                            )[:300]
-                        ],
+                        "candidates": candidate_lines[:50],
                     }
                 },
             )
 
+        # Build structured skill context — tags + referenced services as hints.
+        skill_tags = [
+            str(t) for t in (activation.get("tags") or []) if isinstance(t, str)
+        ]
+        instructions_text = str(activation.get("instructions") or "")
+        referenced_services = self._scan_referenced_services(skill_tags, instructions_text)
+
+        # Produce an instruction-excerpt that preserves section headers.
+        excerpt_lines = []
+        remaining = 3000
+        for line in instructions_text.splitlines():
+            excerpt_lines.append(line)
+            remaining -= len(line) + 1
+            if remaining <= 0:
+                excerpt_lines.append("… (truncated)")
+                break
+        instructions_excerpt = "\n".join(excerpt_lines)
+
+        skill_context = (
+            f"Skill: {activation.get('name')} ({activation.get('skill_id')})\n"
+            f"Tags: {', '.join(skill_tags) or 'none'}\n"
+            f"Description: {activation.get('description') or ''}\n"
+            + (
+                f"Services referenced in instructions: {', '.join(referenced_services)}\n"
+                if referenced_services
+                else ""
+            )
+            + f"Instructions:\n{instructions_excerpt}"
+        )
+
+        # Tightened system prompt (A2).
+        system_prompt = (
+            "You classify which policy-hidden tools a loaded skill needs to activate. "
+            "Return strict JSON with keys 'tool_ids' (array of stable tool ids) and "
+            "'reasons' (object mapping tool_id to a one-sentence justification). "
+            "Return empty 'tool_ids' when no tool is clearly required.\n\n"
+            "Selection rules, in priority order:\n"
+            "1. Choose the MINIMAL set of tools the skill genuinely needs.\n"
+            "2. Prefer tools whose server_name or name matches a service named in the "
+            "skill tags or 'Services referenced' list (e.g. tag 'gmail' → prefer "
+            "tools from 'googleworkspace' server with 'gmail' in the name).\n"
+            "3. Prefer service-specific tools over generic alternatives. When the skill "
+            "mentions a concrete service, pick that service's tool, not a generic "
+            "stand-in (avoid generic names like 'search_custom', 'browser_open', "
+            "'browser_get_text' unless the skill explicitly requires generic web search "
+            "or browser automation).\n"
+            "4. Avoid tools with category/profile 'system' unless the skill explicitly "
+            "requires controller/admin operations.\n"
+            "5. Avoid read_only=False tools unless the skill explicitly performs writes.\n"
+            "6. Be conservative. An empty result is better than a wrong result."
+        )
+
         resolved: set[str] = set()
+        all_reasons: dict[str, str] = {}
         for chunk_index, candidate_chunk in enumerate(candidate_chunks, start=1):
             messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You classify which hidden tools a loaded skill needs to activate. "
-                        "Return strict JSON with key 'tool_ids' as an array of stable tool ids. "
-                        "Return an empty array when no tool is clearly required.\n\n"
-                        "Rules:\n"
-                        "- Choose the MINIMAL set of tools the skill genuinely needs.\n"
-                        "- Prefer domain/data tools (mcp, web, memory, filesystem) over "
-                        "generic controller/system/admin tools.\n"
-                        "- Avoid tools whose category or profile group is 'system' unless "
-                        "the skill explicitly requires controller operations.\n"
-                        "- Avoid tools marked read_only=False unless the skill explicitly "
-                        "performs write operations.\n"
-                        "- Be conservative: an empty result is better than a wrong result."
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": (
-                        f"Skill id: {activation.get('skill_id')}\n"
-                        f"Name: {activation.get('name')}\n"
-                        f"Description: {activation.get('description')}\n"
-                        f"Instructions:\n{str(activation.get('instructions') or '')[:4000]}\n\n"
+                        f"{skill_context}\n\n"
                         f"Candidate chunk: {chunk_index}/{len(candidate_chunks)}\n"
-                        "Each candidate line format: "
+                        "Each candidate line: "
                         "- tool_id: name [category=X, profile=Y, source=Z, read_only=T/F] — description\n"
                         "Candidate tools:\n"
                         + "\n".join(candidate_chunk)
@@ -9528,6 +9710,12 @@ class AgentLoop:
                     label="skill_tool_classifier",
                 )
                 raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []
+                # A4: capture reasons at DEBUG level only.
+                reasons = payload.get("reasons") if isinstance(payload, dict) else None
+                if isinstance(reasons, dict):
+                    all_reasons.update(
+                        {str(k): str(v)[:200] for k, v in reasons.items() if k and v}
+                    )
             except Exception:
                 logger.warning(
                     "skill tool classifier failed",
@@ -9550,6 +9738,7 @@ class AgentLoop:
                     if isinstance(tool_id, str) and tool_id.strip() and tool_id in tool_by_id
                 }
             )
+
         set_cached = getattr(self.session_cache, "set_skill_tool_classification", None)
         if callable(set_cached):
             set_cached(ctx.session.session_id, cache_key, sorted(resolved))
@@ -9565,9 +9754,23 @@ class AgentLoop:
                     "chunk_count": len(candidate_chunks),
                     "resolved_count": len(resolved),
                     "resolved_tool_ids": sorted(resolved),
+                    "referenced_services": referenced_services,
+                    "skill_tags": skill_tags,
                 }
             },
         )
+        if all_reasons and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "skill tool classifier reasons",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "skill_id": activation.get("skill_id"),
+                        "reasons": {k: v for k, v in all_reasons.items() if k in resolved},
+                    }
+                },
+            )
         return resolved
 
     async def _apply_skill_activation(
@@ -9577,7 +9780,13 @@ class AgentLoop:
         metadata: dict[str, Any],
         promoted_tool_ids: set[str],
         activated_tool_ids: set[str],
-    ) -> None:
+    ) -> str | None:
+        """Activate tools for a loaded skill.
+
+        Returns an optional transparency notice string (``<skill_activation>``
+        block) that the caller should inject as a system message so the model
+        knows which tools were auto-enabled and can self-correct if needed.
+        """
         activation = metadata.get("skill_activation")
         if not isinstance(activation, dict):
             return
@@ -9604,27 +9813,24 @@ class AgentLoop:
                 promoted_tool_ids,
                 activated_tool_ids,
             )
-            searchable_tool_ids = {
-                stable_tool_id(tool)
-                for tool in full_inventory_tools
-                if step_profile_allows_tool(tool, resolved_profile)
-                or stable_tool_id(tool) in activated_tool_ids
-            }
-            already_visible_tool_ids = {
-                stable_tool_id(tool)
-                for tool in full_inventory_tools
-                if stable_tool_id(tool) in searchable_tool_ids
-                and (
-                    step_profile_visible_by_default(tool, resolved_profile)
-                    or stable_tool_id(tool) in promoted_tool_ids
-                    or stable_tool_id(tool) in activated_tool_ids
-                )
-            }
+            # B1 — strict policy-hidden scope.
+            # The classifier's job is to UNLOCK tools that the step profile
+            # would not expose by default.  Policy-visible tools are already
+            # reachable through the normal visible set plus search_tools; they
+            # do not need activation and should not appear as candidates.
+            # (Previously we scoped by "not already_visible_tool_ids" which was
+            # "not currently visible due to cap" — that over-included policy-
+            # visible tools and let the classifier activate wrong service tools
+            # like 'search_custom' instead of 'get_events'.)
             candidate_tools = [
                 tool
                 for tool in full_inventory_tools
-                if stable_tool_id(tool) in searchable_tool_ids
-                and stable_tool_id(tool) not in already_visible_tool_ids
+                if (
+                    step_profile_allows_tool(tool, resolved_profile)
+                    or stable_tool_id(tool) in activated_tool_ids
+                )
+                and not step_profile_visible_by_default(tool, resolved_profile)
+                and stable_tool_id(tool) not in activated_tool_ids
             ]
             resolved_tool_ids = await self._classify_skill_activation_tool_ids(
                 ctx,
@@ -9643,7 +9849,7 @@ class AgentLoop:
                     }
                 },
             )
-            return
+            return None
 
         # Promote the resolved tool ids so they become visible next turn.
         promoted_tool_ids.update(resolved_tool_ids)
@@ -9664,6 +9870,30 @@ class AgentLoop:
                 }
             },
         )
+
+        # B2 — return a transparency notice for the model.
+        # Keeps it short: tool names only, plus a self-correction hint.
+        notice_lines = [
+            f"<skill_activation skill_id=\"{skill_id}\">",
+            "The following tools were auto-enabled for this skill. "
+            "If they do not match what the skill actually needs, call search_tools "
+            "to find the correct ones.",
+        ]
+        for tool_id_str in sorted(resolved_tool_ids):
+            tool_obj = (
+                next(
+                    (
+                        t
+                        for t in (ctx.tool_registry.list_tools() if ctx.tool_registry else [])
+                        if stable_tool_id(t) == tool_id_str
+                    ),
+                    None,
+                )
+            )
+            name = tool_obj.name if tool_obj else tool_id_str
+            notice_lines.append(f"- {name} ({tool_id_str})")
+        notice_lines.append("</skill_activation>")
+        return "\n".join(notice_lines)
 
     def _merge_promoted_tool_ids(
         self, promoted_tool_ids: set[str], metadata: dict[str, Any]

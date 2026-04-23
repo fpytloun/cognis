@@ -648,6 +648,7 @@ async def _handle_skill_load(
                 "name": row.name,
                 "description": row.description,
                 "instructions": instructions,
+                "tags": row.tags or [],
                 "content_hash": (
                     version_row.content_hash
                     if version_row is not None and isinstance(version_row.content_hash, str)
