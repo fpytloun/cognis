@@ -46,7 +46,6 @@ from cognis.models.workflow import (
     WorkflowState,
 )
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
-from cognis.tools.builtin.image import IMAGE_EDIT_TOOL
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -2349,13 +2348,24 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_skill_load_classifier_activates_tools_for_session() -> None:
+async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -> None:
     class _ClassifierLLM:
         async def generate(
             self, messages: list[dict[str, object]], **_: object
         ) -> dict[str, object]:
             del messages
-            return {"choices": [{"message": {"content": '{"tool_ids": ["builtin:image_edit"]}'}}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"tool_ids": ["builtin:read_tool_output", '
+                                '"builtin:browser_snapshot"]}'
+                            )
+                        }
+                    }
+                ]
+            }
 
         async def get_model_info(self, model: str | None) -> SimpleNamespace:
             del model
@@ -2365,8 +2375,25 @@ async def test_skill_load_classifier_activates_tools_for_session() -> None:
             del model
             return len(text)
 
+    hidden_tool = ToolDefinition(
+        name="browser_snapshot",
+        description="Edit an existing image for the brief hero card.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="browser",
+        read_only=True,
+    )
+    visible_tool = ToolDefinition(
+        name="read_tool_output",
+        description="Read prior tool output.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="context",
+        read_only=True,
+    )
     registry = ToolRegistry()
-    registry.register(RegisteredTool(definition=IMAGE_EDIT_TOOL, handler=None))
+    registry.register(RegisteredTool(definition=hidden_tool, handler=None))
+    registry.register(RegisteredTool(definition=visible_tool, handler=None))
     session_cache = _NoopSessionCache()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
@@ -2381,7 +2408,12 @@ async def test_skill_load_classifier_activates_tools_for_session() -> None:
         pause_waiter=PauseWaiter(),
     )
     ctx = StepContext(
-        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            step_profile_id="system:general-task",
+        ),
         session=SimpleNamespace(session_id="sess-skill", intaris_session_id="sess-skill"),
         conversation=SimpleNamespace(conversation_id="conv-skill"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
@@ -2406,11 +2438,81 @@ async def test_skill_load_classifier_activates_tools_for_session() -> None:
         activated_tool_ids=activated_tool_ids,
     )
 
-    assert stable_tool_id(IMAGE_EDIT_TOOL) in activated_tool_ids
-    assert stable_tool_id(IMAGE_EDIT_TOOL) in session_cache.activated_skill_tool_ids
+    assert stable_tool_id(hidden_tool) in activated_tool_ids
+    assert stable_tool_id(visible_tool) not in activated_tool_ids
+    assert stable_tool_id(hidden_tool) in session_cache.activated_skill_tool_ids
     assert session_cache.skill_tool_classifications["skill_daily_brief:hash-1"] == [
-        stable_tool_id(IMAGE_EDIT_TOOL)
+        stable_tool_id(hidden_tool)
     ]
+
+
+@pytest.mark.asyncio
+async def test_relevant_skill_suggestions_use_classifier() -> None:
+    class _ClassifierLLM:
+        async def generate(
+            self, messages: list[dict[str, object]], **_: object
+        ) -> dict[str, object]:
+            del messages
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"skill_ids": ["skill_evening", "skill_unknown"]}'
+                        }
+                    }
+                ]
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="execute", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-skill-suggest", intaris_session_id="sess-skill-suggest"),
+        conversation=SimpleNamespace(conversation_id="conv-skill-suggest"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_runtime_skill_summaries": [
+                    {
+                        "skill_id": "skill_evening",
+                        "name": "evening-summary",
+                        "description": "Summarize the evening.",
+                        "tags": ["summary"],
+                    },
+                    {
+                        "skill_id": "skill_morning",
+                        "name": "morning-summary",
+                        "description": "Summarize the morning.",
+                        "tags": ["summary"],
+                    },
+                ]
+            },
+        ),
+        policy=CHAT_POLICY,
+        user_message="Prepare the evening summary.",
+    )
+
+    message = await agent_loop._build_relevant_skills_message(
+        ctx,
+        user_message="expanded workflow prompt should not be used here",
+    )
+
+    assert message is not None
+    assert message["role"] == "system"
+    assert "evening-summary" in str(message["content"])
+    assert "morning-summary" not in str(message["content"])
 
 
 @pytest.mark.asyncio

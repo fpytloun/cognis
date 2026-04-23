@@ -318,7 +318,7 @@ def step_profile_allows_tool(tool: ToolDefinition, profile: ResolvedStepProfile)
 def step_profile_visible_by_default(tool: ToolDefinition, profile: ResolvedStepProfile) -> bool:
     """Return whether a tool should be pre-exposed before search discovery."""
 
-    return step_profile_allows_tool(tool, profile)
+    return apply_profile_overrides(tool, profile)
 
 
 def _merge_profile_config(

@@ -19,12 +19,16 @@ from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.project_context import ProjectContextEntry, build_project_instruction_message
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
-from cognis.core.step_profiles import resolve_step_profile, step_profile_visible_by_default
+from cognis.core.step_profiles import (
+    resolve_step_profile,
+    step_profile_allows_tool,
+    step_profile_visible_by_default,
+)
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.config import ModelInfo
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
 from cognis.models.tool import ToolDefinition, ToolSource
-from cognis.models.workflow import StepDefinition
+from cognis.models.workflow import StepDefinition, StepProfileMode
 
 
 class _CacheEntry:
@@ -1496,7 +1500,11 @@ def test_direct_default_profile_keeps_delegate_visible() -> None:
         _profile_tool("create_task", category="orchestration", read_only=False),
         profile,
     )
-    assert step_profile_visible_by_default(
+    assert not step_profile_visible_by_default(
+        _profile_tool("bash", category="shell", read_only=False),
+        profile,
+    )
+    assert step_profile_allows_tool(
         _profile_tool("bash", category="shell", read_only=False),
         profile,
     )
@@ -1510,7 +1518,7 @@ def test_direct_default_profile_keeps_delegate_visible() -> None:
     )
 
 
-def test_general_task_profile_uses_soft_visibility_for_eligible_tools() -> None:
+def test_general_task_profile_uses_matrix_for_visible_tools_but_keeps_broad_search() -> None:
     profile = resolve_step_profile(
         StepDefinition(
             name="task",
@@ -1538,6 +1546,35 @@ def test_general_task_profile_uses_soft_visibility_for_eligible_tools() -> None:
     )
     assert not step_profile_visible_by_default(
         _profile_tool("get_status", category="system", read_only=True),
+        profile,
+    )
+    assert not step_profile_visible_by_default(
+        _profile_tool("browser_snapshot", category="browser", read_only=True),
+        profile,
+    )
+    assert step_profile_allows_tool(
+        _profile_tool("browser_snapshot", category="browser", read_only=True),
+        profile,
+    )
+
+
+def test_hard_profile_hides_and_removes_out_of_matrix_tools() -> None:
+    profile = resolve_step_profile(
+        StepDefinition(
+            name="direct",
+            type="run",
+            prompt="",
+            step_profile_id="system:direct-default",
+            step_profile_mode=StepProfileMode.HARD,
+        )
+    )
+
+    assert not step_profile_visible_by_default(
+        _profile_tool("bash", category="shell", read_only=False),
+        profile,
+    )
+    assert not step_profile_allows_tool(
+        _profile_tool("bash", category="shell", read_only=False),
         profile,
     )
 

@@ -888,9 +888,8 @@ provider-specific discovery strategy.  The profile decides two things:
 
 Mode semantics:
 
-- `soft` makes all profile-eligible tools visible by default; discovery is still
-  available for additional eligible tools introduced through deferred loading or
-  skill activation
+- `soft` narrows the default-visible tool surface to the profile matrix plus
+  explicit overrides, while keeping the searchable inventory broad for that step
 - `hard` narrows the searchable inventory too, so discovery cannot escape the
   hard-approved subset
 - agent/executor/runtime tool assignment remains the outer hard boundary in all
@@ -909,7 +908,7 @@ skill-defined tools that are not attached by default.
 2. If the skill version declares tool summaries that resolve to tool ids,
    Cognis activates those ids immediately.
 3. If the skill has no declared tool ids, Cognis retrieves BM25-ranked tool
-   candidates from the current eligible inventory and asks the configured
+   candidates from the current hidden searchable inventory and asks the configured
    ``classifier`` model to choose zero or more tool ids.
 4. Activated tool ids are cached for the current session and included in later
    model-facing visibility calculations.
@@ -945,7 +944,7 @@ provider configuration is updated.
    - Deferred: MCP, Intaris MCP, overflow → loaded on demand
 
 3. Resolve the step profile:
-   - Filter the eligible inventory (`hard` narrows search, `soft` keeps eligible tools visible)
+   - Filter the eligible inventory (`hard` narrows search, `soft` keeps search broad)
    - Compute the default-visible subset for the step
 
 4. Detect provider capabilities:

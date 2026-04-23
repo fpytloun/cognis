@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -76,7 +77,7 @@ from cognis.core.tool_exposure import (
     ToolExposureContract,
     prepare_tool_exposure,
 )
-from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
+from cognis.core.tool_retrieval import retrieve_relevant_tools
 from cognis.core.truncation import middle_truncate
 from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
@@ -2120,7 +2121,7 @@ class AgentLoop:
             self._raise_if_cancelled(ctx)
 
             if not relevant_skills_message_added:
-                relevant_skills_message = self._build_relevant_skills_message(
+                relevant_skills_message = await self._build_relevant_skills_message(
                     ctx,
                     user_message=effective_user_message,
                 )
@@ -8814,7 +8815,173 @@ class AgentLoop:
             or getattr(step_definition, "name", None),
         }
 
-    def _build_relevant_skills_message(
+    async def _classify_relevant_skills(
+        self,
+        ctx: StepContext,
+        *,
+        user_message: str,
+        skills: list[dict[str, Any]],
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        if not skills:
+            return []
+
+        query_text = str(ctx.user_message or user_message or "").strip() or user_message
+        sorted_skills = sorted(
+            (
+                skill
+                for skill in skills
+                if isinstance(skill, dict)
+                and isinstance(skill.get("skill_id"), str)
+                and str(skill.get("skill_id") or "").strip()
+                and isinstance(skill.get("name"), str)
+                and str(skill.get("name") or "").strip()
+            ),
+            key=lambda item: (
+                str(item.get("name") or "").lower(),
+                str(item.get("skill_id") or "").lower(),
+            ),
+        )
+        if not sorted_skills:
+            return []
+
+        logger.info(
+            "skill suggestion classifier started",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "query_length": len(query_text),
+                    "candidate_count": len(sorted_skills),
+                    "limit": limit,
+                }
+            },
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "skill suggestion classifier payload",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "query_length": len(query_text),
+                        "skills": [
+                            {
+                                "skill_id": str(skill.get("skill_id")),
+                                "name": str(skill.get("name")),
+                                "description": str(skill.get("description") or ""),
+                                "tags": [
+                                    str(tag)
+                                    for tag in skill.get("tags") or []
+                                    if isinstance(tag, str)
+                                ],
+                            }
+                            for skill in sorted_skills[:50]
+                        ],
+                    }
+                },
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You select which skills are relevant to a task. Return strict JSON with key "
+                    "'skill_ids' as an array of skill ids. Return an empty array when none clearly "
+                    "match. Be conservative and choose at most 5 skill ids."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Task:\n{query_text}\n\nAvailable skills:\n"
+                    + "\n".join(
+                        f"- {skill['skill_id']}: {skill['name']} — "
+                        f"{str(skill.get('description') or 'No description provided.')}"
+                        + (
+                            f" [tags: {', '.join(str(tag) for tag in skill.get('tags') or [] if isinstance(tag, str))}]"
+                            if any(isinstance(tag, str) for tag in skill.get("tags") or [])
+                            else ""
+                        )
+                        for skill in sorted_skills
+                    )
+                    + "\n\nReturn JSON only."
+                ),
+            },
+        ]
+
+        generate = getattr(self.providers.llm, "generate", None)
+        if not callable(generate):
+            logger.warning(
+                "skill suggestion classifier unavailable",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "candidate_count": len(sorted_skills),
+                    }
+                },
+            )
+            return []
+
+        try:
+            response = await generate(
+                messages,
+                task_type="classifier",
+                response_format={"type": "json_object"},
+            )
+            content = (
+                response.get("choices", [{}])[0].get("message", {}).get("content")
+                if isinstance(response, dict)
+                else None
+            )
+            payload = extract_json_object(str(content or "{}"), label="relevant_skill_classifier")
+            raw_ids = payload.get("skill_ids") if isinstance(payload, dict) else []
+        except Exception:
+            logger.warning(
+                "skill suggestion classifier failed",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "candidate_count": len(sorted_skills),
+                    }
+                },
+                exc_info=True,
+            )
+            return []
+
+        skills_by_id = {
+            str(skill.get("skill_id")): skill
+            for skill in sorted_skills
+            if isinstance(skill.get("skill_id"), str)
+        }
+        selected_ids: list[str] = []
+        for skill_id in raw_ids if isinstance(raw_ids, list) else []:
+            if not isinstance(skill_id, str):
+                continue
+            normalized = skill_id.strip()
+            if not normalized or normalized not in skills_by_id or normalized in selected_ids:
+                continue
+            selected_ids.append(normalized)
+            if len(selected_ids) >= limit:
+                break
+
+        logger.info(
+            "skill suggestion classifier resolved",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    **self._step_log_metadata(ctx),
+                    "candidate_count": len(sorted_skills),
+                    "resolved_count": len(selected_ids),
+                    "resolved_skill_ids": selected_ids,
+                }
+            },
+        )
+        return [skills_by_id[skill_id] for skill_id in selected_ids]
+
+    async def _build_relevant_skills_message(
         self,
         ctx: StepContext,
         *,
@@ -8823,16 +8990,11 @@ class AgentLoop:
         skills = _runtime_skill_summaries(ctx.agent)
         if not skills:
             return None
-        relevant = retrieve_relevant_skills(
-            user_message,
-            skills,
-            loaded_skill_ids=set(),
+        relevant = await self._classify_relevant_skills(
+            ctx,
+            user_message=user_message,
+            skills=skills,
             limit=5,
-            log_context={
-                "reason": "relevant_skill_suggestions",
-                "session_id": ctx.session.session_id,
-                **self._step_log_metadata(ctx),
-            },
         )
         if not relevant:
             return None
@@ -8842,7 +9004,7 @@ class AgentLoop:
                 "extra_data": {
                     "session_id": ctx.session.session_id,
                     **self._step_log_metadata(ctx),
-                    "skill_ids": [item.skill_id for item in relevant],
+                    "skill_ids": [str(item.get("skill_id")) for item in relevant],
                     "skill_count": len(relevant),
                 }
             },
@@ -8853,7 +9015,8 @@ class AgentLoop:
         ]
         for item in relevant:
             lines.append(
-                f"- {item.name} ({item.skill_id}): {item.description or 'No description provided.'}"
+                f"- {str(item.get('name') or '')} ({str(item.get('skill_id') or '')}): "
+                f"{str(item.get('description') or 'No description provided.')}"
             )
         lines.append("</relevant_skills>")
         return {"role": "system", "content": "\n".join(lines)}
@@ -9058,12 +9221,35 @@ class AgentLoop:
         resolution_path = "declared"
         if not resolved_tool_ids and ctx.tool_registry is not None:
             resolution_path = "classified"
-            candidate_tools = _filter_model_inventory_tools(
+            resolved_profile = resolve_step_profile(ctx.step_definition)
+            full_inventory_tools = _filter_model_inventory_tools(
                 ctx.agent,
                 classify_tool_definitions_sync(ctx.tool_registry.list_tools()),
                 discovered_tool_ids,
                 activated_tool_ids,
             )
+            searchable_tool_ids = {
+                stable_tool_id(tool)
+                for tool in full_inventory_tools
+                if step_profile_allows_tool(tool, resolved_profile)
+                or stable_tool_id(tool) in activated_tool_ids
+            }
+            already_visible_tool_ids = {
+                stable_tool_id(tool)
+                for tool in full_inventory_tools
+                if stable_tool_id(tool) in searchable_tool_ids
+                and (
+                    step_profile_visible_by_default(tool, resolved_profile)
+                    or stable_tool_id(tool) in discovered_tool_ids
+                    or stable_tool_id(tool) in activated_tool_ids
+                )
+            }
+            candidate_tools = [
+                tool
+                for tool in full_inventory_tools
+                if stable_tool_id(tool) in searchable_tool_ids
+                and stable_tool_id(tool) not in already_visible_tool_ids
+            ]
             resolved_tool_ids = await self._classify_skill_activation_tool_ids(
                 ctx,
                 activation=activation,
