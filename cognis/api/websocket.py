@@ -224,6 +224,7 @@ class WebSocketTurnObserver:
         is_error: bool,
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "tool_result",
@@ -238,6 +239,8 @@ class WebSocketTurnObserver:
         }
         if evaluation:
             payload["evaluation"] = evaluation
+        if attachments:
+            payload["attachments"] = strip_attachment_payload_bytes(attachments)
         await self._manager.send_to_conversation(conversation_id, payload)
 
     async def on_turn_complete(self, result: TurnResult) -> None:
@@ -574,6 +577,14 @@ class WebSocketConnectionManager:
                     )
                     replayed += 1
                 elif event_type == "tool_result":
+                    attachments = await hydrate_attachment_refs(
+                        artifact_session,
+                        artifact_store,
+                        data.get("attachments") if isinstance(data.get("attachments"), list) else [],
+                        owner_email=connection.user_email,
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                    )
                     await connection.send_json(
                         {
                             "type": "tool_result",
@@ -586,6 +597,7 @@ class WebSocketConnectionManager:
                             "is_error": bool(data.get("is_error", False)),
                             "duration_ms": data.get("duration_ms"),
                             "evaluation": data.get("evaluation"),
+                            "attachments": attachments,
                         }
                     )
                     replayed += 1
@@ -1525,6 +1537,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "is_error": bool(event.data.get("is_error", False)),
                 "duration_ms": event.data.get("duration_ms"),
                 "evaluation": event.data.get("evaluation"),
+                "attachments": event.data.get("attachments") or [],
                 "timestamp": event.timestamp.isoformat() if event.timestamp else None,
             }
         return {

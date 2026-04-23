@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ToolCallTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';
+  import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
@@ -346,6 +347,13 @@
                 {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
               </button>
             {/if}
+          </div>
+        {/if}
+
+        {#if item.attachments && item.attachments.length > 0}
+          <div>
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Artifacts</p>
+            <MessageAttachments attachments={item.attachments} />
           </div>
         {/if}
       {/if}

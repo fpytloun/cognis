@@ -872,6 +872,7 @@ class ChannelTurnObserver:
         is_error: bool,
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         """No-op for tool results."""
 

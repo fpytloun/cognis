@@ -1358,6 +1358,7 @@ export interface WebSocketToolResultEvent {
   is_error: boolean;
   duration_ms: number | null;
   timestamp?: string | null;
+  attachments?: AttachmentRef[];
   evaluation?: {
     decision: string;
     reasoning?: string;

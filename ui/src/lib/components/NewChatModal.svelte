@@ -1,6 +1,5 @@
 <script lang="ts">
   import type { Agent } from '$lib/types/api';
-  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
 
@@ -46,15 +45,19 @@
     {/if}
 
     <div class={error ? 'mt-5' : ''}>
-      <AgentSelect
-        label="Primary agent"
-        agents={primaryAgents}
-        value={selectedAgentId}
-        onchange={(next) => { selectedAgentId = next; }}
-        disabled={busy || primaryAgents.length === 0}
-        emptyLabel="No active primary agents"
-        placeholder="Select an agent"
-      />
+      <label class="block space-y-1">
+        <span class="block text-xs font-medium uppercase tracking-widest text-slate-500">Primary agent</span>
+        <select
+          bind:value={selectedAgentId}
+          class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+          disabled={busy || primaryAgents.length === 0}
+        >
+          <option value="" disabled>{primaryAgents.length === 0 ? 'No active primary agents' : 'Select an agent'}</option>
+          {#each primaryAgents as agent (agent.agent_id)}
+            <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
+          {/each}
+        </select>
+      </label>
     </div>
   {/snippet}
 

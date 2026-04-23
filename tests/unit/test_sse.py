@@ -39,3 +39,41 @@ async def test_sse_turn_complete_includes_sanitized_attachments() -> None:
             "size_bytes": 3,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_sse_tool_result_includes_sanitized_attachments() -> None:
+    observer = SSETurnObserver("conv-1")
+
+    await observer.on_tool_result(
+        "conv-1",
+        "sess-1",
+        "call-1",
+        "generate_document",
+        "done",
+        False,
+        20,
+        None,
+        [
+            {
+                "artifact_id": "doc_1",
+                "kind": "pdf",
+                "mime_type": "application/pdf",
+                "filename": "summary.pdf",
+                "size_bytes": 5,
+                "content_b64": "YWJj",
+            }
+        ],
+    )
+
+    event = await observer._queue.get()  # noqa: SLF001
+    assert event["event"] == "tool_result"
+    assert event["data"]["attachments"] == [
+        {
+            "artifact_id": "doc_1",
+            "kind": "pdf",
+            "mime_type": "application/pdf",
+            "filename": "summary.pdf",
+            "size_bytes": 5,
+        }
+    ]

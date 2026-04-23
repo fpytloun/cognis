@@ -77,7 +77,6 @@ from cognis.core.tool_exposure import (
     ToolExposureContract,
     prepare_tool_exposure,
 )
-from cognis.core.tool_retrieval import retrieve_relevant_tools
 from cognis.core.truncation import middle_truncate
 from cognis.json_stream import merge_incremental_json_fragment, recover_trailing_json_object
 from cognis.logging import get_logger
@@ -2315,6 +2314,25 @@ class AgentLoop:
                         ),
                     },
                 )
+            logger.info(
+                "tool exposure prepared",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "strategy": exposure.debug_metadata.get("strategy"),
+                        "step_profile_id": resolved_profile.profile_id,
+                        "step_profile_mode": (
+                            str(resolved_profile.mode) if resolved_profile.mode is not None else None
+                        ),
+                        "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
+                        "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
+                        "deferred_tool_count": exposure.debug_metadata.get("deferred_tool_count"),
+                        "discovered_tool_count": exposure.debug_metadata.get("discovered_tool_count"),
+                        "activated_tool_count": len(activated_tool_ids),
+                    }
+                },
+            )
             search_tools_visible = any(
                 tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
                 for tool in exposure.tools
@@ -4118,6 +4136,7 @@ class AgentLoop:
                             else None
                         ),
                         limit=int(tc.arguments.get("limit", 10) or 10),
+                        already_visible_tool_ids=set(exposure.visible_tool_ids),
                         log_context={
                             "reason": "search_tools_builtin",
                             "session_id": ctx.session.session_id,
@@ -7247,6 +7266,8 @@ class AgentLoop:
                 recovery_call_id = candidate_recovery_call_id
         if recovery_call_id is None and has_saved_output:
             recovery_call_id = tc.call_id
+        normalized_result_attachments = normalize_attachment_refs(result.attachments or [])
+        safe_result_attachments = strip_attachment_payload_bytes(normalized_result_attachments)
         events_to_record.append(
             SessionEvent(
                 type="tool_result",
@@ -7264,6 +7285,7 @@ class AgentLoop:
                     "has_full_output": has_saved_output,
                     "recovery_call_id": recovery_call_id,
                     "evaluation": eval_meta,
+                    "attachments": safe_result_attachments,
                     "protect_from_pruning": bool(
                         result.metadata and result.metadata.get("protected_context")
                     ),
@@ -7286,9 +7308,10 @@ class AgentLoop:
                 result.is_error,
                 result.duration_ms,
                 eval_meta,
+                safe_result_attachments or None,
             )
-        if result.attachments:
-            normalized_attachments = normalize_attachment_refs(result.attachments)
+        if normalized_result_attachments:
+            normalized_attachments = normalized_result_attachments
             collected_attachments.extend(normalized_attachments)
             pending_assistant_attachments.extend(normalized_attachments)
         if result.metadata:
@@ -7343,6 +7366,7 @@ class AgentLoop:
                     "is_error": result.is_error,
                     "duration_ms": result.duration_ms,
                     "evaluation": eval_meta,
+                    "attachments": safe_result_attachments,
                 },
             )
         )
@@ -9071,51 +9095,13 @@ class AgentLoop:
             },
         )
 
-        ranked_tools = retrieve_relevant_tools(
-            " ".join(
-                part
-                for part in (
-                    str(activation.get("name") or "").strip(),
-                    str(activation.get("description") or "").strip(),
-                    str(activation.get("instructions") or "")[:2000].strip(),
-                )
-                if part
-            ),
-            candidate_tools,
-            already_visible_tool_ids=set(),
-            limit=20,
-            log_context={
-                "reason": "skill_tool_classifier_candidates",
-                "session_id": ctx.session.session_id,
-                **self._step_log_metadata(ctx),
-                "skill_id": activation.get("skill_id"),
-                "cache_key": cache_key_label,
-            },
-        )
-        if not ranked_tools:
-            logger.info(
-                "skill tool classifier found no BM25 candidates",
-                extra={
-                    "extra_data": {
-                        "session_id": ctx.session.session_id,
-                        **self._step_log_metadata(ctx),
-                        "skill_id": activation.get("skill_id"),
-                        "cache_key": cache_key_label,
-                    }
-                },
-            )
-            return set()
-
         candidate_lines = []
         tool_by_id = {stable_tool_id(tool): tool for tool in candidate_tools}
-        for item in ranked_tools:
-            tool = tool_by_id.get(item.tool_id)
-            if tool is None:
-                continue
-            candidate_lines.append(f"- {item.tool_id}: {tool.name} — {tool.description}")
+        for tool_id, tool in sorted(tool_by_id.items(), key=lambda item: (item[1].name.lower(), item[0])):
+            candidate_lines.append(f"- {tool_id}: {tool.name} — {str(tool.description or '')[:160]}")
         if not candidate_lines:
             logger.info(
-                "skill tool classifier candidate list empty",
+                "skill tool classifier found no hidden candidates",
                 extra={
                     "extra_data": {
                         "session_id": ctx.session.session_id,
@@ -9126,6 +9112,29 @@ class AgentLoop:
                 },
             )
             return set()
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "skill tool classifier payload",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        **self._step_log_metadata(ctx),
+                        "skill_id": activation.get("skill_id"),
+                        "cache_key": cache_key_label,
+                        "candidate_tools": [
+                            {
+                                "tool_id": tool_id,
+                                "name": tool.name,
+                                "description": str(tool.description or "")[:160],
+                            }
+                            for tool_id, tool in sorted(
+                                tool_by_id.items(),
+                                key=lambda item: (item[1].name.lower(), item[0]),
+                            )[:300]
+                        ],
+                    }
+                },
+            )
 
         messages = [
             {

@@ -65,6 +65,7 @@ export interface ToolCallTimelineItem {
   isError?: boolean;
   durationMs?: number;
   evaluation?: ToolCallEvaluation;
+   attachments?: AttachmentRef[];
   reconstructed?: boolean;
   /**
    * Notification ID backing a pending `step_request_input` tool call.
@@ -201,6 +202,16 @@ function findOptimisticUserMessageIndex(
   return index;
 }
 
+function normalizeEventAttachments(value: unknown): AttachmentRef[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is AttachmentRef =>
+      typeof item === 'object'
+      && item !== null
+      && typeof (item as Record<string, unknown>).artifact_id === 'string'
+  );
+}
+
 let _noticeCounter = 0;
 
 function createNotice(
@@ -276,9 +287,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
   for (const event of events) {
     const content = typeof event.data.content === 'string' ? event.data.content : '';
-    const attachments = Array.isArray(event.data.attachments)
-      ? event.data.attachments.filter((item): item is AttachmentRef => typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).artifact_id === 'string')
-      : [];
+    const attachments = normalizeEventAttachments(event.data.attachments);
     // Use session_id from event data to build lineage-safe IDs (seq is session-local).
     const sid = typeof event.data.session_id === 'string' ? event.data.session_id : '';
     const eid = sid ? `${sid}:${event.seq}` : `${event.seq}`;
@@ -388,6 +397,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
     if (event.type === 'tool_result') {
       const callId = String(event.data.call_id ?? '');
+      const resultAttachments = normalizeEventAttachments(event.data.attachments);
       const evaluation =
         typeof event.data.evaluation === 'object' && event.data.evaluation !== null
           ? (event.data.evaluation as ToolCallEvaluation)
@@ -401,7 +411,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           result: typeof event.data.result === 'string' ? event.data.result : undefined,
           isError: typeof event.data.is_error === 'boolean' ? event.data.is_error : undefined,
           durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
-          evaluation
+          evaluation,
+          attachments: resultAttachments.length > 0 ? resultAttachments : existing.attachments,
         };
       } else {
         items.push({
@@ -415,6 +426,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           isError: typeof event.data.is_error === 'boolean' ? event.data.is_error : undefined,
           durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
           evaluation,
+          attachments: resultAttachments.length > 0 ? resultAttachments : undefined,
           reconstructed: true
         });
       }
@@ -708,7 +720,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   let next = [...items];
 
   if (event.type === 'user_message') {
-    const attachments = Array.isArray(event.attachments) ? event.attachments : [];
+    const attachments = normalizeEventAttachments(event.attachments);
     const optimisticIndex = findOptimisticUserMessageIndex(next, event.content, attachments);
     if (optimisticIndex >= 0 && next[optimisticIndex]?.kind === 'message') {
       const existing = next[optimisticIndex] as MessageTimelineItem;
@@ -754,7 +766,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'message_complete') {
     const itemId = `message:${event.message_id}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');
-    const attachments = Array.isArray(event.attachments) ? event.attachments : [];
+    const attachments = normalizeEventAttachments(event.attachments);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       // Finalize and release the streamer for this message.
@@ -804,7 +816,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         result: existing.result,
         isError: existing.isError,
         durationMs: existing.durationMs,
-        evaluation: existing.evaluation
+        evaluation: existing.evaluation,
+        attachments: existing.attachments,
       };
       return next;
     }
@@ -815,6 +828,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'tool_result') {
     const itemId = `tool:${event.call_id}`;
     const evaluation = event.evaluation ?? undefined;
+    const attachments = normalizeEventAttachments(event.attachments);
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
@@ -825,7 +839,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         result: event.result,
         isError: event.is_error,
         durationMs: event.duration_ms ?? undefined,
-        evaluation
+        evaluation,
+        attachments: attachments.length > 0 ? attachments : existing.attachments,
       };
       return next;
     }
@@ -840,7 +855,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       result: event.result,
       isError: event.is_error,
       durationMs: event.duration_ms ?? undefined,
-      evaluation
+      evaluation,
+      attachments: attachments.length > 0 ? attachments : undefined,
     });
     return next;
   }

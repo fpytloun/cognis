@@ -131,6 +131,7 @@ class SSETurnObserver:
         is_error: bool,
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -145,6 +146,7 @@ class SSETurnObserver:
                     "result": result,
                     "is_error": is_error,
                     "duration_ms": duration_ms,
+                    "attachments": strip_attachment_payload_bytes(attachments or []),
                 },
             }
         )

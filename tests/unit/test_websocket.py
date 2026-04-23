@@ -303,6 +303,44 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_turn_observer_tool_result_strips_attachment_payload_bytes() -> None:
+    manager = AsyncMock()
+    observer = WebSocketTurnObserver(manager)
+
+    await observer.on_tool_result(
+        "conv-1",
+        "sess-1",
+        "call-1",
+        "image_edit",
+        "done",
+        False,
+        42,
+        None,
+        [
+            {
+                "artifact_id": "img_1",
+                "kind": "image",
+                "mime_type": "image/png",
+                "filename": "image.png",
+                "size_bytes": 3,
+                "content_b64": "YWJj",
+            }
+        ],
+    )
+
+    payload = manager.send_to_conversation.await_args.args[1]
+    assert payload["attachments"] == [
+        {
+            "artifact_id": "img_1",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "image.png",
+            "size_bytes": 3,
+        }
+    ]
+
+
 def test_workflow_composed_payload_supports_lifecycle_backed_replay() -> None:
     payload = _workflow_composed_payload(
         "conv-1",

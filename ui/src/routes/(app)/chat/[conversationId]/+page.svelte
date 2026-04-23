@@ -86,6 +86,7 @@ import X from 'lucide-svelte/icons/x';
   let agents = $state<Agent[]>([]);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
+  let conversationSubloadsLoading = $state(false);
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
@@ -145,7 +146,7 @@ import X from 'lucide-svelte/icons/x';
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
   let lastTimelineScrollTop = $state(0);
-  let composerChromeEl = $state<HTMLDivElement | null>(null);
+  let footerChromeEl = $state<HTMLDivElement | null>(null);
   let selectedChannel = $state('all');
   let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
@@ -429,14 +430,8 @@ import X from 'lucide-svelte/icons/x';
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
   }));
-  function isCurrentNonWebConversationActive(): boolean {
-    if (!currentConversation || isWebConversation(currentConversation)) return false;
-    const status = activeSessionStatus();
-    return status === 'active';
-  }
-
   let showTurnProgress = $derived.by(() =>
-    (turnInProgress || isCurrentNonWebConversationActive())
+    turnInProgress
       && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
   );
   let isPreSessionConversation = $derived.by(() =>
@@ -1151,11 +1146,18 @@ import X from 'lucide-svelte/icons/x';
       sessionsError,
       historyError,
     });
-    await reloadConversationSubloads(currentConversation.conversation_id, requestId, {
-      reloadSessions: retryScope.sessions,
-      reloadHistory: retryScope.history,
-      resubscribe: false,
-    });
+    conversationSubloadsLoading = true;
+    try {
+      await reloadConversationSubloads(currentConversation.conversation_id, requestId, {
+        reloadSessions: retryScope.sessions,
+        reloadHistory: retryScope.history,
+        resubscribe: false,
+      });
+    } finally {
+      if (!isStaleConversationLoad(requestId)) {
+        conversationSubloadsLoading = false;
+      }
+    }
   }
 
   async function openConversation(conversationId: string): Promise<void> {
@@ -1222,11 +1224,18 @@ import X from 'lucide-svelte/icons/x';
       contextUsage = null;
       subSessionPanelOpen = false;
 
-      await reloadConversationSubloads(conversationId, requestId, {
-        reloadSessions: true,
-        reloadHistory: true,
-        resubscribe: true,
-      });
+      conversationSubloadsLoading = true;
+      try {
+        await reloadConversationSubloads(conversationId, requestId, {
+          reloadSessions: true,
+          reloadHistory: true,
+          resubscribe: true,
+        });
+      } finally {
+        if (!isStaleConversationLoad(requestId)) {
+          conversationSubloadsLoading = false;
+        }
+      }
       if (isStaleConversationLoad(requestId)) {
         return;
       }
@@ -1254,6 +1263,7 @@ import X from 'lucide-svelte/icons/x';
       pendingDirectQuestion = null;
       directQuestionSubmitting = false;
       sessionIds.clear();
+      conversationSubloadsLoading = false;
     } finally {
       if (!isStaleConversationLoad(requestId)) {
         initializing = false;
@@ -2183,7 +2193,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    if ((!timelineContentEl && !composerChromeEl) || typeof ResizeObserver === 'undefined') {
+    if ((!timelineContentEl && !footerChromeEl) || typeof ResizeObserver === 'undefined') {
       return;
     }
     const observer = new ResizeObserver(() => {
@@ -2192,8 +2202,8 @@ import X from 'lucide-svelte/icons/x';
     if (timelineContentEl) {
       observer.observe(timelineContentEl);
     }
-    if (composerChromeEl) {
-      observer.observe(composerChromeEl);
+    if (footerChromeEl) {
+      observer.observe(footerChromeEl);
     }
     return () => observer.disconnect();
   });
@@ -2850,9 +2860,19 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
               </div>
             {:else if displayedTimeline.length === 0}
-              <p class="px-4 py-16 text-center text-sm text-slate-500">
-                Send the first message to start this conversation.
-              </p>
+              {#if conversationSubloadsLoading && !historyError && !sessionsError}
+                <div class="rounded-2xl border border-dashed border-slate-700 px-4 py-10 text-center text-sm text-slate-400">
+                  {#if initialLoadTimedOut}
+                    Conversation data is still loading. Use Retry above if it stays stuck.
+                  {:else}
+                    Loading conversation history and preparing the live stream.
+                  {/if}
+                </div>
+              {:else if !historyError && !sessionsError}
+                <p class="px-4 py-16 text-center text-sm text-slate-500">
+                  Send the first message to start this conversation.
+                </p>
+              {/if}
             {:else}
               {#each displayedTimeline as item (item.id)}
                 {#if item.kind === 'message'}
@@ -2923,46 +2943,7 @@ import X from 'lucide-svelte/icons/x';
           {/if}
         </div>
 
-        <!-- Composer or read-only banner -->
-        {#if currentConversation && !isWebConversation(currentConversation)}
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
-            This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
-          </div>
-        {:else if currentConversation && currentConversation.status === 'archived'}
-          <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
-            This conversation is archived.
-          </div>
-        {:else if currentConversation && currentConversation.status === 'deleted'}
-          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-center text-sm text-rose-100">
-            This conversation has been deleted.
-          </div>
-        {:else if isSessionBlocked()}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">
-            {#if activeSessionStatus() === 'suspended'}
-              This session is suspended.
-            {:else if activeSessionStatus() === 'terminated'}
-              This session has been terminated.
-            {:else}
-              This session has ended ({activeSessionStatus()}).
-            {/if}
-          </div>
-        {:else}
-          <!--
-            Composer container. \`--kb-offset\` is published by the
-            viewport store using \`visualViewport\`; on iOS this pushes
-            the composer above the on-screen keyboard so the input
-            stays visible. Keep the wrapper visually neutral so the
-            composer feels like part of the page rather than a dark
-            boxed footer.
-          -->
-          <div bind:this={composerChromeEl} class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
-          <!--
-            Compact todo drawer. Single-line header ("Todos · N active
-            · X in progress"), and each todo renders as a single line:
-            a coloured status dot, the content, and a muted priority
-            label. No bordered cards, no coloured backgrounds — the
-            whole list stays visually quiet above the composer.
-          -->
+        <div bind:this={footerChromeEl} class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
           {#if shouldShowChatTodoDrawer}
             <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
               <button
@@ -3000,6 +2981,38 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
+          <!-- Composer or read-only banner -->
+          {#if currentConversation && !isWebConversation(currentConversation)}
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
+              This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
+            </div>
+          {:else if currentConversation && currentConversation.status === 'archived'}
+            <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
+              This conversation is archived.
+            </div>
+          {:else if currentConversation && currentConversation.status === 'deleted'}
+            <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-center text-sm text-rose-100">
+              This conversation has been deleted.
+            </div>
+          {:else if isSessionBlocked()}
+            <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">
+              {#if activeSessionStatus() === 'suspended'}
+                This session is suspended.
+              {:else if activeSessionStatus() === 'terminated'}
+                This session has been terminated.
+              {:else}
+                This session has ended ({activeSessionStatus()}).
+              {/if}
+            </div>
+          {:else}
+          <!--
+            Composer container. \`--kb-offset\` is published by the
+            viewport store using \`visualViewport\`; on iOS this pushes
+            the composer above the on-screen keyboard so the input
+            stays visible. Keep the wrapper visually neutral so the
+            composer feels like part of the page rather than a dark
+            boxed footer.
+          -->
           <!--
             Composer: sits flush at the bottom of the viewport and spans
             the full width of the chat area. No outer card, no recessed
@@ -3134,8 +3147,8 @@ import X from 'lucide-svelte/icons/x';
               {/if}
             </div>
           </form>
-          </div>
-        {/if}
+          {/if}
+        </div>
       </div>
 
       {#if showNewChatModal}

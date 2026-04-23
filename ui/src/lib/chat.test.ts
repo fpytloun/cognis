@@ -239,6 +239,38 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('keeps tool-result attachments in normalized history', () => {
+    const items = normalizeHistory([
+      {
+        seq: 6,
+        type: 'tool_result',
+        data: {
+          call_id: 'call-attachments',
+          name: 'generate_document',
+          result: 'created',
+          is_error: false,
+          attachments: [
+            {
+              artifact_id: 'art_doc_1',
+              kind: 'pdf',
+              mime_type: 'application/pdf',
+              filename: 'summary.pdf',
+              size_bytes: 123,
+              url: 'https://cognis.example.com/summary.pdf'
+            }
+          ]
+        },
+        timestamp: '2026-04-07T00:00:00Z'
+      }
+    ]);
+
+    expect(items[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call-attachments',
+      attachments: [{ artifact_id: 'art_doc_1', filename: 'summary.pdf' }]
+    });
+  });
+
   it('ignores legacy internal reasoning events in persisted history', () => {
     const items = normalizeHistory([
       {
@@ -324,6 +356,45 @@ describe('chat timeline helpers', () => {
       role: 'assistant',
       streaming: true,
       content: 'Working on it and done',
+    });
+  });
+
+  it('stores live tool-result attachments on the tool block', () => {
+    const withTool = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live_artifact',
+      tool_name: 'image_edit',
+      status: 'started',
+      arguments: { prompt: 'sharpen' }
+    });
+
+    const withResult = applyWebSocketEvent(withTool, {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live_artifact',
+      tool_name: 'image_edit',
+      result: 'done',
+      is_error: false,
+      duration_ms: 25,
+      attachments: [
+        {
+          artifact_id: 'img_edited_1',
+          kind: 'image',
+          mime_type: 'image/png',
+          filename: 'edited.png',
+          size_bytes: 456,
+          url: 'https://cognis.example.com/edited.png'
+        }
+      ]
+    });
+
+    expect(withResult[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_live_artifact',
+      attachments: [{ artifact_id: 'img_edited_1', filename: 'edited.png' }]
     });
   });
 
