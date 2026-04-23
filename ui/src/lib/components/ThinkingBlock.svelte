@@ -77,7 +77,7 @@
           <hr class="border-violet-500/10" />
         {/if}
         <div class="px-3 py-2.5">
-          {#if item.blocks.length > 1 || block.title !== headerTitle}
+          {#if !(i === 0 && displayTitle(block.title) === headerTitle)}
             <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-violet-400/60">
               Thinking: {displayTitle(block.title)}
             </p>
