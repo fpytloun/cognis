@@ -596,6 +596,10 @@ import X from 'lucide-svelte/icons/x';
     return page.params.conversationId ?? '';
   }
 
+  function isMobileViewport(): boolean {
+    return typeof window !== 'undefined' && window.innerWidth < 1024;
+  }
+
   function beginInitialLoadTimeout(): void {
     if (initialLoadTimeoutTimer !== null) {
       window.clearTimeout(initialLoadTimeoutTimer);
@@ -2356,7 +2360,7 @@ import X from 'lucide-svelte/icons/x';
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
       class={`fixed left-3 top-[calc(1rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex w-[min(22rem,calc(100vw-1.5rem))] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:z-auto lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
-      inert={(!mobileListOpen && Boolean(currentConversation)) || undefined}
+      inert={(!mobileListOpen && Boolean(currentConversation) && isMobileViewport()) || undefined}
       role={mobileListOpen ? 'dialog' : undefined}
     >
       <!-- Static top: filters -->
