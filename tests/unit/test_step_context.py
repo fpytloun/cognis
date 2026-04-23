@@ -53,6 +53,21 @@ def test_step_input_config_summary_multiple_sources() -> None:
     assert config.source_names() == ["plan", "research"]
 
 
+def test_step_input_config_all_source_used_alone() -> None:
+    config = StepInputConfig(type="last", source="all")
+    assert config.source_names() == ["all"]
+
+
+def test_step_input_config_rejects_mixed_all_source() -> None:
+    with pytest.raises(ValueError, match="used alone"):
+        StepInputConfig(type="last", source=["all", "plan"])
+
+
+def test_step_input_config_full_rejects_all_source() -> None:
+    with pytest.raises(ValueError, match="cannot use source='all'"):
+        StepInputConfig(type="full", source="all")
+
+
 # ---------------------------------------------------------------------------
 # Backward compatibility — legacy list[str] coercion
 # ---------------------------------------------------------------------------
@@ -156,6 +171,19 @@ def test_resolve_source_names_uses_shared_helper() -> None:
     ]
     names = resolve_source_names(steps[1], 1, steps)
     assert names == ["plan"]
+
+
+def test_resolve_source_names_expands_all_to_prior_run_steps() -> None:
+    steps = [
+        StepDefinition(name="setup", type="run"),
+        StepDefinition(name="gate", type="gate", gate={"message": "Continue?"}),
+        StepDefinition(name="collect", type="run"),
+        StepDefinition(name="synthesize", type="run", input=StepInputConfig(type="last", source="all")),
+    ]
+
+    names = resolve_source_names(steps[3], 3, steps)
+
+    assert names == ["setup", "collect"]
 
 
 def test_resolve_effective_input_last_without_source_defaults_to_previous() -> None:

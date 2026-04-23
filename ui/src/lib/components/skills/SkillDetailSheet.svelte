@@ -413,8 +413,11 @@
       if (!confirmed) return;
     }
     const draft = skillToWorkflowDraft(skill, steps ?? undefined);
+    const sourceHash = steps === decompositionPreview
+      ? decompositionSourceHash
+      : skill.current_version?.decomposition_source_hash ?? null;
     clearSkillWorkflowDraft();
-    saveSkillWorkflowDraft(skill.skill_id, draft);
+    saveSkillWorkflowDraft(skill.skill_id, draft, sourceHash);
     await goto(`/workflows?draftFromSkill=${encodeURIComponent(skill.skill_id)}`);
   }
 

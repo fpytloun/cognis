@@ -59,20 +59,15 @@ def _validate_workflow_payload(definition: dict[str, object]) -> None:
     backward-compatible ``list[str]`` → ``StepInputConfig``) and then runs the
     shared registry validation for reference integrity.
     """
-    from cognis.core.workflow_registry import _validate_workflow
-    from cognis.models.workflow import Workflow
+    from cognis.core.management import validate_workflow_definition
 
     steps = definition.get("steps")
     if not isinstance(steps, list) or not steps:
         raise api_exception(400, "validation_error", "Workflow must contain at least one step")
 
     try:
-        workflow = Workflow.model_validate(definition)
+        validate_workflow_definition(dict(definition))
     except Exception as exc:
-        raise api_exception(400, "validation_error", str(exc)) from exc
-    try:
-        _validate_workflow(workflow)
-    except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
 
 

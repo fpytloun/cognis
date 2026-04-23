@@ -516,6 +516,8 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE schedules ADD COLUMN one_shot_at TIMESTAMP WITH TIME ZONE"))
     if "timezone" not in columns:
         execute(text("ALTER TABLE schedules ADD COLUMN timezone VARCHAR NOT NULL DEFAULT 'UTC'"))
+    if "skill_id" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN skill_id VARCHAR"))
     if "max_concurrent_runs" not in columns:
         execute(
             text("ALTER TABLE schedules ADD COLUMN max_concurrent_runs INTEGER NOT NULL DEFAULT 1")

@@ -176,8 +176,17 @@ class StepInputConfig(BaseModel):
     ) -> str | list[str] | None:
         """Reject list sources for ``type="full"``."""
         input_type = info.data.get("type") if info.data else None
+        all_source = value == "all" or (
+            isinstance(value, list) and any(str(item).strip() == "all" for item in value)
+        )
         if input_type == "full" and isinstance(value, list):
             raise ValueError("StepInputConfig type='full' only accepts a single source, not a list")
+        if input_type == "full" and all_source:
+            raise ValueError("StepInputConfig type='full' cannot use source='all'")
+        if isinstance(value, list):
+            normalized = [str(item).strip() for item in value if str(item).strip()]
+            if "all" in normalized and len(normalized) > 1:
+                raise ValueError("StepInputConfig source='all' must be used alone")
         return value
 
     def source_names(self) -> list[str]:
@@ -454,4 +463,11 @@ def resolve_source_names(
     Use this everywhere instead of iterating ``step_def.input`` directly.
     """
     effective = resolve_effective_input(step_def, step_index, workflow_steps)
-    return effective.source_names()
+    source_names = effective.source_names()
+    if source_names != ["all"]:
+        return source_names
+    return [
+        workflow_steps[index].name
+        for index in range(step_index)
+        if workflow_steps[index].type == "run"
+    ]

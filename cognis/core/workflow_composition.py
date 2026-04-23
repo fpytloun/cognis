@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -110,6 +112,8 @@ class SkillMaterial(BaseModel):
     instructions: str
     tools: list[dict[str, Any]] = Field(default_factory=list)
     prompt_templates: dict[str, Any] = Field(default_factory=dict)
+    secret_placeholders: list[str] = Field(default_factory=list)
+    asset_manifest: list[dict[str, Any]] = Field(default_factory=list)
     steps: list[dict[str, Any]] = Field(default_factory=list)
     decomposition_source_hash: str | None = None
     current_source_hash: str | None = None
@@ -230,6 +234,36 @@ def _normalize_generated_steps(
     return normalized_steps
 
 
+def _instruction_diff_summary(previous: str, current: str, *, limit: int = 80) -> str:
+    """Return a compact unified diff for skill instructions."""
+
+    diff_lines = list(
+        difflib.unified_diff(
+            previous.splitlines(),
+            current.splitlines(),
+            fromfile="previous",
+            tofile="current",
+            lineterm="",
+            n=2,
+        )
+    )
+    if not diff_lines:
+        return ""
+    trimmed = diff_lines[:limit]
+    if len(diff_lines) > limit:
+        trimmed.append("... diff truncated ...")
+    return "\n".join(trimmed)
+
+
+def _json_change_summary(previous: Any, current: Any) -> dict[str, Any]:
+    """Summarize old/new JSON-ish values without generating a large raw diff."""
+
+    return {
+        "previous": previous,
+        "current": current,
+    }
+
+
 async def decompose_skill_material(
     *,
     llm: Any,
@@ -239,6 +273,14 @@ async def decompose_skill_material(
     instructions: str,
     tools: list[dict[str, Any]],
     prompt_templates: dict[str, Any],
+    secret_placeholders: list[str] | None = None,
+    asset_manifest: list[dict[str, Any]] | None = None,
+    existing_steps: list[dict[str, Any]] | None = None,
+    previous_instructions: str | None = None,
+    previous_tools: list[dict[str, Any]] | None = None,
+    previous_prompt_templates: dict[str, Any] | None = None,
+    previous_secret_placeholders: list[str] | None = None,
+    previous_asset_manifest: list[dict[str, Any]] | None = None,
     timeout_seconds: float = 60.0,
 ) -> SkillDecompositionResult:
     """Decompose a skill into reusable workflow steps."""
@@ -253,6 +295,60 @@ async def decompose_skill_material(
         else "You decompose skills into workflow step fragments. Respond with JSON only."
     )
     skill_tool_names = _declared_skill_tool_names(tools)
+    refresh_existing = existing_steps is not None
+    refresh_sections: list[str] = []
+    if refresh_existing:
+        refresh_sections.append(
+            "Existing decomposition steps:\n"
+            + json.dumps(existing_steps or [], indent=2, default=str)
+        )
+        if previous_instructions is not None and previous_instructions != instructions:
+            diff_text = _instruction_diff_summary(previous_instructions, instructions)
+            if diff_text:
+                refresh_sections.append(f"Instruction diff:\n{diff_text}")
+        if previous_tools is not None and previous_tools != tools:
+            refresh_sections.append(
+                "Tool changes:\n"
+                + json.dumps(_json_change_summary(previous_tools, tools), indent=2, default=str)
+            )
+        if previous_prompt_templates is not None and previous_prompt_templates != prompt_templates:
+            refresh_sections.append(
+                "Prompt template changes:\n"
+                + json.dumps(
+                    _json_change_summary(previous_prompt_templates, prompt_templates),
+                    indent=2,
+                    default=str,
+                )
+            )
+        if previous_secret_placeholders is not None and previous_secret_placeholders != (
+            secret_placeholders or []
+        ):
+            refresh_sections.append(
+                "Secret placeholder changes:\n"
+                + json.dumps(
+                    _json_change_summary(previous_secret_placeholders, secret_placeholders or []),
+                    indent=2,
+                    default=str,
+                )
+            )
+        if previous_asset_manifest is not None and previous_asset_manifest != (asset_manifest or []):
+            refresh_sections.append(
+                "Asset manifest changes:\n"
+                + json.dumps(
+                    _json_change_summary(previous_asset_manifest, asset_manifest or []),
+                    indent=2,
+                    default=str,
+                )
+            )
+    refresh_block = ""
+    if refresh_sections:
+        refresh_block = (
+            "Refresh this skill's existing decomposition selectively when possible. "
+            "Preserve unaffected step names, explicit input wiring, and intent unless the changes make them incorrect. "
+            "Return the full updated step list, not a patch.\n\n"
+            + "\n\n".join(refresh_sections)
+            + "\n\n"
+        )
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -264,12 +360,19 @@ async def decompose_skill_material(
                 f"Instructions:\n{instructions}\n\n"
                 f"Tools:\n{tools}\n\n"
                 f"Prompt templates:\n{prompt_templates}\n\n"
-                f"{_step_profile_catalog_text()}\n\n"
-                "Return JSON with keys 'rationale' and 'steps'. Keep the rationale short and return at most 8 steps. Each step must be a valid "
-                "Cognis StepDefinition object with name, type='run' or 'gate', prompt, and "
-                "any relevant completion/input/deliverable fields. Use require_deliverable=false "
-                "for obvious gather/inspect steps and true for synthesis/report/final steps. "
-                "Every run step should include step_profile_id. If this skill declares executable skill tools, prefer step_profile_mode='hard' plus inline step_profile.tool_overrides.include for those tool names."
+                f"Secret placeholders:\n{secret_placeholders or []}\n\n"
+                f"Asset manifest:\n{asset_manifest or []}\n\n"
+                + refresh_block
+                + f"{_step_profile_catalog_text()}\n\n"
+                + "Return JSON with keys 'rationale' and 'steps'. Keep the rationale short and return at most 8 steps. Each step must be a valid "
+                + "Cognis StepDefinition object with name, type='run' or 'gate', prompt, and "
+                + "any relevant completion/input/deliverable fields. Use require_deliverable=false "
+                + "for obvious gather/inspect steps and true for synthesis/report/final steps. "
+                + "Important input semantics: when input is omitted, Cognis defaults to the immediately preceding run step. "
+                + "If multiple gather/collector steps depend on one earlier setup step, you must set input explicitly to that step instead of relying on defaults. "
+                + "For final synthesis that should consume every prior run step, you may use input={type:'last', source:'all'} or input={type:'summary', source:'all'}. "
+                + "Never use source='all' with type='full'. "
+                + "Every run step should include step_profile_id. If this skill declares executable skill tools, prefer step_profile_mode='hard' plus inline step_profile.tool_overrides.include for those tool names."
             ),
         },
     ]

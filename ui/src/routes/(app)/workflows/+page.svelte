@@ -45,6 +45,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   let stepProfileMap: Record<string, StepProfileDefinition> = {};
   let stepProfileOptions: Array<{ id: string; label: string }> = [{ id: '', label: 'Unrestricted' }];
   let selectedWorkflow: Workflow | null = null;
+  let editingSkillId: string | null = null;
+  let editingSkillDecompositionHash: string | null = null;
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
   let initialSnapshot = JSON.stringify(form);
@@ -112,9 +114,13 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       const nextSelected = selectedId ? workflows.find((workflow) => workflow.workflow_id === selectedId) : selectedWorkflow ? workflows.find((workflow) => workflow.workflow_id === selectedWorkflow?.workflow_id) : workflows[0];
       if (nextSelected) {
         selectedWorkflow = nextSelected;
+        editingSkillId = null;
+        editingSkillDecompositionHash = null;
         form = workflowToFormState(nextSelected, stepProfileMap);
       } else {
         selectedWorkflow = null;
+        editingSkillId = null;
+        editingSkillDecompositionHash = null;
         form = createEmptyWorkflowForm();
       }
       initialSnapshot = JSON.stringify(form);
@@ -132,6 +138,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     try {
       const nextForm = workflowToFormState(workflow, stepProfileMap);
       selectedWorkflow = workflow;
+      editingSkillId = null;
+      editingSkillDecompositionHash = null;
       form = nextForm;
       error = '';
       initialSnapshot = JSON.stringify(form);
@@ -148,6 +156,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       return;
     }
     selectedWorkflow = null;
+    editingSkillId = null;
+    editingSkillDecompositionHash = null;
     form = createEmptyWorkflowForm();
     error = '';
     initialSnapshot = JSON.stringify(form);
@@ -164,6 +174,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         const source = await api.workflows.detail(workflowId);
         const nextForm = workflowToFormState(source, stepProfileMap);
         selectedWorkflow = null;
+        editingSkillId = null;
+        editingSkillDecompositionHash = null;
         form = {
           ...nextForm,
           workflowId: '',
@@ -187,15 +199,22 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
     try {
       const stored = skillId ? loadSkillWorkflowDraft(skillId) : null;
+      const loadedSkill = skillId && !stored ? await api.skills.get(skillId) : null;
       const nextForm = stored
         ? stored.form
-        : skillId
-          ? skillToWorkflowDraft(await api.skills.get(skillId), undefined, stepProfileMap)
+        : loadedSkill
+          ? skillToWorkflowDraft(loadedSkill, undefined, stepProfileMap)
           : null;
       if (!nextForm) {
         return;
       }
       selectedWorkflow = null;
+      editingSkillId = skillId;
+      editingSkillDecompositionHash = (
+        stored?.decompositionSourceHash
+        ?? loadedSkill?.current_version?.decomposition_source_hash
+        ?? null
+      );
       form = { ...nextForm, workflowId: '', lifecycle: 'persistent' };
       error = '';
       initialSnapshot = JSON.stringify(form);
@@ -272,6 +291,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       } else if (selectedWorkflow?.lifecycle === 'ephemeral') {
         error = 'Ephemeral workflows are historical artifacts. Promote or duplicate them into a persistent workflow instead.';
         return;
+      } else if (editingSkillId) {
+        const saved = await api.skills.update(editingSkillId, {
+          steps: (payload.steps as Array<Record<string, unknown>>) ?? [],
+          decomposition_source_hash: editingSkillDecompositionHash ?? undefined
+        });
+        form = skillToWorkflowDraft(saved, saved.current_version?.steps as Record<string, unknown>[] | null | undefined, stepProfileMap);
+        selectedWorkflow = null;
+        editingSkillId = saved.skill_id;
+        editingSkillDecompositionHash = saved.current_version?.decomposition_source_hash ?? null;
       } else if (selectedWorkflow) {
         const updated = await api.workflows.update(selectedWorkflow.workflow_id, payload);
         await loadWorkflows(updated.workflow_id);
@@ -279,7 +307,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         const created = await api.workflows.create(payload);
         await loadWorkflows(created.workflow_id);
       }
-      addToast('Workflow saved.', 'success');
+      addToast(editingSkillId ? 'Skill decomposition saved.' : 'Workflow saved.', 'success');
       initialSnapshot = JSON.stringify(form);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -508,7 +536,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
         <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
-        <Button onclick={saveWorkflow} disabled={saving || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}</Button>
+        <Button onclick={saveWorkflow} disabled={saving || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}</Button>
       </div>
     </div>
 
@@ -591,6 +619,11 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
             <p class="font-medium">Ephemeral workflow</p>
             <p class="mt-1 text-violet-100/80">This workflow is a historical composed artifact. It is read-only. Promote it into a new persistent workflow to edit or reuse it.</p>
           </Card>
+        {:else if editingSkillId}
+          <Card class="border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-100">
+            <p class="font-medium">Skill decomposition editor</p>
+            <p class="mt-1 text-emerald-100/80">This editor is reusing workflow step controls for the latest saved decomposition of skill <code>{editingSkillId}</code>. Saving here updates the skill version rather than creating a workflow.</p>
+          </Card>
         {/if}
 
         <!-- Pipeline diagram (first thing the user sees) -->
@@ -607,25 +640,25 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Workflow ID</span>
-              <Input bind:value={form.workflowId} disabled={!!selectedWorkflow} placeholder="wf_review_loop" />
+              <Input bind:value={form.workflowId} disabled={!!selectedWorkflow || !!editingSkillId} placeholder="wf_review_loop" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Name</span>
-              <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system} />
+              <Input bind:value={form.name} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Version</span>
-              <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system} type="number" />
+              <Input bind:value={form.version} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Tags</span>
-              <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system} placeholder="code, review" />
+              <Input bind:value={form.tagsText} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} placeholder="code, review" />
             </label>
           </div>
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
             <span>Description</span>
-            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+            <textarea bind:value={form.description} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
           </label>
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
@@ -635,7 +668,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                 <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
-            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+            <textarea bind:value={form.criteria} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}></textarea>
           </label>
         </Card>
 
@@ -650,7 +683,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
-              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+              <select bind:value={form.interactionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="none">Autonomous</option>
                 <option value="explicit_gates">Gates only</option>
                 <option value="step_requests">Steps can ask</option>
@@ -663,7 +696,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
-              <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system} type="number" />
+              <Input bind:value={form.defaultMaxAttempts} disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="number" />
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span class="inline-flex items-center gap-2">
@@ -672,7 +705,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                 </Tooltip>
               </span>
-              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+              <select bind:value={form.defaultOnExhausted} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="continue">Continue anyway</option>
                 <option value="fail">Fail task</option>
                 <option value="gate">Ask human</option>
@@ -680,7 +713,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
             </label>
           </div>
           <label class="mt-4 flex items-center gap-3 text-sm text-slate-200">
-            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+            <input bind:checked={form.defaultEvaluate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
             <span class="inline-flex items-center gap-2">
               Evaluate steps by default
               <Tooltip text="When enabled, an evaluator LLM checks whether each step's objective was met before advancing to the next step. Disable for simple or fire-and-forget steps.">
@@ -696,12 +729,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
               </Tooltip>
             </span>
             <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-              <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+              <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
                 <option value="default">Default delivery</option>
                 <option value="direct">Direct channel delivery</option>
               </select>
               <label class="inline-flex items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200">
-                <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system} type="checkbox" />
+                <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-slate-600 bg-slate-950" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
                 <span>Allow silent completion</span>
               </label>
             </div>
@@ -922,11 +955,11 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span class="inline-flex items-center gap-2">
                       Source steps
-                      <Tooltip text="Comma-separated names of steps to pull input from. Leave empty to use the immediately preceding step. Only applies when input mode is not 'None'.">
+                      <Tooltip text="Comma-separated names of steps to pull input from. Leave empty to use the immediately preceding step. Use 'all' to aggregate all prior run-step deliverables. 'all' must be used alone and cannot be combined with 'Full history'. Only applies when input mode is not 'None'.">
                         <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
-                    <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review'} />
+                    <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review or all'} />
                   </label>
                 </div>
 
@@ -1192,7 +1225,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
           onclick={saveWorkflow}
           disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}
         >
-          {saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : 'Save workflow'}
+          {saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}
         </Button>
       </div>
     </div>

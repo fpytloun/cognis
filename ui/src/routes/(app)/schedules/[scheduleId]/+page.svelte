@@ -7,7 +7,7 @@
   import {
     buildWorkflowSourceOptions,
     decodeWorkflowSourceValue,
-    workflowSourceValueForWorkflow
+    workflowSourceValueForSelection
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -138,7 +138,7 @@ import Zap from 'lucide-svelte/icons/zap';
       one_shot_at: s.one_shot_at ?? '',
       timezone: s.timezone,
       agent_id: s.agent_id,
-      workflow_source: workflowSourceValueForWorkflow(s.workflow_id),
+      workflow_source: workflowSourceValueForSelection(s.workflow_id, s.skill_id),
       task_title: (tmpl.title as string) ?? '',
       task_description: (tmpl.description as string) ?? '',
       priority: (tmpl.priority as number) ?? 0,

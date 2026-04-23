@@ -5,6 +5,7 @@ import {
   createEmptySkillForm,
   formStateToSkillPayload,
   loadSkillWorkflowDraft,
+  SKILL_WORKFLOW_DRAFT_STORAGE_KEY,
   saveSkillWorkflowDraft,
   skillToFormState,
   skillToWorkflowDraft,
@@ -210,7 +211,7 @@ describe('skill workflow drafts', () => {
   it('creates a persistent workflow draft from saved skill steps', () => {
     const form = skillToWorkflowDraft(makeSkill());
 
-    expect(form.name).toBe('Release Helper Workflow');
+    expect(form.name).toBe('Release Helper');
     expect(form.lifecycle).toBe('persistent');
     expect(form.steps.map((step) => step.name)).toEqual(['plan_release', 'publish_release']);
     expect(form.lineage).toEqual({
@@ -223,19 +224,31 @@ describe('skill workflow drafts', () => {
     const form = skillToWorkflowDraft(makeSkill());
 
     clearSkillWorkflowDraft();
-    saveSkillWorkflowDraft('skill_release', form);
+    saveSkillWorkflowDraft('skill_release', form, 'hash_123');
 
     expect(loadSkillWorkflowDraft('skill_release')).toEqual(
       expect.objectContaining({
         skillId: 'skill_release',
+        decompositionSourceHash: 'hash_123',
         form: expect.objectContaining({
-          name: 'Release Helper Workflow',
+          name: 'Release Helper',
           steps: expect.any(Array)
         })
       })
     );
 
     clearSkillWorkflowDraft();
+    expect(loadSkillWorkflowDraft('skill_release')).toBeNull();
+  });
+
+  it('ignores legacy stored drafts without decomposition hash', () => {
+    const form = skillToWorkflowDraft(makeSkill());
+
+    sessionStorage.setItem(
+      SKILL_WORKFLOW_DRAFT_STORAGE_KEY,
+      JSON.stringify({ skillId: 'skill_release', generatedAt: new Date().toISOString(), form })
+    );
+
     expect(loadSkillWorkflowDraft('skill_release')).toBeNull();
   });
 });

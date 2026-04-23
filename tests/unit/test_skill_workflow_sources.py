@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.workflow_management import materialize_skill_workflow
 from cognis.store.queries import (
     create_agent,
     create_skill,
@@ -128,19 +129,73 @@ def test_schedule_create_accepts_decomposed_skill_source(monkeypatch: object, tm
                 "timezone": "UTC",
                 "agent_id": "agent-1",
                 "skill_id": "skill_release",
-                "task_template": {"title": "Scheduled release"},
+                "task_template": {
+                    "title": "Scheduled release",
+                    "workflow_id": "wf_should_be_ignored",
+                    "skill_id": "skill_should_be_ignored",
+                },
             },
         )
 
         assert response.status_code == 201
         body = response.json()
-        assert body["workflow_id"] is not None
+        assert body["workflow_id"] is None
+        assert body["skill_id"] == "skill_release"
+        assert "workflow_id" not in body["task_template"]
+        assert "skill_id" not in body["task_template"]
 
-        workflow = client.get(f"/api/v1/workflows/{body['workflow_id']}", headers=headers)
-        assert workflow.status_code == 200
-        workflow_body = workflow.json()
-        assert workflow_body["lifecycle"] == "persistent"
-        assert workflow_body["lineage"]["source_skill_ids"] == ["skill_release"]
+
+def test_materialized_skill_workflow_uses_latest_saved_skill_version(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        skill_id = asyncio.run(_seed_skill_workflow_source(client.app))
+
+        async def _create_latest_version() -> None:
+            async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
+                version = await create_skill_version(
+                    session,
+                    skill_id=skill_id,
+                    version_number=2,
+                    content_hash="c" * 64,
+                    instructions="Gather release notes, validate, and publish the release.",
+                    steps=[
+                        {
+                            "name": "validate_release",
+                            "type": "run",
+                            "prompt": "Validate the release state.",
+                            "require_deliverable": False,
+                        },
+                        {
+                            "name": "publish_release",
+                            "type": "run",
+                            "prompt": "Publish the release.",
+                            "require_deliverable": True,
+                        },
+                    ],
+                    decomposition_source_hash="d" * 64,
+                )
+                await set_current_version(session, skill_id, version.version_id)
+                await session.commit()
+
+        asyncio.run(_create_latest_version())
+
+        workflow_row = asyncio.run(
+            materialize_skill_workflow(
+                session_factory=client.app.state.session_factory,  # type: ignore[attr-defined]
+                owner_email="user@example.com",
+                skill_id=skill_id,
+                lifecycle="ephemeral",
+                composition_source="manual",
+                composition_intent="Ship release",
+            )
+        )
+
+        workflow = workflow_row.definition
+        assert [step["name"] for step in workflow["steps"]] == [
+            "validate_release",
+            "publish_release",
+        ]
 
 
 def test_task_create_rejects_unattached_skill_source(monkeypatch: object, tmp_path: Path) -> None:

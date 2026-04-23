@@ -921,6 +921,7 @@ export interface Schedule {
   timezone: string;
   agent_id: string;
   workflow_id: string | null;
+  skill_id: string | null;
   task_template: Record<string, unknown>;
   enabled: boolean;
   max_concurrent_runs: number;

@@ -521,6 +521,7 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     session_factory=self._session_factory,
                     user_email=current_user_email.get(),
+                    llm=self.llm,
                     artifact_store=self.artifact_store,
                 )
             # Signal same-turn refresh for mutation tools so the agent loop

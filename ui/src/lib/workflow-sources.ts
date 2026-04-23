@@ -60,6 +60,16 @@ export function workflowSourceValueForWorkflow(workflowId: string | null | undef
   return workflowId ? encodeWorkflowSourceValue('workflow', workflowId) : '';
 }
 
+export function workflowSourceValueForSelection(
+  workflowId: string | null | undefined,
+  skillId: string | null | undefined
+): string {
+  if (skillId) {
+    return encodeWorkflowSourceValue('skill', skillId);
+  }
+  return workflowSourceValueForWorkflow(workflowId);
+}
+
 export function buildWorkflowSourceOptions(
   workflows: Workflow[],
   skills: Skill[],

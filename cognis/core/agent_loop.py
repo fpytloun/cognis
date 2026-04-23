@@ -6584,6 +6584,16 @@ class AgentLoop:
                         if version_row is not None
                         else row.prompt_templates
                     ) or {}
+                    secret_placeholders = (
+                        list(getattr(version_row, "secret_placeholders", None) or [])
+                        if version_row is not None
+                        else []
+                    )
+                    asset_manifest = [
+                        item
+                        for item in (getattr(version_row, "asset_manifest", None) or [])
+                        if isinstance(item, dict)
+                    ]
                     steps = [
                         item
                         for item in (
@@ -6604,13 +6614,21 @@ class AgentLoop:
                             instructions=instructions,
                             tools=tools,
                             prompt_templates=prompt_templates,
+                            secret_placeholders=secret_placeholders,
+                            asset_manifest=asset_manifest,
                             steps=steps,
                             decomposition_source_hash=(
                                 getattr(version_row, "decomposition_source_hash", None)
                                 if version_row is not None
                                 else None
                             ),
-                            current_source_hash=compute_decomposition_source_hash(instructions),
+                            current_source_hash=compute_decomposition_source_hash(
+                                instructions,
+                                tools=tools,
+                                prompt_templates=prompt_templates,
+                                secret_placeholders=secret_placeholders,
+                                asset_manifest=asset_manifest,
+                            ),
                         )
                     )
             return materials
@@ -6648,7 +6666,11 @@ class AgentLoop:
                     secret_placeholders=current_version_row.secret_placeholders,
                     steps=material.steps,
                     decomposition_source_hash=compute_decomposition_source_hash(
-                        current_version_row.instructions
+                        current_version_row.instructions,
+                        tools=_coerce_skill_tools(current_version_row.tools),
+                        prompt_templates=current_version_row.prompt_templates,
+                        secret_placeholders=current_version_row.secret_placeholders,
+                        asset_manifest=current_version_row.asset_manifest,
                     ),
                     source_url=current_version_row.source_url,
                     resolved_url=current_version_row.resolved_url,
@@ -6686,6 +6708,8 @@ class AgentLoop:
                     instructions=material.instructions,
                     tools=material.tools,
                     prompt_templates=material.prompt_templates,
+                    secret_placeholders=material.secret_placeholders,
+                    asset_manifest=material.asset_manifest,
                 )
             except Exception as exc:
                 return ToolResult(
@@ -8895,7 +8919,7 @@ class AgentLoop:
         from ``workflow_state.step_outputs``.  Returns empty string if no
         prior outputs are available (first step or null input).
         """
-        from cognis.models.workflow import StepOutput, resolve_effective_input
+        from cognis.models.workflow import StepOutput, resolve_effective_input, resolve_source_names
 
         if not ctx.workflow_state or not ctx.workflow_steps:
             return ""
@@ -8906,7 +8930,11 @@ class AgentLoop:
         if effective_input.type == "null":
             return ""
 
-        source_names = effective_input.source_names()
+        source_names = resolve_source_names(
+            ctx.step_definition,
+            ctx.step_index,
+            ctx.workflow_steps,
+        )
         if not source_names:
             return ""
 

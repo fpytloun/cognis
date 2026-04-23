@@ -23,12 +23,18 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.workflow_management import (
+    delete_materialized_workflow,
+    get_attached_skill_workflow_source,
+    materialize_skill_workflow,
+)
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
     delete_schedule,
+    get_agent,
     get_schedule,
     list_due_schedules,
     list_schedules,
@@ -226,9 +232,36 @@ class Scheduler:
             description = template.pop("description", sched.description or "")
             expected_output = template.pop("expected_output", None)
             priority = template.pop("priority", 0)
-            workflow_id = template.pop("workflow_id", None) or sched.workflow_id
+            template.pop("workflow_id", None)
+            template.pop("skill_id", None)
+            workflow_id = sched.workflow_id
+            skill_id = getattr(sched, "skill_id", None)
             workspace_root = template.pop("workspace_root", None)
             working_directory = template.pop("working_directory", None)
+            created_workflow_id: str | None = None
+            created_task_id: str | None = None
+
+            if skill_id:
+                async with self._db_session() as db:
+                    agent_row = await get_agent(db, sched.agent_id)
+                if agent_row is None:
+                    raise ValueError(f"Agent '{sched.agent_id}' not found for schedule")
+                await get_attached_skill_workflow_source(
+                    session_factory=self._db_session,
+                    owner_email=sched.created_by,
+                    agent=agent_row,
+                    skill_id=str(skill_id),
+                )
+                created_workflow = await materialize_skill_workflow(
+                    session_factory=self._db_session,
+                    owner_email=sched.created_by,
+                    skill_id=str(skill_id),
+                    lifecycle="ephemeral",
+                    composition_source="manual",
+                    composition_intent=str(description or title),
+                )
+                workflow_id = created_workflow.workflow_id
+                created_workflow_id = created_workflow.workflow_id
 
             # Delivery config from template
             delivery_raw = template.pop("delivery", None)
@@ -255,6 +288,7 @@ class Scheduler:
                 workspace_root=workspace_root,
                 working_directory=working_directory,
             )
+            created_task_id = task.task_id
 
             logger.info(
                 "Schedule %s fired -> task %s",
@@ -290,6 +324,12 @@ class Scheduler:
             )
 
         except Exception:
+            if created_workflow_id is not None and created_task_id is None:
+                with contextlib.suppress(Exception):
+                    await delete_materialized_workflow(
+                        session_factory=self._db_session,
+                        workflow_id=created_workflow_id,
+                    )
             logger.exception("Schedule %s fire failed", schedule_id)
             errors = sched.consecutive_errors + 1
             disabled = errors >= self._max_consecutive_errors

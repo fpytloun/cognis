@@ -155,6 +155,25 @@ def test_validate_workflow_accepts_valid_definition() -> None:
     _validate_workflow(workflow)
 
 
+def test_validate_workflow_accepts_all_input_source() -> None:
+    workflow = Workflow(
+        workflow_id="test:all-input",
+        name="All Input",
+        steps=[
+            StepDefinition(name="setup", type="run", prompt="Setup"),
+            StepDefinition(name="collect", type="run", prompt="Collect"),
+            StepDefinition(
+                name="synthesize",
+                type="run",
+                prompt="Synthesize",
+                input={"type": "last", "source": "all"},
+            ),
+        ],
+    )
+
+    _validate_workflow(workflow)
+
+
 def test_validate_workflow_rejects_duplicate_step_names() -> None:
     workflow = Workflow(
         workflow_id="test:dup",

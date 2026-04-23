@@ -615,10 +615,19 @@ export function validateWorkflowForm(form: WorkflowFormState): string[] {
     }
 
     const referencedInputs = step.inputMode === 'null' || step.inputMode === 'auto' ? [] : parseList(step.inputText);
+    if (referencedInputs.includes('all') && referencedInputs.length > 1) {
+      issues.push(`Step ${step.name || index + 1} must use 'all' as the only source step.`);
+    }
     if (step.inputMode === 'full' && referencedInputs.length !== 1) {
       issues.push(`Step ${step.name || index + 1} uses full input and requires exactly one source step.`);
     }
+    if (step.inputMode === 'full' && referencedInputs[0] === 'all') {
+      issues.push(`Step ${step.name || index + 1} cannot use 'all' with full input.`);
+    }
     referencedInputs.forEach((inputName) => {
+      if (inputName === 'all') {
+        return;
+      }
       if (!previousNames.includes(inputName)) {
         issues.push(`Step ${step.name || index + 1} references missing or later input: ${inputName}.`);
       }

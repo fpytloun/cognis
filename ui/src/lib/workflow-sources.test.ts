@@ -6,6 +6,7 @@ import {
   encodeWorkflowSourceValue,
   skillIsAttachedToAgent,
   skillHasWorkflow,
+  workflowSourceValueForSelection,
   workflowSourceValueForWorkflow
 } from '$lib/workflow-sources';
 import type { Agent, Skill, Workflow } from '$lib/types/api';
@@ -125,6 +126,7 @@ describe('workflow source helpers', () => {
       skill_id: 'skill_release'
     });
     expect(workflowSourceValueForWorkflow('wf_release')).toBe('workflow:wf_release');
+    expect(workflowSourceValueForSelection(null, 'skill_release')).toBe('skill:skill_release');
   });
 
   it('builds combined workflow and skill options', () => {

@@ -75,7 +75,13 @@ def _version_to_response(
     *,
     asset_refs: list[Any] | None = None,
 ) -> SkillVersionResponse:
-    current_source_hash = compute_decomposition_source_hash(str(row.instructions or ""))
+    current_source_hash = compute_decomposition_source_hash(
+        str(row.instructions or ""),
+        tools=_coerce_tools_list(getattr(row, "tools", None)),
+        prompt_templates=getattr(row, "prompt_templates", None) or {},
+        secret_placeholders=getattr(row, "secret_placeholders", None) or [],
+        asset_manifest=getattr(row, "asset_manifest", None) or [],
+    )
     decomposition_source_hash = getattr(row, "decomposition_source_hash", None)
     return SkillVersionResponse(
         version_id=row.version_id,
@@ -98,6 +104,32 @@ def _version_to_response(
         import_format=row.import_format,
         asset_manifest=[_asset_to_response(asset) for asset in (asset_refs or [])],
         created_at=row.created_at,
+    )
+
+
+def _decomposition_inputs_changed(
+    *,
+    instructions: str,
+    tools: list[dict[str, Any]] | None,
+    prompt_templates: dict[str, Any] | None,
+    secret_placeholders: list[str] | None,
+    asset_inputs: list[dict[str, Any]] | None,
+    current_instructions: str,
+    current_tools: list[dict[str, Any]] | None,
+    current_templates: dict[str, Any] | None,
+    current_placeholders: list[str] | None,
+    current_asset_inputs: list[dict[str, Any]] | None,
+) -> bool:
+    """Return whether decomposition-driving skill content changed."""
+
+    return any(
+        [
+            instructions != current_instructions,
+            (tools or []) != (current_tools or []),
+            (prompt_templates or {}) != (current_templates or {}),
+            (secret_placeholders or []) != (current_placeholders or []),
+            (asset_inputs or []) != (current_asset_inputs or []),
+        ]
     )
 
 
@@ -284,10 +316,6 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
                 steps=steps,
                 assets=assets,
                 allow_binary_assets=True,
-                decomposition_source_hash=(
-                    body.decomposition_source_hash
-                    or (compute_decomposition_source_hash(body.instructions) if steps else None)
-                ),
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
@@ -304,6 +332,8 @@ async def update_skill_route(
 ) -> SkillResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    from cognis.core.workflow_composition import decompose_skill_material
+
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
@@ -371,10 +401,19 @@ async def update_skill_route(
             current_version.secret_placeholders if current_version is not None else None
         )
         current_steps = getattr(current_version, "steps", None) if current_version is not None else None
-        current_decomposition_hash = (
-            getattr(current_version, "decomposition_source_hash", None) if current_version is not None else None
+        comparable_asset_inputs = _canonical_asset_inputs(asset_inputs)
+        current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
+        current_source_hash = compute_decomposition_source_hash(
+            instructions,
+            tools=tools,
+            prompt_templates=prompt_templates,
+            secret_placeholders=secret_placeholders,
+            asset_manifest=(
+                comparable_asset_inputs
+                if body.assets is not None
+                else getattr(current_version, "asset_manifest", None) or []
+            ),
         )
-        current_source_hash = compute_decomposition_source_hash(instructions)
         if (
             body.steps is not None
             and body.decomposition_source_hash is not None
@@ -383,21 +422,73 @@ async def update_skill_route(
             raise api_exception(
                 409,
                 "stale_decomposition_preview",
-                "Skill instructions changed after the decomposition preview was generated. Refresh the preview before saving.",
+                "Skill content changed after the decomposition preview was generated. Refresh the preview before saving.",
             )
-        current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
-        comparable_asset_inputs = _canonical_asset_inputs(asset_inputs)
+        decomposition_inputs_changed = _decomposition_inputs_changed(
+            instructions=instructions,
+            tools=tools,
+            prompt_templates=prompt_templates,
+            secret_placeholders=secret_placeholders,
+            asset_inputs=comparable_asset_inputs,
+            current_instructions=current_instructions,
+            current_tools=current_tools,
+            current_templates=current_templates,
+            current_placeholders=current_placeholders,
+            current_asset_inputs=current_asset_inputs,
+        )
+        if body.steps is None and decomposition_inputs_changed and current_steps:
+            llm = getattr(request.app.state.providers, "llm", None)
+            if llm is None:
+                raise api_exception(
+                    503,
+                    "service_unavailable",
+                    "LLM provider is not available for decomposition refresh",
+                )
+            try:
+                decomposition = await decompose_skill_material(
+                    llm=llm,
+                    skill_id=row.skill_id,
+                    name=body.name or row.name,
+                    description=(
+                        body.description if body.description is not None else row.description
+                    ),
+                    instructions=instructions,
+                    tools=tools or [],
+                    prompt_templates=prompt_templates or {},
+                    secret_placeholders=secret_placeholders or [],
+                    asset_manifest=comparable_asset_inputs,
+                    existing_steps=current_steps,
+                    previous_instructions=current_instructions,
+                    previous_tools=_coerce_tools_list(current_tools) or [],
+                    previous_prompt_templates=current_templates or {},
+                    previous_secret_placeholders=current_placeholders or [],
+                    previous_asset_manifest=current_asset_inputs,
+                )
+            except TimeoutError as exc:
+                raise api_exception(
+                    504,
+                    "timeout",
+                    "Timed out while refreshing the saved skill decomposition.",
+                ) from exc
+            except ValueError as exc:
+                raise api_exception(
+                    502,
+                    "provider_error",
+                    f"Skill decomposition refresh returned invalid output: {exc}",
+                ) from exc
+            except Exception as exc:
+                raise api_exception(
+                    502,
+                    "provider_error",
+                    f"Failed to refresh the saved skill decomposition: {exc}",
+                ) from exc
+            steps = decomposition.steps
         content_changed = (
             (body.instructions is not None and instructions != current_instructions)
             or (body.tools is not None and (tools or []) != (current_tools or []))
             or (body.prompt_templates is not None and (prompt_templates or {}) != (current_templates or {}))
             or (body.secret_placeholders is not None and (secret_placeholders or []) != (current_placeholders or []))
-            or (body.steps is not None and (steps or []) != (current_steps or []))
-            or (
-                body.steps is not None
-                and body.decomposition_source_hash is not None
-                and body.decomposition_source_hash != current_decomposition_hash
-            )
+            or (steps or []) != (current_steps or [])
             or (body.assets is not None and comparable_asset_inputs != current_asset_inputs)
         )
         if content_changed:
@@ -446,13 +537,6 @@ async def update_skill_route(
                     import_checksum=current_version.import_checksum if current_version is not None else None,
                     imported_at=current_version.imported_at if current_version is not None else None,
                     import_format=current_version.import_format if current_version is not None else None,
-                    decomposition_source_hash=(
-                        body.decomposition_source_hash
-                        if body.steps is not None and body.decomposition_source_hash is not None
-                        else compute_decomposition_source_hash(instructions)
-                        if body.steps is not None and steps
-                        else getattr(current_version, "decomposition_source_hash", None)
-                    ),
                 )
             except ValueError as exc:
                 raise api_exception(400, "validation_error", str(exc)) from exc
@@ -504,13 +588,19 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             current_version.prompt_templates if current_version is not None else row.prompt_templates
         )
         current_steps = getattr(current_version, "steps", None) if current_version is not None else None
-        current_decomposition_hash = (
-            getattr(current_version, "decomposition_source_hash", None) if current_version is not None else None
-        )
         expected_decomposition_hash = (
-            compute_decomposition_source_hash(str(defaults["instructions"]))
+            compute_decomposition_source_hash(
+                str(defaults["instructions"]),
+                tools=normalize_skill_tools(defaults.get("tools")),
+                prompt_templates=normalize_prompt_templates(defaults.get("prompt_templates")),
+                secret_placeholders=[],
+                asset_manifest=[],
+            )
             if defaults.get("steps")
             else None
+        )
+        current_decomposition_hash = (
+            getattr(current_version, "decomposition_source_hash", None) if current_version is not None else None
         )
         current_assets = (
             await load_skill_asset_refs(session, current_version) if current_version is not None else []
@@ -559,11 +649,6 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
                 assets=None,
                 allow_binary_assets=True,
-                decomposition_source_hash=(
-                    compute_decomposition_source_hash(row.instructions)
-                    if defaults.get("steps")
-                    else None
-                ),
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
@@ -620,6 +705,14 @@ async def decompose_skill_preview_route(
         prompt_templates = (
             version_row.prompt_templates if version_row is not None else row.prompt_templates
         ) or {}
+        secret_placeholders = (
+            list(getattr(version_row, "secret_placeholders", None) or [])
+            if version_row is not None
+            else []
+        )
+        asset_manifest = [
+            item for item in (getattr(version_row, "asset_manifest", None) or []) if isinstance(item, dict)
+        ]
 
     try:
         preview = await decompose_skill_material(
@@ -630,6 +723,8 @@ async def decompose_skill_preview_route(
             instructions=instructions,
             tools=tools,
             prompt_templates=prompt_templates,
+            secret_placeholders=secret_placeholders,
+            asset_manifest=asset_manifest,
         )
     except ValueError as exc:
         raise api_exception(
@@ -646,7 +741,13 @@ async def decompose_skill_preview_route(
 
     return SkillDecompositionPreviewResponse(
         skill_id=row.skill_id,
-        source_hash=compute_decomposition_source_hash(instructions),
+        source_hash=compute_decomposition_source_hash(
+            instructions,
+            tools=tools,
+            prompt_templates=prompt_templates,
+            secret_placeholders=secret_placeholders,
+            asset_manifest=asset_manifest,
+        ),
         rationale=preview.rationale,
         steps=preview.steps,
     )
@@ -759,9 +860,6 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
                 import_checksum=provenance.import_checksum if provenance else None,
                 imported_at=provenance.imported_at if provenance else None,
                 import_format=provenance.import_format if provenance else body.format,
-                decomposition_source_hash=(
-                    compute_decomposition_source_hash(instructions) if steps else None
-                ),
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc

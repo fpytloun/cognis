@@ -364,6 +364,10 @@ Rules:
 - Prefer a small number of meaningful steps.
 - Keep gather/inspect steps lightweight.
 - Use require_deliverable=true for synthesis/report/final artifact steps.
+- When input is omitted, Cognis defaults it to the immediately preceding run step.
+- If several later steps depend on one earlier setup step, set input explicitly instead of relying on the default previous-step behavior.
+- Final aggregation steps may use input {type: "last", source: "all"} or {type: "summary", source: "all"}.
+- Never use source="all" with type="full".
 - Do not invent tools or fields outside the workflow schema.
 
 Return JSON:

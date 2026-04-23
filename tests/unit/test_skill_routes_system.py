@@ -291,8 +291,118 @@ def test_skill_decompose_preview_returns_provider_error_on_invalid_output(
         )
 
         assert response.status_code == 502
-        assert response.json()["error"]["code"] == "provider_error"
-        assert "invalid output" in response.json()["error"]["message"]
+    assert response.json()["error"]["code"] == "provider_error"
+    assert "invalid output" in response.json()["error"]["message"]
+
+
+def test_skill_update_refreshes_saved_decomposition_when_inputs_change(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    async def _refresh(*args: object, **kwargs: object) -> SkillDecompositionResult:
+        return SkillDecompositionResult(
+            rationale="Refresh only the affected synthesis step.",
+            steps=[
+                {
+                    "name": "collect",
+                    "type": "run",
+                    "prompt": "Collect data.",
+                    "require_deliverable": False,
+                },
+                {
+                    "name": "synthesize",
+                    "type": "run",
+                    "prompt": "Write the refreshed brief.",
+                    "input": {"type": "last", "source": "all"},
+                    "require_deliverable": True,
+                },
+            ],
+        )
+
+    monkeypatch.setattr("cognis.core.workflow_composition.decompose_skill_material", _refresh)
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={
+                "name": "Briefing",
+                "instructions": "Write a briefing.",
+                "steps": [
+                    {
+                        "name": "collect",
+                        "type": "run",
+                        "prompt": "Collect data.",
+                        "require_deliverable": False,
+                    },
+                    {
+                        "name": "synthesize",
+                        "type": "run",
+                        "prompt": "Write the brief.",
+                        "require_deliverable": True,
+                    },
+                ],
+            },
+        )
+        assert created.status_code == 201
+
+        updated = client.put(
+            f"/api/v1/skills/{created.json()['skill_id']}",
+            headers=headers,
+            json={"instructions": "Write a refreshed multi-section briefing."},
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["current_version"]["steps"][1]["input"] == {
+            "type": "last",
+            "source": "all",
+        }
+
+
+def test_skill_update_fails_when_decomposition_refresh_fails(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    async def _refresh(*args: object, **kwargs: object) -> SkillDecompositionResult:
+        raise TimeoutError()
+
+    monkeypatch.setattr("cognis.core.workflow_composition.decompose_skill_material", _refresh)
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={
+                "name": "Briefing",
+                "instructions": "Write a briefing.",
+                "steps": [
+                    {
+                        "name": "collect",
+                        "type": "run",
+                        "prompt": "Collect data.",
+                        "require_deliverable": False,
+                    }
+                ],
+            },
+        )
+        assert created.status_code == 201
+        current_version_id = created.json()["current_version_id"]
+
+        updated = client.put(
+            f"/api/v1/skills/{created.json()['skill_id']}",
+            headers=headers,
+            json={"instructions": "Write a refreshed multi-section briefing."},
+        )
+
+        assert updated.status_code == 504
+
+        reloaded = client.get(f"/api/v1/skills/{created.json()['skill_id']}", headers=headers)
+        assert reloaded.status_code == 200
+        assert reloaded.json()["current_version_id"] == current_version_id
 
 
 def test_skill_update_with_identical_content_does_not_create_new_version(

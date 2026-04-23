@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 import mimetypes
 import posixpath
 import zipfile
@@ -144,10 +145,66 @@ def normalize_skill_steps(value: Any) -> list[dict[str, Any]] | None:
     return normalized
 
 
-def compute_decomposition_source_hash(instructions: str) -> str:
-    """Compute a stable hash for the instruction text that produced decomposition."""
+def _canonical_decomposition_asset_manifest(
+    asset_manifest: list[dict[str, Any]] | list[SkillAssetRef] | None,
+) -> list[dict[str, str]]:
+    """Normalize asset manifest entries for decomposition hashing."""
 
-    return hashlib.sha256(instructions.strip().encode("utf-8")).hexdigest()
+    normalized: list[dict[str, str]] = []
+    for raw_item in asset_manifest or []:
+        item = (
+            raw_item.model_dump(mode="json", exclude_none=True)
+            if isinstance(raw_item, SkillAssetRef)
+            else raw_item
+        )
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "").strip()
+        if not filename:
+            continue
+        inline_content = item.get("content")
+        inline_content_b64 = item.get("content_b64")
+        if isinstance(inline_content, str):
+            fingerprint = hashlib.sha256(inline_content.encode("utf-8")).hexdigest()
+        elif isinstance(inline_content_b64, str) and inline_content_b64:
+            fingerprint = hashlib.sha256(inline_content_b64.encode("utf-8")).hexdigest()
+        else:
+            fingerprint = (
+                str(item.get("content_hash") or "").strip()
+                or str(item.get("existing_asset_id") or "").strip()
+                or str(item.get("source_artifact_id") or "").strip()
+                or str(item.get("asset_id") or "").strip()
+            )
+        normalized.append(
+            {
+                "filename": filename,
+                "fingerprint": fingerprint,
+                "content_type": str(item.get("content_type") or "").strip(),
+            }
+        )
+    normalized.sort(key=lambda entry: entry["filename"])
+    return normalized
+
+
+def compute_decomposition_source_hash(
+    instructions: str,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    prompt_templates: dict[str, Any] | None = None,
+    secret_placeholders: list[str] | None = None,
+    asset_manifest: list[dict[str, Any]] | list[SkillAssetRef] | None = None,
+) -> str:
+    """Compute a stable hash for all skill content that drives decomposition."""
+
+    payload = {
+        "instructions": instructions.strip(),
+        "tools": normalize_skill_tools(tools),
+        "prompt_templates": normalize_prompt_templates(prompt_templates),
+        "secret_placeholders": normalize_secret_placeholders(secret_placeholders),
+        "asset_manifest": _canonical_decomposition_asset_manifest(asset_manifest),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def normalize_skill_asset_filename(filename: str) -> str:
@@ -403,6 +460,14 @@ async def create_skill_version_with_assets(
         ).model_dump(mode="json", exclude_none=True)
         for asset in prepared_assets
     ]
+    if decomposition_source_hash is None and normalized_steps is not None:
+        decomposition_source_hash = compute_decomposition_source_hash(
+            instructions,
+            tools=normalized_tools,
+            prompt_templates=normalized_templates,
+            secret_placeholders=normalized_placeholders,
+            asset_manifest=asset_manifest,
+        )
 
     content_hash = compute_content_hash(
         instructions,

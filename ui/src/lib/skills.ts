@@ -66,6 +66,7 @@ export interface SkillFormState {
 export interface SkillWorkflowDraftStorage {
   skillId: string;
   generatedAt: string;
+  decompositionSourceHash: string | null;
   form: WorkflowFormState;
 }
 
@@ -376,7 +377,7 @@ export function skillToWorkflowDraft(
   const effectiveSteps = Array.isArray(steps) && steps.length > 0 ? steps : skill.current_version?.steps ?? skill.steps ?? [];
   if (!Array.isArray(effectiveSteps) || effectiveSteps.length === 0) {
     const form = createEmptyWorkflowForm();
-    form.name = `${skill.name} Workflow`;
+    form.name = skill.name;
     form.description = skill.description ?? '';
     form.lineage = {
       source_skill_ids: [skill.skill_id],
@@ -386,7 +387,7 @@ export function skillToWorkflowDraft(
   }
   const workflow: Workflow = {
     workflow_id: '',
-    name: `${skill.name} Workflow`,
+    name: skill.name,
     description: skill.description ?? '',
     version: 1,
     criteria: '',
@@ -419,13 +420,18 @@ export function skillToWorkflowDraft(
   return workflowToFormState(workflow, profileMap);
 }
 
-export function saveSkillWorkflowDraft(skillId: string, form: WorkflowFormState): void {
+export function saveSkillWorkflowDraft(
+  skillId: string,
+  form: WorkflowFormState,
+  decompositionSourceHash: string | null = null
+): void {
   if (typeof sessionStorage === 'undefined') {
     return;
   }
   const payload: SkillWorkflowDraftStorage = {
     skillId,
     generatedAt: new Date().toISOString(),
+    decompositionSourceHash,
     form
   };
   sessionStorage.setItem(SKILL_WORKFLOW_DRAFT_STORAGE_KEY, JSON.stringify(payload));
@@ -441,7 +447,11 @@ export function loadSkillWorkflowDraft(skillId: string): SkillWorkflowDraftStora
   }
   try {
     const parsed = JSON.parse(raw) as SkillWorkflowDraftStorage;
-    if (parsed.skillId !== skillId || !parsed.form) {
+    if (
+      parsed.skillId !== skillId
+      || !parsed.form
+      || !Object.prototype.hasOwnProperty.call(parsed, 'decompositionSourceHash')
+    ) {
       return null;
     }
     return parsed;

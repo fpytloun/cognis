@@ -467,6 +467,7 @@ async def handle_skill_management_tool(
     arguments: dict[str, Any],
     session_factory: Any,
     user_email: str,
+    llm: Any | None = None,
     artifact_store: Any | None = None,
 ) -> ToolResult:
     """Handle a skill management tool call."""
@@ -481,15 +482,15 @@ async def handle_skill_management_tool(
             return await _handle_skill_versions(session_factory, user_email, arguments)
         if tool_name == "skill_write":
             return await _handle_skill_write(
-                session_factory, user_email, arguments, artifact_store=artifact_store
+                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
             )
         if tool_name == "skill_asset_write":
             return await _handle_skill_asset_write(
-                session_factory, user_email, arguments, artifact_store=artifact_store
+                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
             )
         if tool_name == "skill_asset_delete":
             return await _handle_skill_asset_delete(
-                session_factory, user_email, arguments, artifact_store=artifact_store
+                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
             )
         if tool_name == "skill_delete":
             return await _handle_skill_delete(session_factory, user_email, arguments)
@@ -511,6 +512,110 @@ async def handle_skill_management_tool(
             exc_info=True,
         )
         return ToolResult(output=f"Skill operation failed: {str(exc)[:500]}", is_error=True)
+
+
+def _canonical_asset_inputs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    canonical: list[dict[str, Any]] = []
+    for item in items:
+        payload = dict(item)
+        if payload.get("existing_asset_id"):
+            payload.pop("content_type", None)
+        canonical.append(payload)
+    return canonical
+
+
+def _decomposition_inputs_changed(
+    *,
+    instructions: str,
+    tools: list[dict[str, Any]] | None,
+    prompt_templates: dict[str, Any] | None,
+    secret_placeholders: list[str] | None,
+    asset_inputs: list[dict[str, Any]] | None,
+    current_instructions: str,
+    current_tools: list[dict[str, Any]] | None,
+    current_templates: dict[str, Any] | None,
+    current_placeholders: list[str] | None,
+    current_asset_inputs: list[dict[str, Any]] | None,
+) -> bool:
+    """Return whether skill content that drives decomposition changed."""
+
+    return any(
+        [
+            instructions != current_instructions,
+            (tools or []) != (current_tools or []),
+            (prompt_templates or {}) != (current_templates or {}),
+            (secret_placeholders or []) != (current_placeholders or []),
+            (asset_inputs or []) != (current_asset_inputs or []),
+        ]
+    )
+
+
+async def _refresh_skill_steps_if_needed(
+    *,
+    llm: Any | None,
+    skill_id: str,
+    skill_name: str,
+    description: str | None,
+    instructions: str,
+    tools: list[dict[str, Any]] | None,
+    prompt_templates: dict[str, Any] | None,
+    secret_placeholders: list[str] | None,
+    asset_inputs: list[dict[str, Any]] | None,
+    current_instructions: str,
+    current_tools: list[dict[str, Any]] | None,
+    current_templates: dict[str, Any] | None,
+    current_placeholders: list[str] | None,
+    current_steps: list[dict[str, Any]] | None,
+    current_asset_inputs: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Refresh saved skill decomposition when omitted steps became stale."""
+
+    if current_steps is None:
+        return None, None
+    comparable_asset_inputs = _canonical_asset_inputs(asset_inputs or [])
+    if not _decomposition_inputs_changed(
+        instructions=instructions,
+        tools=tools,
+        prompt_templates=prompt_templates,
+        secret_placeholders=secret_placeholders,
+        asset_inputs=comparable_asset_inputs,
+        current_instructions=current_instructions,
+        current_tools=current_tools,
+        current_templates=current_templates,
+        current_placeholders=current_placeholders,
+        current_asset_inputs=_canonical_asset_inputs(current_asset_inputs or []),
+    ):
+        return current_steps, None
+    if llm is None:
+        return None, "LLM provider is not available for decomposition refresh"
+
+    from cognis.core.workflow_composition import decompose_skill_material
+
+    try:
+        decomposition = await decompose_skill_material(
+            llm=llm,
+            skill_id=skill_id,
+            name=skill_name,
+            description=description,
+            instructions=instructions,
+            tools=tools or [],
+            prompt_templates=prompt_templates or {},
+            secret_placeholders=secret_placeholders or [],
+            asset_manifest=comparable_asset_inputs,
+            existing_steps=current_steps,
+            previous_instructions=current_instructions,
+            previous_tools=current_tools or [],
+            previous_prompt_templates=current_templates or {},
+            previous_secret_placeholders=current_placeholders or [],
+            previous_asset_manifest=_canonical_asset_inputs(current_asset_inputs or []),
+        )
+    except TimeoutError:
+        return None, "Timed out while refreshing the saved skill decomposition"
+    except ValueError as exc:
+        return None, f"Skill decomposition refresh returned invalid output: {exc}"
+    except Exception as exc:
+        return None, f"Failed to refresh the saved skill decomposition: {exc}"
+    return decomposition.steps, None
 
 
 async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResult:
@@ -751,6 +856,7 @@ async def _handle_skill_write(
     user_email: str,
     arguments: dict[str, Any],
     *,
+    llm: Any | None,
     artifact_store: Any | None,
 ) -> ToolResult:
     import json
@@ -788,19 +894,6 @@ async def _handle_skill_write(
     decomposition_source_hash = arguments.get("decomposition_source_hash")
     if decomposition_source_hash is not None:
         decomposition_source_hash = str(decomposition_source_hash).strip() or None
-    current_source_hash = compute_decomposition_source_hash(instructions)
-    if (
-        steps is not None
-        and decomposition_source_hash is not None
-        and decomposition_source_hash != current_source_hash
-    ):
-        return ToolResult(
-            output=(
-                "steps do not match the current instructions; decomposition_source_hash is stale. "
-                "Refresh the decomposition before saving."
-            ),
-            is_error=True,
-        )
 
     async with session_factory() as session:
         created_new_skill = False
@@ -818,6 +911,26 @@ async def _handle_skill_write(
                 else []
             )
             assets = asset_refs_to_inputs(current_assets)
+            current_asset_inputs = _canonical_asset_inputs(list(assets))
+            current_source_hash = compute_decomposition_source_hash(
+                instructions,
+                tools=tools,
+                prompt_templates=templates,
+                secret_placeholders=secret_placeholders,
+                asset_manifest=getattr(current_version, "asset_manifest", None) or [],
+            )
+            if (
+                steps is not None
+                and decomposition_source_hash is not None
+                and decomposition_source_hash != current_source_hash
+            ):
+                return ToolResult(
+                    output=(
+                        "steps do not match the current skill content; decomposition_source_hash is stale. "
+                        "Refresh the decomposition before saving."
+                    ),
+                    is_error=True,
+                )
             await update_skill(
                 session,
                 skill_id,
@@ -831,6 +944,36 @@ async def _handle_skill_write(
                 auto_load=attach_to_all_agents,
             )
             next_num = await get_next_version_number(session, skill_id)
+            if steps is None:
+                steps, refresh_error = await _refresh_skill_steps_if_needed(
+                    llm=llm,
+                    skill_id=skill_id,
+                    skill_name=name,
+                    description=description if isinstance(description, str) else row.description,
+                    instructions=instructions,
+                    tools=tools,
+                    prompt_templates=templates,
+                    secret_placeholders=secret_placeholders,
+                    asset_inputs=current_asset_inputs,
+                    current_instructions=current_version.instructions
+                    if current_version is not None
+                    else row.instructions,
+                    current_tools=current_version.tools if current_version is not None else row.tools,
+                    current_templates=(
+                        current_version.prompt_templates
+                        if current_version is not None
+                        else row.prompt_templates
+                    ),
+                    current_placeholders=(
+                        current_version.secret_placeholders if current_version is not None else None
+                    ),
+                    current_steps=getattr(current_version, "steps", None)
+                    if current_version is not None
+                    else None,
+                    current_asset_inputs=current_asset_inputs,
+                )
+                if refresh_error is not None:
+                    return ToolResult(output=refresh_error, is_error=True)
         else:
             # Create new
             created_new_skill = True
@@ -848,6 +991,25 @@ async def _handle_skill_write(
             skill_id = row.skill_id
             next_num = 1
             assets = []
+            current_source_hash = compute_decomposition_source_hash(
+                instructions,
+                tools=tools,
+                prompt_templates=templates,
+                secret_placeholders=secret_placeholders,
+                asset_manifest=[],
+            )
+            if (
+                steps is not None
+                and decomposition_source_hash is not None
+                and decomposition_source_hash != current_source_hash
+            ):
+                return ToolResult(
+                    output=(
+                        "steps do not match the current skill content; decomposition_source_hash is stale. "
+                        "Refresh the decomposition before saving."
+                    ),
+                    is_error=True,
+                )
 
         try:
             version_row = await create_skill_version_with_assets(
@@ -877,15 +1039,6 @@ async def _handle_skill_write(
                 import_format=current_version.import_format
                 if current_version is not None
                 else None,
-                decomposition_source_hash=(
-                    decomposition_source_hash
-                    if steps is not None and decomposition_source_hash is not None
-                    else current_source_hash
-                    if steps is not None
-                    else getattr(current_version, "decomposition_source_hash", None)
-                    if current_version is not None
-                    else None
-                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
@@ -926,6 +1079,7 @@ async def _handle_skill_asset_write(
     user_email: str,
     arguments: dict[str, Any],
     *,
+    llm: Any | None,
     artifact_store: Any | None,
 ) -> ToolResult:
     import json
@@ -962,6 +1116,7 @@ async def _handle_skill_asset_write(
             if current_version is not None
             else []
         )
+        current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
         retained_assets = [item for item in current_assets if item.filename != filename]
         asset_inputs = [*asset_refs_to_inputs(retained_assets), asset_payload]
         instructions = (
@@ -974,6 +1129,27 @@ async def _handle_skill_asset_write(
             else row.prompt_templates
         )
         placeholders = current_version.secret_placeholders if current_version is not None else None
+        steps = getattr(current_version, "steps", None) if current_version is not None else None
+        if steps is not None:
+            steps, refresh_error = await _refresh_skill_steps_if_needed(
+                llm=llm,
+                skill_id=skill_id,
+                skill_name=row.name,
+                description=row.description,
+                instructions=instructions,
+                tools=tools,
+                prompt_templates=templates,
+                secret_placeholders=placeholders,
+                asset_inputs=_canonical_asset_inputs(asset_inputs),
+                current_instructions=instructions,
+                current_tools=tools,
+                current_templates=templates,
+                current_placeholders=placeholders,
+                current_steps=steps,
+                current_asset_inputs=current_asset_inputs,
+            )
+            if refresh_error is not None:
+                return ToolResult(output=refresh_error, is_error=True)
         try:
             version_row = await create_skill_version_with_assets(
                 session,
@@ -985,9 +1161,7 @@ async def _handle_skill_asset_write(
                 tools=tools,
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
-                steps=getattr(current_version, "steps", None)
-                if current_version is not None
-                else None,
+                steps=steps,
                 assets=asset_inputs,
                 allow_binary_assets=False,
                 source_url=current_version.source_url if current_version is not None else None,
@@ -1000,11 +1174,6 @@ async def _handle_skill_asset_write(
                 import_format=current_version.import_format
                 if current_version is not None
                 else None,
-                decomposition_source_hash=(
-                    getattr(current_version, "decomposition_source_hash", None)
-                    if current_version is not None
-                    else None
-                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
@@ -1038,6 +1207,7 @@ async def _handle_skill_asset_delete(
     user_email: str,
     arguments: dict[str, Any],
     *,
+    llm: Any | None,
     artifact_store: Any | None,
 ) -> ToolResult:
     import json
@@ -1067,6 +1237,7 @@ async def _handle_skill_asset_delete(
             if current_version is not None
             else []
         )
+        current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
         retained_assets = [item for item in current_assets if item.filename != filename]
         if len(retained_assets) == len(current_assets):
             return ToolResult(
@@ -1082,6 +1253,28 @@ async def _handle_skill_asset_delete(
             else row.prompt_templates
         )
         placeholders = current_version.secret_placeholders if current_version is not None else None
+        steps = getattr(current_version, "steps", None) if current_version is not None else None
+        if steps is not None:
+            retained_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(retained_assets))
+            steps, refresh_error = await _refresh_skill_steps_if_needed(
+                llm=llm,
+                skill_id=skill_id,
+                skill_name=row.name,
+                description=row.description,
+                instructions=instructions,
+                tools=tools,
+                prompt_templates=templates,
+                secret_placeholders=placeholders,
+                asset_inputs=retained_asset_inputs,
+                current_instructions=instructions,
+                current_tools=tools,
+                current_templates=templates,
+                current_placeholders=placeholders,
+                current_steps=steps,
+                current_asset_inputs=current_asset_inputs,
+            )
+            if refresh_error is not None:
+                return ToolResult(output=refresh_error, is_error=True)
         version_row = await create_skill_version_with_assets(
             session,
             artifact_store,
@@ -1092,7 +1285,7 @@ async def _handle_skill_asset_delete(
             tools=tools,
             prompt_templates=templates,
             secret_placeholders=placeholders,
-            steps=getattr(current_version, "steps", None) if current_version is not None else None,
+            steps=steps,
             assets=asset_refs_to_inputs(retained_assets),
             allow_binary_assets=False,
             source_url=current_version.source_url if current_version is not None else None,
@@ -1103,11 +1296,6 @@ async def _handle_skill_asset_delete(
             else None,
             imported_at=current_version.imported_at if current_version is not None else None,
             import_format=current_version.import_format if current_version is not None else None,
-            decomposition_source_hash=(
-                getattr(current_version, "decomposition_source_hash", None)
-                if current_version is not None
-                else None
-            ),
         )
         await update_skill(
             session,
@@ -1249,9 +1437,6 @@ async def _handle_skill_import_url(
                 import_checksum=provenance.import_checksum,
                 imported_at=provenance.imported_at,
                 import_format=provenance.import_format,
-                decomposition_source_hash=(
-                    compute_decomposition_source_hash(instructions) if steps else None
-                ),
             )
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)

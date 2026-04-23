@@ -301,6 +301,27 @@ describe('formStateToWorkflowPayload', () => {
     expect(validateWorkflowForm(form)).toEqual([]);
   });
 
+  it("accepts 'all' as a standalone input source", () => {
+    const form = createEmptyWorkflowForm();
+    form.steps = [
+      { ...form.steps[0], name: 'setup' },
+      { ...form.steps[0], name: 'collect' },
+      { ...form.steps[0], name: 'synthesize', inputMode: 'last', inputText: 'all' }
+    ];
+
+    expect(validateWorkflowForm(form)).toEqual([]);
+  });
+
+  it("rejects 'all' mixed with named input sources", () => {
+    const form = createEmptyWorkflowForm();
+    form.steps = [
+      { ...form.steps[0], name: 'setup' },
+      { ...form.steps[0], name: 'synthesize', inputMode: 'last', inputText: 'all, setup' }
+    ];
+
+    expect(validateWorkflowForm(form).some((issue) => issue.includes("'all' as the only source"))).toBe(true);
+  });
+
   it('omits inline step profile payload when step matches preset defaults', () => {
     const form = createEmptyWorkflowForm();
     form.steps = [

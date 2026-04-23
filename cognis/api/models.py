@@ -696,6 +696,7 @@ class ScheduleResponse(BaseModel):
     timezone: str = "UTC"
     agent_id: str
     workflow_id: str | None = None
+    skill_id: str | None = None
     task_template: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     max_concurrent_runs: int = 1

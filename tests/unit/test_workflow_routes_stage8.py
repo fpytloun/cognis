@@ -99,6 +99,24 @@ def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_pa
         assert len(body["steps"]) == 3
 
 
+def test_workflow_create_accepts_null_workflow_id(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+
+        response = client.post(
+            "/api/v1/workflows",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={
+                "workflow_id": None,
+                "name": "Daily Brief",
+                "steps": [{"name": "collect", "type": "run", "prompt": "Collect inputs."}],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["workflow_id"].startswith("wf_")
+
+
 def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
     monkeypatch: object, tmp_path: Path
 ) -> None:

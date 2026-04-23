@@ -314,9 +314,16 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
     from cognis.core.workflow_registry import _validate_workflow
     from cognis.models.workflow import Workflow
 
-    workflow = Workflow.model_validate(definition)
+    normalized = dict(definition)
+    restore_missing_id = normalized.get("workflow_id") in {None, ""}
+    if restore_missing_id:
+        normalized["workflow_id"] = "wf_validation"
+    workflow = Workflow.model_validate(normalized)
     _validate_workflow(workflow)
-    return workflow.model_dump(mode="json")
+    payload = workflow.model_dump(mode="json")
+    if restore_missing_id:
+        payload.pop("workflow_id", None)
+    return payload
 
 
 async def get_scoped_workflow_row(

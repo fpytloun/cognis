@@ -833,13 +833,14 @@ class WorkflowEngine:
         # delivered through event forking (type="full") or the step prompt
         # (type="last"/"summary"), not through a separate prior_context.
         effective_input = resolve_effective_input(step_def, step_index, workflow.steps)
+        resolved_sources = resolve_source_names(step_def, step_index, workflow.steps)
         logger.info(
             "workflow: resolved step input",
             extra={
                 "extra_data": {
                     "step": step_def.name,
                     "input_type": effective_input.type,
-                    "sources": effective_input.source_names(),
+                    "sources": resolved_sources,
                     "available_outputs": list(state.step_outputs.keys()),
                 }
             },

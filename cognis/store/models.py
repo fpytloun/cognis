@@ -546,6 +546,7 @@ class Schedule(Base):
     timezone: Mapped[str] = mapped_column(String, nullable=False, default="UTC")
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    skill_id: Mapped[str | None] = mapped_column(String, nullable=True)
     task_template: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     max_concurrent_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

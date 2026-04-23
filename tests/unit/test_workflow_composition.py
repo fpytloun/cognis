@@ -211,6 +211,56 @@ def test_decompose_skill_material_assigns_step_profiles_for_skill_tools() -> Non
     assert result.steps[0]["step_profile"]["tool_overrides"]["include"] == ["run_release"]
 
 
+def test_decompose_skill_material_includes_refresh_guidance_for_existing_steps() -> None:
+    llm = _FallbackLLM(
+        {
+            "rationale": "Keep the setup step and update the final synthesis.",
+            "steps": [
+                {
+                    "name": "resolve_window",
+                    "type": "run",
+                    "prompt": "Resolve the date window.",
+                    "require_deliverable": False,
+                },
+                {
+                    "name": "synthesize",
+                    "type": "run",
+                    "prompt": "Write the final brief.",
+                    "input": {"type": "last", "source": "all"},
+                    "require_deliverable": True,
+                },
+            ],
+        }
+    )
+
+    asyncio.run(
+        decompose_skill_material(
+            llm=llm,
+            skill_id="skill_brief",
+            name="Daily Brief",
+            description="Prepare a daily brief.",
+            instructions="Write a concise brief.",
+            tools=[],
+            prompt_templates={},
+            existing_steps=[
+                {
+                    "name": "resolve_window",
+                    "type": "run",
+                    "prompt": "Resolve the date window.",
+                    "require_deliverable": False,
+                }
+            ],
+            previous_instructions="Write a concise brief with one section.",
+            timeout_seconds=6.0,
+        )
+    )
+
+    prompt = str(llm.calls[-1]["messages"][-1]["content"])
+    assert "Refresh this skill's existing decomposition selectively when possible" in prompt
+    assert "source:'all'" in prompt
+    assert "immediately preceding run step" in prompt
+
+
 def test_compose_workflow_plan_retries_without_response_format_after_timeout() -> None:
     llm = _FallbackLLM(
         {

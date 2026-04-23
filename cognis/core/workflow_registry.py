@@ -17,7 +17,7 @@ from cognis.models.workflow import (
     StepProfileMode,
     Workflow,
     WorkflowDefaults,
-    resolve_effective_input,
+    resolve_source_names,
 )
 from cognis.providers.llm.reasoning import normalize_reasoning_effort
 from cognis.store.queries import (
@@ -596,8 +596,7 @@ def _validate_workflow(workflow: Workflow) -> None:
         seen_names.add(step.name)
 
         # Validate input source references point to earlier steps
-        effective = resolve_effective_input(step, i, workflow.steps)
-        for ref in effective.source_names():
+        for ref in resolve_source_names(step, i, workflow.steps):
             if ref not in seen_names:
                 raise ValueError(f"Step {step.name!r} references unknown/later input: {ref!r}")
 
