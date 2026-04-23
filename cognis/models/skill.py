@@ -126,6 +126,7 @@ class SkillVersion(BaseModel):
     schema_version: int = 1
     instructions: str
     tools: list[SkillToolSpec] = Field(default_factory=list)
+    linked_tool_ids: list[str] = Field(default_factory=list)
     prompt_templates: dict[str, str] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
     steps: list[dict[str, Any]] = Field(default_factory=list)
@@ -142,6 +143,7 @@ class SkillSummary(BaseModel):
     name: str
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
+    linked_tool_ids: list[str] = Field(default_factory=list)
     auto_load: bool = False  # Internal flag: attached to all agents
     source: str = "db"
     owner_email: str | None = None
@@ -164,6 +166,8 @@ class ResolvedSkill(BaseModel):
     skill_id: str
     name: str
     description: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    linked_tool_ids: list[str] = Field(default_factory=list)
     version_id: str
     version_number: int
     content_hash: str
@@ -226,6 +230,7 @@ class SkillImportRequest(BaseModel):
     format: str | None = None  # "skill_md" | "cognis_yaml" | "cognis_package"
     name: str | None = None  # override imported name
     tags: list[str] | None = None  # override imported tags
+    linked_tool_ids: list[str] | None = None
     auto_load: bool = False
 
 
@@ -236,6 +241,7 @@ class SkillExportData(BaseModel):
     name: str
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
+    linked_tool_ids: list[str] = Field(default_factory=list)
     auto_load: bool = False
     instructions: str
     tools: list[dict[str, Any]] = Field(default_factory=list)

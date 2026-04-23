@@ -31,7 +31,7 @@ def parse_skill_md(content: str) -> dict[str, Any]:
     """Parse a SKILL.md file into a skill data dict.
 
     Returns a dict with keys: name, description, instructions, tags,
-    tools, prompt_templates, secret_placeholders, and any extra
+    tools, linked_tool_ids, prompt_templates, secret_placeholders, and any extra
     frontmatter fields.
 
     Raises ``ValueError`` on missing required fields.
@@ -45,6 +45,7 @@ def parse_skill_md(content: str) -> dict[str, Any]:
             "instructions": content.strip(),
             "tags": [],
             "tools": [],
+            "linked_tool_ids": [],
             "prompt_templates": {},
             "secret_placeholders": [],
             "steps": [],
@@ -77,6 +78,13 @@ def parse_skill_md(content: str) -> dict[str, Any]:
     raw_tools = frontmatter.get("tools") or []
     tools = _parse_tool_specs(raw_tools)
 
+    raw_linked_tool_ids = frontmatter.get("linked_tool_ids") or []
+    if not isinstance(raw_linked_tool_ids, list):
+        raw_linked_tool_ids = []
+    linked_tool_ids = [
+        str(tool_id).strip() for tool_id in raw_linked_tool_ids if str(tool_id).strip()
+    ]
+
     # Parse prompt templates
     prompt_templates = frontmatter.get("prompt_templates") or {}
     if not isinstance(prompt_templates, dict):
@@ -97,6 +105,7 @@ def parse_skill_md(content: str) -> dict[str, Any]:
         "instructions": body,
         "tags": tags,
         "tools": [tool.model_dump(mode="json") for tool in tools],
+        "linked_tool_ids": linked_tool_ids,
         "prompt_templates": prompt_templates,
         "secret_placeholders": [str(s) for s in secret_placeholders],
         "steps": [item for item in raw_steps if isinstance(item, dict)],
@@ -169,6 +178,7 @@ def parse_cognis_yaml(content: str) -> dict[str, Any]:
         "instructions": str(data.get("instructions") or ""),
         "tags": data.get("tags") or [],
         "tools": [tool.model_dump(mode="json") for tool in tools],
+        "linked_tool_ids": data.get("linked_tool_ids") or [],
         "prompt_templates": data.get("prompt_templates") or {},
         "secret_placeholders": data.get("secret_placeholders") or [],
         "steps": [item for item in (data.get("steps") or []) if isinstance(item, dict)],
@@ -234,6 +244,7 @@ def parse_skill_content(content: str, format: str | None = None) -> dict[str, An
 def compute_content_hash(
     instructions: str,
     tools: list[dict[str, Any]] | None = None,
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any] | None = None,
     secret_placeholders: list[str] | None = None,
     asset_manifest: list[dict[str, Any]] | None = None,
@@ -246,6 +257,7 @@ def compute_content_hash(
         {
             "instructions": instructions,
             "tools": tools or [],
+            "linked_tool_ids": linked_tool_ids or [],
             "prompt_templates": prompt_templates or {},
             "secret_placeholders": secret_placeholders or [],
             "asset_manifest": asset_manifest or [],
@@ -271,6 +283,8 @@ def export_skill_md(data: SkillExportData) -> str:
         frontmatter["description"] = data.description
     if data.tags:
         frontmatter["tags"] = data.tags
+    if data.linked_tool_ids:
+        frontmatter["linked_tool_ids"] = data.linked_tool_ids
     if data.tools:
         frontmatter["tools"] = data.tools
     if data.prompt_templates:
@@ -296,6 +310,8 @@ def export_cognis_yaml(data: SkillExportData) -> str:
         export_dict["description"] = data.description
     if data.tags:
         export_dict["tags"] = data.tags
+    if data.linked_tool_ids:
+        export_dict["linked_tool_ids"] = data.linked_tool_ids
     export_dict["auto_load"] = data.auto_load
     export_dict["instructions"] = data.instructions
     if data.tools:

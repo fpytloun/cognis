@@ -598,6 +598,7 @@ export interface SkillVersion {
   schema_version: number;
   instructions: string;
   tools: Record<string, unknown>[] | null;
+  linked_tool_ids: string[] | null;
   prompt_templates: Record<string, unknown> | null;
   secret_placeholders: string[] | null;
   steps: Record<string, unknown>[] | null;
@@ -639,6 +640,7 @@ export interface Skill {
   description: string | null;
   instructions: string;
   tools: Record<string, unknown>[] | null;
+  linked_tool_ids: string[] | null;
   prompt_templates: Record<string, unknown> | null;
   steps: Record<string, unknown>[] | null;
   tags: string[] | null;
@@ -658,6 +660,7 @@ export interface SkillCreate {
   description?: string;
   instructions: string;
   tools?: Record<string, unknown>[];
+  linked_tool_ids?: string[];
   prompt_templates?: Record<string, unknown>;
   steps?: Record<string, unknown>[];
   decomposition_source_hash?: string;
@@ -673,6 +676,7 @@ export interface SkillUpdate {
   description?: string;
   instructions?: string;
   tools?: Record<string, unknown>[];
+  linked_tool_ids?: string[];
   prompt_templates?: Record<string, unknown>;
   steps?: Record<string, unknown>[];
   decomposition_source_hash?: string;
@@ -691,6 +695,7 @@ export interface SkillImportRequest {
   format?: string;
   name?: string;
   tags?: string[];
+  linked_tool_ids?: string[];
   attach_to_all_agents?: boolean;
   auto_load?: boolean;
 }

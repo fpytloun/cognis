@@ -20,6 +20,7 @@ function makeSkill(overrides: Partial<Skill> = {}): Skill {
     description: 'Coordinates release steps',
     instructions: 'Do release work.',
     tools: null,
+    linked_tool_ids: ['builtin:bash'],
     prompt_templates: null,
     steps: null,
     tags: ['release'],
@@ -64,6 +65,7 @@ function makeSkill(overrides: Partial<Skill> = {}): Skill {
           }
         }
       ],
+      linked_tool_ids: ['builtin:bash'],
       prompt_templates: {
         changelog: 'Summarize the release notes.'
       },
@@ -250,5 +252,14 @@ describe('skill workflow drafts', () => {
     );
 
     expect(loadSkillWorkflowDraft('skill_release')).toBeNull();
+  });
+});
+
+describe('linked runtime tools', () => {
+  it('round-trips linked tool ids through form state and payload', () => {
+    const form = skillToFormState(makeSkill());
+
+    expect(form.linkedToolIds).toEqual(['builtin:bash']);
+    expect(formStateToSkillPayload(form)).toMatchObject({ linked_tool_ids: ['builtin:bash'] });
   });
 });

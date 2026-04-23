@@ -967,6 +967,7 @@ class SkillVersionResponse(BaseModel):
     schema_version: int = 1
     instructions: str
     tools: list[dict[str, Any]] | None = None
+    linked_tool_ids: list[str] | None = None
     prompt_templates: dict[str, Any] | None = None
     secret_placeholders: list[str] | None = None
     steps: list[dict[str, Any]] | None = None
@@ -988,6 +989,7 @@ class SkillResponse(BaseModel):
     description: str | None = None
     instructions: str
     tools: list[dict[str, Any]] | None = None
+    linked_tool_ids: list[str] | None = None
     prompt_templates: dict[str, Any] | None = None
     steps: list[dict[str, Any]] | None = None
     tags: list[str] | None = None
@@ -1007,6 +1009,7 @@ class SkillCreateRequest(BaseModel):
     description: str | None = None
     instructions: str
     tools: list[dict[str, Any]] | None = None
+    linked_tool_ids: list[str] | None = None
     prompt_templates: dict[str, Any] | None = None
     steps: list[dict[str, Any]] | None = None
     decomposition_source_hash: str | None = None
@@ -1022,6 +1025,7 @@ class SkillUpdateRequest(BaseModel):
     description: str | None = None
     instructions: str | None = None
     tools: list[dict[str, Any]] | None = None
+    linked_tool_ids: list[str] | None = None
     prompt_templates: dict[str, Any] | None = None
     steps: list[dict[str, Any]] | None = None
     decomposition_source_hash: str | None = None
@@ -1040,6 +1044,7 @@ class SkillImportRequest(BaseModel):
     format: str | None = None
     name: str | None = None
     tags: list[str] | None = None
+    linked_tool_ids: list[str] | None = None
     attach_to_all_agents: bool | None = None
     auto_load: bool | None = None
 

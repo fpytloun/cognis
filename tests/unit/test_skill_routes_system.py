@@ -405,6 +405,48 @@ def test_skill_update_fails_when_decomposition_refresh_fails(
         assert reloaded.json()["current_version_id"] == current_version_id
 
 
+def test_skill_linked_tool_ids_are_versioned_and_restorable(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        created = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={
+                "name": "Linked Skill",
+                "instructions": "Use shell helpers.",
+                "linked_tool_ids": ["builtin:bash"],
+            },
+        )
+        assert created.status_code == 201
+        skill_id = created.json()["skill_id"]
+        first_version_id = created.json()["current_version_id"]
+        assert created.json()["current_version"]["linked_tool_ids"] == ["builtin:bash"]
+        assert created.json()["current_version"]["decomposition_stale"] is False
+
+        updated = client.put(
+            f"/api/v1/skills/{skill_id}",
+            headers=headers,
+            json={"linked_tool_ids": ["builtin:read"]},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["current_version_id"] != first_version_id
+        assert updated.json()["current_version"]["linked_tool_ids"] == ["builtin:read"]
+        assert updated.json()["current_version"]["decomposition_stale"] is False
+
+        restored = client.post(
+            f"/api/v1/skills/{skill_id}/versions/{first_version_id}/restore",
+            headers=headers,
+        )
+        assert restored.status_code == 200
+        assert restored.json()["current_version_id"] == first_version_id
+        assert restored.json()["linked_tool_ids"] == ["builtin:bash"]
+        assert restored.json()["current_version"]["linked_tool_ids"] == ["builtin:bash"]
+
+
 def test_skill_update_with_identical_content_does_not_create_new_version(
     monkeypatch: object, tmp_path: Path
 ) -> None:

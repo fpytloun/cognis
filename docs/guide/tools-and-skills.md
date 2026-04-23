@@ -43,6 +43,14 @@ Today, the most visible skill workflow is:
 
 Depending on the imported format and runtime configuration, a skill can also carry richer metadata such as templates, assets, or tool-related information. This guide focuses on the shipped workflow you can use directly from the current app.
 
+In practice, a skill can expose capability in three distinct ways:
+
+- **Instructions** for reasoning and operating procedure
+- **Linked runtime tools** that point at existing builtin or MCP tools already present in the registry
+- **Bundled executable skill tools** that ship inside the skill version itself
+
+Skills may also store a **saved workflow decomposition**. That decomposition is treated as a skill-owned template, not as a persistent workflow definition by itself.
+
 ### Managing skills
 
 In the UI you can:
@@ -52,6 +60,8 @@ In the UI you can:
 - export skills for sharing and version control
 - organize skills with tags
 - attach a skill to all agents by default
+- bind linked runtime tools that should become available when the skill is attached or explicitly loaded
+- review or save workflow decomposition on the skill itself
 
 ### How skills work at runtime
 
@@ -59,17 +69,20 @@ Skills use a hybrid lazy-loading model for token efficiency:
 
 1. **Compact metadata in the system prompt** -- visible skills are announced in the immutable prompt prefix with compact summaries. Attached skills are marked so the agent knows which ones are preferred defaults.
 2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions are loaded into the mutable context, not the cached prefix.
-3. **Deferred executable skill tools** -- skill-defined tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools after the agent loads the skill.
+3. **Deferred tool exposure** -- linked runtime tools and bundled executable skill tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools after the agent loads the skill.
 
 This means:
 - adding or removing skills does not invalidate the entire prompt cache
 - the agent only pays token costs for skills it actually uses
 - skill edits are visible on the next turn without restarting the session
-- after `skill_load`, the loaded skill's tools become eligible for subsequent model calls in the turn
+- after `skill_load`, the loaded skill's linked runtime tools and bundled executable tools become eligible for subsequent model calls in the turn
+- if a skill carries saved decomposition, tasks and schedules that use that skill materialize from the latest saved skill version
 
 ### Agent skill selection
 
 In the agent editor, you can select which skills to attach to an agent. Attached skills are highlighted in prompt metadata and their tools are available immediately through the deferred tool-loading path.
+
+Attached-skill defaults now include linked runtime tools as well as bundled skill tools. This lets a skill bring an existing builtin or MCP tool surface into scope without duplicating that tool definition inside the skill.
 
 Some shipped system agents also come with default attached skills. For example,
 `system:implement` and `system:code-review` attach the built-in Cognis coding
@@ -96,6 +109,8 @@ Agents can manage skills through built-in tools:
 
 All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates or imports a skill, Cognis automatically attaches it to that agent for future runs.
 
+When a skill already has saved decomposition and its decomposition-driving inputs change, Cognis refreshes that decomposition before publishing the new current version. If the refresh fails, the update fails rather than leaving the latest saved version stale.
+
 ### Built-in Cognis management skills
 
 Cognis also ships global management skills for Cognis-native operations such as task and workflow management. These skills are intended for the main chat agent and are discoverable through the normal skill tools (`skill_list`, `skill_load`). They guide the agent to inspect state first, use the correct management tools, and avoid mutating protected resources such as system workflows.
@@ -120,9 +135,26 @@ Import security:
 
 ### Executable skill tools
 
-Skills can define tools with execution recipes. These tools appear as first-class tools in the agent's effective tool set. When called, the executor stages required assets into a temporary workspace, executes the recipe, and cleans up afterward.
+Skills can define tools with execution recipes. These bundled executable tools appear as first-class tools in the agent's effective tool set. When called, the executor stages required assets into a temporary workspace, executes the recipe, and cleans up afterward.
 
-Skills can also carry reusable workflow step material, including step tool-profile data. That means a skill can ship both executable tools and the recommended tool surface for the steps it contributes to composed workflows.
+### Linked runtime tools
+
+Skills can also point at existing runtime tools through `linked_tool_ids`. These are references to already-registered builtin or MCP tools. They are useful when a skill should expose a known tool surface without re-declaring a bundled executor-side tool recipe.
+
+Use linked runtime tools when:
+
+- the tool already exists in the registry
+- the skill should surface that existing tool when attached or loaded
+- you do not need to ship new executable code with the skill
+
+Use bundled executable skill tools when:
+
+- the skill needs to carry its own reusable command or script
+- the behavior should travel with the skill version and asset package
+
+Skills can also carry reusable workflow step material, including step tool-profile data. That means a skill can ship both runtime tool bindings and the recommended tool surface for the steps it contributes to composed workflows.
+
+When Cognis decomposes a skill into workflow steps, it automatically tries to align step profiles and per-step tool overrides with the skill's linked and bundled tools. The saved decomposition is editable through the workflow editor UI, but saving in that mode writes back to the skill version rather than creating a standalone workflow row.
 
 Skill assets are stored in Cognis itself (database metadata plus artifact storage) and are never managed as editable controller filesystem state. Executors only receive temporary staged copies for execution.
 

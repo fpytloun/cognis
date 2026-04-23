@@ -20,10 +20,12 @@ from cognis.tools.skill_parser import (
 )
 from cognis.tools.skill_service import (
     export_cognis_package,
+    normalize_linked_tool_ids,
     normalize_skill_asset_filename,
     parse_cognis_package,
 )
 from cognis.tools.skills import (
+    attached_skill_tool_ids_by_skill,
     build_available_skills_metadata,
     discoverable_skill_tools_to_definitions,
     extract_agent_skill_refs,
@@ -183,6 +185,20 @@ Use the API.
     assert result["secret_placeholders"] == ["API_KEY", "API_SECRET"]
 
 
+def test_parse_skill_md_with_linked_tool_ids() -> None:
+    content = """---
+name: linked-skill
+linked_tool_ids:
+  - builtin:bash
+  - builtin:read
+---
+
+Use linked runtime tools.
+"""
+    result = parse_skill_md(content)
+    assert result["linked_tool_ids"] == ["builtin:bash", "builtin:read"]
+
+
 # ---------------------------------------------------------------------------
 # Format detection
 # ---------------------------------------------------------------------------
@@ -210,8 +226,8 @@ def test_parse_skill_content_auto_detect() -> None:
 
 
 def test_compute_content_hash_deterministic() -> None:
-    h1 = compute_content_hash("instructions", [{"name": "t"}], {"k": "v"})
-    h2 = compute_content_hash("instructions", [{"name": "t"}], {"k": "v"})
+    h1 = compute_content_hash("instructions", [{"name": "t"}], None, {"k": "v"})
+    h2 = compute_content_hash("instructions", [{"name": "t"}], None, {"k": "v"})
     assert h1 == h2
     assert len(h1) == 64  # SHA-256 hex
 
@@ -237,6 +253,7 @@ def test_compute_content_hash_differs_for_assets_and_placeholders() -> None:
     h1 = compute_content_hash(
         "instructions",
         [{"name": "t"}],
+        None,
         {"k": "v"},
         ["API_KEY"],
         asset_manifest,
@@ -244,6 +261,7 @@ def test_compute_content_hash_differs_for_assets_and_placeholders() -> None:
     h2 = compute_content_hash(
         "instructions",
         [{"name": "t"}],
+        None,
         {"k": "v"},
         ["API_KEY"],
         [],
@@ -319,6 +337,13 @@ def test_export_cognis_package_round_trip() -> None:
     assert parsed["name"] == "packaged-skill"
     assert parsed["instructions"] == "Use the packaged asset."
     assert parsed["assets"][0]["filename"] == "scripts/run.py"
+
+
+def test_normalize_linked_tool_ids_deduplicates() -> None:
+    assert normalize_linked_tool_ids(["builtin:bash", "builtin:bash", " builtin:read "]) == [
+        "builtin:bash",
+        "builtin:read",
+    ]
 
 
 def test_normalize_skill_asset_filename_preserves_dotfiles() -> None:
@@ -472,6 +497,33 @@ def test_skill_tools_to_definitions_excludes_unattached_by_default() -> None:
 
     assert skill_tools_to_definitions(skill_set) == []
     assert len(discoverable_skill_tools_to_definitions(skill_set)) == 1
+
+
+def test_attached_skill_tool_ids_by_skill_includes_linked_and_bundled_tools() -> None:
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="skill_release",
+                name="Release",
+                linked_tool_ids=["builtin:bash"],
+                version_id="sv_1",
+                version_number=1,
+                content_hash="abc",
+                instructions="Run the release helper.",
+                tools=[
+                    SkillToolSpec(
+                        name="run_release",
+                        description="Run the release workflow.",
+                    )
+                ],
+                attached=True,
+            )
+        ]
+    )
+
+    assert attached_skill_tool_ids_by_skill(skill_set) == {
+        "skill_release": ["builtin:bash", "skill:skill_release:run_release"]
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,7 @@ async def test_skill_write_persists_decomposition_steps_with_step_profiles(tmp_p
                 },
             ],
         },
+        llm=None,
         artifact_store=artifact_store,
     )
 
@@ -112,10 +113,55 @@ async def test_skill_write_rejects_stale_decomposition_hash(tmp_path):
             "decomposition_source_hash": "stale-hash",
             "steps": [{"name": "research", "type": "run", "prompt": "Research the task."}],
         },
+        llm=None,
         artifact_store=artifact_store,
     )
 
     assert result.is_error is True
     assert "stale" in result.output
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_skill_write_persists_linked_runtime_tool_ids(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/skills.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    artifact_store = ArtifactStore(
+        ArtifactStoreConfig(backend="filesystem", path=str(tmp_path / "artifacts"))
+    )
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hashed",
+        )
+        await session.commit()
+
+    result = await _handle_skill_write(
+        session_factory,
+        "user@example.com",
+        {
+            "name": "Linked Skill",
+            "instructions": "Use shell helpers.",
+            "linked_tool_ids": ["builtin:bash", "builtin:read"],
+        },
+        llm=None,
+        artifact_store=artifact_store,
+    )
+
+    assert result.is_error is False
+    payload = json.loads(result.output)
+
+    async with session_factory() as session:
+        row = await get_skill_scoped(session, payload["skill_id"], owner_email="user@example.com")
+        assert row is not None
+        assert row.linked_tool_ids == ["builtin:bash", "builtin:read"]
+
+    loaded = await _handle_skill_get(session_factory, "user@example.com", {"skill_id": payload["skill_id"]})
+    loaded_payload = json.loads(loaded.output)
+    assert loaded_payload["linked_tool_ids"] == ["builtin:bash", "builtin:read"]
 
     await engine.dispose()

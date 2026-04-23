@@ -6600,6 +6600,11 @@ class AgentLoop:
                         )
                         or []
                     )
+                    linked_tool_ids = [
+                        str(tool_id).strip()
+                        for tool_id in (getattr(row, "linked_tool_ids", None) or [])
+                        if str(tool_id).strip()
+                    ]
                     prompt_templates = (
                         version_row.prompt_templates
                         if version_row is not None
@@ -6634,6 +6639,7 @@ class AgentLoop:
                             description=row.description,
                             instructions=instructions,
                             tools=tools,
+                            linked_tool_ids=linked_tool_ids,
                             prompt_templates=prompt_templates,
                             secret_placeholders=secret_placeholders,
                             asset_manifest=asset_manifest,
@@ -6646,6 +6652,7 @@ class AgentLoop:
                             current_source_hash=compute_decomposition_source_hash(
                                 instructions,
                                 tools=tools,
+                                linked_tool_ids=linked_tool_ids,
                                 prompt_templates=prompt_templates,
                                 secret_placeholders=secret_placeholders,
                                 asset_manifest=asset_manifest,
@@ -6676,6 +6683,7 @@ class AgentLoop:
                     content_hash=compute_content_hash(
                         current_version_row.instructions,
                         _coerce_skill_tools(current_version_row.tools),
+                        getattr(current_version_row, "linked_tool_ids", None),
                         current_version_row.prompt_templates,
                         current_version_row.secret_placeholders,
                         current_version_row.asset_manifest,
@@ -6683,12 +6691,14 @@ class AgentLoop:
                     ),
                     instructions=current_version_row.instructions,
                     tools=_coerce_skill_tools(current_version_row.tools),
+                    linked_tool_ids=getattr(current_version_row, "linked_tool_ids", None),
                     prompt_templates=current_version_row.prompt_templates,
                     secret_placeholders=current_version_row.secret_placeholders,
                     steps=material.steps,
                     decomposition_source_hash=compute_decomposition_source_hash(
                         current_version_row.instructions,
                         tools=_coerce_skill_tools(current_version_row.tools),
+                        linked_tool_ids=getattr(current_version_row, "linked_tool_ids", None),
                         prompt_templates=current_version_row.prompt_templates,
                         secret_placeholders=current_version_row.secret_placeholders,
                         asset_manifest=current_version_row.asset_manifest,
@@ -6728,6 +6738,7 @@ class AgentLoop:
                     description=material.description,
                     instructions=material.instructions,
                     tools=material.tools,
+                    linked_tool_ids=material.linked_tool_ids,
                     prompt_templates=material.prompt_templates,
                     secret_placeholders=material.secret_placeholders,
                     asset_manifest=material.asset_manifest,

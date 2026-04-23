@@ -47,6 +47,7 @@ from cognis.tools.mcp import invalid_mcp_config_reason
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import (
     attached_skill_tool_ids,
+    attached_skill_tool_ids_by_skill,
     build_available_skills_metadata,
     discoverable_skill_tools_to_definitions,
     load_skill_tool_names,
@@ -363,10 +364,12 @@ def build_step_runtime_factory(
                 if metadata:
                     if not isinstance(agent.skills, dict):
                         agent.skills = {}
+                    attached_tool_ids_by_skill = attached_skill_tool_ids_by_skill(resolved_skills)
                     agent.skills["_available_skills_metadata"] = metadata
                     agent.skills["_attached_skill_tool_ids"] = sorted(
                         attached_skill_tool_ids(resolved_skills)
                     )
+                    agent.skills["_attached_skill_tool_ids_by_skill"] = attached_tool_ids_by_skill
                     agent.skills["_runtime_skill_summaries"] = [
                         {
                             "skill_id": skill.skill_id,
@@ -375,6 +378,7 @@ def build_step_runtime_factory(
                             "attached": skill.attached,
                             "auto_load": skill.auto_load,
                             "tags": list(getattr(skill, "tags", []) or []),
+                            "linked_tool_ids": list(getattr(skill, "linked_tool_ids", []) or []),
                         }
                         for skill in resolved_skills.skills
                     ]

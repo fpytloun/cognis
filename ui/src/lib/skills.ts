@@ -57,6 +57,7 @@ export interface SkillFormState {
   instructions: string;
   tagsText: string;
   attachToAllAgents: boolean;
+  linkedToolIds: string[];
   promptTemplates: SkillPromptTemplateFormItem[];
   secretPlaceholders: string[];
   tools: SkillToolFormItem[];
@@ -253,6 +254,7 @@ export function createEmptySkillForm(): SkillFormState {
     instructions: '',
     tagsText: '',
     attachToAllAgents: false,
+    linkedToolIds: [],
     promptTemplates: [],
     secretPlaceholders: [],
     tools: [],
@@ -268,6 +270,9 @@ export function skillToFormState(skill: Skill): SkillFormState {
     instructions: current?.instructions ?? skill.instructions,
     tagsText: (skill.tags ?? []).join(', '),
     attachToAllAgents: Boolean(skill.attach_to_all_agents ?? skill.auto_load),
+    linkedToolIds: Array.isArray(skill.linked_tool_ids)
+      ? skill.linked_tool_ids.filter((item): item is string => typeof item === 'string')
+      : [],
     promptTemplates: parsePromptTemplates(current?.prompt_templates ?? skill.prompt_templates),
     secretPlaceholders: Array.isArray(current?.secret_placeholders)
       ? current.secret_placeholders.filter((item): item is string => typeof item === 'string')
@@ -353,6 +358,7 @@ export function formStateToSkillPayload(form: SkillFormState): SkillCreate | Ski
     instructions: form.instructions,
     tags: splitCsvOrLines(form.tagsText),
     attach_to_all_agents: form.attachToAllAgents,
+    linked_tool_ids: [...form.linkedToolIds],
     prompt_templates: Object.fromEntries(
       form.promptTemplates
         .filter((template) => template.key.trim())

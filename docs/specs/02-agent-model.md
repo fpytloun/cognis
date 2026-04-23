@@ -729,7 +729,9 @@ composer needs structure but the skill does not declare `steps:` explicitly.
 
 ```
 You are a skill decomposer. Given a skill's instructions and the current
-intent, produce a compact set of reusable workflow step fragments as JSON.
+intent, linked/bundled tool surface, and any existing saved decomposition,
+produce a compact set of reusable workflow step fragments as JSON.
+Preserve unaffected step structure when selective refresh is sufficient.
 Return only structure, no explanations.
 ```
 

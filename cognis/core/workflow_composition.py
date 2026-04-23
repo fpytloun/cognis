@@ -16,7 +16,11 @@ from cognis.core.json_utils import (
 )
 from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.logging import get_logger
+from cognis.models.skill import ResolvedSkill, ResolvedSkillSet, SkillToolSpec
+from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
+from cognis.tools.skill_service import normalize_linked_tool_ids
+from cognis.tools.skills import skill_tools_to_definitions
 
 logger = get_logger(__name__)
 
@@ -111,6 +115,7 @@ class SkillMaterial(BaseModel):
     description: str | None = None
     instructions: str
     tools: list[dict[str, Any]] = Field(default_factory=list)
+    linked_tool_ids: list[str] = Field(default_factory=list)
     prompt_templates: dict[str, Any] = Field(default_factory=dict)
     secret_placeholders: list[str] = Field(default_factory=list)
     asset_manifest: list[dict[str, Any]] = Field(default_factory=list)
@@ -155,15 +160,42 @@ class WorkflowComposerOutput(BaseModel):
     expected_output: str | None = None
 
 
-def _declared_skill_tool_names(tools: list[dict[str, Any]]) -> list[str]:
-    names: list[str] = []
+def _resolved_skill_tool_identifiers(
+    *,
+    skill_id: str,
+    name: str,
+    description: str | None,
+    instructions: str,
+    tools: list[dict[str, Any]],
+    linked_tool_ids: list[str],
+) -> list[str]:
+    """Return stable tool identifiers surfaced by one skill."""
+
+    parsed_tools: list[SkillToolSpec] = []
     for raw_tool in tools:
         if not isinstance(raw_tool, dict):
             continue
-        name = str(raw_tool.get("name") or "").strip()
-        if name and name not in names:
-            names.append(name)
-    return names
+        parsed_tools.append(SkillToolSpec.model_validate(raw_tool))
+
+    resolved = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id=skill_id,
+                name=name,
+                description=description,
+                linked_tool_ids=normalize_linked_tool_ids(linked_tool_ids) or [],
+                version_id="",
+                version_number=0,
+                content_hash="",
+                instructions=instructions,
+                tools=parsed_tools,
+                attached=True,
+            )
+        ]
+    )
+    identifiers = {stable_tool_id(tool) for tool in skill_tools_to_definitions(resolved)}
+    identifiers.update(normalize_linked_tool_ids(linked_tool_ids) or [])
+    return sorted(identifiers)
 
 
 def _step_profile_catalog_text() -> str:
@@ -189,7 +221,7 @@ def _normalize_generated_steps(
     steps: list[Any],
     *,
     default_profile_id: str,
-    skill_tool_names: list[str],
+    skill_tool_identifiers: list[str],
 ) -> list[Any]:
     normalized_steps: list[Any] = []
     for step in steps:
@@ -211,7 +243,7 @@ def _normalize_generated_steps(
                 default_profile_id,
             )
 
-            if skill_tool_names:
+            if skill_tool_identifiers:
                 if not normalized.get("step_profile_mode"):
                     normalized["step_profile_mode"] = "hard"
                 raw_inline_profile = normalized.get("step_profile")
@@ -223,9 +255,9 @@ def _normalize_generated_steps(
                 include = [
                     str(item).strip() for item in overrides.get("include", []) if str(item).strip()
                 ]
-                for tool_name in skill_tool_names:
-                    if tool_name not in include:
-                        include.append(tool_name)
+                for tool_identifier in skill_tool_identifiers:
+                    if tool_identifier not in include:
+                        include.append(tool_identifier)
                 overrides["include"] = include
                 inline_profile["tool_overrides"] = overrides
                 normalized["step_profile"] = inline_profile
@@ -272,6 +304,7 @@ async def decompose_skill_material(
     description: str | None,
     instructions: str,
     tools: list[dict[str, Any]],
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any],
     secret_placeholders: list[str] | None = None,
     asset_manifest: list[dict[str, Any]] | None = None,
@@ -294,7 +327,14 @@ async def decompose_skill_material(
         if decomposer_agent and decomposer_agent.system_prompt
         else "You decompose skills into workflow step fragments. Respond with JSON only."
     )
-    skill_tool_names = _declared_skill_tool_names(tools)
+    skill_tool_identifiers = _resolved_skill_tool_identifiers(
+        skill_id=skill_id,
+        name=name,
+        description=description,
+        instructions=instructions,
+        tools=tools,
+        linked_tool_ids=linked_tool_ids or [],
+    )
     refresh_existing = existing_steps is not None
     refresh_sections: list[str] = []
     if refresh_existing:
@@ -359,6 +399,7 @@ async def decompose_skill_material(
                 f"Description: {description or ''}\n"
                 f"Instructions:\n{instructions}\n\n"
                 f"Tools:\n{tools}\n\n"
+                f"Linked runtime tool ids:\n{linked_tool_ids or []}\n\n"
                 f"Prompt templates:\n{prompt_templates}\n\n"
                 f"Secret placeholders:\n{secret_placeholders or []}\n\n"
                 f"Asset manifest:\n{asset_manifest or []}\n\n"
@@ -372,7 +413,7 @@ async def decompose_skill_material(
                 + "If multiple gather/collector steps depend on one earlier setup step, you must set input explicitly to that step instead of relying on defaults. "
                 + "For final synthesis that should consume every prior run step, you may use input={type:'last', source:'all'} or input={type:'summary', source:'all'}. "
                 + "Never use source='all' with type='full'. "
-                + "Every run step should include step_profile_id. If this skill declares executable skill tools, prefer step_profile_mode='hard' plus inline step_profile.tool_overrides.include for those tool names."
+                + "Every run step should include step_profile_id. If this skill exposes linked or bundled tools, prefer step_profile_mode='hard' plus inline step_profile.tool_overrides.include for the exact required tool identifiers."
             ),
         },
     ]
@@ -394,7 +435,7 @@ async def decompose_skill_material(
         for step in _normalize_generated_steps(
             result.steps,
             default_profile_id="system:general-task",
-            skill_tool_names=skill_tool_names,
+            skill_tool_identifiers=skill_tool_identifiers,
         )
     ]
     return SkillDecompositionResult(rationale=result.rationale, steps=normalized_steps)
@@ -487,15 +528,22 @@ def validate_composed_workflow(
     normalized_payload = dict(payload)
     raw_steps = payload.get("steps")
     if isinstance(raw_steps, list):
-        skill_tool_names: list[str] = []
+        skill_tool_identifiers: list[str] = []
         for material in skill_materials or []:
-            for tool_name in _declared_skill_tool_names(material.tools):
-                if tool_name not in skill_tool_names:
-                    skill_tool_names.append(tool_name)
+            for tool_identifier in _resolved_skill_tool_identifiers(
+                skill_id=material.skill_id,
+                name=material.name,
+                description=material.description,
+                instructions=material.instructions,
+                tools=material.tools,
+                linked_tool_ids=material.linked_tool_ids,
+            ):
+                if tool_identifier not in skill_tool_identifiers:
+                    skill_tool_identifiers.append(tool_identifier)
         normalized_payload["steps"] = _normalize_generated_steps(
             raw_steps,
             default_profile_id="system:general-task",
-            skill_tool_names=skill_tool_names,
+            skill_tool_identifiers=skill_tool_identifiers,
         )
 
     workflow = Workflow.model_validate(normalized_payload)

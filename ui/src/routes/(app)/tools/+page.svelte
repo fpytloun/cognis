@@ -97,6 +97,11 @@ import Server from 'lucide-svelte/icons/server';
   };
 
   $: selectedSkill = skills.find((skill) => skill.skill_id === selectedSkillId) || null;
+  $: skillBindableTools = mergeToolInventories([
+    staticTools,
+    intarisMcpTools,
+    observedLocalMcpTools
+  ]).filter((tool) => tool.source?.type !== 'skill');
   $: filteredSkills = skills
     .filter((skill) => {
       const query = skillsSearch.trim().toLowerCase();
@@ -753,6 +758,7 @@ import Server from 'lucide-svelte/icons/server';
         open={skillSheetOpen}
         skill={selectedSkill}
         mode={skillSheetMode}
+        availableTools={skillBindableTools}
         onClose={closeSkillSheet}
         allowManage={true}
         onSaved={async (savedSkill) => {

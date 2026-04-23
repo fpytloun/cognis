@@ -41,6 +41,7 @@ from cognis.tools.skill_service import (
     export_cognis_package,
     load_export_assets,
     load_skill_asset_refs,
+    normalize_linked_tool_ids,
     normalize_prompt_templates,
     normalize_secret_placeholders,
     normalize_skill_steps,
@@ -78,6 +79,7 @@ def _version_to_response(
     current_source_hash = compute_decomposition_source_hash(
         str(row.instructions or ""),
         tools=_coerce_tools_list(getattr(row, "tools", None)),
+        linked_tool_ids=getattr(row, "linked_tool_ids", None) or [],
         prompt_templates=getattr(row, "prompt_templates", None) or {},
         secret_placeholders=getattr(row, "secret_placeholders", None) or [],
         asset_manifest=getattr(row, "asset_manifest", None) or [],
@@ -91,6 +93,7 @@ def _version_to_response(
         schema_version=row.schema_version,
         instructions=row.instructions,
         tools=_coerce_tools_list(row.tools),
+        linked_tool_ids=getattr(row, "linked_tool_ids", None) or [],
         prompt_templates=row.prompt_templates,
         secret_placeholders=row.secret_placeholders,
         steps=[item for item in (getattr(row, "steps", None) or []) if isinstance(item, dict)],
@@ -111,11 +114,13 @@ def _decomposition_inputs_changed(
     *,
     instructions: str,
     tools: list[dict[str, Any]] | None,
+    linked_tool_ids: list[str] | None,
     prompt_templates: dict[str, Any] | None,
     secret_placeholders: list[str] | None,
     asset_inputs: list[dict[str, Any]] | None,
     current_instructions: str,
     current_tools: list[dict[str, Any]] | None,
+    current_linked_tool_ids: list[str] | None,
     current_templates: dict[str, Any] | None,
     current_placeholders: list[str] | None,
     current_asset_inputs: list[dict[str, Any]] | None,
@@ -126,6 +131,7 @@ def _decomposition_inputs_changed(
         [
             instructions != current_instructions,
             (tools or []) != (current_tools or []),
+            (linked_tool_ids or []) != (current_linked_tool_ids or []),
             (prompt_templates or {}) != (current_templates or {}),
             (secret_placeholders or []) != (current_placeholders or []),
             (asset_inputs or []) != (current_asset_inputs or []),
@@ -154,6 +160,7 @@ def _skill_to_response(
         description=row.description,
         instructions=instructions,
         tools=tools,
+        linked_tool_ids=row.linked_tool_ids,
         prompt_templates=prompt_templates,
         steps=steps,
         tags=row.tags,
@@ -284,6 +291,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
     user = require_current_user(request)
     try:
         tools = normalize_skill_tools(body.tools)
+        linked_tool_ids = normalize_linked_tool_ids(body.linked_tool_ids) or []
         prompt_templates = normalize_prompt_templates(body.prompt_templates)
         secret_placeholders = normalize_secret_placeholders(body.secret_placeholders)
         steps = normalize_skill_steps(body.steps)
@@ -297,6 +305,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
             description=body.description,
             instructions=body.instructions,
             tools=tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=prompt_templates,
             tags=body.tags,
             auto_load=_resolve_attach_to_all_agents(body),
@@ -311,6 +320,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
                 owner_email=user.email,
                 instructions=body.instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=prompt_templates,
                 secret_placeholders=secret_placeholders,
                 steps=steps,
@@ -355,6 +365,15 @@ async def update_skill_route(
             tools = normalize_skill_tools(body.tools) if body.tools is not None else (
                 current_version.tools if current_version is not None else row.tools
             )
+            linked_tool_ids = (
+                normalize_linked_tool_ids(body.linked_tool_ids)
+                if body.linked_tool_ids is not None
+                else (
+                    getattr(current_version, "linked_tool_ids", None)
+                    if current_version is not None
+                    else row.linked_tool_ids or []
+                )
+            )
             prompt_templates = (
                 normalize_prompt_templates(body.prompt_templates)
                 if body.prompt_templates is not None
@@ -389,6 +408,8 @@ async def update_skill_route(
             metadata_updates["description"] = body.description
         if body.tags is not None:
             metadata_updates["tags"] = body.tags
+        if body.linked_tool_ids is not None:
+            metadata_updates["linked_tool_ids"] = linked_tool_ids
         if body.attach_to_all_agents is not None or body.auto_load is not None:
             metadata_updates["auto_load"] = _resolve_attach_to_all_agents(body)
 
@@ -406,6 +427,7 @@ async def update_skill_route(
         current_source_hash = compute_decomposition_source_hash(
             instructions,
             tools=tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=prompt_templates,
             secret_placeholders=secret_placeholders,
             asset_manifest=(
@@ -427,11 +449,17 @@ async def update_skill_route(
         decomposition_inputs_changed = _decomposition_inputs_changed(
             instructions=instructions,
             tools=tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=prompt_templates,
             secret_placeholders=secret_placeholders,
             asset_inputs=comparable_asset_inputs,
             current_instructions=current_instructions,
             current_tools=current_tools,
+            current_linked_tool_ids=(
+                getattr(current_version, "linked_tool_ids", None)
+                if current_version is not None
+                else row.linked_tool_ids or []
+            ),
             current_templates=current_templates,
             current_placeholders=current_placeholders,
             current_asset_inputs=current_asset_inputs,
@@ -454,6 +482,7 @@ async def update_skill_route(
                     ),
                     instructions=instructions,
                     tools=tools or [],
+                    linked_tool_ids=linked_tool_ids,
                     prompt_templates=prompt_templates or {},
                     secret_placeholders=secret_placeholders or [],
                     asset_manifest=comparable_asset_inputs,
@@ -488,6 +517,15 @@ async def update_skill_route(
             or (body.tools is not None and (tools or []) != (current_tools or []))
             or (body.prompt_templates is not None and (prompt_templates or {}) != (current_templates or {}))
             or (body.secret_placeholders is not None and (secret_placeholders or []) != (current_placeholders or []))
+            or (
+                body.linked_tool_ids is not None
+                and (linked_tool_ids or [])
+                != (
+                    getattr(current_version, "linked_tool_ids", None)
+                    if current_version is not None
+                    else row.linked_tool_ids or []
+                )
+            )
             or (steps or []) != (current_steps or [])
             or (body.assets is not None and comparable_asset_inputs != current_asset_inputs)
         )
@@ -526,6 +564,7 @@ async def update_skill_route(
                     owner_email=user.email,
                     instructions=instructions,
                     tools=tools,
+                    linked_tool_ids=linked_tool_ids,
                     prompt_templates=prompt_templates,
                     secret_placeholders=secret_placeholders,
                     steps=steps,
@@ -592,6 +631,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             compute_decomposition_source_hash(
                 str(defaults["instructions"]),
                 tools=normalize_skill_tools(defaults.get("tools")),
+                linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")) or [],
                 prompt_templates=normalize_prompt_templates(defaults.get("prompt_templates")),
                 secret_placeholders=[],
                 asset_manifest=[],
@@ -612,6 +652,8 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             and (current_version.instructions if current_version is not None else row.instructions)
             == str(defaults["instructions"])
             and current_tools == normalize_skill_tools(defaults.get("tools"))
+            and (row.linked_tool_ids or [])
+            == (normalize_linked_tool_ids(defaults.get("linked_tool_ids")) or [])
             and current_templates == normalize_prompt_templates(defaults.get("prompt_templates"))
             and (current_steps or []) == (defaults.get("steps") or [])
             and current_decomposition_hash == expected_decomposition_hash
@@ -628,6 +670,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 description=str(defaults["description"]) if defaults.get("description") is not None else None,
                 instructions=str(defaults["instructions"]),
                 tools=normalize_skill_tools(defaults.get("tools")),
+                linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")),
                 prompt_templates=normalize_prompt_templates(defaults.get("prompt_templates")),
                 tags=list(defaults["tags"]),
                 auto_load=bool(defaults.get("auto_load", False)),
@@ -644,6 +687,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 owner_email=user.email,
                 instructions=row.instructions,
                 tools=row.tools,
+                linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")) or [],
                 prompt_templates=row.prompt_templates,
                 secret_placeholders=None,
                 steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
@@ -722,6 +766,7 @@ async def decompose_skill_preview_route(
             description=row.description,
             instructions=instructions,
             tools=tools,
+            linked_tool_ids=row.linked_tool_ids or [],
             prompt_templates=prompt_templates,
             secret_placeholders=secret_placeholders,
             asset_manifest=asset_manifest,
@@ -744,6 +789,7 @@ async def decompose_skill_preview_route(
         source_hash=compute_decomposition_source_hash(
             instructions,
             tools=tools,
+            linked_tool_ids=row.linked_tool_ids or [],
             prompt_templates=prompt_templates,
             secret_placeholders=secret_placeholders,
             asset_manifest=asset_manifest,
@@ -775,6 +821,7 @@ async def restore_skill_version_route(
         row.current_version_id = version_id
         row.instructions = version_row.instructions
         row.tools = version_row.tools
+        row.linked_tool_ids = getattr(version_row, "linked_tool_ids", None) or []
         row.prompt_templates = version_row.prompt_templates
         await session.commit()
         await _enqueue_skill_tool_classifications(request, row, version_row)
@@ -819,6 +866,9 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
         name = body.name or str(skill_data.get("name") or "Imported Skill")
         instructions = str(skill_data.get("instructions") or "")
         tools = normalize_skill_tools(skill_data.get("tools"))
+        linked_tool_ids = normalize_linked_tool_ids(
+            body.linked_tool_ids if body.linked_tool_ids is not None else skill_data.get("linked_tool_ids")
+        ) or []
         prompt_templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         secret_placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
         steps = normalize_skill_steps(skill_data.get("steps"))
@@ -834,6 +884,7 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
             description=skill_data.get("description"),
             instructions=instructions,
             tools=tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=prompt_templates,
             tags=tags,
             auto_load=_resolve_attach_to_all_agents(body),
@@ -849,6 +900,7 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
                 owner_email=user.email,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=prompt_templates,
                 secret_placeholders=secret_placeholders,
                 steps=steps,
@@ -908,6 +960,7 @@ async def export_skill_route(
         name=row.name,
         description=row.description,
         tags=row.tags or [],
+        linked_tool_ids=row.linked_tool_ids or [],
         auto_load=row.auto_load,
         instructions=version_row.instructions if version_row is not None else row.instructions,
         tools=version_row.tools or [] if version_row is not None else row.tools or [],

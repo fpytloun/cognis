@@ -38,7 +38,7 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { toErrorMessage } from '$lib/utils';
-  import type { Skill, SkillCreate, SkillVersion } from '$lib/types/api';
+  import type { Skill, SkillCreate, SkillVersion, ToolDefinitionSummary } from '$lib/types/api';
 
   type SkillSheetMode = 'view' | 'edit' | 'create';
   type SkillExportFormat = 'skill_md' | 'cognis_yaml' | 'cognis_package';
@@ -50,6 +50,7 @@
     skill,
     mode = 'view',
     onClose,
+    availableTools = [],
     allowManage = false,
     onSaved = async () => {},
     onDeleted = async () => {}
@@ -58,6 +59,7 @@
     skill: Skill | null;
     mode?: SkillSheetMode;
     onClose: () => void;
+    availableTools?: ToolDefinitionSummary[];
     allowManage?: boolean;
     onSaved?: (skill: Skill, action: 'created' | 'updated') => void | Promise<void>;
     onDeleted?: (skillId: string) => void | Promise<void>;
@@ -75,6 +77,7 @@
   let decompositionLoading = $state(false);
   let decompositionSaving = $state(false);
   let exportMenuOpen = $state(false);
+  let linkedToolSearch = $state('');
   let secretDraft = $state('');
   let form = $state<SkillFormState>(createEmptySkillForm());
   let formSnapshot = $state('');
@@ -104,14 +107,65 @@
     }, null)
   );
   const isDirty = $derived(JSON.stringify(form) !== formSnapshot);
+  const selectableLinkedTools = $derived(
+    (availableTools ?? [])
+      .filter((tool: ToolDefinitionSummary) => tool.tool_id && tool.source.type !== 'skill')
+      .slice()
+      .sort((left: ToolDefinitionSummary, right: ToolDefinitionSummary) => {
+        const leftSource = left.source.server_name || left.source.type || '';
+        const rightSource = right.source.server_name || right.source.type || '';
+        const sourceCompare = leftSource.localeCompare(rightSource);
+        if (sourceCompare !== 0) return sourceCompare;
+        return left.name.localeCompare(right.name);
+      })
+  );
+  const linkedToolMap = $derived(
+    new Map<string, ToolDefinitionSummary>(
+      selectableLinkedTools.map((tool: ToolDefinitionSummary) => [tool.tool_id as string, tool])
+    )
+  );
+  const filteredLinkedTools = $derived(
+    selectableLinkedTools.filter((tool: ToolDefinitionSummary) => {
+      const query = linkedToolSearch.trim().toLowerCase();
+      if (!query) return true;
+      return [
+        tool.name,
+        tool.description,
+        tool.tool_id || '',
+        tool.category,
+        tool.profile_group || '',
+        tool.source.server_name || '',
+        tool.source.type || ''
+      ]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+    })
+  );
 
   function resetTransientState(): void {
     versions = [];
     decompositionPreview = null;
     decompositionRationale = '';
     decompositionSourceHash = null;
+    linkedToolSearch = '';
     secretDraft = '';
     exportMenuOpen = false;
+  }
+
+  function linkedToolDisplay(toolId: string): string {
+    const tool: ToolDefinitionSummary | undefined = linkedToolMap.get(toolId);
+    if (!tool) return toolId;
+    const source = tool.source.server_name || tool.source.type || 'tool';
+    return `${tool.name} (${source})`;
+  }
+
+  function toggleLinkedTool(toolId: string): void {
+    if (form.linkedToolIds.includes(toolId)) {
+      form.linkedToolIds = form.linkedToolIds.filter((item) => item !== toolId);
+      return;
+    }
+    form.linkedToolIds = [...form.linkedToolIds, toolId];
   }
 
   function setForm(nextForm: SkillFormState): void {
@@ -680,6 +734,25 @@
 
         <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
           <div class="flex items-center gap-2 text-slate-200">
+            <Wrench class="h-4 w-4 text-slate-400" />
+            <h3 class="font-medium">Linked Runtime Tools</h3>
+            <Tooltip placement="bottom" text="Existing registry tools that this skill should expose when it is attached or loaded. These are not bundled with the skill package itself.">
+              <button aria-label="Linked tools help" class={tooltipButtonClass} title="Linked tools help" type="button"><Info class="h-4 w-4" /></button>
+            </Tooltip>
+          </div>
+          {#if skill.linked_tool_ids && skill.linked_tool_ids.length > 0}
+            <div class="flex flex-wrap gap-2">
+              {#each skill.linked_tool_ids as toolId}
+                <Badge>{linkedToolDisplay(toolId)}</Badge>
+              {/each}
+            </div>
+          {:else}
+            <p class="text-xs text-slate-500">No linked runtime tools configured.</p>
+          {/if}
+        </div>
+
+        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+          <div class="flex items-center gap-2 text-slate-200">
             <Layers class="h-4 w-4 text-slate-400" />
             <h3 class="font-medium">Templates And Secrets</h3>
           </div>
@@ -754,6 +827,50 @@
       </section>
 
       <section class="grid gap-4 xl:grid-cols-2">
+        <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 xl:col-span-2">
+          <div class="flex items-center gap-2 text-slate-200">
+            <Wrench class="h-4 w-4 text-slate-400" />
+            <h3 class="font-medium">Linked Runtime Tools</h3>
+            <Tooltip placement="bottom" text="Select existing builtin or MCP tools that should become available when this skill is attached or loaded. This is separate from bundled executable tools below.">
+              <button aria-label="Linked runtime tools help" class={tooltipButtonClass} title="Linked runtime tools help" type="button"><Info class="h-4 w-4" /></button>
+            </Tooltip>
+          </div>
+          <input bind:value={linkedToolSearch} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="Search existing tools by name, source, category, or id" type="text" />
+          {#if form.linkedToolIds.length > 0}
+            <div class="flex flex-wrap gap-2">
+              {#each form.linkedToolIds as toolId}
+                <span class="inline-flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200">
+                  {linkedToolDisplay(toolId)}
+                  <button class="text-slate-500 hover:text-rose-300" onclick={() => toggleLinkedTool(toolId)} type="button"><X class="h-3.5 w-3.5" /></button>
+                </span>
+              {/each}
+            </div>
+          {:else}
+            <p class="text-xs text-slate-500">No linked runtime tools selected yet.</p>
+          {/if}
+          <div class="max-h-72 space-y-2 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40 p-2">
+            {#if filteredLinkedTools.length > 0}
+              {#each filteredLinkedTools as tool}
+                <label class="flex cursor-pointer items-start justify-between gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3 text-sm text-slate-200">
+                  <div class="min-w-0 space-y-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-medium text-slate-100">{tool.name}</span>
+                      <Badge>{tool.category}</Badge>
+                      {#if tool.profile_group}<Badge>{tool.profile_group}</Badge>{/if}
+                      <Badge>{tool.source?.server_name || tool.source?.type || 'tool'}</Badge>
+                    </div>
+                    <p class="text-xs text-slate-400">{tool.description}</p>
+                    {#if tool.tool_id}<p class="font-mono text-[11px] text-slate-500">{tool.tool_id}</p>{/if}
+                  </div>
+                  <input checked={Boolean(tool.tool_id && form.linkedToolIds.includes(tool.tool_id))} class="mt-1 rounded border-slate-600 bg-slate-950" disabled={!tool.tool_id} onchange={() => tool.tool_id && toggleLinkedTool(tool.tool_id)} type="checkbox" />
+                </label>
+              {/each}
+            {:else}
+              <p class="px-2 py-1 text-xs text-slate-500">No matching existing tools.</p>
+            {/if}
+          </div>
+        </div>
+
         <div class="space-y-3 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
           <div class="flex items-center gap-2 text-slate-200">
             <Layers class="h-4 w-4 text-slate-400" />

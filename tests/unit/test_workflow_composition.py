@@ -208,7 +208,46 @@ def test_decompose_skill_material_assigns_step_profiles_for_skill_tools() -> Non
 
     assert result.steps[0]["step_profile_id"] == "system:general-task"
     assert result.steps[0]["step_profile_mode"] == "hard"
-    assert result.steps[0]["step_profile"]["tool_overrides"]["include"] == ["run_release"]
+    assert result.steps[0]["step_profile"]["tool_overrides"]["include"] == [
+        "skill:skill_release:run_release"
+    ]
+
+
+def test_decompose_skill_material_assigns_step_profiles_for_linked_tools() -> None:
+    llm = _FallbackLLM(
+        {
+            "rationale": "Use the linked tools and summarize the result.",
+            "steps": [
+                {
+                    "name": "execute",
+                    "type": "run",
+                    "prompt": "Run the shell helpers.",
+                    "require_deliverable": False,
+                }
+            ],
+        }
+    )
+
+    result = asyncio.run(
+        decompose_skill_material(
+            llm=llm,
+            skill_id="skill_release",
+            name="Release",
+            description="Run the release automation.",
+            instructions="Use the release helper and summarize the result.",
+            tools=[],
+            linked_tool_ids=["builtin:bash", "builtin:read"],
+            prompt_templates={},
+            timeout_seconds=6.0,
+        )
+    )
+
+    assert result.steps[0]["step_profile_id"] == "system:general-task"
+    assert result.steps[0]["step_profile_mode"] == "hard"
+    assert result.steps[0]["step_profile"]["tool_overrides"]["include"] == [
+        "builtin:bash",
+        "builtin:read",
+    ]
 
 
 def test_decompose_skill_material_includes_refresh_guidance_for_existing_steps() -> None:
@@ -331,5 +370,7 @@ def test_validate_composed_workflow_normalizes_missing_step_profiles_from_skill_
     assert workflow.steps[0].step_profile_id == "system:general-task"
     assert str(workflow.steps[0].step_profile_mode) == "hard"
     assert workflow.steps[0].step_profile is not None
-    assert workflow.steps[0].step_profile.tool_overrides.include == ["run_release"]
+    assert workflow.steps[0].step_profile.tool_overrides.include == [
+        "skill:skill_release:run_release"
+    ]
     assert workflow.steps[1].step_profile_id == "system:coding"

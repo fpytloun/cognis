@@ -14,6 +14,11 @@ tags:
   - cognis
   - orchestration
   - workflows
+linked_tool_ids:
+  - builtin:create_task
+  - builtin:compose_and_run_workflow
+  - builtin:list_workflows
+  - builtin:get_workflow
 ---
 
 # Purpose
@@ -56,6 +61,16 @@ tags:
   - cognis
   - coding
   - implementation
+linked_tool_ids:
+  - builtin:read
+  - builtin:write
+  - builtin:edit
+  - builtin:patch
+  - builtin:multiedit
+  - builtin:lsp
+  - builtin:glob
+  - builtin:grep
+  - builtin:bash
 ---
 
 # Purpose
@@ -118,6 +133,16 @@ tags:
   - cognis
   - management
   - tasks
+linked_tool_ids:
+  - builtin:create_task
+  - builtin:list_tasks
+  - builtin:get_task
+  - builtin:respond_task_input
+  - builtin:update_task
+  - builtin:cancel_task
+  - builtin:get_task_output
+  - builtin:get_task_step_output
+  - builtin:resolve_task_pause
 ---
 
 # Purpose
@@ -180,6 +205,13 @@ tags:
   - cognis
   - management
   - workflows
+linked_tool_ids:
+  - builtin:list_workflows
+  - builtin:get_workflow
+  - builtin:create_workflow
+  - builtin:update_workflow
+  - builtin:delete_workflow
+  - builtin:duplicate_workflow
 ---
 
 # Purpose
@@ -248,6 +280,7 @@ def get_system_skill_default(skill_id: str) -> dict[str, object] | None:
         "description": parsed["description"],
         "instructions": parsed["instructions"],
         "tags": list(parsed["tags"]),
+        "linked_tool_ids": list(parsed.get("linked_tool_ids") or []),
         "tools": parsed["tools"],
         "prompt_templates": parsed["prompt_templates"],
         "steps": parsed.get("steps") or [],

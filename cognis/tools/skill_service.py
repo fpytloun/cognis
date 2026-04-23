@@ -122,6 +122,24 @@ def normalize_prompt_templates(value: Any) -> dict[str, str] | None:
     return {str(key): str(item) for key, item in value.items()}
 
 
+def normalize_linked_tool_ids(value: Any) -> list[str] | None:
+    """Validate and canonicalize skill-linked runtime tool ids."""
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("linked_tool_ids must be a list of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        candidate = str(item).strip()
+        if not candidate or candidate in seen:
+            continue
+        normalized.append(candidate)
+        seen.add(candidate)
+    return normalized
+
+
 def normalize_secret_placeholders(value: Any) -> list[str] | None:
     if value is None:
         return None
@@ -190,6 +208,7 @@ def compute_decomposition_source_hash(
     instructions: str,
     *,
     tools: list[dict[str, Any]] | None = None,
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any] | None = None,
     secret_placeholders: list[str] | None = None,
     asset_manifest: list[dict[str, Any]] | list[SkillAssetRef] | None = None,
@@ -199,6 +218,7 @@ def compute_decomposition_source_hash(
     payload = {
         "instructions": instructions.strip(),
         "tools": normalize_skill_tools(tools),
+        "linked_tool_ids": normalize_linked_tool_ids(linked_tool_ids),
         "prompt_templates": normalize_prompt_templates(prompt_templates),
         "secret_placeholders": normalize_secret_placeholders(secret_placeholders),
         "asset_manifest": _canonical_decomposition_asset_manifest(asset_manifest),
@@ -409,6 +429,7 @@ async def create_skill_version_with_assets(
     owner_email: str,
     instructions: str,
     tools: list[dict[str, Any]] | None,
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any] | None,
     secret_placeholders: list[str] | None,
     steps: list[dict[str, Any]] | None,
@@ -464,6 +485,7 @@ async def create_skill_version_with_assets(
         decomposition_source_hash = compute_decomposition_source_hash(
             instructions,
             tools=normalized_tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=normalized_templates,
             secret_placeholders=normalized_placeholders,
             asset_manifest=asset_manifest,
@@ -472,6 +494,7 @@ async def create_skill_version_with_assets(
     content_hash = compute_content_hash(
         instructions,
         normalized_tools,
+        normalize_linked_tool_ids(linked_tool_ids),
         normalized_templates,
         normalized_placeholders,
         asset_manifest,
@@ -484,6 +507,7 @@ async def create_skill_version_with_assets(
         content_hash=content_hash,
         instructions=instructions,
         tools=normalized_tools,
+        linked_tool_ids=normalize_linked_tool_ids(linked_tool_ids),
         prompt_templates=normalized_templates,
         secret_placeholders=normalized_placeholders,
         steps=normalized_steps,

@@ -183,6 +183,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_skill_versioning_columns)
+        await conn.run_sync(_ensure_skill_linked_tools_column)
         await conn.run_sync(_ensure_skill_decomposition_columns)
         await conn.run_sync(_ensure_skill_system_column)
         await conn.run_sync(_ensure_schedule_extended_columns)
@@ -467,6 +468,20 @@ def _ensure_skill_versioning_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE skills ADD COLUMN current_version_id VARCHAR"))
 
 
+def _ensure_skill_linked_tools_column(sync_conn: object) -> None:
+    """Add linked_tool_ids column to skills when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("skills")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "linked_tool_ids" not in columns:
+        execute(text("ALTER TABLE skills ADD COLUMN linked_tool_ids JSON"))
+
+
 def _ensure_skill_system_column(sync_conn: object) -> None:
     inspector = cast(Any, inspect(sync_conn))
     try:
@@ -491,6 +506,8 @@ def _ensure_skill_decomposition_columns(sync_conn: object) -> None:
 
     if "steps" not in columns:
         execute(text("ALTER TABLE skill_versions ADD COLUMN steps JSON"))
+    if "linked_tool_ids" not in columns:
+        execute(text("ALTER TABLE skill_versions ADD COLUMN linked_tool_ids JSON"))
     if "decomposition_source_hash" not in columns:
         execute(text("ALTER TABLE skill_versions ADD COLUMN decomposition_source_hash VARCHAR"))
 
@@ -785,6 +802,9 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             updates: dict[str, object] = {
                 "is_system": True,
                 "auto_load": bool(defaults.get("auto_load", False)),
+                "linked_tool_ids": [
+                    str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
+                ],
             }
             if existing.owner_email is None and existing.current_version_id is None:
                 updates.update(
@@ -803,6 +823,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                 content_hash = compute_content_hash(
                     existing.instructions,
                     existing.tools,
+                    existing.linked_tool_ids,
                     existing.prompt_templates,
                     steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
                 )
@@ -813,6 +834,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                     content_hash=content_hash,
                     instructions=existing.instructions,
                     tools=existing.tools,
+                    linked_tool_ids=existing.linked_tool_ids,
                     prompt_templates=existing.prompt_templates,
                     secret_placeholders=None,
                     steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
@@ -830,6 +852,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             ),
             instructions=str(defaults["instructions"]),
             tools=defaults.get("tools"),
+            linked_tool_ids=[str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])],
             prompt_templates=defaults.get("prompt_templates"),
             tags=list(defaults["tags"]),
             auto_load=bool(defaults.get("auto_load", False)),
@@ -844,11 +867,13 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             content_hash=compute_content_hash(
                 row.instructions,
                 row.tools,
+                row.linked_tool_ids,
                 row.prompt_templates,
                 steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
             ),
             instructions=row.instructions,
             tools=row.tools,
+            linked_tool_ids=row.linked_tool_ids,
             prompt_templates=row.prompt_templates,
             secret_placeholders=None,
             steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,

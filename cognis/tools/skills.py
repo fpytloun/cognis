@@ -228,6 +228,8 @@ async def resolve_skills_for_agent(
                         skill_id=skill_id,
                         name=skill_row.name,
                         description=skill_row.description,
+                        tags=skill_row.tags or [],
+                        linked_tool_ids=skill_row.linked_tool_ids or [],
                         version_id=version_row.version_id,
                         version_number=version_row.version_number,
                         content_hash=version_row.content_hash,
@@ -258,6 +260,8 @@ async def resolve_skills_for_agent(
                 skill_id=skill_id,
                 name=skill_row.name,
                 description=skill_row.description,
+                tags=skill_row.tags or [],
+                linked_tool_ids=skill_row.linked_tool_ids or [],
                 version_id="",
                 version_number=0,
                 content_hash="",
@@ -343,6 +347,7 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
     )
     for skill in ordered_skills:
         tool_names = ", ".join(t.name for t in skill.tools) if skill.tools else ""
+        linked_tool_names = ", ".join(skill.linked_tool_ids) if skill.linked_tool_ids else ""
         lines.append("  <skill>")
         lines.append(f"    <name>{skill.name}</name>")
         lines.append(f"    <skill_id>{skill.skill_id}</skill_id>")
@@ -360,6 +365,8 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
         lines.append(f"    <description>{desc}</description>")
         if tool_names:
             lines.append(f"    <tools>{tool_names}</tools>")
+        if linked_tool_names:
+            lines.append(f"    <linked_tools>{linked_tool_names}</linked_tools>")
         if skill.attached:
             lines.append("    <attached>true</attached>")
         if skill.auto_load:
@@ -479,11 +486,26 @@ def _qualified_skill_tool_name(skill_id: str, tool_name: str) -> str:
 
 
 def attached_skill_tool_ids(resolved: ResolvedSkillSet) -> set[str]:
-    """Return stable tool IDs for skills attached to this agent context."""
+    """Return runtime tool IDs surfaced immediately by attached skills."""
+
+    attached_by_skill = attached_skill_tool_ids_by_skill(resolved)
+    return {tool_id for tool_ids in attached_by_skill.values() for tool_id in tool_ids}
+
+
+def attached_skill_tool_ids_by_skill(resolved: ResolvedSkillSet) -> dict[str, list[str]]:
+    """Return runtime tool IDs keyed by attached skill id."""
+
+    attached_skills = [skill for skill in resolved.skills if skill.attached]
+    attached_tool_ids_by_skill: dict[str, set[str]] = {
+        skill.skill_id: set(skill.linked_tool_ids) for skill in attached_skills
+    }
+    for tool in skill_tools_to_definitions(ResolvedSkillSet(skills=attached_skills)):
+        skill_id = tool.source.skill_id
+        if not skill_id:
+            continue
+        attached_tool_ids_by_skill.setdefault(skill_id, set()).add(stable_tool_id(tool))
 
     return {
-        stable_tool_id(tool)
-        for tool in skill_tools_to_definitions(
-            ResolvedSkillSet(skills=[skill for skill in resolved.skills if skill.attached])
-        )
+        skill_id: sorted(tool_ids)
+        for skill_id, tool_ids in attached_tool_ids_by_skill.items()
     }

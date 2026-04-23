@@ -20,6 +20,7 @@ from cognis.tools.skill_service import (
     export_cognis_package,
     load_export_assets,
     load_skill_asset_refs,
+    normalize_linked_tool_ids,
     normalize_prompt_templates,
     normalize_secret_placeholders,
     normalize_skill_steps,
@@ -149,7 +150,12 @@ SKILL_WRITE_TOOL = ToolDefinition(
             "tools": {
                 "type": "array",
                 "items": {"type": "object"},
-                "description": "Tool definitions (optional)",
+                "description": "Bundled executable skill tool definitions (optional)",
+            },
+            "linked_tool_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Existing runtime tool ids to expose when this skill is attached or loaded",
             },
             "prompt_templates": {
                 "type": "object",
@@ -273,6 +279,11 @@ SKILL_IMPORT_URL_TOOL = ToolDefinition(
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Tags to apply (optional)",
+            },
+            "linked_tool_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Existing runtime tool ids to expose when this imported skill is attached or loaded",
             },
             "attach_to_all_agents": {
                 "type": "boolean",
@@ -419,6 +430,7 @@ def _resolved_skill_tool_ids(
     attach_to_all_agents: bool,
     instructions: str,
     tools: list[dict[str, Any]] | dict[str, Any] | None,
+    linked_tool_ids: list[str] | None = None,
 ) -> set[str]:
     """Return stable tool ids for one resolved skill payload."""
 
@@ -443,6 +455,7 @@ def _resolved_skill_tool_ids(
                     skill_id=skill_id,
                     name=name,
                     description=description,
+                    linked_tool_ids=normalize_linked_tool_ids(linked_tool_ids) or [],
                     version_id="",
                     version_number=0,
                     content_hash="",
@@ -454,7 +467,9 @@ def _resolved_skill_tool_ids(
             ]
         )
     )
-    return {stable_tool_id(tool) for tool in tool_defs}
+    resolved_tool_ids = {stable_tool_id(tool) for tool in tool_defs}
+    resolved_tool_ids.update(normalize_linked_tool_ids(linked_tool_ids) or [])
+    return resolved_tool_ids
 
 
 # ---------------------------------------------------------------------------
@@ -528,11 +543,13 @@ def _decomposition_inputs_changed(
     *,
     instructions: str,
     tools: list[dict[str, Any]] | None,
+    linked_tool_ids: list[str] | None,
     prompt_templates: dict[str, Any] | None,
     secret_placeholders: list[str] | None,
     asset_inputs: list[dict[str, Any]] | None,
     current_instructions: str,
     current_tools: list[dict[str, Any]] | None,
+    current_linked_tool_ids: list[str] | None,
     current_templates: dict[str, Any] | None,
     current_placeholders: list[str] | None,
     current_asset_inputs: list[dict[str, Any]] | None,
@@ -543,6 +560,7 @@ def _decomposition_inputs_changed(
         [
             instructions != current_instructions,
             (tools or []) != (current_tools or []),
+            (linked_tool_ids or []) != (current_linked_tool_ids or []),
             (prompt_templates or {}) != (current_templates or {}),
             (secret_placeholders or []) != (current_placeholders or []),
             (asset_inputs or []) != (current_asset_inputs or []),
@@ -558,11 +576,13 @@ async def _refresh_skill_steps_if_needed(
     description: str | None,
     instructions: str,
     tools: list[dict[str, Any]] | None,
+    linked_tool_ids: list[str] | None,
     prompt_templates: dict[str, Any] | None,
     secret_placeholders: list[str] | None,
     asset_inputs: list[dict[str, Any]] | None,
     current_instructions: str,
     current_tools: list[dict[str, Any]] | None,
+    current_linked_tool_ids: list[str] | None,
     current_templates: dict[str, Any] | None,
     current_placeholders: list[str] | None,
     current_steps: list[dict[str, Any]] | None,
@@ -576,11 +596,13 @@ async def _refresh_skill_steps_if_needed(
     if not _decomposition_inputs_changed(
         instructions=instructions,
         tools=tools,
+        linked_tool_ids=linked_tool_ids,
         prompt_templates=prompt_templates,
         secret_placeholders=secret_placeholders,
         asset_inputs=comparable_asset_inputs,
         current_instructions=current_instructions,
         current_tools=current_tools,
+        current_linked_tool_ids=current_linked_tool_ids,
         current_templates=current_templates,
         current_placeholders=current_placeholders,
         current_asset_inputs=_canonical_asset_inputs(current_asset_inputs or []),
@@ -599,6 +621,7 @@ async def _refresh_skill_steps_if_needed(
             description=description,
             instructions=instructions,
             tools=tools or [],
+            linked_tool_ids=linked_tool_ids or [],
             prompt_templates=prompt_templates or {},
             secret_placeholders=secret_placeholders or [],
             asset_manifest=comparable_asset_inputs,
@@ -634,6 +657,7 @@ async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResul
                 "name": row.name,
                 "description": row.description,
                 "tags": row.tags or [],
+                "linked_tool_ids": row.linked_tool_ids or [],
                 "attach_to_all_agents": row.auto_load,
                 "auto_load": row.auto_load,
                 "source": row.source,
@@ -708,6 +732,7 @@ async def _handle_skill_load(
             row.auto_load,
             instructions,
             tools,
+            row.linked_tool_ids,
         )
     )
     logger.info(
@@ -742,12 +767,14 @@ async def _handle_skill_load(
         "asset_count": len(asset_refs),
         "message": "Skill loaded into working context for this turn.",
         "tags": row.tags or [],
+        "linked_tool_ids": row.linked_tool_ids or [],
     }
     return ToolResult(
         output=json.dumps(result, indent=2, default=str),
         metadata={
             "protected_context": "\n".join(protected_context_parts),
             "discovered_tool_ids": declared_tool_ids,
+            "legacy_skill_tool_fallback": row.linked_tool_ids is None and not declared_tool_ids,
             "skill_activation": {
                 "skill_id": row.skill_id,
                 "name": row.name,
@@ -790,6 +817,7 @@ async def _handle_skill_get(
                 "content_hash": current_version.content_hash,
                 "instructions": current_version.instructions,
                 "tools": current_version.tools,
+                "linked_tool_ids": getattr(current_version, "linked_tool_ids", None) or [],
                 "steps": getattr(current_version, "steps", None),
                 "prompt_templates": current_version.prompt_templates,
                 "secret_placeholders": current_version.secret_placeholders,
@@ -811,6 +839,7 @@ async def _handle_skill_get(
         "tags": row.tags or [],
         "attach_to_all_agents": row.auto_load,
         "auto_load": row.auto_load,
+        "linked_tool_ids": row.linked_tool_ids or [],
         "source": row.source,
         "current_version": version_data,
         "version_count": len(versions),
@@ -883,6 +912,7 @@ async def _handle_skill_write(
 
     try:
         tools = normalize_skill_tools(arguments.get("tools"))
+        linked_tool_ids = normalize_linked_tool_ids(arguments.get("linked_tool_ids"))
         templates = normalize_prompt_templates(arguments.get("prompt_templates"))
         secret_placeholders = normalize_secret_placeholders(arguments.get("secret_placeholders"))
         steps = normalize_skill_steps(arguments.get("steps"))
@@ -904,6 +934,8 @@ async def _handle_skill_write(
             row = await get_skill_scoped(session, skill_id, owner_email=user_email)
             if row is None:
                 return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
+            if linked_tool_ids is None:
+                linked_tool_ids = row.linked_tool_ids or []
             current_version = await resolve_current_skill_version(session, row)
             current_assets = (
                 await load_skill_asset_refs(session, current_version)
@@ -915,6 +947,7 @@ async def _handle_skill_write(
             current_source_hash = compute_decomposition_source_hash(
                 instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
                 asset_manifest=getattr(current_version, "asset_manifest", None) or [],
@@ -939,6 +972,7 @@ async def _handle_skill_write(
                 description=description,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 tags=tags,
                 auto_load=attach_to_all_agents,
@@ -952,6 +986,7 @@ async def _handle_skill_write(
                     description=description if isinstance(description, str) else row.description,
                     instructions=instructions,
                     tools=tools,
+                    linked_tool_ids=linked_tool_ids,
                     prompt_templates=templates,
                     secret_placeholders=secret_placeholders,
                     asset_inputs=current_asset_inputs,
@@ -959,6 +994,11 @@ async def _handle_skill_write(
                     if current_version is not None
                     else row.instructions,
                     current_tools=current_version.tools if current_version is not None else row.tools,
+                    current_linked_tool_ids=(
+                        getattr(current_version, "linked_tool_ids", None)
+                        if current_version is not None
+                        else row.linked_tool_ids or []
+                    ),
                     current_templates=(
                         current_version.prompt_templates
                         if current_version is not None
@@ -977,12 +1017,14 @@ async def _handle_skill_write(
         else:
             # Create new
             created_new_skill = True
+            linked_tool_ids = linked_tool_ids or []
             row = await create_skill(
                 session,
                 name=name,
                 description=description,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 tags=tags,
                 auto_load=attach_to_all_agents,
@@ -994,6 +1036,7 @@ async def _handle_skill_write(
             current_source_hash = compute_decomposition_source_hash(
                 instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
                 asset_manifest=[],
@@ -1020,6 +1063,7 @@ async def _handle_skill_write(
                 owner_email=user_email,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 secret_placeholders=secret_placeholders,
                 steps=steps
@@ -1058,6 +1102,7 @@ async def _handle_skill_write(
                 attach_to_all_agents,
                 instructions,
                 tools,
+                linked_tool_ids,
             )
         )
 
@@ -1138,11 +1183,17 @@ async def _handle_skill_asset_write(
                 description=row.description,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=row.linked_tool_ids or [],
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 asset_inputs=_canonical_asset_inputs(asset_inputs),
                 current_instructions=instructions,
                 current_tools=tools,
+                current_linked_tool_ids=(
+                    getattr(current_version, "linked_tool_ids", None)
+                    if current_version is not None
+                    else row.linked_tool_ids or []
+                ),
                 current_templates=templates,
                 current_placeholders=placeholders,
                 current_steps=steps,
@@ -1159,6 +1210,7 @@ async def _handle_skill_asset_write(
                 owner_email=user_email,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=row.linked_tool_ids or [],
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 steps=steps,
@@ -1183,6 +1235,7 @@ async def _handle_skill_asset_write(
             owner_email=user_email,
             instructions=instructions,
             tools=tools,
+            linked_tool_ids=row.linked_tool_ids or [],
             prompt_templates=templates,
         )
         await set_current_version(session, skill_id, version_row.version_id)
@@ -1263,11 +1316,17 @@ async def _handle_skill_asset_delete(
                 description=row.description,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=row.linked_tool_ids or [],
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 asset_inputs=retained_asset_inputs,
                 current_instructions=instructions,
                 current_tools=tools,
+                current_linked_tool_ids=(
+                    getattr(current_version, "linked_tool_ids", None)
+                    if current_version is not None
+                    else row.linked_tool_ids or []
+                ),
                 current_templates=templates,
                 current_placeholders=placeholders,
                 current_steps=steps,
@@ -1350,6 +1409,7 @@ async def _handle_skill_delete(
                 row.auto_load,
                 instructions,
                 tools,
+                row.linked_tool_ids,
             )
         )
         try:
@@ -1394,6 +1454,11 @@ async def _handle_skill_import_url(
         name = arguments.get("name") or skill_data.get("name") or "Imported Skill"
         instructions = str(skill_data.get("instructions") or "")
         tools = normalize_skill_tools(skill_data.get("tools"))
+        linked_tool_ids = normalize_linked_tool_ids(
+            arguments.get("linked_tool_ids")
+            if arguments.get("linked_tool_ids") is not None
+            else skill_data.get("linked_tool_ids")
+        ) or []
         templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
         steps = skill_data.get("steps") if isinstance(skill_data.get("steps"), list) else None
@@ -1409,6 +1474,7 @@ async def _handle_skill_import_url(
             description=skill_data.get("description"),
             instructions=instructions,
             tools=tools,
+            linked_tool_ids=linked_tool_ids,
             prompt_templates=templates,
             tags=tags,
             auto_load=attach_to_all_agents,
@@ -1424,6 +1490,7 @@ async def _handle_skill_import_url(
                 owner_email=user_email,
                 instructions=instructions,
                 tools=tools,
+                linked_tool_ids=linked_tool_ids,
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 steps=steps,
@@ -1465,6 +1532,7 @@ async def _handle_skill_import_url(
                     attach_to_all_agents,
                     str(instructions),
                     tools,
+                    linked_tool_ids,
                 )
             ),
         },
@@ -1521,6 +1589,7 @@ async def _handle_skill_export(
         name=row.name,
         description=row.description,
         tags=row.tags or [],
+        linked_tool_ids=row.linked_tool_ids or [],
         auto_load=row.auto_load,
         instructions=version_row.instructions if version_row else row.instructions,
         tools=version_row.tools or [] if version_row else row.tools or [],

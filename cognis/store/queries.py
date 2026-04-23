@@ -2659,6 +2659,7 @@ async def create_skill(
     description: str | None = None,
     instructions: str,
     tools: list[dict[str, Any]] | dict[str, Any] | None = None,
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any] | None = None,
     tags: list[str] | None = None,
     auto_load: bool = False,
@@ -2673,6 +2674,7 @@ async def create_skill(
         description=description,
         instructions=instructions,
         tools=tools,
+        linked_tool_ids=linked_tool_ids,
         prompt_templates=prompt_templates,
         tags=tags,
         auto_load=auto_load,
@@ -2726,6 +2728,7 @@ async def reset_skill_to_defaults(
     description: str | None,
     instructions: str,
     tools: list[dict[str, Any]] | None,
+    linked_tool_ids: list[str] | None,
     prompt_templates: dict[str, Any] | None,
     tags: list[str] | None,
     auto_load: bool,
@@ -2739,6 +2742,7 @@ async def reset_skill_to_defaults(
     row.description = description
     row.instructions = instructions
     row.tools = tools
+    row.linked_tool_ids = linked_tool_ids
     row.prompt_templates = prompt_templates
     row.tags = tags
     row.auto_load = auto_load
@@ -2801,6 +2805,7 @@ async def create_skill_version(
     content_hash: str,
     instructions: str,
     tools: list[dict[str, Any]] | None = None,
+    linked_tool_ids: list[str] | None = None,
     prompt_templates: dict[str, Any] | None = None,
     secret_placeholders: list[str] | None = None,
     steps: list[dict[str, Any]] | None = None,
@@ -2823,6 +2828,7 @@ async def create_skill_version(
         schema_version=schema_version,
         instructions=instructions,
         tools=tools,
+        linked_tool_ids=linked_tool_ids,
         prompt_templates=prompt_templates,
         secret_placeholders=secret_placeholders,
         steps=steps,
