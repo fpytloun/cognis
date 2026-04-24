@@ -695,7 +695,7 @@ import { onMount, tick } from 'svelte';
       await api.secrets.upsert({
         name: secretModalName,
         value: secretModalValue,
-        scope: 'system',
+        scope: secretModalTarget === 'provider' ? 'system' : 'user',
         agent_id: null,
         description: secretModalTarget === 'provider'
           ? `API key for provider ${providerForm.display_name || providerForm.provider_id}`
