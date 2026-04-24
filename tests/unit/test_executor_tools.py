@@ -161,7 +161,9 @@ class TestReadTool:
         assert "1: secret" in result.output
 
     @pytest.mark.asyncio()
-    async def test_read_binary_file_returns_attachment_analysis_request(self, tmp_path: Path) -> None:
+    async def test_read_binary_file_returns_attachment_analysis_request(
+        self, tmp_path: Path
+    ) -> None:
         target = tmp_path / "photo.png"
         target.write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
 
@@ -177,9 +179,7 @@ class TestReadTool:
     async def test_read_svg_file_returns_text(self, tmp_path: Path) -> None:
         target = tmp_path / "icon.svg"
         target.write_text(
-            '<svg xmlns="http://www.w3.org/2000/svg">\n'
-            '  <text x="0" y="12">hello</text>\n'
-            "</svg>\n",
+            '<svg xmlns="http://www.w3.org/2000/svg">\n  <text x="0" y="12">hello</text>\n</svg>\n',
             encoding="utf-8",
         )
 
@@ -192,8 +192,8 @@ class TestReadTool:
         assert result.attachments is None
         assert result.metadata is not None
         assert "attachment_analysis_request" not in result.metadata
-        assert "1: <svg xmlns=\"http://www.w3.org/2000/svg\">" in result.output
-        assert "2:   <text x=\"0\" y=\"12\">hello</text>" in result.output
+        assert '1: <svg xmlns="http://www.w3.org/2000/svg">' in result.output
+        assert '2:   <text x="0" y="12">hello</text>' in result.output
 
 
 class TestWriteTool:
@@ -892,6 +892,39 @@ class TestGrepTool:
         assert "cwd.py" not in result.output
 
     @pytest.mark.asyncio()
+    async def test_grep_accepts_single_file_path(self, tmp_path: Path) -> None:
+        target = tmp_path / "a.py"
+        other = tmp_path / "b.py"
+        target.write_text("def hello():\n    pass\n")
+        other.write_text("def hello():\n    pass\n")
+
+        result = await handle_grep({"pattern": "hello", "path": str(target)}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "a.py" in result.output
+        assert "b.py" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_ignores_include_for_single_file_path(self, tmp_path: Path) -> None:
+        target = tmp_path / "+layout.svelte"
+        other = tmp_path / "other.ts"
+        target.write_text('<div class="bg-slate-900"></div>\n')
+        other.write_text("const color = 'bg-slate-900'\n")
+
+        result = await handle_grep(
+            {
+                "pattern": "bg-slate",
+                "path": str(target),
+                "include": "*.ts",
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        assert "+layout.svelte" in result.output
+        assert "other.ts" not in result.output
+
+    @pytest.mark.asyncio()
     async def test_grep_rg_uses_end_of_options_separator(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1058,6 +1091,35 @@ class TestBashTool:
 
         assert result.is_error
         assert "Working directory not found" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_shell_parse_errors_include_quoting_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        class _Process:
+            returncode = 2
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (
+                    b"",
+                    b"/bin/bash: -c: line 1: syntax error near unexpected token `('\n",
+                )
+
+        async def _fake_create_process(**_: object) -> _Process:
+            return _Process()
+
+        monkeypatch.setattr(shell_module, "_create_process", _fake_create_process)
+
+        result = await handle_bash(
+            {"command": "git diff -- ui/src/routes/(app)/+layout.svelte", "workdir": str(tmp_path)},
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.is_error
+        assert "parsed by the shell" in result.output
+        assert "Quote literal paths" in result.output
 
     @pytest.mark.asyncio()
     async def test_bash_defaults_to_home_when_workdir_omitted(

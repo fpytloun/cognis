@@ -58,6 +58,10 @@ _BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "Use edit, multiedit, patch, or write instead of tee to rewrite source files.",
     ),
 )
+_SHELL_PARSE_ERROR_PATTERN = re.compile(
+    r"syntax error near unexpected token|parse error near|unexpected EOF|unexpected end of file",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -251,6 +255,15 @@ def _background_shell_manager(context: ToolExecutionContext) -> _BackgroundShell
     return manager
 
 
+def _shell_parse_error_hint(stderr_text: str) -> str | None:
+    if not _SHELL_PARSE_ERROR_PATTERN.search(stderr_text):
+        return None
+    return (
+        "Hint: This command is parsed by the shell. Quote literal paths or arguments "
+        "containing parentheses, spaces, globs, $, or other shell metacharacters."
+    )
+
+
 async def cleanup_shell_manager(runtime_metadata: dict[str, Any]) -> None:
     """Stop any background shell sessions stored in runtime metadata."""
 
@@ -385,12 +398,15 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
     stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
     exit_code = process.returncode or 0
+    shell_hint = _shell_parse_error_hint(stderr_text)
 
     parts: list[str] = []
     if stdout_text:
         parts.append(stdout_text)
     if stderr_text:
         parts.append(f"STDERR:\n{stderr_text}")
+    if shell_hint:
+        parts.append(shell_hint)
     if exit_code != 0:
         parts.append(f"\nExit code: {exit_code}")
 

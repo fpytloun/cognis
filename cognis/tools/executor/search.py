@@ -119,8 +119,16 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
         base = resolve_path(search_path, context=context, default_to_home=True)
     except ValueError as exc:
         return ToolResult(output=str(exc), is_error=True)
+
+    if base.is_file():
+        if _RG_PATH is not None:
+            rg_result = await _grep_with_rg(base.parent, str(pattern), None, target=base)
+            if rg_result is not None:
+                return rg_result
+        return await _grep_file_with_python(base, str(pattern))
+
     if not base.is_dir():
-        return ToolResult(output=f"Not a directory: {search_path}", is_error=True)
+        return ToolResult(output=f"Not a directory or file: {search_path}", is_error=True)
 
     if _RG_PATH is not None:
         rg_result = await _grep_with_rg(base, str(pattern), str(include) if include else None)
@@ -183,7 +191,13 @@ def _format_glob_results(base: Path, matches: list[Path]) -> ToolResult:
     return ToolResult(output=result)
 
 
-async def _grep_with_rg(base: Path, pattern: str, include: str | None) -> ToolResult | None:
+async def _grep_with_rg(
+    base: Path,
+    pattern: str,
+    include: str | None,
+    *,
+    target: Path | None = None,
+) -> ToolResult | None:
     command = [
         _RG_PATH,
         "--json",
@@ -198,7 +212,7 @@ async def _grep_with_rg(base: Path, pattern: str, include: str | None) -> ToolRe
         command.extend(["--glob", include])
     for skip_dir in sorted(_SKIP_DIRS):
         command.extend(["--glob", f"!**/{skip_dir}/**"])
-    command.extend(["--", pattern, str(base)])
+    command.extend(["--", pattern, str(target or base)])
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -254,20 +268,8 @@ async def _grep_with_python(base: Path, pattern: str, include: str | None) -> To
         for file_path in base.glob(file_pattern):
             if not file_path.is_file() or _should_skip(file_path):
                 continue
-            try:
-                content = file_path.read_text(encoding="utf-8", errors="replace")
-            except (OSError, PermissionError):
-                continue
-            file_matches: list[tuple[int, str]] = []
-            for line_num, line in enumerate(content.splitlines(), start=1):
-                if regex.search(line):
-                    display = line[:_MAX_LINE_LENGTH]
-                    if len(line) > _MAX_LINE_LENGTH:
-                        display += "..."
-                    file_matches.append((line_num, display))
-                    total_matches += 1
-                    if total_matches >= _MAX_MATCHES:
-                        break
+            file_matches = _grep_python_file_matches(file_path, regex)
+            total_matches += len(file_matches)
             if file_matches:
                 results[str(file_path)] = file_matches
             if total_matches >= _MAX_MATCHES:
@@ -276,6 +278,31 @@ async def _grep_with_python(base: Path, pattern: str, include: str | None) -> To
         return ToolResult(output=f"Search error: {exc}", is_error=True)
 
     return _format_grep_results(base, results, total_matches)
+
+
+async def _grep_file_with_python(file_path: Path, pattern: str) -> ToolResult:
+    regex = re.compile(pattern)
+    try:
+        matches = _grep_python_file_matches(file_path, regex)
+    except (OSError, PermissionError) as exc:
+        return ToolResult(output=f"Search error: {exc}", is_error=True)
+    return _format_grep_results(
+        file_path.parent, {str(file_path): matches} if matches else {}, len(matches)
+    )
+
+
+def _grep_python_file_matches(file_path: Path, regex: re.Pattern[str]) -> list[tuple[int, str]]:
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    file_matches: list[tuple[int, str]] = []
+    for line_num, line in enumerate(content.splitlines(), start=1):
+        if regex.search(line):
+            display = line[:_MAX_LINE_LENGTH]
+            if len(line) > _MAX_LINE_LENGTH:
+                display += "..."
+            file_matches.append((line_num, display))
+            if len(file_matches) >= _MAX_MATCHES:
+                break
+    return file_matches
 
 
 def _format_grep_results(

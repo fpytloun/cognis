@@ -315,11 +315,11 @@ GREP_TOOL = ToolDefinition(
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "path": {
                 "type": "string",
-                "description": "Directory to search in. Use ~ for home directory. Defaults to the executor home directory if omitted.",
+                "description": "Directory or single file to search in. Use ~ for home directory. Defaults to the executor home directory if omitted.",
             },
             "include": {
                 "type": "string",
-                "description": "File pattern filter (e.g. '*.py', '*.{ts,tsx}')",
+                "description": "Optional file pattern filter when path is a directory (e.g. '*.py', '*.{ts,tsx}').",
             },
         },
         "required": ["pattern"],
@@ -338,12 +338,17 @@ BASH_TOOL = ToolDefinition(
         "Execute a shell command and return its output. Use for terminal-native "
         "operations such as git, build/test/package-manager commands, and atomic "
         "filesystem operations like mv, cp, rm, and mkdir. Prefer dedicated file "
-        "tools for reading and editing file contents."
+        "tools for reading and editing file contents. Commands are parsed by the "
+        "shell, so quote literal paths containing spaces, parentheses, globs, $, "
+        "or other shell metacharacters."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Shell command to execute"},
+            "command": {
+                "type": "string",
+                "description": "Shell command to execute. Commands are shell-parsed, so quote literal paths or arguments that contain shell metacharacters.",
+            },
             "description": {
                 "type": "string",
                 "description": "Brief description of what this command does",
