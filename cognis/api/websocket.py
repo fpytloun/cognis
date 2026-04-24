@@ -182,6 +182,7 @@ class WebSocketTurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         delta: str,
     ) -> None:
         await self._manager.send_to_conversation(
@@ -191,6 +192,7 @@ class WebSocketTurnObserver:
                 "conversation_id": conversation_id,
                 "session_id": session_id,
                 "message_id": message_id,
+                "turn_id": turn_id,
                 "content": delta,
                 "index": 0,
             },
@@ -203,6 +205,7 @@ class WebSocketTurnObserver:
         call_id: str,
         tool_name: str,
         arguments: dict[str, Any] | None,
+        turn_id: str | None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "tool_call",
@@ -212,6 +215,7 @@ class WebSocketTurnObserver:
             "tool_name": tool_name,
             "status": "started",
             "timestamp": datetime.now(UTC).isoformat(),
+            "turn_id": turn_id,
         }
         if arguments is not None:
             payload["arguments"] = arguments
@@ -228,6 +232,7 @@ class WebSocketTurnObserver:
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "tool_result",
@@ -239,6 +244,7 @@ class WebSocketTurnObserver:
             "is_error": is_error,
             "duration_ms": duration_ms,
             "timestamp": datetime.now(UTC).isoformat(),
+            "turn_id": turn_id,
         }
         if evaluation:
             payload["evaluation"] = evaluation
@@ -252,6 +258,7 @@ class WebSocketTurnObserver:
             "conversation_id": result.conversation_id,
             "session_id": result.session_id,
             "message_id": result.message_id,
+            "turn_id": result.turn_id,
             "seq": result.last_seq,
             "token_usage": None,
             "context_usage": result.context_usage,
@@ -291,6 +298,7 @@ class WebSocketTurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         block_id: str,
         delta: str,
         title: str | None,
@@ -312,6 +320,7 @@ class WebSocketTurnObserver:
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "message_id": message_id,
+                    "turn_id": turn_id,
                     "block_id": block_id,
                     "delta": delta,
                     "title": title,
@@ -327,6 +336,7 @@ class WebSocketTurnObserver:
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "message_id": message_id,
+                    "turn_id": turn_id,
                     "block_id": block_id,
                     "title": title,
                     "complete": True,
@@ -572,7 +582,8 @@ class WebSocketConnectionManager:
                 event_type = item.get("type")
                 data = item.get("data", {})
                 if event_type == "assistant_message":
-                    message_id = f"replay_{item.get('seq', uuid.uuid4().hex)}"
+                    turn_id = data.get("turn_id") if isinstance(data.get("turn_id"), str) else None
+                    message_id = turn_id or f"replay_{item.get('seq', uuid.uuid4().hex)}"
                     content = str(data.get("content", ""))
                     attachments = await hydrate_attachment_refs(
                         artifact_session,
@@ -591,6 +602,7 @@ class WebSocketConnectionManager:
                                 "conversation_id": conversation_id,
                                 "session_id": session.session_id,
                                 "message_id": message_id,
+                                "turn_id": turn_id,
                                 "content": content,
                                 "index": 0,
                             }
@@ -601,6 +613,7 @@ class WebSocketConnectionManager:
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
                             "message_id": message_id,
+                            "turn_id": turn_id,
                             "seq": item.get("seq", 0),
                             "token_usage": None,
                             "queued_count": 0,
@@ -623,6 +636,7 @@ class WebSocketConnectionManager:
                             "tool_name": data.get("name") or data.get("tool_name"),
                             "status": data.get("status", "started"),
                             "arguments": arguments,
+                            "turn_id": data.get("turn_id"),
                         }
                     )
                     replayed += 1
@@ -648,6 +662,7 @@ class WebSocketConnectionManager:
                             "duration_ms": data.get("duration_ms"),
                             "evaluation": data.get("evaluation"),
                             "attachments": attachments,
+                            "turn_id": data.get("turn_id"),
                         }
                     )
                     replayed += 1
@@ -660,6 +675,7 @@ class WebSocketConnectionManager:
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
                             "message_id": data.get("message_id") or data.get("turn_id"),
+                            "turn_id": data.get("turn_id"),
                             "block_id": block_id,
                             "title": data.get("title"),
                             "content": data.get("content", ""),
@@ -712,6 +728,7 @@ class WebSocketConnectionManager:
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
                                 "result": data.get("result_summary"),
+                                "turn_id": data.get("turn_id"),
                             }
                         )
                     elif status == "failed":
@@ -721,6 +738,7 @@ class WebSocketConnectionManager:
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
                                 "reason": data.get("error"),
+                                "turn_id": data.get("turn_id"),
                             }
                         )
                     else:
@@ -733,6 +751,7 @@ class WebSocketConnectionManager:
                                 "mode": data.get("mode"),
                                 "agent_id": data.get("agent_id"),
                                 "task": data.get("task"),
+                                "turn_id": data.get("turn_id"),
                             }
                         )
                     replayed += 1
@@ -743,6 +762,7 @@ class WebSocketConnectionManager:
                             "conversation_id": conversation_id,
                             "seq": item.get("seq"),
                             "text": str(data.get("message", "")),
+                            "turn_id": data.get("turn_id"),
                         }
                     )
                     replayed += 1
@@ -1588,6 +1608,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "text": event.data.get("message"),
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
         "tool_call_started",
@@ -1606,6 +1627,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "evaluation": event.data.get("evaluation"),
                 "attachments": event.data.get("attachments") or [],
                 "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+                "turn_id": event.data.get("turn_id"),
             }
         return {
             "type": "tool_call",
@@ -1616,6 +1638,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "status": "started",
             "arguments": event.data.get("arguments"),
             "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.TURN_STARTED:
         return {
@@ -1796,6 +1819,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "session_id": event.data.get("session_id"),
             "content": event.data.get("content", ""),
             "attachments": event.data.get("attachments", []),
+            "turn_id": event.data.get("turn_id"),
         }
     return None
 

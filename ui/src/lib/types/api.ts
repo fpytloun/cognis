@@ -1145,6 +1145,7 @@ export interface WebSocketChunkEvent {
   conversation_id?: string;
   session_id?: string;
   message_id: string;
+  turn_id?: string | null;
   content: string;
   index: number;
 }
@@ -1154,6 +1155,7 @@ export interface WebSocketChunkGapEvent {
   conversation_id?: string;
   session_id?: string;
   message_id: string;
+  turn_id?: string | null;
   dropped_count: number;
   recoverable: boolean;
 }
@@ -1171,6 +1173,7 @@ export interface WebSocketMessageCompleteEvent {
   conversation_id?: string;
   session_id?: string;
   message_id: string;
+  turn_id?: string | null;
   seq: number;
   token_usage: Record<string, unknown> | null;
   context_usage: ContextUsage | null;
@@ -1198,6 +1201,7 @@ export interface WebSocketToolCallEvent {
   conversation_id?: string;
   session_id?: string;
   seq?: number;
+  turn_id?: string | null;
   call_id: string;
   tool_name: string;
   status: string;
@@ -1358,6 +1362,7 @@ export interface WebSocketToolResultEvent {
   conversation_id?: string;
   session_id?: string;
   seq?: number;
+  turn_id?: string | null;
   call_id: string;
   tool_name: string;
   result: string;
@@ -1379,6 +1384,7 @@ export interface WebSocketAssistantThinkingChunkEvent {
   conversation_id?: string;
   session_id?: string;
   message_id: string;
+  turn_id?: string | null;
   block_id: string;
   delta: string;
   title?: string | null;
@@ -1392,6 +1398,7 @@ export interface WebSocketAssistantThinkingBlockEvent {
   /** seq present on replay frames only */
   seq?: number;
   message_id: string;
+  turn_id?: string | null;
   block_id: string;
   title?: string | null;
   /** Full content — present on replay frames */
@@ -1416,6 +1423,7 @@ export interface WebSocketSystemMessageEvent {
   type: 'system_message';
   conversation_id?: string;
   seq?: number;
+  turn_id?: string | null;
   text: string;
 }
 
@@ -1475,6 +1483,7 @@ export interface WebSocketUserMessageEvent {
   type: 'user_message';
   conversation_id?: string;
   session_id?: string;
+  turn_id?: string | null;
   content: string;
   attachments?: AttachmentRef[];
 }

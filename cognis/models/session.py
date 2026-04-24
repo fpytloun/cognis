@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -85,6 +86,23 @@ class SessionEvent(BaseModel):
 
     type: str
     data: dict[str, Any]
+
+
+def with_session_event_turn_id(event: SessionEvent, turn_id: str | None) -> SessionEvent:
+    """Return a copy of ``event`` with a normalized ``turn_id`` field."""
+
+    data = dict(event.data)
+    data.setdefault("turn_id", turn_id)
+    return event.model_copy(update={"data": data})
+
+
+def with_session_events_turn_id(
+    events: Sequence[SessionEvent],
+    turn_id: str | None,
+) -> list[SessionEvent]:
+    """Normalize ``turn_id`` on a batch of persisted session events."""
+
+    return [with_session_event_turn_id(event, turn_id) for event in events]
 
 
 class EventAppendResult(BaseModel):

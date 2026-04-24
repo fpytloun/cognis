@@ -82,6 +82,7 @@ class SSETurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         delta: str,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
@@ -93,6 +94,7 @@ class SSETurnObserver:
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "message_id": message_id,
+                    "turn_id": turn_id,
                     "delta": delta,
                 },
             }
@@ -105,6 +107,7 @@ class SSETurnObserver:
         call_id: str,
         tool_name: str,
         arguments: dict[str, Any] | None,
+        turn_id: str | None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -117,6 +120,7 @@ class SSETurnObserver:
                     "call_id": call_id,
                     "tool_name": tool_name,
                     "status": "started",
+                    "turn_id": turn_id,
                 },
             }
         )
@@ -132,6 +136,7 @@ class SSETurnObserver:
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -147,6 +152,7 @@ class SSETurnObserver:
                     "is_error": is_error,
                     "duration_ms": duration_ms,
                     "attachments": strip_attachment_payload_bytes(attachments or []),
+                    "turn_id": turn_id,
                 },
             }
         )
@@ -156,6 +162,7 @@ class SSETurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         block_id: str,
         delta: str,
         title: str | None,
@@ -171,6 +178,7 @@ class SSETurnObserver:
                         "conversation_id": conversation_id,
                         "session_id": session_id,
                         "message_id": message_id,
+                        "turn_id": turn_id,
                         "block_id": block_id,
                         "delta": delta,
                         "title": title,
@@ -186,6 +194,7 @@ class SSETurnObserver:
                         "conversation_id": conversation_id,
                         "session_id": session_id,
                         "message_id": message_id,
+                        "turn_id": turn_id,
                         "block_id": block_id,
                         "title": title,
                         "complete": True,
@@ -204,6 +213,7 @@ class SSETurnObserver:
                     "conversation_id": result.conversation_id,
                     "session_id": result.session_id,
                     "message_id": result.message_id,
+                    "turn_id": result.turn_id,
                     "last_seq": result.last_seq,
                     "context_usage": result.context_usage,
                     "delegated": result.delegated,

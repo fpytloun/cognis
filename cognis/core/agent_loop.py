@@ -84,7 +84,12 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
 from cognis.models.deliverable import Deliverable
-from cognis.models.session import ConversationModel, SessionEvent, SessionModel
+from cognis.models.session import (
+    ConversationModel,
+    SessionEvent,
+    SessionModel,
+    with_session_events_turn_id,
+)
 from cognis.models.tool import (
     Permission,
     ToolCall,
@@ -1879,19 +1884,22 @@ class AgentLoop:
                 try:
                     await self.providers.guardrails.record_events(
                         session_id=parent_intaris_session_id,
-                        events=[
-                            SessionEvent(
-                                type="delegation",
-                                data={
-                                    "status": "completed",
-                                    "child_session_id": child_session_id,
-                                    "mode": "delegate",
-                                    "result_summary": result_summary,
-                                    "result_content": result_content,
-                                    **deliverable_data,
-                                },
-                            )
-                        ],
+                        events=with_session_events_turn_id(
+                            [
+                                SessionEvent(
+                                    type="delegation",
+                                    data={
+                                        "status": "completed",
+                                        "child_session_id": child_session_id,
+                                        "mode": "delegate",
+                                        "result_summary": result_summary,
+                                        "result_content": result_content,
+                                        **deliverable_data,
+                                    },
+                                )
+                            ],
+                            None,
+                        ),
                         idempotency_key=(
                             f"{parent_intaris_session_id}:delegation_completed_{child_session_id}"
                         ),
@@ -1949,17 +1957,20 @@ class AgentLoop:
                 try:
                     await self.providers.guardrails.record_events(
                         session_id=parent_intaris_session_id,
-                        events=[
-                            SessionEvent(
-                                type="delegation",
-                                data={
-                                    "status": "failed",
-                                    "child_session_id": child_session_id,
-                                    "mode": "delegate",
-                                    "error": "Delegation execution failed",
-                                },
-                            )
-                        ],
+                        events=with_session_events_turn_id(
+                            [
+                                SessionEvent(
+                                    type="delegation",
+                                    data={
+                                        "status": "failed",
+                                        "child_session_id": child_session_id,
+                                        "mode": "delegate",
+                                        "error": "Delegation execution failed",
+                                    },
+                                )
+                            ],
+                            None,
+                        ),
                         idempotency_key=(
                             f"{parent_intaris_session_id}:delegation_failed_{child_session_id}"
                         ),
@@ -2117,7 +2128,8 @@ class AgentLoop:
         events_to_record: list[SessionEvent] = []
         ctx.pending_events = events_to_record
         ctx.pending_tool_calls.clear()
-        ctx.turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        if not ctx.turn_id:
+            ctx.turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         messages: list[dict[str, Any]] = []
         assistant_content_parts: list[str] = []  # User-visible assistant output only
         assistant_memory_parts: list[str] = []  # Include attachment notes for memory/compaction
@@ -2337,6 +2349,7 @@ class AgentLoop:
                     data={
                         "conversation_id": ctx.conversation.conversation_id,
                         "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
                         "text": "Immutable prefix is unavailable for this session.",
                     },
                 )
@@ -5089,6 +5102,7 @@ class AgentLoop:
                 data={
                     "conversation_id": ctx.conversation.conversation_id,
                     "parent_session_id": ctx.session.session_id,
+                    "turn_id": ctx.turn_id,
                     "child_session_id": child_session.session_id,
                     "mode": "delegate",
                     "agent_id": child_session.agent_id,
@@ -5400,6 +5414,7 @@ class AgentLoop:
                         data={
                             "conversation_id": ctx.conversation.conversation_id,
                             "parent_session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
                             "child_session_id": task.task_id,
                             "mode": "task",
                             "agent_id": task.agent_id,
@@ -6992,6 +7007,7 @@ class AgentLoop:
                     data={
                         "conversation_id": ctx.conversation.conversation_id,
                         "parent_session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
                         "child_session_id": task.task_id,
                         "mode": "task",
                         "agent_id": task.agent_id,
@@ -7020,6 +7036,7 @@ class AgentLoop:
                 type=EventType.WORKFLOW_COMPOSED,
                 data={
                     "conversation_id": ctx.conversation.conversation_id,
+                    "turn_id": ctx.turn_id,
                     "workflow_id": persisted_workflow_id,
                     "workflow_name": workflow.name,
                     "lifecycle": str(workflow.lifecycle),
@@ -7157,7 +7174,7 @@ class AgentLoop:
     ) -> bool:
         if not events:
             return False
-        batch = list(events)
+        batch = with_session_events_turn_id(events, ctx.turn_id)
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
         idempotency_key = self._intaris_batch_idempotency_key(intaris_id, batch, reason=reason)
         while True:
@@ -7740,6 +7757,7 @@ class AgentLoop:
                     "event": "tool_call_completed",
                     "task_id": ctx.task_id,
                     "session_id": ctx.session.session_id,
+                    "turn_id": ctx.turn_id,
                     "step_name": ctx.step_definition.name,
                     "step_run_id": ctx.step_run_id,
                     "call_id": tc.call_id,
@@ -7975,6 +7993,7 @@ class AgentLoop:
                         "event": "tool_call_started",
                         "task_id": ctx.task_id,
                         "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
                         "step_name": ctx.step_definition.name,
                         "step_run_id": ctx.step_run_id,
                         "call_id": item.tool_call.call_id,

@@ -45,7 +45,7 @@ from cognis.core.title_policy import sync_intaris_title
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
-from cognis.models.session import ConversationModel, SessionModel
+from cognis.models.session import ConversationModel, SessionModel, with_session_events_turn_id
 from cognis.models.tool import Permission, ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
@@ -1394,7 +1394,10 @@ class ContextAssembler:
                 return []
 
             intaris_session_id = session.intaris_session_id or session.session_id
-            message_events = build_prefix_message_events(prefix_entries)
+            message_events = with_session_events_turn_id(
+                build_prefix_message_events(prefix_entries),
+                None,
+            )
             idempotency_key = f"{intaris_session_id}:immutable_prefix:{snapshot_source}:messages"
             with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
                 append_result = await self.guardrails.record_events(
@@ -1428,10 +1431,11 @@ class ContextAssembler:
                     "repair_reason": repair_reason,
                 },
             )
+            snapshot_events = with_session_events_turn_id([snapshot_event], None)
             with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
                 snapshot_result = await self.guardrails.record_events(
                     session_id=intaris_session_id,
-                    events=[snapshot_event],
+                    events=snapshot_events,
                     source="cognis",
                     idempotency_key=f"{intaris_session_id}:immutable_prefix:{snapshot_source}:snapshot",
                 )
@@ -1441,9 +1445,7 @@ class ContextAssembler:
                     reason="record_failed",
                 )
             await self.session_cache.append_recorded_events(session, message_events, append_result)
-            await self.session_cache.append_recorded_events(
-                session, [snapshot_event], snapshot_result
-            )
+            await self.session_cache.append_recorded_events(session, snapshot_events, snapshot_result)
             await self.session_cache.store_prefix_snapshot(
                 session.session_id,
                 resolved_entries,

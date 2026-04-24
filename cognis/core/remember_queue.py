@@ -18,7 +18,7 @@ from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
-from cognis.models.session import SessionEvent
+from cognis.models.session import SessionEvent, with_session_events_turn_id
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import RememberQueueRow, Session
 
@@ -504,17 +504,20 @@ class RememberRetryQueue:
                 with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
                     await self._event_reader.record_events(
                         session_id=session_ref["intaris_session_id"],
-                        events=[
-                            SessionEvent(
-                                type="lifecycle",
-                                data={
-                                    "event": "system_notice",
-                                    "message": message,
-                                    "source": "remember_queue",
-                                    "item_id": item.item_id,
-                                },
-                            )
-                        ],
+                        events=with_session_events_turn_id(
+                            [
+                                SessionEvent(
+                                    type="lifecycle",
+                                    data={
+                                        "event": "system_notice",
+                                        "message": message,
+                                        "source": "remember_queue",
+                                        "item_id": item.item_id,
+                                    },
+                                )
+                            ],
+                            None,
+                        ),
                         source="cognis",
                         idempotency_key=f"remember-failed:{item.item_id}",
                     )

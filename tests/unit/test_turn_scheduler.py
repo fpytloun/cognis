@@ -42,6 +42,7 @@ class _RecordingObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         delta: str,
     ) -> None:
         self.tokens.append(delta)
@@ -53,6 +54,7 @@ class _RecordingObserver:
         call_id: str,
         tool_name: str,
         arguments: dict[str, object] | None,
+        turn_id: str | None,
     ) -> None:
         return None
 
@@ -66,6 +68,21 @@ class _RecordingObserver:
         is_error: bool,
         duration_ms: int | None,
         evaluation: dict[str, object] | None,
+        attachments: list[dict[str, object]] | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        return None
+
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        turn_id: str | None,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
     ) -> None:
         return None
 

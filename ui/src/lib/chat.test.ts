@@ -138,6 +138,223 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('groups turn-scoped assistant history around tool calls', () => {
+    const items = normalizeHistory([
+      {
+        seq: 10,
+        type: 'assistant_message',
+        data: { content: 'First segment', turn_id: 'turn_1' },
+        timestamp: '2026-04-09T00:00:00Z'
+      },
+      {
+        seq: 11,
+        type: 'tool_call',
+        data: { call_id: 'call_1', name: 'image_generate', arguments: { prompt: 'logo' }, turn_id: 'turn_1' },
+        timestamp: '2026-04-09T00:00:01Z'
+      },
+      {
+        seq: 12,
+        type: 'tool_result',
+        data: {
+          call_id: 'call_1',
+          name: 'image_generate',
+          result: 'done',
+          is_error: false,
+          turn_id: 'turn_1',
+          attachments: [
+            {
+              artifact_id: 'img_turn_1',
+              kind: 'image',
+              mime_type: 'image/png',
+              filename: 'logo.png',
+              size_bytes: 321,
+              url: 'https://cognis.example.com/logo.png'
+            }
+          ]
+        },
+        timestamp: '2026-04-09T00:00:02Z'
+      },
+      {
+        seq: 13,
+        type: 'assistant_message',
+        data: {
+          content: 'Second segment',
+          turn_id: 'turn_1',
+          attachments: [
+            {
+              artifact_id: 'img_turn_1',
+              kind: 'image',
+              mime_type: 'image/png',
+              filename: 'logo.png',
+              size_bytes: 321,
+              url: 'https://cognis.example.com/logo.png'
+            }
+          ]
+        },
+        timestamp: '2026-04-09T00:00:03Z'
+      }
+    ]);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ kind: 'tool_call', callId: 'call_1', status: 'completed' });
+    expect(items[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'First segment\n\nSecond segment',
+      attachments: [{ artifact_id: 'img_turn_1', filename: 'logo.png' }],
+      turnId: 'turn_1'
+    });
+  });
+
+  it('keeps live websocket turns aligned with persisted turn history', () => {
+    const live = [
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_2',
+        turn_id: 'turn_2',
+        content: 'First segment',
+        index: 0,
+      },
+      {
+        type: 'tool_call' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_turn_2',
+        tool_name: 'image_generate',
+        status: 'started',
+        arguments: { prompt: 'logo' },
+        turn_id: 'turn_2',
+      },
+      {
+        type: 'tool_result' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_turn_2',
+        tool_name: 'image_generate',
+        result: 'done',
+        is_error: false,
+        duration_ms: 25,
+        turn_id: 'turn_2',
+        attachments: [
+          {
+            artifact_id: 'img_turn_2',
+            kind: 'image' as const,
+            mime_type: 'image/png',
+            filename: 'logo.png',
+            size_bytes: 321,
+            url: 'https://cognis.example.com/logo.png'
+          }
+        ]
+      },
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_2',
+        turn_id: 'turn_2',
+        content: '\n\nSecond segment',
+        index: 1,
+      },
+      {
+        type: 'message_complete' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_2',
+        turn_id: 'turn_2',
+        seq: 14,
+        token_usage: null,
+        context_usage: null,
+        queued_count: 0,
+        attachments: [
+          {
+            artifact_id: 'img_turn_2',
+            kind: 'image' as const,
+            mime_type: 'image/png',
+            filename: 'logo.png',
+            size_bytes: 321,
+            url: 'https://cognis.example.com/logo.png'
+          }
+        ]
+      }
+    ].reduce((timeline, event) => applyWebSocketEvent(timeline, event), [] as ReturnType<typeof normalizeHistory>);
+
+    const history = normalizeHistory([
+      {
+        seq: 10,
+        type: 'assistant_message',
+        data: { content: 'First segment', turn_id: 'turn_2' },
+        timestamp: '2026-04-09T00:00:00Z'
+      },
+      {
+        seq: 11,
+        type: 'tool_call',
+        data: { call_id: 'call_turn_2', name: 'image_generate', arguments: { prompt: 'logo' }, turn_id: 'turn_2' },
+        timestamp: '2026-04-09T00:00:01Z'
+      },
+      {
+        seq: 12,
+        type: 'tool_result',
+        data: {
+          call_id: 'call_turn_2',
+          name: 'image_generate',
+          result: 'done',
+          is_error: false,
+          turn_id: 'turn_2',
+          attachments: [
+            {
+              artifact_id: 'img_turn_2',
+              kind: 'image',
+              mime_type: 'image/png',
+              filename: 'logo.png',
+              size_bytes: 321,
+              url: 'https://cognis.example.com/logo.png'
+            }
+          ]
+        },
+        timestamp: '2026-04-09T00:00:02Z'
+      },
+      {
+        seq: 13,
+        type: 'assistant_message',
+        data: {
+          content: 'Second segment',
+          turn_id: 'turn_2',
+          attachments: [
+            {
+              artifact_id: 'img_turn_2',
+              kind: 'image',
+              mime_type: 'image/png',
+              filename: 'logo.png',
+              size_bytes: 321,
+              url: 'https://cognis.example.com/logo.png'
+            }
+          ]
+        },
+        timestamp: '2026-04-09T00:00:03Z'
+      }
+    ]);
+
+    expect(live).toHaveLength(2);
+    expect(live[0]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
+    expect(live[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'First segment\n\nSecond segment',
+      attachments: [{ artifact_id: 'img_turn_2', filename: 'logo.png' }],
+      turnId: 'turn_2'
+    });
+    expect(history[0]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
+    expect(history[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'First segment\n\nSecond segment',
+      attachments: [{ artifact_id: 'img_turn_2', filename: 'logo.png' }],
+      turnId: 'turn_2'
+    });
+  });
+
   it('does not duplicate direct-chat clarification prompts in the timeline', () => {
     const items = applyWebSocketEvent([], {
       type: 'workflow_step_question',

@@ -823,6 +823,7 @@ class ChannelTurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         delta: str,
     ) -> None:
         """Accumulate tokens and send typing indicator."""
@@ -844,6 +845,7 @@ class ChannelTurnObserver:
         call_id: str,
         tool_name: str,
         arguments: dict[str, Any] | None,
+        turn_id: str | None,
     ) -> None:
         """Flush buffered text (immediate mode) and send typing indicator."""
         self._turn_active = True
@@ -873,6 +875,7 @@ class ChannelTurnObserver:
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
     ) -> None:
         """No-op for tool results."""
 
@@ -1082,6 +1085,7 @@ class ChannelTurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         block_id: str,
         delta: str,
         title: str | None,

@@ -20,6 +20,12 @@ Session **content** (messages, tool calls, events) is in Intaris event store.
 Intaris-derived state (event seq, compaction summary, intention) is in the
 **session cache** (in-memory / Redis) — NOT in Cognis DB.
 
+Persisted session events carry a `turn_id` field in their event data.
+For events that belong to a concrete turn, `turn_id` is that turn's stable
+correlation key across persisted history, replay, and live transport frames.
+Out-of-band events that are not part of a specific turn still include the field
+with a `null` value so the event schema stays uniform.
+
 For external runtimes, see `18-runtime-contract.md` for the distinction
 between raw runtime trace, runtime session identity, and normalized transcript
 projection.

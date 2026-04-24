@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
-from cognis.models.session import SessionEvent, SessionModel
+from cognis.models.session import SessionEvent, SessionModel, with_session_events_turn_id
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
 
@@ -192,10 +192,11 @@ class CompactionStrategy:
         )
         # Retry is handled by the Intaris provider (exponential backoff).
         idempotency_key = f"{session.session_id}:compaction:{method}:{older_events[-1].seq}"
+        compaction_events = with_session_events_turn_id([compaction_event], None)
         with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
             append_result = await self.guardrails.record_events(
                 session_id=session.intaris_session_id or session.session_id,
-                events=[compaction_event],
+                events=compaction_events,
                 idempotency_key=idempotency_key,
             )
         await self.session_cache.apply_compaction(

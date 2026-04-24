@@ -22,6 +22,7 @@ from cognis.models.session import (
     ConversationModel,
     SessionModel,
     SessionStatus,
+    with_session_events_turn_id,
 )
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store import queries
@@ -698,7 +699,10 @@ class SessionManager:
                         content=compaction_summary,
                     )
                 )
-            message_events = build_prefix_message_events(rotated_prefix)
+            message_events = with_session_events_turn_id(
+                build_prefix_message_events(rotated_prefix),
+                None,
+            )
             append_result = await self.providers.guardrails.record_events(
                 session_id=new_session.intaris_session_id or new_session.session_id,
                 events=message_events,
@@ -720,9 +724,10 @@ class SessionManager:
                     snapshot_source="compaction",
                     extras={"parent_session_id": current_session.session_id},
                 )
+                snapshot_events = with_session_events_turn_id([snapshot_event], None)
                 snapshot_result = await self.providers.guardrails.record_events(
                     session_id=new_session.intaris_session_id or new_session.session_id,
-                    events=[snapshot_event],
+                    events=snapshot_events,
                     source="cognis",
                     idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:snapshot",
                 )
@@ -732,7 +737,7 @@ class SessionManager:
                     )
                     if callable(append_recorded_events):
                         await append_recorded_events(new_session, message_events, append_result)
-                        await append_recorded_events(new_session, [snapshot_event], snapshot_result)
+                        await append_recorded_events(new_session, snapshot_events, snapshot_result)
                     store_prefix_snapshot = getattr(
                         self.session_cache, "store_prefix_snapshot", None
                     )

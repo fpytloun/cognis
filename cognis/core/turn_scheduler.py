@@ -151,6 +151,7 @@ class TurnResult:
     conversation_id: str
     session_id: str
     message_id: str
+    turn_id: str | None = None
     last_seq: int = 0
     context_usage: dict[str, Any] | None = None
     delegated: bool = False
@@ -224,6 +225,7 @@ class TurnObserver(Protocol):
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         delta: str,
     ) -> None: ...
 
@@ -234,6 +236,7 @@ class TurnObserver(Protocol):
         call_id: str,
         tool_name: str,
         arguments: dict[str, Any] | None,
+        turn_id: str | None,
     ) -> None: ...
 
     async def on_tool_result(
@@ -247,6 +250,7 @@ class TurnObserver(Protocol):
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        turn_id: str | None = None,
     ) -> None: ...
 
     async def on_thinking(
@@ -254,6 +258,7 @@ class TurnObserver(Protocol):
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         block_id: str,
         delta: str,
         title: str | None,
@@ -1245,7 +1250,8 @@ class TurnScheduler:
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
-        message_id = f"msg_{uuid.uuid4().hex[:12]}"
+        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        message_id = turn_id
         _pre_turn_title = conversation.title
         start_time = asyncio.get_running_loop().time()
         turn_type = "system" if system_initiated else "user"
@@ -1289,6 +1295,7 @@ class TurnScheduler:
                         "conversation_id": conversation_id,
                         "session_id": session.session_id,
                         "message_id": message_id,
+                        "turn_id": turn_id,
                         "system_initiated": system_initiated,
                     },
                 )
@@ -1306,6 +1313,7 @@ class TurnScheduler:
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
                             "content": published_user_content,
+                            "turn_id": turn_id,
                             "attachments": [
                                 item.model_dump(mode="json") for item in (attachments or [])
                             ],
@@ -1352,6 +1360,7 @@ class TurnScheduler:
                     conversation_id=conversation_id,
                     session_id=session.session_id,
                     message_id=message_id,
+                    turn_id=turn_id,
                     delegated=True,
                     task_id=task.task_id,
                     system_initiated=system_initiated,
@@ -1368,7 +1377,11 @@ class TurnScheduler:
 
             # Build streaming callbacks from observers
             on_token, on_thinking, on_tool_call, on_tool_result = self._build_callbacks(
-                conversation_id, session.session_id, message_id, turn_observers=turn_observers
+                conversation_id,
+                session.session_id,
+                message_id,
+                turn_id,
+                turn_observers=turn_observers,
             )
 
             # Execute the turn
@@ -1388,6 +1401,7 @@ class TurnScheduler:
                 on_tool_result=on_tool_result,
                 cancel_event=cancel_event,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
+                turn_id=turn_id,
                 consume_boundary_batch=lambda reason: self._consume_queued_batch_for_active_turn(
                     conversation_id,
                     reason=reason,
@@ -1424,6 +1438,7 @@ class TurnScheduler:
                 conversation_id=conversation_id,
                 session_id=session.session_id,
                 message_id=message_id,
+                turn_id=turn_id,
                 last_seq=last_seq,
                 context_usage=context_usage,
                 title_changed=title_changed,
@@ -1479,6 +1494,7 @@ class TurnScheduler:
                 conversation_id,
                 session.session_id,
                 error,
+                turn_id=turn_id,
                 system_initiated=system_initiated,
                 channel_deliverable=(
                     channel_deliverable or turn_control.absorbed_channel_deliverable
@@ -1502,6 +1518,7 @@ class TurnScheduler:
                 conversation_id,
                 session.session_id,
                 error,
+                turn_id=turn_id,
                 system_initiated=system_initiated,
                 channel_deliverable=(
                     channel_deliverable or turn_control.absorbed_channel_deliverable
@@ -1590,6 +1607,7 @@ class TurnScheduler:
         conversation_id: str,
         session_id: str,
         message_id: str,
+        turn_id: str | None,
         *,
         turn_observers: tuple[TurnObserver, ...] = (),
     ) -> tuple[Any, Any, Any, Any]:
@@ -1605,6 +1623,7 @@ class TurnScheduler:
                         conversation_id,
                         session_id,
                         message_id,
+                        turn_id,
                         delta,
                     )
                     for observer in self._iter_observers(
@@ -1628,6 +1647,7 @@ class TurnScheduler:
                         conversation_id,
                         session_id,
                         message_id,
+                        turn_id,
                         block_id,
                         delta,
                         title,
@@ -1655,6 +1675,7 @@ class TurnScheduler:
                         call_id,
                         tool_name,
                         arguments,
+                        turn_id,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1686,6 +1707,7 @@ class TurnScheduler:
                         duration_ms,
                         evaluation,
                         attachments,
+                        turn_id,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1774,6 +1796,7 @@ class TurnScheduler:
                     "conversation_id": result.conversation_id,
                     "session_id": result.session_id,
                     "message_id": result.message_id,
+                    "turn_id": result.turn_id,
                     "last_seq": result.last_seq,
                     "context_usage": result.context_usage,
                     "delegated": result.delegated,
@@ -1797,6 +1820,7 @@ class TurnScheduler:
         session_id: str,
         error: TurnError,
         *,
+        turn_id: str | None = None,
         system_initiated: bool = False,
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
@@ -1826,6 +1850,7 @@ class TurnScheduler:
                 data={
                     "conversation_id": conversation_id,
                     "session_id": session_id,
+                    "turn_id": turn_id,
                     "error_code": error.code,
                     "error_message": error.message,
                     "recoverable": error.recoverable,

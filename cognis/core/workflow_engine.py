@@ -48,7 +48,7 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import AttachmentRef
 from cognis.models.deliverable import Deliverable, DeliverableStatus
-from cognis.models.session import SessionEvent
+from cognis.models.session import SessionEvent, with_session_events_turn_id
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
     CompletionConfig,
@@ -173,6 +173,7 @@ class WorkflowEngine:
         on_tool_result: ToolResultCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         bootstrap_wait_for_intention: bool = False,
+        turn_id: str | None = None,
         consume_boundary_batch: Callable[[str], Any] | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
@@ -215,6 +216,7 @@ class WorkflowEngine:
             cancel_event=cancel_event,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
+            turn_id=turn_id,
             consume_boundary_batch=consume_boundary_batch,
         )
 
@@ -1622,7 +1624,7 @@ class WorkflowEngine:
             )
             await self._providers.guardrails.record_events(
                 session_id=prior_run.intaris_session_id,
-                events=[event],
+                events=with_session_events_turn_id([event], None),
                 source="cognis",
             )
             # Clear in-state fallback — the event is now in Intaris
@@ -2077,7 +2079,7 @@ class WorkflowEngine:
                         delivery_session_id = sess.session_id
                         await self._providers.guardrails.record_events(
                             session_id=sess.intaris_session_id,
-                            events=[event],
+                            events=with_session_events_turn_id([event], None),
                             source="cognis",
                         )
                 break  # Success
@@ -2414,7 +2416,10 @@ class WorkflowEngine:
 
         # Write source events to the new Intaris session
         target_intaris_id = target_session.intaris_session_id or target_session.session_id
-        session_events = [SessionEvent(type=e.type, data=e.data) for e in source_events]
+        session_events = with_session_events_turn_id(
+            [SessionEvent(type=e.type, data=e.data) for e in source_events],
+            None,
+        )
         try:
             append_result = await self._providers.guardrails.record_events(
                 session_id=target_intaris_id,
@@ -2437,6 +2442,7 @@ class WorkflowEngine:
                         for entry in prefix_entries
                     ],
                 )
+                message_events = with_session_events_turn_id(message_events, None)
                 message_result = await self._providers.guardrails.record_events(
                     session_id=target_intaris_id,
                     events=message_events,
@@ -2458,9 +2464,10 @@ class WorkflowEngine:
                         snapshot_source="fork",
                         extras={"source_step": source_label},
                     )
+                    snapshot_events = with_session_events_turn_id([snapshot_event], None)
                     snapshot_result = await self._providers.guardrails.record_events(
                         session_id=target_intaris_id,
-                        events=[snapshot_event],
+                        events=snapshot_events,
                         source="cognis",
                         idempotency_key=f"{target_session.session_id}:immutable_prefix:fork:snapshot",
                     )
@@ -2474,7 +2481,7 @@ class WorkflowEngine:
                     )
                     await self._session_cache.append_recorded_events(
                         target_session,
-                        [snapshot_event],
+                        snapshot_events,
                         snapshot_result,
                     )
                     await self._session_cache.store_prefix_snapshot(
