@@ -753,6 +753,9 @@ async def test_tool_router_handles_artifact_read_with_current_model(
             return b"png-bytes", "image/png"
 
     class _Llm:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] | None = None
+
         async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
             del model_id, provider_id
             return SimpleNamespace(
@@ -765,7 +768,8 @@ async def test_tool_router_handles_artifact_read_with_current_model(
         async def generate(
             self, messages: list[dict[str, object]], **kwargs: object
         ) -> dict[str, object]:
-            del messages, kwargs
+            del kwargs
+            self.messages = messages
             return {"choices": [{"message": {"content": "It is a blue square."}}]}
 
     class _Session:
@@ -794,9 +798,10 @@ async def test_tool_router_handles_artifact_read_with_current_model(
         ),
     )
 
+    llm = _Llm()
     router = ToolRouter(
         guardrails=_Guardrails(),
-        llm=_Llm(),
+        llm=llm,
         artifact_store=_Store(),
         session_factory=session_factory,
     )
@@ -805,7 +810,7 @@ async def test_tool_router_handles_artifact_read_with_current_model(
         ToolCall(
             call_id="art-1",
             name="artifact_read",
-            arguments={"artifact_id": "img_1"},
+            arguments={"artifact_id": "img_1", "offset": 99, "limit": 1},
             runtime_metadata={"resolved_model": "gpt-4o-mini"},
         ),
         _session(),
@@ -817,6 +822,21 @@ async def test_tool_router_handles_artifact_read_with_current_model(
     assert result.is_error is False
     assert result.metadata is not None
     assert result.metadata["_raw_output"] == "It is a blue square."
+    assert llm.messages is not None
+    content = llm.messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[1] == {
+        "type": "text",
+        "text": (
+            "Artifact metadata: artifact_id=img_1, filename=image.png, kind=image, "
+            "mime_type=image/png, size_bytes=8, "
+            "url=https://cognis.example.com/images/img_1/image.png"
+        ),
+    }
+    assert content[2] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,cG5nLWJ5dGVz"},
+    }
 
 
 @pytest.mark.asyncio
@@ -831,6 +851,9 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
             return b"jpeg-bytes", "image/jpeg"
 
     class _Llm:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, object]] | None = None
+
         async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
             del model_id, provider_id
             return SimpleNamespace(
@@ -843,7 +866,8 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
         async def generate(
             self, messages: list[dict[str, object]], **kwargs: object
         ) -> dict[str, object]:
-            del messages, kwargs
+            del kwargs
+            self.messages = messages
             return {"choices": [{"message": {"content": "It is a generated banner."}}]}
 
     class _Session:
@@ -896,9 +920,10 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
         )
     )
 
+    llm = _Llm()
     router = ToolRouter(
         guardrails=_Guardrails(),
-        llm=_Llm(),
+        llm=llm,
         artifact_store=_Store(),
         session_factory=session_factory,
     )
@@ -935,6 +960,13 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
     assert result.metadata["analysis_model"] == "gpt-5.4"
     assert result.metadata["used_attachment_analysis_route"] is False
     assert session.attachment_analysis_lookups == 0
+    assert llm.messages is not None
+    content = llm.messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[2] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,anBlZy1ieXRlcw=="},
+    }
 
 
 @pytest.mark.asyncio
@@ -1160,9 +1192,9 @@ async def test_tool_router_handles_artifact_get_url(
     assert result.metadata is not None
     assert result.metadata["artifact_id"] == "img_4"
     assert result.metadata["url"] == "https://cognis.example.com/images/img_4/image"
-    assert '"url": "https://cognis.example.com/images/img_4/image"' in result.metadata[
-        "_raw_output"
-    ]
+    assert (
+        '"url": "https://cognis.example.com/images/img_4/image"' in result.metadata["_raw_output"]
+    )
     assert result.attachments == [
         {
             "artifact_id": "img_4",

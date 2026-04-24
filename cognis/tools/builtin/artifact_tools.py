@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -372,6 +373,7 @@ async def _handle_artifact_read(
                 "filename": attachment.filename,
                 "mime_type": attachment.mime_type,
                 "kind": attachment.kind.value,
+                "url": attachment.url,
             },
         )
 
@@ -657,21 +659,22 @@ async def analyze_attachment_ref(
             is_error=True,
         )
 
-    file_url = attachment.url
-    if not isinstance(file_url, str) or not file_url:
+    file_url = attachment.url if isinstance(attachment.url, str) and attachment.url else None
+    if attachment.kind != ArtifactKind.IMAGE and file_url is None:
         return ToolResult(
             output=f"Could not obtain a signed URL for artifact {attachment.artifact_id}.",
             is_error=True,
         )
 
     analysis_prompt = prompt or _default_analysis_prompt(attachment)
-    blocks = _analysis_blocks(attachment, file_url)
+    blocks = _analysis_blocks(attachment, file_url=file_url, content=content)
     response = await llm.generate(
         messages=[
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": analysis_prompt},
+                    {"type": "text", "text": _analysis_artifact_context(attachment, file_url)},
                     *blocks,
                 ],
             }
@@ -718,6 +721,7 @@ async def analyze_attachment_ref(
             "filename": attachment.filename,
             "mime_type": attachment.mime_type,
             "kind": attachment.kind.value,
+            "url": attachment.url,
             "analysis_model": selected_model,
             "analysis_task_type": selected_task_type,
             "used_attachment_analysis_route": used_fallback_route,
@@ -765,10 +769,36 @@ async def _get_model_info(llm: Any, model: str, provider_id: str | None) -> Any:
     return await llm.get_model_info(model)
 
 
-def _analysis_blocks(attachment: AttachmentRef, url: str) -> list[dict[str, Any]]:
+def _analysis_blocks(
+    attachment: AttachmentRef,
+    *,
+    file_url: str | None,
+    content: bytes,
+) -> list[dict[str, Any]]:
     if attachment.kind == ArtifactKind.IMAGE:
-        return [{"type": "image_url", "image_url": {"url": url}}]
-    return [{"type": "file", "file": {"file_url": url, "filename": attachment.filename}}]
+        encoded = base64.b64encode(content).decode("ascii")
+        return [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{attachment.mime_type};base64,{encoded}"},
+            }
+        ]
+    if file_url is None:
+        return []
+    return [{"type": "file", "file": {"file_url": file_url, "filename": attachment.filename}}]
+
+
+def _analysis_artifact_context(attachment: AttachmentRef, file_url: str | None) -> str:
+    details = [
+        f"artifact_id={attachment.artifact_id}",
+        f"filename={attachment.filename}",
+        f"kind={attachment.kind.value}",
+        f"mime_type={attachment.mime_type}",
+        f"size_bytes={attachment.size_bytes}",
+    ]
+    if file_url is not None:
+        details.append(f"url={file_url}")
+    return "Artifact metadata: " + ", ".join(details)
 
 
 def _default_analysis_prompt(attachment: AttachmentRef) -> str:
@@ -807,6 +837,7 @@ def _analysis_response_diagnostics(
         "filename": attachment.filename,
         "mime_type": attachment.mime_type,
         "kind": attachment.kind.value,
+        "url": attachment.url,
         "analysis_model": analysis_model,
         "analysis_provider_id": analysis_provider_id,
         "analysis_task_type": analysis_task_type,
