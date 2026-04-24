@@ -891,6 +891,36 @@ class TestGrepTool:
         assert "home.py" in result.output
         assert "cwd.py" not in result.output
 
+    @pytest.mark.asyncio()
+    async def test_grep_rg_uses_end_of_options_separator(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        captured: list[str] = []
+
+        class _Process:
+            returncode = 1
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (b"", b"")
+
+        async def _fake_exec(*args: str, **_: object) -> _Process:
+            captured.extend(args)
+            return _Process()
+
+        pattern = "--|theme|color|font|tailwind|tokens|:root|background|surface|accent"
+
+        monkeypatch.setattr(search_module, "_RG_PATH", "/usr/bin/rg")
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        result = await handle_grep({"pattern": pattern, "path": str(tmp_path)}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        separator_index = captured.index("--")
+        assert captured[separator_index + 1] == pattern
+        assert captured[separator_index + 2] == str(tmp_path)
+
 
 class TestBashTool:
     """Test the bash shell tool."""

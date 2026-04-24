@@ -193,13 +193,12 @@ async def _grep_with_rg(base: Path, pattern: str, include: str | None) -> ToolRe
         "never",
         "--max-count",
         str(_MAX_MATCHES),
-        pattern,
-        str(base),
     ]
     if include:
         command.extend(["--glob", include])
     for skip_dir in sorted(_SKIP_DIRS):
         command.extend(["--glob", f"!**/{skip_dir}/**"])
+    command.extend(["--", pattern, str(base)])
 
     try:
         process = await asyncio.create_subprocess_exec(
