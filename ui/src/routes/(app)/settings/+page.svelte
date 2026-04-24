@@ -14,6 +14,7 @@ import { onMount, tick } from 'svelte';
   import ModelCard from '$lib/components/settings/ModelCard.svelte';
   import ModelEditModal from '$lib/components/settings/ModelEditModal.svelte';
   import ModelDiscoveryModal from '$lib/components/settings/ModelDiscoveryModal.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -3667,11 +3668,19 @@ import { onMount, tick } from 'svelte';
 
 <!-- Secret creation modal -->
 {#if showSecretModal}
-  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">New credential</p>
-      <h3 class="mt-1 text-lg font-semibold text-white">{secretModalTarget === 'provider' ? 'Create API key secret' : 'Create environment secret'}</h3>
-      <div class="mt-4 space-y-4">
+  <BlockingDialog label="Create credential secret" onClose={() => (showSecretModal = false)} titleId="secret-modal-title">
+    {#snippet header()}
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">New credential</p>
+          <h3 class="mt-1 text-lg font-semibold text-white" id="secret-modal-title">{secretModalTarget === 'provider' ? 'Create API key secret' : 'Create environment secret'}</h3>
+        </div>
+        <Button aria-label="Close credential dialog" size="icon" variant="secondary" onclick={() => (showSecretModal = false)}>&times;</Button>
+      </div>
+    {/snippet}
+
+    {#snippet children()}
+      <div class="space-y-4">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Secret name</span>
           <Input bind:value={secretModalName} placeholder="openai_api_key" />
@@ -3681,21 +3690,32 @@ import { onMount, tick } from 'svelte';
           <Input bind:value={secretModalValue} type="password" placeholder={secretModalTarget === 'provider' ? 'sk-...' : 'secret-value'} />
         </label>
       </div>
-      <div class="mt-5 flex justify-end gap-2">
+    {/snippet}
+
+    {#snippet footer()}
+      <div class="flex justify-end gap-2">
         <Button variant="secondary" onclick={() => (showSecretModal = false)}>Cancel</Button>
         <Button onclick={saveSecretFromModal} disabled={busy || !secretModalName.trim() || !secretModalValue.trim()}>Save credential</Button>
       </div>
-    </div>
-  </div>
+    {/snippet}
+  </BlockingDialog>
 {/if}
 
 <!-- User create modal -->
 {#if showUserCreateModal}
-  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
-      <h3 class="mt-1 text-lg font-semibold text-white">Create user</h3>
-      <div class="mt-4 space-y-4">
+  <BlockingDialog label="Create user" onClose={() => (showUserCreateModal = false)} titleId="user-create-title">
+    {#snippet header()}
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
+          <h3 class="mt-1 text-lg font-semibold text-white" id="user-create-title">Create user</h3>
+        </div>
+        <Button aria-label="Close user creation dialog" size="icon" variant="secondary" onclick={() => (showUserCreateModal = false)}>&times;</Button>
+      </div>
+    {/snippet}
+
+    {#snippet children()}
+      <div class="space-y-4">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Email</span>
           <Input bind:value={userCreateForm.email} type="email" placeholder="user@example.com" />
@@ -3722,22 +3742,33 @@ import { onMount, tick } from 'svelte';
           <Input bind:value={userCreateForm.confirm_password} type="password" />
         </label>
       </div>
-      <div class="mt-5 flex justify-end gap-2">
+    {/snippet}
+
+    {#snippet footer()}
+      <div class="flex justify-end gap-2">
         <Button variant="secondary" onclick={() => (showUserCreateModal = false)}>Cancel</Button>
         <Button onclick={createUserSubmit} disabled={busy || !userCreateForm.email.trim() || userCreateForm.password.length < 8 || userCreateForm.password !== userCreateForm.confirm_password}>Create user</Button>
       </div>
-    </div>
-  </div>
+    {/snippet}
+  </BlockingDialog>
 {/if}
 
 <!-- User edit modal -->
 {#if showUserEditModal && editingUser}
-  <div class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur" role="dialog" aria-modal="true">
-    <div class="max-h-full w-full max-w-md overflow-y-auto rounded-3xl border border-slate-800 bg-slate-950 p-6 shadow-card overscroll-contain">
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
-      <h3 class="mt-1 text-lg font-semibold text-white">Edit user</h3>
-      <p class="mt-1 text-sm text-slate-400">{editingUser.email}</p>
-      <div class="mt-4 space-y-4">
+  <BlockingDialog label="Edit user" onClose={() => { showUserEditModal = false; editingUser = null; }} titleId="user-edit-title">
+    {#snippet header()}
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Administration</p>
+          <h3 class="mt-1 text-lg font-semibold text-white" id="user-edit-title">Edit user</h3>
+          <p class="mt-1 text-sm text-slate-400">{editingUser?.email}</p>
+        </div>
+        <Button aria-label="Close user editor" size="icon" variant="secondary" onclick={() => { showUserEditModal = false; editingUser = null; }}>&times;</Button>
+      </div>
+    {/snippet}
+
+    {#snippet children()}
+      <div class="space-y-4">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Name</span>
           <Input bind:value={userEditForm.name} placeholder="Display name" />
@@ -3752,12 +3783,15 @@ import { onMount, tick } from 'svelte';
           </select>
         </label>
       </div>
-      <div class="mt-5 flex justify-end gap-2">
+    {/snippet}
+
+    {#snippet footer()}
+      <div class="flex justify-end gap-2">
         <Button variant="secondary" onclick={() => { showUserEditModal = false; editingUser = null; }}>Cancel</Button>
         <Button onclick={updateUserSubmit} disabled={busy}>Save changes</Button>
       </div>
-    </div>
-  </div>
+    {/snippet}
+  </BlockingDialog>
 {/if}
 
 <!-- Model discovery modal -->

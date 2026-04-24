@@ -1,6 +1,7 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import type { ModelEntry } from '$lib/types/api';
 
   let { model, onclose, onsave } = $props<{
@@ -51,14 +52,6 @@
     onsave(result);
   }
 
-  function handleBackdropClick(event: MouseEvent): void {
-    if (event.target === event.currentTarget) onclose();
-  }
-
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') onclose();
-  }
-
   function toggleCapability(key: string): void {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const obj = draft as any;
@@ -66,26 +59,15 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div
-  class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur"
-  onclick={handleBackdropClick}
-  role="presentation"
->
-  <div
-    class="max-h-full w-full max-w-lg overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Edit model"
-  >
-    <!-- Header -->
-    <div class="mb-5 flex items-center justify-between">
-      <h2 class="text-lg font-semibold text-white">Edit model: {model.model_id}</h2>
-      <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close">&times;</button>
+<BlockingDialog label="Edit model" onClose={onclose} titleId="model-edit-title">
+  {#snippet header()}
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold text-white" id="model-edit-title">Edit model: {model.model_id}</h2>
+      <Button aria-label="Close model editor" size="icon" variant="secondary" onclick={onclose}>&times;</Button>
     </div>
+  {/snippet}
 
+  {#snippet children()}
     <div class="space-y-5 pr-1">
       <!-- Display name -->
       <div class="space-y-1">
@@ -154,11 +136,12 @@
         </div>
       </div>
     </div>
+  {/snippet}
 
-    <!-- Footer -->
-    <div class="mt-6 flex justify-end gap-3">
+  {#snippet footer()}
+    <div class="flex justify-end gap-3">
       <Button variant="secondary" onclick={onclose}>Cancel</Button>
       <Button onclick={handleSave}>Save</Button>
     </div>
-  </div>
-</div>
+  {/snippet}
+</BlockingDialog>

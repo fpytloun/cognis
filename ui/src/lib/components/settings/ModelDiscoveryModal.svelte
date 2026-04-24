@@ -1,6 +1,7 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import { formatTokenCount } from '$lib/providers';
   import type { ModelEntry } from '$lib/types/api';
 
@@ -48,14 +49,6 @@
     onadd(selected);
   }
 
-  function handleBackdropClick(event: MouseEvent): void {
-    if (event.target === event.currentTarget) onclose();
-  }
-
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Escape') onclose();
-  }
-
   function formatMeta(model: ModelEntry): string {
     const parts: string[] = [];
     parts.push(`${formatTokenCount(model.context_window)} ctx`);
@@ -67,33 +60,22 @@
   }
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div
-  class="app-viewport-overlay z-[80] flex items-center justify-center overflow-y-auto overscroll-contain bg-slate-950/80 px-4 py-4 backdrop-blur"
-  onclick={handleBackdropClick}
-  role="presentation"
->
-  <div
-    class="max-h-full w-full max-w-2xl overflow-y-auto rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl overscroll-contain"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Add discovered models"
-  >
-    <!-- Header -->
-    <div class="mb-4 flex items-center justify-between">
-      <h2 class="text-lg font-semibold text-white">Add discovered models</h2>
-      <button class="text-slate-400 hover:text-white" onclick={onclose} aria-label="Close">&times;</button>
+<BlockingDialog label="Add discovered models" onClose={onclose} titleId="model-discovery-title" panelClass="max-w-2xl">
+  {#snippet header()}
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-lg font-semibold text-white" id="model-discovery-title">Add discovered models</h2>
+      <Button aria-label="Close model discovery" size="icon" variant="secondary" onclick={onclose}>&times;</Button>
     </div>
+  {/snippet}
 
+  {#snippet children()}
     <!-- Search -->
-    <div class="mb-4">
+    <div>
       <Input bind:value={search} placeholder="Search models..." />
     </div>
 
     <!-- Model list -->
-    <div class="max-h-96 space-y-1 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40 p-1">
+    <div class="mt-4 max-h-96 space-y-1 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40 p-1">
       {#if filtered.length === 0}
         <p class="px-3 py-6 text-center text-sm text-slate-500">No models match your search.</p>
       {:else}
@@ -131,9 +113,10 @@
         {/each}
       {/if}
     </div>
+  {/snippet}
 
-    <!-- Footer -->
-    <div class="mt-5 flex items-center justify-between">
+  {#snippet footer()}
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <span class="text-sm text-slate-400">
         {#if selectedCount > 0}
           {selectedCount} selected
@@ -148,5 +131,5 @@
         </Button>
       </div>
     </div>
-  </div>
-</div>
+  {/snippet}
+</BlockingDialog>

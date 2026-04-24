@@ -33,7 +33,7 @@
   } from '$lib/skills';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import Sheet from '$lib/components/ui/Sheet.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
@@ -578,18 +578,18 @@
   }
 </script>
 
-<Sheet
+<BlockingDialog
   open={open}
   onClose={() => void handleSheetClose()}
-  side="right"
   label={activeMode === 'create' ? 'Create skill' : skill ? `${skill.name} skill details` : 'Skill details'}
-  class="w-full md:w-[min(64rem,100vw)]"
+  titleId="skill-detail-title"
+  panelClass="max-w-6xl"
 >
   {#snippet header()}
     <div class="flex flex-col gap-3">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p class="text-sm font-semibold text-slate-100">
+          <p class="text-sm font-semibold text-slate-100" id="skill-detail-title">
             {#if activeMode === 'create'}
               New Skill
             {:else}
@@ -606,23 +606,28 @@
             {/if}
           </p>
         </div>
-        {#if skill}
-          <div class="flex flex-wrap items-center gap-2">
-            <Badge>{skill.source}</Badge>
-            {#if skill.is_system}
-              <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>
-            {/if}
-            {#if skill.attach_to_all_agents ?? skill.auto_load}
-              <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">attached to all agents</Badge>
-            {/if}
-            {#if savedSteps.length > 0}
-              <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>
-            {/if}
-            {#if currentVersion?.decomposition_stale}
-              <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">decomposition stale</Badge>
-            {/if}
-          </div>
-        {/if}
+        <div class="flex items-start gap-2">
+          {#if skill}
+            <div class="flex flex-wrap items-center justify-end gap-2">
+              <Badge>{skill.source}</Badge>
+              {#if skill.is_system}
+                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>
+              {/if}
+              {#if skill.attach_to_all_agents ?? skill.auto_load}
+                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">attached to all agents</Badge>
+              {/if}
+              {#if savedSteps.length > 0}
+                <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>
+              {/if}
+              {#if currentVersion?.decomposition_stale}
+                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">decomposition stale</Badge>
+              {/if}
+            </div>
+          {/if}
+          <Button aria-label="Close skill dialog" size="icon" variant="secondary" onclick={() => void handleSheetClose()}>
+            <X class="h-4 w-4" />
+          </Button>
+        </div>
       </div>
 
       {#if activeMode === 'view' && skill && allowManage}
@@ -667,18 +672,10 @@
           {/if}
         </div>
       {/if}
-
-      {#if activeMode !== 'view'}
-        <div class="flex flex-wrap items-center gap-2">
-          <Button size="sm" variant="secondary" onclick={() => void cancelEditing()}>Cancel</Button>
-          <Button size="sm" variant="primary" disabled={saving} onclick={() => void saveSkill()}>
-            <Save class="mr-1 h-4 w-4" /> {saving ? 'Saving…' : activeMode === 'create' ? 'Create skill' : 'Save new version'}
-          </Button>
-        </div>
-      {/if}
     </div>
   {/snippet}
 
+  {#snippet children()}
   <div class="space-y-5 text-sm">
     {#if activeMode === 'view' && skill}
       <section class="space-y-2 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
@@ -1288,4 +1285,20 @@
       </section>
     {/if}
   </div>
-</Sheet>
+  {/snippet}
+
+  {#snippet footer()}
+    {#if activeMode !== 'view'}
+      <div class="flex flex-col-reverse justify-end gap-3 sm:flex-row">
+        <Button variant="secondary" onclick={() => void cancelEditing()}>Cancel</Button>
+        <Button variant="primary" disabled={saving} onclick={() => void saveSkill()}>
+          <Save class="mr-1 h-4 w-4" /> {saving ? 'Saving…' : activeMode === 'create' ? 'Create skill' : 'Save new version'}
+        </Button>
+      </div>
+    {:else}
+      <div class="flex justify-end">
+        <Button variant="secondary" onclick={() => void handleSheetClose()}>Close</Button>
+      </div>
+    {/if}
+  {/snippet}
+</BlockingDialog>
