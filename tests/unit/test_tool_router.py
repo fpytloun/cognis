@@ -110,7 +110,15 @@ class _ArtifactStore:
     ) -> None:
         self.saved.append((namespace, object_id, filename, content, mime_type, owner_email))
 
-    async def async_get_public_url(self, namespace: str, object_id: str, filename: str) -> str:
+    async def async_get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        del ttl_seconds
         return f"https://cognis.example.com/{namespace}/{object_id}/{filename}"
 
     async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
@@ -1091,7 +1099,80 @@ async def test_tool_router_handles_artifact_get_metadata(
     assert result.is_error is False
     assert result.metadata is not None
     assert result.metadata["artifact_id"] == "doc_4"
+    assert result.metadata["download_url_tool"] == "artifact_get_url"
     assert '"namespace": "documents"' in result.metadata["_raw_output"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_handles_artifact_get_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_4",
+                namespace="images",
+                object_id="img_4",
+                filename="image",
+                owner_email="user@example.com",
+                conversation_id="conv-3",
+                session_id="sess-3",
+                message_role="assistant",
+                purpose="tool_output",
+                kind="image",
+                mime_type="image/jpeg",
+                size_bytes=512,
+                status="attached",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                expires_at=None,
+                deleted_at=None,
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-url",
+            name="artifact_get_url",
+            arguments={"artifact_id": "img_4"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["artifact_id"] == "img_4"
+    assert result.metadata["url"] == "https://cognis.example.com/images/img_4/image"
+    assert '"url": "https://cognis.example.com/images/img_4/image"' in result.metadata[
+        "_raw_output"
+    ]
+    assert result.attachments == [
+        {
+            "artifact_id": "img_4",
+            "url": "https://cognis.example.com/images/img_4/image",
+            "filename": "image",
+            "kind": "image",
+            "mime_type": "image/jpeg",
+            "size_bytes": 512,
+        }
+    ]
 
 
 @pytest.mark.asyncio

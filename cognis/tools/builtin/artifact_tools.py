@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
 
@@ -83,7 +83,8 @@ ARTIFACT_LIST_RECENT_TOOL = ToolDefinition(
     name="artifact_list_recent",
     description=(
         "List your most recent saved Cognis artifacts by metadata. Use this to browse older "
-        "generated files or attachments when you do not know the artifact_id."
+        "generated files or attachments when you do not know the artifact_id. Call "
+        "artifact_get_url for download links or UI attachments."
     ),
     parameters={
         "type": "object",
@@ -123,7 +124,7 @@ ARTIFACT_SEARCH_TOOL = ToolDefinition(
     description=(
         "Search your saved Cognis artifacts by metadata such as filename, artifact_id, purpose, "
         "kind, conversation, session, and creation time. This is metadata-only search, not file "
-        "content search."
+        "content search. Call artifact_get_url for download links or UI attachments."
     ),
     parameters={
         "type": "object",
@@ -174,7 +175,8 @@ ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
     name="artifact_get_metadata",
     description=(
         "Get metadata for one saved Cognis artifact by artifact_id. Use this after artifact_search "
-        "or artifact_list_recent when you need the full stored metadata before reading the file."
+        "or artifact_list_recent when you need the full stored metadata before reading the file. "
+        "Call artifact_get_url when the user asks for a download URL or wants to view the artifact."
     ),
     parameters={
         "type": "object",
@@ -193,12 +195,43 @@ ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
     max_result_size=30_000,
 )
 
+ARTIFACT_GET_URL_TOOL = ToolDefinition(
+    name="artifact_get_url",
+    description=(
+        "Generate a short-lived download URL for a saved Cognis artifact by artifact_id. Use this "
+        "when the user asks for download links, wants to view artifacts, or wants images/files "
+        "returned as direct UI attachments."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "description": "Artifact id to download or attach.",
+            },
+            "ttl_seconds": {
+                "type": "integer",
+                "description": "Signed URL lifetime in seconds (default 3600, max 604800).",
+                "minimum": 60,
+                "maximum": 604800,
+            },
+        },
+        "required": ["artifact_id"],
+    },
+    source=_SOURCE,
+    category="artifact",
+    read_only=True,
+    timeout_seconds=15,
+    max_result_size=30_000,
+)
+
 ARTIFACT_TOOL_NAMES = frozenset(
     {
         ARTIFACT_READ_TOOL.name,
         ARTIFACT_LIST_RECENT_TOOL.name,
         ARTIFACT_SEARCH_TOOL.name,
         ARTIFACT_GET_METADATA_TOOL.name,
+        ARTIFACT_GET_URL_TOOL.name,
     }
 )
 
@@ -211,6 +244,7 @@ def artifact_tools() -> list[ToolDefinition]:
         ARTIFACT_LIST_RECENT_TOOL,
         ARTIFACT_SEARCH_TOOL,
         ARTIFACT_GET_METADATA_TOOL,
+        ARTIFACT_GET_URL_TOOL,
     ]
 
 
@@ -276,6 +310,13 @@ async def handle_artifact_tool(
     if tool_name == ARTIFACT_GET_METADATA_TOOL.name:
         return await _handle_artifact_get_metadata(
             arguments,
+            session_factory=session_factory,
+            user_email=user_email,
+        )
+    if tool_name == ARTIFACT_GET_URL_TOOL.name:
+        return await _handle_artifact_get_url(
+            arguments,
+            artifact_store=artifact_store,
             session_factory=session_factory,
             user_email=user_email,
         )
@@ -492,7 +533,52 @@ async def _handle_artifact_get_metadata(
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
 
     item = _artifact_metadata_item(row)
+    item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
     return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
+
+
+async def _handle_artifact_get_url(
+    arguments: dict[str, Any],
+    *,
+    artifact_store: Any | None,
+    session_factory: Any | None,
+    user_email: str | None,
+) -> ToolResult:
+    if artifact_store is None or session_factory is None:
+        return ToolResult(output="Artifact support is not available.", is_error=True)
+
+    artifact_id = str(arguments.get("artifact_id") or "").strip()
+    if not artifact_id:
+        return ToolResult(output="artifact_id is required.", is_error=True)
+    ttl_seconds = _coerce_limit(arguments.get("ttl_seconds"), default=3600, maximum=604800)
+    ttl_seconds = max(60, ttl_seconds)
+
+    async with session_factory() as session:
+        row = await get_artifact_record(session, artifact_id)
+    if row is None or row.status == "deleted":
+        return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+    if row.owner_email and user_email and row.owner_email != user_email:
+        return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
+
+    try:
+        url = await artifact_store.async_get_public_url(
+            row.namespace,
+            row.object_id,
+            row.filename,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception as exc:
+        return ToolResult(
+            output=f"Failed to create download URL for artifact {artifact_id}: {exc}",
+            is_error=True,
+        )
+
+    item = _artifact_url_item(row, url=url, ttl_seconds=ttl_seconds)
+    return ToolResult(
+        output=json.dumps(item, indent=2, sort_keys=True),
+        metadata=item,
+        attachments=[_artifact_attachment_item(row, url=url)],
+    )
 
 
 async def analyze_attachment_ref(
@@ -888,6 +974,29 @@ def _artifact_metadata_item(row: Any) -> dict[str, Any]:
         "created_at": _serialize_datetime(getattr(row, "created_at", None)),
         "expires_at": _serialize_datetime(getattr(row, "expires_at", None)),
         "deleted_at": _serialize_datetime(getattr(row, "deleted_at", None)),
+    }
+
+
+def _artifact_url_item(row: Any, *, url: str, ttl_seconds: int) -> dict[str, Any]:
+    return {
+        "artifact_id": str(row.artifact_id),
+        "url": url,
+        "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
+        "filename": str(row.filename),
+        "kind": str(row.kind),
+        "mime_type": str(row.mime_type),
+        "size_bytes": int(row.size_bytes or 0),
+    }
+
+
+def _artifact_attachment_item(row: Any, *, url: str) -> dict[str, Any]:
+    return {
+        "artifact_id": str(row.artifact_id),
+        "url": url,
+        "filename": str(row.filename),
+        "kind": str(row.kind),
+        "mime_type": str(row.mime_type),
+        "size_bytes": int(row.size_bytes or 0),
     }
 
 
