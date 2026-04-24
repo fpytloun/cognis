@@ -38,6 +38,14 @@
     ),
   );
 
+  const lightboxImages = $derived(
+    imageAttachments.map((image: AttachmentRef & { url: string }) => ({
+      src: image.url,
+      alt: image.filename,
+      filename: image.filename,
+    })),
+  );
+
   function openLightbox(index: number): void {
     lightboxIndex = index;
   }
@@ -123,6 +131,9 @@
     src={current.url}
     alt={current.filename}
     filename={current.filename}
+    images={lightboxImages}
+    index={lightboxIndex}
+    onIndexChange={(nextIndex) => { lightboxIndex = nextIndex; }}
     onClose={closeLightbox}
   />
 {/if}

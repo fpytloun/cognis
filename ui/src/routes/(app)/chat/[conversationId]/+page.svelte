@@ -146,6 +146,7 @@ import X from 'lucide-svelte/icons/x';
   let timelineEl = $state<HTMLDivElement | null>(null);
   let timelineContentEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
+  let loadingOlderMessages = $state(false);
   let programmaticScroll = false;
   let lastTimelineScrollTop = $state(0);
   let footerChromeEl = $state<HTMLDivElement | null>(null);
@@ -920,6 +921,10 @@ import X from 'lucide-svelte/icons/x';
     }
 
     lastTimelineScrollTop = currentScrollTop;
+
+    if (currentScrollTop <= 24 && visibleStartIndex > 0) {
+      void loadOlder();
+    }
   }
 
   function jumpToBottom(): void {
@@ -1859,8 +1864,25 @@ import X from 'lucide-svelte/icons/x';
     return Math.max(0, Math.ceil(timeout - elapsed));
   }
 
-  function loadOlder(): void {
+  async function loadOlder(): Promise<void> {
+    if (!timelineEl || loadingOlderMessages || visibleStartIndex === 0) return;
+
+    const previousScrollHeight = timelineEl.scrollHeight;
+    const previousScrollTop = timelineEl.scrollTop;
+    loadingOlderMessages = true;
+    programmaticScroll = true;
+
     visibleStartIndex = Math.max(0, visibleStartIndex - 50);
+    await tick();
+
+    requestAnimationFrame(() => {
+      if (timelineEl) {
+        timelineEl.scrollTop = previousScrollTop + (timelineEl.scrollHeight - previousScrollHeight);
+        lastTimelineScrollTop = timelineEl.scrollTop;
+      }
+      loadingOlderMessages = false;
+      programmaticScroll = false;
+    });
   }
 
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
@@ -2955,10 +2977,8 @@ import X from 'lucide-svelte/icons/x';
           onpointerdown={closeHeaderInfo}
         >
           <div bind:this={timelineContentEl} class="space-y-3">
-            {#if visibleStartIndex > 0}
-              <div class="flex justify-center">
-                <Button size="sm" variant="secondary" onclick={loadOlder}>Load older messages</Button>
-              </div>
+            {#if loadingOlderMessages}
+              <p class="px-4 py-2 text-center text-xs text-slate-500">Loading older messages…</p>
             {/if}
 
             {#if !currentConversation && !error}
