@@ -12,8 +12,9 @@ import pytest
 
 from cognis.executor import __main__ as executor_main
 from cognis.executor.runner import ExecutorRunner, _normalize_result
-from cognis.models.tool import ExecutorConfig, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolDefinition, ToolResult, ToolSource
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
+from cognis.tools.mcp import MCPClientError
 
 
 class DummyWebSocket:
@@ -259,6 +260,52 @@ async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
     degraded_server = ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
     assert degraded_server["message"] == "github startup timed out"
     assert degraded_server["stderr_summary"] == "npm error: missing token"
+
+
+@pytest.mark.asyncio
+async def test_prepare_mcp_runtime_suppresses_failed_client_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    class _BrokenClient:
+        async def connect(self) -> None:
+            raise MCPClientError(
+                "googleworkspace",
+                "initialize",
+                "redirect failed",
+                error_class="httpstatuserror",
+            )
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            return []
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            del tool_name, arguments
+            return {}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+            raise BaseExceptionGroup("cleanup failed", [RuntimeError("cleanup")])
+
+    monkeypatch.setattr("cognis.executor.runner.build_mcp_client", lambda *_: _BrokenClient())
+
+    clients, discovered, statuses, warnings = await runner._prepare_mcp_runtime(
+        [
+            MCPServerConfig(
+                name="googleworkspace",
+                transport="streamable_http",
+                url="http://mcp-gws.openwebui.svc.cluster.local/mcp/",
+            )
+        ],
+        {},
+    )
+
+    assert clients == {}
+    assert discovered == []
+    assert warnings == ["MCP server googleworkspace failed during initialize."]
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["message"] == "redirect failed"
 
 
 @pytest.mark.asyncio

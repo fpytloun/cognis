@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp.client.session import ClientSession
@@ -165,7 +166,7 @@ class _SessionMCPClient:
             )
             await session.initialize()
         except Exception as exc:
-            await exit_stack.aclose()
+            await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
             raise _coerce_client_error(self.config.name, "initialize", exc) from exc
 
         self._exit_stack = exit_stack
@@ -356,10 +357,12 @@ class StreamableHTTPMCPClient(_SessionMCPClient):
                 "MCP streamable HTTP url is required",
                 error_class="missing_url",
             )
-        logger.info("MCP streamable_http: connecting %s (%s)", self.config.name, self.config.url)
+        url = normalize_streamable_http_url(self.config.url)
+        logger.info("MCP streamable_http: connecting %s (%s)", self.config.name, url)
         client = await exit_stack.enter_async_context(
             httpx.AsyncClient(
                 headers=self.headers,
+                follow_redirects=True,
                 timeout=httpx.Timeout(
                     self.config.timeout_seconds,
                     read=max(self.config.timeout_seconds, _HTTP_READ_TIMEOUT_SECONDS),
@@ -367,9 +370,18 @@ class StreamableHTTPMCPClient(_SessionMCPClient):
             )
         )
         read_stream, write_stream, _get_session_id = await exit_stack.enter_async_context(
-            streamable_http_client(self.config.url, http_client=client)
+            streamable_http_client(url, http_client=client)
         )
         return read_stream, write_stream
+
+
+def normalize_streamable_http_url(url: str) -> str:
+    """Return a redirect-resistant streamable HTTP MCP endpoint URL."""
+
+    parsed = urlsplit(url)
+    if parsed.path.endswith("/mcp/"):
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path[:-1], parsed.query, parsed.fragment))
+    return url
 
 
 def mcp_tools_to_definitions(
@@ -427,6 +439,21 @@ def build_mcp_client(config: MCPServerConfig, secrets: dict[str, str]) -> MCPCli
     if config.transport == "streamable_http":
         return StreamableHTTPMCPClient(config, headers=resolve_secret_refs(config.headers, secrets))
     raise ValueError(f"Unsupported MCP transport: {config.transport}")
+
+
+async def _close_exit_stack_after_connect_failure(
+    exit_stack: AsyncExitStack, server_name: str
+) -> None:
+    """Best-effort cleanup that never masks the primary MCP connect error."""
+
+    try:
+        await exit_stack.aclose()
+    except BaseException as exc:
+        logger.debug(
+            "MCP: %s ignored cleanup error after failed connect: %s",
+            server_name,
+            type(exc).__name__,
+        )
 
 
 def runtime_mcp_server_key(config: MCPServerConfig | ToolSource) -> str:

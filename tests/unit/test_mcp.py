@@ -8,12 +8,17 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
+from cognis.tools import mcp as mcp_module
 from cognis.tools.mcp import (
+    MCPClientError,
     StdioMCPClient,
+    StreamableHTTPMCPClient,
+    _SessionMCPClient,
     _normalize_call_result,
     _safe_message,
     _strip_empty_optionals,
     mcp_tools_to_definitions,
+    normalize_streamable_http_url,
     runtime_mcp_server_key,
 )
 
@@ -127,6 +132,88 @@ def test_normalize_call_result_emits_binary_attachment() -> None:
     assert result.attachments is not None
     assert result.attachments[0]["content_b64"] == "YWJj"
     assert result.attachments[0]["mime_type"] == "image/png"
+
+
+def test_normalize_streamable_http_url_removes_mcp_trailing_slash() -> None:
+    url = "http://mcp-gws.openwebui.svc.cluster.local/mcp/?x=1#frag"
+
+    assert normalize_streamable_http_url(url) == (
+        "http://mcp-gws.openwebui.svc.cluster.local/mcp?x=1#frag"
+    )
+    assert normalize_streamable_http_url("http://example.test/other/") == (
+        "http://example.test/other/"
+    )
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class _AsyncContext:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        async def __aenter__(self) -> object:
+            return self.value
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class _HTTPClient:
+        def __init__(self, **kwargs: object) -> None:
+            calls["http_kwargs"] = kwargs
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    def _streamable_http_client(url: str, *, http_client: object) -> _AsyncContext:
+        calls["url"] = url
+        calls["http_client"] = http_client
+        return _AsyncContext((object(), object(), lambda: None))
+
+    monkeypatch.setattr(mcp_module.httpx, "AsyncClient", _HTTPClient)
+    monkeypatch.setattr(mcp_module, "streamable_http_client", _streamable_http_client)
+
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            name="googleworkspace",
+            transport="streamable_http",
+            url="http://mcp-gws.openwebui.svc.cluster.local/mcp/",
+        )
+    )
+
+    async with mcp_module.AsyncExitStack() as stack:
+        await client._enter_transport(stack)
+
+    assert calls["url"] == "http://mcp-gws.openwebui.svc.cluster.local/mcp"
+    assert calls["http_kwargs"]["follow_redirects"] is True
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_cleanup_does_not_mask_primary_error() -> None:
+    class _BadContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_: object) -> None:
+            raise BaseExceptionGroup("cleanup failed", [RuntimeError("cleanup")])
+
+    class _BrokenClient(_SessionMCPClient):
+        async def _enter_transport(self, exit_stack: mcp_module.AsyncExitStack) -> tuple[object, object]:
+            await exit_stack.enter_async_context(_BadContext())
+            raise RuntimeError("primary failure")
+
+    client = _BrokenClient(MCPServerConfig(name="broken", command="ignored"))
+
+    with pytest.raises(MCPClientError) as exc_info:
+        await client.connect()
+
+    assert "primary failure" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

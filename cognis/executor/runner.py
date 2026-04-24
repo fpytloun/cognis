@@ -987,7 +987,7 @@ class ExecutorRunner:
                 )
                 if exc.safe_stderr:
                     logger.warning("MCP: server %s stderr: %s", server.name, exc.safe_stderr)
-                await client.close(suppress_cancelled=True)
+                await self._close_failed_mcp_client(client, server.name)
                 statuses.append(
                     {
                         "server_id": server.server_id,
@@ -1008,7 +1008,7 @@ class ExecutorRunner:
                     server.name,
                     exc,
                 )
-                await client.close(suppress_cancelled=True)
+                await self._close_failed_mcp_client(client, server.name)
                 statuses.append(
                     {
                         "server_id": server.server_id,
@@ -1046,6 +1046,18 @@ class ExecutorRunner:
                 )
             )
         return clients, discovered, statuses, warnings
+
+    async def _close_failed_mcp_client(self, client: MCPClient, server_name: str) -> None:
+        """Best-effort MCP cleanup that cannot abort executor configuration."""
+
+        try:
+            await client.close(suppress_cancelled=True)
+        except BaseException as exc:
+            logger.debug(
+                "MCP: server %s cleanup failed after initialization error: %s",
+                server_name,
+                type(exc).__name__,
+            )
 
     async def _discover_mcp_tools(self, servers: list[MCPServerConfig]) -> list[ToolDefinition]:
         discovered: list[ToolDefinition] = []
