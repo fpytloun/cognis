@@ -2871,7 +2871,7 @@ import X from 'lucide-svelte/icons/x';
       {/if}
 
       <!-- Message area + composer -->
-      <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 py-2 sm:gap-4 sm:px-4 sm:py-4">
+      <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 pt-2 pb-0 sm:gap-4 sm:px-4 sm:py-4">
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
             Memory is currently unavailable — this conversation won't have access to past context.
@@ -3133,7 +3133,7 @@ import X from 'lucide-svelte/icons/x';
             the screen on iPhone PWAs without hiding behind the home
             indicator.
           -->
-          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-transparent px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+env(safe-area-inset-bottom))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-slate-950/95 px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+env(safe-area-inset-bottom))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
