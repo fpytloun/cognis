@@ -3286,7 +3286,7 @@ import X from 'lucide-svelte/icons/x';
 
         <!-- Drawer -->
         <aside class={`absolute inset-0 z-30 flex h-full w-full flex-col border-l border-slate-800/80 bg-slate-900/95 shadow-2xl backdrop-blur ${subSessionClosing ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}>
-          <div class="flex items-center gap-3 border-b border-slate-800/80 px-4 py-3">
+          <div class="flex items-center gap-3 border-b border-slate-800/80 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
             <button
               class="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
               onclick={closeSubSessionPanel}

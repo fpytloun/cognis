@@ -35,10 +35,16 @@ function readKeyboardOffset(): number {
   return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
 }
 
+function syncViewportHeight(): void {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return;
+  document.documentElement.style.setProperty('--app-viewport-height', `${window.innerHeight}px`);
+}
+
 export const keyboardOffset = readable(0, (set) => {
   if (typeof window === 'undefined' || !window.visualViewport) return;
   const vv = window.visualViewport;
   const update = () => {
+    syncViewportHeight();
     const offset = readKeyboardOffset();
     set(offset);
     // Expose as CSS variable so fixed-position elements (composer, bottom tabs)
@@ -46,6 +52,7 @@ export const keyboardOffset = readable(0, (set) => {
     document.documentElement.style.setProperty('--kb-offset', `${offset}px`);
   };
   const reset = () => {
+    syncViewportHeight();
     set(0);
     document.documentElement.style.setProperty('--kb-offset', '0px');
   };
@@ -65,11 +72,22 @@ export const keyboardOffset = readable(0, (set) => {
   update();
   vv.addEventListener('resize', update);
   vv.addEventListener('scroll', update);
+  window.addEventListener('resize', update, { passive: true });
+  window.addEventListener('orientationchange', update, { passive: true });
+  window.addEventListener('pageshow', update);
+  document.addEventListener('visibilitychange', update);
   window.addEventListener('focusout', handleFocusOut, true);
+  window.setTimeout(update, 250);
+  window.setTimeout(update, 1000);
   return () => {
     vv.removeEventListener('resize', update);
     vv.removeEventListener('scroll', update);
+    window.removeEventListener('resize', update);
+    window.removeEventListener('orientationchange', update);
+    window.removeEventListener('pageshow', update);
+    document.removeEventListener('visibilitychange', update);
     window.removeEventListener('focusout', handleFocusOut, true);
+    document.documentElement.style.setProperty('--app-viewport-height', '100dvh');
     document.documentElement.style.setProperty('--kb-offset', '0px');
   };
 });

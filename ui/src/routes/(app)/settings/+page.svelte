@@ -1919,7 +1919,7 @@ import { onMount, tick } from 'svelte';
       {#if isAdmin}
         <div
           class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur md:hidden"
-          style="bottom: calc(var(--app-shell-bottom-offset, 0px) + env(safe-area-inset-bottom, 0px));"
+          style="bottom: var(--app-shell-bottom-offset, 0px);"
         >
           <div class="flex items-center gap-2">
             <Button class="flex-1 justify-center" onclick={saveProvider} disabled={!isAdmin || busy}>

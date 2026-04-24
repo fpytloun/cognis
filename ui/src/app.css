@@ -5,6 +5,7 @@
 :root {
   color-scheme: dark;
   --kb-offset: 0px;
+  --app-viewport-height: 100dvh;
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
 }
@@ -62,12 +63,6 @@ body {
   background-attachment: fixed;
   overflow-x: hidden;
   overscroll-behavior-y: none;
-}
-
-@supports (padding: max(0px)) {
-  body {
-    padding-bottom: env(safe-area-inset-bottom, 0);
-  }
 }
 
 .skip-link {
