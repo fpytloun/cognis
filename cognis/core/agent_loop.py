@@ -291,6 +291,7 @@ _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 _MAX_STEP_COMPLETE_REPROMPTS = 3
+_MAX_EMPTY_DIRECT_RESPONSE_REPROMPTS = 2
 _MAX_TOOL_CALL_ARGUMENT_CHARS = 256_000
 _DELIVERABLE_PREVIEW_CHARS = 240
 _PROJECT_TOUCH_TOOL_NAMES = frozenset(
@@ -2380,6 +2381,7 @@ class AgentLoop:
 
         # Main agentic loop
         step_reprompt_count = 0
+        empty_direct_response_reprompt_count = 0
         mid_stream_retries = 0
         _MAX_MID_STREAM_RETRIES = 2
         openai_tool_search_retries = 0
@@ -3011,9 +3013,63 @@ class AgentLoop:
                             content=str(messages[-1]["content"]),
                         )
                         continue
+                    visible_completion_content = merge_content_and_attachment_note(
+                        content,
+                        strip_attachment_payload_bytes(collected_attachments),
+                    )
+                    summary = visible_completion_content.strip()
+                    if not summary:
+                        if (
+                            empty_direct_response_reprompt_count
+                            < _MAX_EMPTY_DIRECT_RESPONSE_REPROMPTS
+                        ):
+                            empty_direct_response_reprompt_count += 1
+                            STEP_REPROMPTS.inc()
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "Internal controller reminder — this is not a new user "
+                                        "message. Do not write a filler acknowledgment just for "
+                                        "this reminder. Your previous response was empty. Reply "
+                                        "with the actual user-facing result, ask a necessary "
+                                        "question, or call the needed tools. Do not send an empty "
+                                        "message."
+                                    ),
+                                }
+                            )
+                            _queue_audit_message(
+                                role="developer",
+                                source="tool_reminder",
+                                content=str(messages[-1]["content"]),
+                            )
+                            continue
+                        error_msg = "Model returned an empty response without tool calls."
+                        events_to_record.append(
+                            SessionEvent(
+                                type="lifecycle",
+                                data={
+                                    "event": "system_notice",
+                                    "message": f"Step failed: {error_msg}",
+                                },
+                            )
+                        )
+                        step_output = StepOutput(
+                            summary="Step failed: empty assistant response",
+                            content="",
+                            outputs={},
+                            claims=[],
+                            error=error_msg,
+                            attachments=list(collected_attachments),
+                            session_id=ctx.session.session_id,
+                            intaris_session_id=ctx.session.intaris_session_id
+                            or ctx.session.session_id,
+                            completed_at=datetime.now(UTC),
+                        )
+                        break
                     # Todos done (or max re-prompts reached) — complete
                     step_output = StepOutput(
-                        summary=content[:500] if content else "",
+                        summary=summary[:500],
                         content=content,
                         outputs={},
                         claims=[],

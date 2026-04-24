@@ -22,6 +22,8 @@ STEP_COMPLETE_TOOL = ToolDefinition(
         "properties": {
             "summary": {
                 "type": "string",
+                "minLength": 1,
+                "pattern": "\\S",
                 "description": "Brief summary of what was accomplished in this step.",
             },
             "outputs": {

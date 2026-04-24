@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
-
+from cognis.tools.builtin.workflow import STEP_COMPLETE_TOOL
 
 _STEP_TODO_SCHEMA = {
     "type": "object",
@@ -94,3 +94,14 @@ def test_as_tool_result_produces_structured_payload() -> None:
 
 def test_schema_none_accepts_any_dict() -> None:
     assert validate_tool_arguments("something", {"anything": 1}, schema=None) is None
+
+
+def test_step_complete_summary_schema_rejects_blank_strings() -> None:
+    error = validate_tool_arguments(
+        "step_complete",
+        {"summary": "   "},
+        schema=STEP_COMPLETE_TOOL.parameters,
+    )
+    assert isinstance(error, ToolArgumentError)
+    assert error.reason == "schema_violation"
+    assert any("summary" in line for line in error.errors)
