@@ -894,7 +894,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const index = next.findIndex((item) => item.id === thinkingId && item.kind === 'thinking');
     if (index >= 0) {
       const existing = next[index] as ThinkingTimelineItem;
-      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+      // Block ids can repeat across separate reasoning cycles within the same
+      // turn. Only reuse an in-flight block; if the prior one is already
+      // complete, start a new block instead of appending into old content.
+      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId && !b.complete);
       if (blockIdx >= 0) {
         const blocks = existing.blocks.slice();
         const block = blocks[blockIdx];
@@ -978,7 +981,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       };
       if (index >= 0) {
         const existing = next[index] as ThinkingTimelineItem;
-        const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+        const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId && !b.complete);
         const blocks =
           blockIdx >= 0
             ? existing.blocks.map((b, i) => (i === blockIdx ? block : b))
@@ -1003,7 +1006,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     } else if (index >= 0) {
       // Complete signal for streaming block
       const existing = next[index] as ThinkingTimelineItem;
-      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+      const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId && !b.complete);
       const blocks = existing.blocks.slice();
       if (blockIdx >= 0) {
         const block = blocks[blockIdx];
