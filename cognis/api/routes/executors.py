@@ -30,10 +30,15 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(tags=["executors"])
+LOCAL_EXECUTOR_TYPES = {"in_process", "subprocess"}
 
 
 def _executor_is_shared(row: Any) -> bool:
     return is_shared_owner_email(getattr(row, "owner_email", None))
+
+
+def _executor_is_local(row: Any) -> bool:
+    return getattr(row, "executor_type", None) in LOCAL_EXECUTOR_TYPES
 
 
 def _resolve_executor_owner(user: Any, shared: bool) -> str:
@@ -43,15 +48,17 @@ def _resolve_executor_owner(user: Any, shared: bool) -> str:
 def _enforce_executor_creation_rules(user: Any, *, executor_type: str, shared: bool) -> None:
     if shared and user.role != "admin":
         raise api_exception(403, "forbidden", "Only admins can create shared executors")
-    if executor_type in {"in_process", "subprocess"} and user.role != "admin":
+    if executor_type in LOCAL_EXECUTOR_TYPES and user.role != "admin":
         raise api_exception(403, "forbidden", "Only admins can create local executors")
 
 
 def _require_executor_mutation_access(request: Request, row: Any) -> None:
+    user = require_current_user(request)
+    if _executor_is_local(row) and user.role != "admin":
+        raise api_exception(403, "forbidden", "Only admins can manage local executors")
     if _executor_is_shared(row):
         require_admin(request)
         return
-    user = require_current_user(request)
     if row.owner_email != user.email:
         raise api_exception(404, "not_found", "Executor not found")
 

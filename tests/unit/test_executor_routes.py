@@ -150,3 +150,40 @@ def test_regular_user_cannot_create_shared_or_local_executors(
 
         assert local_response.status_code == 403
         assert shared_response.status_code == 403
+
+
+def test_regular_user_cannot_mutate_owned_local_executor(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_executor(
+                    session,
+                    executor_id="owned-local",
+                    name="Owned Local",
+                    executor_type="in_process",
+                    owner_email="user@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(client.app, email="user@example.com", role="user")
+        update_response = client.put(
+            "/api/v1/executors/owned-local",
+            headers=headers,
+            json={"name": "Edited Local"},
+        )
+        token_response = client.post("/api/v1/executors/owned-local/token", headers=headers)
+
+        assert update_response.status_code == 403
+        assert token_response.status_code == 403

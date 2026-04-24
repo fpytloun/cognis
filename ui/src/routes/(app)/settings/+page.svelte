@@ -1017,6 +1017,15 @@ import { onMount, tick } from 'svelte';
     return savingExecutorIds.includes(executorId);
   }
 
+  function canManageExecutor(exec: ExecutorConfig): boolean {
+    const currentUserEmail = auth.getSnapshot().user?.email ?? null;
+    const localExecutor = exec.executor_type === 'in_process' || exec.executor_type === 'subprocess';
+    if (exec.shared || localExecutor) {
+      return isAdmin;
+    }
+    return !exec.owner_email || exec.owner_email === currentUserEmail;
+  }
+
   async function loadSettings(): Promise<void> {
     loading = true;
     error = '';
@@ -2312,6 +2321,7 @@ import { onMount, tick } from 'svelte';
 
         {#each executorConfigs as exec}
           {@const toolGroups = [...new Set(executorTools.map(t => t.category))].sort()}
+          {@const canManage = canManageExecutor(exec)}
           <Card class="p-5 space-y-4">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
@@ -2330,19 +2340,21 @@ import { onMount, tick } from 'svelte';
                 {/if}
               </div>
               <div class="flex gap-2">
-                <Button variant="secondary" size="sm" onclick={() => {
-                  editingExecutor = exec;
-                  executorForm = {
-                    executor_id: exec.executor_id,
-                    name: exec.name,
-                    executor_type: exec.executor_type,
-                    labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', '),
-                    status: exec.status,
-                    shared: !!exec.shared
-                  };
-                  showExecutorForm = true;
-                }}>Edit</Button>
-                {#if exec.executor_type !== 'in_process'}
+                {#if canManage}
+                  <Button variant="secondary" size="sm" onclick={() => {
+                    editingExecutor = exec;
+                    executorForm = {
+                      executor_id: exec.executor_id,
+                      name: exec.name,
+                      executor_type: exec.executor_type,
+                      labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', '),
+                      status: exec.status,
+                      shared: !!exec.shared
+                    };
+                    showExecutorForm = true;
+                  }}>Edit</Button>
+                {/if}
+                {#if canManage && exec.executor_type !== 'in_process'}
                   <Button variant="secondary" size="sm" onclick={async () => {
                     try {
                       executorToken = await api.executor.generateToken(exec.executor_id);
@@ -2352,7 +2364,7 @@ import { onMount, tick } from 'svelte';
                     }
                   }}>Generate token</Button>
                 {/if}
-                {#if !exec.is_default}
+                {#if canManage && !exec.is_default}
                   <Button variant="danger" size="sm" onclick={async () => {
                     const confirmed = await confirmAction({ title: 'Delete executor', message: `Delete "${exec.name}"? This cannot be undone.` });
                     if (confirmed) {
@@ -2393,7 +2405,7 @@ import { onMount, tick } from 'svelte';
               </div>
             {/if}
 
-            {#if executorToken && executorToken.executor_id === exec.executor_id}
+            {#if canManage && executorToken && executorToken.executor_id === exec.executor_id}
               {@const execCommand = `cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken.token}`}
               <div class="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-3">
                 <p class="text-sm text-emerald-100">Copy this token now. It is not stored in the UI.</p>
@@ -2407,6 +2419,7 @@ import { onMount, tick } from 'svelte';
               </div>
             {/if}
 
+            {#if canManage}
             <!-- Quick presets -->
             <div class="flex flex-wrap gap-2">
               <span class="text-xs text-slate-400 self-center">Presets:</span>
@@ -2902,6 +2915,11 @@ import { onMount, tick } from 'svelte';
                   {/each}
                 </div>
               </details>
+            {/if}
+            {:else}
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-400">
+                This executor is available for use, but you do not have permission to change its configuration.
+              </div>
             {/if}
           </Card>
         {/each}
@@ -3552,7 +3570,7 @@ import { onMount, tick } from 'svelte';
      Re-uses the same per-tool toggle logic as the desktop grid. -->
 {#if toolPickerExecutorId}
   {@const exec = executorConfigs.find((e) => e.executor_id === toolPickerExecutorId)}
-  {#if exec}
+  {#if exec && canManageExecutor(exec)}
     {@const query = toolPickerQuery.trim().toLowerCase()}
     {@const filteredTools = query
       ? executorTools.filter((t) => t.name.toLowerCase().includes(query) || (t.description ?? '').toLowerCase().includes(query) || t.category.toLowerCase().includes(query))
