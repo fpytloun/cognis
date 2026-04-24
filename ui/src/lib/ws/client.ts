@@ -15,6 +15,11 @@ interface WebSocketState {
   lastError: string | null;
 }
 
+interface ConversationSubscription {
+  lastSeq: number;
+  sessionId: string | null;
+}
+
 const initialState: WebSocketState = {
   status: 'idle',
   attempts: 0,
@@ -24,7 +29,7 @@ const initialState: WebSocketState = {
 class CognisWebSocketClient {
   private socket: WebSocket | null = null;
   private listeners = new Set<EventListener>();
-  private subscriptions = new Map<string, number>();
+  private subscriptions = new Map<string, ConversationSubscription>();
   private queuedMessages: string[] = [];
   private reconnectTimer: number | null = null;
   private heartbeatTimer: number | null = null;
@@ -114,14 +119,19 @@ class CognisWebSocketClient {
     this.state.set(initialState);
   }
 
-  subscribeConversation(conversationId: string, lastSeq = 0): void {
-    const previous = this.subscriptions.get(conversationId) ?? 0;
-    this.subscriptions.set(conversationId, Math.max(previous, lastSeq));
+  subscribeConversation(conversationId: string, lastSeq = 0, sessionId: string | null = null): void {
+    const previous = this.subscriptions.get(conversationId);
+    const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
+    const next: ConversationSubscription = previous && previous.sessionId === normalizedSessionId
+      ? { lastSeq: Math.max(previous.lastSeq, lastSeq), sessionId: normalizedSessionId }
+      : { lastSeq, sessionId: normalizedSessionId };
+    this.subscriptions.set(conversationId, next);
     if (this.authenticated) {
       this.sendRaw({
         type: 'reconnect',
         conversation_id: conversationId,
-        last_seq: this.subscriptions.get(conversationId) ?? 0
+        last_seq: next.lastSeq,
+        session_id: next.sessionId,
       });
       return;
     }
@@ -133,9 +143,17 @@ class CognisWebSocketClient {
     this.subscriptions.delete(conversationId);
   }
 
-  updateConversationSeq(conversationId: string, lastSeq: number): void {
-    const previous = this.subscriptions.get(conversationId) ?? 0;
-    this.subscriptions.set(conversationId, Math.max(previous, lastSeq));
+  updateConversationSeq(conversationId: string, lastSeq: number, sessionId: string | null = null): void {
+    const previous = this.subscriptions.get(conversationId);
+    const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
+    if (!previous || previous.sessionId !== normalizedSessionId) {
+      this.subscriptions.set(conversationId, { lastSeq, sessionId: normalizedSessionId });
+      return;
+    }
+    this.subscriptions.set(conversationId, {
+      lastSeq: Math.max(previous.lastSeq, lastSeq),
+      sessionId: previous.sessionId,
+    });
   }
 
   sendMessage(conversationId: string, content: string, attachments: AttachmentRef[] = []): void {
@@ -211,15 +229,29 @@ class CognisWebSocketClient {
         this.clearPongTimeout();
         this.state.set({ status: 'connected', attempts: 0, lastError: null });
         this.startHeartbeat();
-        for (const [conversationId, lastSeq] of this.subscriptions.entries()) {
-          this.sendRaw({ type: 'reconnect', conversation_id: conversationId, last_seq: lastSeq });
+        for (const [conversationId, subscription] of this.subscriptions.entries()) {
+          this.sendRaw({
+            type: 'reconnect',
+            conversation_id: conversationId,
+            last_seq: subscription.lastSeq,
+            session_id: subscription.sessionId,
+          });
         }
         this.flushQueue();
         return;
       }
 
-      if (payload.type === 'message_complete' && payload.conversation_id && payload.seq > 0) {
-        this.updateConversationSeq(payload.conversation_id, payload.seq);
+      if (
+        'conversation_id' in payload
+        && typeof payload.conversation_id === 'string'
+        && 'seq' in payload
+        && typeof payload.seq === 'number'
+        && payload.seq > 0
+      ) {
+        const sessionId = 'session_id' in payload && typeof payload.session_id === 'string'
+          ? payload.session_id
+          : null;
+        this.updateConversationSeq(payload.conversation_id, payload.seq, sessionId);
       }
 
       if (payload.type === 'error') {

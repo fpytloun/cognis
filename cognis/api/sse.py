@@ -167,6 +167,7 @@ class SSETurnObserver:
         delta: str,
         title: str | None,
         complete: bool,
+        content: str | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -198,6 +199,7 @@ class SSETurnObserver:
                         "block_id": block_id,
                         "title": title,
                         "complete": True,
+                        "content": content,
                     },
                 }
             )

@@ -83,6 +83,7 @@ class _RecordingObserver:
         delta: str,
         title: str | None,
         complete: bool,
+        content: str | None = None,
     ) -> None:
         return None
 

@@ -138,7 +138,7 @@ describe('chat timeline helpers', () => {
     });
   });
 
-  it('groups turn-scoped assistant history around tool calls', () => {
+  it('keeps assistant history split across tool-call phase boundaries', () => {
     const items = normalizeHistory([
       {
         seq: 10,
@@ -195,12 +195,18 @@ describe('chat timeline helpers', () => {
       }
     ]);
 
-    expect(items).toHaveLength(2);
-    expect(items[0]).toMatchObject({ kind: 'tool_call', callId: 'call_1', status: 'completed' });
-    expect(items[1]).toMatchObject({
+    expect(items).toHaveLength(3);
+    expect(items[0]).toMatchObject({
       kind: 'message',
       role: 'assistant',
-      content: 'First segment\n\nSecond segment',
+      content: 'First segment',
+      turnId: 'turn_1'
+    });
+    expect(items[1]).toMatchObject({ kind: 'tool_call', callId: 'call_1', status: 'completed' });
+    expect(items[2]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'Second segment',
       attachments: [{ artifact_id: 'img_turn_1', filename: 'logo.png' }],
       turnId: 'turn_1'
     });
@@ -254,7 +260,7 @@ describe('chat timeline helpers', () => {
         session_id: 'sess_1',
         message_id: 'turn_2',
         turn_id: 'turn_2',
-        content: '\n\nSecond segment',
+        content: 'Second segment',
         index: 1,
       },
       {
@@ -336,22 +342,160 @@ describe('chat timeline helpers', () => {
       }
     ]);
 
-    expect(live).toHaveLength(2);
-    expect(live[0]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
-    expect(live[1]).toMatchObject({
+    expect(live).toHaveLength(3);
+    expect(live[0]).toMatchObject({
       kind: 'message',
       role: 'assistant',
-      content: 'First segment\n\nSecond segment',
+      content: 'First segment',
+      turnId: 'turn_2'
+    });
+    expect(live[1]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
+    expect(live[2]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'Second segment',
       attachments: [{ artifact_id: 'img_turn_2', filename: 'logo.png' }],
       turnId: 'turn_2'
     });
-    expect(history[0]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
-    expect(history[1]).toMatchObject({
+    expect(history[0]).toMatchObject({
       kind: 'message',
       role: 'assistant',
-      content: 'First segment\n\nSecond segment',
+      content: 'First segment',
+      turnId: 'turn_2'
+    });
+    expect(history[1]).toMatchObject({ kind: 'tool_call', callId: 'call_turn_2', status: 'completed' });
+    expect(history[2]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'Second segment',
       attachments: [{ artifact_id: 'img_turn_2', filename: 'logo.png' }],
       turnId: 'turn_2'
+    });
+  });
+
+  it('keeps thinking above assistant within the same phase and splits on tool calls', () => {
+    const timeline = [
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        content: 'Draft reply',
+        index: 0,
+      },
+      {
+        type: 'assistant_thinking_chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        block_id: 'thk_1',
+        delta: 'Reasoning before tool',
+        title: 'Exploring options',
+        complete: false,
+      },
+      {
+        type: 'assistant_thinking_block' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        block_id: 'thk_1',
+        title: 'Exploring options',
+        complete: true,
+        content: 'Reasoning before tool',
+      },
+      {
+        type: 'tool_call' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_phase_1',
+        tool_name: 'bash',
+        status: 'started',
+        arguments: { command: 'pwd' },
+        turn_id: 'turn_phase',
+      },
+      {
+        type: 'assistant_thinking_chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        block_id: 'thk_2',
+        delta: 'Reasoning after tool',
+        title: 'Checking result',
+        complete: false,
+      },
+      {
+        type: 'assistant_thinking_block' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        block_id: 'thk_2',
+        title: 'Checking result',
+        complete: true,
+        content: 'Reasoning after tool',
+      },
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_phase',
+        turn_id: 'turn_phase',
+        content: 'Final reply',
+        index: 1,
+      },
+    ].reduce((items, event) => applyWebSocketEvent(items, event), [] as ReturnType<typeof normalizeHistory>);
+
+    expect(timeline[0]).toMatchObject({ kind: 'thinking' });
+    expect(timeline[1]).toMatchObject({ kind: 'message', role: 'assistant', content: 'Draft reply' });
+    expect(timeline[2]).toMatchObject({ kind: 'tool_call', callId: 'call_phase_1', status: 'started' });
+    expect(timeline[3]).toMatchObject({ kind: 'thinking' });
+    expect(timeline[4]).toMatchObject({ kind: 'message', role: 'assistant', content: 'Final reply' });
+  });
+
+  it('concatenates assistant chunks across thinking within the same phase', () => {
+    const timeline = [
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_mix',
+        turn_id: 'turn_mix',
+        content: 'Part one',
+        index: 0,
+      },
+      {
+        type: 'assistant_thinking_block' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_mix',
+        turn_id: 'turn_mix',
+        block_id: 'thk_mix_1',
+        title: 'Exploring',
+        complete: true,
+        content: 'Reasoning between message chunks',
+      },
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_mix',
+        turn_id: 'turn_mix',
+        content: ' and part two',
+        index: 1,
+      },
+    ].reduce((items, event) => applyWebSocketEvent(items, event), [] as ReturnType<typeof normalizeHistory>);
+
+    expect(timeline).toHaveLength(2);
+    expect(timeline[0]).toMatchObject({ kind: 'thinking' });
+    expect(timeline[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      streaming: true,
+      content: 'Part one and part two',
     });
   });
 
@@ -643,7 +787,7 @@ describe('chat timeline helpers', () => {
     expect(withTool[1]).toMatchObject({ kind: 'tool_call' });
   });
 
-  it('keeps the assistant draft trailing behind live tool calls until completion', () => {
+  it('starts a new assistant phase after tool activity', () => {
     const streaming = applyWebSocketEvent([], {
       type: 'chunk',
       conversation_id: 'conv_1',
@@ -693,13 +837,14 @@ describe('chat timeline helpers', () => {
       index: 1
     });
 
-    expect(continued[0]).toMatchObject({ kind: 'tool_call', callId: 'call_live_1', status: 'completed' });
-    expect(continued[1]).toMatchObject({ kind: 'tool_call', callId: 'call_live_2', status: 'started' });
-    expect(continued[2]).toMatchObject({
+    expect(continued[0]).toMatchObject({ kind: 'message', role: 'assistant', content: 'Working on it' });
+    expect(continued[1]).toMatchObject({ kind: 'tool_call', callId: 'call_live_1', status: 'completed' });
+    expect(continued[2]).toMatchObject({ kind: 'tool_call', callId: 'call_live_2', status: 'started' });
+    expect(continued[3]).toMatchObject({
       kind: 'message',
       role: 'assistant',
       streaming: true,
-      content: 'Working on it and done',
+      content: ' and done',
     });
   });
 

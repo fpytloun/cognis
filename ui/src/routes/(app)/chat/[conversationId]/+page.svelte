@@ -201,6 +201,10 @@ import X from 'lucide-svelte/icons/x';
   let unsubscribeComposerFocus: (() => void) | null = null;
   let unsubscribeCancelTurn: (() => void) | null = null;
   let visibilityHandler: (() => void) | null = null;
+  let focusHandler: (() => void) | null = null;
+  let pageShowHandler: ((event: PageTransitionEvent) => void) | null = null;
+  let onlineHandler: (() => void) | null = null;
+  let foregroundSyncTimer: number | null = null;
   let conversationLoadRequestId = 0;
   let mobileDrawerPreviouslyFocused: HTMLElement | null = null;
   let initialLoadTimeoutTimer: number | null = null;
@@ -1047,11 +1051,17 @@ import X from 'lucide-svelte/icons/x';
   async function reloadConversationSubloads(
     conversationId: string,
     requestId: number,
-    options: { reloadSessions?: boolean; reloadHistory?: boolean; resubscribe?: boolean } = {},
+    options: {
+      reloadSessions?: boolean;
+      reloadHistory?: boolean;
+      resubscribe?: boolean;
+      preserveTimelineOnHistoryFailure?: boolean;
+    } = {},
   ): Promise<void> {
     const reloadSessions = options.reloadSessions ?? true;
     const reloadHistory = options.reloadHistory ?? true;
     const shouldResubscribe = options.resubscribe ?? false;
+    const preserveTimelineOnHistoryFailure = options.preserveTimelineOnHistoryFailure ?? false;
 
     const [sessionResult, historyResult] = await Promise.allSettled([
       reloadSessions ? api.conversations.sessions(conversationId) : Promise.resolve(sessions),
@@ -1100,8 +1110,10 @@ import X from 'lucide-svelte/icons/x';
       syncVisibleWindow();
       userScrolledUp = false;
     } else if (reloadHistory && historyResult.status === 'rejected') {
-      timeline = [];
-      syncVisibleWindow();
+      if (!preserveTimelineOnHistoryFailure) {
+        timeline = [];
+        syncVisibleWindow();
+      }
       const nextError = asApiError(historyResult.reason).message;
       if (!(isPreSessionChatConversation(previousConversation, nextSessions.length) && isMissingSessionError(nextError))) {
         historyError = nextError;
@@ -1113,7 +1125,10 @@ import X from 'lucide-svelte/icons/x';
         conversationId,
         reloadHistory && historyResult.status === 'fulfilled'
           ? (historyResult.value.active_session_last_seq ?? 0)
-          : 0
+          : 0,
+        reloadHistory && historyResult.status === 'fulfilled'
+          ? (historyResult.value.active_session_id ?? null)
+          : nextActiveSessionId,
       );
     }
 
@@ -1164,6 +1179,55 @@ import X from 'lucide-svelte/icons/x';
         conversationSubloadsLoading = false;
       }
     }
+  }
+
+  function appendLocalSystemMessage(text: string): void {
+    const lastItem = timeline[timeline.length - 1];
+    if (lastItem?.kind === 'system_message' && lastItem.text === text) {
+      return;
+    }
+    timeline = applyWebSocketEvent(timeline, {
+      type: 'system_message',
+      text,
+    });
+    syncVisibleWindow();
+  }
+
+  async function reconcileActiveConversation(): Promise<void> {
+    if (!currentConversation || document.hidden || initializing || switchingConversation) {
+      return;
+    }
+
+    const requestId = beginConversationLoad();
+    conversationSubloadsLoading = true;
+    try {
+      wsClient.connect();
+      await reloadConversationSubloads(currentConversation.conversation_id, requestId, {
+        reloadSessions: true,
+        reloadHistory: true,
+        resubscribe: true,
+        preserveTimelineOnHistoryFailure: true,
+      });
+
+      if (!isStaleConversationLoad(requestId) && (historyError || sessionsError)) {
+        appendLocalSystemMessage('Chat refresh failed. History may be stale.');
+      }
+    } finally {
+      if (!isStaleConversationLoad(requestId)) {
+        conversationSubloadsLoading = false;
+      }
+    }
+  }
+
+  function scheduleForegroundReconcile(delayMs = 150): void {
+    if (typeof window === 'undefined') return;
+    if (foregroundSyncTimer !== null) {
+      window.clearTimeout(foregroundSyncTimer);
+    }
+    foregroundSyncTimer = window.setTimeout(() => {
+      foregroundSyncTimer = null;
+      void reconcileActiveConversation();
+    }, delayMs);
   }
 
   async function openConversation(conversationId: string): Promise<void> {
@@ -2290,11 +2354,24 @@ import X from 'lucide-svelte/icons/x';
     });
     visibilityHandler = () => {
       if (!document.hidden) {
+        scheduleForegroundReconcile();
         void refreshEscalations();
         void refreshPendingDirectQuestion();
       }
     };
+    focusHandler = () => {
+      scheduleForegroundReconcile();
+    };
+    pageShowHandler = () => {
+      scheduleForegroundReconcile();
+    };
+    onlineHandler = () => {
+      scheduleForegroundReconcile();
+    };
     document.addEventListener('visibilitychange', visibilityHandler);
+    window.addEventListener('focus', focusHandler);
+    window.addEventListener('pageshow', pageShowHandler);
+    window.addEventListener('online', onlineHandler);
     startNotificationRefreshPolling();
 
     void initialize();
@@ -2310,6 +2387,19 @@ import X from 'lucide-svelte/icons/x';
       stopNotificationRefreshPolling();
       if (visibilityHandler) {
         document.removeEventListener('visibilitychange', visibilityHandler);
+      }
+      if (focusHandler) {
+        window.removeEventListener('focus', focusHandler);
+      }
+      if (pageShowHandler) {
+        window.removeEventListener('pageshow', pageShowHandler);
+      }
+      if (onlineHandler) {
+        window.removeEventListener('online', onlineHandler);
+      }
+      if (foregroundSyncTimer !== null) {
+        window.clearTimeout(foregroundSyncTimer);
+        foregroundSyncTimer = null;
       }
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);

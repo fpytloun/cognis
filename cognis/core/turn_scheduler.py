@@ -263,6 +263,7 @@ class TurnObserver(Protocol):
         delta: str,
         title: str | None,
         complete: bool,
+        content: str | None = None,
     ) -> None: ...
 
     async def on_turn_complete(self, result: TurnResult) -> None: ...
@@ -1637,6 +1638,7 @@ class TurnScheduler:
             delta: str,
             title: str | None,
             complete: bool,
+            content: str | None = None,
         ) -> None:
             await asyncio.gather(
                 *(
@@ -1652,6 +1654,7 @@ class TurnScheduler:
                         delta,
                         title,
                         complete,
+                        content,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers

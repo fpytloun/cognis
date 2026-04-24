@@ -303,6 +303,7 @@ class WebSocketTurnObserver:
         delta: str,
         title: str | None,
         complete: bool,
+        content: str | None = None,
     ) -> None:
         """Emit assistant thinking chunk or block boundary frame.
 
@@ -340,6 +341,7 @@ class WebSocketTurnObserver:
                     "block_id": block_id,
                     "title": title,
                     "complete": True,
+                    "content": content,
                 },
             )
 
@@ -526,6 +528,7 @@ class WebSocketConnectionManager:
         *,
         conversation_id: str,
         last_seq: int,
+        client_session_id: str | None = None,
     ) -> None:
         """Replay missed events for a reconnecting client."""
         from cognis.core.session import _to_session_model
@@ -568,6 +571,8 @@ class WebSocketConnectionManager:
             return
 
         session = _to_session_model(session_row)
+        if client_session_id and client_session_id != session.session_id:
+            last_seq = 0
 
         result = await self.app.state.providers.guardrails.read_events(
             session_id=session.intaris_session_id or session.session_id,
@@ -813,6 +818,7 @@ class WebSocketConnectionManager:
             {
                 "type": "reconnected",
                 "conversation_id": conversation_id,
+                "session_id": session.session_id,
                 "missed_events_count": replayed,
                 "last_seq": result.last_seq,
             }
@@ -967,6 +973,7 @@ async def handle_websocket(websocket: WebSocket) -> None:
             if message_type == "reconnect":
                 conversation_id = message.get("conversation_id")
                 last_seq = message.get("last_seq", 0)
+                session_id = message.get("session_id")
                 if not isinstance(conversation_id, str) or not isinstance(last_seq, int):
                     await manager.send_error(
                         connection,
@@ -975,7 +982,12 @@ async def handle_websocket(websocket: WebSocket) -> None:
                         recoverable=True,
                     )
                     continue
-                await manager.replay(connection, conversation_id=conversation_id, last_seq=last_seq)
+                await manager.replay(
+                    connection,
+                    conversation_id=conversation_id,
+                    last_seq=last_seq,
+                    client_session_id=session_id if isinstance(session_id, str) else None,
+                )
                 continue
 
             await manager.send_error(

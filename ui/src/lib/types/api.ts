@@ -1340,6 +1340,7 @@ export interface WebSocketQueuedEvent {
 export interface WebSocketReconnectedEvent {
   type: 'reconnected';
   conversation_id?: string;
+  session_id?: string;
   missed_events_count: number;
   last_seq?: number;
 }

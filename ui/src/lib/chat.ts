@@ -61,10 +61,10 @@ export interface ThinkingBlock {
 export interface ThinkingTimelineItem {
   id: string;
   kind: 'thinking';
-  /** Message (turn) ID that owns these blocks */
+  /** Transport message id for the thinking turn */
   messageId: string;
   turnId?: string | null;
-  /** Ordered list of thinking blocks for this turn */
+  /** Ordered list of contiguous thinking blocks in this segment */
   blocks: ThinkingBlock[];
   /** True while at least one block is still streaming */
   streaming: boolean;
@@ -298,10 +298,10 @@ function finalizeInFlightAssistantItems(items: TimelineItem[]): TimelineItem[] {
   const next = items.map((item) => {
     if (item.kind === 'message' && item.role === 'assistant' && item.streaming) {
       changed = true;
-      if (item.messageId) {
-        const streamer = getStreamer(item.messageId);
+      if (item.id) {
+        const streamer = getStreamer(item.id);
         const finalHtml = streamer.finalize(item.content);
-        releaseStreamer(item.messageId);
+        releaseStreamer(item.id);
         return {
           ...item,
           html: finalHtml,
@@ -334,49 +334,86 @@ function finalizeInFlightAssistantItems(items: TimelineItem[]): TimelineItem[] {
   return changed ? next : items;
 }
 
-function insertBeforeTrailingStreamingAssistant(items: TimelineItem[], item: TimelineItem): void {
-  let insertionIndex = items.length;
-  for (let index = items.length - 1; index >= 0; index--) {
-    const candidate = items[index];
-    if (candidate.kind === 'message' && candidate.role === 'assistant' && candidate.streaming && candidate.seq === null) {
-      insertionIndex = index;
-      continue;
-    }
-    break;
-  }
-  items.splice(insertionIndex, 0, item);
-}
-
-function findAssistantTurnMessageIndex(items: TimelineItem[], turnId: string | null): number {
-  if (!turnId) return -1;
-  return items.findIndex(
-    (item) => item.kind === 'message' && item.role === 'assistant' && item.turnId === turnId,
+function isAssistantPhaseItem(item: TimelineItem, turnId: string | null): boolean {
+  if (!turnId) return false;
+  return (
+    (item.kind === 'thinking' && item.turnId === turnId)
+    || (item.kind === 'message' && item.role === 'assistant' && item.turnId === turnId)
   );
 }
 
-function shiftToolCallIndices(
-  toolCallIndexByCallId: Map<string, number>,
-  insertionIndex: number,
-): void {
-  for (const [callId, index] of toolCallIndexByCallId.entries()) {
-    if (index >= insertionIndex) {
-      toolCallIndexByCallId.set(callId, index + 1);
-    }
+function openTurnPhaseStartIndex(items: TimelineItem[], turnId: string | null): number {
+  if (!turnId) return items.length;
+  let index = items.length;
+  while (index > 0 && isAssistantPhaseItem(items[index - 1], turnId)) {
+    index -= 1;
   }
+  return index;
 }
 
-function insertBeforeAssistantTurnMessage(
+function findOpenPhaseAssistantIndex(items: TimelineItem[], turnId: string | null): number {
+  if (!turnId) return -1;
+  const start = openTurnPhaseStartIndex(items, turnId);
+  for (let index = items.length - 1; index >= start; index -= 1) {
+    const item = items[index];
+    if (item.kind === 'message' && item.role === 'assistant' && item.turnId === turnId) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findThinkingItemIndexByBlockId(
+  items: TimelineItem[],
+  blockId: string,
+  turnId: string | null,
+): number {
+  return items.findIndex(
+    (item) => item.kind === 'thinking'
+      && item.turnId === turnId
+      && item.blocks.some((block) => block.block_id === blockId),
+  );
+}
+
+function findOpenPhaseThinkingIndex(items: TimelineItem[], turnId: string | null): number {
+  const assistantIndex = findOpenPhaseAssistantIndex(items, turnId);
+  const candidateIndex = (assistantIndex >= 0 ? assistantIndex : items.length) - 1;
+  if (candidateIndex < 0) return -1;
+  const candidate = items[candidateIndex];
+  if (candidate?.kind !== 'thinking') return -1;
+  return candidate.turnId === turnId ? candidateIndex : -1;
+}
+
+function appendThinkingBlockToSegment(
+  items: TimelineItem[],
+  segmentIndex: number,
+  block: ThinkingBlock,
+  turnId: string | null,
+  timestamp: string | null,
+  streaming: boolean,
+  activeTitle: string | null,
+): void {
+  const existing = items[segmentIndex] as ThinkingTimelineItem;
+  items[segmentIndex] = {
+    ...existing,
+    turnId,
+    timestamp: existing.timestamp ?? timestamp,
+    blocks: [...existing.blocks, block],
+    streaming,
+    activeTitle,
+  } satisfies ThinkingTimelineItem;
+}
+
+function insertBeforeOpenPhaseAssistant(
   items: TimelineItem[],
   item: TimelineItem,
   turnId: string | null,
-  toolCallIndexByCallId?: Map<string, number>,
 ): number {
-  const assistantIndex = findAssistantTurnMessageIndex(items, turnId);
+  const assistantIndex = findOpenPhaseAssistantIndex(items, turnId);
   if (assistantIndex < 0) {
-    insertBeforeTrailingStreamingAssistant(items, item);
-    return items.findIndex((candidate) => candidate.id === item.id);
+    items.push(item);
+    return items.length - 1;
   }
-  if (toolCallIndexByCallId) shiftToolCallIndices(toolCallIndexByCallId, assistantIndex);
   items.splice(assistantIndex, 0, item);
   return assistantIndex;
 }
@@ -403,7 +440,7 @@ function upsertAssistantTurnMessage(
     streaming?: boolean;
   },
 ): void {
-  const existingIndex = findAssistantTurnMessageIndex(items, turnId);
+  const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
   if (existingIndex >= 0 && items[existingIndex]?.kind === 'message') {
     const existing = items[existingIndex] as MessageTimelineItem;
     const nextContent = existing.content && content ? `${existing.content}\n\n${content}` : existing.content || content;
@@ -479,7 +516,6 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const messageId = typeof event.data.message_id === 'string' ? event.data.message_id
         : typeof event.data.turn_id === 'string' ? event.data.turn_id
         : eid;
-      const thinkingId = `thinking:${messageId}`;
       const blockId = typeof event.data.block_id === 'string' ? event.data.block_id : `thk_${eid}`;
       const title = typeof event.data.title === 'string' && event.data.title ? event.data.title : 'Thinking';
       const blockContent = typeof event.data.content === 'string' ? event.data.content : '';
@@ -491,18 +527,12 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         source: typeof event.data.reasoning_source === 'string' ? event.data.reasoning_source : 'summary',
         complete: true,
       };
-      const existingIdx = items.findIndex((i) => i.id === thinkingId && i.kind === 'thinking');
-      if (existingIdx >= 0) {
-        const existing = items[existingIdx] as ThinkingTimelineItem;
-        items[existingIdx] = {
-          ...existing,
-          blocks: [...existing.blocks, block],
-          turnId,
-          activeTitle: null,
-        };
+      const contiguousIndex = findOpenPhaseThinkingIndex(items, turnId);
+      if (contiguousIndex >= 0) {
+        appendThinkingBlockToSegment(items, contiguousIndex, block, turnId, event.timestamp, false, null);
       } else {
-        items.push({
-          id: thinkingId,
+        insertBeforeOpenPhaseAssistant(items, {
+          id: `thinking:${eid}:${blockId}`,
           kind: 'thinking',
           messageId,
           turnId,
@@ -510,7 +540,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           streaming: false,
           activeTitle: null,
           timestamp: event.timestamp,
-        });
+        } satisfies ThinkingTimelineItem, turnId);
       }
       continue;
     }
@@ -536,8 +566,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         timestamp: event.timestamp,
         arguments: args
       };
-      const insertionIndex = insertBeforeAssistantTurnMessage(items, item, turnId, toolCallIndexByCallId);
-      toolCallIndexByCallId.set(callId, insertionIndex);
+      toolCallIndexByCallId.set(callId, items.length);
+      items.push(item);
       continue;
     }
 
@@ -610,7 +640,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           turnId: existing.turnId ?? turnId,
         };
       } else {
-        insertBeforeAssistantTurnMessage(items, {
+        toolCallIndexByCallId.set(callId || `tc-${eid}`, items.length);
+        items.push({
           id: `tool:${callId || `tc-${eid}`}`,
           kind: 'tool_call',
           callId: callId || `tc-${eid}`,
@@ -624,7 +655,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           evaluation,
           attachments: resultAttachments.length > 0 ? resultAttachments : undefined,
           reconstructed: true
-        }, turnId, toolCallIndexByCallId);
+        });
       }
       continue;
     }
@@ -938,14 +969,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'chunk') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
-    const itemId = `message:${event.message_id}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');
+    const index = findOpenPhaseAssistantIndex(next, turnId);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       const content = `${message.content}${event.content}`;
       // Use the per-message streamer: finalized blocks are memoized, only the
       // in-progress tail is re-parsed. See docstring on createMarkdownStreamer.
-      const streamer = getStreamer(event.message_id);
+      const streamer = getStreamer(message.id);
       next[index] = {
         ...message,
         content,
@@ -957,6 +987,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
 
+    const itemId = `message:${event.message_id}:${next.length}`;
     next.push(
       createMessageItem(itemId, 'assistant', event.content, new Date().toISOString(), null, event.message_id, true, [], false, turnId)
     );
@@ -965,15 +996,15 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'message_complete') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
-    const itemId = `message:${event.message_id}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'message');
+    const itemId = `message:${event.message_id}:${next.length}`;
+    const index = findOpenPhaseAssistantIndex(next, turnId);
     const attachments = normalizeEventAttachments(event.attachments);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       // Finalize and release the streamer for this message.
-      const streamer = getStreamer(event.message_id);
+      const streamer = getStreamer(message.id);
       const finalHtml = streamer.finalize(message.content);
-      releaseStreamer(event.message_id);
+      releaseStreamer(message.id);
       next[index] = {
         ...message,
         html: finalHtml,
@@ -1004,10 +1035,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'assistant_thinking_chunk') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
-    const thinkingId = `thinking:${turnId}`;
     const blockId = event.block_id;
     const delta = event.delta ?? '';
-    const index = next.findIndex((item) => item.id === thinkingId && item.kind === 'thinking');
+    const index = findThinkingItemIndexByBlockId(next, blockId, turnId);
     if (index >= 0) {
       const existing = next[index] as ThinkingTimelineItem;
       // Block ids can repeat across separate reasoning cycles within the same
@@ -1055,28 +1085,38 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         };
       }
     } else {
-      // First chunk for this turn — insert before trailing streaming assistant
       const streamer = getThinkingStreamer(blockId);
-      const item: ThinkingTimelineItem = {
-        id: thinkingId,
-        kind: 'thinking',
-        messageId: event.message_id,
-        turnId,
-        blocks: [
-          {
-            block_id: blockId,
-            title: event.title ?? 'Thinking',
-            content: delta,
-            html: streamer.render(delta),
-            source: 'summary',
-            complete: false,
-          },
-        ],
-        streaming: true,
-        activeTitle: event.title ?? null,
-        timestamp: new Date().toISOString(),
-      };
-      insertBeforeAssistantTurnMessage(next, item, turnId);
+      const block = {
+        block_id: blockId,
+        title: event.title ?? 'Thinking',
+        content: delta,
+        html: streamer.render(delta),
+        source: 'summary',
+        complete: false,
+      } satisfies ThinkingBlock;
+      const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
+      if (contiguousIndex >= 0) {
+        appendThinkingBlockToSegment(
+          next,
+          contiguousIndex,
+          block,
+          turnId,
+          new Date().toISOString(),
+          true,
+          event.title ?? null,
+        );
+      } else {
+        insertBeforeOpenPhaseAssistant(next, {
+          id: `thinking:${turnId}:${blockId}`,
+          kind: 'thinking',
+          messageId: event.message_id,
+          turnId,
+          blocks: [block],
+          streaming: true,
+          activeTitle: event.title ?? null,
+          timestamp: new Date().toISOString(),
+        } satisfies ThinkingTimelineItem, turnId);
+      }
     }
     return next;
   }
@@ -1084,9 +1124,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'assistant_thinking_block') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
     const messageId = event.message_id;
-    const thinkingId = `thinking:${turnId}`;
     const blockId = event.block_id;
-    const index = next.findIndex((item) => item.id === thinkingId && item.kind === 'thinking');
+    const index = findThinkingItemIndexByBlockId(next, blockId, turnId);
 
     if (event.content) {
       // Replay frame with full content (no prior chunks)
@@ -1114,16 +1153,21 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
           activeTitle: null,
         };
       } else {
-        insertBeforeAssistantTurnMessage(next, {
-          id: thinkingId,
-          kind: 'thinking',
-          messageId,
-          turnId,
-          blocks: [block],
-          streaming: false,
-          activeTitle: null,
-          timestamp: new Date().toISOString(),
-        } satisfies ThinkingTimelineItem, turnId);
+        const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
+        if (contiguousIndex >= 0) {
+          appendThinkingBlockToSegment(next, contiguousIndex, block, turnId, new Date().toISOString(), false, null);
+        } else {
+          insertBeforeOpenPhaseAssistant(next, {
+            id: `thinking:${turnId}:${blockId}`,
+            kind: 'thinking',
+            messageId,
+            turnId,
+            blocks: [block],
+            streaming: false,
+            activeTitle: null,
+            timestamp: new Date().toISOString(),
+          } satisfies ThinkingTimelineItem, turnId);
+        }
       }
     } else if (index >= 0) {
       // Complete signal for streaming block
@@ -1149,6 +1193,30 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         turnId,
         activeTitle: null,
       };
+    } else {
+      const fallbackBlock: ThinkingBlock = {
+        block_id: blockId,
+        title: event.title ?? 'Thinking',
+        content: '',
+        html: '',
+        source: 'summary',
+        complete: true,
+      };
+      const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
+      if (contiguousIndex >= 0) {
+        appendThinkingBlockToSegment(next, contiguousIndex, fallbackBlock, turnId, new Date().toISOString(), false, null);
+      } else {
+        insertBeforeOpenPhaseAssistant(next, {
+          id: `thinking:${turnId}:${blockId}`,
+          kind: 'thinking',
+          messageId,
+          turnId,
+          blocks: [fallbackBlock],
+          streaming: false,
+          activeTitle: null,
+          timestamp: new Date().toISOString(),
+        } satisfies ThinkingTimelineItem, turnId);
+      }
     }
     return next;
   }
@@ -1185,7 +1253,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       };
       return next;
     }
-    insertBeforeAssistantTurnMessage(next, toolItem, turnId);
+    next.push(toolItem);
     return next;
   }
 
@@ -1211,7 +1279,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
     // tool_result arrived before tool_call — create a placeholder
-    insertBeforeAssistantTurnMessage(next, {
+    next.push({
       id: itemId,
       kind: 'tool_call',
       callId: event.call_id,
@@ -1224,7 +1292,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       durationMs: event.duration_ms ?? undefined,
       evaluation,
       attachments: attachments.length > 0 ? attachments : undefined,
-    }, turnId);
+    });
     return next;
   }
 

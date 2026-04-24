@@ -1090,6 +1090,7 @@ class ChannelTurnObserver:
         delta: str,
         title: str | None,
         complete: bool,
+        content: str | None = None,
     ) -> None:
         """No-op — thinking blocks are not delivered to channels."""
 

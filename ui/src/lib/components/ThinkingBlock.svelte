@@ -22,6 +22,10 @@
     return cleaned || 'Thinking';
   }
 
+  function hasRenderedBody(block: ThinkingTimelineItem['blocks'][number]): boolean {
+    return Boolean(block.html?.trim() || block.content?.trim());
+  }
+
   /**
    * Derive the display title shown in the collapsed header.
    * While streaming: use the activeTitle (mutates as the model thinks).
@@ -87,7 +91,11 @@
           <div
             class="prose prose-sm prose-invert max-w-none text-slate-300/80 prose-p:my-1 prose-ul:my-1 prose-li:my-0 prose-code:text-violet-200 prose-code:bg-violet-900/30"
           >
-            {@html block.html}
+            {#if hasRenderedBody(block)}
+              {@html block.html}
+            {:else}
+              <p class="my-1 text-sm text-slate-400/80">Thinking details unavailable.</p>
+            {/if}
             {#if !block.complete}
               <span class="inline-block h-3 w-0.5 animate-pulse bg-violet-400/60 align-middle"></span>
             {/if}

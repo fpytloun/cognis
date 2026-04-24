@@ -755,7 +755,7 @@ class ThinkingBlockState:
 class ThinkingEvent:
     """A reasoning delta event produced by ``StreamAccumulator.pop_thinking_events``."""
 
-    __slots__ = ("block_id", "delta", "title", "source", "complete")
+    __slots__ = ("block_id", "delta", "title", "source", "complete", "content")
 
     def __init__(
         self,
@@ -765,12 +765,14 @@ class ThinkingEvent:
         title: str | None,
         source: str,
         complete: bool,
+        content: str | None = None,
     ) -> None:
         self.block_id = block_id
         self.delta = delta
         self.title = title
         self.source = source
         self.complete = complete
+        self.content = content
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +854,7 @@ class StreamAccumulator:
                 title=block.get_title(),
                 source=block.source,
                 complete=True,
+                content=block.get_content(),
             )
         )
 
@@ -2720,6 +2723,7 @@ class AgentLoop:
                                 thinking_evt.delta,
                                 thinking_evt.title,
                                 thinking_evt.complete,
+                                thinking_evt.content,
                             )
             except OpenAIToolSearchFallbackRequired as exc:
                 if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
@@ -2816,12 +2820,13 @@ class AgentLoop:
             # Drain any remaining thinking events (e.g. the final close event)
             if on_thinking:
                 for thinking_evt in accumulator.pop_thinking_events():
-                    await on_thinking(
-                        thinking_evt.block_id,
-                        thinking_evt.delta,
-                        thinking_evt.title,
-                        thinking_evt.complete,
-                    )
+                        await on_thinking(
+                            thinking_evt.block_id,
+                            thinking_evt.delta,
+                            thinking_evt.title,
+                            thinking_evt.complete,
+                            thinking_evt.content,
+                        )
             # Record completed thinking blocks to Intaris
             if completed_thinking_blocks and mid_stream_error is None:
                 for block in completed_thinking_blocks:
