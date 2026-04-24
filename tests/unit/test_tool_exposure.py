@@ -22,6 +22,17 @@ def _tool(name: str, *, source_type: str = "builtin", category: str = "system") 
     )
 
 
+def _write_tool(name: str) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=False,
+    )
+
+
 def _mcp(server: str, raw_name: str, *, category: str = "mcp") -> ToolDefinition:
     return ToolDefinition(
         name=sanitize_mcp_tool_name(server, raw_name),
@@ -404,3 +415,126 @@ def test_prepare_tool_exposure_visible_only_chat_without_search() -> None:
     ]
     assert result.debug_metadata["strategy"] == "chat_visible_only"
     assert function_names == ["read"]
+
+
+def test_gpt5_prefers_patch_over_exact_edit_tools() -> None:
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _write_tool("write"),
+        _write_tool("edit"),
+        _write_tool("multiedit"),
+        _write_tool("patch"),
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES, discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    function_names = [tool["function"]["name"] for tool in result.tools]
+    assert "patch" in function_names
+    assert "write" not in function_names
+    assert "edit" not in function_names
+    assert "multiedit" not in function_names
+    assert result.debug_metadata["edit_tool_family"] == "gpt5"
+    assert result.debug_metadata["edit_tool_mode"] == "patch"
+
+
+def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
+    for model_id in [
+        "claude-sonnet-4-5",
+        "gemini-2.5-pro",
+        "groq/llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
+        "mistral-large",
+    ]:
+        inventory = [
+            _tool("read", source_type="executor", category="filesystem"),
+            _write_tool("write"),
+            _write_tool("edit"),
+            _write_tool("multiedit"),
+            _write_tool("patch"),
+        ]
+
+        result = prepare_tool_exposure(
+            inventory_tools=inventory,
+            controller_tool_schemas=[],
+            model_info=ModelInfo(model_id=model_id, max_tools=128),
+            contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+            promoted_tool_ids=set(),
+            allow_tool_search=False,
+        )
+
+        function_names = [tool["function"]["name"] for tool in result.tools]
+        assert "patch" not in function_names
+        assert {"write", "edit", "multiedit"} <= set(function_names)
+        assert result.debug_metadata["edit_tool_mode"] == "exact"
+
+
+def test_single_allowed_edit_surface_is_preserved_for_any_model() -> None:
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _write_tool("edit"),
+        _write_tool("write"),
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES, discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    function_names = [tool["function"]["name"] for tool in result.tools]
+    assert {"read", "edit", "write"} <= set(function_names)
+
+
+def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> None:
+    read = _tool("read", source_type="executor", category="filesystem")
+    edit = _write_tool("edit")
+    write = _write_tool("write")
+    patch = _write_tool("patch")
+
+    result = prepare_tool_exposure(
+        inventory_tools=[read, edit, write, patch],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES, discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(read), stable_tool_id(edit), stable_tool_id(write)},
+        allow_tool_search=False,
+    )
+
+    function_names = [tool["function"]["name"] for tool in result.tools]
+    assert "patch" not in function_names
+    assert {"edit", "write"} <= set(function_names)
+
+
+def test_deferred_loading_still_uses_single_edit_surface() -> None:
+    read = _tool("read", source_type="executor", category="filesystem")
+    edit = _write_tool("edit")
+    patch = _write_tool("patch")
+
+    result = prepare_tool_exposure(
+        inventory_tools=[read, edit, patch],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(
+            model_id="claude-sonnet-4-5",
+            max_tools=128,
+            supports_defer_loading=True,
+        ),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.CONTROLLER_SEARCH),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(read), stable_tool_id(patch)},
+        allow_tool_search=True,
+    )
+
+    function_names = [tool["function"]["name"] for tool in result.tools]
+    assert "edit" in function_names
+    assert "patch" not in function_names

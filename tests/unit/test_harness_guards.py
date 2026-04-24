@@ -157,9 +157,45 @@ class TestArgumentSanity:
             args = {"file_path": "/dev/null"}
             if tool == "multiedit":
                 args["edits"] = [{"old_string": "a", "new_string": "b"}]
+            if tool == "patch":
+                args["patch_text"] = "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"
             violation = check_argument_sanity(tool, args)
             assert violation is not None, f"failed for {tool}"
             assert violation.reason == "invalid_file_path"
+
+    def test_patch_dev_null_header_rejected(self) -> None:
+        violation = check_argument_sanity(
+            "patch",
+            {"patch_text": "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"},
+        )
+        assert violation is not None
+        assert violation.reason == "invalid_file_path"
+
+    def test_patch_dev_null_like_hunk_content_is_allowed(self) -> None:
+        violation = check_argument_sanity(
+            "patch",
+            {
+                "patch_text": (
+                    "--- a/tmp/file.txt\n+++ b/tmp/file.txt\n@@ -1 +1 @@\n"
+                    " --- /dev/null\n+actual content\n"
+                )
+            },
+        )
+
+        assert violation is None
+
+    def test_patch_envelope_header_like_hunk_content_is_allowed(self) -> None:
+        violation = check_argument_sanity(
+            "patch",
+            {
+                "patch_text": (
+                    "*** Begin Patch\n*** Update File: tmp/file.txt\n@@\n"
+                    " *** Add File: /dev/null\n+literal content\n*** End Patch\n"
+                )
+            },
+        )
+
+        assert violation is None
 
     def test_other_dev_devices_rejected(self) -> None:
         for special in ("/dev/zero", "/dev/random", "/dev/urandom"):

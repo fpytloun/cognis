@@ -148,13 +148,13 @@ edit_tool = ToolDefinition(
 # patch — Apply a strict text patch
 patch_tool = ToolDefinition(
     name="patch",
-    description="Apply a strict apply_patch patch or the supported unified diff update subset to one or more text files.",
+    description="Apply a strict patch envelope or the supported unified diff update subset to one or more text files.",
     parameters={
         "type": "object",
         "properties": {
             "patch_text": {
                 "type": "string",
-                "description": "Patch text in strict apply_patch syntax or the supported unified diff update subset",
+                "description": "Patch text in strict envelope syntax or the supported unified diff update subset",
             },
         },
         "required": ["patch_text"],
@@ -341,13 +341,15 @@ server startup. `read` may warm LSP in the background, but it does not block on
 diagnostics.
 
 The `patch` tool accepts strict text-only patches in two forms:
-- full `apply_patch` syntax for `Add File`, `Update File`, `Delete File`, and `Move to`
+- full patch envelope syntax for `Add File`, `Update File`, `Delete File`, and `Move to`
 - the supported unified diff subset for updates to existing files
 
 Existing-file `patch` updates, deletes, and moves require a prior `read` of the
 source file in the same execution scope. `Add File` does not. Unsupported patch
 forms fail deterministically instead of falling back to fuzzy matching. EOF
-markers such as `\ No newline at end of file` are currently rejected.
+markers are supported: `*** End of File` is accepted inside patch envelopes,
+and `\ No newline at end of file` preserves final-newline semantics in patch
+envelopes and unified-diff hunks.
 
 ## Built-in Orchestration Tools
 

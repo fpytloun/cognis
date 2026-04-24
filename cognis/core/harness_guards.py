@@ -269,6 +269,42 @@ def check_argument_sanity(
                     "call this tool if no file change is required."
                 ),
             )
+        if tool_name == "patch":
+            patch_text = _as_str(arguments.get("patch_text") or arguments.get("patchText"))
+            for line in patch_text.splitlines():
+                for prefix in (
+                    "*** Add File: ",
+                    "*** Update File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                ):
+                    if not line.startswith(prefix):
+                        continue
+                    target = line[len(prefix) :].strip()
+                    if target in _DISALLOWED_FILE_PATHS:
+                        return ArgumentSanityViolation(
+                            reason="invalid_file_path",
+                            message=(
+                                f"{tool_name} cannot target special device file "
+                                f"{target!r}. Supply an actual file path, or do not "
+                                "call this tool if no file change is required."
+                            ),
+                        )
+                for prefix in ("--- ", "+++ "):
+                    if not line.startswith(prefix):
+                        continue
+                    target = line[len(prefix) :].strip()
+                    if target.startswith(("a/", "b/")):
+                        target = target[2:]
+                    if target in _DISALLOWED_FILE_PATHS:
+                        return ArgumentSanityViolation(
+                            reason="invalid_file_path",
+                            message=(
+                                f"{tool_name} cannot target special device file "
+                                f"{target!r}. Supply an actual file path, or do not "
+                                "call this tool if no file change is required."
+                            ),
+                        )
 
     # multiedit with an empty edits array is a no-op placeholder call.
     if tool_name == "multiedit":

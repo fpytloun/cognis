@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from cognis.core.tool_exposure import EditToolMode, preferred_edit_tool_mode
+
 
 class PromptContext(Enum):
     """Execution context that determines which system instructions to inject."""
@@ -78,20 +80,19 @@ and identifiers in English.
 - When referencing code, include file paths and line numbers \
 (e.g. `src/main.py:42`)."""
 
-_TOOL_GUIDANCE = """\
+_TOOL_GUIDANCE_TEMPLATE = """\
 ## Tool usage
 
 - Use the most direct tool for the operation.
-- Use `read`, `grep`, `glob`, `edit`, `multiedit`, `patch`, and `write` \
-  for file contents and code changes.
+- Use `read`, `grep`, and `glob` for file contents and code inspection.
+{edit_guidance}
 - Use `bash` for terminal-native operations and atomic filesystem \
   operations such as `mv`, `cp`, `rm`, `mkdir`, `chmod`, `git`, build, \
   test, and package-manager commands.
 - Prefer dedicated edit tools over shell or interpreter one-liners for file \
   content changes.
 - Avoid using `bash` to run Python, Perl, Ruby, or shell one-liners that \
-  rewrite files when `edit`, `multiedit`, `patch`, or `write` can make the \
-  change directly.
+  rewrite files when dedicated edit tools can make the change directly.
 - Do not emulate filesystem operations by reading and rewriting file \
   contents when a direct `bash` operation is more appropriate.
 - Prefer the fewest correct tool calls.
@@ -110,6 +111,14 @@ queries and enable `exact_match` when appropriate.
 - For structured saved outputs such as numbered search results, prefer \
 list_tool_output_anchors then read_tool_output_anchor over reloading the \
 entire output."""
+
+_EDIT_GUIDANCE = """\
+- Use whichever dedicated edit tools are actually visible for file contents \
+  and code changes.
+- Use `patch` for patch-envelope or unified-diff style changes when it is \
+  visible. Use `edit`, `multiedit`, and `write` for exact replacements and \
+  file creation when those tools are visible.
+- Do not call edit tools that are not visible in the current tool list."""
 
 _EXECUTION_BIAS = """\
 ## Execution bias
@@ -312,6 +321,47 @@ You are handling a system-initiated follow-up that should be presented as a sepa
 - If the follow-up indicates failure or pause, explain the issue and any user options without pretending the old thread is still active."""
 
 
+def _build_tool_guidance(model_id: str | None) -> str:
+    return _TOOL_GUIDANCE_TEMPLATE.format(edit_guidance=_EDIT_GUIDANCE)
+
+
+def build_visible_edit_tool_guidance(
+    visible_tool_names: set[str] | frozenset[str], *, model_id: str | None = None
+) -> str | None:
+    """Return turn-local guidance that matches the actually exposed edit tools."""
+
+    has_patch = "patch" in visible_tool_names
+    exact_tools = [name for name in ("edit", "multiedit", "write") if name in visible_tool_names]
+    if not has_patch and not exact_tools:
+        return None
+    if has_patch and not exact_tools:
+        return (
+            "Turn-local edit guidance: `patch` is the visible edit tool. Use it for file "
+            "contents and code changes; do not call `edit`, `multiedit`, or `write` unless "
+            "they become visible in a later turn."
+        )
+    if exact_tools and not has_patch:
+        rendered = ", ".join(f"`{name}`" for name in exact_tools)
+        return (
+            f"Turn-local edit guidance: {rendered} are the visible edit tools. Use these "
+            "for file contents and code changes; do not call `patch` unless it becomes "
+            "visible in a later turn."
+        )
+
+    edit_mode = preferred_edit_tool_mode(model_id)
+    if edit_mode is EditToolMode.PATCH:
+        return (
+            "Turn-local edit guidance: `patch` and exact edit tools are visible. Prefer "
+            "`patch` for source-code modifications on this model; use exact edit tools only "
+            "when they are the simpler correct option."
+        )
+    return (
+        "Turn-local edit guidance: `patch` and exact edit tools are visible. Prefer "
+        "`edit` or `multiedit` for existing files and reserve `write` for new files or "
+        "full-file replacement."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hidden agent prompt overrides (evaluator, classifier, compaction)
 # ---------------------------------------------------------------------------
@@ -350,6 +400,7 @@ def build_system_instructions(
     *,
     agent_id: str | None = None,
     include_work_routing: bool = True,
+    model_id: str | None = None,
 ) -> str | None:
     """Assemble context-appropriate system instructions.
 
@@ -366,7 +417,11 @@ def build_system_instructions(
     if agent_id and agent_id in _SKIP_SYSTEM_INSTRUCTIONS:
         return None
 
-    sections: list[str] = [_CORE_BEHAVIOR, _TOOL_GUIDANCE, _CONTEXT_AWARENESS]
+    sections: list[str] = [
+        _CORE_BEHAVIOR,
+        _build_tool_guidance(model_id),
+        _CONTEXT_AWARENESS,
+    ]
 
     if context == PromptContext.CHAT:
         sections.append(_EXECUTION_BIAS)

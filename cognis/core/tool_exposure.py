@@ -51,10 +51,98 @@ class ToolDiscoveryMode(StrEnum):
     NONE = "none"
 
 
+class EditToolMode(StrEnum):
+    """Preferred model-facing editing surface."""
+
+    PATCH = "patch"
+    EXACT = "exact"
+
+
+class EditToolFamily(StrEnum):
+    """Coarse model family used for prompt and tool-surface tailoring."""
+
+    GPT5 = "gpt5"
+    ANTHROPIC = "anthropic"
+    GEMINI = "gemini"
+    GROQ = "groq"
+    OPEN_SOURCE = "open_source"
+    GENERIC = "generic"
+
+
+_EXACT_TOOL_NAMES = frozenset({"edit", "multiedit", "write"})
+_PATCH_TOOL_NAMES = frozenset({"patch"})
+_OPEN_SOURCE_MODEL_TOKENS = (
+    "gpt-oss",
+    "llama",
+    "qwen",
+    "mistral",
+    "mixtral",
+    "deepseek",
+    "gemma",
+    "phi",
+    "falcon",
+    "rwkv",
+    "granite",
+    "olmo",
+    "yi-",
+    "smollm",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ToolExposureContract:
     llm_api: LLMApiMode
     discovery_mode: ToolDiscoveryMode
+
+
+def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
+    """Return the family used for edit-tool preference decisions."""
+
+    normalized = _normalize_model_name(model_id)
+    if "claude" in normalized or normalized.startswith("anthropic/"):
+        return EditToolFamily.ANTHROPIC
+    if "gemini" in normalized or normalized.startswith(("google/", "vertex_ai/")):
+        return EditToolFamily.GEMINI
+    if normalized.startswith("groq/"):
+        return EditToolFamily.GROQ
+    if ("gpt-5" in normalized or "codex" in normalized) and "gpt-oss" not in normalized:
+        return EditToolFamily.GPT5
+    if any(token in normalized for token in _OPEN_SOURCE_MODEL_TOKENS):
+        return EditToolFamily.OPEN_SOURCE
+    return EditToolFamily.GENERIC
+
+
+def preferred_edit_tool_mode(model_id: str | None) -> EditToolMode:
+    """Return the preferred edit surface for a model family."""
+
+    if detect_edit_tool_family(model_id) is EditToolFamily.GPT5:
+        return EditToolMode.PATCH
+    return EditToolMode.EXACT
+
+
+def filter_edit_tools_for_model(tools: list[ToolDefinition], model_id: str | None) -> list[ToolDefinition]:
+    """Drop mutually-exclusive edit tools when both surfaces are available."""
+
+    tool_names = {tool.name for tool in tools}
+    has_patch = bool(tool_names & _PATCH_TOOL_NAMES)
+    has_exact = bool(tool_names & _EXACT_TOOL_NAMES)
+    if not (has_patch and has_exact):
+        return tools
+
+    preferred = preferred_edit_tool_mode(model_id)
+    keep_names = _PATCH_TOOL_NAMES if preferred is EditToolMode.PATCH else _EXACT_TOOL_NAMES
+    filtered: list[ToolDefinition] = []
+    for tool in tools:
+        if tool.name in _PATCH_TOOL_NAMES | _EXACT_TOOL_NAMES and tool.name not in keep_names:
+            continue
+        filtered.append(tool)
+    return filtered
+
+
+def _normalize_model_name(model_id: str | None) -> str:
+    if not isinstance(model_id, str):
+        return ""
+    return model_id.strip().lower()
 
 
 def prepare_tool_exposure(
@@ -96,6 +184,9 @@ def prepare_tool_exposure(
     ]
     request_kwargs: dict[str, Any] = {}
 
+    effective_model_id = getattr(model_info, "model_id", None)
+    edit_tool_family = detect_edit_tool_family(effective_model_id)
+    edit_tool_mode = preferred_edit_tool_mode(effective_model_id)
     sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
 
     # Resolve policy-visible set.
@@ -124,6 +215,9 @@ def prepare_tool_exposure(
         for tool in sorted_inventory
         if stable_tool_id(tool) in promoted_tool_ids
     ]
+    policy_visible_tools = filter_edit_tools_for_model(policy_visible_tools, effective_model_id)
+    hidden_searchable_tools = filter_edit_tools_for_model(hidden_searchable_tools, effective_model_id)
+    promoted_visible = filter_edit_tools_for_model(promoted_visible, effective_model_id)
 
     # search_tools lives in the controller schemas, not the inventory.
     search_tool_schema_present = any(
@@ -187,6 +281,7 @@ def prepare_tool_exposure(
             if stable_tool_id(tool) not in promoted_tool_ids
         ]
         visible_tools = policy_visible_tools + promoted_non_policy + remaining_hidden
+        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(
             visible_tools,
             alias_map,
@@ -216,6 +311,7 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=has_hidden,
         )
+        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
 
@@ -223,6 +319,7 @@ def prepare_tool_exposure(
         # OpenAI Responses without discovery: show policy-visible + promoted.
         strategy = "openai_responses_visible_only"
         visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
+        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
 
@@ -235,12 +332,14 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=has_hidden,
         )
+        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
     else:
         # No discovery: show policy-visible + promoted only.
         strategy = "chat_visible_only"
         visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
+        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
@@ -273,6 +372,8 @@ def prepare_tool_exposure(
             "promoted_visible_count": len(promoted_visible_ids),
             "visible_tool_count": len(visible_tools),
             "max_tools": max_tools,
+            "edit_tool_family": str(edit_tool_family),
+            "edit_tool_mode": str(edit_tool_mode),
         },
     )
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import difflib
 import mimetypes
 import os
 import re
@@ -105,6 +106,7 @@ class _StagedPatchOperation:
     kind: str
     source_path: Path | None = None
     destination_path: Path | None = None
+    previous_content: str = ""
     content: str | None = None
 
 
@@ -285,6 +287,28 @@ def _find_prettier_binary(start_dir: Path) -> str | None:
     return global_prettier
 
 
+def _unified_diff(path: Path, before: str, after: str) -> str:
+    if before == after:
+        return ""
+    return "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=str(path),
+            tofile=str(path),
+        )
+    )
+
+
+def _files_written_metadata(
+    paths: list[Path], diffs: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"files_written": [str(path) for path in paths]}
+    if diffs:
+        metadata["file_diffs"] = diffs
+    return metadata
+
+
 async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Read a file or directory, returning line-numbered content for text."""
     file_path = arguments.get("file_path", "")
@@ -408,27 +432,40 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
 
     async def _write() -> ToolResult:
         exists = path.exists()
+        before = ""
+        content_to_write = content
         if exists:
             try:
                 await _assert_can_modify_existing(context, path)
+                before = _read_text_preserving_newlines(path) if path.is_file() else ""
+                if path.is_file():
+                    content_to_write = _normalize_text_for_newline(content, _detect_newline(before))
             except RuntimeError as exc:
                 return ToolResult(output=str(exc), is_error=True)
+            except (OSError, PermissionError, UnicodeDecodeError) as exc:
+                return ToolResult(output=f"Cannot read file before write: {exc}", is_error=True)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            path.write_text(content_to_write, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(path)
+            final_content = _read_text_preserving_newlines(path)
             if formatter_changed:
                 _remove_tracked_path(context, path)
             else:
                 await _record_write(context, path)
-        except (OSError, PermissionError) as exc:
+        except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-        output = f"Wrote {len(content)} bytes to {file_path}"
+        output = f"Wrote {len(content_to_write.encode('utf-8'))} bytes to {file_path}"
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output, metadata={"files_written": [str(path)]})
+        return ToolResult(
+            output=output,
+            metadata=_files_written_metadata(
+                [path], [{"path": str(path), "diff": _unified_diff(path, before, final_content)}]
+            ),
+        )
 
     return await _with_file_lock(context, path, _write)
 
@@ -533,13 +570,14 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
             else content.replace(normalized_old, normalized_new, 1)
         )
         try:
-            path.write_text(new_content, encoding="utf-8", newline=newline)
+            path.write_text(new_content, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(path)
+            final_content = _read_text_preserving_newlines(path)
             if formatter_changed:
                 _remove_tracked_path(context, path)
             else:
                 await _record_write(context, path)
-        except (OSError, PermissionError) as exc:
+        except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
         replacements = count if replace_all else 1
@@ -549,14 +587,19 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output, metadata={"files_written": [str(path)]})
+        return ToolResult(
+            output=output,
+            metadata=_files_written_metadata(
+                [path], [{"path": str(path), "diff": _unified_diff(path, content, final_content)}]
+            ),
+        )
 
     return await _with_file_lock(context, path, _edit)
 
 
 async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-    """Apply a strict unified diff or apply_patch patch."""
-    patch_text = arguments.get("patch_text", "")
+    """Apply a strict patch envelope or unified diff patch."""
+    patch_text = arguments.get("patch_text") or arguments.get("patchText") or ""
     if not patch_text.strip():
         return ToolResult(output="Empty patch text.", is_error=True)
 
@@ -579,7 +622,7 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
             # Re-stage once more immediately before apply so we catch files
             # that changed after the initial read but before the write phase.
             staged = await _stage_patch_operations(operations, context)
-            summary_lines, diagnostic_paths = await _apply_staged_patch_operations(staged, context)
+            summary_lines, diagnostic_paths, file_diffs = await _apply_staged_patch_operations(staged, context)
     except (
         PatchFormatError,
         PatchConflictError,
@@ -601,7 +644,7 @@ async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext)
 
     return ToolResult(
         output="\n".join(summary_lines),
-        metadata={"files_written": [str(path) for path in diagnostic_paths]},
+        metadata=_files_written_metadata(diagnostic_paths, file_diffs),
     )
 
 
@@ -631,6 +674,7 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
             return ToolResult(output=f"Cannot read file: {exc}", is_error=True)
 
         newline = _detect_newline(content)
+        original_content = content
 
         applied = 0
         for i, edit in enumerate(edits):
@@ -660,13 +704,14 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
             applied += 1
 
         try:
-            path.write_text(content, encoding="utf-8", newline=newline)
+            path.write_text(content, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(path)
+            final_content = _read_text_preserving_newlines(path)
             if formatter_changed:
                 _remove_tracked_path(context, path)
             else:
                 await _record_write(context, path)
-        except (OSError, PermissionError) as exc:
+        except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
         output = f"Applied {applied} edit(s) to {file_path}"
@@ -675,7 +720,12 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
         diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
         if diagnostics_text:
             output += f"\n\n{diagnostics_text}"
-        return ToolResult(output=output, metadata={"files_written": [str(path)]})
+        return ToolResult(
+            output=output,
+            metadata=_files_written_metadata(
+                [path], [{"path": str(path), "diff": _unified_diff(path, original_content, final_content)}]
+            ),
+        )
 
     return await _with_file_lock(context, path, _multiedit)
 
@@ -731,10 +781,14 @@ def _line_stripped(line: str) -> str:
     return line.rstrip("\r\n")
 
 
-def _is_apply_patch_header(stripped: str) -> bool:
+def _is_patch_envelope_header(stripped: str) -> bool:
     return stripped in {"*** End Patch", "*** End of File"} or stripped.startswith(
         ("*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: ")
     )
+
+
+def _is_no_newline_marker(stripped: str) -> bool:
+    return stripped == "\\ No newline at end of file"
 
 
 def _detect_newline(text: str) -> str:
@@ -751,6 +805,36 @@ def _normalize_patch_text_for_newline(text: str, newline: str) -> str:
     if newline == "\n":
         return text
     return text.replace("\n", newline)
+
+
+def _strip_one_trailing_newline(text: str) -> str:
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def _strip_last_part_newline(parts: list[str]) -> None:
+    if parts:
+        parts[-1] = _strip_one_trailing_newline(parts[-1])
+
+
+def _apply_no_newline_marker(
+    old_parts: list[str], new_parts: list[str], last_line_kind: str | None
+) -> None:
+    if last_line_kind == "-":
+        _strip_last_part_newline(old_parts)
+    elif last_line_kind == "+":
+        _strip_last_part_newline(new_parts)
+    elif last_line_kind == " ":
+        _strip_last_part_newline(old_parts)
+        _strip_last_part_newline(new_parts)
+
+
+def _read_text_preserving_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def _read_text_file(path: Path) -> str:
@@ -771,14 +855,14 @@ def _parse_patch_operations(
 ) -> list[_PatchOperation]:
     stripped = patch_text.lstrip()
     if stripped.startswith("*** Begin Patch"):
-        return _parse_apply_patch(patch_text, context)
+        return _parse_patch_envelope(patch_text, context)
     return _parse_unified_diff(patch_text, context)
 
 
-def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
+def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
     lines = patch_text.splitlines(keepends=True)
     if not lines or _line_stripped(lines[0]) != "*** Begin Patch":
-        raise PatchFormatError("apply_patch must start with `*** Begin Patch`.")
+        raise PatchFormatError("patch must start with `*** Begin Patch`.")
 
     operations: list[_PatchOperation] = []
     index = 1
@@ -790,7 +874,8 @@ def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_
                 raise PatchFormatError("Unexpected content after `*** End Patch`.")
             return operations
         if stripped == "*** End of File":
-            raise PatchFormatError("`*** End of File` is not supported.")
+            index += 1
+            continue
         if stripped.startswith("*** Update File: "):
             raw_path = stripped[len("*** Update File: ") :].strip()
             if not raw_path:
@@ -816,14 +901,15 @@ def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_
             while index < len(lines):
                 stripped = _line_stripped(lines[index])
                 if stripped == "*** End of File":
-                    raise PatchFormatError("`*** End of File` is not supported.")
-                if _is_apply_patch_header(stripped) and not stripped.startswith("@@"):
+                    index += 1
+                    continue
+                if _is_patch_envelope_header(stripped) and not stripped.startswith("@@"):
                     break
                 if not lines[index].startswith("@@"):
                     raise PatchFormatError(
                         f"Unexpected line in update patch: {stripped or '<blank>'}"
                     )
-                hunk, index = _parse_apply_patch_hunk(lines, index)
+                hunk, index = _parse_patch_envelope_hunk(lines, index)
                 operation.hunks.append(hunk)
 
             if not operation.hunks and operation.kind != "move":
@@ -844,11 +930,14 @@ def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_
             while index < len(lines):
                 stripped = _line_stripped(lines[index])
                 if stripped == "*** End of File":
-                    raise PatchFormatError("`*** End of File` is not supported.")
-                if _is_apply_patch_header(stripped):
+                    index += 1
+                    continue
+                if _is_patch_envelope_header(stripped):
                     break
-                if stripped == "\\ No newline at end of file":
-                    raise PatchFormatError("`\\ No newline at end of file` is not supported.")
+                if _is_no_newline_marker(stripped):
+                    _strip_last_part_newline(content_parts)
+                    index += 1
+                    continue
                 if not lines[index].startswith("+"):
                     raise PatchFormatError("`*** Add File:` only accepts `+` lines.")
                 content_parts.append(lines[index][1:])
@@ -869,37 +958,44 @@ def _parse_apply_patch(patch_text: str, context: ToolExecutionContext) -> list[_
             while index < len(lines):
                 stripped = _line_stripped(lines[index])
                 if stripped == "*** End of File":
-                    raise PatchFormatError("`*** End of File` is not supported.")
-                if _is_apply_patch_header(stripped):
+                    index += 1
+                    continue
+                if _is_patch_envelope_header(stripped):
                     break
                 raise PatchFormatError("`*** Delete File:` does not accept body content.")
             operations.append(operation)
             continue
 
-        raise PatchFormatError(f"Unknown apply_patch header: {stripped or '<blank>'}")
+        raise PatchFormatError(f"Unknown patch header: {stripped or '<blank>'}")
 
-    raise PatchFormatError("apply_patch is missing `*** End Patch`.")
+    raise PatchFormatError("patch is missing `*** End Patch`.")
 
 
-def _parse_apply_patch_hunk(lines: list[str], start_index: int) -> tuple[_PatchHunk, int]:
+def _parse_patch_envelope_hunk(lines: list[str], start_index: int) -> tuple[_PatchHunk, int]:
     index = start_index + 1
     old_parts: list[str] = []
     new_parts: list[str] = []
+    last_line_kind: str | None = None
     while index < len(lines):
         stripped = _line_stripped(lines[index])
-        if lines[index].startswith("@@") or _is_apply_patch_header(stripped):
+        if lines[index].startswith("@@") or _is_patch_envelope_header(stripped):
             break
-        if stripped == "\\ No newline at end of file":
-            raise PatchFormatError("`\\ No newline at end of file` is not supported.")
+        if _is_no_newline_marker(stripped):
+            _apply_no_newline_marker(old_parts, new_parts, last_line_kind)
+            index += 1
+            continue
         line = lines[index]
         if line.startswith("-"):
             old_parts.append(line[1:])
+            last_line_kind = "-"
         elif line.startswith("+"):
             new_parts.append(line[1:])
+            last_line_kind = "+"
         elif line.startswith(" "):
             content = line[1:]
             old_parts.append(content)
             new_parts.append(content)
+            last_line_kind = " "
         else:
             raise PatchFormatError(f"Invalid hunk line: {_line_stripped(line) or '<blank>'}")
         index += 1
@@ -914,11 +1010,13 @@ def _parse_unified_diff(patch_text: str, context: ToolExecutionContext) -> list[
     old_parts: list[str] = []
     new_parts: list[str] = []
     hunk_start: int | None = None
+    last_line_kind: str | None = None
 
     for line in patch_text.splitlines(keepends=True):
         stripped = _line_stripped(line)
-        if stripped == "\\ No newline at end of file":
-            raise PatchFormatError("`\\ No newline at end of file` is not supported.")
+        if _is_no_newline_marker(stripped):
+            _apply_no_newline_marker(old_parts, new_parts, last_line_kind)
+            continue
         if line.startswith("diff ") or line.startswith("index "):
             continue
         if line.startswith("--- "):
@@ -962,6 +1060,7 @@ def _parse_unified_diff(patch_text: str, context: ToolExecutionContext) -> list[
             old_parts = []
             new_parts = []
             hunk_start = None
+            last_line_kind = None
             expected_old_path = None
             continue
         if (
@@ -983,17 +1082,21 @@ def _parse_unified_diff(patch_text: str, context: ToolExecutionContext) -> list[
             hunk_start = int(match.group(1))
             old_parts = []
             new_parts = []
+            last_line_kind = None
             continue
         if current_path is None:
             continue
         if line.startswith("-"):
             old_parts.append(line[1:])
+            last_line_kind = "-"
         elif line.startswith("+"):
             new_parts.append(line[1:])
+            last_line_kind = "+"
         elif line.startswith(" "):
             content = line[1:]
             old_parts.append(content)
             new_parts.append(content)
+            last_line_kind = " "
         else:
             raise PatchFormatError(f"Unsupported unified diff line: {stripped or '<blank>'}")
 
@@ -1053,13 +1156,10 @@ async def _stage_patch_operation(
             raise PatchConflictError(
                 f"Add File target already exists: {operation.destination_path}"
             )
-        if not operation.destination_path.parent.is_dir():
-            raise PatchConflictError(
-                f"Parent directory does not exist: {operation.destination_path.parent}"
-            )
         return _StagedPatchOperation(
             kind="add",
             destination_path=operation.destination_path,
+            previous_content="",
             content=operation.add_content,
         )
 
@@ -1076,7 +1176,9 @@ async def _stage_patch_operation(
     newline = _detect_newline(source_content)
 
     if operation.kind == "delete":
-        return _StagedPatchOperation(kind="delete", source_path=source_path)
+        return _StagedPatchOperation(
+            kind="delete", source_path=source_path, previous_content=source_content
+        )
 
     destination_path = operation.destination_path or source_path
     if operation.kind == "move":
@@ -1084,19 +1186,18 @@ async def _stage_patch_operation(
             raise PatchConflictError(f"Move destination must differ from source: {source_path}")
         if destination_path.exists():
             raise PatchConflictError(f"Move destination already exists: {destination_path}")
-        if not destination_path.parent.is_dir():
-            raise PatchConflictError(f"Parent directory does not exist: {destination_path.parent}")
 
-    staged_content = _apply_patch_hunks(source_content, operation.hunks, newline)
+    staged_content = _apply_envelope_hunks(source_content, operation.hunks, newline)
     return _StagedPatchOperation(
         kind=operation.kind,
         source_path=source_path,
         destination_path=destination_path,
+        previous_content=source_content,
         content=staged_content,
     )
 
 
-def _apply_patch_hunks(content: str, hunks: list[_PatchHunk], newline: str) -> str:
+def _apply_envelope_hunks(content: str, hunks: list[_PatchHunk], newline: str) -> str:
     if any(hunk.old_start is not None for hunk in hunks):
         lines = content.splitlines(keepends=True)
         offset = 0
@@ -1121,6 +1222,12 @@ def _apply_patch_hunks(content: str, hunks: list[_PatchHunk], newline: str) -> s
         old_text = _normalize_patch_text_for_newline(hunk.old_text, newline)
         new_text = _normalize_patch_text_for_newline(hunk.new_text, newline)
         matches = updated.count(old_text)
+        if matches == 0 and old_text != (trimmed_old := _strip_one_trailing_newline(old_text)):
+            trimmed_new = _strip_one_trailing_newline(new_text)
+            trimmed_matches = updated.count(trimmed_old)
+            if trimmed_matches == 1:
+                updated = updated.replace(trimmed_old, trimmed_new, 1)
+                continue
         if matches == 0:
             raise PatchConflictError("Patch hunk did not match the current file content.")
         if matches > 1:
@@ -1131,21 +1238,30 @@ def _apply_patch_hunks(content: str, hunks: list[_PatchHunk], newline: str) -> s
 
 async def _apply_staged_patch_operations(
     staged: list[_StagedPatchOperation], context: ToolExecutionContext
-) -> tuple[list[str], list[Path]]:
+) -> tuple[list[str], list[Path], list[dict[str, str]]]:
     summary_lines: list[str] = []
     diagnostic_paths: list[Path] = []
+    file_diffs: list[dict[str, str]] = []
 
     for operation in staged:
         if operation.kind == "add":
             assert operation.destination_path is not None and operation.content is not None
-            operation.destination_path.write_text(operation.content, encoding="utf-8")
+            operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
+            operation.destination_path.write_text(operation.content, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(operation.destination_path)
+            final_content = _read_text_file(operation.destination_path)
             if formatter_changed:
                 _remove_tracked_path(context, operation.destination_path)
             else:
                 await _record_write(context, operation.destination_path)
             summary_lines.append(f"Added {operation.destination_path}")
             diagnostic_paths.append(operation.destination_path)
+            file_diffs.append(
+                {
+                    "path": str(operation.destination_path),
+                    "diff": _unified_diff(operation.destination_path, "", final_content),
+                }
+            )
             continue
 
         if operation.kind == "delete":
@@ -1153,18 +1269,33 @@ async def _apply_staged_patch_operations(
             operation.source_path.unlink()
             _remove_tracked_path(context, operation.source_path)
             summary_lines.append(f"Deleted {operation.source_path}")
+            file_diffs.append(
+                {
+                    "path": str(operation.source_path),
+                    "diff": _unified_diff(operation.source_path, operation.previous_content, ""),
+                }
+            )
             continue
 
         if operation.kind == "update":
             assert operation.source_path is not None and operation.content is not None
-            operation.source_path.write_text(operation.content, encoding="utf-8")
+            operation.source_path.write_text(operation.content, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(operation.source_path)
+            final_content = _read_text_file(operation.source_path)
             if formatter_changed:
                 _remove_tracked_path(context, operation.source_path)
             else:
                 await _record_write(context, operation.source_path)
             summary_lines.append(f"Updated {operation.source_path}")
             diagnostic_paths.append(operation.source_path)
+            file_diffs.append(
+                {
+                    "path": str(operation.source_path),
+                    "diff": _unified_diff(
+                        operation.source_path, operation.previous_content, final_content
+                    ),
+                }
+            )
             continue
 
         if operation.kind == "move":
@@ -1175,11 +1306,15 @@ async def _apply_staged_patch_operations(
             )
             source_content = _read_text_file(operation.source_path)
             if source_content == operation.content:
+                operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
                 operation.source_path.rename(operation.destination_path)
                 await _move_tracked_path(context, operation.source_path, operation.destination_path)
+                final_content = operation.content
             else:
-                operation.destination_path.write_text(operation.content, encoding="utf-8")
+                operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
+                operation.destination_path.write_text(operation.content, encoding="utf-8", newline="")
                 formatter_changed = await _maybe_format_file(operation.destination_path)
+                final_content = _read_text_file(operation.destination_path)
                 if formatter_changed:
                     _remove_tracked_path(context, operation.destination_path)
                 else:
@@ -1188,9 +1323,17 @@ async def _apply_staged_patch_operations(
                 _remove_tracked_path(context, operation.source_path)
             summary_lines.append(f"Moved {operation.source_path} -> {operation.destination_path}")
             diagnostic_paths.append(operation.destination_path)
+            file_diffs.append(
+                {
+                    "path": str(operation.destination_path),
+                    "diff": _unified_diff(
+                        operation.destination_path, operation.previous_content, final_content
+                    ),
+                }
+            )
             continue
 
         raise PatchConflictError(f"Unsupported patch operation: {operation.kind}")
 
     deduped_paths = list(dict.fromkeys(diagnostic_paths))
-    return summary_lines, deduped_paths
+    return summary_lines, deduped_paths, file_diffs

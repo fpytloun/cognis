@@ -1645,6 +1645,7 @@ class ContextAssembler:
             prompt_context,
             agent_id=agent.agent_id,
             include_work_routing=include_work_routing,
+            model_id=resolved_model,
         )
         if system_instructions:
             tagged_instructions = _tagged_section("instructions", system_instructions)

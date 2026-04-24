@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from cognis.core.prompts import PromptContext, build_system_instructions
+from cognis.core.prompts import (
+    PromptContext,
+    build_system_instructions,
+    build_visible_edit_tool_guidance,
+)
 
 
 def test_chat_prompt_describes_turn_local_todos() -> None:
@@ -59,6 +63,28 @@ def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
     assert instructions is not None
     assert "Prefer dedicated edit tools over shell or interpreter one-liners" in instructions
     assert "Avoid using `bash` to run Python, Perl, Ruby" in instructions
+
+
+def test_prompt_does_not_assume_patch_is_visible() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT, model_id="gpt-5.4")
+    assert instructions is not None
+    assert "actually visible" in instructions
+    assert "Do not call edit tools that are not visible" in instructions
+    assert "Prefer `patch` over `write`, `edit`, or `multiedit`" not in instructions
+
+
+def test_visible_edit_guidance_prefers_patch_when_only_patch_is_visible() -> None:
+    guidance = build_visible_edit_tool_guidance({"read", "patch"}, model_id="gpt-5.4")
+    assert guidance is not None
+    assert "`patch` is the visible edit tool" in guidance
+    assert "do not call `edit`, `multiedit`, or `write`" in guidance
+
+
+def test_visible_edit_guidance_avoids_patch_when_not_visible() -> None:
+    guidance = build_visible_edit_tool_guidance({"read", "edit", "write"}, model_id="gpt-5.4")
+    assert guidance is not None
+    assert "`edit`, `write` are the visible edit tools" in guidance
+    assert "do not call `patch`" in guidance
 
 
 def test_critical_rules_cover_truncated_output_recovery_and_placeholder_bleed() -> None:

@@ -237,6 +237,22 @@ class TestWriteTool:
         assert "modified since it was last read" in result.output
 
     @pytest.mark.asyncio()
+    async def test_write_existing_file_preserves_crlf(self, tmp_path: Path) -> None:
+        target = tmp_path / "existing.txt"
+        target.write_bytes(b"old\r\nvalue\r\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_write({"file_path": str(target), "content": "new\nvalue\n"}, context)
+
+        assert not result.is_error
+        assert target.read_bytes() == b"new\r\nvalue\r\n"
+        assert result.metadata is not None
+        diff = result.metadata["file_diffs"][0]["diff"]
+        assert "-old\r\n" in diff
+        assert "+new\r\n" in diff
+
+    @pytest.mark.asyncio()
     async def test_write_succeeds_when_lsp_fails(self, tmp_path: Path) -> None:
         class _BrokenLSP:
             async def touch_file(self, *_: object, **__: object) -> None:
@@ -281,6 +297,8 @@ class TestWriteTool:
 
         assert not result.is_error
         assert target.read_text() == "x = 1\n"
+        assert result.metadata is not None
+        assert result.metadata["file_diffs"][0]["diff"].endswith("+x = 1\n")
 
         follow_up = await handle_edit(
             {"file_path": str(target), "old_string": "x = 1", "new_string": "x = 2"},
@@ -340,6 +358,26 @@ class TestEditTool:
         )
         assert not result.is_error
         assert "baz qux" in tmp_file.read_text()
+
+    @pytest.mark.asyncio()
+    async def test_edit_diff_metadata_preserves_crlf(self, tmp_path: Path) -> None:
+        target = tmp_path / "crlf.txt"
+        target.write_bytes(b"alpha\r\nbeta\r\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {"file_path": str(target), "old_string": "beta", "new_string": "gamma"},
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_bytes() == b"alpha\r\ngamma\r\n"
+        assert result.metadata is not None
+        diff = result.metadata["file_diffs"][0]["diff"]
+        assert " alpha\r\n" in diff
+        assert "+gamma\r\n" in diff
+        assert "+alpha\n" not in diff
 
     @pytest.mark.asyncio()
     async def test_edit_multiple_matches_fails(self, tmp_file: Path) -> None:
@@ -414,6 +452,27 @@ class TestMultieditTool:
         assert "CCC" in content
 
     @pytest.mark.asyncio()
+    async def test_multiedit_preserves_crlf(self, tmp_path: Path) -> None:
+        f = tmp_path / "multi-crlf.txt"
+        f.write_bytes(b"aaa\r\nbbb\r\nccc\r\n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
+
+        result = await handle_multiedit(
+            {
+                "file_path": str(f),
+                "edits": [
+                    {"old_string": "aaa", "new_string": "AAA"},
+                    {"old_string": "ccc", "new_string": "CCC"},
+                ],
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert f.read_bytes() == b"AAA\r\nbbb\r\nCCC\r\n"
+
+    @pytest.mark.asyncio()
     async def test_multiedit_stale_read_fails(self, tmp_path: Path) -> None:
         f = tmp_path / "multi.txt"
         f.write_text("aaa\nbbb\nccc\n")
@@ -467,6 +526,27 @@ class TestPatchTool:
 
         assert not result.is_error
         assert target.read_text() == "hi\n"
+        assert result.metadata is not None
+        assert result.metadata["file_diffs"][0]["diff"]
+
+    @pytest.mark.asyncio()
+    async def test_patch_accepts_patch_text_camel_case_alias(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
     async def test_patch_add_file_success(self, tmp_path: Path) -> None:
@@ -495,6 +575,22 @@ class TestPatchTool:
 
         assert not result.is_error
         assert target.read_text() == ""
+
+    @pytest.mark.asyncio()
+    async def test_patch_add_file_creates_parent_directories(self, tmp_path: Path) -> None:
+        target = tmp_path / "nested" / "new.txt"
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** End Patch\n"
+                )
+            },
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
     async def test_patch_add_file_fails_if_exists(self, tmp_path: Path) -> None:
@@ -593,6 +689,27 @@ class TestPatchTool:
         assert not result.is_error
         assert not source.exists()
         assert dest.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_move_creates_parent_directories(self, tmp_path: Path) -> None:
+        source = tmp_path / "old.txt"
+        dest = tmp_path / "nested" / "new.txt"
+        source.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(source)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert not source.exists()
+        assert dest.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
     async def test_patch_move_fails_if_destination_exists(self, tmp_path: Path) -> None:
@@ -750,7 +867,7 @@ class TestPatchTool:
         assert "denied" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_rejects_end_of_file_marker(self, tmp_path: Path) -> None:
+    async def test_patch_accepts_end_of_file_marker(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
         context = _context()
@@ -765,8 +882,65 @@ class TestPatchTool:
             context,
         )
 
-        assert result.is_error
-        assert "*** End of File" in result.output
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_accepts_no_newline_marker(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n\\ No newline at end of file\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi"
+
+    @pytest.mark.asyncio()
+    async def test_patch_no_newline_marker_can_add_final_newline(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n\\ No newline at end of file\n+hello\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hello\n"
+
+    @pytest.mark.asyncio()
+    async def test_patch_unified_diff_accepts_no_newline_marker(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_patch(
+            {
+                "patch_text": (
+                    f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n\\ No newline at end of file\n+hi\n\\ No newline at end of file\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi"
 
     @pytest.mark.asyncio()
     async def test_patch_rejects_unified_diff_rename_headers(self, tmp_path: Path) -> None:

@@ -62,7 +62,7 @@ from cognis.core.project_context import (
     normalize_project_path,
     project_context_event_data,
 )
-from cognis.core.prompts import PromptContext
+from cognis.core.prompts import PromptContext, build_visible_edit_tool_guidance
 from cognis.core.pruning import prune_tool_outputs
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, ResolvedStepRuntime
 from cognis.core.step_profiles import (
@@ -2396,6 +2396,8 @@ class AgentLoop:
         continuation_message_index: int | None = None
         continuation_reminder_index: int | None = None
         relevant_skills_message_added = False
+        queued_edit_guidance: str | None = None
+        edit_guidance_message_index: int | None = None
         while True:
             self._raise_if_cancelled(ctx)
 
@@ -2407,14 +2409,6 @@ class AgentLoop:
                 if relevant_skills_message is not None:
                     messages.append(relevant_skills_message)
                 relevant_skills_message_added = True
-
-            resolved_model = getattr(context_result, "resolved_model", "")
-            model_messages = self._project_model_messages(
-                ctx,
-                messages=messages,
-                resolved_model=resolved_model,
-                max_context_tokens=context_result.max_context_tokens,
-            )
 
             # Resolve model and reasoning effort for this turn.
             # Chain: session override → workflow step default → agent config → provider default.
@@ -2445,6 +2439,7 @@ class AgentLoop:
                     # agent was configured for.
                     llm_kwargs["max_tokens"] = ctx.agent.llm_config.max_tokens
 
+            resolved_model = getattr(context_result, "resolved_model", "")
             current_model = model_for_llm or resolved_model
             current_provider_id: str | None = None
             if hasattr(self.providers.llm, "resolve_model_target"):
@@ -2653,6 +2648,41 @@ class AgentLoop:
                         ),
                     )
                 queued_discovery_guidance_mode = effective_discovery_mode
+            visible_tool_names: set[str] = set()
+            for tool_schema in exposure.tools:
+                if not isinstance(tool_schema, dict):
+                    continue
+                function_schema = tool_schema.get("function")
+                if not isinstance(function_schema, dict):
+                    continue
+                tool_name = function_schema.get("name")
+                if isinstance(tool_name, str):
+                    visible_tool_names.add(tool_name)
+            edit_guidance = build_visible_edit_tool_guidance(
+                visible_tool_names,
+                model_id=current_model,
+            )
+            if edit_guidance is None and edit_guidance_message_index is not None:
+                edit_guidance = (
+                    "Turn-local edit guidance: no dedicated edit tools are currently visible. "
+                    "Do not call `patch`, `edit`, `multiedit`, or `write` unless one becomes "
+                    "visible in a later turn."
+                )
+            if edit_guidance is not None and edit_guidance != queued_edit_guidance:
+                if edit_guidance_message_index is None:
+                    edit_guidance_message_index = len(messages)
+                    messages.append({"role": "system", "content": edit_guidance})
+                else:
+                    messages[edit_guidance_message_index] = {
+                        "role": "system",
+                        "content": edit_guidance,
+                    }
+                _queue_audit_message(
+                    role="developer",
+                    source="edit_tool_guidance",
+                    content=edit_guidance,
+                )
+                queued_edit_guidance = edit_guidance
             logger.debug(
                 "Prepared tool exposure",
                 extra={
@@ -2664,6 +2694,12 @@ class AgentLoop:
                         ),
                     }
                 },
+            )
+            model_messages = self._project_model_messages(
+                ctx,
+                messages=messages,
+                resolved_model=current_model,
+                max_context_tokens=context_result.max_context_tokens,
             )
             pre_call_snapshot = self._context_pressure_snapshot(
                 ctx,

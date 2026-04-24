@@ -103,7 +103,7 @@ Use this skill when the agent is doing software engineering work and should foll
 
 - Prefer `read`, `grep`, and `glob` for code inspection.
 - Use `lsp` for semantic navigation such as definitions, references, hover, and symbols when available.
-- Prefer `edit`, `multiedit`, `patch`, and `write` for file-content changes.
+- Prefer the dedicated file editing tools exposed for the current model. Use `patch` when that is the visible edit tool; otherwise use `edit`, `multiedit`, and `write` for file-content changes.
 - Use `bash` for git, tests, builds, package managers, and atomic filesystem operations.
 - Avoid shell or interpreter one-liners that rewrite files when dedicated edit tools fit the task.
 
