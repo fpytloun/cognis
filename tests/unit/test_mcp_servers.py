@@ -78,7 +78,7 @@ def test_select_static_tools_honors_disabled_categories_and_tools() -> None:
     assert "read" not in names
 
 
-def test_non_admin_cannot_create_mcp_server(monkeypatch: object, tmp_path: Path) -> None:
+def test_regular_user_can_create_private_mcp_server(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         import asyncio
 
@@ -239,6 +239,49 @@ def test_mcp_servers_are_user_scoped(monkeypatch: object, tmp_path: Path) -> Non
         )
         assert len(alice.json()) == 1
         assert bob.json() == []
+
+
+def test_regular_user_can_list_but_not_mutate_shared_mcp_server(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_mcp_server(
+                    session,
+                    server_id="shared_mcp",
+                    name="shared-server",
+                    transport="stdio",
+                    command="/bin/echo",
+                    owner_email="admin@example.com",
+                    shared=True,
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(client.app, email="user@example.com", role="user")
+        list_response = client.get("/api/v1/mcp-servers", headers=headers)
+        update_response = client.put(
+            "/api/v1/mcp-servers/shared_mcp",
+            headers=headers,
+            json={"name": "changed"},
+        )
+        delete_response = client.delete("/api/v1/mcp-servers/shared_mcp", headers=headers)
+
+        assert list_response.status_code == 200
+        assert list_response.json()[0]["shared"] is True
+        assert update_response.status_code == 403
+        assert delete_response.status_code == 403
 
 
 def test_effective_tools_preview_respects_executor_owner_scope(

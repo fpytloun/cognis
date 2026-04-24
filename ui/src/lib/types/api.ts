@@ -369,6 +369,7 @@ export interface MCPServerCreateRequest {
   headers?: Record<string, string>;
   timeout_seconds?: number;
   description?: string | null;
+  shared?: boolean;
 }
 
 export interface MCPServerUpdateRequest {
@@ -382,6 +383,7 @@ export interface MCPServerUpdateRequest {
   timeout_seconds?: number;
   description?: string | null;
   status?: string;
+  shared?: boolean;
 }
 
 export interface ChannelCapabilities {

@@ -77,7 +77,7 @@ import { onMount, tick } from 'svelte';
   };
 
   const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'tools', 'executors', 'users', 'system', 'account'];
-  const USER_TABS: SettingsTab[] = ['secrets', 'executors', 'account'];
+  const USER_TABS: SettingsTab[] = ['secrets', 'tools', 'executors', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
@@ -222,7 +222,7 @@ import { onMount, tick } from 'svelte';
   let newStepProfileForm = $state({ profile_id: '', name: '', mode: 'soft' as 'soft' | 'hard' });
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
-  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
+  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '', shared: false });
   let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : USER_TABS);
   let selectedProviderId = $state('');
@@ -977,19 +977,19 @@ import { onMount, tick } from 'svelte';
     accountNameForm = auth.getSnapshot().user?.name ?? '';
     accountNameDirty = false;
 
+    mcpServerConfigs = await api.tools.listMcpServerConfigs().catch(() => []);
+
     if (isAdmin) {
       const profileDefs = await api.settings.stepProfiles().catch(() => []);
-      [providers, diagnostics, mcpServerConfigs] = await Promise.all([
+      [providers, diagnostics] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
-        api.tools.listMcpServerConfigs().catch(() => []),
       ]);
       stepProfileForms = profileDefs.map(toStepProfileForm);
       await loadUsers();
     } else {
       providers = [];
       diagnostics = null;
-      mcpServerConfigs = [];
       stepProfileForms = [];
       userList = [];
     }
@@ -1024,6 +1024,14 @@ import { onMount, tick } from 'svelte';
       return isAdmin;
     }
     return !exec.owner_email || exec.owner_email === currentUserEmail;
+  }
+
+  function canManageMcpServer(server: MCPServerConfigResponse): boolean {
+    const currentUserEmail = auth.getSnapshot().user?.email ?? null;
+    if (server.shared) {
+      return isAdmin;
+    }
+    return !server.owner_email || server.owner_email === currentUserEmail;
   }
 
   async function loadSettings(): Promise<void> {
@@ -3245,11 +3253,11 @@ import { onMount, tick } from 'svelte';
             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Tools</p>
             <h2 class="mt-1 text-lg font-semibold text-white">MCP Servers</h2>
             <p class="mt-2 text-sm text-slate-400">
-              Configure MCP servers globally, then assign them to executors. Agents inherit MCP tools from their executor.
+              {isAdmin ? 'Configure private or shared MCP servers, then assign them to executors.' : 'Configure your private MCP servers, then assign them to your executors.'} Agents inherit MCP tools from their executor.
             </p>
           </div>
           <Button variant="primary" size="sm" onclick={() => {
-            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], headers: [], timeout_seconds: 30, description: '' };
+            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], headers: [], timeout_seconds: 30, description: '', shared: false };
             editingMcpServer = null;
             showMcpForm = true;
           }}>New MCP server</Button>
@@ -3291,6 +3299,12 @@ import { onMount, tick } from 'svelte';
                 <span>Timeout (seconds)</span>
                 <Input bind:value={mcpForm.timeout_seconds} type="number" />
               </label>
+              {#if isAdmin}
+                <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
+                  <input bind:checked={mcpForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+                  <span>Shared MCP server available to all users</span>
+                </label>
+              {/if}
             </div>
             {#if mcpForm.transport === 'stdio'}
               <label class="space-y-1 text-sm text-slate-200">
@@ -3339,6 +3353,7 @@ import { onMount, tick } from 'svelte';
                       headers: mcpForm.transport !== 'stdio' ? headers : {},
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || null,
+                      shared: isAdmin ? mcpForm.shared : false,
                     });
                   } else {
                     await api.tools.createMcpServer({
@@ -3351,6 +3366,7 @@ import { onMount, tick } from 'svelte';
                       headers: mcpForm.transport !== 'stdio' ? headers : {},
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || undefined,
+                      shared: isAdmin ? mcpForm.shared : false,
                     });
                   }
                   showMcpForm = false;
@@ -3363,14 +3379,19 @@ import { onMount, tick } from 'svelte';
         {/if}
 
         {#each mcpServerConfigs as srv}
+          {@const canManageMcp = canManageMcpServer(srv)}
           <Card class="p-5 space-y-3">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-3">
                 <h3 class="text-lg font-medium text-white">{srv.name}</h3>
                 <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{srv.transport}</span>
                 <span class="px-2 py-0.5 rounded text-xs {srv.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{srv.status}</span>
+                {#if srv.shared}
+                  <span class="px-2 py-0.5 bg-violet-500/20 text-violet-300 text-xs rounded">shared</span>
+                {/if}
               </div>
               <div class="flex gap-2">
+                {#if canManageMcp}
                 <Button variant="secondary" size="sm" onclick={() => {
                   editingMcpServer = srv;
                   mcpForm = {
@@ -3383,6 +3404,7 @@ import { onMount, tick } from 'svelte';
                     headers: parseMcpEntries(srv.headers || {}),
                     timeout_seconds: srv.timeout_seconds,
                     description: srv.description || '',
+                    shared: !!srv.shared,
                   };
                   showMcpForm = true;
                 }}>Edit</Button>
@@ -3396,6 +3418,7 @@ import { onMount, tick } from 'svelte';
                     } catch (e) { error = asApiError(e).message; }
                   }
                 }}>Delete</Button>
+                {/if}
               </div>
             </div>
             {#if srv.transport === 'stdio' && srv.command}
@@ -3410,6 +3433,9 @@ import { onMount, tick } from 'svelte';
               <p class="text-sm text-amber-300">{srv.invalid_reason}</p>
             {/if}
             <div class="text-xs text-slate-500 font-mono">ID: {srv.server_id}</div>
+            {#if !canManageMcp}
+              <p class="text-xs text-slate-500">This shared MCP server is available to assign to your executors, but only an administrator can edit it.</p>
+            {/if}
           </Card>
         {/each}
 
