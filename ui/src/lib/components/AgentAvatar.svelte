@@ -33,7 +33,7 @@
 {#if avatarUrl && !imgFailed}
   <img alt={name} class={cn('h-10 w-10 shrink-0 aspect-square rounded-2xl object-cover', className)} src={avatarUrl} onerror={handleError} />
 {:else}
-  <div class={cn('flex h-10 w-10 shrink-0 aspect-square items-center justify-center rounded-2xl bg-sky-500/20 text-sm font-semibold text-sky-200', className)}>
+  <div class={cn('flex h-10 w-10 shrink-0 aspect-square items-center justify-center rounded-2xl bg-amber-500/20 text-sm font-semibold text-amber-200', className)}>
     {initials() || '?'}
   </div>
 {/if}

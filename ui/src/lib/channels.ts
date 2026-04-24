@@ -137,7 +137,7 @@ export const policyOptions = [
 
 const accountStatusClass: Record<string, string> = {
   connected: 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20',
-  connecting: 'bg-sky-500/10 text-sky-300 border border-sky-500/20',
+  connecting: 'bg-amber-500/10 text-amber-300 border border-amber-500/20',
   reconnecting: 'bg-amber-500/10 text-amber-300 border border-amber-500/20',
   error: 'bg-rose-500/10 text-rose-300 border border-rose-500/20',
   disconnected: 'bg-slate-800 text-slate-300 border border-slate-700',

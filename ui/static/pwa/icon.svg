@@ -1,6 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
-  <rect width="512" height="512" rx="96" fill="#020617" />
-  <path d="M136 188C136 146.026 170.026 112 212 112H300C341.974 112 376 146.026 376 188V324C376 365.974 341.974 400 300 400H212C170.026 400 136 365.974 136 324V188Z" fill="#0F172A" stroke="#38BDF8" stroke-width="20" />
-  <path d="M200 192C200 174.327 214.327 160 232 160H280C324.183 160 360 195.817 360 240C360 284.183 324.183 320 280 320H232C214.327 320 200 305.673 200 288V192Z" fill="#38BDF8" fill-opacity="0.22" stroke="#38BDF8" stroke-width="20" />
-  <path d="M232 208H280C302.091 208 320 225.909 320 248C320 270.091 302.091 288 280 288H232V208Z" fill="#38BDF8" />
+  <defs>
+    <linearGradient id="bg" x1="96" y1="64" x2="440" y2="448" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#122A35" />
+      <stop offset="0.5" stop-color="#08141D" />
+      <stop offset="1" stop-color="#020617" />
+    </linearGradient>
+    <linearGradient id="mark" x1="160" y1="136" x2="356" y2="376" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4D35E" />
+      <stop offset="0.48" stop-color="#D97706" />
+      <stop offset="1" stop-color="#F97316" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(174 124) rotate(54) scale(344 300)">
+      <stop stop-color="#FDE68A" stop-opacity="0.62" />
+      <stop offset="0.43" stop-color="#F97316" stop-opacity="0.22" />
+      <stop offset="1" stop-color="#020617" stop-opacity="0" />
+    </radialGradient>
+    <filter id="softShadow" x="62" y="80" width="388" height="368" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="28" stdDeviation="24" flood-color="#000000" flood-opacity="0.45" />
+      <feDropShadow dx="0" dy="0" stdDeviation="12" flood-color="#F59E0B" flood-opacity="0.22" />
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="108" fill="url(#bg)" />
+  <rect width="512" height="512" rx="108" fill="url(#glow)" />
+  <path d="M101 356C145 380 203 395 256 395C314 395 369 377 411 344" stroke="#FBBF24" stroke-opacity="0.28" stroke-width="18" stroke-linecap="round" />
+  <path d="M108 158C151 121 205 101 260 101C314 101 363 118 404 151" stroke="#FDE68A" stroke-opacity="0.18" stroke-width="16" stroke-linecap="round" />
+  <g filter="url(#softShadow)">
+    <path d="M168 154C168 137.431 181.431 124 198 124H284C346.96 124 398 175.04 398 238C398 300.96 346.96 352 284 352H198C181.431 352 168 338.569 168 322V154Z" fill="#07111A" stroke="#F4D35E" stroke-width="24" />
+    <path d="M220 194C220 184.059 228.059 176 238 176H284C318.242 176 346 203.758 346 238C346 272.242 318.242 300 284 300H238C228.059 300 220 291.941 220 282V194Z" fill="url(#mark)" />
+    <path d="M258 216H284C296.15 216 306 225.85 306 238C306 250.15 296.15 260 284 260H258V216Z" fill="#fff7d6" fill-opacity="0.92" />
+  </g>
 </svg>

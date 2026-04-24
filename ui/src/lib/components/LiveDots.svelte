@@ -1,7 +1,7 @@
 <script lang="ts">
   let {
     label = '',
-    tone = 'sky',
+    tone = 'amber',
     size = 'md',
     inline = false,
     class: className = ''
@@ -15,11 +15,11 @@
 
   function dotClass(): string {
     const palette = {
-      sky: 'bg-sky-400',
+      sky: 'bg-amber-400',
       slate: 'bg-slate-400',
       amber: 'bg-amber-300'
     } as const;
-    const safeTone: keyof typeof palette = tone === 'slate' || tone === 'amber' ? tone : 'sky';
+    const safeTone: keyof typeof palette = tone === 'slate' || tone === 'sky' ? tone : 'amber';
     const dimensions = size === 'sm' ? 'h-1.5 w-1.5' : 'h-2 w-2';
     return `${dimensions} rounded-full ${palette[safeTone]}`;
   }

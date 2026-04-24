@@ -425,16 +425,16 @@ import Server from 'lucide-svelte/icons/server';
   </div>
 
   <div class="flex gap-1 mb-6 border-b border-zinc-700 overflow-x-auto">
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'builtin' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'builtin'}>
+    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'builtin' ? 'text-amber-400 border-b-2 border-amber-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'builtin'}>
       Native Tools ({staticTools.length})
     </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'intaris_mcp' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'intaris_mcp'}>
+    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'intaris_mcp' ? 'text-amber-400 border-b-2 border-amber-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'intaris_mcp'}>
       Intaris MCP ({intarisMcpTools.length})
     </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'executor_mcp' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'executor_mcp'}>
+    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'executor_mcp' ? 'text-amber-400 border-b-2 border-amber-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'executor_mcp'}>
       Executor MCP ({observedLocalMcpTools.length})
     </button>
-    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'skills' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'skills'}>
+    <button class="px-4 py-2 text-sm font-medium transition-colors whitespace-nowrap {activeTab === 'skills' ? 'text-amber-400 border-b-2 border-amber-400' : 'text-zinc-400 hover:text-zinc-200'}" onclick={() => activeTab = 'skills'}>
       Skills ({skills.length})
     </button>
   </div>
@@ -451,9 +451,9 @@ import Server from 'lucide-svelte/icons/server';
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
           <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search tools..." bind:value={builtinSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
+          <input type="text" placeholder="Search tools..." bind:value={builtinSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-amber-500" />
         </div>
-        <select bind:value={builtinCategoryFilter} class="px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500">
+        <select bind:value={builtinCategoryFilter} class="px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500">
           <option value="all">All categories</option>
           {#each orderedBuiltinCategories as cat}
             <option value={cat}>{getCategoryLabel(cat)}</option>
@@ -503,7 +503,7 @@ import Server from 'lucide-svelte/icons/server';
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
           <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search Intaris MCP tools..." bind:value={intarisSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
+          <input type="text" placeholder="Search Intaris MCP tools..." bind:value={intarisSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-amber-500" />
         </div>
         <span class="text-sm text-zinc-500">{filteredIntarisTools.length} tools</span>
         <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
@@ -511,7 +511,7 @@ import Server from 'lucide-svelte/icons/server';
         </Button>
         <div class="ml-auto">
           {#if intarisUrl}
-            <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-blue-400 hover:text-blue-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
+            <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-amber-400 hover:text-amber-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
               <ExternalLink class="w-3.5 h-3.5" />
               Configure in Intaris
             </a>
@@ -524,7 +524,7 @@ import Server from 'lucide-svelte/icons/server';
           <Plug class="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p>No Intaris MCP servers configured.</p>
           {#if intarisUrl}
-            <p class="text-sm mt-1">Configure MCP servers in the <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="text-blue-400 hover:text-blue-300">Intaris web UI</a>.</p>
+            <p class="text-sm mt-1">Configure MCP servers in the <a href={intarisUrl} target="_blank" rel="noopener noreferrer" class="text-amber-400 hover:text-amber-300">Intaris web UI</a>.</p>
           {/if}
         </div>
       {:else}
@@ -569,14 +569,14 @@ import Server from 'lucide-svelte/icons/server';
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
           <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search executor MCP tools..." bind:value={executorMcpSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
+          <input type="text" placeholder="Search executor MCP tools..." bind:value={executorMcpSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-amber-500" />
         </div>
         <span class="text-sm text-zinc-500">{filteredExecutorMcpTools.length} tools</span>
         <Button size="sm" variant="secondary" disabled={isActionBusy('rerun:pending')} onclick={() => void rerunAllPending()}>
           <RotateCcw class="w-4 h-4 mr-1" /> Re-run all pending
         </Button>
         <div class="ml-auto">
-          <a href="/settings#tools" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-blue-400 hover:text-blue-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
+          <a href="/settings#tools" class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm text-amber-400 hover:text-amber-300 border border-zinc-700 rounded-lg hover:border-zinc-600 transition-colors">
             <Settings class="w-3.5 h-3.5" />
             Configure MCP Servers
           </a>
@@ -596,7 +596,7 @@ import Server from 'lucide-svelte/icons/server';
               <Plug class="w-4 h-4 text-zinc-400" />
               <span class="text-sm font-medium text-zinc-200">{serverGroup.serverName}</span>
               <Badge>{serverGroup.tools.length}</Badge>
-              <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">cached</Badge>
+              <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">cached</Badge>
               <span class="text-xs text-zinc-500 ml-auto">Executor MCP</span>
             </button>
             {#if expandedGroups.has(groupKey)}
@@ -649,7 +649,7 @@ import Server from 'lucide-svelte/icons/server';
         <div class="text-center py-12 text-zinc-500">
           <Plug class="w-8 h-8 mx-auto mb-2 opacity-50" />
           <p>No MCP servers configured.</p>
-          <p class="text-sm mt-1">Add MCP servers in <a href="/settings#tools" class="text-blue-400 hover:text-blue-300">Settings</a> and assign them to executors.</p>
+          <p class="text-sm mt-1">Add MCP servers in <a href="/settings#tools" class="text-amber-400 hover:text-amber-300">Settings</a> and assign them to executors.</p>
         </div>
       {/if}
     </div>
@@ -667,7 +667,7 @@ import Server from 'lucide-svelte/icons/server';
       <div class="flex gap-3 items-center flex-wrap">
         <div class="relative flex-1 max-w-md">
           <Search class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
-          <input type="text" placeholder="Search skills..." bind:value={skillsSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-blue-500" />
+          <input type="text" placeholder="Search skills..." bind:value={skillsSearch} class="w-full pl-10 pr-4 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-amber-500" />
         </div>
         <span class="text-sm text-zinc-500">{filteredSkills.length} skills</span>
       </div>
@@ -682,28 +682,28 @@ import Server from 'lucide-svelte/icons/server';
           </div>
           {#if importMode === 'url'}
             <p class="text-sm text-zinc-400">Import a SKILL.md file or GitHub skill URL. Cognis will best-effort parse upstream/community formats.</p>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>URL</span><input type="url" bind:value={importForm.url} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md" /></label>
+            <label class="block text-sm text-zinc-400 space-y-1"><span>URL</span><input type="url" bind:value={importForm.url} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500" placeholder="https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md" /></label>
           {:else if importMode === 'content'}
             <p class="text-sm text-zinc-400">Paste SKILL.md or Cognis YAML content directly.</p>
             <label class="block text-sm text-zinc-400 space-y-1">
               <span>Format (optional)</span>
-              <select bind:value={importForm.contentFormat} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500">
+              <select bind:value={importForm.contentFormat} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500">
                 <option value="">Auto-detect</option>
                 <option value="skill_md">SKILL.md</option>
                 <option value="cognis_yaml">Cognis YAML</option>
               </select>
             </label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Content</span><textarea bind:value={importForm.content} rows="12" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-blue-500" placeholder="---&#10;name: my-skill&#10;---&#10;&#10;Instructions..."></textarea></label>
+            <label class="block text-sm text-zinc-400 space-y-1"><span>Content</span><textarea bind:value={importForm.content} rows="12" class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono focus:outline-none focus:border-amber-500" placeholder="---&#10;name: my-skill&#10;---&#10;&#10;Instructions..."></textarea></label>
           {:else}
             <p class="text-sm text-zinc-400">Upload a full Cognis package to import instructions together with assets.</p>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Package file</span><input type="file" accept=".zip,application/zip" onchange={loadPackageFile} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" /></label>
+            <label class="block text-sm text-zinc-400 space-y-1"><span>Package file</span><input type="file" accept=".zip,application/zip" onchange={loadPackageFile} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500" /></label>
             {#if importForm.packageName}
               <p class="text-xs text-zinc-500">Loaded {importForm.packageName}</p>
             {/if}
           {/if}
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Name override (optional)</span><input type="text" bind:value={importForm.name} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="Leave empty to use imported name" /></label>
-            <label class="block text-sm text-zinc-400 space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={importForm.tags} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-blue-500" placeholder="e.g. imported, claude" /></label>
+            <label class="block text-sm text-zinc-400 space-y-1"><span>Name override (optional)</span><input type="text" bind:value={importForm.name} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500" placeholder="Leave empty to use imported name" /></label>
+            <label class="block text-sm text-zinc-400 space-y-1"><span>Tags (comma-separated)</span><input type="text" bind:value={importForm.tags} class="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-sm text-zinc-200 focus:outline-none focus:border-amber-500" placeholder="e.g. imported, claude" /></label>
           </div>
           <label class="flex items-center gap-2 text-sm text-zinc-400"><input type="checkbox" bind:checked={importForm.autoLoad} class="rounded border-zinc-600" /> Attach to all agents</label>
           <div class="flex gap-2 justify-end">
@@ -730,7 +730,7 @@ import Server from 'lucide-svelte/icons/server';
                     <span class="font-medium text-zinc-100">{skill.name}</span>
                     <Badge>{skill.source}</Badge>
                     {#if skill.is_system}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>{/if}
-                    {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-blue-500/30 bg-blue-500/10 text-blue-300">attached to all agents</Badge>{/if}
+                    {#if skill.attach_to_all_agents ?? skill.auto_load}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">attached to all agents</Badge>{/if}
                     {#if skill.current_version?.steps && skill.current_version.steps.length > 0}<Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>{/if}
                     {#if skill.current_version?.decomposition_stale}<Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>{/if}
                   </div>
@@ -781,7 +781,7 @@ import Server from 'lucide-svelte/icons/server';
     <button class="w-full flex items-center gap-3 text-left" onclick={() => toggleTool(toolKey)}>
       {#if expandedTools.has(toolKey)}<ChevronDown class="w-4 h-4 text-zinc-500 shrink-0" />{:else}<ChevronRight class="w-4 h-4 text-zinc-500 shrink-0" />{/if}
       <span class="font-mono text-sm text-zinc-100">{tool.name}</span>
-      <Badge class={getSourceType(tool) === 'executor' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-blue-500/30 bg-blue-500/10 text-blue-300'}>
+      <Badge class={getSourceType(tool) === 'executor' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/30 bg-amber-500/10 text-amber-300'}>
         {getSourceLabel(getSourceType(tool))}
       </Badge>
       <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
@@ -831,7 +831,7 @@ import Server from 'lucide-svelte/icons/server';
     <div class="flex flex-wrap items-center gap-2">
       <Badge>{tool.profile_group || 'development'}</Badge>
       {#each tool.capabilities || [] as capability}
-        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{capability}</Badge>
+        <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">{capability}</Badge>
       {/each}
       <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{tool.classification_source || 'heuristic'}</Badge>
       {#if tool.classification_confidence != null}

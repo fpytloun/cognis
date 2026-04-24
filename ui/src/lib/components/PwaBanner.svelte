@@ -83,12 +83,12 @@ import X from 'lucide-svelte/icons/x';
 
 {#if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div
-    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
+    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-amber-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
     style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"
     role="region"
     aria-label="Install Cognis as app"
   >
-    <Download class="mt-0.5 h-4 w-4 shrink-0 text-sky-300" />
+    <Download class="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
     <div class="min-w-0 flex-1">
       <p class="font-medium">Install Cognis</p>
       <p class="text-xs text-slate-400">Get a dedicated window, offline shell, and app-icon launch.</p>
@@ -102,12 +102,12 @@ import X from 'lucide-svelte/icons/x';
 
 {#if shouldShowInstallUi && showIosHint && $displayMode === 'browser'}
   <div
-    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
+    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-amber-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
     style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"
     role="region"
     aria-label="Add Cognis to Home Screen"
   >
-    <Share class="mt-0.5 h-4 w-4 shrink-0 text-sky-300" />
+    <Share class="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
     <div class="min-w-0 flex-1">
       <p class="font-medium">Add to Home Screen</p>
       <p class="text-xs text-slate-400">Tap the Share icon in Safari, then "Add to Home Screen" for a native-app feel.</p>

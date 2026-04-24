@@ -68,7 +68,7 @@
     {#each imageAttachments as image, index (image.artifact_id)}
       <button
         type="button"
-        class="group relative h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-slate-800/60 bg-slate-950/60 transition hover:border-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 sm:h-28 sm:w-28"
+        class="group relative h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-slate-800/60 bg-slate-950/60 transition hover:border-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 sm:h-28 sm:w-28"
         onclick={() => openLightbox(index)}
         aria-label={`View ${image.filename}`}
       >
@@ -97,7 +97,7 @@
               href={attachment.url}
               target="_blank"
               rel="noreferrer"
-              class="block truncate text-sm font-medium text-slate-100 hover:text-sky-300"
+              class="block truncate text-sm font-medium text-slate-100 hover:text-amber-300"
             >
               {attachment.filename}
             </a>

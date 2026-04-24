@@ -86,12 +86,12 @@
         <label class="text-sm font-medium text-slate-200" for="avatar-prompt">Prompt</label>
         <button
           type="button"
-          class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50"
+          class="flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300 disabled:opacity-50"
           onclick={generatePrompt}
           disabled={generatingPrompt}
         >
           {#if generatingPrompt}
-            <span class="inline-block h-3 w-3 animate-spin rounded-full border border-slate-600 border-t-sky-400"></span>
+            <span class="inline-block h-3 w-3 animate-spin rounded-full border border-slate-600 border-t-amber-400"></span>
           {/if}
           Regenerate prompt
         </button>
@@ -111,7 +111,7 @@
       <div class="flex h-48 items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/80">
         {#if generatingImage}
           <div class="flex flex-col items-center gap-2 text-slate-400">
-            <span class="inline-block h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-sky-400"></span>
+            <span class="inline-block h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-amber-400"></span>
             <span class="text-sm">Generating...</span>
           </div>
         {:else if generatedImageUrl}

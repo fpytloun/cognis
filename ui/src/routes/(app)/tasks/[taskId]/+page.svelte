@@ -87,8 +87,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
 
   const statusColors: Record<string, string> = {
     pending: 'border-slate-600 text-slate-400',
-    running: 'border-sky-600 text-sky-300',
-    evaluating: 'border-violet-600 text-violet-300',
+    running: 'border-amber-600 text-amber-300',
+    evaluating: 'border-orange-600 text-orange-300',
     approved: 'border-emerald-700 text-emerald-300',
     completed: 'border-emerald-700 text-emerald-300',
     failed: 'border-rose-700 text-rose-300',
@@ -400,7 +400,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
    * pill. Matches the chat-side compact rendering.
    */
   function todoStatusDot(status: string): string {
-    if (status === 'in_progress') return 'bg-sky-400';
+    if (status === 'in_progress') return 'bg-amber-400';
     if (status === 'completed') return 'bg-emerald-400';
     if (status === 'cancelled') return 'bg-slate-600';
     return 'bg-amber-400';
@@ -1053,7 +1053,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Live workflow</p>
                   <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-300">
                     {#if task.status === 'running' || task.status === 'evaluating'}
-                      <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-500/30 bg-sky-500/10 text-sky-300">
+                      <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-300">
                         <LoaderCircle class="h-3.5 w-3.5 animate-spin" />
                       </span>
                     {/if}
@@ -1095,7 +1095,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </button>
                       <ArrowRight class="h-3.5 w-3.5 text-slate-600" />
                     {/each}
-                    <span class="inline-flex items-center rounded-full border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100">{task.title}</span>
+                    <span class="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-100">{task.title}</span>
                   </div>
                 </div>
               {/if}
@@ -1103,7 +1103,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 {#each stepGroups as group}
                   {@const liveStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
                   <button
-                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-amber-400/60 bg-amber-500/10 text-amber-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
                     onclick={() => openStepDetail(group.stepName)}
                     type="button"
                   >
@@ -1159,7 +1159,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         {#if activePause}
           <Card class="overflow-hidden p-0">
             <div class="space-y-4">
-              <div class="border-b border-slate-800/80 bg-gradient-to-r from-sky-500/10 via-slate-900 to-slate-900 px-5 py-4">
+              <div class="border-b border-slate-800/80 bg-gradient-to-r from-amber-500/10 via-slate-900 to-slate-900 px-5 py-4">
                 <div class="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.25em] text-slate-400">
                   <span>{activePause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}</span>
                   {#if activePause.step_name}
@@ -1177,9 +1177,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <div class="px-5 pb-5">
               {#if activePause.pause_type === 'gate'}
                 <div class="space-y-3">
-                  <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
-                    <div class="flex items-center gap-2 text-sm font-medium text-sky-100">
-                      <Sparkles class="h-4 w-4 text-sky-300" />
+                  <div class="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4">
+                    <div class="flex items-center gap-2 text-sm font-medium text-amber-100">
+                      <Sparkles class="h-4 w-4 text-amber-300" />
                       Optional instruction for the next attempt
                     </div>
                     <p class="mt-1 text-sm text-slate-400">This will be passed into the next execution when you continue or retry.</p>
@@ -1200,7 +1200,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   {#if (activePause.options ?? []).length > 0}
                     <div class="flex flex-wrap gap-2">
                       {#each activePause.options ?? [] as option}
-                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
+                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-amber-400/40 hover:bg-amber-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
                       {/each}
                     </div>
                   {/if}
@@ -1244,7 +1244,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
                 {@const groupAgent = agentFor(group.latest?.agent_id ?? null)}
                 <button
-                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/50 bg-sky-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
+                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-amber-400/50 bg-amber-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
                   onclick={() => openStepDetail(group.stepName, { mobileDrawer: false })}
                   type="button"
                 >
@@ -1285,7 +1285,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                         <div class="flex flex-wrap items-center gap-2">
                           <h3 class="text-lg font-semibold text-white">{latestAttempt.step_name}</h3>
                           {#if selectedStepGroup.attempts.length > 1}
-                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-amber-200">Latest attempt</span>
                           {/if}
                           <span class="text-xs text-slate-500">#{latestAttempt.attempt}</span>
                         </div>
@@ -1342,7 +1342,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
 
                     {#if latestAttempt.deliverables.length > 0}
                       {@const deliverable = latestDeliverable(latestAttempt)}
-                      <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
+                      <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-4">
                         <div class="flex flex-wrap items-center justify-between gap-3">
                           <div>
                             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Deliverable</p>
@@ -1352,7 +1352,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                           </div>
                           <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
                             {#each latestAttempt.deliverables as item}
-                              <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : item.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : item.status === 'rejected' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
+                              <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : item.status === 'approved' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : item.status === 'rejected' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
                                 v{item.version} {item.status}
                               </span>
                             {/each}
@@ -1421,7 +1421,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                     {#if latestAttempt.evaluation}
                       {@const evalDecision = String(latestAttempt.evaluation.decision ?? '')}
                       {@const evalReasoning = String(latestAttempt.evaluation.reasoning ?? '')}
-                      {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-amber-400'}
+                      {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-amber-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-amber-400'}
                       <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
                         <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
                         <p class="mt-1 text-sm text-slate-300">
@@ -1513,7 +1513,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <dl class="mt-3 space-y-2">
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Source</dt><dd>{sourceLabel}</dd></div>
                 {#if sourceConversation}
-                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
+                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-amber-400 hover:text-amber-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
                 {/if}
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
@@ -1574,7 +1574,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <div class="flex justify-between gap-3">
                 <dt class="text-slate-500">Conversation</dt>
                 <dd>
-                  <a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">
+                  <a href="/chat/{sourceConversation.conversation_id}" class="text-amber-400 hover:text-amber-300 hover:underline">
                     {sourceConversation.title ?? 'Untitled'}
                   </a>
                 </dd>

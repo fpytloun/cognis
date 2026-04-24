@@ -20,7 +20,7 @@ import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
       icon: TriangleAlert
     },
     info: {
-      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
+      className: 'border-amber-500/40 bg-amber-500/15 text-amber-50',
       icon: Info
     }
   } as const;

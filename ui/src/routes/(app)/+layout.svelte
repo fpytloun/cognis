@@ -408,12 +408,12 @@ import X from 'lucide-svelte/icons/x';
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
             <div class="space-y-2 border-b border-slate-800/80 pb-5">
-              <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
+              <p class="text-sm font-medium uppercase tracking-[0.3em] text-amber-300">Cognis</p>
               <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
             </div>
           {:else}
             <div class="flex justify-center border-b border-slate-800/80 pb-4">
-              <span class="text-lg font-bold text-sky-300">C</span>
+              <span class="text-lg font-bold text-amber-300">C</span>
             </div>
           {/if}
 
@@ -431,7 +431,7 @@ import X from 'lucide-svelte/icons/x';
               {#if sidebarExpanded}
                 <a
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -441,7 +441,7 @@ import X from 'lucide-svelte/icons/x';
                 <a
                   use:sidebarTooltip={item.label}
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -632,11 +632,11 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if shouldShowGettingStarted()}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
+          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium">Finish first-run setup</p>
-                <p class="mt-1 text-sky-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
+                <p class="mt-1 text-amber-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
               </div>
               <Button size="sm" onclick={() => goto('/getting-started')}>Open guide</Button>
             </div>
@@ -676,7 +676,7 @@ import X from 'lucide-svelte/icons/x';
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
         <div>
-          <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
+          <p class="text-sm uppercase tracking-[0.25em] text-amber-300">Cognis</p>
           <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
         </div>
         <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
@@ -688,7 +688,7 @@ import X from 'lucide-svelte/icons/x';
     <nav class="space-y-2">
       {#each navigationItems as item}
         <a
-          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
           href={item.href}
           onclick={closeMobileNav}
         >

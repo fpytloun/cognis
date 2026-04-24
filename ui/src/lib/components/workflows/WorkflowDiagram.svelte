@@ -119,13 +119,13 @@ import Logs from 'lucide-svelte/icons/logs';
   function nodeStroke(stepName: string, defaultStroke: string): string {
     if (!isTaskMode) return defaultStroke;
     if (skippedSteps.includes(stepName)) return '#334155';
-    if (stepName === activeStepName) return '#0ea5e9';
+    if (stepName === activeStepName) return '#f59e0b';
     const status = stepStatuses[stepName];
     if (!status) return '#334155';
     if (status === 'approved' || status === 'completed') return '#059669';
     if (status === 'failed' || status === 'cancelled') return '#dc2626';
     if (status === 'rejected' || status === 'revise') return '#d97706';
-    if (status === 'running' || status === 'evaluating') return '#0ea5e9';
+    if (status === 'running' || status === 'evaluating') return '#f59e0b';
     if (status === 'paused') return '#eab308';
     return defaultStroke;
   }
@@ -340,7 +340,7 @@ import Logs from 'lucide-svelte/icons/logs';
                 <div class="flex gap-1">
                 {#if hasOutput}
                 <button
-                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-orange-400/60 hover:text-white"
                   onclick={(event) => handleStepOutputClick(event, step.name)}
                   type="button"
                   aria-label={`Open full output for ${step.name}`}
@@ -351,7 +351,7 @@ import Logs from 'lucide-svelte/icons/logs';
                 {/if}
                 {#if hasLogs}
                 <button
-                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-amber-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
@@ -381,8 +381,8 @@ import Logs from 'lucide-svelte/icons/logs';
               width={NODE_W}
               height={NODE_H}
               rx="12"
-              fill={selected ? '#0ea5e914' : nodeFill(step.name, '#0c0a09')}
-              stroke={selected ? '#38bdf8' : isActive ? '#0ea5e9' : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
+              fill={selected ? '#f59e0b14' : nodeFill(step.name, '#0c0a09')}
+              stroke={selected ? '#fbbf24' : isActive ? '#f59e0b' : nodeStroke(step.name, hasAgent ? '#f59e0b' : '#334155')}
               stroke-width={selected ? '2.5' : nodeStrokeWidth(step.name)}
               class={isActive ? 'node-active' : ''}
             />
@@ -400,27 +400,27 @@ import Logs from 'lucide-svelte/icons/logs';
                 x={x + NODE_W / 2}
                 y={y + NODE_H / 2 + 10}
                 text-anchor="middle"
-                class="fill-sky-400/70 text-[9px]"
+                class="fill-amber-400/70 text-[9px]"
               >
                 {step.agentOverride}
               </text>
             {/if}
             {#if isActive}
               <g>
-                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#0ea5e933" stroke-width="2" />
-                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#f59e0b33" stroke-width="2" />
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#fbbf24" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
               </g>
             {/if}
             {#if attempt}
-              <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#0ea5e91a" stroke="#38bdf866" stroke-width="0.75" />
-              <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-sky-300 text-[8px] font-semibold">{attempt}</text>
+              <rect x={x + NODE_W - 28} y={y + NODE_H - 18} width="22" height="12" rx="6" fill="#f59e0b1a" stroke="#fbbf2466" stroke-width="0.75" />
+              <text x={x + NODE_W - 17} y={y + NODE_H - 9} text-anchor="middle" class="fill-amber-300 text-[8px] font-semibold">{attempt}</text>
             {/if}
             {#if isTaskMode && (hasLogs || hasOutput)}
               <foreignObject x={x + 4} y={y + 4} width="64" height="30">
                 <div class="flex gap-1">
                 {#if hasOutput}
                 <button
-                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-violet-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-orange-400/60 hover:text-white"
                   onclick={(event) => handleStepOutputClick(event, step.name)}
                   type="button"
                   aria-label={`Open full output for ${step.name}`}
@@ -431,7 +431,7 @@ import Logs from 'lucide-svelte/icons/logs';
                 {/if}
                 {#if hasLogs}
                 <button
-                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-sky-400/60 hover:text-white"
+                  class="flex h-7 w-7 md:h-5 md:w-5 items-center justify-center rounded-md border border-slate-600/80 bg-slate-950/90 text-slate-200 transition hover:border-amber-400/60 hover:text-white"
                   onclick={(event) => handleStepLogsClick(event, step.name)}
                   type="button"
                   aria-label={`Open logs for ${step.name}`}
@@ -484,15 +484,15 @@ import Logs from 'lucide-svelte/icons/logs';
                 width="32"
                 height="14"
                 rx="7"
-                fill={badge === 'eval' ? '#065f4620' : '#7c3aed20'}
-                stroke={badge === 'eval' ? '#065f46' : '#7c3aed'}
+                fill={badge === 'eval' ? '#065f4620' : '#d9770620'}
+                stroke={badge === 'eval' ? '#065f46' : '#d97706'}
                 stroke-width="0.75"
               />
               <text
                 x={bx + 16}
                 y={y + NODE_H + 13}
                 text-anchor="middle"
-                class="text-[8px] {badge === 'eval' ? 'fill-emerald-400' : 'fill-violet-400'}"
+                class="text-[8px] {badge === 'eval' ? 'fill-emerald-400' : 'fill-orange-400'}"
               >
                 {badge === 'eval' ? 'eval' : 'ask'}
               </text>

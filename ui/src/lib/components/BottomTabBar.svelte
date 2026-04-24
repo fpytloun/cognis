@@ -93,7 +93,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
           <a
             class={`flex min-h-[56px] flex-col items-center justify-center gap-0.5 px-2 py-1.5 text-[11px] transition ${
               active
-                ? 'text-sky-300'
+                ? 'text-amber-300'
                 : isOnTabRoute
                   ? 'text-slate-400 hover:text-white'
                   : 'text-slate-500 hover:text-slate-300'

@@ -183,15 +183,15 @@
           <div class="flex flex-wrap items-center gap-2">
             <h2 class="truncate text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
             {#if agent.is_system}
-              <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-sky-300">System</span>
+              <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-amber-300">System</span>
             {/if}
             {#if agent.is_shared_with_me}
-              <span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-violet-300">Shared</span>
+              <span class="rounded-full border border-orange-500/30 bg-orange-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-orange-300">Shared</span>
             {/if}
           </div>
           <p class="break-all text-sm text-slate-400">{agent.agent_id}</p>
           {#if agent.is_shared_with_me}
-            <p class="mt-1 text-xs text-violet-300/80">Shared by {agent.shared_by_email ?? agent.owner_email}</p>
+            <p class="mt-1 text-xs text-orange-300/80">Shared by {agent.shared_by_email ?? agent.owner_email}</p>
           {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{agent.description ?? 'No description yet.'}</p>
         </div>

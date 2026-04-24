@@ -64,7 +64,7 @@ import Copy from 'lucide-svelte/icons/copy';
 
   function bubbleClass(): string {
     return item.role === 'user'
-      ? 'ml-auto bg-sky-500 text-slate-950'
+      ? 'ml-auto bg-amber-500 text-slate-950'
       : item.role === 'assistant'
         ? 'bg-slate-900 text-slate-100 border border-slate-800'
         : 'bg-slate-800/70 text-slate-200 border border-slate-700';
@@ -73,7 +73,7 @@ import Copy from 'lucide-svelte/icons/copy';
   function proseClass(): string {
     return item.role === 'user'
       ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none prose-a:text-slate-900 prose-a:underline'
-      : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
+      : 'prose-invert prose-code:text-amber-200 prose-code:before:content-none prose-code:after:content-none';
   }
 
   async function copyMessage(): Promise<void> {
@@ -224,7 +224,7 @@ import Copy from 'lucide-svelte/icons/copy';
         {#if agent}
           <button
             type="button"
-            class="block rounded-2xl transition hover:ring-2 hover:ring-sky-400/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+            class="block rounded-2xl transition hover:ring-2 hover:ring-amber-300/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
             aria-label={`View ${agentName} profile`}
             onclick={() => { showAgentProfile = !showAgentProfile; }}
           >

@@ -48,7 +48,7 @@
   }
 </script>
 
-<span class={`relative inline-flex focus-within:ring-2 focus-within:ring-sky-400 focus-within:rounded-xl ${className}`}>
+<span class={`relative inline-flex focus-within:ring-2 focus-within:ring-amber-300 focus-within:rounded-xl ${className}`}>
   <Button size="sm" variant="secondary" type="button" tabindex={-1} aria-hidden="true" {disabled}>
     <Paperclip class="h-4 w-4 sm:mr-2" /> <span class="hidden sm:inline">{label}</span>
   </Button>

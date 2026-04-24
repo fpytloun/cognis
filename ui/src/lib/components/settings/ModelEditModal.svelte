@@ -131,7 +131,7 @@
                 type="checkbox"
                 checked={draft[cap.key] === true}
                 onchange={() => toggleCapability(cap.key)}
-                class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400"
+                class="rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300"
               />
               {cap.label}
             </label>

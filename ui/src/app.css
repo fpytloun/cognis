@@ -8,6 +8,13 @@
   --app-viewport-height: 100dvh;
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
+  --theme-void: #020617;
+  --theme-obsidian: #07111a;
+  --theme-ink: #122a35;
+  --theme-line: #1f3540;
+  --theme-gold: #f4d35e;
+  --theme-amber: #d97706;
+  --theme-flame: #f97316;
 }
 
 html {
@@ -55,32 +62,38 @@ body,
 body {
   @apply bg-slate-950 text-slate-100 antialiased;
   min-height: 100dvh;
-  /* Simplified background: single subtle radial + gradient. Previous 3-layer
-     stack caused continuous GPU composition on low-end devices. */
+  /* Warm command-deck backdrop matching the Cognis mark while staying cheap to render. */
   background-image:
-    radial-gradient(circle at top left, rgb(59 130 246 / 0.12), transparent 42%),
-    linear-gradient(180deg, rgb(2 6 23) 0%, rgb(15 23 42) 100%);
+    radial-gradient(circle at 12% 0%, rgb(244 211 94 / 0.16), transparent 32%),
+    radial-gradient(circle at 88% 8%, rgb(249 115 22 / 0.09), transparent 30%),
+    linear-gradient(180deg, var(--theme-obsidian) 0%, var(--theme-void) 54%, #0f1719 100%);
   background-attachment: fixed;
   overflow-x: hidden;
   overscroll-behavior-y: none;
 }
 
 .skip-link {
-  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl bg-sky-500 px-4 py-2 font-medium text-slate-950 shadow-card focus:not-sr-only;
+  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl px-4 py-2 font-medium text-slate-950 shadow-card focus:not-sr-only;
+  background: var(--theme-gold);
 }
 
 a {
-  @apply text-sky-300 transition-colors hover:text-sky-200;
+  @apply transition-colors;
+  color: #f6c85f;
+}
+
+a:hover {
+  color: #fde68a;
 }
 
 /* JSON syntax highlighting for tool-call input/output blocks. Colours
    stay close to the assistant bubble palette so highlighted payloads
    read as part of the conversation, not a separate dev tool. */
-.json-key { @apply text-sky-300; }
+.json-key { @apply text-amber-300; }
 .json-string { @apply text-emerald-300; }
 .json-number { @apply text-amber-200; }
-.json-boolean { @apply text-violet-300; }
-.json-null { @apply text-violet-300 italic; }
+.json-boolean { @apply text-orange-300; }
+.json-null { @apply text-orange-300 italic; }
 .json-punct { @apply text-slate-500; }
 
 button:focus-visible,
@@ -88,7 +101,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  @apply outline-none ring-2 ring-sky-400 ring-offset-2 ring-offset-slate-950;
+  @apply outline-none ring-2 ring-amber-300 ring-offset-2 ring-offset-slate-950;
 }
 
 ::-webkit-scrollbar {

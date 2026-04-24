@@ -77,8 +77,8 @@ import Zap from 'lucide-svelte/icons/zap';
     failed: 'bg-red-500/20 text-red-400',
     skipped: 'bg-amber-500/20 text-amber-400',
     completed: 'bg-emerald-500/20 text-emerald-400',
-    running: 'bg-blue-500/20 text-blue-400',
-    paused: 'bg-violet-500/20 text-violet-400',
+    running: 'bg-amber-500/20 text-amber-400',
+    paused: 'bg-orange-500/20 text-orange-400',
     queued: 'bg-slate-500/20 text-slate-400',
     ready: 'bg-cyan-500/20 text-cyan-400',
     cancelled: 'bg-slate-500/20 text-slate-400'
@@ -282,7 +282,7 @@ import Zap from 'lucide-svelte/icons/zap';
             <Badge class="bg-cyan-500/20 text-cyan-300">Direct delivery</Badge>
           {/if}
           {#if schedule.allow_silent_completion}
-            <Badge class="bg-indigo-500/20 text-indigo-400">Silent allowed</Badge>
+            <Badge class="bg-orange-500/20 text-orange-400">Silent allowed</Badge>
           {/if}
         </div>
         <p class="mt-0.5 text-sm text-slate-400">{schedule.human_schedule ?? schedule.cron_expr}</p>

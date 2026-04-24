@@ -1703,7 +1703,7 @@ import { onMount, tick } from 'svelte';
               <p class="text-sm text-slate-400">Provider management is available to admin users only.</p>
             {:else}
               {#each providers as provider}
-                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
+                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-amber-400/40 bg-amber-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
                   <div class="flex items-center justify-between gap-3">
                     <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
                     <ProviderStatusBadge status={provider.status} />
@@ -1765,9 +1765,9 @@ import { onMount, tick } from 'svelte';
           </div>
 
           {#if providerForm.location === 'executor'}
-            <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4 space-y-3">
+            <div class="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 space-y-3">
               <div>
-                <p class="text-xs uppercase tracking-[0.25em] text-sky-200/80">Executor routing</p>
+                <p class="text-xs uppercase tracking-[0.25em] text-amber-200/80">Executor routing</p>
                 <p class="mt-2 text-sm text-slate-300">This provider stays configured normally, but requests are executed from a matching remote executor instead of the controller.</p>
               </div>
               <label class="space-y-2 text-sm font-medium text-slate-200 block">
@@ -1837,7 +1837,7 @@ import { onMount, tick } from 'svelte';
 
           {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
-              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
               <span class="space-y-1">
                 <span class="block font-medium">Use OpenAI Responses transport when supported</span>
                 <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
@@ -2237,7 +2237,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if WEB_BACKEND_INFO[webKeySetup.backend]?.link}
                 <p class="text-xs text-slate-400">
-                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-blue-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
+                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-amber-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
                 </p>
               {/if}
               <div class="flex gap-2">
@@ -2289,7 +2289,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if isAdmin}
                 <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
-                  <input bind:checked={executorForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+                  <input bind:checked={executorForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
                   <span>Shared executor available to all users</span>
                 </label>
               {/if}
@@ -2341,10 +2341,10 @@ import { onMount, tick } from 'svelte';
                   <span class="text-slate-300">{executorRuntimeLabel(exec)}</span>
                 </span>
                 {#if exec.is_default}
-                  <span class="px-2 py-0.5 bg-blue-500/20 text-blue-300 text-xs rounded">default</span>
+                  <span class="px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded">default</span>
                 {/if}
                 {#if exec.shared}
-                  <span class="px-2 py-0.5 bg-violet-500/20 text-violet-300 text-xs rounded">shared</span>
+                  <span class="px-2 py-0.5 bg-orange-500/20 text-orange-300 text-xs rounded">shared</span>
                 {/if}
               </div>
               <div class="flex gap-2">
@@ -3108,7 +3108,7 @@ import { onMount, tick } from 'svelte';
                           <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.mode}</span>
                           <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.matrix.length} groups</span>
                           {#if profile.is_custom}
-                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-300">custom</span>
+                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">custom</span>
                           {:else if profile.has_override}
                             <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">customized</span>
                           {/if}
@@ -3301,7 +3301,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if isAdmin}
                 <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
-                  <input bind:checked={mcpForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+                  <input bind:checked={mcpForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
                   <span>Shared MCP server available to all users</span>
                 </label>
               {/if}
@@ -3387,7 +3387,7 @@ import { onMount, tick } from 'svelte';
                 <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{srv.transport}</span>
                 <span class="px-2 py-0.5 rounded text-xs {srv.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{srv.status}</span>
                 {#if srv.shared}
-                  <span class="px-2 py-0.5 bg-violet-500/20 text-violet-300 text-xs rounded">shared</span>
+                  <span class="px-2 py-0.5 bg-orange-500/20 text-orange-300 text-xs rounded">shared</span>
                 {/if}
               </div>
               <div class="flex gap-2">

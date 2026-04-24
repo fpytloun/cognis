@@ -121,7 +121,7 @@
   function todoStatusDot(status: string): string {
     if (status === 'completed') return 'bg-emerald-400';
     if (status === 'cancelled') return 'bg-slate-600';
-    if (status === 'in_progress') return 'bg-sky-400';
+    if (status === 'in_progress') return 'bg-amber-400';
     return 'bg-amber-400';
   }
 
@@ -402,9 +402,9 @@
                 {item.text}
               </div>
             {:else if item.kind === 'compaction'}
-              <div class="rounded-xl border border-sky-900/40 bg-sky-950/20 px-3 py-3 text-sm text-sky-100/90">
+              <div class="rounded-xl border border-amber-900/40 bg-amber-950/20 px-3 py-3 text-sm text-amber-100/90">
                 <p class="font-medium">Conversation compacted</p>
-                <p class="mt-1 text-sky-100/70">{item.summaryPreview}</p>
+                <p class="mt-1 text-amber-100/70">{item.summaryPreview}</p>
               </div>
             {/if}
           {/each}

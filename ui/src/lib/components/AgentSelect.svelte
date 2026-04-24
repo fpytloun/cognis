@@ -127,14 +127,14 @@
           <button
             aria-selected={selected}
             role="option"
-            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
+            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-amber-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
             onclick={() => selectValue(allValue)}
             type="button"
           >
             <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-[11px] font-semibold text-slate-300">All</span>
             <span class="flex-1 truncate">{allLabel}</span>
             {#if selected}
-              <Check class="h-4 w-4 text-sky-300" />
+              <Check class="h-4 w-4 text-amber-300" />
             {/if}
           </button>
         </li>
@@ -150,14 +150,14 @@
           <button
             aria-selected={selected}
             role="option"
-            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
+            class={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm transition ${selected ? 'bg-amber-500/15 text-white' : 'text-slate-200 hover:bg-slate-900'}`}
             onclick={() => selectValue(agent.agent_id)}
             type="button"
           >
             <AgentAvatar name={agentLabel(agent)} avatarUrl={agent.avatar_url ?? null} class="h-7 w-7 rounded-lg text-[11px]" />
             <span class="flex-1 truncate">{agentLabel(agent)}</span>
             {#if selected}
-              <Check class="h-4 w-4 text-sky-300" />
+              <Check class="h-4 w-4 text-amber-300" />
             {/if}
           </button>
         </li>

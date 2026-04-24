@@ -104,8 +104,8 @@ import Zap from 'lucide-svelte/icons/zap';
     completed: 'bg-emerald-500/20 text-emerald-400',
     failed: 'bg-red-500/20 text-red-400',
     skipped: 'bg-amber-500/20 text-amber-400',
-    running: 'bg-blue-500/20 text-blue-400',
-    paused: 'bg-violet-500/20 text-violet-400',
+    running: 'bg-amber-500/20 text-amber-400',
+    paused: 'bg-orange-500/20 text-orange-400',
     queued: 'bg-slate-500/20 text-slate-400',
     ready: 'bg-cyan-500/20 text-cyan-400',
     cancelled: 'bg-slate-500/20 text-slate-400'
@@ -401,7 +401,7 @@ import Zap from 'lucide-svelte/icons/zap';
                       <Badge class="bg-cyan-500/20 text-cyan-300">Direct delivery</Badge>
                     {/if}
                     {#if schedule.allow_silent_completion}
-                      <Badge class="bg-indigo-500/20 text-indigo-400">Silent allowed</Badge>
+                      <Badge class="bg-orange-500/20 text-orange-400">Silent allowed</Badge>
                     {/if}
                     {#if schedule.consecutive_errors > 0}
                       <Badge class="bg-red-500/20 text-red-400">
@@ -517,7 +517,7 @@ import Zap from 'lucide-svelte/icons/zap';
           <div class="flex gap-2">
             {#each [['cron', 'Cron'], ['interval', 'Interval'], ['one_shot', 'One-shot']] as [value, label]}
               <button
-                class="flex-1 rounded-xl border px-3 py-2 text-sm transition-colors {form.schedule_type === value ? 'border-blue-500 bg-blue-500/10 text-blue-400' : 'border-slate-700 bg-slate-950/80 text-slate-400 hover:border-slate-600'}"
+                class="flex-1 rounded-xl border px-3 py-2 text-sm transition-colors {form.schedule_type === value ? 'border-amber-500 bg-amber-500/10 text-amber-400' : 'border-slate-700 bg-slate-950/80 text-slate-400 hover:border-slate-600'}"
                 onclick={() => (form.schedule_type = value)}
               >
                 {label}
@@ -534,7 +534,7 @@ import Zap from 'lucide-svelte/icons/zap';
             <div class="flex flex-wrap gap-2 pt-1">
               {#each cronPresets as preset}
                 <button
-                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.cron_expr === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.cron_expr === preset.value ? 'border-amber-500/50 bg-amber-500/10 text-amber-400' : ''}"
                   onclick={() => (form.cron_expr = preset.value)}
                   type="button"
                 >
@@ -557,7 +557,7 @@ import Zap from 'lucide-svelte/icons/zap';
             <div class="flex flex-wrap gap-2">
               {#each intervalPresets as preset}
                 <button
-                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.interval_seconds === preset.value ? 'border-blue-500/50 bg-blue-500/10 text-blue-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.interval_seconds === preset.value ? 'border-amber-500/50 bg-amber-500/10 text-amber-400' : ''}"
                   onclick={() => (form.interval_seconds = preset.value)}
                   type="button"
                 >

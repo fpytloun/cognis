@@ -56,7 +56,7 @@
     <Card class="p-6">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Getting started</p>
+          <p class="text-sm uppercase tracking-[0.25em] text-amber-300">Getting started</p>
           <h1 class="mt-2 text-2xl font-semibold text-white">Set up Cognis end to end</h1>
           <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">
             Use this checklist to verify companion services, add an LLM provider, create an agent, and start your first chat.
