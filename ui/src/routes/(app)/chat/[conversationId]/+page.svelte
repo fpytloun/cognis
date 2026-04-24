@@ -3075,7 +3075,7 @@ import X from 'lucide-svelte/icons/x';
           {/if}
         </div>
 
-        <div bind:this={footerChromeEl} class="shrink-0 space-y-3" style="padding-bottom: var(--kb-offset, 0px);">
+        <div bind:this={footerChromeEl} class="shrink-0 space-y-3 bg-slate-950/95 backdrop-blur">
           {#if shouldShowChatTodoDrawer}
             <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
               <button
@@ -3138,22 +3138,14 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {:else}
           <!--
-            Composer container. \`--kb-offset\` is published by the
-            viewport store using \`visualViewport\`; on iOS this pushes
-            the composer above the on-screen keyboard so the input
-            stays visible. Keep the wrapper visually neutral so the
-            composer feels like part of the page rather than a dark
-            boxed footer.
-          -->
-          <!--
             Composer: sits flush at the bottom of the viewport and spans
             the full width of the chat area. No outer card, no recessed
-            background — the textarea below carries its own border. Safe
-            area bottom padding ensures the composer reaches the edge of
-            the screen on iPhone PWAs without hiding behind the home
-            indicator.
+            background — the textarea below carries its own border. The
+            visualViewport-sized app shell moves the footer above the
+            keyboard; `--app-bottom-inset` only reserves the home-indicator
+            safe area when the keyboard is closed.
           -->
-          <form class="shrink-0 space-y-2 border-t border-slate-800/60 bg-slate-950/95 px-3 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+env(safe-area-inset-bottom))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 pb-[calc(0.75rem+var(--app-bottom-inset,env(safe-area-inset-bottom,0px)))] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+var(--app-bottom-inset,env(safe-area-inset-bottom,0px)))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">

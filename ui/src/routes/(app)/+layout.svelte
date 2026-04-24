@@ -274,19 +274,6 @@ import X from 'lucide-svelte/icons/x';
     return 'min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 pb-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 sm:pb-4 lg:px-0 lg:pb-0 lg:pt-0';
   });
 
-  // Route changes can leave `--kb-offset` non-zero if the iOS keyboard
-  // was still dismissing when the user tapped a nav link. Elements on
-  // other pages don't read this variable today, but having it stuck at
-  // the keyboard height produces visible padding gaps (the bottom tab
-  // bar sat above a dark strip on Tasks/Agents/etc. after leaving
-  // Chat). Zero it on every navigation so pages always boot with a
-  // clean viewport state.
-  $effect(() => {
-    void $page.url.pathname;
-    if (typeof document === 'undefined') return;
-    document.documentElement.style.setProperty('--kb-offset', '0px');
-  });
-
   $effect(() => {
     if (typeof window === 'undefined') return;
     void showMobileHeader;

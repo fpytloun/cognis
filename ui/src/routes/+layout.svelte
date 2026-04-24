@@ -6,9 +6,9 @@
 
   import PwaBanner from '$lib/components/PwaBanner.svelte';
   import { registerServiceWorker } from '$lib/stores/pwa';
-  // Subscribe to keyboardOffset so it starts publishing the --kb-offset CSS var
-  // as soon as the shell mounts (value itself is unused here).
-  import { keyboardOffset } from '$lib/stores/viewport';
+  // Subscribe so visualViewport-backed CSS vars are published as soon as
+  // the shell mounts.
+  import { viewportMetrics } from '$lib/stores/viewport';
 
   let { children }: { children: Snippet } = $props();
 
@@ -16,7 +16,7 @@
     (window as Window & { __cognisStartupRecoverySuccess?: () => void }).__cognisStartupRecoverySuccess?.();
     void registerServiceWorker();
     // Keep subscription alive.
-    const unsub = keyboardOffset.subscribe(() => {});
+    const unsub = viewportMetrics.subscribe(() => {});
     return () => unsub();
   });
 </script>

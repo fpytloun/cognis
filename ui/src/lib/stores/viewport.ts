@@ -6,7 +6,9 @@ import { readable } from 'svelte/store';
  * - `isMobile` store: true when viewport < 1024px (our mobile/desktop pivot).
  *   Replaces one-shot `window.innerWidth` checks; updates on resize.
  * - `isTouch()` helper: true when the primary input is coarse (phone/tablet).
- * - `keyboardOffset` store: visualViewport-based offset in pixels for iOS keyboard.
+ * - `viewportMetrics` store: visualViewport-backed CSS variables for mobile
+ *   shells. The shell is sized to the visible viewport; composers should not
+ *   add a separate keyboard offset on top.
  */
 
 const MOBILE_BREAKPOINT = 1024;
@@ -28,66 +30,86 @@ export function isTouch(): boolean {
   return window.matchMedia?.('(hover: none) and (pointer: coarse)').matches ?? false;
 }
 
-function readKeyboardOffset(): number {
-  if (typeof window === 'undefined' || !window.visualViewport) return 0;
-  const vv = window.visualViewport;
-  // When the soft keyboard is up, visualViewport.height shrinks.
-  return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+interface ViewportMetrics {
+  height: number;
+  keyboardOpen: boolean;
 }
 
-function syncViewportHeight(): void {
+function readViewportMetrics(): ViewportMetrics {
+  if (typeof window === 'undefined') {
+    return { height: 0, keyboardOpen: false };
+  }
+  const vv = window.visualViewport;
+  const height = vv?.height ?? window.innerHeight;
+  const keyboardOverlap = vv ? window.innerHeight - vv.height - vv.offsetTop : 0;
+  return {
+    height,
+    keyboardOpen: keyboardOverlap > 80,
+  };
+}
+
+function syncViewportVariables(metrics = readViewportMetrics()): void {
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
-  document.documentElement.style.setProperty('--app-viewport-height', `${window.innerHeight}px`);
+  const height = metrics.height || window.innerHeight;
+  document.documentElement.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
+  document.documentElement.style.setProperty(
+    '--app-bottom-inset',
+    metrics.keyboardOpen ? '0px' : 'env(safe-area-inset-bottom, 0px)',
+  );
 }
 
-export const keyboardOffset = readable(0, (set) => {
-  if (typeof window === 'undefined' || !window.visualViewport) return;
+export const viewportMetrics = readable<ViewportMetrics>({ height: 0, keyboardOpen: false }, (set) => {
+  if (typeof window === 'undefined') return;
   const vv = window.visualViewport;
+  const scheduledTimers = new Set<number>();
   const update = () => {
-    syncViewportHeight();
-    const offset = readKeyboardOffset();
-    set(offset);
-    // Expose as CSS variable so fixed-position elements (composer, bottom tabs)
-    // can offset themselves without JS.
-    document.documentElement.style.setProperty('--kb-offset', `${offset}px`);
+    const metrics = readViewportMetrics();
+    syncViewportVariables(metrics);
+    set(metrics);
   };
-  const reset = () => {
-    syncViewportHeight();
-    set(0);
-    document.documentElement.style.setProperty('--kb-offset', '0px');
+  const scheduleUpdate = () => {
+    update();
+    window.requestAnimationFrame(update);
+    const timer = window.setTimeout(() => {
+      scheduledTimers.delete(timer);
+      update();
+    }, 250);
+    scheduledTimers.add(timer);
   };
-  // iOS Safari sometimes does not fire `visualViewport.resize` immediately
-  // when the on-screen keyboard dismisses — the viewport stays the
-  // keyboard-shrunk size until the user scrolls. That leaves a dark gap
-  // below the composer equal to the keyboard height. Force a reset when
-  // any text input loses focus so the composer snaps back to the bottom.
-  const handleFocusOut = (event: FocusEvent): void => {
-    const target = event.target;
-    if (!(target instanceof HTMLElement)) return;
-    const tag = target.tagName.toLowerCase();
-    if (tag !== 'input' && tag !== 'textarea' && !target.isContentEditable) return;
-    // Defer past iOS's own viewport animation so our reset wins.
-    window.setTimeout(reset, 50);
-  };
+
   update();
-  vv.addEventListener('resize', update);
-  vv.addEventListener('scroll', update);
+  vv?.addEventListener('resize', update);
+  vv?.addEventListener('scroll', update);
   window.addEventListener('resize', update, { passive: true });
-  window.addEventListener('orientationchange', update, { passive: true });
-  window.addEventListener('pageshow', update);
-  document.addEventListener('visibilitychange', update);
-  window.addEventListener('focusout', handleFocusOut, true);
-  window.setTimeout(update, 250);
-  window.setTimeout(update, 1000);
+  window.addEventListener('orientationchange', scheduleUpdate, { passive: true });
+  window.addEventListener('pageshow', scheduleUpdate);
+  document.addEventListener('visibilitychange', scheduleUpdate);
+  window.addEventListener('focusin', scheduleUpdate, true);
+  window.addEventListener('focusout', scheduleUpdate, true);
+  const firstTimer = window.setTimeout(() => {
+    scheduledTimers.delete(firstTimer);
+    update();
+  }, 250);
+  const secondTimer = window.setTimeout(() => {
+    scheduledTimers.delete(secondTimer);
+    update();
+  }, 1000);
+  scheduledTimers.add(firstTimer);
+  scheduledTimers.add(secondTimer);
   return () => {
-    vv.removeEventListener('resize', update);
-    vv.removeEventListener('scroll', update);
+    for (const timer of scheduledTimers) {
+      window.clearTimeout(timer);
+    }
+    scheduledTimers.clear();
+    vv?.removeEventListener('resize', update);
+    vv?.removeEventListener('scroll', update);
     window.removeEventListener('resize', update);
-    window.removeEventListener('orientationchange', update);
-    window.removeEventListener('pageshow', update);
-    document.removeEventListener('visibilitychange', update);
-    window.removeEventListener('focusout', handleFocusOut, true);
+    window.removeEventListener('orientationchange', scheduleUpdate);
+    window.removeEventListener('pageshow', scheduleUpdate);
+    document.removeEventListener('visibilitychange', scheduleUpdate);
+    window.removeEventListener('focusin', scheduleUpdate, true);
+    window.removeEventListener('focusout', scheduleUpdate, true);
     document.documentElement.style.setProperty('--app-viewport-height', '100dvh');
-    document.documentElement.style.setProperty('--kb-offset', '0px');
+    document.documentElement.style.setProperty('--app-bottom-inset', 'env(safe-area-inset-bottom, 0px)');
   };
 });
