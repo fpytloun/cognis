@@ -11,6 +11,7 @@ from typing import Any
 from cognis.core.executor_policy import ExecutorPolicy, is_executor_row_usable
 from cognis.logging import get_logger
 from cognis.models.tool import ToolDefinition
+from cognis.ownership import is_shared_owner_email
 
 logger = get_logger(__name__)
 
@@ -82,15 +83,22 @@ def select_executor_for_agent(
     explicit_id = execution.get("executor_id")
     selector = execution.get("executor_selector") or {}
 
+    def _usable(executor: Any) -> bool:
+        return (
+            is_executor_row_usable(executor, policy, owner_email=owner_email)
+            if policy is not None
+            else getattr(executor, "status", None) == "active"
+            and (
+                owner_email is None
+                or getattr(executor, "owner_email", None) == owner_email
+                or is_shared_owner_email(getattr(executor, "owner_email", None))
+            )
+        )
+
     # 1. Explicit executor ID
     if explicit_id:
         for ex in executors:
-            if ex.executor_id == explicit_id and (
-                is_executor_row_usable(ex, policy, owner_email=owner_email)
-                if policy is not None
-                else ex.status == "active"
-                and (owner_email is None or ex.owner_email == owner_email)
-            ):
+            if ex.executor_id == explicit_id and _usable(ex):
                 return ex
         logger.warning(
             "executor_resolution: explicit executor not found or inactive",
@@ -102,12 +110,7 @@ def select_executor_for_agent(
     if selector:
         matches: list[Any] = []
         for ex in executors:
-            usable = (
-                is_executor_row_usable(ex, policy, owner_email=owner_email)
-                if policy is not None
-                else ex.status == "active"
-                and (owner_email is None or ex.owner_email == owner_email)
-            )
+            usable = _usable(ex)
             if usable and labels_match(ex.labels, selector):
                 matches.append(ex)
         if len(matches) == 1:
@@ -124,24 +127,22 @@ def select_executor_for_agent(
         )
         return None
 
-    # 3. Default executor
+    # 3. Default executor: prefer private owner default, then shared default.
     for ex in executors:
-        usable = (
-            is_executor_row_usable(ex, policy, owner_email=owner_email)
-            if policy is not None
-            else ex.status == "active" and (owner_email is None or ex.owner_email == owner_email)
-        )
-        if ex.is_default and usable:
+        if ex.is_default and _usable(ex) and getattr(ex, "owner_email", None) == owner_email:
             return ex
 
-    # 4. Fallback: first active executor
     for ex in executors:
-        usable = (
-            is_executor_row_usable(ex, policy, owner_email=owner_email)
-            if policy is not None
-            else ex.status == "active" and (owner_email is None or ex.owner_email == owner_email)
-        )
-        if usable:
+        if ex.is_default and _usable(ex) and is_shared_owner_email(getattr(ex, "owner_email", None)):
+            return ex
+
+    # 4. Fallback: first private owner executor, then shared executor.
+    for ex in executors:
+        if _usable(ex) and getattr(ex, "owner_email", None) == owner_email:
+            return ex
+
+    for ex in executors:
+        if _usable(ex) and is_shared_owner_email(getattr(ex, "owner_email", None)):
             return ex
 
     return None

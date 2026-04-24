@@ -24,6 +24,7 @@ function executor(overrides: Partial<ExecutorConfig> = {}): ExecutorConfig {
     runtime_metadata: {},
     last_observed_at: null,
     is_default: false,
+    shared: false,
     owner_email: 'user@example.com',
     created_at: null,
     updated_at: null,

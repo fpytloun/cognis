@@ -54,6 +54,12 @@
     has_overrides: false,
     disabled: false,
     disableable: false,
+    sync_metadata: null,
+    is_shared_with_me: false,
+    shared_by_email: null,
+    granted_permission: null,
+    executor_scope: null,
+    is_readonly_for_caller: false,
     status: 'draft',
     created_at: null,
     updated_at: null

@@ -10,10 +10,17 @@ from cognis.runtime_context import current_user_email
 
 class _AuthProvider:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, list[str]]] = []
+        self.calls: list[tuple[str, str, list[str], str | None]] = []
 
-    def sign_service_jwt(self, subject: str, agent_id: str, audience: list[str]) -> str:
-        self.calls.append((subject, agent_id, audience))
+    def sign_service_jwt(
+        self,
+        subject: str,
+        agent_id: str,
+        audience: list[str],
+        *,
+        agent_owner_email: str | None = None,
+    ) -> str:
+        self.calls.append((subject, agent_id, audience, agent_owner_email))
         return "token"
 
 
@@ -29,8 +36,10 @@ def test_provider_headers_use_request_user_context() -> None:
 
         assert mnemory_headers["Authorization"] == "Bearer token"
         assert intaris_headers["Authorization"] == "Bearer token"
-        assert auth.calls[0] == ("user@example.com", "agent-a", ["mnemory"])
-        assert auth.calls[1] == ("user@example.com", "agent-b", ["intaris"])
+        assert mnemory_headers["X-Agent-Owner"] == "user@example.com"
+        assert intaris_headers["X-Agent-Owner"] == "user@example.com"
+        assert auth.calls[0] == ("user@example.com", "agent-a", ["mnemory"], "user@example.com")
+        assert auth.calls[1] == ("user@example.com", "agent-b", ["intaris"], "user@example.com")
     finally:
         current_user_email.reset(token)
 

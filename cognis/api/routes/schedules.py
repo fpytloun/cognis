@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, Request
 
 from cognis.api.common import (
     api_exception,
+    check_agent_access,
     forbid_mutation_for_viewer,
     require_current_user,
 )
@@ -198,11 +199,12 @@ async def create_schedule_route(
             "Specify either workflow_id or skill_id, not both",
         )
 
-    # Validate agent exists and belongs to user
+    # Validate agent exists and caller can use it
     async with request.app.state.session_factory() as db:
         agent = await get_agent(db, body.agent_id)
-        if agent is None or agent.owner_email != user.email:
+        if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
 
     if body.workflow_id is not None:
         workflow = await request.app.state.workflow_registry.get(
@@ -219,7 +221,7 @@ async def create_schedule_route(
         try:
             await get_attached_skill_workflow_source(
                 session_factory=request.app.state.session_factory,
-                owner_email=user.email,
+                owner_email=agent.owner_email,
                 agent=agent,
                 skill_id=body.skill_id,
             )
@@ -340,12 +342,17 @@ async def update_schedule_route(
         existing = await get_schedule(db, schedule_id)
         if existing is None or existing.created_by != user.email:
             raise api_exception(404, "schedule_not_found", "Schedule not found")
+        current_agent = await get_agent(db, existing.agent_id)
+        if current_agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, current_agent, required="use")
 
         # Validate agent if changing
         if body.agent_id is not None:
             agent = await get_agent(db, body.agent_id)
-            if agent is None or agent.owner_email != user.email:
+            if agent is None:
                 raise api_exception(404, "agent_not_found", "Agent not found")
+            await check_agent_access(request, agent, required="use")
         if body.workflow_id is not None:
             workflow = await request.app.state.workflow_registry.get(
                 body.workflow_id,
@@ -365,7 +372,7 @@ async def update_schedule_route(
             try:
                 await get_attached_skill_workflow_source(
                     session_factory=request.app.state.session_factory,
-                    owner_email=user.email,
+                    owner_email=agent.owner_email,
                     agent=agent,
                     skill_id=existing.skill_id,
                 )
@@ -392,7 +399,7 @@ async def update_schedule_route(
             try:
                 await get_attached_skill_workflow_source(
                     session_factory=request.app.state.session_factory,
-                    owner_email=user.email,
+                    owner_email=agent.owner_email,
                     agent=agent,
                     skill_id=body.skill_id,
                 )
@@ -453,6 +460,10 @@ async def delete_schedule_route(
         existing = await get_schedule(db, schedule_id)
         if existing is None or existing.created_by != user.email:
             raise api_exception(404, "schedule_not_found", "Schedule not found")
+        agent = await get_agent(db, existing.agent_id)
+        if agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
         await delete_schedule(db, schedule_id)
         await db.commit()
 
@@ -475,6 +486,10 @@ async def trigger_schedule_route(
         row = await get_schedule(db, schedule_id)
         if row is None or row.created_by != user.email:
             raise api_exception(404, "schedule_not_found", "Schedule not found")
+        agent = await get_agent(db, row.agent_id)
+        if agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
 
     # Use the scheduler to fire it
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -510,6 +525,10 @@ async def enable_schedule_route(
         existing = await get_schedule(db, schedule_id)
         if existing is None or existing.created_by != user.email:
             raise api_exception(404, "schedule_not_found", "Schedule not found")
+        agent = await get_agent(db, existing.agent_id)
+        if agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
         row = await update_schedule(
             db,
             schedule_id,
@@ -542,6 +561,10 @@ async def disable_schedule_route(
         existing = await get_schedule(db, schedule_id)
         if existing is None or existing.created_by != user.email:
             raise api_exception(404, "schedule_not_found", "Schedule not found")
+        agent = await get_agent(db, existing.agent_id)
+        if agent is None:
+            raise api_exception(404, "agent_not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
         row = await update_schedule(db, schedule_id, enabled=False)
         await db.commit()
 

@@ -31,6 +31,7 @@ from cognis.models.tool import (
     ToolDefinition,
     tool_matches_identifier,
 )
+from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.runtime_context import current_effective_working_directory, current_workspace_root
 from cognis.tools.builtin.artifact_tools import artifact_tools
@@ -317,6 +318,12 @@ def build_step_runtime_factory(
         )
         # Resolve executor config from DB
         executor_config = await _resolve_executor_config(providers, agent, user_email)
+        if (
+            executor_config
+            and executor_config.get("unresolved")
+            and executor_config.get("requires_owner_executor")
+        ):
+            raise RuntimeError("No eligible owner executor is available for this shared agent")
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
 
@@ -331,7 +338,7 @@ def build_step_runtime_factory(
             runtime_metadata["working_directory"] = working_directory
 
         # Inject web backend config (backend name + API keys)
-        web_config = await _resolve_web_config(providers, user_email)
+        web_config = await _resolve_web_config(providers, SYSTEM_USER_EMAIL)
         runtime_metadata.update(web_config)
 
         # Filter tools by agent config AND executor enablement.
@@ -436,7 +443,10 @@ def build_step_runtime_factory(
         if not mcp_servers:
             mcp_servers = _parse_local_mcp_servers(agent)
         if mcp_servers:
-            secrets = await providers.secrets.resolve_for_execution(agent, user_email)
+            secret_owner_email = (
+                executor_config.get("executor_owner_email", user_email) if executor_config else user_email
+            )
+            secrets = await providers.secrets.resolve_for_execution(agent, secret_owner_email)
             handle = await providers.executor.spawn(
                 ExecutorConfig(
                     executor_id=f"controller_step_{uuid.uuid4().hex[:12]}",
@@ -630,22 +640,43 @@ async def _resolve_executor_config(
     if session_factory is None:
         return None
 
-    from cognis.store.queries import list_executors
+    from cognis.store.queries import get_active_agent_grant, list_executors
 
     try:
         policy = await load_executor_policy(session_factory)
         async with session_factory() as session:
-            executors = await list_executors(session, owner_email=user_email)
+            executor_owner_email = user_email
+            requires_owner_executor = False
+            if agent.owner_email != user_email:
+                grant = await get_active_agent_grant(session, agent.agent_id, user_email)
+                if grant is None:
+                    return None
+                if normalize_executor_scope(str(grant.executor_scope)) == "owner_executor":
+                    executor_owner_email = agent.owner_email
+                    requires_owner_executor = True
+            executors = await list_executors(
+                session,
+                owner_email=executor_owner_email,
+                include_shared=True,
+            )
             if not executors:
-                return None
+                return {
+                    "executor_owner_email": executor_owner_email,
+                    "requires_owner_executor": requires_owner_executor,
+                    "unresolved": True,
+                }
             selected = select_executor_for_agent(
                 executors,
                 agent.execution if isinstance(agent.execution, dict) else None,
-                owner_email=user_email,
+                owner_email=executor_owner_email,
                 policy=policy,
             )
             if selected is None:
-                return None
+                return {
+                    "executor_owner_email": executor_owner_email,
+                    "requires_owner_executor": requires_owner_executor,
+                    "unresolved": True,
+                }
             return {
                 "executor_id": selected.executor_id,
                 "executor_type": selected.executor_type,
@@ -654,6 +685,8 @@ async def _resolve_executor_config(
                 "labels": selected.labels or {},
                 "config": selected.config or {},
                 "owner_email": selected.owner_email,
+                "executor_owner_email": executor_owner_email,
+                "requires_owner_executor": requires_owner_executor,
                 "desired_config_version": selected.desired_config_version,
                 "applied_config_version": selected.applied_config_version,
                 "observed_tools": selected.observed_tools or [],
@@ -696,7 +729,7 @@ async def _resolve_web_config(
     if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_secret"):
         for secret_name in ("tavily_api_key", "brave_api_key"):
             try:
-                value = await providers.secrets.get_secret(secret_name, user_email)
+                value = await providers.secrets.get_secret(secret_name, SYSTEM_USER_EMAIL)
                 if value:
                     web_secrets[secret_name] = value
             except KeyError:
@@ -737,7 +770,8 @@ async def _resolve_executor_mcp_servers(
             row = await get_mcp_server(
                 session,
                 str(sid),
-                owner_email=executor_config.get("owner_email") if executor_config else None,
+                owner_email=executor_config.get("executor_owner_email") if executor_config else None,
+                include_shared=True,
             )
             if row is None:
                 logger.warning(

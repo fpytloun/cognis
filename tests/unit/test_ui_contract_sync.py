@@ -19,7 +19,10 @@ from pathlib import Path
 import pytest
 
 from cognis.api.models import (
+    AgentResponse,
     DeliverableResponse,
+    ExecutorConfigResponse,
+    MCPServerConfigResponse,
     PendingPauseResponse,
     SessionResponse,
     SkillResponse,
@@ -39,8 +42,11 @@ def _load_ui_types() -> str:
 
 
 _MODELS_TO_CHECK = (
+    ("Agent", AgentResponse),
     ("Task", TaskResponse),
     ("Deliverable", DeliverableResponse),
+    ("ExecutorConfig", ExecutorConfigResponse),
+    ("MCPServerConfigResponse", MCPServerConfigResponse),
     ("StepRun", StepRunResponse),
     ("PendingPause", PendingPauseResponse),
     ("Session", SessionResponse),
@@ -109,8 +115,11 @@ def test_ui_interface_covers_api_model_fields(interface_name: str, model_cls: ty
     # server side without being surfaced — skip a known allowlist where
     # the UI explicitly ignores a server field.
     allowed_missing = {
+        "Agent": set(),
         "Task": set(),
         "Deliverable": set(),
+        "ExecutorConfig": set(),
+        "MCPServerConfigResponse": set(),
         "StepRun": set(),
         "PendingPause": set(),
         "Session": set(),

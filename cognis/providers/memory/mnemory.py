@@ -13,9 +13,10 @@ from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.retry import with_retry
-from cognis.runtime_context import current_agent_id, current_user_email
+from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 
 logger = get_logger(__name__)
 
@@ -46,7 +47,7 @@ class MnemoryProvider:
     """
 
     def __init__(
-        self, base_url: str, auth_provider: Any, user_email: str = "system@example.com"
+        self, base_url: str, auth_provider: Any, user_email: str = SYSTEM_USER_EMAIL
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
@@ -95,11 +96,13 @@ class MnemoryProvider:
                 )
             subject = self.service_user_email
         resolved_agent_id = agent_id or current_agent_id.get()
+        resolved_agent_owner = current_agent_owner_email.get() or subject
         headers = {
-            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id or 'system', ['mnemory'])}",
+            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id or 'system', ['mnemory'], agent_owner_email=resolved_agent_owner)}",
         }
         if resolved_agent_id is not None:
             headers["X-Agent-Id"] = resolved_agent_id
+            headers["X-Agent-Owner"] = resolved_agent_owner
         return headers
 
     async def _request_json(

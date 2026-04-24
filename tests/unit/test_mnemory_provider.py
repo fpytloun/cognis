@@ -7,8 +7,18 @@ from cognis.runtime_context import scoped_runtime_context
 
 
 class _AuthProvider:
-    def sign_service_jwt(self, user_email: str, agent_id: str, audience: list[str]) -> str:
-        del user_email, agent_id, audience
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, list[str], str | None]] = []
+
+    def sign_service_jwt(
+        self,
+        user_email: str,
+        agent_id: str,
+        audience: list[str],
+        *,
+        agent_owner_email: str | None = None,
+    ) -> str:
+        self.calls.append((user_email, agent_id, audience, agent_owner_email))
         return "token"
 
 
@@ -74,6 +84,27 @@ async def test_recall_keeps_matching_session_ids_unflagged() -> None:
 
     assert result["session_id"] == "mem-existing"
     assert result["_session_forged"] is False
+
+
+def test_headers_include_agent_owner_when_context_sets_it() -> None:
+    auth = _AuthProvider()
+    provider = MnemoryProvider("https://mnemory.test", auth)
+
+    with scoped_runtime_context(
+        user_email="guest@example.com",
+        agent_id="agent-1",
+        agent_owner_email="owner@example.com",
+    ):
+        headers = provider._headers()
+
+    assert headers["X-Agent-Id"] == "agent-1"
+    assert headers["X-Agent-Owner"] == "owner@example.com"
+    assert auth.calls[-1] == (
+        "guest@example.com",
+        "agent-1",
+        ["mnemory"],
+        "owner@example.com",
+    )
 
 
 @pytest.mark.asyncio

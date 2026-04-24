@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from sqlalchemy import select
 
-from cognis.api.common import api_exception, require_admin, require_current_user
+from cognis.api.common import api_exception, require_admin
 from cognis.api.models import (
     CursorPage,
     EnrichModelsPreviewRequest,
@@ -40,6 +40,7 @@ from cognis.core.step_profiles import (
 )
 from cognis.models.config import normalize_reasoning_level
 from cognis.models.workflow import StepProfileConfig
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.settings_schema import setting_category, validate_setting_value
 from cognis.store.models import SystemWorkflowOverride, WorkflowRow
 from cognis.store.queries import (
@@ -171,7 +172,7 @@ def _apply_last_test_metadata(
 
 @router.get("/api/v1/settings", response_model=list[SettingsCategoryResponse])
 async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
-    require_current_user(request)
+    require_admin(request)
     async with request.app.state.session_factory() as session:
         rows = await list_settings(session)
     grouped: dict[str, list[SettingResponse]] = defaultdict(list)
@@ -187,7 +188,7 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
 
 @router.get("/api/v1/settings/step-profiles", response_model=list[StepProfileResponse])
 async def settings_step_profiles(request: Request) -> list[StepProfileResponse]:
-    require_current_user(request)
+    require_admin(request)
     registry = request.app.state.step_profile_registry
     return [
         _step_profile_response(registry, definition) for definition in registry.list_definitions()
@@ -352,7 +353,7 @@ async def settings_step_profile_reset(request: Request, profile_id: str) -> Step
 
 @router.get("/api/v1/settings/{key}", response_model=SettingResponse)
 async def setting_detail(request: Request, key: str) -> SettingResponse:
-    require_current_user(request)
+    require_admin(request)
     async with request.app.state.session_factory() as session:
         row = await get_setting(session, key)
     if row is None:
@@ -408,7 +409,7 @@ async def setting_update(
 @router.get("/api/v1/web-config/status", response_model=WebConfigStatusResponse)
 async def web_config_status(request: Request) -> WebConfigStatusResponse:
     """Return web backend configuration status."""
-    user = require_current_user(request)
+    require_admin(request)
     from cognis.store.queries import get_setting_value
 
     async with request.app.state.session_factory() as session:
@@ -420,7 +421,7 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
     if secrets_provider is not None:
         for secret_name in ("tavily_api_key", "brave_api_key"):
             try:
-                await secrets_provider.get_secret(secret_name, user.email)
+                await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
                 if secret_name == "tavily_api_key":
                     tavily_configured = True
                 else:
@@ -692,7 +693,7 @@ async def llm_provider_enrich_models_preview(
 
 @router.get("/api/v1/model-routing", response_model=ModelRoutingResponse)
 async def model_routing_get(request: Request) -> ModelRoutingResponse:
-    require_current_user(request)
+    require_admin(request)
     async with request.app.state.session_factory() as session:
         rows = await list_model_routing(session)
     route_by_task = {row.task_type: row for row in rows}

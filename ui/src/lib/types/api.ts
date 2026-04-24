@@ -205,9 +205,29 @@ export interface Agent {
   has_overrides: boolean;
   disabled: boolean;
   disableable: boolean;
+  sync_metadata: Record<string, unknown> | null;
+  is_shared_with_me: boolean;
+  shared_by_email: string | null;
+  granted_permission: string | null;
+  executor_scope: string | null;
+  is_readonly_for_caller: boolean;
   status: string;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface AgentGrant {
+  grant_id: string;
+  agent_id: string;
+  grantee_type: string;
+  grantee_user_email: string | null;
+  grantee_group_id: string | null;
+  permission: string;
+  executor_scope: string;
+  granted_by: string;
+  granted_at: string | null;
+  revoked_at: string | null;
+  note: string | null;
 }
 
 export interface ToolParameterProperty {
@@ -327,12 +347,13 @@ export interface MCPServerConfigResponse {
   url: string | null;
   args: string[];
   env: Record<string, string>;
-   headers: Record<string, string>;
+  headers: Record<string, string>;
   timeout_seconds: number;
   description: string | null;
+  shared: boolean;
   owner_email: string;
   status: string;
-   invalid_reason: string | null;
+  invalid_reason: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -499,6 +520,7 @@ export interface ExecutorConfig {
   last_observed_at: string | null;
   observed_tools?: ToolDefinitionSummary[];
   is_default: boolean;
+  shared: boolean;
   owner_email: string | null;
   created_at: string | null;
   updated_at: string | null;
@@ -513,6 +535,7 @@ export interface ExecutorCreateRequest {
   enabled_tool_groups?: string[];
   config?: ExecutorRuntimeConfig;
   is_default?: boolean;
+  shared?: boolean;
 }
 
 export interface ExecutorUpdateRequest {
@@ -523,6 +546,7 @@ export interface ExecutorUpdateRequest {
   config?: ExecutorRuntimeConfig;
   status?: string;
   is_default?: boolean;
+  shared?: boolean;
 }
 
 export interface ExecutorSignalConfig {

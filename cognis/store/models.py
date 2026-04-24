@@ -23,6 +23,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -155,6 +156,42 @@ class AgentSecondaryBinding(Base):
     secondary_agent_id: Mapped[str] = mapped_column(
         String, ForeignKey("agents.agent_id", ondelete="CASCADE"), primary_key=True
     )
+
+
+class AgentGrantRow(Base):
+    """User-to-user sharing grant for an agent."""
+
+    __tablename__ = "agent_grants"
+    __table_args__ = (
+        Index(
+            "uq_agent_grants_active_user",
+            "agent_id",
+            "grantee_user_email",
+            unique=True,
+            sqlite_where=text("grantee_type = 'user' AND revoked_at IS NULL"),
+            postgresql_where=text("grantee_type = 'user' AND revoked_at IS NULL"),
+        ),
+        Index("ix_agent_grants_grantee_user", "grantee_user_email"),
+        Index("ix_agent_grants_agent", "agent_id"),
+    )
+
+    grant_id: Mapped[str] = mapped_column(String, primary_key=True)
+    agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.agent_id", ondelete="CASCADE"), nullable=False
+    )
+    grantee_type: Mapped[str] = mapped_column(String, nullable=False, default="user")
+    grantee_user_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email"), nullable=True
+    )
+    grantee_group_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    permission: Mapped[str] = mapped_column(String, nullable=False, default="use")
+    executor_scope: Mapped[str] = mapped_column(String, nullable=False, default="owner_executor")
+    granted_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class SystemAgentOverride(Base):

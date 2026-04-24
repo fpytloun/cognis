@@ -329,6 +329,11 @@ class AgentResponse(BaseModel):
     has_overrides: bool = False
     disabled: bool = False
     disableable: bool = False
+    is_shared_with_me: bool = False
+    shared_by_email: str | None = None
+    granted_permission: str | None = None
+    executor_scope: str | None = None
+    is_readonly_for_caller: bool = False
     sync_metadata: dict[str, Any] | None = None
     status: str
     created_at: datetime | None = None
@@ -342,6 +347,31 @@ class AgentCardResponse(BaseModel):
     capabilities: dict[str, Any] = Field(default_factory=dict)
     skills: list[dict[str, Any]] = Field(default_factory=list)
     authentication: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentGrantCreateRequest(BaseModel):
+    grantee_email: str
+    executor_scope: Literal["owner_executor", "grantee_executor"] = "owner_executor"
+    note: str | None = None
+
+
+class AgentGrantUpdateRequest(BaseModel):
+    executor_scope: Literal["owner_executor", "grantee_executor"] | None = None
+    note: str | None = None
+
+
+class AgentGrantResponse(BaseModel):
+    grant_id: str
+    agent_id: str
+    grantee_type: str
+    grantee_user_email: str | None = None
+    grantee_group_id: str | None = None
+    permission: str
+    executor_scope: Literal["owner_executor", "grantee_executor"]
+    granted_by: str
+    granted_at: datetime | None = None
+    revoked_at: datetime | None = None
+    note: str | None = None
 
 
 class SettingResponse(BaseModel):
@@ -1096,6 +1126,7 @@ class ExecutorConfigResponse(BaseModel):
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
     last_observed_at: datetime | None = None
     is_default: bool = False
+    shared: bool = False
     owner_email: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -1110,6 +1141,7 @@ class ExecutorCreateRequest(BaseModel):
     enabled_tool_groups: list[str] = Field(default_factory=list)
     config: dict[str, Any] = Field(default_factory=dict)
     is_default: bool = False
+    shared: bool = False
 
 
 class ExecutorUpdateRequest(BaseModel):
@@ -1120,6 +1152,7 @@ class ExecutorUpdateRequest(BaseModel):
     config: dict[str, Any] | None = None
     status: str | None = None
     is_default: bool | None = None
+    shared: bool | None = None
 
 
 class ExecutorTokenResponse(BaseModel):
@@ -1142,6 +1175,7 @@ class MCPServerConfigResponse(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = 30
     description: str | None = None
+    shared: bool = False
     owner_email: str
     status: str = "active"
     invalid_reason: str | None = None
@@ -1160,6 +1194,7 @@ class MCPServerCreateRequest(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = 30
     description: str | None = None
+    shared: bool = False
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> MCPServerCreateRequest:
@@ -1204,6 +1239,7 @@ class MCPServerUpdateRequest(BaseModel):
     timeout_seconds: int | None = None
     description: str | None = None
     status: str | None = None
+    shared: bool | None = None
 
 
 class SendMessageRequest(BaseModel):

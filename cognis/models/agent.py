@@ -41,6 +41,11 @@ class AgentDefinition(BaseModel):
     editable_fields: list[str] = Field(default_factory=list, exclude=True)
     has_overrides: bool = Field(default=False, exclude=True)
     disabled: bool = Field(default=False, exclude=True)
+    is_shared_with_me: bool = False
+    shared_by_email: str | None = None
+    granted_permission: str | None = None
+    executor_scope: str | None = None
+    is_readonly_for_caller: bool = False
     # Metadata
     status: str = "active"
     created_at: datetime | None = None

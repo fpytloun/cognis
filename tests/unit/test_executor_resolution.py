@@ -34,6 +34,7 @@ class FakeExecutor:
     enabled_tool_groups: list[str] | None = field(default_factory=list)
     status: str = "active"
     is_default: bool = False
+    owner_email: str | None = None
 
 
 class TestIsToolEnabled:
@@ -161,6 +162,28 @@ class TestSelectExecutorForAgent:
         result = select_executor_for_agent(executors, {})
         assert result is not None
         assert result.executor_id == "exec_b"
+
+    def test_private_default_preferred_over_shared_default(self) -> None:
+        executors = [
+            FakeExecutor(executor_id="shared", is_default=True, owner_email=None),
+            FakeExecutor(
+                executor_id="private",
+                is_default=True,
+                owner_email="user@example.com",
+            ),
+        ]
+        result = select_executor_for_agent(executors, {}, owner_email="user@example.com")
+        assert result is not None
+        assert result.executor_id == "private"
+
+    def test_shared_default_used_when_no_private_default_exists(self) -> None:
+        executors = [
+            FakeExecutor(executor_id="shared", is_default=True, owner_email=None),
+            FakeExecutor(executor_id="private", owner_email="user@example.com"),
+        ]
+        result = select_executor_for_agent(executors, {}, owner_email="user@example.com")
+        assert result is not None
+        assert result.executor_id == "shared"
 
     def test_no_config_uses_default(self) -> None:
         executors = [FakeExecutor(executor_id="exec_a", is_default=True)]

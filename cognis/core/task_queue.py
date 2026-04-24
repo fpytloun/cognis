@@ -1018,9 +1018,11 @@ class TaskQueue:
         correct user identity instead of the default ``system@example.com``.
         """
         cancel_event = self._run_controls.setdefault(task.task_id, asyncio.Event())
+        agent = await self._agent_registry.get(task.agent_id, owner_email=task.created_by)
         with scoped_runtime_context(
             user_email=task.created_by,
             agent_id=task.agent_id,
+            agent_owner_email=(agent.owner_email if agent is not None else task.created_by),
             workspace_root=task.workspace_root,
             effective_working_directory=task.working_directory or task.workspace_root,
         ):

@@ -15,8 +15,8 @@ from sqlalchemy import select
 
 from cognis.api.common import (
     api_exception,
+    check_agent_access,
     require_current_user,
-    require_owner_or_admin,
 )
 from cognis.api.models import (
     EffectiveToolItemResponse,
@@ -61,6 +61,7 @@ from cognis.models.tool import (
     stable_tool_id,
     tool_display_name,
 )
+from cognis.ownership import is_shared_owner_email
 from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import (
     create_mcp_server,
@@ -97,6 +98,10 @@ def _utcnow() -> datetime:
 
 def _sanitize_mcp_error(error: Exception) -> str:
     return f"{error.__class__.__name__}: {str(error)[:300]}"
+
+
+def _mcp_is_shared(row: Any) -> bool:
+    return is_shared_owner_email(getattr(row, "owner_email", None))
 
 
 async def _discover_local_mcp_tools(
@@ -151,7 +156,7 @@ async def list_tools(request: Request) -> list[ToolResponse]:
 async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        executors = await list_executors(session, owner_email=user.email)
+        executors = await list_executors(session, owner_email=user.email, include_shared=True)
 
     unique: dict[str, ToolDefinition] = {}
     for row in executors:
@@ -195,12 +200,15 @@ async def get_agent_effective_tools(request: Request, agent_id: str) -> Effectiv
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    access = await check_agent_access(request, row, required="view")
     agent = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     return await _resolve_effective_tools_response(
         request,
         agent,
-        user_email=agent.owner_email,
+        acting_user_email=access.user.email,
+        executor_owner_email=(
+            access.user.email if access.executor_scope == "grantee_executor" else agent.owner_email
+        ),
     )
 
 
@@ -218,7 +226,12 @@ async def preview_effective_tools(
         permissions=AgentPermissions.model_validate(payload.permissions or {}),
         execution=payload.execution,
     )
-    return await _resolve_effective_tools_response(request, agent, user_email=user.email)
+    return await _resolve_effective_tools_response(
+        request,
+        agent,
+        acting_user_email=user.email,
+        executor_owner_email=user.email,
+    )
 
 
 @router.get("/api/v1/executor/status", response_model=ExecutorStatusResponse)
@@ -332,18 +345,24 @@ async def _resolve_effective_tools_response(
     request: Request,
     agent: AgentDefinition,
     *,
-    user_email: str,
+    acting_user_email: str,
+    executor_owner_email: str,
 ) -> EffectiveToolsResponse:
     session_factory = request.app.state.session_factory
     policy = await load_executor_policy(session_factory)
     warnings: list[str] = []
+    _ = acting_user_email
 
     async with session_factory() as session:
-        executors = await list_executors(session, owner_email=user_email)
+        executors = await list_executors(
+            session,
+            owner_email=executor_owner_email,
+            include_shared=True,
+        )
         selected = select_executor_for_agent(
             executors,
             agent.execution if isinstance(agent.execution, dict) else None,
-            owner_email=user_email,
+            owner_email=executor_owner_email,
             policy=policy,
         )
 
@@ -382,7 +401,7 @@ async def _resolve_effective_tools_response(
 
         async with session_factory() as db_session:
             resolved_skills = await resolve_skills_for_agent(
-                db_session, agent, owner_email=user_email
+                db_session, agent, owner_email=agent.owner_email
             )
         if resolved_skills.skills:
             skill_tool_defs = skill_tools_to_definitions(resolved_skills)
@@ -396,7 +415,12 @@ async def _resolve_effective_tools_response(
             mcp_servers: list[MCPServerConfig] = []
             async with session_factory() as session:
                 for server_id in config_ids:
-                    row = await get_mcp_server(session, str(server_id), owner_email=user_email)
+                    row = await get_mcp_server(
+                        session,
+                        str(server_id),
+                        owner_email=executor_owner_email,
+                        include_shared=True,
+                    )
                     if row is None or row.status != "active":
                         continue
                     if (
@@ -424,7 +448,11 @@ async def _resolve_effective_tools_response(
                         )
                     )
             configured_tools.extend(
-                await _discover_temp_mcp_tools(request.app.state.providers, mcp_servers, user_email)
+                await _discover_temp_mcp_tools(
+                    request.app.state.providers,
+                    mcp_servers,
+                    executor_owner_email,
+                )
             )
         elif (
             selected.observed_tools
@@ -452,7 +480,7 @@ async def _resolve_effective_tools_response(
     configured_tools = await resolve_tool_classifications(
         configured_tools,
         session_factory=request.app.state.session_factory,
-        owner_email=user_email,
+        owner_email=acting_user_email,
         queue=getattr(request.app.state, "tool_classification_queue", None),
     )
 
@@ -505,7 +533,7 @@ async def _resolve_effective_tools_response(
             live_tools = await resolve_tool_classifications(
                 merged_result.tools,
                 session_factory=request.app.state.session_factory,
-                owner_email=user_email,
+                owner_email=acting_user_email,
                 queue=getattr(request.app.state, "tool_classification_queue", None),
             )
             for tool in live_tools:
@@ -649,7 +677,7 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
         agent = await get_agent(session, agent_id)
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, agent.owner_email)
+    access = await check_agent_access(request, agent, required="view")
     classified_static = await resolve_tool_classifications(
         select_static_tools(agent),
         session_factory=request.app.state.session_factory,
@@ -659,7 +687,10 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
     tools = [tool_to_response(tool) for tool in classified_static]
     agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
     try:
-        discovered = await _discover_local_mcp_tools(request, agent_definition, agent.owner_email)
+        discovery_owner = (
+            access.user.email if access.executor_scope == "grantee_executor" else agent.owner_email
+        )
+        discovered = await _discover_local_mcp_tools(request, agent_definition, discovery_owner)
     except Exception:
         discovered = []
     discovered = await resolve_tool_classifications(
@@ -716,7 +747,7 @@ async def test_agent_mcp_servers(request: Request, agent_id: str) -> MCPServerTe
         agent = await get_agent(session, agent_id)
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, agent.owner_email)
+    access = await check_agent_access(request, agent, required="view")
 
     agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
     raw_servers = []
@@ -727,8 +758,11 @@ async def test_agent_mcp_servers(request: Request, agent_id: str) -> MCPServerTe
 
     started_at = monotonic()
     try:
+        discovery_owner = (
+            access.user.email if access.executor_scope == "grantee_executor" else agent.owner_email
+        )
         discovered = await asyncio.wait_for(
-            _discover_local_mcp_tools(request, agent_definition, agent.owner_email), timeout=30
+            _discover_local_mcp_tools(request, agent_definition, discovery_owner), timeout=30
         )
     except TimeoutError:
         return MCPServerTestResponse(
@@ -838,6 +872,7 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
         headers=_redact_secret_mapping(row.headers),
         timeout_seconds=row.timeout_seconds,
         description=row.description,
+        shared=_mcp_is_shared(row),
         owner_email=row.owner_email,
         status=row.status,
         invalid_reason=invalid_reason,
@@ -850,7 +885,7 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
 async def list_mcp_servers_route(request: Request) -> list[dict[str, Any]]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_global_mcp_servers(session, owner_email=user.email)
+        rows = await list_global_mcp_servers(session, owner_email=user.email, include_shared=True)
     return [_mcp_row_to_response(r) for r in rows]
 
 
@@ -858,7 +893,7 @@ async def list_mcp_servers_route(request: Request) -> list[dict[str, Any]]:
 async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, Any]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_mcp_server(session, server_id, owner_email=user.email)
+        row = await get_mcp_server(session, server_id, owner_email=user.email, include_shared=True)
     if row is None:
         raise api_exception(404, "not_found", "MCP server not found")
     return _mcp_row_to_response(row)
@@ -867,6 +902,8 @@ async def get_mcp_server_route(request: Request, server_id: str) -> dict[str, An
 @router.post("/api/v1/mcp-servers")
 async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest) -> dict[str, Any]:
     user = require_current_user(request)
+    if body.shared and user.role != "admin":
+        raise api_exception(403, "forbidden", "Only admins can create shared MCP servers")
     # Normalize args: split any whitespace-containing entries so that
     # "npx -y @doist/todoist-ai" stored as a single arg becomes ["-y", "@doist/todoist-ai"].
     normalized_args = _normalize_mcp_args(body.args)
@@ -888,6 +925,7 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
             timeout_seconds=body.timeout_seconds,
             description=body.description,
             owner_email=user.email,
+            shared=body.shared,
         )
         await session.commit()
     return _mcp_row_to_response(row)
@@ -899,10 +937,14 @@ async def update_mcp_server_route(
 ) -> dict[str, Any]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        existing = await get_mcp_server(session, server_id, owner_email=user.email)
+        existing = await get_mcp_server(session, server_id, owner_email=user.email, include_shared=True)
         if existing is None:
             raise api_exception(404, "not_found", "MCP server not found")
+        if _mcp_is_shared(existing) and user.role != "admin":
+            raise api_exception(403, "forbidden", "Only admins can modify shared MCP servers")
         updates = body.model_dump(exclude_unset=True)
+        if updates.get("shared") and user.role != "admin":
+            raise api_exception(403, "forbidden", "Only admins can create shared MCP servers")
         if "args" in updates and isinstance(updates["args"], list):
             updates["args"] = _normalize_mcp_args(updates["args"])
         if "headers" in updates and isinstance(updates["headers"], dict):
@@ -938,7 +980,13 @@ async def update_mcp_server_route(
             MCPServerConfig.model_validate(merged)
         except ValidationError as exc:
             raise api_exception(422, "validation_error", str(exc)) from exc
-        row = await update_mcp_server(session, server_id, owner_email=user.email, **updates)
+        row = await update_mcp_server(
+            session,
+            server_id,
+            owner_email=user.email,
+            include_shared=True,
+            **updates,
+        )
         if row is None:
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()
@@ -949,9 +997,17 @@ async def update_mcp_server_route(
 async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str, str]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
+        existing = await get_mcp_server(session, server_id, owner_email=user.email, include_shared=True)
+        if existing is None:
+            raise api_exception(404, "not_found", "MCP server not found")
+        if _mcp_is_shared(existing) and user.role != "admin":
+            raise api_exception(403, "forbidden", "Only admins can delete shared MCP servers")
         # Check for executor references before deleting
         referencing = await mcp_server_referenced_by_executors(
-            session, server_id, owner_email=user.email
+            session,
+            server_id,
+            owner_email=user.email,
+            include_shared=True,
         )
         if referencing:
             raise api_exception(
@@ -960,7 +1016,12 @@ async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str,
                 f"MCP server is referenced by executor(s): {', '.join(referencing)}. "
                 "Remove the assignment first.",
             )
-        deleted = await delete_mcp_server(session, server_id, owner_email=user.email)
+        deleted = await delete_mcp_server(
+            session,
+            server_id,
+            owner_email=user.email,
+            include_shared=True,
+        )
         if not deleted:
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()

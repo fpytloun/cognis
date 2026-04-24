@@ -67,11 +67,23 @@ class JWTAuthProvider:
             {"sub": subject, "aud": ["cognis"], "typ": "refresh"}, self.refresh_ttl_seconds
         )
 
-    def sign_service_jwt(self, subject: str, agent_id: str, audience: list[str]) -> str:
-        return self._sign(
-            {"sub": subject, "agent_id": agent_id, "aud": audience, "typ": "service"},
-            self.token_ttl_seconds,
-        )
+    def sign_service_jwt(
+        self,
+        subject: str,
+        agent_id: str,
+        audience: list[str],
+        *,
+        agent_owner_email: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "sub": subject,
+            "agent_id": agent_id,
+            "aud": audience,
+            "typ": "service",
+        }
+        if agent_owner_email and agent_owner_email != subject:
+            payload["aow"] = agent_owner_email
+        return self._sign(payload, self.token_ttl_seconds)
 
     def sign_executor_token(self, executor_id: str, ttl_seconds: int = 30 * 24 * 3600) -> str:
         """Sign a long-lived JWT for executor authentication.

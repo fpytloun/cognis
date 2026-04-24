@@ -12,10 +12,11 @@ from sqlalchemy import select
 
 from cognis.api.common import (
     api_exception,
+    check_agent_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
-    require_owner_or_admin,
+    require_resource_owner,
 )
 from cognis.api.models import (
     BatchSubmitRequest,
@@ -182,7 +183,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         try:
             source = await get_attached_skill_workflow_source(
                 session_factory=request.app.state.session_factory,
-                owner_email=user.email,
+                owner_email=agent.owner_email,
                 agent=agent,
                 skill_id=payload.skill_id,
             )
@@ -314,7 +315,7 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         try:
             source = await get_attached_skill_workflow_source(
                 session_factory=request.app.state.session_factory,
-                owner_email=existing_row.created_by,
+                owner_email=agent.owner_email,
                 agent=agent,
                 skill_id=payload.skill_id,
             )
@@ -427,7 +428,8 @@ async def task_delete(request: Request, task_id: str) -> TaskActionResponse:
 @router.post("/api/v1/tasks/{task_id}/submit", response_model=TaskActionResponse)
 async def task_submit(request: Request, task_id: str) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
-    await _require_task(request, task_id)
+    task = await _require_task(request, task_id)
+    await _validate_agent_access(request, task.agent_id)
     task = await request.app.state.task_queue.submit_existing(task_id)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
@@ -443,7 +445,8 @@ async def task_pause(request: Request, task_id: str) -> TaskActionResponse:
 @router.post("/api/v1/tasks/{task_id}/resume", response_model=TaskActionResponse)
 async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
     forbid_mutation_for_viewer(request)
-    await _require_task(request, task_id)
+    task = await _require_task(request, task_id)
+    await _validate_agent_access(request, task.agent_id)
     task = await request.app.state.task_queue.resume_task(task_id)
     return TaskActionResponse(ok=True, task_id=task_id, status=str(task.status))
 
@@ -451,7 +454,8 @@ async def task_resume(request: Request, task_id: str) -> TaskActionResponse:
 @router.post("/api/v1/tasks/{task_id}/rerun", response_model=TaskRerunResponse)
 async def task_rerun(request: Request, task_id: str) -> TaskRerunResponse:
     forbid_mutation_for_viewer(request)
-    await _require_task(request, task_id)
+    task = await _require_task(request, task_id)
+    await _validate_agent_access(request, task.agent_id)
     result = await request.app.state.task_queue.rerun_task(task_id)
     return TaskRerunResponse(
         ok=True,
@@ -542,7 +546,8 @@ async def task_batch_submit(request: Request, payload: BatchSubmitRequest) -> Ba
             row = await get_task(session, task_id)
             if row is None:
                 continue
-            require_owner_or_admin(request, row.created_by)
+            require_resource_owner(request, row.created_by)
+            await _validate_agent_access(request, row.agent_id)
     result = await request.app.state.task_queue.batch_submit(payload.task_ids)
     return BatchSubmitResponse(**result)
 
@@ -642,13 +647,12 @@ async def task_remove_dependency(
 
 
 async def _require_task(request: Request, task_id: str) -> TaskModel:
-    user = require_current_user(request)
+    require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_task(session, task_id)
     if row is None:
         raise api_exception(404, "not_found", "Task not found")
-    if row.created_by != user.email:
-        raise api_exception(404, "not_found", "Task not found")
+    require_resource_owner(request, row.created_by)
     return _row_to_task(row)
 
 
@@ -659,7 +663,7 @@ async def _validate_agent_access(request: Request, agent_id: str | None) -> None
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    await check_agent_access(request, row, required="use")
 
 
 async def _validate_workflow_access(
@@ -674,7 +678,7 @@ async def _validate_workflow_access(
     if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
     if workflow.owner_email is not None:
-        require_owner_or_admin(request, workflow.owner_email)
+        require_resource_owner(request, workflow.owner_email)
 
 
 async def _validate_conversation_access(request: Request, conversation_id: str | None) -> None:
@@ -684,7 +688,7 @@ async def _validate_conversation_access(request: Request, conversation_id: str |
         row = await get_conversation(session, conversation_id)
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
 
 
 async def _build_workflow_run_response(

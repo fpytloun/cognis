@@ -13,6 +13,7 @@ from cognis.api.executor_runtime import reconcile_executor
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
+from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
 from cognis.store.queries import get_executor_row, get_mcp_server, update_executor_runtime_state
 from cognis.tools.mcp import invalid_mcp_config_reason
@@ -91,6 +92,7 @@ async def handle_executor_websocket(
             environment=params.get("environment"),
             platform=params.get("platform") or {},
             status=row.status,
+            owner_email=row.owner_email,
         ),
     )
 
@@ -251,11 +253,14 @@ def _executor_connection_metadata(
     environment: Any,
     platform: dict[str, Any],
     status: str,
+    owner_email: str | None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "labels": labels,
         "platform": platform,
         "status": status,
+        "owner_email": owner_email,
+        "shared": is_shared_owner_email(owner_email),
     }
     if isinstance(environment, dict):
         metadata["environment"] = environment

@@ -3,24 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from cognis.api.common import (
     api_exception,
+    apply_agent_access_metadata,
+    check_agent_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
-    require_owner_or_admin,
+    require_resource_owner,
     slugify,
 )
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.models import (
     AgentCardResponse,
     AgentCreateRequest,
+    AgentGrantCreateRequest,
+    AgentGrantResponse,
+    AgentGrantUpdateRequest,
     AgentResponse,
     AgentUpdateRequest,
     CursorPage,
@@ -29,17 +36,26 @@ from cognis.api.serializers import agent_to_response
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.ownership import normalize_executor_scope
+from cognis.store.models import Schedule, Task
 from cognis.store.queries import (
     add_secondary_binding,
     create_agent,
+    create_agent_grant,
     delete_system_agent_override,
     get_agent,
+    get_agent_grant,
+    get_agent_grant_for_user,
     get_system_agent_override,
+    get_user,
+    list_agent_grants,
     list_secondary_bindings,
     remove_secondary_binding,
+    revoke_agent_grant,
     set_agent_status,
     set_secondary_bindings,
     update_agent,
+    update_agent_grant,
     upsert_system_agent_override,
 )
 
@@ -63,6 +79,22 @@ def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, o
         "personality_sync_error": error_detail,
         "personality_sync_checked_at": datetime.now(UTC).isoformat(),
     }
+
+
+def _grant_to_response(row: object) -> AgentGrantResponse:
+    return AgentGrantResponse(
+        grant_id=row.grant_id,  # type: ignore[attr-defined]
+        agent_id=row.agent_id,  # type: ignore[attr-defined]
+        grantee_type=row.grantee_type,  # type: ignore[attr-defined]
+        grantee_user_email=getattr(row, "grantee_user_email", None),
+        grantee_group_id=getattr(row, "grantee_group_id", None),
+        permission=row.permission,  # type: ignore[attr-defined]
+        executor_scope=normalize_executor_scope(str(row.executor_scope)),  # type: ignore[attr-defined]
+        granted_by=row.granted_by,  # type: ignore[attr-defined]
+        granted_at=getattr(row, "granted_at", None),
+        revoked_at=getattr(row, "revoked_at", None),
+        note=getattr(row, "note", None),
+    )
 
 
 async def _persist_sync_metadata(
@@ -195,7 +227,8 @@ async def agent_detail(request: Request, agent_id: str) -> AgentResponse:
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    access = await check_agent_access(request, row, required="view")
+    apply_agent_access_metadata(row, access)
     return agent_to_response(row)
 
 
@@ -212,7 +245,7 @@ async def update_agent_route(
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         previous_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
         updates = payload.model_dump(exclude_unset=True)
         profile_fields = {"name", "display_name", "avatar_image_id"}
@@ -356,7 +389,7 @@ async def archive_agent(request: Request, agent_id: str) -> dict[str, bool]:
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="delete")
         ok = await set_agent_status(session, agent_id, "archived")
         await session.commit()
     return {"ok": ok}
@@ -407,7 +440,7 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         new_agent_id = f"{slugify(row.display_name or row.name)}-{uuid.uuid4().hex[:6]}"
         new_row = await create_agent(
             session,
@@ -510,7 +543,7 @@ async def activate_agent(request: Request, agent_id: str) -> AgentResponse:
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         await set_agent_status(session, agent_id, "active")
         await session.commit()
         await session.refresh(row)
@@ -541,7 +574,7 @@ async def suspend_agent(request: Request, agent_id: str) -> AgentResponse:
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         await set_agent_status(session, agent_id, "suspended")
         await session.commit()
         await session.refresh(row)
@@ -555,7 +588,7 @@ async def sync_personality(request: Request, agent_id: str) -> dict[str, bool]:
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    await check_agent_access(request, row, required="edit")
     definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     current_content = definition.compose_personality() or definition.system_prompt
     try:
@@ -590,7 +623,7 @@ async def delete_agent_avatar(request: Request, agent_id: str) -> dict[str, bool
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         old_image_id = row.avatar_image_id
         ok = await update_agent(session, agent_id, updates={"avatar_image_id": None})
         await session.commit()
@@ -740,7 +773,7 @@ async def list_agent_bindings(request: Request, agent_id: str) -> list[str]:
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    await check_agent_access(request, row, required="view")
     async with request.app.state.session_factory() as session:
         return await list_secondary_bindings(session, agent_id)
 
@@ -757,7 +790,7 @@ async def replace_agent_bindings(
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         await set_secondary_bindings(session, agent_id, payload)
         await session.commit()
     return {"ok": True}
@@ -775,7 +808,7 @@ async def add_agent_binding(
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         ok = await add_secondary_binding(session, agent_id, secondary_agent_id)
         await session.commit()
     return {"ok": ok}
@@ -793,7 +826,7 @@ async def remove_agent_binding(
         row = await get_agent(session, agent_id)
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, row.owner_email)
+        await check_agent_access(request, row, required="edit")
         ok = await remove_secondary_binding(session, agent_id, secondary_agent_id)
         await session.commit()
     return {"ok": ok}
@@ -805,9 +838,143 @@ async def agent_card(request: Request, agent_id: str) -> AgentCardResponse:
         row = await get_agent(session, agent_id)
     if row is None:
         raise api_exception(404, "not_found", "Agent not found")
-    require_owner_or_admin(request, row.owner_email)
+    await check_agent_access(request, row, required="view")
     raise api_exception(
         501,
         "not_implemented",
         "Agent cards require additional public discovery metadata and are deferred in MVP.",
     )
+
+
+@router.get("/{agent_id}/shares", response_model=list[AgentGrantResponse])
+async def list_agent_shares(request: Request, agent_id: str) -> list[AgentGrantResponse]:
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_resource_owner(request, row.owner_email)
+        grants = await list_agent_grants(session, agent_id)
+    return [_grant_to_response(grant) for grant in grants]
+
+
+@router.post("/{agent_id}/shares", response_model=AgentGrantResponse, status_code=201)
+async def create_agent_share(
+    request: Request,
+    agent_id: str,
+    payload: AgentGrantCreateRequest,
+) -> AgentGrantResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, agent_id)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_resource_owner(request, agent.owner_email)
+        if payload.grantee_email == agent.owner_email:
+            raise api_exception(400, "validation_error", "Agent owner cannot be granted their own agent")
+        grantee = await get_user(session, str(payload.grantee_email))
+        if grantee is None:
+            raise api_exception(404, "not_found", "Grantee user not found")
+        existing = await get_agent_grant_for_user(session, agent_id, str(payload.grantee_email))
+        if existing is not None:
+            row = await update_agent_grant(
+                session,
+                existing.grant_id,
+                executor_scope=payload.executor_scope,
+                note=payload.note,
+                granted_at=datetime.now(UTC),
+                granted_by=user.email,
+                revoked_at=None,
+            )
+            assert row is not None
+        else:
+            row = await create_agent_grant(
+                session,
+                agent_id=agent_id,
+                grantee_user_email=str(payload.grantee_email),
+                executor_scope=payload.executor_scope,
+                granted_by=user.email,
+                note=payload.note,
+            )
+        await session.commit()
+    return _grant_to_response(row)
+
+
+@router.patch("/{agent_id}/shares/{grant_id}", response_model=AgentGrantResponse)
+async def update_agent_share(
+    request: Request,
+    agent_id: str,
+    grant_id: str,
+    payload: AgentGrantUpdateRequest,
+) -> AgentGrantResponse:
+    forbid_mutation_for_viewer(request)
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, agent_id)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_resource_owner(request, agent.owner_email)
+        row = await get_agent_grant(session, grant_id)
+        if row is None or row.agent_id != agent_id or row.revoked_at is not None:
+            raise api_exception(404, "not_found", "Grant not found")
+        updated = await update_agent_grant(
+            session,
+            grant_id,
+            executor_scope=payload.executor_scope,
+            note=payload.note,
+        )
+        assert updated is not None
+        await session.commit()
+    return _grant_to_response(updated)
+
+
+@router.delete("/{agent_id}/shares/{grant_id}", response_model=dict)
+async def revoke_agent_share(request: Request, agent_id: str, grant_id: str) -> dict[str, bool]:
+    forbid_mutation_for_viewer(request)
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, agent_id)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        require_resource_owner(request, agent.owner_email)
+        row = await get_agent_grant(session, grant_id)
+        if row is None or row.agent_id != agent_id or row.revoked_at is not None:
+            raise api_exception(404, "not_found", "Grant not found")
+        revoked = await revoke_agent_grant(session, grant_id)
+        assert revoked is not None
+
+        grantee_email = revoked.grantee_user_email
+        running_task_ids: list[str] = []
+        if grantee_email:
+            schedules_result = await session.execute(
+                select(Schedule).where(
+                    Schedule.agent_id == agent_id,
+                    Schedule.created_by == grantee_email,
+                    Schedule.enabled.is_(True),
+                )
+            )
+            for schedule in schedules_result.scalars().all():
+                schedule.enabled = False
+                schedule.disabled_reason = "access_revoked"
+
+            task_result = await session.execute(
+                select(Task).where(
+                    Task.agent_id == agent_id,
+                    Task.created_by == grantee_email,
+                    Task.status.in_(["draft", "queued", "ready", "running", "paused"]),
+                )
+            )
+            for task in task_result.scalars().all():
+                if task.status == "running":
+                    running_task_ids.append(task.task_id)
+                else:
+                    task.status = "paused"
+                task.updated_at = datetime.now(UTC)
+                if not task.result_summary:
+                    task.result_summary = "Access to the shared agent was revoked."
+
+        await session.commit()
+    task_queue = getattr(request.app.state, "task_queue", None)
+    if task_queue is not None:
+        for task_id in running_task_ids:
+            with contextlib.suppress(Exception):
+                await task_queue.pause_task(task_id)
+    return {"ok": True}

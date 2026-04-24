@@ -8,6 +8,7 @@ from typing import Any
 
 from cognis.core.executor_resolution import labels_match
 from cognis.models.config import ImageGenerationResult, SpeechToTextResult
+from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
 
 
@@ -204,7 +205,10 @@ class InferenceRouter:
     async def _find_executor(self, executor_labels: dict[str, str] | None) -> Any | None:
         active = await self._ws_provider.list_active()
         for handle in active:
-            labels = handle.metadata.get("labels", {}) if handle.metadata else {}
+            metadata = handle.metadata or {}
+            if not bool(metadata.get("shared")) and not is_shared_owner_email(metadata.get("owner_email")):
+                continue
+            labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
             if executor_labels and not labels_match(labels, executor_labels):
                 continue
             try:

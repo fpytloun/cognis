@@ -9,10 +9,11 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from cognis.api.common import (
     api_exception,
+    check_agent_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
-    require_owner_or_admin,
+    require_resource_owner,
 )
 from cognis.api.models import (
     ConversationCreateRequest,
@@ -54,7 +55,7 @@ logger = get_logger(__name__)
 def _require_visible_conversation(request: Request, row: Any) -> Any:
     if row is None or getattr(row, "status", None) == "deleted":
         raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     return row
 
 
@@ -130,7 +131,7 @@ async def resolve_conversation(
         agent = await get_agent(session, payload.agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, agent.owner_email)
+        await check_agent_access(request, agent, required="use")
         existing = await get_latest_active_conversation_for_agent(
             session,
             user.email,
@@ -165,7 +166,7 @@ async def create_conversation(
         agent = await get_agent(session, payload.agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
-        require_owner_or_admin(request, agent.owner_email)
+        await check_agent_access(request, agent, required="use")
     conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
@@ -201,7 +202,7 @@ async def update_conversation(
         row = await get_conversation(session, conversation_id)
         if row is None:
             raise api_exception(404, "not_found", "Conversation not found")
-        require_owner_or_admin(request, row.user_email)
+        require_resource_owner(request, row.user_email)
         if row.status == "deleted":
             raise api_exception(404, "not_found", "Conversation not found")
         if payload.archived is True:
@@ -235,7 +236,7 @@ async def delete_conversation(request: Request, conversation_id: str) -> dict[st
         row = await get_conversation(session, conversation_id)
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     ok = await request.app.state.session_manager.soft_delete_conversation(conversation_id)
     return {"ok": ok}
 
@@ -250,7 +251,7 @@ async def purge_conversation(request: Request, conversation_id: str) -> dict[str
         )
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     ok = await request.app.state.session_manager.purge_conversation(conversation_id)
     delete_session = getattr(request.app.state.providers.guardrails, "delete_session", None)
     if not callable(delete_session):
@@ -485,7 +486,12 @@ async def send_message(
         row = await get_conversation(session, conversation_id)
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, row.agent_id)
+    if agent is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    await check_agent_access(request, agent, required="use")
     if row.status == "deleted":
         raise api_exception(404, "not_found", "Conversation not found")
     if row.status == "archived":

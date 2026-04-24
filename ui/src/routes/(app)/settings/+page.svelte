@@ -77,6 +77,7 @@ import { onMount, tick } from 'svelte';
   };
 
   const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'tools', 'executors', 'users', 'system', 'account'];
+  const USER_TABS: SettingsTab[] = ['secrets', 'executors', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
@@ -158,7 +159,7 @@ import { onMount, tick } from 'svelte';
   let webBackendForm = $state('direct');
   let webKeySetup = $state<{ backend: string; value: string } | null>(null);
   let showExecutorForm = $state(false);
-  let executorForm = $state({ executor_id: '', name: '', executor_type: 'in_process', labels: '', status: 'active' });
+  let executorForm = $state({ executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false });
   let executorToken = $state<ExecutorTokenResponse | null>(null);
   // Mobile tool-picker sheet: holds the executor id whose tool list should be
   // open, plus the current search query inside that picker. Setting both to
@@ -223,7 +224,7 @@ import { onMount, tick } from 'svelte';
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
   let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '' });
   let isAdmin = $state(false);
-  let tabs = $derived(isAdmin ? ALL_TABS : ALL_TABS.filter((t) => t !== 'users' && t !== 'system'));
+  let tabs = $derived(isAdmin ? ALL_TABS : USER_TABS);
   let selectedProviderId = $state('');
   let selectedSettingKey = $state('');
   let settingValueText = $state('');
@@ -694,7 +695,7 @@ import { onMount, tick } from 'svelte';
       await api.secrets.upsert({
         name: secretModalName,
         value: secretModalValue,
-        scope: 'global',
+        scope: 'system',
         agent_id: null,
         description: secretModalTarget === 'provider'
           ? `API key for provider ${providerForm.display_name || providerForm.provider_id}`
@@ -911,14 +912,28 @@ import { onMount, tick } from 'svelte';
 
   async function refreshPageState(): Promise<void> {
     isAdmin = auth.getSnapshot().user?.role === 'admin';
-    [settings, modelRouting, secrets, credentials, health, apiKeys] = await Promise.all([
-      api.settings.list(),
-      api.modelRouting.get(),
+    if (!isAdmin && !USER_TABS.includes(activeTab)) {
+      activeTab = 'account';
+    }
+    [secrets, credentials, health, apiKeys, agents, executorConfigs, executorTools] = await Promise.all([
       api.secrets.list(),
       api.credentials.list().catch(() => []),
       api.system.health(),
-      api.auth.listApiKeys()
+      api.auth.listApiKeys(),
+      api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name, is_system: a.is_system }))),
+      api.executor.list().catch(() => []),
+      api.tools.executorTools().catch(() => [])
     ]);
+
+    if (isAdmin) {
+      [settings, modelRouting] = await Promise.all([
+        api.settings.list(),
+        api.modelRouting.get(),
+      ]);
+    } else {
+      settings = [];
+      modelRouting = emptyModelRouting();
+    }
 
     routingForm = {
       default: {
@@ -951,7 +966,11 @@ import { onMount, tick } from 'svelte';
       }
     };
 
-    webConfig = await api.webConfig.status().catch(() => webConfig);
+    if (isAdmin) {
+      webConfig = await api.webConfig.status().catch(() => webConfig);
+    } else {
+      webConfig = { backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] };
+    }
     webBackendForm = webConfig.backend;
 
     // Initialize account name form
@@ -960,12 +979,9 @@ import { onMount, tick } from 'svelte';
 
     if (isAdmin) {
       const profileDefs = await api.settings.stepProfiles().catch(() => []);
-      [providers, diagnostics, agents, executorConfigs, executorTools, mcpServerConfigs] = await Promise.all([
+      [providers, diagnostics, mcpServerConfigs] = await Promise.all([
         api.llmProviders.list().then((page) => page.items),
         api.system.diagnostics(),
-        api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name, is_system: a.is_system }))),
-        api.executor.list().catch(() => []),
-        api.tools.executorTools().catch(() => []),
         api.tools.listMcpServerConfigs().catch(() => []),
       ]);
       stepProfileForms = profileDefs.map(toStepProfileForm);
@@ -973,9 +989,7 @@ import { onMount, tick } from 'svelte';
     } else {
       providers = [];
       diagnostics = null;
-      agents = [];
-      executorConfigs = [];
-      executorTools = [];
+      mcpServerConfigs = [];
       stepProfileForms = [];
       userList = [];
     }
@@ -1318,7 +1332,7 @@ import { onMount, tick } from 'svelte';
     error = '';
     try {
       const secretName = webKeySetup.backend === 'tavily' ? 'tavily_api_key' : 'brave_api_key';
-      await api.secrets.upsert({ name: secretName, value: webKeySetup.value, scope: 'global', description: `API key for ${WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}` });
+      await api.secrets.upsert({ name: secretName, value: webKeySetup.value, scope: 'system', description: `API key for ${WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}` });
       secrets = await api.secrets.list();
       webConfig = await api.webConfig.status();
       webKeySetup = null;
@@ -1608,7 +1622,7 @@ import { onMount, tick } from 'svelte';
       clearInterval(executorPollTimer);
       executorPollTimer = null;
     }
-    if (!isAdmin || activeTab !== 'executors') return;
+    if (activeTab !== 'executors') return;
     executorPollTimer = setInterval(() => {
       void refreshPageState();
     }, 5000);
@@ -2003,7 +2017,9 @@ import { onMount, tick } from 'svelte';
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Scope</span>
               <select bind:value={secretForm.scope} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="global">Global (all users and agents)</option>
+                {#if isAdmin}
+                  <option value="system">System (shared infrastructure)</option>
+                {/if}
                 <option value="user">User (current user only)</option>
                 <option value="agent">Agent-specific</option>
               </select>
@@ -2225,7 +2241,7 @@ import { onMount, tick } from 'svelte';
               Executors handle tool execution. Enable tools on each executor to make them available to agents.
             </p>
           </div>
-          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active' }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
+          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
         </div>
 
         {#if showExecutorForm}
@@ -2244,14 +2260,22 @@ import { onMount, tick } from 'svelte';
                 <span>Type</span>
                 <select bind:value={executorForm.executor_type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!editingExecutor}>
                   <option value="websocket">websocket</option>
-                  <option value="subprocess">subprocess</option>
-                  <option value="in_process">in_process</option>
+                  {#if isAdmin}
+                    <option value="subprocess">subprocess</option>
+                    <option value="in_process">in_process</option>
+                  {/if}
                 </select>
               </label>
               <label class="space-y-1 text-sm text-slate-200">
                 <span>Labels (key=value, comma-separated)</span>
                 <Input bind:value={executorForm.labels} placeholder="tier=standard, gpu=false" />
               </label>
+              {#if isAdmin}
+                <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
+                  <input bind:checked={executorForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-400" />
+                  <span>Shared executor available to all users</span>
+                </label>
+              {/if}
               {#if editingExecutor}
                 <label class="space-y-1 text-sm text-slate-200">
                   <span>Status</span>
@@ -2273,9 +2297,9 @@ import { onMount, tick } from 'svelte';
                 );
                 try {
                   if (editingExecutor) {
-                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels, status: executorForm.status });
+                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels, status: executorForm.status, shared: executorForm.shared });
                   } else {
-                    await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels });
+                    await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels, shared: executorForm.shared });
                   }
                   showExecutorForm = false;
                   await refreshPageState();
@@ -2301,6 +2325,9 @@ import { onMount, tick } from 'svelte';
                 {#if exec.is_default}
                   <span class="px-2 py-0.5 bg-blue-500/20 text-blue-300 text-xs rounded">default</span>
                 {/if}
+                {#if exec.shared}
+                  <span class="px-2 py-0.5 bg-violet-500/20 text-violet-300 text-xs rounded">shared</span>
+                {/if}
               </div>
               <div class="flex gap-2">
                 <Button variant="secondary" size="sm" onclick={() => {
@@ -2310,7 +2337,8 @@ import { onMount, tick } from 'svelte';
                     name: exec.name,
                     executor_type: exec.executor_type,
                     labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', '),
-                    status: exec.status
+                    status: exec.status,
+                    shared: !!exec.shared
                   };
                   showExecutorForm = true;
                 }}>Edit</Button>

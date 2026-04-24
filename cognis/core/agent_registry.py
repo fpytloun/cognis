@@ -13,7 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
-from cognis.store.queries import get_agent, get_system_agent_override, list_agents
+from cognis.ownership import normalize_executor_scope
+from cognis.store.queries import (
+    get_agent,
+    get_system_agent_override,
+    list_agents,
+    list_visible_agents,
+)
 
 logger = get_logger(__name__)
 
@@ -642,9 +648,21 @@ class AgentRegistry:
                 result.append(effective)
 
         async with self._session_factory() as db_session:
-            rows = await list_agents(db_session, owner_email=owner_email)
-        for row in rows:
+            rows = (
+                await list_visible_agents(db_session, owner_email)
+                if owner_email is not None
+                else [(row, None) for row in await list_agents(db_session, owner_email=owner_email)]
+            )
+        for row, grant in rows:
             defn = _row_to_definition(row)
+            if grant is not None and owner_email is not None and row.owner_email != owner_email:
+                defn.is_shared_with_me = True
+                defn.shared_by_email = row.owner_email
+                defn.granted_permission = str(getattr(grant, "permission", "use"))
+                defn.executor_scope = normalize_executor_scope(
+                    str(getattr(grant, "executor_scope", "owner_executor"))
+                )
+                defn.is_readonly_for_caller = True
             if not include_hidden and defn.hidden:
                 continue
             if agent_type is not None and defn.agent_type != agent_type:

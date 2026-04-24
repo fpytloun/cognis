@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY
+from cognis.ownership import is_shared_owner_email
 from cognis.store.queries import get_mcp_server, get_setting_value
 
 logger = get_logger(__name__)
@@ -49,7 +50,10 @@ def is_executor_row_usable(
 ) -> bool:
     if row is None:
         return False
-    if owner_email is not None and getattr(row, "owner_email", None) != owner_email:
+    row_owner_email = getattr(row, "owner_email", None)
+    if owner_email is not None and row_owner_email != owner_email and not is_shared_owner_email(
+        row_owner_email
+    ):
         return False
     if getattr(row, "status", None) != "active":
         return False
@@ -73,7 +77,15 @@ async def validate_executor_mcp_scope(
         msg = f"{MCP_SERVER_IDS_KEY} must be a list"
         raise ValueError(msg)
     for server_id in ids:
-        row = await get_mcp_server(session, str(server_id), owner_email=owner_email)
+        row = await get_mcp_server(
+            session,
+            str(server_id),
+            owner_email=owner_email,
+            include_shared=not is_shared_owner_email(owner_email),
+        )
         if row is None:
             msg = f"MCP server '{server_id}' is not available for this user"
+            raise ValueError(msg)
+        if is_shared_owner_email(owner_email) and not is_shared_owner_email(getattr(row, "owner_email", None)):
+            msg = f"MCP server '{server_id}' is private and cannot be assigned to a shared executor"
             raise ValueError(msg)

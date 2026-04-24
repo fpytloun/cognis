@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from cognis.config import CognisConfig
 from cognis.core.system_skills import SYSTEM_SKILL_DEFAULTS, get_system_skill_default
 from cognis.logging import get_logger
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.queries import (
     count_users,
@@ -197,6 +198,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_step_run_deliverable_columns)
         await conn.run_sync(_ensure_workflow_lifecycle_columns)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
+        await conn.run_sync(_ensure_agent_grants_table)
         await conn.run_sync(_ensure_harness_recovery_tables)
         await conn.run_sync(_ensure_tool_classification_table)
         await conn.run_sync(_ensure_tool_classification_override_table)
@@ -270,6 +272,14 @@ def _ensure_browser_sessions_table(sync_conn: object) -> None:
     from cognis.store.models import BrowserSession
 
     BrowserSession.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_agent_grants_table(sync_conn: object) -> None:
+    """Create the durable agent grants table."""
+
+    from cognis.store.models import AgentGrantRow
+
+    AgentGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:
@@ -714,19 +724,16 @@ def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE system_agent_overrides ADD COLUMN skills_override JSON"))
 
 
-_SYSTEM_USER_EMAIL = "system@cognis.local"
-
-
 async def _ensure_system_user(session: AsyncSession) -> None:
     """Create the system user if it doesn't exist (for FK integrity)."""
     from cognis.store.models import User
 
-    existing = await session.execute(select(User).where(User.email == _SYSTEM_USER_EMAIL))
+    existing = await session.execute(select(User).where(User.email == SYSTEM_USER_EMAIL))
     if existing.scalar_one_or_none() is not None:
         return
     session.add(
         User(
-            email=_SYSTEM_USER_EMAIL,
+            email=SYSTEM_USER_EMAIL,
             name="System",
             role="system",
         )
@@ -754,7 +761,7 @@ async def seed_system_agents(session: AsyncSession) -> None:
             session.add(
                 Agent(
                     agent_id=agent_def.agent_id,
-                    owner_email=_SYSTEM_USER_EMAIL,
+                    owner_email=SYSTEM_USER_EMAIL,
                     name=agent_def.name,
                     description=agent_def.description,
                     system_prompt=agent_def.system_prompt,
@@ -766,7 +773,7 @@ async def seed_system_agents(session: AsyncSession) -> None:
                 )
             )
             continue
-        row.owner_email = _SYSTEM_USER_EMAIL
+        row.owner_email = SYSTEM_USER_EMAIL
         row.name = agent_def.name
         row.description = agent_def.description
         row.system_prompt = agent_def.system_prompt
