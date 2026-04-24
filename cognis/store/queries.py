@@ -14,8 +14,10 @@ import sqlalchemy as sa
 from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import (
     Agent,
+    AgentGrantRow,
     AgentSecondaryBinding,
     ApiKey,
     ArtifactRecordRow,
@@ -55,6 +57,10 @@ def _utcnow() -> datetime:
 
 
 _UNSET = object()
+
+
+def _shared_owner_clause(column: Any) -> Any:
+    return sa.or_(column == SYSTEM_USER_EMAIL, column.is_(None))
 
 
 def tool_classification_scope(owner_email: str | None) -> str:
@@ -232,6 +238,8 @@ async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
             )
         )
     )
+    await session.execute(delete(AgentGrantRow).where(AgentGrantRow.grantee_user_email == email))
+    await session.execute(delete(AgentGrantRow).where(AgentGrantRow.granted_by == email))
     # Schedules reference agents owned by user
     await session.execute(delete(Schedule).where(Schedule.created_by == email))
     # Tasks reference agents and users
@@ -536,21 +544,16 @@ async def list_active_agents_summary(
 ) -> list[dict[str, str | None]]:
     """List safe agent metadata for tool responses."""
 
-    query = (
-        select(Agent.agent_id, Agent.name, Agent.description, Agent.status)
-        .where(Agent.status == "active")
-        .where(Agent.owner_email == owner_email)
-        .order_by(Agent.agent_id)
-    )
-    result = await session.execute(query)
+    visible = await list_visible_agents(session, owner_email)
     return [
         {
-            "agent_id": agent_id,
-            "name": name,
-            "description": description,
-            "status": status,
+            "agent_id": row.agent_id,
+            "name": row.name,
+            "description": row.description,
+            "status": row.status,
         }
-        for agent_id, name, description, status in result.all()
+        for row, _grant in visible
+        if row.status == "active"
     ]
 
 
@@ -568,6 +571,153 @@ async def list_agents(session: AsyncSession, owner_email: str | None = None) -> 
         query = query.where(Agent.owner_email == owner_email)
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_visible_agents(
+    session: AsyncSession,
+    user_email: str,
+) -> list[tuple[Agent, AgentGrantRow | None]]:
+    """List agents visible to a user (owned + actively shared)."""
+
+    owned = await list_agents(session, owner_email=user_email)
+    shared_result = await session.execute(
+        select(Agent, AgentGrantRow)
+        .join(AgentGrantRow, AgentGrantRow.agent_id == Agent.agent_id)
+        .where(AgentGrantRow.grantee_type == "user")
+        .where(AgentGrantRow.grantee_user_email == user_email)
+        .where(AgentGrantRow.revoked_at.is_(None))
+        .order_by(Agent.updated_at.desc(), Agent.agent_id.asc())
+    )
+    rows: list[tuple[Agent, AgentGrantRow | None]] = [(row, None) for row in owned]
+    seen = {row.agent_id for row in owned}
+    for agent_row, grant_row in shared_result.all():
+        if agent_row.agent_id in seen:
+            continue
+        rows.append((agent_row, grant_row))
+        seen.add(agent_row.agent_id)
+    return rows
+
+
+async def get_active_agent_grant(
+    session: AsyncSession,
+    agent_id: str,
+    grantee_user_email: str,
+) -> AgentGrantRow | None:
+    """Return the active user grant for an agent and grantee email."""
+
+    result = await session.execute(
+        select(AgentGrantRow)
+        .where(AgentGrantRow.agent_id == agent_id)
+        .where(AgentGrantRow.grantee_type == "user")
+        .where(AgentGrantRow.grantee_user_email == grantee_user_email)
+        .where(AgentGrantRow.revoked_at.is_(None))
+        .order_by(AgentGrantRow.granted_at.desc(), AgentGrantRow.grant_id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_agent_grants(session: AsyncSession, agent_id: str) -> list[AgentGrantRow]:
+    """List active grants for an agent."""
+
+    result = await session.execute(
+        select(AgentGrantRow)
+        .where(AgentGrantRow.agent_id == agent_id)
+        .where(AgentGrantRow.revoked_at.is_(None))
+        .order_by(AgentGrantRow.granted_at.desc(), AgentGrantRow.grant_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_agent_grant_for_user(
+    session: AsyncSession,
+    agent_id: str,
+    grantee_user_email: str,
+) -> AgentGrantRow | None:
+    """Return the latest grant row for a user principal, including revoked grants."""
+
+    result = await session.execute(
+        select(AgentGrantRow)
+        .where(AgentGrantRow.agent_id == agent_id)
+        .where(AgentGrantRow.grantee_type == "user")
+        .where(AgentGrantRow.grantee_user_email == grantee_user_email)
+        .order_by(AgentGrantRow.granted_at.desc(), AgentGrantRow.grant_id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_agent_grant(session: AsyncSession, grant_id: str) -> AgentGrantRow | None:
+    """Get a grant by ID."""
+
+    result = await session.execute(select(AgentGrantRow).where(AgentGrantRow.grant_id == grant_id))
+    return result.scalar_one_or_none()
+
+
+async def create_agent_grant(
+    session: AsyncSession,
+    *,
+    agent_id: str,
+    grantee_user_email: str,
+    executor_scope: str,
+    granted_by: str,
+    note: str | None = None,
+) -> AgentGrantRow:
+    """Create an agent-sharing grant."""
+
+    row = AgentGrantRow(
+        grant_id=f"grant_{uuid.uuid4().hex[:12]}",
+        agent_id=agent_id,
+        grantee_type="user",
+        grantee_user_email=grantee_user_email,
+        permission="use",
+        executor_scope=executor_scope,
+        granted_by=granted_by,
+        note=note,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def update_agent_grant(
+    session: AsyncSession,
+    grant_id: str,
+    *,
+    executor_scope: str | None = None,
+    note: str | None = None,
+    revoked_at: datetime | None | object = _UNSET,
+    granted_at: datetime | None | object = _UNSET,
+    granted_by: str | None | object = _UNSET,
+) -> AgentGrantRow | None:
+    """Update mutable fields on an agent-sharing grant."""
+
+    row = await get_agent_grant(session, grant_id)
+    if row is None:
+        return None
+    if executor_scope is not None:
+        row.executor_scope = executor_scope
+    if note is not None:
+        row.note = note
+    if revoked_at is not _UNSET:
+        row.revoked_at = revoked_at
+    if granted_at is not _UNSET:
+        row.granted_at = granted_at
+    if granted_by is not _UNSET:
+        row.granted_by = granted_by
+    await session.flush()
+    return row
+
+
+async def revoke_agent_grant(session: AsyncSession, grant_id: str) -> AgentGrantRow | None:
+    """Soft-revoke an agent-sharing grant."""
+
+    row = await get_agent_grant(session, grant_id)
+    if row is None:
+        return None
+    row.revoked_at = datetime.now(UTC)
+    await session.flush()
+    return row
 
 
 async def create_agent(
@@ -2942,12 +3092,20 @@ async def get_skill_asset(session: AsyncSession, asset_id: str) -> SkillAssetRow
 
 
 async def list_executors(
-    session: AsyncSession, *, owner_email: str | None = None
+    session: AsyncSession,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> list[ExecutorRow]:
     """List all executor configurations."""
     stmt = select(ExecutorRow).order_by(ExecutorRow.name)
     if owner_email is not None:
-        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+            )
+        else:
+            stmt = stmt.where(ExecutorRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -2957,22 +3115,36 @@ async def get_executor_row(
     executor_id: str,
     *,
     owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> ExecutorRow | None:
     """Get an executor by ID."""
     stmt = select(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
     if owner_email is not None:
-        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+            )
+        else:
+            stmt = stmt.where(ExecutorRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
 async def get_default_executor(
-    session: AsyncSession, *, owner_email: str | None = None
+    session: AsyncSession,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> ExecutorRow | None:
     """Get the default executor (is_default=True)."""
     stmt = select(ExecutorRow).where(ExecutorRow.is_default.is_(True)).limit(1)
     if owner_email is not None:
-        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+            )
+        else:
+            stmt = stmt.where(ExecutorRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -2989,6 +3161,7 @@ async def create_executor(
     config: dict[str, Any] | None = None,
     is_default: bool = False,
     owner_email: str | None = None,
+    shared: bool = False,
 ) -> ExecutorRow:
     """Create an executor configuration."""
     row = ExecutorRow(
@@ -3000,7 +3173,7 @@ async def create_executor(
         enabled_tool_groups=enabled_tool_groups or [],
         config=config,
         is_default=is_default,
-        owner_email=owner_email,
+        owner_email=SYSTEM_USER_EMAIL if shared else owner_email,
     )
     session.add(row)
     await session.flush()
@@ -3012,12 +3185,21 @@ async def update_executor(
     executor_id: str,
     *,
     owner_email: str | None = None,
+    include_shared: bool = False,
     **kwargs: Any,
 ) -> ExecutorRow | None:
     """Update an executor by ID."""
-    row = await get_executor_row(session, executor_id, owner_email=owner_email)
+    row = await get_executor_row(
+        session,
+        executor_id,
+        owner_email=owner_email,
+        include_shared=include_shared,
+    )
     if row is None:
         return None
+    if "shared" in kwargs:
+        shared = bool(kwargs.pop("shared"))
+        row.owner_email = SYSTEM_USER_EMAIL if shared else owner_email
     for key, value in kwargs.items():
         if hasattr(row, key):
             setattr(row, key, value)
@@ -3026,15 +3208,29 @@ async def update_executor(
 
 
 async def delete_executor(
-    session: AsyncSession, executor_id: str, *, owner_email: str | None = None
+    session: AsyncSession,
+    executor_id: str,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> bool:
     """Delete an executor by ID."""
-    row = await get_executor_row(session, executor_id, owner_email=owner_email)
+    row = await get_executor_row(
+        session,
+        executor_id,
+        owner_email=owner_email,
+        include_shared=include_shared,
+    )
     if row is None:
         return False
     stmt = delete(ExecutorRow).where(ExecutorRow.executor_id == executor_id)
     if owner_email is not None:
-        stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+            )
+        else:
+            stmt = stmt.where(ExecutorRow.owner_email == owner_email)
     await session.execute(stmt)
     return True
 
@@ -3248,6 +3444,7 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
         enabled_tools=[],
         enabled_tool_groups=[],
         is_default=True,
+        shared=True,
     )
 
 
@@ -3255,12 +3452,20 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
 
 
 async def list_mcp_servers(
-    session: AsyncSession, *, owner_email: str | None = None
+    session: AsyncSession,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> list[MCPServerRow]:
     """List all MCP server configurations."""
     stmt = select(MCPServerRow).order_by(MCPServerRow.name)
     if owner_email is not None:
-        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+            )
+        else:
+            stmt = stmt.where(MCPServerRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -3270,11 +3475,17 @@ async def get_mcp_server(
     server_id: str,
     *,
     owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> MCPServerRow | None:
     """Get an MCP server by ID."""
     stmt = select(MCPServerRow).where(MCPServerRow.server_id == server_id)
     if owner_email is not None:
-        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+            )
+        else:
+            stmt = stmt.where(MCPServerRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
@@ -3294,6 +3505,7 @@ async def create_mcp_server(
     description: str | None = None,
     owner_email: str,
     status: str = "active",
+    shared: bool = False,
 ) -> MCPServerRow:
     """Create an MCP server configuration."""
     row = MCPServerRow(
@@ -3307,7 +3519,7 @@ async def create_mcp_server(
         headers=headers or {},
         timeout_seconds=timeout_seconds,
         description=description,
-        owner_email=owner_email,
+        owner_email=SYSTEM_USER_EMAIL if shared else owner_email,
         status=status,
     )
     session.add(row)
@@ -3320,12 +3532,21 @@ async def update_mcp_server(
     server_id: str,
     *,
     owner_email: str | None = None,
+    include_shared: bool = False,
     **kwargs: Any,
 ) -> MCPServerRow | None:
     """Update an MCP server by ID."""
-    row = await get_mcp_server(session, server_id, owner_email=owner_email)
+    row = await get_mcp_server(
+        session,
+        server_id,
+        owner_email=owner_email,
+        include_shared=include_shared,
+    )
     if row is None:
         return None
+    if "shared" in kwargs:
+        shared = bool(kwargs.pop("shared"))
+        row.owner_email = SYSTEM_USER_EMAIL if shared else owner_email or row.owner_email
     for key, value in kwargs.items():
         if hasattr(row, key):
             setattr(row, key, value)
@@ -3334,26 +3555,48 @@ async def update_mcp_server(
 
 
 async def delete_mcp_server(
-    session: AsyncSession, server_id: str, *, owner_email: str | None = None
+    session: AsyncSession,
+    server_id: str,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> bool:
     """Delete an MCP server by ID."""
-    row = await get_mcp_server(session, server_id, owner_email=owner_email)
+    row = await get_mcp_server(
+        session,
+        server_id,
+        owner_email=owner_email,
+        include_shared=include_shared,
+    )
     if row is None:
         return False
     stmt = delete(MCPServerRow).where(MCPServerRow.server_id == server_id)
     if owner_email is not None:
-        stmt = stmt.where(MCPServerRow.owner_email == owner_email)
+        if include_shared:
+            stmt = stmt.where(
+                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+            )
+        else:
+            stmt = stmt.where(MCPServerRow.owner_email == owner_email)
     await session.execute(stmt)
     return True
 
 
 async def mcp_server_referenced_by_executors(
-    session: AsyncSession, server_id: str, *, owner_email: str | None = None
+    session: AsyncSession,
+    server_id: str,
+    *,
+    owner_email: str | None = None,
+    include_shared: bool = False,
 ) -> list[str]:
     """Return executor IDs that reference this MCP server in their config."""
     from cognis.models.tool import MCP_SERVER_IDS_KEY
 
-    executors = await list_executors(session, owner_email=owner_email)
+    executors = await list_executors(
+        session,
+        owner_email=owner_email,
+        include_shared=include_shared,
+    )
     referencing: list[str] = []
     for ex in executors:
         config = ex.config or {}

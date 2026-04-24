@@ -502,7 +502,11 @@ class ContextAssembler:
             context=cached_intention,
         )
 
-        with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+        with scoped_runtime_context(
+            user_email=session.user_email,
+            agent_id=session.agent_id,
+            agent_owner_email=agent.owner_email,
+        ):
             recall_task = self.memory.recall(
                 query=user_message,
                 session_id=session.mnemory_session_id,
@@ -1312,6 +1316,7 @@ class ContextAssembler:
                 identity_payload = await self._load_identity_payload(
                     session_id=session.mnemory_session_id,
                     session=session,
+                    agent=agent,
                     memory_labels=memory_labels,
                     context=context,
                 )
@@ -1360,6 +1365,7 @@ class ContextAssembler:
                     identity_payload = await self._load_identity_payload(
                         session_id=None,
                         session=session,
+                        agent=agent,
                         memory_labels=memory_labels,
                         context=context,
                     )
@@ -1399,7 +1405,11 @@ class ContextAssembler:
                 None,
             )
             idempotency_key = f"{intaris_session_id}:immutable_prefix:{snapshot_source}:messages"
-            with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+            with scoped_runtime_context(
+                user_email=session.user_email,
+                agent_id=session.agent_id,
+                agent_owner_email=agent.owner_email,
+            ):
                 append_result = await self.guardrails.record_events(
                     session_id=intaris_session_id,
                     events=message_events,
@@ -1432,7 +1442,11 @@ class ContextAssembler:
                 },
             )
             snapshot_events = with_session_events_turn_id([snapshot_event], None)
-            with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+            with scoped_runtime_context(
+                user_email=session.user_email,
+                agent_id=session.agent_id,
+                agent_owner_email=agent.owner_email,
+            ):
                 snapshot_result = await self.guardrails.record_events(
                     session_id=intaris_session_id,
                     events=snapshot_events,
@@ -1467,10 +1481,15 @@ class ContextAssembler:
         *,
         session_id: str | None,
         session: SessionModel,
+        agent: AgentDefinition,
         memory_labels: dict[str, str],
         context: str | None,
     ) -> dict[str, Any]:
-        with scoped_runtime_context(user_email=session.user_email, agent_id=session.agent_id):
+        with scoped_runtime_context(
+            user_email=session.user_email,
+            agent_id=session.agent_id,
+            agent_owner_email=agent.owner_email,
+        ):
             return await self.memory.load_session_identity(
                 session_id=session_id,
                 labels=memory_labels,

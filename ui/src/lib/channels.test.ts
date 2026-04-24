@@ -37,7 +37,9 @@ const agent: Agent = {
   system_prompt: null, personality: null, skills: null, tools: null, permissions: null, llm_config: null,
   execution: null, personality_synced: false, personality_sync_error: null, personality_sync_checked_at: null,
   avatar_url: null, avatar_image_id: null, agent_type: 'primary', is_system: false, hidden: false,
-  editable_fields: [], has_overrides: false, disabled: false, disableable: false, status: 'active',
+  editable_fields: [], has_overrides: false, disabled: false, disableable: false, sync_metadata: null,
+  is_shared_with_me: false, shared_by_email: null, granted_permission: null, executor_scope: null,
+  is_readonly_for_caller: false, status: 'active',
   created_at: null, updated_at: null,
 };
 

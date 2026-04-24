@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import Secret
 
 logger = get_logger(__name__)
@@ -39,14 +40,15 @@ class EncryptedDBSecretsProvider:
 
     async def get_secret(self, name: str, user_id: str, agent_id: str | None = None) -> str:
         async with self.session_factory() as session:
-            scopes: list[tuple[str, str | None]] = [
-                ("agent", agent_id),
-                ("user", None),
-                ("global", None),
+            scopes: list[tuple[str, str, str | None]] = [
+                (user_id, "agent", agent_id),
+                (user_id, "user", None),
+                (SYSTEM_USER_EMAIL, "system", None),
+                (user_id, "global", None),
             ]
-            for scope, scope_agent_id in scopes:
+            for scope_user_id, scope, scope_agent_id in scopes:
                 stmt = select(Secret).where(
-                    Secret.user_email == user_id, Secret.name == name, Secret.scope == scope
+                    Secret.user_email == scope_user_id, Secret.name == name, Secret.scope == scope
                 )
                 if scope_agent_id is not None:
                     stmt = stmt.where(Secret.agent_id == scope_agent_id)

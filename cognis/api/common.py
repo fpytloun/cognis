@@ -6,6 +6,7 @@ import base64
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
@@ -14,6 +15,8 @@ from fastapi.responses import JSONResponse
 
 from cognis.api.middleware import AuthenticatedUser
 from cognis.api.models import ErrorBody, ErrorResponse
+from cognis.ownership import normalize_executor_scope
+from cognis.store.queries import get_active_agent_grant
 
 
 def api_exception(
@@ -83,6 +86,74 @@ def require_owner_or_admin(request: Request, owner_email: str) -> AuthenticatedU
     if user.role != "admin" and user.email != owner_email:
         raise api_exception(403, "forbidden", "Resource access denied")
     return user
+
+
+def require_resource_owner(request: Request, owner_email: str) -> AuthenticatedUser:
+    """Require strict resource ownership with no admin bypass."""
+
+    user = require_current_user(request)
+    if user.email != owner_email:
+        raise api_exception(403, "forbidden", "Resource access denied")
+    return user
+
+
+@dataclass(slots=True)
+class AgentAccess:
+    """Resolved caller access to an agent."""
+
+    user: AuthenticatedUser
+    owner_email: str
+    is_owner: bool
+    grant: Any | None = None
+
+    @property
+    def granted_permission(self) -> str | None:
+        return str(self.grant.permission) if self.grant is not None else None
+
+    @property
+    def executor_scope(self) -> str | None:
+        return normalize_executor_scope(str(self.grant.executor_scope)) if self.grant is not None else None
+
+
+async def check_agent_access(request: Request, agent: Any, *, required: str) -> AgentAccess:
+    """Resolve agent access for the caller.
+
+    ``required`` may be ``view``, ``use``, ``edit``, ``delete``, or ``share``.
+    Ownership is the only write path; active ``use`` grants permit only
+    ``view`` and ``use``. Admin role is intentionally ignored here.
+    """
+
+    user = require_current_user(request)
+    owner_email = str(getattr(agent, "owner_email", "") or "")
+    if not owner_email:
+        raise api_exception(500, "internal_error", "Agent owner is missing")
+    if user.email == owner_email:
+        return AgentAccess(user=user, owner_email=owner_email, is_owner=True)
+
+    if required not in {"view", "use", "edit", "delete", "share"}:
+        raise api_exception(500, "internal_error", f"Unsupported agent access requirement: {required}")
+    if required not in {"view", "use"}:
+        raise api_exception(403, "forbidden", "Resource access denied")
+
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise api_exception(500, "internal_error", "Session factory unavailable")
+    async with session_factory() as session:
+        grant = await get_active_agent_grant(session, str(agent.agent_id), user.email)
+    if grant is None:
+        raise api_exception(403, "forbidden", "Resource access denied")
+    return AgentAccess(user=user, owner_email=owner_email, is_owner=False, grant=grant)
+
+
+def apply_agent_access_metadata(agent: Any, access: AgentAccess) -> Any:
+    """Annotate an agent row/definition with caller-scoped sharing metadata."""
+
+    agent.is_shared_with_me = not access.is_owner
+    agent.shared_by_email = None if access.is_owner else access.owner_email
+    agent.granted_permission = access.granted_permission
+    agent.executor_scope = access.executor_scope
+    agent.is_readonly_for_caller = not access.is_owner
+    return agent
 
 
 def forbid_mutation_for_viewer(request: Request) -> None:

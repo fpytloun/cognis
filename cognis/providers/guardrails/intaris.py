@@ -19,9 +19,10 @@ from cognis.models.session import (
     SessionEvent,
 )
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.retry import with_retry
-from cognis.runtime_context import current_agent_id, current_user_email
+from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 
 logger = get_logger(__name__)
 
@@ -46,7 +47,7 @@ class IntarisProvider:
     """
 
     def __init__(
-        self, base_url: str, auth_provider: Any, user_email: str = "system@example.com"
+        self, base_url: str, auth_provider: Any, user_email: str = SYSTEM_USER_EMAIL
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
@@ -96,9 +97,11 @@ class IntarisProvider:
         resolved_agent_id = (
             agent_id if agent_id != "system" else (current_agent_id.get() or "system")
         )
+        resolved_agent_owner = current_agent_owner_email.get() or subject
         return {
-            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id, ['intaris'])}",
+            "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id, ['intaris'], agent_owner_email=resolved_agent_owner)}",
             "X-Agent-Id": resolved_agent_id,
+            "X-Agent-Owner": resolved_agent_owner,
         }
 
     async def create_session(

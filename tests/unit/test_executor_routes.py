@@ -71,3 +71,82 @@ def test_executor_update_bumps_desired_generation_and_marks_stale(
         assert payload["desired_config_version"] == 2
         assert payload["applied_config_version"] == 1
         assert payload["runtime_state"] == "stale"
+
+
+def test_executor_list_includes_shared_for_regular_users(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_executor(
+                    session,
+                    executor_id="shared-exec",
+                    name="Shared",
+                    executor_type="websocket",
+                    owner_email="user@example.com",
+                    shared=True,
+                )
+                await create_executor(
+                    session,
+                    executor_id="private-exec",
+                    name="Private",
+                    executor_type="websocket",
+                    owner_email="user@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/executors",
+            headers=_auth_headers(client.app, email="user@example.com", role="user"),
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert {row["executor_id"] for row in payload} == {
+            "default_inprocess",
+            "shared-exec",
+            "private-exec",
+        }
+        assert next(row for row in payload if row["executor_id"] == "shared-exec")["shared"] is True
+
+
+def test_regular_user_cannot_create_shared_or_local_executors(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        local_response = client.post(
+            "/api/v1/executors",
+            headers=_auth_headers(client.app, email="user@example.com", role="user"),
+            json={"name": "Local", "executor_type": "subprocess"},
+        )
+        shared_response = client.post(
+            "/api/v1/executors",
+            headers=_auth_headers(client.app, email="user@example.com", role="user"),
+            json={"name": "Shared", "executor_type": "websocket", "shared": True},
+        )
+
+        assert local_response.status_code == 403
+        assert shared_response.status_code == 403

@@ -166,6 +166,7 @@ class SessionManager:
         )
         async with self.session_factory() as db_session:
             try:
+                agent = await self._require_agent(db_session, agent_id)
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation_id,
@@ -173,7 +174,11 @@ class SessionManager:
                     agent_id=agent_id,
                     session_id=session_id,
                 )
-                with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+                with scoped_runtime_context(
+                    user_email=user_email,
+                    agent_id=agent_id,
+                    agent_owner_email=agent.owner_email,
+                ):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
                         intention=normalized_intention,
@@ -217,13 +222,18 @@ class SessionManager:
         async with self.session_factory() as db_session:
             session_row = None
             try:
+                agent = await self._require_agent(db_session, agent_id)
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation_id,
                     user_email=user_email,
                     agent_id=agent_id,
                 )
-                with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+                with scoped_runtime_context(
+                    user_email=user_email,
+                    agent_id=agent_id,
+                    agent_owner_email=agent.owner_email,
+                ):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
                         intention=normalized_intention,
@@ -292,7 +302,11 @@ class SessionManager:
                 resolved_intention = _normalize_intention(
                     intention or self._build_root_intention(agent, title)
                 )
-                with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+                with scoped_runtime_context(
+                    user_email=user_email,
+                    agent_id=agent_id,
+                    agent_owner_email=agent.owner_email,
+                ):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
                         intention=resolved_intention,
@@ -353,6 +367,7 @@ class SessionManager:
                 with scoped_runtime_context(
                     user_email=parent_session.user_email,
                     agent_id=parent_session.agent_id,
+                    agent_owner_email=child_agent.owner_email,
                 ):
                     await self.providers.guardrails.create_session(
                         session_id=session_row.session_id,
@@ -653,6 +668,7 @@ class SessionManager:
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
+                    agent_owner_email=(await self._require_agent(db_session, current_session.agent_id)).owner_email,
                 ):
                     await self.providers.guardrails.create_session(
                         session_id=new_session_row.session_id,

@@ -16,6 +16,8 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
+    AgentGrantResponse,
+    AgentResponse,
     DeliverableResponse,
     EffectiveToolItemResponse,
     ModelRoutingEntry,
@@ -123,6 +125,39 @@ def test_deliverable_response_round_trip() -> None:
 
     assert response.outputs == {"tests": "passed"}
     assert response.status == "approved"
+
+
+def test_agent_response_round_trips_sharing_fields() -> None:
+    response = AgentResponse(
+        agent_id="agent-1",
+        owner_email="owner@example.com",
+        name="Shared Agent",
+        status="active",
+        is_shared_with_me=True,
+        shared_by_email="owner@example.com",
+        granted_permission="use",
+        executor_scope="owner_executor",
+        is_readonly_for_caller=True,
+    )
+
+    assert response.is_shared_with_me is True
+    assert response.shared_by_email == "owner@example.com"
+    assert response.executor_scope == "owner_executor"
+
+
+def test_agent_grant_response_round_trip() -> None:
+    response = AgentGrantResponse(
+        grant_id="grant-1",
+        agent_id="agent-1",
+        grantee_type="user",
+        grantee_user_email="guest@example.com",
+        permission="use",
+        executor_scope="grantee_executor",
+        granted_by="owner@example.com",
+    )
+
+    assert response.grantee_user_email == "guest@example.com"
+    assert response.executor_scope == "grantee_executor"
 
 
 class TestPendingPauseShapeContract:

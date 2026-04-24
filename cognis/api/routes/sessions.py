@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query, Request
 
-from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_owner_or_admin
+from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_resource_owner
 from cognis.api.models import SessionCancelResponse, SessionEventsResponse, SessionResponse
 from cognis.api.serializers import serialize_event_rows, session_to_response
 from cognis.store.queries import get_session_row
@@ -23,7 +23,7 @@ async def session_detail(request: Request, session_id: str) -> SessionResponse:
         row = await get_session_row(session, session_id)
     if row is None:
         raise api_exception(404, "not_found", "Session not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     return session_to_response(row)
 
 
@@ -34,7 +34,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> dict[str,
         row = await get_session_row(session, session_id)
     if row is None:
         raise api_exception(404, "not_found", "Session not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     intaris_sid = row.intaris_session_id or row.session_id
     try:
         intaris_session = await request.app.state.providers.guardrails.get_session(intaris_sid)
@@ -66,7 +66,7 @@ async def session_events(
         row = await get_session_row(session, session_id)
     if row is None:
         raise api_exception(404, "not_found", "Session not found")
-    require_owner_or_admin(request, row.user_email)
+    require_resource_owner(request, row.user_email)
     result = await request.app.state.providers.guardrails.read_events(
         session_id=row.intaris_session_id or row.session_id,
         after_seq=after_seq,
@@ -102,7 +102,7 @@ async def cancel_session(request: Request, session_id: str) -> SessionCancelResp
         row = await get_session_row(session, session_id)
         if row is None:
             raise api_exception(404, "not_found", "Session not found")
-        require_owner_or_admin(request, row.user_email)
+        require_resource_owner(request, row.user_email)
     ok = await request.app.state.session_manager.mark_cancelled(
         session_id,
         result_summary="cancelled via API",

@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cognis.api.common import api_exception, require_current_user
+from cognis.api.common import api_exception, require_admin, require_current_user
 from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.api.models import (
     ExecutorConfigResponse,
@@ -19,6 +19,7 @@ from cognis.core.executor_policy import (
     load_executor_policy,
     validate_executor_mcp_scope,
 )
+from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.store.queries import (
     create_executor,
     delete_executor,
@@ -29,6 +30,30 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(tags=["executors"])
+
+
+def _executor_is_shared(row: Any) -> bool:
+    return is_shared_owner_email(getattr(row, "owner_email", None))
+
+
+def _resolve_executor_owner(user: Any, shared: bool) -> str:
+    return SYSTEM_USER_EMAIL if shared else user.email
+
+
+def _enforce_executor_creation_rules(user: Any, *, executor_type: str, shared: bool) -> None:
+    if shared and user.role != "admin":
+        raise api_exception(403, "forbidden", "Only admins can create shared executors")
+    if executor_type in {"in_process", "subprocess"} and user.role != "admin":
+        raise api_exception(403, "forbidden", "Only admins can create local executors")
+
+
+def _require_executor_mutation_access(request: Request, row: Any) -> None:
+    if _executor_is_shared(row):
+        require_admin(request)
+        return
+    user = require_current_user(request)
+    if row.owner_email != user.email:
+        raise api_exception(404, "not_found", "Executor not found")
 
 
 def _executor_to_response(row: Any) -> ExecutorConfigResponse:
@@ -47,6 +72,7 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
         runtime_metadata=getattr(row, "runtime_metadata", None) or {},
         last_observed_at=getattr(row, "last_observed_at", None),
         is_default=row.is_default,
+        shared=_executor_is_shared(row),
         owner_email=row.owner_email,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -57,7 +83,7 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
 async def list_executors_route(request: Request) -> list[ExecutorConfigResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_executors(session, owner_email=user.email)
+        rows = await list_executors(session, owner_email=user.email, include_shared=True)
     return [_executor_to_response(row) for row in rows]
 
 
@@ -65,7 +91,7 @@ async def list_executors_route(request: Request) -> list[ExecutorConfigResponse]
 async def get_executor_route(request: Request, executor_id: str) -> ExecutorConfigResponse:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email)
+        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
     if row is None:
         raise api_exception(404, "not_found", "Executor not found")
     return _executor_to_response(row)
@@ -76,6 +102,7 @@ async def create_executor_route(
     request: Request, body: ExecutorCreateRequest
 ) -> ExecutorConfigResponse:
     user = require_current_user(request)
+    _enforce_executor_creation_rules(user, executor_type=body.executor_type, shared=body.shared)
     policy = await load_executor_policy(request.app.state.session_factory)
     try:
         ensure_executor_type_allowed(body.executor_type, policy)
@@ -85,7 +112,7 @@ async def create_executor_route(
         try:
             await validate_executor_mcp_scope(
                 session,
-                owner_email=user.email,
+                owner_email=_resolve_executor_owner(user, body.shared),
                 config=body.config or None,
             )
         except ValueError as exc:
@@ -101,6 +128,7 @@ async def create_executor_route(
             config=body.config or None,
             is_default=body.is_default,
             owner_email=user.email,
+            shared=body.shared,
         )
         if row.executor_type == "websocket":
             row.desired_config_version = 1
@@ -115,9 +143,10 @@ async def generate_executor_token_route(
 ) -> ExecutorTokenResponse:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email)
+        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
     if row is None:
         raise api_exception(404, "not_found", "Executor not found")
+    _require_executor_mutation_access(request, row)
     token = request.app.state.providers.auth.sign_executor_token(executor_id)
     return ExecutorTokenResponse(executor_id=executor_id, token=token, expires_in=30 * 24 * 3600)
 
@@ -132,20 +161,29 @@ async def update_executor_route(
         raise api_exception(400, "validation_error", "No fields to update")
     policy = await load_executor_policy(request.app.state.session_factory)
     async with request.app.state.session_factory() as session:
-        existing = await get_executor_row(session, executor_id, owner_email=user.email)
+        existing = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
         if existing is None:
             raise api_exception(404, "not_found", "Executor not found")
+        _require_executor_mutation_access(request, existing)
         executor_type = str(updates.get("executor_type", existing.executor_type))
+        next_shared = bool(updates.get("shared", _executor_is_shared(existing)))
+        _enforce_executor_creation_rules(user, executor_type=executor_type, shared=next_shared)
         try:
             ensure_executor_type_allowed(executor_type, policy)
             await validate_executor_mcp_scope(
                 session,
-                owner_email=user.email,
+                owner_email=_resolve_executor_owner(user, next_shared),
                 config=updates.get("config", existing.config or {}),
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
-        row = await update_executor(session, executor_id, owner_email=user.email, **updates)
+        row = await update_executor(
+            session,
+            executor_id,
+            owner_email=user.email,
+            include_shared=True,
+            **updates,
+        )
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
         runtime_affecting = (
@@ -171,12 +209,18 @@ async def update_executor_route(
 async def delete_executor_route(request: Request, executor_id: str) -> None:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email)
+        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
+        _require_executor_mutation_access(request, row)
         if row.is_default:
             raise api_exception(400, "validation_error", "Cannot delete the default executor")
-        deleted = await delete_executor(session, executor_id, owner_email=user.email)
+        deleted = await delete_executor(
+            session,
+            executor_id,
+            owner_email=user.email,
+            include_shared=True,
+        )
         if not deleted:
             raise api_exception(404, "not_found", "Executor not found")
         await session.commit()
