@@ -317,6 +317,98 @@ Only WebSocket (remote) executors are permitted. These settings are
 DB-backed and persist across restarts. Default settings are seeded only
 when missing (non-destructive), so manual changes are never overwritten.
 
+#### WebSocket Executor Manifest Example
+
+For a persistent browser-capable executor on Kubernetes, prefer a
+`StatefulSet` with a PVC-backed home directory. This keeps browser
+profiles, shell history, caches, and workspace files stable across restarts.
+
+Use `enableServiceLinks: false` on the pod. Kubernetes service-link
+environment variables can collide with Cognis env names such as
+`COGNIS_PORT` and inject values like `tcp://10.103.145.251:8080`, which
+break executor startup paths that parse those variables as integers.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cognis-executor-romana-secret
+  namespace: openwebui
+type: Opaque
+stringData:
+  token: "<executor-jwt-token>"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cognis-executor-romana-home
+  namespace: openwebui
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cognis-executor-romana
+  namespace: openwebui
+spec:
+  serviceName: cognis-executor-romana
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cognis-executor-romana
+  template:
+    metadata:
+      labels:
+        app: cognis-executor-romana
+    spec:
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/hostname: hades
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: cognis-executor-romana
+          image: genunix/cognis-executor:latest
+          imagePullPolicy: Always
+          env:
+            - name: COGNIS_PORT
+              value: "8080"
+            - name: COGNIS_CONTROLLER_URL
+              value: "wss://cognis.example.com/api/executor/ws"
+            - name: COGNIS_EXECUTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cognis-executor-romana-secret
+                  key: token
+            - name: COGNIS_DATA_DIR
+              value: "/home/cognis/.cognis"
+            - name: COGNIS_LOG_LEVEL
+              value: "info"
+            - name: COGNIS_LSP_AUTO_INSTALL
+              value: "true"
+          volumeMounts:
+            - name: home
+              mountPath: /home/cognis
+      volumes:
+        - name: home
+          persistentVolumeClaim:
+            claimName: cognis-executor-romana-home
+```
+
+This example uses a pre-created PVC for the executor home directory. That
+works well for singleton executors pinned to a specific node. If you scale
+to one PVC per replica, use `volumeClaimTemplates` instead.
+
 #### Storage Backends
 
 | Data | Backend | Config |
