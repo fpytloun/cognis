@@ -185,8 +185,14 @@
             {#if agent.is_system}
               <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-sky-300">System</span>
             {/if}
+            {#if agent.is_shared_with_me}
+              <span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-violet-300">Shared</span>
+            {/if}
           </div>
           <p class="break-all text-sm text-slate-400">{agent.agent_id}</p>
+          {#if agent.is_shared_with_me}
+            <p class="mt-1 text-xs text-violet-300/80">Shared by {agent.shared_by_email ?? agent.owner_email}</p>
+          {/if}
           <p class="mt-3 text-sm leading-6 text-slate-300">{agent.description ?? 'No description yet.'}</p>
         </div>
       </div>
@@ -227,7 +233,9 @@
     {/if}
 
     <div class="mt-5 flex flex-wrap gap-2">
-      {#if !agent.is_system}
+      {#if agent.is_shared_with_me}
+        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>View</Button>
+      {:else if !agent.is_system}
         <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Edit</Button>
         <Button size="sm" variant="secondary" onclick={() => toggleStatus(agent)}>{agent.status === 'active' ? 'Suspend' : 'Activate'}</Button>
         {#if agent.agent_type === 'primary'}

@@ -4,6 +4,7 @@ import { auth } from '$lib/stores/auth';
 import type {
   ApiKeyCreateResponse,
   Agent,
+  AgentGrant,
   AttachmentRef,
   ChannelAccount,
   ChannelAccountStatus,
@@ -469,6 +470,35 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(secondaryAgentIds)
       });
+    },
+
+    listShares(agentId: string): Promise<AgentGrant[]> {
+      return request<AgentGrant[]>(`/api/v1/agents/${agentId}/shares`);
+    },
+
+    createShare(
+      agentId: string,
+      payload: { grantee_email: string; executor_scope: 'owner_executor' | 'grantee_executor'; note?: string | null }
+    ): Promise<AgentGrant> {
+      return request<AgentGrant>(`/api/v1/agents/${agentId}/shares`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    updateShare(
+      agentId: string,
+      grantId: string,
+      payload: { executor_scope?: 'owner_executor' | 'grantee_executor'; note?: string | null }
+    ): Promise<AgentGrant> {
+      return request<AgentGrant>(`/api/v1/agents/${agentId}/shares/${grantId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    revokeShare(agentId: string, grantId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/agents/${agentId}/shares/${grantId}`, { method: 'DELETE' });
     },
 
     generateField(field: string, currentValue: string, context: Record<string, string>): Promise<{ value: string }> {
