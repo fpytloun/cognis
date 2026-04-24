@@ -294,6 +294,85 @@ A system-level controller unit (`cognis-controller.service`) is also provided. S
 
 The default `ExecStart` uses `uvx cognis-executor` (PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with a `WorkingDirectory`. Both variants are documented in the unit files as comments.
 
+## Running as a Docker container
+
+The published executor image is `ghcr.io/fpytloun/cognis-executor`. It includes the Python executor runtime, Playwright browsers, `Xvfb`, shell tools, search tools, Node/npm, common language servers, Python formatting tools, Go/Rust/C/C++ build tooling, and a persistent non-root home directory.
+
+Create a WebSocket executor in `Settings -> Executors` and generate a token before starting the container.
+
+For a local controller without TLS, run the executor on the host network so `ws://localhost` is genuinely local to the executor process:
+
+```bash
+docker run -d \
+  --name cognis-executor \
+  --network host \
+  -v cognis-executor-home:/home/cognis \
+  -e COGNIS_CONTROLLER_URL=ws://localhost:8080/api/executor/ws \
+  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+For production or any non-local controller, use `wss://`:
+
+```bash
+docker run -d \
+  --name cognis-executor \
+  -v cognis-executor-home:/home/cognis \
+  -e COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws \
+  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+The image starts through `tini`, so Kubernetes and Docker `SIGTERM` shutdowns are forwarded correctly and orphaned browser, LSP, MCP, and shell subprocesses are reaped.
+
+### Persistent home directory
+
+Mount `/home/cognis` as a volume when you want browser profiles, LSP caches, shell history, and workspace files to survive restarts:
+
+```bash
+docker volume create cognis-executor-home
+```
+
+The entrypoint initializes `.bashrc`, `.profile`, `.cognis/cache`, `.cache`, `.local/bin`, and `workspace` when the home directory is writable. If the container runs as root, it fixes ownership and drops to the `cognis` user. If Kubernetes sets `runAsUser`, the entrypoint does not attempt to `chown`; the volume must already be writable by that UID or group.
+
+### Kubernetes security context
+
+Use a persistent volume for `/home/cognis` and set a security context that makes it writable by the runtime user:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+```
+
+For platforms that assign an arbitrary UID, keep `fsGroup` on a writable volume. The image includes `libnss-wrapper` so tools that need a passwd entry still work when the numeric UID is not present in `/etc/passwd`.
+
+Minimal Kubernetes container example:
+
+```yaml
+containers:
+  - name: executor
+    image: ghcr.io/fpytloun/cognis-executor:latest
+    env:
+      - name: COGNIS_CONTROLLER_URL
+        value: wss://cognis.example.com/api/executor/ws
+      - name: COGNIS_EXECUTOR_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: cognis-executor-token
+            key: token
+    volumeMounts:
+      - name: home
+        mountPath: /home/cognis
+volumes:
+  - name: home
+    persistentVolumeClaim:
+      claimName: cognis-executor-home
+```
+
 ## Signal on executors
 
 Signal direct mode is an example of why executor-hosted adapters exist.

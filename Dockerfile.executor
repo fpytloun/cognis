@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-bookworm AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV COGNIS_DATA_DIR=/home/cognis/.cognis
+ENV COGNIS_EXECUTOR_SHELL=/bin/bash
+ENV COGNIS_LSP_AUTO_INSTALL=true
+ENV COGNIS_LOG_LEVEL=info
+ENV COGNIS_SKIP_UI_BUILD=1
+ENV HOME=/home/cognis
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PATH=/home/cognis/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV SHELL=/bin/bash
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        bzip2 \
+        ca-certificates \
+        cargo \
+        clang \
+        clangd \
+        cmake \
+        curl \
+        dbus \
+        dbus-x11 \
+        fd-find \
+        ffmpeg \
+        file \
+        fontconfig \
+        fonts-liberation \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        git \
+        git-lfs \
+        gnupg \
+        golang-go \
+        gosu \
+        jq \
+        less \
+        libffi-dev \
+        libnss-wrapper \
+        libpq-dev \
+        libssl-dev \
+        make \
+        nodejs \
+        npm \
+        openssh-client \
+        patch \
+        pkg-config \
+        postgresql-client \
+        procps \
+        psmisc \
+        ripgrep \
+        shellcheck \
+        sqlite3 \
+        sudo \
+        tini \
+        unzip \
+        vim-tiny \
+        wget \
+        xauth \
+        xvfb \
+        xz-utils \
+        zip \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md build.py ./
+COPY cognis/ ./cognis/
+COPY docs/ ./docs/
+
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir ".[postgres,s3,redis]" \
+    && python -m pip install --no-cache-dir "ruff>=0.5.0" uv \
+    && python -m playwright install --with-deps chromium firefox webkit \
+    && npm install -g --ignore-scripts \
+        @vue/language-server@2.2.8 \
+        bash-language-server@5.4.2 \
+        dockerfile-language-server-nodejs@0.13.0 \
+        prettier@3.4.2 \
+        pyright@1.1.390 \
+        svelte-language-server@0.17.8 \
+        typescript \
+        typescript-language-server@4.3.3 \
+        vscode-langservers-extracted@4.10.0 \
+        yaml-language-server@1.15.0 \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/* /tmp/*
+
+RUN groupadd --gid 1000 cognis \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash cognis \
+    && mkdir -p /home/cognis/.cache /home/cognis/.cognis/cache/browser /home/cognis/.cognis/cache/lsp /home/cognis/.local/bin /home/cognis/workspace /ms-playwright \
+    && chown -R cognis:cognis /home/cognis \
+    && chmod -R g+rwX /home/cognis \
+    && chmod 2775 /home/cognis /home/cognis/.cache /home/cognis/.cognis /home/cognis/.cognis/cache /home/cognis/.cognis/cache/browser /home/cognis/.cognis/cache/lsp /home/cognis/.local /home/cognis/.local/bin /home/cognis/workspace \
+    && chmod -R a+rX /ms-playwright
+
+COPY docker/executor/entrypoint.sh /usr/local/bin/cognis-executor-entrypoint
+RUN chmod 0755 /usr/local/bin/cognis-executor-entrypoint
+
+WORKDIR /home/cognis/workspace
+
+STOPSIGNAL SIGTERM
+USER 1000:1000
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cognis-executor-entrypoint"]
+CMD ["cognis-executor"]

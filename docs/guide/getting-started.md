@@ -108,6 +108,61 @@ Once basic chat is working, the next useful areas are:
 - `Channels` for external messaging integrations
 - `Docs` for embedded user guidance inside the app
 
+## Docker Quick Start
+
+Cognis publishes two container images:
+
+- `ghcr.io/fpytloun/cognis` for the controller and bundled web UI
+- `ghcr.io/fpytloun/cognis-executor` for a remote WebSocket executor with browser, coding, shell, search, and LSP tooling
+
+Run the controller with a persistent data volume:
+
+```bash
+docker run -d \
+  --name cognis \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8080:8080 \
+  -v cognis-data:/data \
+  -e COGNIS_DATA_DIR=/data \
+  -e COGNIS_MNEMORY_URL=http://host.docker.internal:8050 \
+  -e COGNIS_INTARIS_URL=http://host.docker.internal:8060 \
+  -e OPENAI_API_KEY=sk-... \
+  ghcr.io/fpytloun/cognis:latest
+```
+
+`host.docker.internal` works by default on Docker Desktop. On Linux, the `--add-host=host.docker.internal:host-gateway` flag maps it to the Docker host so a containerized controller can reach Mnemory and Intaris running on the host.
+
+Open the printed setup URL from the controller logs:
+
+```bash
+docker logs cognis
+```
+
+Create a WebSocket executor in `Settings -> Executors`, generate a token, then run the executor image. For a local non-TLS controller, use host networking so the executor URL is `ws://localhost:8080/...`, which the executor accepts as a local-only insecure connection:
+
+```bash
+docker run -d \
+  --name cognis-executor \
+  --network host \
+  -v cognis-executor-home:/home/cognis \
+  -e COGNIS_CONTROLLER_URL=ws://localhost:8080/api/executor/ws \
+  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+For remote controllers, always use TLS:
+
+```bash
+docker run -d \
+  --name cognis-executor \
+  -v cognis-executor-home:/home/cognis \
+  -e COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws \
+  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+The executor image runs as the non-root `cognis` user by default. Its home directory is designed to be mounted as a persistent volume so browser profiles, LSP caches, shell history, and workspace files survive restarts.
+
 ## Common setup problems
 
 - **Mnemory or Intaris unreachable**

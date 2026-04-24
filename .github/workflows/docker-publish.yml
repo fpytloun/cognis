@@ -1,0 +1,80 @@
+name: Publish Docker Images
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-publish:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: controller
+            image: ghcr.io/${{ github.repository }}
+            dockerfile: Dockerfile
+            context: .
+          - name: executor
+            image: ghcr.io/${{ github.repository }}-executor
+            dockerfile: Dockerfile.executor
+            context: .
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=cognis-${{ matrix.name }}
+            org.opencontainers.image.description=Cognis ${{ matrix.name }} image
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Write image reference artifact
+        run: |
+          mkdir -p docker-image-artifacts
+          {
+            printf 'image=%s\n' '${{ matrix.image }}'
+            printf 'release_tag=%s\n' '${{ github.event.release.tag_name }}'
+            printf 'digest=%s\n' '${{ steps.build.outputs.digest }}'
+            printf 'tags<<EOF\n%s\nEOF\n' '${{ steps.meta.outputs.tags }}'
+          } > docker-image-artifacts/${{ matrix.name }}.txt
+
+      - name: Upload image reference artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ matrix.name }}
+          path: docker-image-artifacts/${{ matrix.name }}.txt

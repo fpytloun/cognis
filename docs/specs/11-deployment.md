@@ -142,16 +142,19 @@ INTARIS_JWKS_URL=https://cognis.example.com/.well-known/jwks.json
 
 ## Docker Compose
 
+The released controller image is `ghcr.io/fpytloun/cognis`. The released full executor image is `ghcr.io/fpytloun/cognis-executor`.
+
 ```yaml
 services:
   cognis:
-    build: .
+    image: ghcr.io/fpytloun/cognis:latest
     ports:
       - "8080:8080"
     environment:
+      COGNIS_DATA_DIR: /data
       DATABASE_URL: "postgresql+asyncpg://cognis:${POSTGRES_PASSWORD}@postgres:5432/cognis"
-      MNEMORY_URL: "http://mnemory:8050"
-      INTARIS_URL: "http://intaris:8060"
+      COGNIS_MNEMORY_URL: "http://mnemory:8050"
+      COGNIS_INTARIS_URL: "http://intaris:8060"
     env_file: .env
     volumes:
       - cognis-data:/data
@@ -186,9 +189,23 @@ services:
     image: ghcr.io/fpytloun/intaris:latest
     # No host ports - only accessible within Docker network
 
+  # Start after creating a WebSocket executor in Cognis and generating a token.
+  # Local non-TLS WebSocket URLs must use localhost, so use host networking for
+  # local Docker. For production, prefer wss:// through your ingress instead.
+  executor:
+    image: ghcr.io/fpytloun/cognis-executor:latest
+    network_mode: host
+    environment:
+      COGNIS_CONTROLLER_URL: "ws://localhost:8080/api/executor/ws"
+      COGNIS_EXECUTOR_TOKEN: "${COGNIS_EXECUTOR_TOKEN}"
+    volumes:
+      - cognis-executor-home:/home/cognis
+    profiles: ["executor"]
+
 volumes:
   pgdata:
   cognis-data:
+  cognis-executor-home:
 
 secrets:
   jwt_private_key: {file: ./keys/private.pem}
