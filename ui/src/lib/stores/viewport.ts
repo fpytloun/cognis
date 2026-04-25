@@ -40,8 +40,9 @@ function readViewportMetrics(): ViewportMetrics {
     return { height: 0, keyboardOpen: false };
   }
   const vv = window.visualViewport;
-  const height = vv?.height ?? window.innerHeight;
-  const keyboardOverlap = vv ? window.innerHeight - vv.height - vv.offsetTop : 0;
+  const visualBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+  const height = Math.min(window.innerHeight, Math.max(0, visualBottom));
+  const keyboardOverlap = vv ? window.innerHeight - visualBottom : 0;
   return {
     height,
     keyboardOpen: keyboardOverlap > 80,
