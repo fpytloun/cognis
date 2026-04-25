@@ -3142,10 +3142,13 @@ import X from 'lucide-svelte/icons/x';
             the full width of the chat area. No outer card, no recessed
             background — the textarea below carries its own border. The
             visualViewport-sized app shell moves the footer above the
-            keyboard; `--app-bottom-inset` only reserves the home-indicator
-            safe area when the keyboard is closed.
+            keyboard; `--app-bottom-inset` reserves the home-indicator
+            safe area when the keyboard is closed and collapses to 0 when
+            it is open, so the pill sits flush against the top of the
+            keyboard on mobile. On tablet and up we keep a small padding
+            so the pill never bleeds into the window chrome.
           -->
-          <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 pb-[calc(0.75rem+var(--app-bottom-inset,env(safe-area-inset-bottom,0px)))] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(1rem+var(--app-bottom-inset,env(safe-area-inset-bottom,0px)))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 pb-[var(--app-bottom-inset,env(safe-area-inset-bottom,0px))] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(0.5rem+var(--app-bottom-inset,env(safe-area-inset-bottom,0px)))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
