@@ -145,19 +145,23 @@ edit_tool = ToolDefinition(
     timeout_seconds=30,
 )
 
-# patch — Apply a strict text patch
-patch_tool = ToolDefinition(
-    name="patch",
-    description="Apply a strict patch envelope or the supported unified diff update subset to one or more text files.",
+# apply_patch — Apply a strict text patch
+apply_patch_tool = ToolDefinition(
+    name="apply_patch",
+    description="Apply a strict apply_patch envelope or the supported unified diff update subset to one or more text files.",
     parameters={
         "type": "object",
         "properties": {
-            "patch_text": {
+            "patchText": {
                 "type": "string",
-                "description": "Patch text in strict envelope syntax or the supported unified diff update subset",
+                "description": "Patch text in apply_patch envelope syntax or the supported unified diff update subset",
+            },
+            "operation": {
+                "type": "object",
+                "description": "Native apply_patch operation with type, path, and optional diff",
             },
         },
-        "required": ["patch_text"],
+        "anyOf": [{"required": ["patchText"]}, {"required": ["operation"]}],
     },
     source=ToolSource(type="executor"),
     category="filesystem",
@@ -319,7 +323,7 @@ the Tavily backend.
 | `read` | yes | no | Read-only filesystem access |
 | `write` | no | **yes** | Creates/overwrites files |
 | `edit` | no | **yes** | Modifies file content |
-| `patch` | no | **yes** | Modifies files via diff |
+| `apply_patch` | no | **yes** | Modifies files via diff |
 | `multiedit` | no | **yes** | Modifies file content |
 | `list_directory` | yes | no | Read-only directory listing |
 | `glob` | yes | no | Read-only file search |
@@ -340,15 +344,16 @@ edit still succeeds if LSP is disabled, unavailable, or times out during first
 server startup. `read` may warm LSP in the background, but it does not block on
 diagnostics.
 
-The `patch` tool accepts strict text-only patches in two forms:
-- full patch envelope syntax for `Add File`, `Update File`, `Delete File`, and `Move to`
+The `apply_patch` tool accepts strict text-only patches in two forms:
+- full apply_patch envelope syntax for `Add File`, `Update File`, `Delete File`, and `Move to`
 - the supported unified diff subset for updates to existing files
+- native OpenAI Responses operation objects (`create_file`, `update_file`, `delete_file`)
 
-Existing-file `patch` updates, deletes, and moves require a prior `read` of the
-source file in the same execution scope. `Add File` does not. Unsupported patch
+Existing-file `apply_patch` updates, deletes, and moves require a prior `read` of the
+source file in the same execution scope. `Add File` does not. Unsupported apply_patch
 forms fail deterministically instead of falling back to fuzzy matching. EOF
-markers are supported: `*** End of File` is accepted inside patch envelopes,
-and `\ No newline at end of file` preserves final-newline semantics in patch
+markers are supported: `*** End of File` is accepted inside apply_patch envelopes,
+and `\ No newline at end of file` preserves final-newline semantics in apply_patch
 envelopes and unified-diff hunks.
 
 ## Built-in Orchestration Tools
@@ -601,7 +606,7 @@ Configured in the `settings` DB table (key: `security.non_bypassable_tools`),
 managed via Settings UI or `PUT /api/v1/settings/security.non_bypassable_tools`:
 
 ```json
-["bash", "write", "edit", "patch", "multiedit", "*/create_*", "*/delete_*"]
+["bash", "write", "edit", "apply_patch", "multiedit", "*/create_*", "*/delete_*"]
 ```
 
 This prevents an agent with `"*": "allow"` from bypassing safety checks on

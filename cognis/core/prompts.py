@@ -115,7 +115,7 @@ entire output."""
 _EDIT_GUIDANCE = """\
 - Use whichever dedicated edit tools are actually visible for file contents \
   and code changes.
-- Use `patch` for patch-envelope or unified-diff style changes when it is \
+- Use `apply_patch` for patch-envelope or unified-diff style changes when it is \
   visible. Use `edit`, `multiedit`, and `write` for exact replacements and \
   file creation when those tools are visible.
 - Do not call edit tools that are not visible in the current tool list."""
@@ -330,13 +330,13 @@ def build_visible_edit_tool_guidance(
 ) -> str | None:
     """Return turn-local guidance that matches the actually exposed edit tools."""
 
-    has_patch = "patch" in visible_tool_names
+    has_patch = "apply_patch" in visible_tool_names
     exact_tools = [name for name in ("edit", "multiedit", "write") if name in visible_tool_names]
     if not has_patch and not exact_tools:
         return None
     if has_patch and not exact_tools:
         return (
-            "Turn-local edit guidance: `patch` is the visible edit tool. Use it for file "
+            "Turn-local edit guidance: `apply_patch` is the visible edit tool. Use it for file "
             "contents and code changes; do not call `edit`, `multiedit`, or `write` unless "
             "they become visible in a later turn."
         )
@@ -344,19 +344,19 @@ def build_visible_edit_tool_guidance(
         rendered = ", ".join(f"`{name}`" for name in exact_tools)
         return (
             f"Turn-local edit guidance: {rendered} are the visible edit tools. Use these "
-            "for file contents and code changes; do not call `patch` unless it becomes "
+            "for file contents and code changes; do not call `apply_patch` unless it becomes "
             "visible in a later turn."
         )
 
     edit_mode = preferred_edit_tool_mode(model_id)
-    if edit_mode is EditToolMode.PATCH:
+    if edit_mode is EditToolMode.APPLY_PATCH:
         return (
-            "Turn-local edit guidance: `patch` and exact edit tools are visible. Prefer "
-            "`patch` for source-code modifications on this model; use exact edit tools only "
+            "Turn-local edit guidance: `apply_patch` and exact edit tools are visible. Prefer "
+            "`apply_patch` for source-code modifications on this model; use exact edit tools only "
             "when they are the simpler correct option."
         )
     return (
-        "Turn-local edit guidance: `patch` and exact edit tools are visible. Prefer "
+        "Turn-local edit guidance: `apply_patch` and exact edit tools are visible. Prefer "
         "`edit` or `multiedit` for existing files and reserve `write` for new files or "
         "full-file replacement."
     )

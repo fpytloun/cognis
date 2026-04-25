@@ -295,7 +295,17 @@ _MAX_EMPTY_DIRECT_RESPONSE_REPROMPTS = 2
 _MAX_TOOL_CALL_ARGUMENT_CHARS = 256_000
 _DELIVERABLE_PREVIEW_CHARS = 240
 _PROJECT_TOUCH_TOOL_NAMES = frozenset(
-    {"read", "write", "edit", "patch", "multiedit", "list_directory", "glob", "grep", "bash"}
+    {
+        "read",
+        "write",
+        "edit",
+        "apply_patch",
+        "multiedit",
+        "list_directory",
+        "glob",
+        "grep",
+        "bash",
+    }
 )
 
 
@@ -2652,6 +2662,9 @@ class AgentLoop:
             for tool_schema in exposure.tools:
                 if not isinstance(tool_schema, dict):
                     continue
+                if tool_schema.get("type") == "apply_patch":
+                    visible_tool_names.add("apply_patch")
+                    continue
                 function_schema = tool_schema.get("function")
                 if not isinstance(function_schema, dict):
                     continue
@@ -2665,7 +2678,7 @@ class AgentLoop:
             if edit_guidance is None and edit_guidance_message_index is not None:
                 edit_guidance = (
                     "Turn-local edit guidance: no dedicated edit tools are currently visible. "
-                    "Do not call `patch`, `edit`, `multiedit`, or `write` unless one becomes "
+                    "Do not call `apply_patch`, `edit`, `multiedit`, or `write` unless one becomes "
                     "visible in a later turn."
                 )
             if edit_guidance is not None and edit_guidance != queued_edit_guidance:
@@ -7815,6 +7828,7 @@ class AgentLoop:
                 "tool_call_id": tc.call_id,
                 "content": result.output,
                 "_tool_name": tc.name,
+                "_tool_is_error": result.is_error,
                 "_protected_tool_output": bool(
                     result.metadata and result.metadata.get("protected_context")
                 ),
@@ -8689,7 +8703,7 @@ class AgentLoop:
                 raw_path = ctx.working_directory or ctx.workspace_root
             if raw_path is None:
                 return None
-        elif tc.name == "patch":
+        elif tc.name == "apply_patch":
             raw_path = ctx.working_directory or ctx.workspace_root
             if raw_path is None:
                 return None

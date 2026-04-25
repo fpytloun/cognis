@@ -153,29 +153,37 @@ class TestArgumentSanity:
         )
 
     def test_dev_null_file_path_rejected_for_write_tools(self) -> None:
-        for tool in ("write", "edit", "multiedit", "patch"):
+        for tool in ("write", "edit", "multiedit", "apply_patch"):
             args = {"file_path": "/dev/null"}
             if tool == "multiedit":
                 args["edits"] = [{"old_string": "a", "new_string": "b"}]
-            if tool == "patch":
-                args["patch_text"] = "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"
+            if tool == "apply_patch":
+                args["patchText"] = "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"
             violation = check_argument_sanity(tool, args)
             assert violation is not None, f"failed for {tool}"
             assert violation.reason == "invalid_file_path"
 
-    def test_patch_dev_null_header_rejected(self) -> None:
+    def test_apply_patch_dev_null_header_rejected(self) -> None:
         violation = check_argument_sanity(
-            "patch",
-            {"patch_text": "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"},
+            "apply_patch",
+            {"patchText": "*** Begin Patch\n*** Add File: /dev/null\n+x\n*** End Patch\n"},
         )
         assert violation is not None
         assert violation.reason == "invalid_file_path"
 
-    def test_patch_dev_null_like_hunk_content_is_allowed(self) -> None:
+    def test_apply_patch_native_operation_dev_null_rejected(self) -> None:
         violation = check_argument_sanity(
-            "patch",
+            "apply_patch",
+            {"operation": {"type": "update_file", "path": "/dev/null", "diff": "@@\n-x\n+y\n"}},
+        )
+        assert violation is not None
+        assert violation.reason == "invalid_file_path"
+
+    def test_apply_patch_dev_null_like_hunk_content_is_allowed(self) -> None:
+        violation = check_argument_sanity(
+            "apply_patch",
             {
-                "patch_text": (
+                "patchText": (
                     "--- a/tmp/file.txt\n+++ b/tmp/file.txt\n@@ -1 +1 @@\n"
                     " --- /dev/null\n+actual content\n"
                 )
@@ -184,11 +192,11 @@ class TestArgumentSanity:
 
         assert violation is None
 
-    def test_patch_envelope_header_like_hunk_content_is_allowed(self) -> None:
+    def test_apply_patch_envelope_header_like_hunk_content_is_allowed(self) -> None:
         violation = check_argument_sanity(
-            "patch",
+            "apply_patch",
             {
-                "patch_text": (
+                "patchText": (
                     "*** Begin Patch\n*** Update File: tmp/file.txt\n@@\n"
                     " *** Add File: /dev/null\n+literal content\n*** End Patch\n"
                 )

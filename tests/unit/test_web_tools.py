@@ -195,7 +195,7 @@ class TestDefinitions:
         names = {d.name for d in defs}
         assert "web_fetch" not in names
         assert "web_search" not in names
-        assert {"read", "write", "edit", "multiedit", "patch", "grep", "glob", "bash"} <= names
+        assert {"read", "write", "edit", "multiedit", "apply_patch", "grep", "glob", "bash"} <= names
 
 
 class TestDynamicWebDefinitions:

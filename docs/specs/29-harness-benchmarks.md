@@ -385,13 +385,13 @@ The same tools go to Anthropic and OpenAI with minor schema differences.
 
 **References**
 
-- Opencode selectively enables its patch-style editing tool only for GPT-5 family and
+- Opencode selectively enables its apply_patch-style editing tool only for GPT-5 family and
   falls back to `edit`/`write` for others (`tool/registry.ts:273`).
 
 **Remediation direction**
 
 - Let the tool registry advertise preferred families per tool. For example:
-  - `patch` preferred on GPT-5+
+  - `apply_patch` preferred on GPT-5+
   - `edit`/`multiedit`/`write` preferred on Anthropic/Gemini/Groq/open-source models
   - Disable `web_search` for models with native browsing (rare, but cleaner)
 
@@ -429,7 +429,7 @@ P0 = immediate, P1 = next, P2 = nice-to-have.
   and project `skill/`).
 - **G11 Stable ordering** in visible selection.
 - **G12 `<system-reminder>` discipline** for skill / todo / plan reminders.
-- **G13 Per-family tool tailoring** (e.g. `patch` only for GPT-5+).
+- **G13 Per-family tool tailoring** (e.g. `apply_patch` only for GPT-5+).
 
 ## Non-goals
 

@@ -350,6 +350,15 @@ def _supports_openai_tool_search_model(model_name: str) -> bool:
     return (major, minor) >= (5, 4)
 
 
+def _looks_like_openai_apply_patch_model(model_name: str) -> bool:
+    """Conservative fallback for OpenAI Responses native apply_patch support."""
+
+    normalized = model_name.strip().lower()
+    if "gpt-oss" in normalized:
+        return False
+    return "codex" in normalized or normalized.startswith(("gpt-5.1", "openai/gpt-5.1"))
+
+
 def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
     """Convert litellm proxy ``model_info`` fields to Cognis ``ModelInfo`` fields.
 
@@ -386,6 +395,8 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
         normalized["supports_openai_namespace_tools"] = bool(
             info["supports_openai_namespace_tools"]
         )
+    if "supports_openai_apply_patch" in info:
+        normalized["supports_openai_apply_patch"] = bool(info["supports_openai_apply_patch"])
     if "supports_tool_choice" in info and info.get("supports_function_calling"):
         normalized["supports_tools"] = True
     # Cost conversion: per-token → per-million-tokens (rounded to avoid float drift)
@@ -907,6 +918,11 @@ class LiteLLMProvider:
                             merged,
                             "supports_openai_allowed_tools",
                         ),
+                        "supports_openai_apply_patch": _merge_live_bool(
+                            live,
+                            merged,
+                            "supports_openai_apply_patch",
+                        ),
                         "supported_openai_params": list(live.get("supported_openai_params") or []),
                         "max_tools": live.get("max_tools") or merged.get("max_tools"),
                     }
@@ -994,6 +1010,11 @@ class LiteLLMProvider:
         supports_openai_tool_search = bool(
             supports_responses_api and _supports_openai_tool_search_model(model_name)
         )
+        supports_openai_apply_patch = bool(
+            supports_responses_api
+            and preset == "openai"
+            and _looks_like_openai_apply_patch_model(model_name)
+        )
         supports_image_generation = _looks_like_image_generation_model(model_name)
         return {
             "supports_defer_loading": is_anthropic,
@@ -1003,6 +1024,7 @@ class LiteLLMProvider:
             "supports_extended_thinking": False,
             "supports_openai_namespace_tools": supports_openai_tool_search,
             "supports_openai_allowed_tools": supports_openai_tool_search,
+            "supports_openai_apply_patch": supports_openai_apply_patch,
             "supports_image_generation": supports_image_generation,
             "max_tools": 128 if is_openai_like else None,
         }
@@ -1040,6 +1062,50 @@ class LiteLLMProvider:
             rollout_mode=self._responses_rollout_mode(),
         )
 
+    def _native_apply_patch_setting(
+        self, model_id: str, provider: LLMProviderRow | None
+    ) -> str | bool:
+        """Return provider/model native apply_patch setting: auto, true, or false."""
+
+        if provider is None:
+            return "auto"
+        config = dict(provider.config or {})
+        setting: str | bool = config.get("use_native_apply_patch", "auto")
+        row_models = config.get("models", [])
+        if isinstance(row_models, list):
+            for model in row_models:
+                if isinstance(model, dict) and model.get("model_id") == model_id:
+                    if "use_native_apply_patch" in model:
+                        setting = model.get("use_native_apply_patch")
+                    break
+        if isinstance(setting, bool):
+            return setting
+        normalized = str(setting or "auto").strip().lower()
+        if normalized in {"true", "on", "enabled", "yes"}:
+            return True
+        if normalized in {"false", "off", "disabled", "no"}:
+            return False
+        return "auto"
+
+    def _resolve_native_apply_patch_contract(
+        self,
+        *,
+        model_id: str,
+        model_info: ModelInfo,
+        provider: LLMProviderRow | None,
+        use_responses_api: bool,
+    ) -> tuple[bool, str]:
+        setting = self._native_apply_patch_setting(model_id, provider)
+        if setting is False:
+            return False, "disabled_by_config"
+        if not use_responses_api:
+            return False, "responses_api_not_active"
+        if not bool(model_info.supports_openai_apply_patch):
+            return False, "model_capability_missing"
+        if setting is True:
+            return True, "enabled_by_config"
+        return True, "model_capability"
+
     async def resolve_tool_exposure_contract(
         self,
         *,
@@ -1062,6 +1128,12 @@ class LiteLLMProvider:
             is_json_mode_request=False,
         )
         llm_api = LLMApiMode.RESPONSES if use_responses_api else LLMApiMode.CHAT_COMPLETIONS
+        native_apply_patch, native_apply_patch_reason = self._resolve_native_apply_patch_contract(
+            model_id=model_id,
+            model_info=model_info,
+            provider=provider,
+            use_responses_api=use_responses_api,
+        )
 
         # Cognis uses controller-managed `search_tools` as the canonical
         # model-facing discovery interface. Native provider discovery may still
@@ -1071,7 +1143,12 @@ class LiteLLMProvider:
             ToolDiscoveryMode.CONTROLLER_SEARCH if allow_tool_search else ToolDiscoveryMode.NONE
         )
 
-        return ToolExposureContract(llm_api=llm_api, discovery_mode=discovery_mode)
+        return ToolExposureContract(
+            llm_api=llm_api,
+            discovery_mode=discovery_mode,
+            native_apply_patch=native_apply_patch,
+            native_apply_patch_reason=native_apply_patch_reason,
+        )
 
     def invalidate_json_mode_cache_for_provider(self, provider_id: str) -> None:
         """Clear any JSON-mode broken-key entries matching the given provider.

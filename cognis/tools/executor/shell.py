@@ -25,37 +25,37 @@ _MAX_BACKGROUND_OUTPUT_CHARS = 200_000
 _BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r'(^|\s)sed\s+-i(?:[\s\'"]|$)'),
-        "Use edit, multiedit, patch, or write instead of sed -i for file content changes.",
+        "Use edit, multiedit, apply_patch, or write instead of sed -i for file content changes.",
     ),
     (
         re.compile(r'(^|\s)perl\s+-pi(?:[\s\'"]|$)'),
-        "Use edit, multiedit, patch, or write instead of perl -pi for file content changes.",
+        "Use edit, multiedit, apply_patch, or write instead of perl -pi for file content changes.",
     ),
     (
         re.compile(r'(^|\s)ruby\s+-pi(?:[\s\'"]|$)'),
-        "Use edit, multiedit, patch, or write instead of ruby -pi for file content changes.",
+        "Use edit, multiedit, apply_patch, or write instead of ruby -pi for file content changes.",
     ),
     (
         re.compile(
             r"(^|\s)python(?:3)?\s+-c\s+.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
             re.DOTALL,
         ),
-        "Use edit, multiedit, patch, or write instead of Python one-liners that rewrite files.",
+        "Use edit, multiedit, apply_patch, or write instead of Python one-liners that rewrite files.",
     ),
     (
         re.compile(
             r"(^|\s)python(?:3)?\s+.*<<[-~]?['\"]?(?:PY|EOF)['\"]?.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
             re.DOTALL,
         ),
-        "Use edit, multiedit, patch, or write instead of embedded Python scripts that rewrite files.",
+        "Use edit, multiedit, apply_patch, or write instead of embedded Python scripts that rewrite files.",
     ),
     (
         re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
-        "Use edit, multiedit, patch, or write instead of shell redirection to rewrite source files.",
+        "Use edit, multiedit, apply_patch, or write instead of shell redirection to rewrite source files.",
     ),
     (
         re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
-        "Use edit, multiedit, patch, or write instead of tee to rewrite source files.",
+        "Use edit, multiedit, apply_patch, or write instead of tee to rewrite source files.",
     ),
 )
 _SHELL_PARSE_ERROR_PATTERN = re.compile(

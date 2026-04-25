@@ -47,8 +47,13 @@ def _contract(
     *,
     llm_api: LLMApiMode = LLMApiMode.CHAT_COMPLETIONS,
     discovery_mode: ToolDiscoveryMode = ToolDiscoveryMode.CONTROLLER_SEARCH,
+    native_apply_patch: bool = False,
 ) -> ToolExposureContract:
-    return ToolExposureContract(llm_api=llm_api, discovery_mode=discovery_mode)
+    return ToolExposureContract(
+        llm_api=llm_api,
+        discovery_mode=discovery_mode,
+        native_apply_patch=native_apply_patch,
+    )
 
 
 def _search_schema() -> dict[str, object]:
@@ -423,7 +428,7 @@ def test_gpt5_prefers_patch_over_exact_edit_tools() -> None:
         _write_tool("write"),
         _write_tool("edit"),
         _write_tool("multiedit"),
-        _write_tool("patch"),
+        _write_tool("apply_patch"),
     ]
 
     result = prepare_tool_exposure(
@@ -436,12 +441,12 @@ def test_gpt5_prefers_patch_over_exact_edit_tools() -> None:
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert "patch" in function_names
+    assert "apply_patch" in function_names
     assert "write" not in function_names
     assert "edit" not in function_names
     assert "multiedit" not in function_names
     assert result.debug_metadata["edit_tool_family"] == "gpt5"
-    assert result.debug_metadata["edit_tool_mode"] == "patch"
+    assert result.debug_metadata["edit_tool_mode"] == "apply_patch"
 
 
 def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
@@ -457,7 +462,7 @@ def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
             _write_tool("write"),
             _write_tool("edit"),
             _write_tool("multiedit"),
-            _write_tool("patch"),
+            _write_tool("apply_patch"),
         ]
 
         result = prepare_tool_exposure(
@@ -470,7 +475,7 @@ def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
         )
 
         function_names = [tool["function"]["name"] for tool in result.tools]
-        assert "patch" not in function_names
+        assert "apply_patch" not in function_names
         assert {"write", "edit", "multiedit"} <= set(function_names)
         assert result.debug_metadata["edit_tool_mode"] == "exact"
 
@@ -499,7 +504,7 @@ def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> 
     read = _tool("read", source_type="executor", category="filesystem")
     edit = _write_tool("edit")
     write = _write_tool("write")
-    patch = _write_tool("patch")
+    patch = _write_tool("apply_patch")
 
     result = prepare_tool_exposure(
         inventory_tools=[read, edit, write, patch],
@@ -512,14 +517,14 @@ def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> 
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert "patch" not in function_names
+    assert "apply_patch" not in function_names
     assert {"edit", "write"} <= set(function_names)
 
 
 def test_deferred_loading_still_uses_single_edit_surface() -> None:
     read = _tool("read", source_type="executor", category="filesystem")
     edit = _write_tool("edit")
-    patch = _write_tool("patch")
+    patch = _write_tool("apply_patch")
 
     result = prepare_tool_exposure(
         inventory_tools=[read, edit, patch],
@@ -537,4 +542,32 @@ def test_deferred_loading_still_uses_single_edit_surface() -> None:
 
     function_names = [tool["function"]["name"] for tool in result.tools]
     assert "edit" in function_names
-    assert "patch" not in function_names
+    assert "apply_patch" not in function_names
+
+
+def test_responses_native_apply_patch_replaces_function_schema() -> None:
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _write_tool("apply_patch"),
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.1-codex", supports_responses_api=True, max_tools=128),
+        contract=_contract(
+            llm_api=LLMApiMode.RESPONSES,
+            discovery_mode=ToolDiscoveryMode.NONE,
+            native_apply_patch=True,
+        ),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    assert {tool.get("type") for tool in result.tools} >= {"function", "apply_patch"}
+    assert all(
+        tool.get("function", {}).get("name") != "apply_patch"
+        for tool in result.tools
+        if isinstance(tool.get("function"), dict)
+    )
+    assert result.debug_metadata["native_apply_patch_exposed"] is True

@@ -86,6 +86,7 @@ class ModelInfo(BaseModel):
     supports_extended_thinking: bool = False
     supports_openai_namespace_tools: bool = False
     supports_openai_allowed_tools: bool = False
+    supports_openai_apply_patch: bool = False
     supports_image_generation: bool = False
     supported_openai_params: list[str] = Field(default_factory=list)
     max_tools: int | None = None

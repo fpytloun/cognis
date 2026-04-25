@@ -94,7 +94,7 @@ You are a focused implementation agent for software engineering tasks.
 - Use the most direct tool for the operation.
 - Prefer `read`, `grep`, and `glob` for inspection.
 - Prefer the dedicated file editing tools exposed for the current model. Use
-  `patch` when that is the visible edit tool; otherwise use `edit`,
+  `apply_patch` when that is the visible edit tool; otherwise use `edit`,
   `multiedit`, and `write` for content changes.
 - Use shell commands for terminal-native operations and atomic filesystem
   operations such as `mv`, `cp`, `rm`, `mkdir`, `git`, and build/test
@@ -505,7 +505,7 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
                     "write",
                     "edit",
                     "multiedit",
-                    "patch",
+                    "apply_patch",
                     "grep",
                     "glob",
                     "list",

@@ -4,7 +4,7 @@
 
 ## Implementation Notes
 
-- Added 10 executor-native tools: read, write, edit, patch, multiedit, list_directory, glob, grep, bash, web_fetch
+- Added 10 executor-native tools: read, write, edit, apply_patch, multiedit, list_directory, glob, grep, bash, web_fetch
 - New `executor` source type with priority 400 (between builtin 500 and skill 300)
 - Tools & Skills page added as top-level nav item at `/tools`
 - Executors tab added to Settings page with full CRUD, tool toggles, presets, label editor
@@ -40,13 +40,13 @@ After this stage, Cognis has:
 New directory with 5 modules:
 
 - `definitions.py` — Tool definitions and handler registry for all 10 tools
-- `filesystem.py` — read, write, edit, patch, multiedit, list_directory handlers
+- `filesystem.py` — read, write, edit, apply_patch, multiedit, list_directory handlers
 - `search.py` — glob, grep handlers
 - `shell.py` — bash handler
 - `web.py` — web_fetch handler
 
 All tools return `ToolResult` and follow the `ToolHandler` protocol.
-Write operations (write, edit, patch, multiedit, bash) are `non_bypassable=True`.
+Write operations (write, edit, apply_patch, multiedit, bash) are `non_bypassable=True`.
 Read operations (read, glob, grep, list_directory, web_fetch) are `read_only=True`.
 
 ### 2. Tool Registry Updates (`cognis/tools/registry.py`)

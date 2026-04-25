@@ -70,13 +70,13 @@ def test_prompt_does_not_assume_patch_is_visible() -> None:
     assert instructions is not None
     assert "actually visible" in instructions
     assert "Do not call edit tools that are not visible" in instructions
-    assert "Prefer `patch` over `write`, `edit`, or `multiedit`" not in instructions
+    assert "Prefer `apply_patch` over `write`, `edit`, or `multiedit`" not in instructions
 
 
 def test_visible_edit_guidance_prefers_patch_when_only_patch_is_visible() -> None:
-    guidance = build_visible_edit_tool_guidance({"read", "patch"}, model_id="gpt-5.4")
+    guidance = build_visible_edit_tool_guidance({"read", "apply_patch"}, model_id="gpt-5.4")
     assert guidance is not None
-    assert "`patch` is the visible edit tool" in guidance
+    assert "`apply_patch` is the visible edit tool" in guidance
     assert "do not call `edit`, `multiedit`, or `write`" in guidance
 
 
@@ -84,7 +84,7 @@ def test_visible_edit_guidance_avoids_patch_when_not_visible() -> None:
     guidance = build_visible_edit_tool_guidance({"read", "edit", "write"}, model_id="gpt-5.4")
     assert guidance is not None
     assert "`edit`, `write` are the visible edit tools" in guidance
-    assert "do not call `patch`" in guidance
+    assert "do not call `apply_patch`" in guidance
 
 
 def test_critical_rules_cover_truncated_output_recovery_and_placeholder_bleed() -> None:

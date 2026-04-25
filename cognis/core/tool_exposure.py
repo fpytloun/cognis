@@ -54,7 +54,7 @@ class ToolDiscoveryMode(StrEnum):
 class EditToolMode(StrEnum):
     """Preferred model-facing editing surface."""
 
-    PATCH = "patch"
+    APPLY_PATCH = "apply_patch"
     EXACT = "exact"
 
 
@@ -70,7 +70,7 @@ class EditToolFamily(StrEnum):
 
 
 _EXACT_TOOL_NAMES = frozenset({"edit", "multiedit", "write"})
-_PATCH_TOOL_NAMES = frozenset({"patch"})
+_APPLY_PATCH_TOOL_NAMES = frozenset({"apply_patch"})
 _OPEN_SOURCE_MODEL_TOKENS = (
     "gpt-oss",
     "llama",
@@ -93,6 +93,8 @@ _OPEN_SOURCE_MODEL_TOKENS = (
 class ToolExposureContract:
     llm_api: LLMApiMode
     discovery_mode: ToolDiscoveryMode
+    native_apply_patch: bool = False
+    native_apply_patch_reason: str | None = None
 
 
 def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
@@ -116,7 +118,7 @@ def preferred_edit_tool_mode(model_id: str | None) -> EditToolMode:
     """Return the preferred edit surface for a model family."""
 
     if detect_edit_tool_family(model_id) is EditToolFamily.GPT5:
-        return EditToolMode.PATCH
+        return EditToolMode.APPLY_PATCH
     return EditToolMode.EXACT
 
 
@@ -124,16 +126,18 @@ def filter_edit_tools_for_model(tools: list[ToolDefinition], model_id: str | Non
     """Drop mutually-exclusive edit tools when both surfaces are available."""
 
     tool_names = {tool.name for tool in tools}
-    has_patch = bool(tool_names & _PATCH_TOOL_NAMES)
+    has_patch = bool(tool_names & _APPLY_PATCH_TOOL_NAMES)
     has_exact = bool(tool_names & _EXACT_TOOL_NAMES)
     if not (has_patch and has_exact):
         return tools
 
     preferred = preferred_edit_tool_mode(model_id)
-    keep_names = _PATCH_TOOL_NAMES if preferred is EditToolMode.PATCH else _EXACT_TOOL_NAMES
+    keep_names = (
+        _APPLY_PATCH_TOOL_NAMES if preferred is EditToolMode.APPLY_PATCH else _EXACT_TOOL_NAMES
+    )
     filtered: list[ToolDefinition] = []
     for tool in tools:
-        if tool.name in _PATCH_TOOL_NAMES | _EXACT_TOOL_NAMES and tool.name not in keep_names:
+        if tool.name in _APPLY_PATCH_TOOL_NAMES | _EXACT_TOOL_NAMES and tool.name not in keep_names:
             continue
         filtered.append(tool)
     return filtered
@@ -342,6 +346,23 @@ def prepare_tool_exposure(
         visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
+    native_apply_patch_exposed = False
+    if (
+        use_responses_api
+        and contract.native_apply_patch
+        and any(tool.name == "apply_patch" for tool in visible_tools)
+    ):
+        tool_schemas = [
+            schema
+            for schema in tool_schemas
+            if not (
+                isinstance(schema.get("function"), dict)
+                and schema["function"].get("name") == "apply_patch"
+            )
+        ]
+        tool_schemas.append({"type": "apply_patch"})
+        native_apply_patch_exposed = True
+
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
     hidden_searchable_tool_ids = {
         stable_tool_id(tool)
@@ -374,6 +395,9 @@ def prepare_tool_exposure(
             "max_tools": max_tools,
             "edit_tool_family": str(edit_tool_family),
             "edit_tool_mode": str(edit_tool_mode),
+            "native_apply_patch_requested": contract.native_apply_patch,
+            "native_apply_patch_exposed": native_apply_patch_exposed,
+            "native_apply_patch_reason": contract.native_apply_patch_reason,
         },
     )
 

@@ -640,7 +640,7 @@ async def tool_execute(self, tool_call):
     return ToolResult(output="Tool not available on this executor.", is_error=True)
 ```
 
-Native tools include: `read`, `write`, `edit`, `patch`, `multiedit`,
+Native tools include: `read`, `write`, `edit`, `apply_patch`, `multiedit`,
 `list_directory`, `glob`, `grep`, `bash`, `web_fetch`. See
 [06-tool-system.md](06-tool-system.md) for full definitions.
 

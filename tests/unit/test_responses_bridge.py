@@ -256,6 +256,29 @@ def test_responses_to_chat_response_marks_incomplete_as_length() -> None:
     assert result["response_status"] == "incomplete"
 
 
+def test_responses_to_chat_response_normalizes_apply_patch_call() -> None:
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "apply_patch_call",
+                "id": "apc_1",
+                "call_id": "call_patch",
+                "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"},
+            }
+        ],
+    }
+
+    result = responses_to_chat_response(payload)
+
+    tool_call = result["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["id"] == "call_patch"
+    assert tool_call["function"]["name"] == "apply_patch"
+    assert tool_call["function"]["arguments"] == (
+        '{"operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\\n-x\\n+y\\n"}}'
+    )
+
+
 def test_messages_to_responses_input_drops_tool_messages_without_tool_call_id() -> None:
     result = messages_to_responses_input(
         [
@@ -265,6 +288,49 @@ def test_messages_to_responses_input_drops_tool_messages_without_tool_call_id() 
     )
 
     assert result == [{"role": "assistant", "content": ""}]
+
+
+def test_messages_to_responses_input_maps_native_apply_patch_roundtrip() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": (
+                            '{"operation":{"type":"update_file","path":"/tmp/a.txt","diff":"@@\\n-x\\n+y\\n"}}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "Updated /tmp/a.txt",
+            "_tool_name": "apply_patch",
+            "_tool_is_error": False,
+        },
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [
+        {
+            "type": "apply_patch_call",
+            "call_id": "call_patch",
+            "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"},
+        },
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_patch",
+            "status": "completed",
+            "output": "Updated /tmp/a.txt",
+        },
+    ]
 
 
 def test_responses_request_kwargs_ignores_unsupported_string_response_format() -> None:
@@ -286,6 +352,14 @@ def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None
     )
 
     assert result["reasoning"] == {"effort": "medium", "summary": "detailed"}
+
+
+def test_responses_request_kwargs_passes_through_native_apply_patch_tool() -> None:
+    result = responses_request_kwargs(
+        {"tools": [{"type": "apply_patch"}, {"type": "function", "function": {"name": "read"}}]}
+    )
+
+    assert result["tools"][0] == {"type": "apply_patch"}
 
 
 def test_responses_to_chat_response_prefers_input_output_usage_fields() -> None:
@@ -525,6 +599,36 @@ async def test_responses_stream_to_chat_chunks_emits_done_only_function_call() -
     assert calls[0].name == "step_complete"
     assert calls[0].call_id == "call_done"
     assert calls[0].arguments == {"summary": "done"}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_apply_patch_call() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "apply_patch_call",
+                "id": "apc_done",
+                "call_id": "call_patch",
+                "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"},
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "apply_patch"
+    assert calls[0].call_id == "call_patch"
+    assert calls[0].arguments == {
+        "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"}
+    }
 
 
 @pytest.mark.asyncio

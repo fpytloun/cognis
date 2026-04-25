@@ -1,4 +1,4 @@
-"""Executor-native filesystem tools: read, write, edit, patch, multiedit, list_directory."""
+"""Executor-native filesystem tools: read, write, edit, apply_patch, multiedit, list_directory."""
 
 from __future__ import annotations
 
@@ -597,14 +597,19 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
     return await _with_file_lock(context, path, _edit)
 
 
-async def handle_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-    """Apply a strict patch envelope or unified diff patch."""
-    patch_text = arguments.get("patch_text") or arguments.get("patchText") or ""
-    if not patch_text.strip():
-        return ToolResult(output="Empty patch text.", is_error=True)
+async def handle_apply_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    """Apply an apply_patch envelope, native operation, or unified diff patch."""
+    patch_text = arguments.get("patchText") or ""
+    operation = arguments.get("operation")
+    if not patch_text.strip() and not isinstance(operation, dict):
+        return ToolResult(output="Empty apply_patch payload.", is_error=True)
 
     try:
-        operations = _parse_patch_operations(patch_text, context)
+        operations = (
+            _parse_native_apply_patch_operation(operation, context)
+            if isinstance(operation, dict)
+            else _parse_patch_operations(patch_text, context)
+        )
     except (
         PatchFormatError,
         PatchConflictError,
@@ -850,6 +855,82 @@ def _read_text_file(path: Path) -> str:
         raise PatchConflictError(f"Patch only supports UTF-8 text files: {path}") from exc
 
 
+def _parse_native_apply_patch_operation(
+    operation: dict[str, Any], context: ToolExecutionContext
+) -> list[_PatchOperation]:
+    operation_type = str(operation.get("type") or "").strip()
+    raw_path = str(operation.get("path") or "").strip()
+    if not raw_path:
+        raise PatchFormatError("Native apply_patch operation requires a path.")
+    path = _canonicalize_path(_resolve_path(raw_path, context))
+
+    if operation_type == "delete_file":
+        return [_PatchOperation(kind="delete", source_path=path)]
+
+    if operation_type == "create_file":
+        diff = str(operation.get("diff") or "")
+        return [
+            _PatchOperation(
+                kind="add",
+                destination_path=path,
+                add_content=_native_apply_patch_create_content(diff),
+            )
+        ]
+
+    if operation_type == "update_file":
+        diff = str(operation.get("diff") or "")
+        if not diff.strip():
+            raise PatchFormatError("Native apply_patch update_file operation requires a diff.")
+        return [
+            _PatchOperation(
+                kind="update",
+                source_path=path,
+                destination_path=path,
+                hunks=_parse_native_apply_patch_hunks(diff),
+            )
+        ]
+
+    raise PatchFormatError(
+        "Unsupported native apply_patch operation type. Expected create_file, update_file, or delete_file."
+    )
+
+
+def _parse_native_apply_patch_hunks(diff: str) -> list[_PatchHunk]:
+    lines = diff.splitlines(keepends=True)
+    hunks: list[_PatchHunk] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].startswith("@@"):
+            raise PatchFormatError("Native apply_patch update_file diff must use @@ hunks.")
+        hunk, index = _parse_patch_envelope_hunk(lines, index)
+        hunks.append(hunk)
+    if not hunks:
+        raise PatchFormatError("Native apply_patch update_file diff did not contain a hunk.")
+    return hunks
+
+
+def _native_apply_patch_create_content(diff: str) -> str:
+    if not diff:
+        return ""
+    lines = diff.splitlines(keepends=True)
+    if lines and lines[0].startswith("@@"):
+        hunks = _parse_native_apply_patch_hunks(diff)
+        return "".join(hunk.new_text for hunk in hunks)
+    content_parts: list[str] = []
+    for line in lines:
+        stripped = _line_stripped(line)
+        if _is_no_newline_marker(stripped):
+            _strip_last_part_newline(content_parts)
+            continue
+        if line.startswith(("+", " ")):
+            content_parts.append(line[1:])
+        else:
+            raise PatchFormatError(
+                "Native apply_patch create_file diff must use @@ hunks or + lines."
+            )
+    return "".join(content_parts)
+
+
 def _parse_patch_operations(
     patch_text: str, context: ToolExecutionContext
 ) -> list[_PatchOperation]:
@@ -862,7 +943,7 @@ def _parse_patch_operations(
 def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
     lines = patch_text.splitlines(keepends=True)
     if not lines or _line_stripped(lines[0]) != "*** Begin Patch":
-        raise PatchFormatError("patch must start with `*** Begin Patch`.")
+        raise PatchFormatError("apply_patch must start with `*** Begin Patch`.")
 
     operations: list[_PatchOperation] = []
     index = 1
@@ -968,7 +1049,7 @@ def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> lis
 
         raise PatchFormatError(f"Unknown patch header: {stripped or '<blank>'}")
 
-    raise PatchFormatError("patch is missing `*** End Patch`.")
+    raise PatchFormatError("apply_patch is missing `*** End Patch`.")
 
 
 def _parse_patch_envelope_hunk(lines: list[str], start_index: int) -> tuple[_PatchHunk, int]:

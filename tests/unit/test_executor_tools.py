@@ -16,11 +16,11 @@ from cognis.tools.executor.definitions import (
     executor_tool_handlers,
 )
 from cognis.tools.executor.filesystem import (
+    handle_apply_patch,
     handle_artifact_save,
     handle_edit,
     handle_list_directory,
     handle_multiedit,
-    handle_patch,
     handle_read,
     handle_write,
 )
@@ -59,12 +59,13 @@ class TestDefinitions:
         # includes browser and document tools.
         assert len(defs) >= 11
         names = {d.name for d in defs}
+        assert "patch" not in names
         assert {
             "read",
             "write",
             "artifact_save",
             "edit",
-            "patch",
+            "apply_patch",
             "multiedit",
             "list_directory",
             "lsp",
@@ -82,11 +83,12 @@ class TestDefinitions:
     def test_handlers_match_definitions(self) -> None:
         handlers = executor_tool_handlers()
         defs = executor_tool_definitions()
+        assert "patch" not in handlers
         for d in defs:
             assert d.name in handlers, f"Missing handler for {d.name}"
 
     def test_write_tools_are_non_bypassable(self) -> None:
-        write_tools = {"write", "artifact_save", "edit", "patch", "multiedit", "bash"}
+        write_tools = {"write", "artifact_save", "edit", "apply_patch", "multiedit", "bash"}
         for tool in ALL_EXECUTOR_TOOLS:
             if tool.name in write_tools:
                 assert tool.non_bypassable, f"{tool.name} should be non_bypassable"
@@ -505,19 +507,19 @@ class TestMultieditTool:
         assert "Use the read tool first" in result.output
 
 
-class TestPatchTool:
-    """Test the patch filesystem tool."""
+class TestApplyPatchTool:
+    """Test the apply_patch filesystem tool."""
 
     @pytest.mark.asyncio()
-    async def test_patch_apply_patch_update_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_apply_patch_update_success(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
                 )
             },
@@ -530,13 +532,13 @@ class TestPatchTool:
         assert result.metadata["file_diffs"][0]["diff"]
 
     @pytest.mark.asyncio()
-    async def test_patch_accepts_patch_text_camel_case_alias(self, tmp_path: Path) -> None:
+    async def test_apply_patch_accepts_patch_text(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
                 "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
@@ -549,12 +551,31 @@ class TestPatchTool:
         assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_add_file_success(self, tmp_path: Path) -> None:
-        target = tmp_path / "new.txt"
+    async def test_apply_patch_rejects_legacy_patch_text_key(self, tmp_path: Path) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
                 "patch_text": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "Empty apply_patch payload" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_add_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "new.txt"
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
                     f"*** Begin Patch\n*** Add File: {target}\n+hello\n+world\n*** End Patch\n"
                 )
             },
@@ -565,11 +586,11 @@ class TestPatchTool:
         assert target.read_text() == "hello\nworld\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_add_empty_file_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_add_empty_file_success(self, tmp_path: Path) -> None:
         target = tmp_path / "empty.txt"
 
-        result = await handle_patch(
-            {"patch_text": f"*** Begin Patch\n*** Add File: {target}\n*** End Patch\n"},
+        result = await handle_apply_patch(
+            {"patchText": f"*** Begin Patch\n*** Add File: {target}\n*** End Patch\n"},
             _context(),
         )
 
@@ -577,12 +598,12 @@ class TestPatchTool:
         assert target.read_text() == ""
 
     @pytest.mark.asyncio()
-    async def test_patch_add_file_creates_parent_directories(self, tmp_path: Path) -> None:
+    async def test_apply_patch_add_file_creates_parent_directories(self, tmp_path: Path) -> None:
         target = tmp_path / "nested" / "new.txt"
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** End Patch\n"
                 )
             },
@@ -593,12 +614,12 @@ class TestPatchTool:
         assert target.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_add_file_fails_if_exists(self, tmp_path: Path) -> None:
+    async def test_apply_patch_add_file_fails_if_exists(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
 
-        result = await handle_patch(
-            {"patch_text": f"*** Begin Patch\n*** Add File: {target}\n+hi\n*** End Patch\n"},
+        result = await handle_apply_patch(
+            {"patchText": f"*** Begin Patch\n*** Add File: {target}\n+hi\n*** End Patch\n"},
             _context(),
         )
 
@@ -606,7 +627,7 @@ class TestPatchTool:
         assert "already exists" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_formats_updated_file(
+    async def test_apply_patch_formats_updated_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         target = tmp_path / "format_patch.py"
@@ -621,9 +642,9 @@ class TestPatchTool:
 
         monkeypatch.setattr(filesystem_module, "_maybe_format_file", fake_format)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-x=1\n+x=2\n*** End Patch\n"
                 )
             },
@@ -634,14 +655,14 @@ class TestPatchTool:
         assert calls == [target]
 
     @pytest.mark.asyncio()
-    async def test_patch_delete_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_delete_success(self, tmp_path: Path) -> None:
         target = tmp_path / "delete.txt"
         target.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
-            {"patch_text": f"*** Begin Patch\n*** Delete File: {target}\n*** End Patch\n"},
+        result = await handle_apply_patch(
+            {"patchText": f"*** Begin Patch\n*** Delete File: {target}\n*** End Patch\n"},
             context,
         )
 
@@ -649,16 +670,70 @@ class TestPatchTool:
         assert not target.exists()
 
     @pytest.mark.asyncio()
-    async def test_patch_move_rename_only_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_native_update_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "native.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "operation": {
+                    "type": "update_file",
+                    "path": str(target),
+                    "diff": "@@\n-hello\n+hi\n",
+                }
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_native_create_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "native-new.txt"
+
+        result = await handle_apply_patch(
+            {
+                "operation": {
+                    "type": "create_file",
+                    "path": str(target),
+                    "diff": "@@\n+hello\n+world\n",
+                }
+            },
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hello\nworld\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_native_delete_file_success(self, tmp_path: Path) -> None:
+        target = tmp_path / "native-delete.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {"operation": {"type": "delete_file", "path": str(target)}},
+            context,
+        )
+
+        assert not result.is_error
+        assert not target.exists()
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_move_rename_only_success(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         dest = tmp_path / "new.txt"
         source.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(source)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
                 )
             },
@@ -670,16 +745,16 @@ class TestPatchTool:
         assert dest.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_move_with_content_edit_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_move_with_content_edit_success(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         dest = tmp_path / "new.txt"
         source.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(source)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n@@\n-hello\n+hi\n*** End Patch\n"
                 )
             },
@@ -691,16 +766,16 @@ class TestPatchTool:
         assert dest.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_move_creates_parent_directories(self, tmp_path: Path) -> None:
+    async def test_apply_patch_move_creates_parent_directories(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         dest = tmp_path / "nested" / "new.txt"
         source.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(source)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
                 )
             },
@@ -712,7 +787,7 @@ class TestPatchTool:
         assert dest.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_move_fails_if_destination_exists(self, tmp_path: Path) -> None:
+    async def test_apply_patch_move_fails_if_destination_exists(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         dest = tmp_path / "new.txt"
         source.write_text("hello\n")
@@ -720,9 +795,9 @@ class TestPatchTool:
         context = _context()
         await handle_read({"file_path": str(source)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {source}\n*** Move to: {dest}\n*** End Patch\n"
                 )
             },
@@ -733,13 +808,13 @@ class TestPatchTool:
         assert "destination already exists" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_requires_prior_read(self, tmp_path: Path) -> None:
+    async def test_apply_patch_requires_prior_read(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                "patchText": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
             },
             _context(),
         )
@@ -748,15 +823,15 @@ class TestPatchTool:
         assert "Use the read tool first" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_ambiguous_hunk_fails(self, tmp_path: Path) -> None:
+    async def test_apply_patch_ambiguous_hunk_fails(self, tmp_path: Path) -> None:
         target = tmp_path / "ambiguous.txt"
         target.write_text("hello\nhello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                "patchText": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
             },
             context,
         )
@@ -765,12 +840,12 @@ class TestPatchTool:
         assert "multiple locations" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_no_write_on_prevalidation_failure(self, tmp_path: Path) -> None:
+    async def test_apply_patch_no_write_on_prevalidation_failure(self, tmp_path: Path) -> None:
         target = tmp_path / "new.txt"
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** Delete File: {tmp_path / 'missing.txt'}\n*** End Patch\n"
                 )
             },
@@ -781,7 +856,7 @@ class TestPatchTool:
         assert not target.exists()
 
     @pytest.mark.asyncio()
-    async def test_patch_detects_phase_b_race(
+    async def test_apply_patch_detects_phase_b_race(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         target = tmp_path / "race.txt"
@@ -801,9 +876,9 @@ class TestPatchTool:
 
         monkeypatch.setattr(filesystem_module, "_stage_patch_operations", _wrapped_stage)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                "patchText": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
             },
             context,
         )
@@ -813,14 +888,14 @@ class TestPatchTool:
         assert target.read_text() == "changed\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_unified_diff_regression_success(self, tmp_path: Path) -> None:
+    async def test_apply_patch_unified_diff_regression_success(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
-            {"patch_text": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n"},
+        result = await handle_apply_patch(
+            {"patchText": f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n"},
             context,
         )
 
@@ -828,14 +903,14 @@ class TestPatchTool:
         assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_unified_diff_uses_hunk_location(self, tmp_path: Path) -> None:
+    async def test_apply_patch_unified_diff_uses_hunk_location(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\nkeep\nhello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
-            {"patch_text": (f"--- a/{target}\n+++ b/{target}\n@@ -3 +3 @@\n-hello\n+hi\n")},
+        result = await handle_apply_patch(
+            {"patchText": (f"--- a/{target}\n+++ b/{target}\n@@ -3 +3 @@\n-hello\n+hi\n")},
             context,
         )
 
@@ -843,7 +918,7 @@ class TestPatchTool:
         assert target.read_text() == "hello\nkeep\nhi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_reports_read_failure_during_prevalidation(
+    async def test_apply_patch_reports_read_failure_during_prevalidation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         target = tmp_path / "test.txt"
@@ -856,9 +931,9 @@ class TestPatchTool:
 
         monkeypatch.setattr(filesystem_module, "_read_text_file", _broken_read)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                "patchText": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
             },
             context,
         )
@@ -867,15 +942,15 @@ class TestPatchTool:
         assert "denied" in result.output
 
     @pytest.mark.asyncio()
-    async def test_patch_accepts_end_of_file_marker(self, tmp_path: Path) -> None:
+    async def test_apply_patch_accepts_end_of_file_marker(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End of File\n*** End Patch\n"
                 )
             },
@@ -886,15 +961,15 @@ class TestPatchTool:
         assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_accepts_no_newline_marker(self, tmp_path: Path) -> None:
+    async def test_apply_patch_accepts_no_newline_marker(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n\\ No newline at end of file\n*** End Patch\n"
                 )
             },
@@ -905,15 +980,15 @@ class TestPatchTool:
         assert target.read_text() == "hi"
 
     @pytest.mark.asyncio()
-    async def test_patch_no_newline_marker_can_add_final_newline(self, tmp_path: Path) -> None:
+    async def test_apply_patch_no_newline_marker_can_add_final_newline(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n\\ No newline at end of file\n+hello\n*** End Patch\n"
                 )
             },
@@ -924,15 +999,15 @@ class TestPatchTool:
         assert target.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_patch_unified_diff_accepts_no_newline_marker(self, tmp_path: Path) -> None:
+    async def test_apply_patch_unified_diff_accepts_no_newline_marker(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello")
         context = _context()
         await handle_read({"file_path": str(target)}, context)
 
-        result = await handle_patch(
+        result = await handle_apply_patch(
             {
-                "patch_text": (
+                "patchText": (
                     f"--- a/{target}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n\\ No newline at end of file\n+hi\n\\ No newline at end of file\n"
                 )
             },
@@ -943,15 +1018,15 @@ class TestPatchTool:
         assert target.read_text() == "hi"
 
     @pytest.mark.asyncio()
-    async def test_patch_rejects_unified_diff_rename_headers(self, tmp_path: Path) -> None:
+    async def test_apply_patch_rejects_unified_diff_rename_headers(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         target = tmp_path / "new.txt"
         source.write_text("hello\n")
         context = _context()
         await handle_read({"file_path": str(source)}, context)
 
-        result = await handle_patch(
-            {"patch_text": (f"--- a/{source}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n")},
+        result = await handle_apply_patch(
+            {"patchText": (f"--- a/{source}\n+++ b/{target}\n@@ -1 +1 @@\n-hello\n+hi\n")},
             context,
         )
 
@@ -1200,7 +1275,7 @@ class TestBashTool:
         )
 
         assert result.is_error
-        assert "Use edit, multiedit, patch, or write" in result.output
+        assert "Use edit, multiedit, apply_patch, or write" in result.output
 
     @pytest.mark.asyncio()
     async def test_bash_allows_python_read_only_one_liner(self) -> None:

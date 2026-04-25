@@ -34,11 +34,11 @@ from cognis.tools.executor.document import (
     handle_document_generate,
 )
 from cognis.tools.executor.filesystem import (
+    handle_apply_patch,
     handle_artifact_save,
     handle_edit,
     handle_list_directory,
     handle_multiedit,
-    handle_patch,
     handle_read,
     handle_write,
 )
@@ -162,21 +162,34 @@ EDIT_TOOL = ToolDefinition(
     timeout_seconds=30,
 )
 
-PATCH_TOOL = ToolDefinition(
-    name="patch",
+APPLY_PATCH_TOOL = ToolDefinition(
+    name="apply_patch",
     description=(
-        "Apply a strict patch to one or more text files. Supports the "
-        "patch envelope and the supported unified diff update subset."
+        "Apply a strict patch to one or more text files using the apply_patch "
+        "envelope, native operation object, or supported unified diff update subset."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "patch_text": {
+            "patchText": {
                 "type": "string",
-                "description": "Patch text in strict envelope syntax or the supported unified diff update subset",
+                "description": "Patch text in apply_patch envelope syntax or the supported unified diff update subset",
+            },
+            "operation": {
+                "type": "object",
+                "description": "Native apply_patch operation with type, path, and optional diff. Used by OpenAI Responses native apply_patch calls.",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["create_file", "update_file", "delete_file"],
+                    },
+                    "path": {"type": "string"},
+                    "diff": {"type": "string"},
+                },
+                "required": ["type", "path"],
             },
         },
-        "required": ["patch_text"],
+        "anyOf": [{"required": ["patchText"]}, {"required": ["operation"]}],
     },
     source=_EXECUTOR_SOURCE,
     category="filesystem",
@@ -628,7 +641,7 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     WRITE_TOOL,
     ARTIFACT_SAVE_TOOL,
     EDIT_TOOL,
-    PATCH_TOOL,
+    APPLY_PATCH_TOOL,
     MULTIEDIT_TOOL,
     LIST_DIRECTORY_TOOL,
     LSP_TOOL,
@@ -650,7 +663,7 @@ _HANDLER_MAP: dict[
     "write": handle_write,
     "artifact_save": handle_artifact_save,
     "edit": handle_edit,
-    "patch": handle_patch,
+    "apply_patch": handle_apply_patch,
     "multiedit": handle_multiedit,
     "list_directory": handle_list_directory,
     "lsp": handle_lsp,

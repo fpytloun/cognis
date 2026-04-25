@@ -829,6 +829,122 @@ async def test_litellm_provider_does_not_infer_tool_search_for_gpt5_mini(
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_does_not_infer_native_apply_patch_for_compatible_proxy(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="compatible",
+                display_name="Compatible",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai_compatible",
+                    "default_model": "gpt-5.1-codex",
+                    "models": [
+                        {"model_id": "gpt-5.1-codex", "supports_responses_api": True}
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.1-codex", provider_id="compatible")
+
+    assert model_info.supports_responses_api is True
+    assert model_info.supports_openai_apply_patch is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_resolves_native_apply_patch_toggle(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "use_native_apply_patch": False,
+                    "models": [
+                        {
+                            "model_id": "gpt-5.1-codex",
+                            "supports_responses_api": True,
+                            "supports_openai_apply_patch": True,
+                            "use_native_apply_patch": True,
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.1-codex", provider_id="openai")
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="gpt-5.1-codex",
+        model_info=model_info,
+        provider_id="openai",
+        allow_tool_search=False,
+    )
+
+    assert model_info.supports_openai_apply_patch is True
+    assert contract.native_apply_patch is True
+    assert contract.native_apply_patch_reason == "enabled_by_config"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_does_not_force_native_apply_patch_without_capability(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "use_native_apply_patch": True,
+                    "models": [
+                        {
+                            "model_id": "gpt-5.1-codex",
+                            "supports_responses_api": True,
+                            "supports_openai_apply_patch": False,
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.1-codex", provider_id="openai")
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="gpt-5.1-codex",
+        model_info=model_info,
+        provider_id="openai",
+        allow_tool_search=False,
+    )
+
+    assert contract.native_apply_patch is False
+    assert contract.native_apply_patch_reason == "model_capability_missing"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_applies_gpt5_metadata_floor_when_lookup_fails(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,

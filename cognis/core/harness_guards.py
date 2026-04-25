@@ -258,7 +258,7 @@ def check_argument_sanity(
             )
 
     # Filesystem write/edit tools must not target special device files.
-    if tool_name in {"write", "edit", "multiedit", "patch"}:
+    if tool_name in {"write", "edit", "multiedit", "apply_patch"}:
         file_path = _as_str(arguments.get("file_path")).strip()
         if file_path in _DISALLOWED_FILE_PATHS:
             return ArgumentSanityViolation(
@@ -269,8 +269,20 @@ def check_argument_sanity(
                     "call this tool if no file change is required."
                 ),
             )
-        if tool_name == "patch":
-            patch_text = _as_str(arguments.get("patch_text") or arguments.get("patchText"))
+        if tool_name == "apply_patch":
+            operation = arguments.get("operation")
+            if isinstance(operation, dict):
+                target = _as_str(operation.get("path")).strip()
+                if target in _DISALLOWED_FILE_PATHS:
+                    return ArgumentSanityViolation(
+                        reason="invalid_file_path",
+                        message=(
+                            f"{tool_name} cannot target special device file "
+                            f"{target!r}. Supply an actual file path, or do not "
+                            "call this tool if no file change is required."
+                        ),
+                    )
+            patch_text = _as_str(arguments.get("patchText"))
             for line in patch_text.splitlines():
                 for prefix in (
                     "*** Add File: ",

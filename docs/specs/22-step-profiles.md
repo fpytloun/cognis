@@ -18,7 +18,7 @@ Related specs: [`06-tool-system.md`](06-tool-system.md), [`14-workflow-engine.md
 Profiles are **a focus hint, not a security boundary**. Cognis already has security primitives: non-bypassable guardrails, user-scoped executors, and the Intaris evaluate path. Profiles address a different problem — reducing cognitive load on the model for specialized workflows where a tighter surface measurably improves behavior.
 
 Coding workflows made this concrete: a research-only explanation step had
-`edit`, `multiedit`, and `patch` available, so the model spent tokens exploring
+`edit`, `multiedit`, and `apply_patch` available, so the model spent tokens exploring
 write paths it never needed. Narrowing the surface is the structural fix.
 
 Two constraints shape the design:

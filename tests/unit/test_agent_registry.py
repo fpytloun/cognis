@@ -24,7 +24,7 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
         "write",
         "edit",
         "multiedit",
-        "patch",
+        "apply_patch",
         "grep",
         "glob",
         "list",

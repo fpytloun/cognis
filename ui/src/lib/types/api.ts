@@ -1011,6 +1011,7 @@ export interface ModelEntry {
   supports_defer_loading: boolean;
   supports_openai_namespace_tools: boolean;
   supports_openai_allowed_tools: boolean;
+  supports_openai_apply_patch: boolean;
   supports_responses_api: boolean;
   supports_extended_thinking: boolean;
   supports_image_generation: boolean;
@@ -1039,6 +1040,7 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_defer_loading: false,
     supports_openai_namespace_tools: false,
     supports_openai_allowed_tools: false,
+    supports_openai_apply_patch: false,
     supports_responses_api: false,
     supports_extended_thinking: false,
     supports_image_generation: false,

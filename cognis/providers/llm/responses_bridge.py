@@ -127,6 +127,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
     """Translate canonical Cognis/OpenAI-chat messages into Responses input."""
 
     items: list[dict[str, Any]] = []
+    native_apply_patch_call_ids: set[str] = set()
     for index, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
@@ -144,14 +145,30 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 items.append({"role": "assistant", "content": normalized_content})
             for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
                 function = tool_call.get("function") or {}
+                call_id = normalize_tool_call_id(
+                    tool_call.get("id"), tool_call.get("id"), f"{index}:{tool_index}"
+                )
+                function_name = str(function.get("name", "unknown_tool"))
+                arguments = str(function.get("arguments", "{}"))
+                native_operation = _extract_native_apply_patch_operation(
+                    function_name, arguments
+                )
+                if native_operation is not None:
+                    native_apply_patch_call_ids.add(call_id)
+                    items.append(
+                        {
+                            "type": "apply_patch_call",
+                            "call_id": call_id,
+                            "operation": native_operation,
+                        }
+                    )
+                    continue
                 items.append(
                     {
                         "type": "function_call",
-                        "call_id": normalize_tool_call_id(
-                            tool_call.get("id"), tool_call.get("id"), f"{index}:{tool_index}"
-                        ),
-                        "name": str(function.get("name", "unknown_tool")),
-                        "arguments": str(function.get("arguments", "{}")),
+                        "call_id": call_id,
+                        "name": function_name,
+                        "arguments": arguments,
                     }
                 )
             continue
@@ -163,16 +180,41 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                     extra={"extra_data": {"message_index": index}},
                 )
                 continue
-            items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": normalize_tool_call_id(call_id, call_id, str(index)),
-                    "output": content if isinstance(content, str) else json.dumps(content),
-                }
-            )
+            normalized_call_id = normalize_tool_call_id(call_id, call_id, str(index))
+            output = content if isinstance(content, str) else json.dumps(content)
+            if normalized_call_id in native_apply_patch_call_ids:
+                items.append(
+                    {
+                        "type": "apply_patch_call_output",
+                        "call_id": normalized_call_id,
+                        "status": "failed" if bool(message.get("_tool_is_error")) else "completed",
+                        "output": output,
+                    }
+                )
+            else:
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": normalized_call_id,
+                        "output": output,
+                    }
+                )
             continue
         items.append({"role": role, "content": _normalize_message_content(content)})
     return items
+
+
+def _extract_native_apply_patch_operation(function_name: str, arguments: str) -> dict[str, Any] | None:
+    if function_name != "apply_patch":
+        return None
+    try:
+        parsed = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    operation = parsed.get("operation")
+    return operation if isinstance(operation, dict) else None
 
 
 def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -191,10 +233,7 @@ def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
     if "max_completion_tokens" in filtered and "max_output_tokens" not in filtered:
         filtered["max_output_tokens"] = filtered.pop("max_completion_tokens")
     reasoning = filtered.get("reasoning")
-    if isinstance(reasoning, dict):
-        normalized_reasoning = dict(reasoning)
-    else:
-        normalized_reasoning = {}
+    normalized_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
     if isinstance(reasoning_effort, str) and reasoning_effort.strip():
         normalized_reasoning["effort"] = reasoning_effort.strip()
     if normalized_reasoning and "summary" not in normalized_reasoning:
@@ -221,6 +260,23 @@ def normalize_tool_call_id(
         return item_id
     suffix = hashlib.sha1(str(fallback_seed).encode()).hexdigest()[:10]
     return f"resp_call_{suffix}"
+
+
+def _is_responses_tool_call_item(item: dict[str, Any]) -> bool:
+    return str(item.get("type")) in {"function_call", "apply_patch_call"}
+
+
+def _tool_call_item_name(item: dict[str, Any]) -> str:
+    if str(item.get("type")) == "apply_patch_call":
+        return "apply_patch"
+    return str(item.get("name") or "unknown_tool")
+
+
+def _tool_call_item_arguments(item: dict[str, Any]) -> str:
+    if str(item.get("type")) == "apply_patch_call":
+        operation = item.get("operation")
+        return json.dumps({"operation": operation if isinstance(operation, dict) else {}})
+    return str(item.get("arguments") or "")
 
 
 def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -478,9 +534,10 @@ class _ResponsesStreamState:
             return None, False
         existing = self._resolve_item_state(item_key, *aliases)
         if existing is not None:
-            if item.get("name"):
-                existing["name"] = str(item.get("name") or existing["name"])
-            initial_arguments = str(item.get("arguments") or "")
+            item_name = _tool_call_item_name(item)
+            if item_name != "unknown_tool":
+                existing["name"] = item_name
+            initial_arguments = _tool_call_item_arguments(item)
             if initial_arguments:
                 merge_result = merge_incremental_json_fragment(
                     str(existing.get("arguments") or ""),
@@ -496,9 +553,9 @@ class _ResponsesStreamState:
         state = {
             "state_key": item_key,
             "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_key),
-            "name": str(item.get("name") or "unknown_tool"),
+            "name": _tool_call_item_name(item),
             "name_emitted": False,
-            "arguments": str(item.get("arguments") or ""),
+            "arguments": _tool_call_item_arguments(item),
             "emitted": 0,
             "index": index,
         }
@@ -584,7 +641,7 @@ class _ResponsesStreamState:
         return {"choices": [{"delta": {field: text}}]}
 
     def initial_tool_delta(self, item: dict[str, Any], *, emit_name: bool) -> dict[str, Any] | None:
-        if str(item.get("type")) != "function_call":
+        if not _is_responses_tool_call_item(item):
             return None
         item_key, aliases = self._item_identity(item)
         state = self._resolve_item_state(item_key, *aliases)
@@ -650,13 +707,13 @@ class _ResponsesStreamState:
         }
 
     def finalize_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
-        if str(item.get("type")) != "function_call":
+        if not _is_responses_tool_call_item(item):
             return None
         item_key, aliases = self._item_identity(item)
         state = self._resolve_item_state(item_key, *aliases)
         if state is None:
             return None
-        final_arguments = str(item.get("arguments") or "")
+        final_arguments = _tool_call_item_arguments(item)
         merge_result = merge_incremental_json_fragment(
             str(state.get("arguments") or ""),
             final_arguments,
@@ -751,14 +808,14 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
             if refusal_text:
                 refusal_parts.append(refusal_text)
             continue
-        if item_type == "function_call":
+        if item_type in {"function_call", "apply_patch_call"}:
             envelope.tool_calls.append(
                 {
                     "id": normalize_tool_call_id(item.get("call_id"), item.get("id"), index),
                     "type": "function",
                     "function": {
-                        "name": str(item.get("name") or "unknown_tool"),
-                        "arguments": str(item.get("arguments") or "{}"),
+                        "name": _tool_call_item_name(item),
+                        "arguments": _tool_call_item_arguments(item) or "{}",
                     },
                 }
             )
@@ -1030,6 +1087,8 @@ def _normalize_event_type(event_type: str) -> str:
 
 def _tool_to_responses_tool(tool: Any) -> dict[str, Any]:
     if isinstance(tool, dict):
+        if tool.get("type") == "apply_patch":
+            return {"type": "apply_patch"}
         function = tool.get("function") if isinstance(tool.get("function"), dict) else None
         if function is not None:
             converted = {
