@@ -9,6 +9,41 @@ marked.setOptions({
 const forbiddenAttributes = ['onerror', 'onclick', 'onload', 'onmouseover'];
 const forbiddenTags = ['iframe', 'script', 'style'];
 
+function isOutgoingHref(href: string | null | undefined): boolean {
+  if (!href) return false;
+  const trimmed = href.trim().toLowerCase();
+  return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('mailto:');
+}
+
+function markOutgoingLinks(html: string): string {
+  return html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ');
+}
+
+function applyOutgoingLinkTargets(html: string): string {
+  if (typeof document === 'undefined') return html;
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  template.content.querySelectorAll('a[href]').forEach((link) => {
+    if (isOutgoingHref(link.getAttribute('href'))) {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+  return template.innerHTML;
+}
+
+function createLinkRenderer(): Renderer {
+  const renderer = new Renderer();
+  const baseLink = renderer.link.bind(renderer);
+
+  renderer.link = (token) => {
+    const html = baseLink(token);
+    return isOutgoingHref(token.href) && typeof html === 'string' ? markOutgoingLinks(html) : html;
+  };
+
+  return renderer;
+}
+
 export function sanitizeHtml(html: string): string {
   return DOMPurify.sanitize(html, {
     FORBID_ATTR: forbiddenAttributes,
@@ -18,12 +53,12 @@ export function sanitizeHtml(html: string): string {
 }
 
 export function renderMarkdown(markdown: string): string {
-  const parsed = marked.parse(markdown, { async: false });
-  return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  const parsed = marked.parse(markdown, { async: false, renderer: createLinkRenderer() });
+  return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
 }
 
 function createDocsRenderer(): Renderer {
-  const renderer = new Renderer();
+  const renderer = createLinkRenderer();
   const baseCode = renderer.code.bind(renderer);
   const baseTable = renderer.table.bind(renderer);
 
@@ -38,7 +73,7 @@ export function renderDocsMarkdown(markdown: string): string {
     async: false,
     renderer: createDocsRenderer()
   });
-  return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
 }
 
 /**
@@ -109,8 +144,8 @@ export function createMarkdownStreamer(): MarkdownStreamer {
   }
 
   function parseSanitize(chunk: string): string {
-    const parsed = marked.parse(chunk, { async: false });
-    return sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+    const parsed = marked.parse(chunk, { async: false, renderer: createLinkRenderer() });
+    return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
   }
 
   function render(content: string): string {

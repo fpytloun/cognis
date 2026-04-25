@@ -62,6 +62,7 @@ import X from 'lucide-svelte/icons/x';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
+  import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
   import {
     annotateStepRequestInputWithNotification,
@@ -189,6 +190,7 @@ import X from 'lucide-svelte/icons/x';
   let selectedChannel = $state('all');
   let chatSidebarCollapsed = $state(false);
   interface SessionInfoData {
+    intaris_session_id: string;
     intention: string | null;
     status: string;
     total_calls: number;
@@ -1087,6 +1089,7 @@ import X from 'lucide-svelte/icons/x';
     try {
       const detail = await api.sessions.intarisDetail(sid);
       sessionInfo = {
+        intaris_session_id: detail.intaris_session_id,
         intention: detail.intention,
         status: detail.status,
         total_calls: detail.total_calls,
@@ -1107,6 +1110,7 @@ import X from 'lucide-svelte/icons/x';
     try {
       const detail = await api.sessions.intarisDetail(subSessionId);
       subSessionInfo = {
+        intaris_session_id: detail.intaris_session_id,
         intention: detail.intention,
         status: detail.status,
         total_calls: detail.total_calls,
@@ -1641,6 +1645,22 @@ import X from 'lucide-svelte/icons/x';
       setTimeout(() => { sessionIdCopied = false; }, 2000);
     } catch {
       addToast('Failed to copy session ID', 'error');
+    }
+  }
+
+  async function openIntarisSession(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    try {
+      const exchange = await api.auth.exchangeToken('intaris');
+      openUrlInNewTab(
+        buildLinkedServiceUrl('intaris', {
+          token: exchange.token,
+          tab: 'sessions',
+          session_id: sessionId
+        })
+      );
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to open Intaris');
     }
   }
 
@@ -2988,12 +3008,15 @@ import X from 'lucide-svelte/icons/x';
                 {/if}
               </div>
             {/if}
-            <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
-              <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
-              <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
-              <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
-              <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
-              <span class="text-sky-400">{sessionInfo.escalated_count} escalated</span>
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
+                <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
+                <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
+                <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
+                <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
+                <span class="text-sky-400">{sessionInfo.escalated_count} escalated</span>
+              </div>
+              <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(sessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
             </div>
           {:else}
             <p class="text-xs text-slate-500">Unable to load session details.</p>
@@ -3467,12 +3490,15 @@ import X from 'lucide-svelte/icons/x';
                     {/if}
                   </div>
                 {/if}
-                <div class="flex flex-wrap gap-3 text-xs text-slate-400">
-                  <span>Status: <span class="text-slate-200">{subSessionInfo.status}</span></span>
-                  <span>Calls: <span class="text-slate-200">{subSessionInfo.total_calls}</span></span>
-                  <span class="text-emerald-400">{subSessionInfo.approved_count} approved</span>
-                  <span class="text-rose-400">{subSessionInfo.denied_count} denied</span>
-                  <span class="text-sky-400">{subSessionInfo.escalated_count} escalated</span>
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="flex flex-wrap gap-3 text-xs text-slate-400">
+                    <span>Status: <span class="text-slate-200">{subSessionInfo.status}</span></span>
+                    <span>Calls: <span class="text-slate-200">{subSessionInfo.total_calls}</span></span>
+                    <span class="text-emerald-400">{subSessionInfo.approved_count} approved</span>
+                    <span class="text-rose-400">{subSessionInfo.denied_count} denied</span>
+                    <span class="text-sky-400">{subSessionInfo.escalated_count} escalated</span>
+                  </div>
+                  <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(subSessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
                 </div>
               {:else}
                 <p class="text-xs text-slate-500">Unable to load session details.</p>

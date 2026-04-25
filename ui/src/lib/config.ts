@@ -1,5 +1,7 @@
 const publicEnv = import.meta.env as Record<string, string | undefined>;
 
+export type LinkedServiceTarget = 'intaris' | 'mnemory';
+
 function browserOrigin(): string | null {
   return typeof window === 'undefined' ? null : window.location.origin;
 }
@@ -60,4 +62,23 @@ export function getIntarisUiUrl(): string {
 
 export function getMnemoryUiUrl(): string {
   return trimTrailingSlash(publicEnv.PUBLIC_MNEMORY_UI_URL || deriveLocalServiceUrl(8050) || '/mnemory');
+}
+
+export function getLinkedServiceUiUrl(target: LinkedServiceTarget): string {
+  return target === 'intaris' ? getIntarisUiUrl() : getMnemoryUiUrl();
+}
+
+export function buildLinkedServiceUrl(target: LinkedServiceTarget, params: Record<string, string>): string {
+  const baseUrl = getLinkedServiceUiUrl(target);
+  const url = new URL(baseUrl, browserOrigin() ?? 'http://localhost:5173');
+  for (const [key, value] of Object.entries(params)) {
+    if (value) {
+      url.searchParams.set(key, value);
+    }
+  }
+  return url.toString();
+}
+
+export function openUrlInNewTab(url: string): void {
+  window.open(url, '_blank', 'noopener,noreferrer');
 }

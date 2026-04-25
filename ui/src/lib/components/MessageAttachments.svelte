@@ -96,7 +96,7 @@
             <a
               href={attachment.url}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               class="block truncate text-sm font-medium text-slate-100 hover:text-sky-300"
             >
               {attachment.filename}
@@ -113,7 +113,7 @@
             href={attachment.url}
             download={attachment.filename}
             target="_blank"
-            rel="noreferrer"
+            rel="noopener noreferrer"
             aria-label={`Download ${attachment.filename}`}
             class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
           >

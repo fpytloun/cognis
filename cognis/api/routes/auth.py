@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from starlette.responses import JSONResponse, Response
@@ -373,7 +374,9 @@ async def api_key_delete(request: Request, key_id: str) -> dict[str, bool]:
 
 
 @router.post("/api/v1/auth/exchange-token", response_model=ExchangeTokenResponse)
-async def exchange_token(request: Request, target: str = "intaris") -> ExchangeTokenResponse:
+async def exchange_token(
+    request: Request, target: Literal["intaris", "mnemory"] = "intaris"
+) -> ExchangeTokenResponse:
     user = request.state.user
     token = request.app.state.auth_provider.sign_exchange_token(user.email, target)
     return ExchangeTokenResponse(token=token, target=target, expires_in=60)

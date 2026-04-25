@@ -19,7 +19,7 @@ import { onMount, tick } from 'svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
-  import { getIntarisUiUrl, getMnemoryUiUrl } from '$lib/config';
+  import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
   import { onTabReset } from '$lib/stores/tabReset';
@@ -1399,10 +1399,7 @@ import { onMount, tick } from 'svelte';
   async function openTargetUi(target: 'intaris' | 'mnemory'): Promise<void> {
     try {
       const exchange = await api.auth.exchangeToken(target);
-      const baseUrl = target === 'intaris' ? getIntarisUiUrl() : getMnemoryUiUrl();
-      const url = new URL(baseUrl, window.location.origin);
-      url.searchParams.set('token', exchange.token);
-      window.open(url.toString(), '_blank', 'noopener,noreferrer');
+      openUrlInNewTab(buildLinkedServiceUrl(target, { token: exchange.token }));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to open linked UI');

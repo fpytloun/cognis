@@ -313,7 +313,7 @@
         href={active.src}
         download={active.filename ?? ''}
         target="_blank"
-        rel="noreferrer"
+        rel="noopener noreferrer"
         class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-800/80 text-slate-100 transition hover:bg-slate-700"
       >
         <Download class="h-5 w-5" />

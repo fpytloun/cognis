@@ -20,6 +20,15 @@ describe('renderMarkdown', () => {
     expect(html).not.toContain('javascript:');
   });
 
+  it('opens outgoing markdown links in a new tab', () => {
+    const html = renderMarkdown('[Open](https://example.com) and [local](/settings)');
+
+    expect(html).toContain('href="https://example.com"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+    expect(html).toContain('href="/settings"');
+  });
+
   it('wraps docs tables and code blocks in local overflow containers', () => {
     const html = renderDocsMarkdown([
       '```bash',

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -15,24 +16,31 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
+def _seed_user(client: TestClient, email: str = "admin@example.com", role: str = "admin") -> None:
+    app = client.app
+
+    async def _seed() -> None:
+        async with app.state.session_factory() as session:
+            await create_user(
+                session,
+                email=email,
+                name="Admin",
+                password_hash=app.state.password_hasher.hash("password123"),
+                role=role,
+            )
+            await session.commit()
+
+    asyncio.run(_seed())
+
+
+def _login(client: TestClient, email: str = "admin@example.com") -> None:
+    response = client.post("/api/auth/login", json={"email": email, "password": "password123"})
+    assert response.status_code == 200
+
+
 def test_login_and_me(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> None:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="admin@example.com",
-                    name="Admin",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="admin",
-                )
-                await session.commit()
-
-        import asyncio
-
-        asyncio.run(_seed())
+        _seed_user(client)
 
         response = client.post(
             "/api/auth/login", json={"email": "admin@example.com", "password": "password123"}
@@ -88,3 +96,26 @@ def test_refresh_requires_active_browser_session(monkeypatch: object, tmp_path: 
     with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.post("/api/auth/refresh")
         assert response.status_code == 401
+
+
+def test_exchange_token_accepts_known_targets(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        _seed_user(client)
+        _login(client)
+
+        for target in ("intaris", "mnemory"):
+            response = client.post(f"/api/v1/auth/exchange-token?target={target}")
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["target"] == target
+            assert payload["expires_in"] == 60
+            assert payload["token"]
+
+
+def test_exchange_token_rejects_unknown_target(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        _seed_user(client)
+        _login(client)
+
+        response = client.post("/api/v1/auth/exchange-token?target=unknown")
+        assert response.status_code == 422

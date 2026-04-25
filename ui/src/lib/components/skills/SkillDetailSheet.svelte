@@ -1228,7 +1228,7 @@
                   <p class="mt-1 text-xs text-slate-500">{asset.content_type} · {asset.size_bytes} bytes · {asset.content_hash.slice(0, 8)}</p>
                 </div>
                 {#if asset.url}
-                  <a class="inline-flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200" href={asset.url} rel="noreferrer" target="_blank">
+                  <a class="inline-flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200" href={asset.url} rel="noopener noreferrer" target="_blank">
                     <Download class="h-3.5 w-3.5" /> Download
                   </a>
                 {/if}

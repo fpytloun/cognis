@@ -16,7 +16,7 @@
         <p class="mt-1 text-sm text-slate-400">{guide.service}</p>
       </div>
       {#if docsUrl}
-        <a class="inline-flex items-center gap-2 text-sm text-sky-300 hover:text-sky-200" href={docsUrl} target="_blank" rel="noreferrer">
+        <a class="inline-flex items-center gap-2 text-sm text-sky-300 hover:text-sky-200" href={docsUrl} target="_blank" rel="noopener noreferrer">
           <Link2 class="h-4 w-4" /> Docs
         </a>
       {/if}
