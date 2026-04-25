@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount, tick } from 'svelte';
+  import { get } from 'svelte/store';
   import { fade } from 'svelte/transition';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
@@ -55,7 +56,7 @@ import X from 'lucide-svelte/icons/x';
   import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
-  import { requestOpenMobileNav } from '$lib/stores/mobileNav';
+  import { mobileNavOpen as mobileNavOpenStore, requestOpenMobileNav } from '$lib/stores/mobileNav';
   import { registerOverlay } from '$lib/stores/overlays';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
@@ -1000,23 +1001,36 @@ import X from 'lucide-svelte/icons/x';
     mobileListOpen = true;
   }
 
-  // Edge-swipe handlers for the chat detail viewport. The action gates
-  // them by `disabled` so we don't open the conversation list on
-  // desktop, and we suppress the right-edge gesture entirely while the
-  // composer / textarea is focused (would otherwise close the info
-  // panel mid-typing on rare misfires).
+  // Edge-swipe handlers for the chat detail viewport. The gestures
+  // cascade so users can stack drawers without lifting their finger:
+  //   * Left swipe with nothing open → open the conversation list.
+  //   * Left swipe with the list open → open the global nav menu on
+  //     top of the list.
+  //   * Right swipe with the global nav open → no-op here; the layout
+  //     closes the nav (its right-edge handler is enabled via the
+  //     shared `mobileNavOpenStore`).
+  //   * Right swipe with the list open → close the list.
+  //   * Right swipe with nothing open → no-op (we used to toggle the
+  //     conversation info panel, but the user wants right-edge to
+  //     mean "close" exclusively).
+  // Desktop (>=lg) bypasses both handlers because the conversation
+  // list is permanently visible there.
   function handleChatLeftEdgeSwipe(): void {
     if (!isMobileViewport()) return;
-    if (mobileListOpen) return;
+    if (get(mobileNavOpenStore)) return; // already at the top of the stack
+    if (mobileListOpen) {
+      requestOpenMobileNav();
+      return;
+    }
     openMobileList();
   }
 
   function handleChatRightEdgeSwipe(): void {
+    if (!isMobileViewport()) return;
+    if (get(mobileNavOpenStore)) return; // layout handler closes the nav
     if (mobileListOpen) {
       closeMobileList();
-      return;
     }
-    headerInfoOpen = !headerInfoOpen;
   }
 
   function closeMobileList(): void {

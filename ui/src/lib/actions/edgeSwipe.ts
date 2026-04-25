@@ -25,7 +25,14 @@ export interface EdgeSwipeParam {
   edge: EdgeSwipeEdge;
   /** Called once when the swipe crosses `threshold`. */
   onTrigger: () => void;
-  /** Detection zone width from the edge in CSS px. Default 24. */
+  /**
+   * Detection zone width from the edge in CSS px. Default 48.
+   * On iOS PWA standalone the system reserves the first ~20-30 px
+   * around the bezel for its native back-swipe gesture and only starts
+   * delivering JS touchstart events after the finger has moved past
+   * that zone, so 48 px gives us a reliable practical detection
+   * window of ~20-30 px once iOS yields the gesture.
+   */
   edgeWidth?: number;
   /** Horizontal-drag threshold in CSS px. Default 60. */
   threshold?: number;
@@ -102,7 +109,7 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
     return state.param;
   }
   function edgeWidth(): number {
-    return param().edgeWidth ?? 24;
+    return param().edgeWidth ?? 48;
   }
   function threshold(): number {
     return param().threshold ?? 60;
@@ -117,8 +124,11 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
   // -- touch (primary path, lets us preventDefault on iOS) -------------
 
   function onTouchStart(event: TouchEvent): void {
+    // Always start fresh on touchstart so a missed touchend (which can
+    // happen if iOS hijacks a gesture mid-flight) does not block all
+    // subsequent edge swipes.
+    reset(state);
     if (disabled()) return;
-    if (state.activeTouch !== null) return;
     if (event.touches.length !== 1) return;
     const touch = event.touches[0];
     const viewportWidth = window.innerWidth;
@@ -140,6 +150,10 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
   }
 
   function onTouchMove(event: TouchEvent): void {
+    if (disabled()) {
+      reset(state);
+      return;
+    }
     const touch = findActiveTouch(event);
     if (!touch) return;
     const dx = touch.clientX - state.startX;

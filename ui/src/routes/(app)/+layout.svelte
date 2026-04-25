@@ -36,7 +36,7 @@ import X from 'lucide-svelte/icons/x';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus } from '$lib/shortcuts';
   import { auth } from '$lib/stores/auth';
-  import { mobileNavOpenSignal } from '$lib/stores/mobileNav';
+  import { mobileNavOpen as mobileNavOpenStore, mobileNavOpenSignal } from '$lib/stores/mobileNav';
   import { blockingOverlayActive, resetOverlayState } from '$lib/stores/overlays';
   import { workspaceHealth } from '$lib/system';
   import type { SystemDiagnostics } from '$lib/types/api';
@@ -71,10 +71,20 @@ import X from 'lucide-svelte/icons/x';
     mobileNavOpen = false;
   }
 
+  // Mirror the local mobileNavOpen state into the shared store so
+  // child routes (chat detail) can read it and gate their own swipe
+  // gestures. The layout is the sole writer; readers treat the store
+  // as read-only and call `requestOpenMobileNav()` to open the drawer.
+  $effect(() => {
+    mobileNavOpenStore.set(mobileNavOpen);
+  });
+
   // Edge-swipe handlers. The `edgeSwipe` action owns the gesture
   // detection (touch + pointer) and prevents iOS from claiming the
   // bezel swipe for native back/forward navigation. Left edge opens
-  // the mobile nav drawer; right edge closes it again.
+  // the mobile nav drawer on non-chat routes; right edge closes it
+  // (active everywhere, including chat detail, so the user can always
+  // swipe right to dismiss the open drawer).
   function handleLeftEdgeSwipe(): void {
     if (mobileNavOpen) return;
     openMobileNav();
@@ -622,7 +632,7 @@ import X from 'lucide-svelte/icons/x';
           role="presentation"
           use:scrollPersist={{ key: $page.url.pathname, disabled: isChatDetailRoute }}
           use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen }}
-          use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: isChatDetailRoute || !mobileNavOpen }}
+          use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: !mobileNavOpen }}
         >
             {@render children()}
         </div>
