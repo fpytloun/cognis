@@ -61,10 +61,7 @@ function syncViewportVariables(metrics = readViewportMetrics()): void {
   const root = document.documentElement;
   root.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
   root.style.setProperty('--app-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
-  root.style.setProperty(
-    '--app-bottom-inset',
-    metrics.keyboardOpen ? '0px' : 'env(safe-area-inset-bottom, 0px)',
-  );
+  root.style.setProperty('--app-bottom-inset', '0px');
   root.dataset.keyboard = metrics.keyboardOpen ? 'open' : 'closed';
 }
 
@@ -124,7 +121,7 @@ export const viewportMetrics = readable<ViewportMetrics>(
     const root = document.documentElement;
     root.style.setProperty('--app-viewport-height', '100dvh');
     root.style.setProperty('--app-viewport-offset-top', '0px');
-    root.style.setProperty('--app-bottom-inset', 'env(safe-area-inset-bottom, 0px)');
+    root.style.setProperty('--app-bottom-inset', '0px');
     delete root.dataset.keyboard;
   };
 });

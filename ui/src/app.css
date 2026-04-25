@@ -6,7 +6,7 @@
   color-scheme: dark;
   --app-viewport-height: 100dvh;
   --app-viewport-offset-top: 0px;
-  --app-bottom-inset: env(safe-area-inset-bottom, 0px);
+  --app-bottom-inset: 0px;
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
   --theme-void: #020617;
