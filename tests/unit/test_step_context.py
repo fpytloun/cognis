@@ -339,6 +339,22 @@ def test_events_to_messages_handles_tool_call_with_name_field() -> None:
     assert messages[1]["tool_call_id"] == "c1"
 
 
+def test_events_to_messages_preserves_tool_result_error_flag() -> None:
+    events = [
+        {"type": "tool_call", "data": {"name": "apply_patch", "call_id": "c1"}},
+        {
+            "type": "tool_result",
+            "data": {"call_id": "c1", "result": "failed", "is_error": True},
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[1]["_tool_is_error"] is True
+
+
 def test_events_to_messages_groups_parallel_tool_calls() -> None:
     """Consecutive tool_call events are grouped into a single assistant message."""
     events = [

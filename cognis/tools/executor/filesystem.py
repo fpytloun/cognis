@@ -605,11 +605,12 @@ async def handle_apply_patch(arguments: dict[str, Any], context: ToolExecutionCo
         return ToolResult(output="Empty apply_patch payload.", is_error=True)
 
     try:
-        operations = (
-            _parse_native_apply_patch_operation(operation, context)
-            if isinstance(operation, dict)
-            else _parse_patch_operations(patch_text, context)
-        )
+        if patch_text.strip():
+            operations = _parse_patch_operations(patch_text, context)
+        elif isinstance(operation, dict):
+            operations = _parse_native_apply_patch_operation(operation, context)
+        else:
+            operations = []
     except (
         PatchFormatError,
         PatchConflictError,

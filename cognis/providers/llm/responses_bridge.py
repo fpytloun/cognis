@@ -159,6 +159,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         {
                             "type": "apply_patch_call",
                             "call_id": call_id,
+                            "status": "completed",
                             "operation": native_operation,
                         }
                     )

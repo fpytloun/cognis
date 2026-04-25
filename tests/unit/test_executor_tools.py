@@ -560,6 +560,32 @@ class TestApplyPatchTool:
         assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
+    async def test_apply_patch_prefers_patch_text_over_empty_native_operation(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "test.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+                ),
+                "operation": {
+                    "type": "update_file",
+                    "path": str(target),
+                    "diff": "",
+                },
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
     async def test_apply_patch_rejects_legacy_patch_text_key(self, tmp_path: Path) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")

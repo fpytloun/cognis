@@ -322,6 +322,7 @@ def test_messages_to_responses_input_maps_native_apply_patch_roundtrip() -> None
         {
             "type": "apply_patch_call",
             "call_id": "call_patch",
+            "status": "completed",
             "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"},
         },
         {
@@ -331,6 +332,44 @@ def test_messages_to_responses_input_maps_native_apply_patch_roundtrip() -> None
             "output": "Updated /tmp/a.txt",
         },
     ]
+
+
+def test_messages_to_responses_input_marks_failed_native_apply_patch_output() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": (
+                            '{"operation":{"type":"update_file","path":"/tmp/a.txt","diff":"@@\\n-x\\n+y\\n"}}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "Native apply_patch update_file operation requires a diff.",
+            "_tool_name": "apply_patch",
+            "_tool_is_error": True,
+        },
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result[0]["type"] == "apply_patch_call"
+    assert result[0]["status"] == "completed"
+    assert result[1] == {
+        "type": "apply_patch_call_output",
+        "call_id": "call_patch",
+        "status": "failed",
+        "output": "Native apply_patch update_file operation requires a diff.",
+    }
 
 
 def test_responses_request_kwargs_ignores_unsupported_string_response_format() -> None:
