@@ -1458,6 +1458,7 @@ class StepContext:
     session: SessionModel
     conversation: ConversationModel
     agent: AgentDefinition
+    executor_agent: AgentDefinition | None = None
     step_inputs: dict[str, StepOutput] = field(default_factory=dict)
     todos: list[dict[str, Any]] = field(default_factory=list)
     task_id: str | None = None
@@ -1709,51 +1710,54 @@ class AgentLoop:
             STEP_DURATION.labels(phase="total").observe(duration)
 
     async def _resolve_child_agent(
-        self, child_agent_id: str, parent_agent: AgentDefinition
+        self, child_agent_id: str, parent_agent: AgentDefinition, *, user_email: str
     ) -> AgentDefinition:
         """Resolve the AgentDefinition for a child session (#3).
 
-        Falls back to the parent agent if lookup fails.
+        Delegation must fail closed when the requested agent is not accessible.
         """
         if child_agent_id == parent_agent.agent_id:
             return parent_agent
-        try:
-            from cognis.api.serializers import agent_to_response
-            from cognis.store.queries import get_agent
+        from cognis.core.agent_registry import AgentRegistry
+        from cognis.store.queries import get_active_agent_grant
 
+        registry = AgentRegistry(self.session_manager.session_factory)
+        child_agent = await registry.get(child_agent_id, owner_email=user_email)
+        if child_agent is None or child_agent.status != "active":
+            raise RuntimeError(f"Delegated agent '{child_agent_id}' is not available")
+        if not child_agent.is_system and child_agent.owner_email != user_email:
             async with self.session_manager.session_factory() as db:
-                agent_row = await get_agent(db, child_agent_id)
-            if agent_row is not None:
-                return AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
-        except Exception:
-            logger.warning(
-                "delegation: failed to resolve child agent, using parent",
-                extra={"extra_data": {"child_agent_id": child_agent_id}},
-            )
-        return parent_agent
+                grant = await get_active_agent_grant(db, child_agent.agent_id, user_email)
+            if grant is None:
+                raise RuntimeError(f"Delegated agent '{child_agent_id}' is not accessible")
+        return child_agent
+
+    @staticmethod
+    def _executor_agent_for_child(
+        parent_agent: AgentDefinition,
+        child_agent: AgentDefinition,
+    ) -> AgentDefinition:
+        if child_agent.is_system or child_agent.agent_type == "secondary":
+            return parent_agent
+        return child_agent
 
     async def _resolve_child_runtime(
         self,
         *,
         agent: AgentDefinition,
+        executor_agent: AgentDefinition,
         user_email: str,
-        fallback_tool_registry: Any,
-        fallback_executor_connection: Any,
     ) -> ResolvedStepRuntime:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
         if callable(self._step_runtime_factory):
-            return await self._step_runtime_factory(agent=agent, user_email=user_email)
+            return await self._step_runtime_factory(
+                agent=agent,
+                user_email=user_email,
+                executor_agent=executor_agent,
+            )
 
-        async def _noop_cleanup() -> None:
-            return None
-
-        return ResolvedStepRuntime(
-            tool_registry=fallback_tool_registry,
-            executor_connection=fallback_executor_connection,
-            cleanup=_noop_cleanup,
-            executor_environment=None,
-        )
+        raise RuntimeError("Step runtime factory unavailable; refusing delegation fallback")
 
     # ------------------------------------------------------------------
     # Child session tracking (for /stop cancellation)
@@ -1798,8 +1802,6 @@ class AgentLoop:
         agent: AgentDefinition,
         task_description: str,
         parent_intaris_session_id: str,
-        tool_registry: Any,
-        executor_connection: Any,
         deliverable_step_run_id: str | None = None,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
@@ -1822,49 +1824,55 @@ class AgentLoop:
         conversation_id = conversation.conversation_id
         child_session_id = child_session.session_id
 
-        # Resolve the correct agent if the child uses a different one
-        resolved_agent = await self._resolve_child_agent(child_session.agent_id, agent)
-        child_runtime = await self._resolve_child_runtime(
-            agent=resolved_agent,
-            user_email=child_session.user_email,
-            fallback_tool_registry=tool_registry,
-            fallback_executor_connection=executor_connection,
-        )
-
-        child_step = StepDefinition(
-            name="delegation",
-            type="run",
-            prompt=task_description,
-            require_deliverable=False,
-        )
-        child_ctx = StepContext(
-            step_definition=child_step,
-            session=child_session,
-            conversation=conversation,
-            agent=resolved_agent,
-            policy=DELEGATION_POLICY,
-            user_message=task_description,
-            system_initiated=True,
-            interaction_mode="explicit_gates",
-            tool_registry=child_runtime.tool_registry,
-            executor_connection=child_runtime.executor_connection,
-            executor_environment=child_runtime.executor_environment,
-            workspace_root=current_workspace_root.get(),
-            working_directory=current_effective_working_directory.get(),
-            deliverable_step_run_id=deliverable_step_run_id,
-            orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
-        )
-
         output: StepOutput | None = None
+        child_runtime: ResolvedStepRuntime | None = None
 
-        # Set runtime context for JWT headers
-        with scoped_runtime_context(
-            user_email=child_session.user_email,
-            agent_id=resolved_agent.agent_id,
-            workspace_root=current_workspace_root.get(),
-            effective_working_directory=current_effective_working_directory.get(),
-        ):
-            try:
+        try:
+            resolved_agent = await self._resolve_child_agent(
+                child_session.agent_id,
+                agent,
+                user_email=child_session.user_email,
+            )
+            child_executor_agent = self._executor_agent_for_child(agent, resolved_agent)
+            child_runtime = await self._resolve_child_runtime(
+                agent=resolved_agent,
+                executor_agent=child_executor_agent,
+                user_email=child_session.user_email,
+            )
+
+            child_step = StepDefinition(
+                name="delegation",
+                type="run",
+                prompt=task_description,
+                require_deliverable=False,
+            )
+            child_ctx = StepContext(
+                step_definition=child_step,
+                session=child_session,
+                conversation=conversation,
+                agent=resolved_agent,
+                executor_agent=child_executor_agent,
+                policy=DELEGATION_POLICY,
+                user_message=task_description,
+                system_initiated=True,
+                interaction_mode="explicit_gates",
+                tool_registry=child_runtime.tool_registry,
+                executor_connection=child_runtime.executor_connection,
+                executor_environment=child_runtime.executor_environment,
+                runtime_info=child_runtime.runtime_info or {},
+                workspace_root=current_workspace_root.get(),
+                working_directory=current_effective_working_directory.get(),
+                deliverable_step_run_id=deliverable_step_run_id,
+                orchestration_mode=OrchestrationMode.NONE,  # Sub-sessions cannot delegate
+            )
+
+            # Set runtime context for JWT headers
+            with scoped_runtime_context(
+                user_email=child_session.user_email,
+                agent_id=resolved_agent.agent_id,
+                workspace_root=current_workspace_root.get(),
+                effective_working_directory=current_effective_working_directory.get(),
+            ):
                 output = await self.run_step(
                     child_ctx,
                     on_token=on_token,
@@ -1948,68 +1956,69 @@ class AgentLoop:
                         }
                     },
                 )
+        except Exception:
+            logger.exception(
+                "delegation: child session failed",
+                extra={
+                    "extra_data": {
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_intaris_session_id,
+                    }
+                },
+            )
+            # Each operation guarded independently
+            try:
+                await self.session_manager.mark_failed(
+                    child_session_id,
+                    result_summary="Delegation failed",
+                )
             except Exception:
-                logger.exception(
-                    "delegation: child session failed",
-                    extra={
-                        "extra_data": {
-                            "child_session_id": child_session_id,
-                            "parent_session_id": parent_intaris_session_id,
-                        }
+                logger.warning(
+                    "delegation: failed to mark child session as failed", exc_info=True
+                )
+
+            try:
+                await self.providers.guardrails.record_events(
+                    session_id=parent_intaris_session_id,
+                    events=with_session_events_turn_id(
+                        [
+                            SessionEvent(
+                                type="delegation",
+                                data={
+                                    "status": "failed",
+                                    "child_session_id": child_session_id,
+                                    "mode": "delegate",
+                                    "error": "Delegation execution failed",
+                                },
+                            )
+                        ],
+                        None,
+                    ),
+                    idempotency_key=(
+                        f"{parent_intaris_session_id}:delegation_failed_{child_session_id}"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "delegation: failed to record failure in parent session",
+                    exc_info=True,
+                )
+
+            # Publish event bus event for frontend
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_FAILED,
+                    data={
+                        "conversation_id": conversation_id,
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_intaris_session_id,
+                        "reason": "Delegation execution failed",
                     },
                 )
-                # Each operation guarded independently
-                try:
-                    await self.session_manager.mark_failed(
-                        child_session_id,
-                        result_summary="Delegation failed",
-                    )
-                except Exception:
-                    logger.warning(
-                        "delegation: failed to mark child session as failed", exc_info=True
-                    )
-
-                try:
-                    await self.providers.guardrails.record_events(
-                        session_id=parent_intaris_session_id,
-                        events=with_session_events_turn_id(
-                            [
-                                SessionEvent(
-                                    type="delegation",
-                                    data={
-                                        "status": "failed",
-                                        "child_session_id": child_session_id,
-                                        "mode": "delegate",
-                                        "error": "Delegation execution failed",
-                                    },
-                                )
-                            ],
-                            None,
-                        ),
-                        idempotency_key=(
-                            f"{parent_intaris_session_id}:delegation_failed_{child_session_id}"
-                        ),
-                    )
-                except Exception:
-                    logger.warning(
-                        "delegation: failed to record failure in parent session",
-                        exc_info=True,
-                    )
-
-                # Publish event bus event for frontend
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.DELEGATION_FAILED,
-                        data={
-                            "conversation_id": conversation_id,
-                            "child_session_id": child_session_id,
-                            "parent_session_id": parent_intaris_session_id,
-                            "reason": "Delegation execution failed",
-                        },
-                    )
-                )
-                DELEGATIONS_TOTAL.labels(status="failed").inc()
-            finally:
+            )
+            DELEGATIONS_TOTAL.labels(status="failed").inc()
+        finally:
+            if child_runtime is not None:
                 await child_runtime.cleanup()
 
         return output
@@ -2022,8 +2031,6 @@ class AgentLoop:
         agent: AgentDefinition,
         task_description: str,
         parent_intaris_session_id: str,
-        tool_registry: Any,
-        executor_connection: Any,
         deliverable_step_run_id: str | None = None,
     ) -> None:
         """Async wrapper for _run_child_session that triggers follow-up turns.
@@ -2043,8 +2050,6 @@ class AgentLoop:
                 agent=agent,
                 task_description=task_description,
                 parent_intaris_session_id=parent_intaris_session_id,
-                tool_registry=tool_registry,
-                executor_connection=executor_connection,
                 deliverable_step_run_id=deliverable_step_run_id,
             )
             status = "completed" if output else "failed"
@@ -5239,11 +5244,9 @@ class AgentLoop:
             output = await self._run_child_session(
                 child_session=child_session,
                 conversation=ctx.conversation,
-                agent=ctx.agent,
+                agent=ctx.executor_agent or ctx.agent,
                 task_description=task_description,
                 parent_intaris_session_id=parent_intaris_id,
-                tool_registry=ctx.tool_registry,
-                executor_connection=ctx.executor_connection,
                 deliverable_step_run_id=ctx.step_run_id,
             )
             if output:
@@ -5290,11 +5293,9 @@ class AgentLoop:
                 self._run_child_session_async(
                     child_session=child_session,
                     conversation=ctx.conversation,
-                    agent=ctx.agent,
+                    agent=ctx.executor_agent or ctx.agent,
                     task_description=task_description,
                     parent_intaris_session_id=parent_intaris_id,
-                    tool_registry=ctx.tool_registry,
-                    executor_connection=ctx.executor_connection,
                     deliverable_step_run_id=ctx.step_run_id,
                 )
             )

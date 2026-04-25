@@ -379,6 +379,10 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     ].filter((row) => row.value !== '');
   }
 
+  function runtimeMissingMessage(stepRun: StepRun): string {
+    return stepRun.runtime_info ? '' : 'Runtime not recorded for this attempt.';
+  }
+
   function displayStepStatus(stepRun: StepRun): string {
     const outcomeStatus = stepOutcomeStatus(stepRun);
     if (stepRun.status === 'approved' && outcomeStatus === 'rejected') {
@@ -1352,9 +1356,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                     {/if}
 
-                    {#if runtimeRows(latestAttempt).length > 0}
-                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+                    <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+                      {#if runtimeRows(latestAttempt).length > 0}
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each runtimeRows(latestAttempt) as row}
                             <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
@@ -1363,8 +1367,10 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                             </div>
                           {/each}
                         </dl>
-                      </div>
-                    {/if}
+                      {:else}
+                        <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
+                      {/if}
+                    </div>
 
                     {#if stepError}
                       <div class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
@@ -1799,6 +1805,21 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             {#if summary}
               <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
             {/if}
+            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+              {#if runtimeRows(latestAttempt).length > 0}
+                <dl class="mt-3 grid gap-2 text-xs">
+                  {#each runtimeRows(latestAttempt) as row}
+                    <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
+                      <dt class="text-slate-500">{row.label}</dt>
+                      <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                    </div>
+                  {/each}
+                </dl>
+              {:else}
+                <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
+              {/if}
+            </div>
             <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
               {#if claims.length > 0}

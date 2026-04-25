@@ -88,6 +88,34 @@
     return typeof val === 'string' ? val : '';
   }
 
+  function runtimeString(value: unknown): string {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    return '';
+  }
+
+  function runtimeEnvironment(stepRun: StepRun): Record<string, unknown> {
+    const env = stepRun.runtime_info?.environment;
+    return env && typeof env === 'object' ? (env as Record<string, unknown>) : {};
+  }
+
+  function runtimeRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const info = stepRun.runtime_info;
+    if (!info) return [];
+    const env = runtimeEnvironment(stepRun);
+    return [
+      { label: 'Executor', value: runtimeString(info.executor_id) || 'unresolved' },
+      { label: 'Type', value: runtimeString(info.executor_type) || 'unknown' },
+      { label: 'Runtime', value: runtimeString(info.runtime_source) || 'unknown' },
+      { label: 'Selection', value: runtimeString(info.selection_source) || 'unknown' },
+      { label: 'Fallback', value: runtimeString(info.fallback_used) },
+      { label: 'User', value: runtimeString(env.user) || 'unknown' },
+      { label: 'Home', value: runtimeString(env.home) || 'unknown' },
+      { label: 'CWD', value: runtimeString(env.cwd) || 'unknown' },
+      { label: 'Tools', value: runtimeString(info.visible_tool_count) || runtimeString(info.inventory_tool_count) || 'unknown' }
+    ].filter((row) => row.value !== '');
+  }
+
   function focusableElements(): HTMLElement[] {
     if (!container) return [];
     return Array.from(container.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')).filter((element) => !element.hasAttribute('disabled'));
@@ -216,6 +244,22 @@
           {/if}
         </section>
       {/if}
+
+      <section class="rounded-3xl border border-slate-800 bg-slate-950/70 p-4 sm:p-5">
+        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+        {#if runtimeRows(stepRun).length > 0}
+          <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+            {#each runtimeRows(stepRun) as row}
+              <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
+                <dt class="text-slate-500">{row.label}</dt>
+                <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+              </div>
+            {/each}
+          </dl>
+        {:else}
+          <p class="mt-3 text-sm text-amber-200">Runtime not recorded for this attempt.</p>
+        {/if}
+      </section>
 
       <section class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4 sm:p-5">
         <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>

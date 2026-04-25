@@ -111,11 +111,6 @@ REVIEW_LOOPS = Counter(
 # Callback type for progress notifications
 ProgressCallback = TokenCallback
 
-
-async def _noop_cleanup() -> None:
-    """No-op cleanup callback for shared runtimes."""
-
-
 class WorkflowEngine:
     """Orchestrates step execution for a task."""
 
@@ -200,6 +195,7 @@ class WorkflowEngine:
             session=session,
             conversation=conversation,
             agent=agent,
+            executor_agent=agent,
             policy=CHAT_POLICY,
             user_message=user_message,
             user_attachments=user_attachments or [],
@@ -725,9 +721,12 @@ class WorkflowEngine:
     ) -> tuple[StepOutput | None, str]:
         """Execute a single run step via the agent loop."""
 
-        # Resolve agent
-        agent = await self._resolve_step_agent(task, step_def)
-        if agent is None:
+        # Resolve the step agent for prompt/tools and the primary agent whose
+        # executor secondary/system steps inherit. Runtime selection stays
+        # separate so a system step can never accidentally run on controller
+        # fallback or a system-owned executor.
+        primary_agent, agent = await self._resolve_step_agents(task, step_def)
+        if primary_agent is None or agent is None:
             logger.warning(
                 "Could not resolve agent for step",
                 extra={"extra_data": {"task_id": task.task_id, "step": step_def.name}},
@@ -828,8 +827,10 @@ class WorkflowEngine:
 
         # Resolve tool registry and executor for this step.
         try:
+            executor_agent = self._executor_agent_for_step(primary_agent, agent)
             runtime = await self._resolve_step_runtime(
                 agent=agent,
+                executor_agent=executor_agent,
                 user_email=task.created_by,
             )
         except Exception as exc:
@@ -906,6 +907,7 @@ class WorkflowEngine:
             session=session,
             conversation=conversation,
             agent=agent,
+            executor_agent=executor_agent,
             task_id=task.task_id,
             task_title=task.title,
             task_description=task.description,
@@ -2568,26 +2570,37 @@ class WorkflowEngine:
         *,
         agent: AgentDefinition,
         user_email: str,
+        executor_agent: AgentDefinition | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
             return cast(
                 ResolvedStepRuntime,
-                await self._step_runtime_factory(agent=agent, user_email=user_email),
+                await self._step_runtime_factory(
+                    agent=agent,
+                    user_email=user_email,
+                    executor_agent=executor_agent,
+                ),
             )
 
-        return ResolvedStepRuntime(
-            tool_registry=self._shared_tool_registry,
-            executor_connection=self._shared_executor_connection,
-            cleanup=_noop_cleanup,
-            executor_environment=None,
-        )
+        raise RuntimeError("Step runtime factory unavailable; refusing shared executor fallback")
 
-    async def _resolve_step_agent(
+    def _executor_agent_for_step(
+        self,
+        primary_agent: AgentDefinition,
+        step_agent: AgentDefinition,
+    ) -> AgentDefinition:
+        """Return the agent whose executor is eligible for this step."""
+
+        if step_agent.is_system or step_agent.agent_type == "secondary":
+            return primary_agent
+        return step_agent
+
+    async def _resolve_step_agents(
         self,
         task: TaskModel,
         step_def: StepDefinition,
-    ) -> AgentDefinition | None:
+    ) -> tuple[AgentDefinition | None, AgentDefinition | None]:
         """Resolve which agent runs a step.
 
         If the step has ``agent_override``, resolve that agent (checking
@@ -2595,16 +2608,20 @@ class WorkflowEngine:
         resolve the task's primary agent.
         """
         from cognis.core.agent_registry import AgentRegistry
+        from cognis.store.queries import get_active_agent_grant
 
         registry = AgentRegistry(self._session_factory)
+        primary_agent = await registry.get(task.agent_id, owner_email=task.created_by)
+        if primary_agent is None or primary_agent.status != "active":
+            return None, None
 
         if step_def.agent_override:
             override_agent = await registry.get(
                 step_def.agent_override, owner_email=task.created_by
             )
-            if override_agent is None:
+            if override_agent is None or override_agent.status != "active":
                 logger.warning(
-                    "agent_override agent not found, falling back to task agent",
+                    "agent_override agent not found or inactive",
                     extra={
                         "extra_data": {
                             "agent_override": step_def.agent_override,
@@ -2613,11 +2630,49 @@ class WorkflowEngine:
                         }
                     },
                 )
-            else:
-                return override_agent
+                return None, None
+
+            if not override_agent.is_system and override_agent.owner_email != task.created_by:
+                async with self._session_factory() as db_session:
+                    grant = await get_active_agent_grant(
+                        db_session,
+                        override_agent.agent_id,
+                        task.created_by,
+                    )
+                if grant is None:
+                    logger.warning(
+                        "agent_override agent is not accessible to task owner",
+                        extra={
+                            "extra_data": {
+                                "agent_override": step_def.agent_override,
+                                "task_id": task.task_id,
+                            }
+                        },
+                    )
+                    return None, None
+
+            if override_agent.agent_type == "secondary":
+                is_bound = await registry.is_secondary_bound(
+                    primary_agent.agent_id,
+                    override_agent.agent_id,
+                )
+                if not is_bound:
+                    logger.warning(
+                        "agent_override secondary is not bound to primary agent",
+                        extra={
+                            "extra_data": {
+                                "agent_override": step_def.agent_override,
+                                "primary_agent_id": primary_agent.agent_id,
+                                "task_id": task.task_id,
+                            }
+                        },
+                    )
+                    return None, None
+
+            return primary_agent, override_agent
 
         # Default: use the task's primary agent
-        return await registry.get(task.agent_id, owner_email=task.created_by)
+        return primary_agent, primary_agent
 
     async def _create_step_session(
         self,

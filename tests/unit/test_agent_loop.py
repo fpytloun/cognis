@@ -2059,6 +2059,18 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
+    primary_agent = AgentDefinition(
+        agent_id="primary-1",
+        owner_email="user@example.com",
+        name="Primary",
+        execution={"executor_id": "user-exec"},
+    )
+    step_agent = AgentDefinition(
+        agent_id="system:research",
+        owner_email="system@cognis.local",
+        name="Research",
+        is_system=True,
+    )
     ctx = StepContext(
         step_definition=StepDefinition(name="implement", type="run", prompt=""),
         session=SimpleNamespace(
@@ -2067,7 +2079,8 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
             user_email="user@example.com",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
-        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        agent=step_agent,
+        executor_agent=primary_agent,
         policy=WORKFLOW_POLICY,
         orchestration_mode=OrchestrationMode.DELEGATE_SYNC_ONLY,
         step_run_id="sr-parent",
@@ -2119,6 +2132,7 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
     assert payload["deliverable_version"] == 2
     assert payload["deliverable_format"] == "markdown"
     assert payload["deliverable_title"] == "Child result"
+    assert captured["agent"] is primary_agent
     assert captured["deliverable_step_run_id"] == "sr-parent"
     assert ctx.current_deliverable_id is None
     assert ctx.current_deliverable_content is None

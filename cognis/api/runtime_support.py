@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, cast
+from uuid import uuid4
 
 from prometheus_client import Counter, Histogram
 
@@ -15,8 +15,13 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
-from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
-from cognis.core.executor_resolution import select_executor_for_agent
+from cognis.core.executor_policy import (
+    ExecutorPolicy,
+    is_executor_row_usable,
+    is_executor_type_allowed,
+    load_executor_policy,
+)
+from cognis.core.executor_resolution import labels_match
 from cognis.core.runtime import (
     ResolvedStepRuntime,
     build_local_executor_environment,
@@ -31,8 +36,7 @@ from cognis.models.tool import (
     ToolDefinition,
     tool_matches_identifier,
 )
-from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
-from cognis.providers.executor.in_process import InProcessExecutorConnection
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.runtime_context import current_effective_working_directory, current_workspace_root
 from cognis.tools.builtin.artifact_tools import artifact_tools
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
@@ -82,7 +86,7 @@ INTARIS_MCP_RESOLUTION_LATENCY = Histogram(
     "Latency of Intaris MCP inventory resolution.",
 )
 
-RuntimeFactory = Callable[[AgentDefinition, str], Awaitable[ResolvedStepRuntime]]
+RuntimeFactory = Callable[..., Awaitable[ResolvedStepRuntime]]
 
 
 @dataclass(slots=True)
@@ -109,9 +113,12 @@ def _agent_executor_binding(agent: AgentDefinition) -> tuple[str, bool]:
     execution = agent.execution if isinstance(agent.execution, dict) else {}
     if execution.get("executor_id"):
         return "explicit", True
-    if execution.get("executor_selector"):
+    selector = execution.get("executor_selector")
+    if isinstance(selector, dict) and selector:
         return "selector", True
-    return "default", False
+    if selector is not None:
+        return "empty_selector", False
+    return "none", False
 
 
 def _environment_payload(snapshot: Any | None) -> dict[str, Any] | None:
@@ -143,8 +150,17 @@ def _runtime_info(
     inventory_tool_count: int,
     visible_tool_count: int | None = None,
     failure_reason: str | None = None,
+    tool_agent: AgentDefinition | None = None,
+    executor_agent: AgentDefinition | None = None,
 ) -> dict[str, Any]:
     return {
+        "strict_executor": True,
+        "tool_agent_id": tool_agent.agent_id if tool_agent else None,
+        "tool_agent_type": tool_agent.agent_type if tool_agent else None,
+        "tool_agent_owner_email": tool_agent.owner_email if tool_agent else None,
+        "executor_agent_id": executor_agent.agent_id if executor_agent else None,
+        "executor_agent_type": executor_agent.agent_type if executor_agent else None,
+        "executor_agent_owner_email": executor_agent.owner_email if executor_agent else None,
         "executor_id": executor_config.get("executor_id") if executor_config else None,
         "executor_type": executor_config.get("executor_type") if executor_config else None,
         "executor_owner_email": executor_config.get("executor_owner_email") if executor_config else None,
@@ -180,6 +196,96 @@ def _raise_runtime_resolution_error(
         },
     )
     raise RuntimeError(message)
+
+
+def _executor_config_from_row(
+    row: Any,
+    *,
+    executor_owner_email: str,
+    selection_source: str,
+) -> dict[str, Any]:
+    return {
+        "executor_id": row.executor_id,
+        "executor_type": row.executor_type,
+        "enabled_tools": row.enabled_tools or [],
+        "enabled_tool_groups": row.enabled_tool_groups or [],
+        "labels": row.labels or {},
+        "config": row.config or {},
+        "owner_email": row.owner_email,
+        "executor_owner_email": executor_owner_email,
+        "selection_source": selection_source,
+        "desired_config_version": row.desired_config_version,
+        "applied_config_version": row.applied_config_version,
+        "observed_tools": row.observed_tools or [],
+        "last_observed_at": row.last_observed_at,
+        "runtime_state": row.runtime_state,
+    }
+
+
+async def _resolve_eligible_executor_config(
+    providers: Any,
+    agent: AgentDefinition,
+    user_email: str,
+    policy: ExecutorPolicy,
+) -> dict[str, Any]:
+    """Resolve the only executor eligible for an agent execution.
+
+    Eligibility is intentionally strict: agents must name an executor by
+    ``executor_id`` or by a non-empty label selector. Defaults and first-active
+    fallbacks are not execution-eligible because they can silently move work to
+    the controller or to the wrong user's machine.
+    """
+
+    session_factory = getattr(providers, "_session_factory", None)
+    if session_factory is None:
+        raise RuntimeError("Session factory unavailable; cannot resolve executor")
+
+    execution = agent.execution if isinstance(agent.execution, dict) else {}
+    explicit_id = execution.get("executor_id")
+    selector = execution.get("executor_selector")
+    selection_source, _hard_bound = _agent_executor_binding(agent)
+    if not explicit_id and selector is not None and not (isinstance(selector, dict) and selector):
+        raise RuntimeError("Agent executor_selector must be a non-empty object")
+    if not explicit_id and not selector:
+        raise RuntimeError("Agent must explicitly configure executor_id or executor_selector")
+
+    from cognis.store.queries import get_executor_row, list_executors
+
+    async with session_factory() as session:
+        if explicit_id:
+            row = await get_executor_row(
+                session,
+                str(explicit_id),
+                owner_email=user_email,
+                include_shared=True,
+            )
+            if row is None:
+                raise RuntimeError(f"Executor '{explicit_id}' is not available to this user")
+            if not is_executor_row_usable(row, policy, owner_email=user_email):
+                raise RuntimeError(f"Executor '{explicit_id}' is not active or allowed by policy")
+            return _executor_config_from_row(
+                row,
+                executor_owner_email=user_email,
+                selection_source="explicit",
+            )
+
+        assert isinstance(selector, dict)
+        candidates = await list_executors(session, owner_email=user_email, include_shared=True)
+        matches = [
+            row
+            for row in candidates
+            if is_executor_row_usable(row, policy, owner_email=user_email)
+            and labels_match(row.labels, {str(k): str(v) for k, v in selector.items()})
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Executor selector for agent '{agent.agent_id}' matched {len(matches)} eligible executors"
+            )
+        return _executor_config_from_row(
+            matches[0],
+            executor_owner_email=user_email,
+            selection_source=selection_source,
+        )
 
 
 def static_tool_definitions() -> list[ToolDefinition]:
@@ -386,41 +492,38 @@ def build_step_runtime_factory(
     async def factory(
         agent: AgentDefinition,
         user_email: str,
+        *,
+        executor_agent: AgentDefinition | None = None,
     ) -> ResolvedStepRuntime:
+        tool_agent = agent
+        executor_agent = executor_agent or agent
         session_factory_for_policy = getattr(providers, "_session_factory", None) or session_factory
         policy = (
             await load_executor_policy(session_factory_for_policy)
             if session_factory_for_policy is not None
             else None
         )
-        # Resolve executor config from DB
-        selection_source, hard_bound_executor = _agent_executor_binding(agent)
-        executor_config = await _resolve_executor_config(providers, agent, user_email)
-        if (
-            executor_config
-            and executor_config.get("unresolved")
-            and executor_config.get("requires_owner_executor")
-        ):
-            _raise_runtime_resolution_error(
-                "No eligible owner executor is available for this shared agent",
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
-            )
-        if executor_config and executor_config.get("unresolved") and hard_bound_executor:
-            _raise_runtime_resolution_error(
-                "No eligible executor matches the agent's configured executor binding",
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
-            )
+        if policy is None:
+            raise RuntimeError("Executor policy unavailable; refusing to run agent tools")
+        selection_source, hard_bound_executor = _agent_executor_binding(executor_agent)
+        executor_config = await _resolve_eligible_executor_config(
+            providers,
+            executor_agent,
+            user_email,
+            policy,
+        )
 
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
 
         # Build runtime metadata: user context + executor DB config (LSP settings, etc.)
-        db_config = executor_config.get("config", {}) if executor_config else {}
-        runtime_metadata = {"user_email": user_email, **db_config}
+        db_config = executor_config.get("config", {})
+        runtime_metadata = {
+            "user_email": user_email,
+            "tool_agent_id": tool_agent.agent_id,
+            "executor_agent_id": executor_agent.agent_id,
+            **db_config,
+        }
         workspace_root = current_workspace_root.get()
         working_directory = current_effective_working_directory.get()
         if workspace_root:
@@ -435,7 +538,7 @@ def build_step_runtime_factory(
         # Filter tools by agent config AND executor enablement.
         # Exclude web-category tools — they are injected dynamically below
         # based on available backends.
-        agent_tools = [t for t in select_static_tools(agent) if t.category != "web"]
+        agent_tools = [t for t in select_static_tools(tool_agent) if t.category != "web"]
 
         # Add dynamic web tool definitions based on available backends
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -454,21 +557,21 @@ def build_step_runtime_factory(
         try:
             async with session_factory() as db_session:
                 resolved_skills = await resolve_skills_for_agent(
-                    db_session, agent, owner_email=user_email
+                    db_session, tool_agent, owner_email=user_email
                 )
             if resolved_skills.skills:
                 # Build compact metadata for the immutable prompt prefix
                 metadata = build_available_skills_metadata(resolved_skills)
                 if metadata:
-                    if not isinstance(agent.skills, dict):
-                        agent.skills = {}
+                    if not isinstance(tool_agent.skills, dict):
+                        tool_agent.skills = {}
                     attached_tool_ids_by_skill = attached_skill_tool_ids_by_skill(resolved_skills)
-                    agent.skills["_available_skills_metadata"] = metadata
-                    agent.skills["_attached_skill_tool_ids"] = sorted(
+                    tool_agent.skills["_available_skills_metadata"] = metadata
+                    tool_agent.skills["_attached_skill_tool_ids"] = sorted(
                         attached_skill_tool_ids(resolved_skills)
                     )
-                    agent.skills["_attached_skill_tool_ids_by_skill"] = attached_tool_ids_by_skill
-                    agent.skills["_runtime_skill_summaries"] = [
+                    tool_agent.skills["_attached_skill_tool_ids_by_skill"] = attached_tool_ids_by_skill
+                    tool_agent.skills["_runtime_skill_summaries"] = [
                         {
                             "skill_id": skill.skill_id,
                             "name": skill.name,
@@ -487,50 +590,44 @@ def build_step_runtime_factory(
         except Exception:
             logger.warning(
                 "Failed to resolve DB-backed skills for agent",
-                extra={"extra_data": {"agent_id": agent.agent_id}},
+                extra={"extra_data": {"agent_id": tool_agent.agent_id}},
                 exc_info=True,
             )
 
-        if executor_config is not None:
-            # Only include executor-native tools that are enabled on this executor.
-            # Controller-side tools (builtin) are always available regardless.
-            disabled_categories = (
-                set(agent.tools.get("disabled_categories") or [])
-                if isinstance(agent.tools, dict)
-                else set()
-            )
-            disabled_tools = (
-                set(agent.tools.get("disabled_tools") or [])
-                if isinstance(agent.tools, dict)
-                else set()
-            )
-            filtered: list[ToolDefinition] = []
-            for tool in agent_tools:
-                if tool.category in disabled_categories or any(
-                    tool_matches_identifier(tool, identifier) for identifier in disabled_tools
-                ):
-                    continue
-                if tool.source.type in ("builtin",):
-                    # Controller tools always pass through
-                    filtered.append(tool)
-                elif tool.source.type == "executor":
-                    from cognis.core.executor_resolution import is_tool_enabled
+        # Only include executor-native tools that are enabled on this executor.
+        # Controller-side tools (builtin) are always available regardless.
+        disabled_categories = (
+            set(tool_agent.tools.get("disabled_categories") or [])
+            if isinstance(tool_agent.tools, dict)
+            else set()
+        )
+        disabled_tools = (
+            set(tool_agent.tools.get("disabled_tools") or [])
+            if isinstance(tool_agent.tools, dict)
+            else set()
+        )
+        filtered: list[ToolDefinition] = []
+        for tool in agent_tools:
+            if tool.category in disabled_categories or any(
+                tool_matches_identifier(tool, identifier) for identifier in disabled_tools
+            ):
+                continue
+            if tool.source.type in ("builtin",):
+                # Controller tools always pass through
+                filtered.append(tool)
+            elif tool.source.type == "executor":
+                from cognis.core.executor_resolution import is_tool_enabled
 
-                    if is_tool_enabled(tool, enabled_tools, enabled_groups):
-                        filtered.append(tool)
-                else:
+                if is_tool_enabled(tool, enabled_tools, enabled_groups):
                     filtered.append(tool)
-            agent_tools = filtered
+            else:
+                filtered.append(tool)
+        agent_tools = filtered
 
         resolved_type = (
-            executor_config.get("executor_type", "in_process") if executor_config else "in_process"
+            executor_config.get("executor_type", "in_process")
         )
-        if (
-            executor_config
-            and not executor_config.get("unresolved")
-            and policy is not None
-            and not is_executor_type_allowed(resolved_type, policy)
-        ):
+        if not is_executor_type_allowed(resolved_type, policy):
             _raise_runtime_resolution_error(
                 f"Executor type '{resolved_type}' is disabled by deployment policy",
                 executor_config=executor_config,
@@ -538,28 +635,18 @@ def build_step_runtime_factory(
                 hard_bound=hard_bound_executor,
             )
 
-        # Resolve MCP servers for local in-process execution first, then legacy inline fallback.
         # Remote executors advertise executor-assigned MCP tools through tool.list.
+        # In-process execution is only allowed for the explicitly selected
+        # executor row; legacy agent-local MCP config is intentionally ignored
+        # here to avoid controller fallback.
         mcp_servers: list[MCPServerConfig] = []
         if resolved_type == "in_process":
             mcp_servers = await _resolve_executor_mcp_servers(executor_config, session_factory)
-        if not mcp_servers:
-            mcp_servers = _parse_local_mcp_servers(agent)
-        if mcp_servers:
-            if policy is not None and not policy.allow_in_process:
-                _raise_runtime_resolution_error(
-                    "In-process MCP runtime is disabled by deployment policy",
-                    executor_config=executor_config,
-                    selection_source=selection_source,
-                    hard_bound=hard_bound_executor,
-                )
-            secret_owner_email = (
-                executor_config.get("executor_owner_email", user_email) if executor_config else user_email
-            )
-            secrets = await providers.secrets.resolve_for_execution(agent, secret_owner_email)
+            secret_owner_email = executor_config.get("executor_owner_email", user_email)
+            secrets = await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
             handle = await providers.executor.spawn(
                 ExecutorConfig(
-                    executor_id=f"controller_step_{uuid.uuid4().hex[:12]}",
+                    executor_id=f"{executor_config['executor_id']}:run:{uuid4().hex}",
                     tools=agent_tools,
                     mcp_servers=mcp_servers,
                     secrets=secrets,
@@ -567,7 +654,9 @@ def build_step_runtime_factory(
                 )
             )
             connection = await providers.executor.get_executor(handle)
-            registry = getattr(connection, "registry", shared_registry)
+            registry = getattr(connection, "registry", None)
+            if registry is None:
+                raise RuntimeError("Selected in-process executor did not expose a registry")
 
             async def cleanup() -> None:
                 await providers.executor.cancel(handle)
@@ -575,7 +664,7 @@ def build_step_runtime_factory(
             env_snapshot = build_local_executor_environment(
                 executor_id=handle.executor_id,
                 executor_type=handle.executor_type,
-                source="in_process_mcp_runtime",
+                source="direct_in_process_executor",
             )
             return ResolvedStepRuntime(
                 tool_registry=registry,
@@ -586,10 +675,12 @@ def build_step_runtime_factory(
                     executor_config=executor_config,
                     selection_source=selection_source,
                     hard_bound=hard_bound_executor,
-                    runtime_source="in_process_mcp_runtime",
-                    fallback_used=executor_config is None,
+                    runtime_source="direct_in_process_executor",
+                    fallback_used=False,
                     environment=env_snapshot,
                     inventory_tool_count=len(registry.list_tools()),
+                    tool_agent=tool_agent,
+                    executor_agent=executor_agent,
                 ),
             )
 
@@ -602,24 +693,23 @@ def build_step_runtime_factory(
             from cognis.providers.executor.websocket import WebSocketExecutorProvider
 
             ws_provider: WebSocketExecutorProvider = providers.executor.websocket
-            executor_id = executor_config.get("executor_id", "") if executor_config else ""
+            executor_id = executor_config.get("executor_id", "")
             conn = ws_provider.get_connection(executor_id)
             runtime_ready = bool(
-                executor_config is not None
-                and executor_config.get("runtime_state", "offline") in {"active", "degraded"}
+                executor_config.get("runtime_state", "offline") in {"active", "degraded"}
                 and int(executor_config.get("desired_config_version", 0) or 0)
                 == int(executor_config.get("applied_config_version", 0) or 0)
             )
             if conn is not None and runtime_ready:
                 try:
                     disabled_categories = (
-                        set(agent.tools.get("disabled_categories") or [])
-                        if isinstance(agent.tools, dict)
+                        set(tool_agent.tools.get("disabled_categories") or [])
+                        if isinstance(tool_agent.tools, dict)
                         else set()
                     )
                     disabled_tools = (
-                        set(agent.tools.get("disabled_tools") or [])
-                        if isinstance(agent.tools, dict)
+                        set(tool_agent.tools.get("disabled_tools") or [])
+                        if isinstance(tool_agent.tools, dict)
                         else set()
                     )
 
@@ -628,7 +718,7 @@ def build_step_runtime_factory(
                         remote_tools_data=remote_tools,
                         agent_tools=agent_tools,
                         providers=providers,
-                        agent=agent,
+                        agent=tool_agent,
                         disabled_categories=disabled_categories,
                         disabled_tools=disabled_tools,
                     )
@@ -696,6 +786,8 @@ def build_step_runtime_factory(
                             fallback_used=False,
                             environment=env_snapshot,
                             inventory_tool_count=len(all_tools),
+                            tool_agent=tool_agent,
+                            executor_agent=executor_agent,
                         ),
                     )
                 except Exception as exc:
@@ -720,160 +812,9 @@ def build_step_runtime_factory(
                 hard_bound=hard_bound_executor,
             )
 
-        if isinstance(shared_connection, InProcessExecutorConnection) and not (
-            policy is not None and not policy.allow_in_process
-        ):
-            # Build registry WITH handlers so tool_execute() can dispatch
-            handler_map = _build_handler_map(
-                session_factory,
-                getattr(providers.executor, "status_provider", None),
-            )
-            registry = build_registry_with_handlers(
-                agent_tools,
-                handler_map,
-                artifact_store=artifact_store,
-            )
-            connection = InProcessExecutorConnection(
-                shared_connection.handle,
-                registry,
-                shared_connection.breaker,
-                runtime_metadata,
-                internal_handlers=getattr(shared_connection, "internal_handlers", None),
-            )
-            env_snapshot = build_local_executor_environment(
-                executor_id=getattr(shared_connection.handle, "executor_id", None),
-                executor_type=getattr(shared_connection.handle, "executor_type", "in_process"),
-                source="shared_in_process_runtime",
-            )
-            return ResolvedStepRuntime(
-                tool_registry=registry,
-                executor_connection=connection,
-                cleanup=noop_cleanup,
-                executor_environment=env_snapshot,
-                runtime_info=_runtime_info(
-                    executor_config=executor_config,
-                    selection_source=selection_source,
-                    hard_bound=hard_bound_executor,
-                    runtime_source="shared_in_process_runtime",
-                    fallback_used=executor_config is None or bool(executor_config.get("unresolved")),
-                    environment=env_snapshot,
-                    inventory_tool_count=len(registry.list_tools()),
-                ),
-            )
-
-        if shared_connection is None:
-            raise RuntimeError("No eligible executor is available for this agent")
-        shared_handle = getattr(shared_connection, "handle", None)
-        shared_executor_type = getattr(shared_handle, "executor_type", "in_process")
-        if policy is not None and not is_executor_type_allowed(shared_executor_type, policy):
-            _raise_runtime_resolution_error(
-                f"Fallback executor type '{shared_executor_type}' is disabled by deployment policy",
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
-            )
-        if hard_bound_executor:
-            _raise_runtime_resolution_error(
-                "Refusing fallback because the agent is bound to a specific executor",
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
-            )
-        env_snapshot = build_local_executor_environment(
-            executor_id=getattr(shared_handle, "executor_id", None),
-            executor_type=shared_executor_type,
-            source="shared_runtime_fallback",
-        )
-        return ResolvedStepRuntime(
-            tool_registry=shared_registry,
-            executor_connection=shared_connection,
-            cleanup=noop_cleanup,
-            executor_environment=env_snapshot,
-            runtime_info=_runtime_info(
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
-                runtime_source="shared_runtime_fallback",
-                fallback_used=True,
-                environment=env_snapshot,
-                inventory_tool_count=len(shared_registry.list_tools()),
-            ),
-        )
+        raise RuntimeError(f"Executor type '{resolved_type}' is not supported for agent execution")
 
     return factory
-
-
-async def _resolve_executor_config(
-    providers: Any,
-    agent: AgentDefinition,
-    user_email: str,
-) -> dict[str, Any] | None:
-    """Resolve executor config from DB for an agent.
-
-    Returns a dict with enabled_tools, enabled_tool_groups, etc.
-    or None if no executor config is found.
-    """
-    session_factory = getattr(providers, "_session_factory", None)
-    if session_factory is None:
-        return None
-
-    from cognis.store.queries import get_active_agent_grant, list_executors
-
-    try:
-        policy = await load_executor_policy(session_factory)
-        async with session_factory() as session:
-            executor_owner_email = user_email
-            requires_owner_executor = False
-            if agent.owner_email != user_email:
-                grant = await get_active_agent_grant(session, agent.agent_id, user_email)
-                if grant is None:
-                    return None
-                if normalize_executor_scope(str(grant.executor_scope)) == "owner_executor":
-                    executor_owner_email = agent.owner_email
-                    requires_owner_executor = True
-            executors = await list_executors(
-                session,
-                owner_email=executor_owner_email,
-                include_shared=True,
-            )
-            if not executors:
-                return {
-                    "executor_owner_email": executor_owner_email,
-                    "requires_owner_executor": requires_owner_executor,
-                    "unresolved": True,
-                }
-            selected = select_executor_for_agent(
-                executors,
-                agent.execution if isinstance(agent.execution, dict) else None,
-                owner_email=executor_owner_email,
-                policy=policy,
-            )
-            if selected is None:
-                return {
-                    "executor_owner_email": executor_owner_email,
-                    "requires_owner_executor": requires_owner_executor,
-                    "unresolved": True,
-                }
-            return {
-                "executor_id": selected.executor_id,
-                "executor_type": selected.executor_type,
-                "enabled_tools": selected.enabled_tools or [],
-                "enabled_tool_groups": selected.enabled_tool_groups or [],
-                "labels": selected.labels or {},
-                "config": selected.config or {},
-                "owner_email": selected.owner_email,
-                "executor_owner_email": executor_owner_email,
-                "requires_owner_executor": requires_owner_executor,
-                "desired_config_version": selected.desired_config_version,
-                "applied_config_version": selected.applied_config_version,
-                "observed_tools": selected.observed_tools or [],
-                "last_observed_at": selected.last_observed_at,
-                "runtime_state": selected.runtime_state,
-            }
-    except Exception:
-        logger.warning("Failed to resolve executor config from DB", exc_info=True)
-        return None
-
 
 async def _resolve_web_config(
     providers: Any,
