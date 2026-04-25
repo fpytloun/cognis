@@ -180,7 +180,7 @@
          rubber-band-scrolling the page behind when the user drags
          across the dimmed area. -->
     <button
-      class="absolute inset-0 touch-none bg-slate-950/75 backdrop-blur-sm"
+      class="absolute inset-0 touch-none bg-[color:color-mix(in_srgb,var(--theme-bg-deep)_76%,transparent)] backdrop-blur-sm"
       onclick={dismissible ? onClose : undefined}
       type="button"
       aria-label="Dismiss"
@@ -192,7 +192,7 @@
       bind:this={panelEl}
       tabindex="-1"
       class={cn(
-        'absolute flex flex-col border border-slate-800/80 bg-slate-950 shadow-card',
+        'absolute flex flex-col border border-[color:var(--theme-border)] bg-[color:var(--theme-bg)] shadow-card',
         sideClasses,
         side === 'bottom' ? 'w-full' : '',
         className
@@ -214,7 +214,7 @@
           onpointerup={onPointerUp}
           onpointercancel={onPointerUp}
         >
-          <span aria-hidden="true" class="h-1.5 w-10 rounded-full bg-slate-700"></span>
+          <span aria-hidden="true" class="h-1.5 w-10 rounded-full bg-[color:var(--theme-border)]"></span>
         </div>
       {/if}
 

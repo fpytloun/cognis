@@ -13,11 +13,14 @@ import Clock from 'lucide-svelte/icons/clock';
 import ListTodo from 'lucide-svelte/icons/list-todo';
 import Menu from 'lucide-svelte/icons/menu';
 import MessageSquareText from 'lucide-svelte/icons/message-square-text';
+import Monitor from 'lucide-svelte/icons/monitor';
+import Moon from 'lucide-svelte/icons/moon';
 import Radio from 'lucide-svelte/icons/radio';
 import RefreshCw from 'lucide-svelte/icons/refresh-cw';
 import ServerCrash from 'lucide-svelte/icons/server-crash';
 import Settings from 'lucide-svelte/icons/settings';
 import ShieldAlert from 'lucide-svelte/icons/shield-alert';
+import Sun from 'lucide-svelte/icons/sun';
 import Workflow from 'lucide-svelte/icons/workflow';
 import Wrench from 'lucide-svelte/icons/wrench';
 import X from 'lucide-svelte/icons/x';
@@ -54,11 +57,27 @@ import X from 'lucide-svelte/icons/x';
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
+  type ThemeMode = 'system' | 'light' | 'dark';
+
+  const THEME_STORAGE_KEY = 'cognis-theme';
+  const THEME_COLORS: Record<'light' | 'dark', string> = {
+    dark: '#06130F',
+    light: '#F6FBF7'
+  };
+
+  const themeOptions: { mode: ThemeMode; label: string; icon: typeof Monitor }[] = [
+    { mode: 'system', label: 'System', icon: Monitor },
+    { mode: 'light', label: 'Light', icon: Sun },
+    { mode: 'dark', label: 'Dark', icon: Moon }
+  ];
+
   let bootstrapped = $state(false);
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
   let mobileHeaderEl = $state<HTMLElement | null>(null);
+  let themeMode = $state<ThemeMode>('system');
+  let resolvedTheme = $state<'light' | 'dark'>('dark');
   let workspaceRunning = false;
 
   function openMobileNav(): void {
@@ -126,6 +145,56 @@ import X from 'lucide-svelte/icons/x';
     if (typeof window !== 'undefined') {
       window.localStorage.setItem('cognis-sidebar-collapsed', sidebarCollapsed ? '1' : '0');
     }
+  }
+
+  function isThemeMode(value: string | null): value is ThemeMode {
+    return value === 'system' || value === 'light' || value === 'dark';
+  }
+
+  function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
+    if (mode === 'light' || mode === 'dark') return mode;
+    if (typeof window === 'undefined') return 'dark';
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  function applyTheme(mode: ThemeMode): void {
+    const nextResolved = resolveTheme(mode);
+    themeMode = mode;
+    resolvedTheme = nextResolved;
+    if (typeof document === 'undefined') return;
+    document.documentElement.dataset.themeMode = mode;
+    document.documentElement.dataset.theme = nextResolved;
+    document.documentElement.classList.toggle('dark', nextResolved === 'dark');
+    document.documentElement.style.colorScheme = nextResolved;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', THEME_COLORS[nextResolved]);
+  }
+
+  function restoreTheme(): void {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    const initialMode = isThemeMode(stored) ? stored : 'system';
+    applyTheme(initialMode);
+  }
+
+  function setTheme(mode: ThemeMode): void {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(THEME_STORAGE_KEY, mode);
+    }
+    applyTheme(mode);
+  }
+
+  function cycleTheme(): void {
+    const index = themeOptions.findIndex((item) => item.mode === themeMode);
+    const next = themeOptions[(index + 1) % themeOptions.length] ?? themeOptions[0];
+    setTheme(next.mode);
+  }
+
+  function currentThemeLabel(): string {
+    return themeOptions.find((item) => item.mode === themeMode)?.label ?? 'System';
+  }
+
+  function currentThemeIcon(): typeof Monitor {
+    return themeOptions.find((item) => item.mode === themeMode)?.icon ?? Monitor;
   }
 
   // Sidebar state is fully controlled by the explicit collapse toggle.
@@ -267,6 +336,7 @@ import X from 'lucide-svelte/icons/x';
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
   let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
+  let CurrentThemeIcon = $derived(currentThemeIcon());
   let contentShellClass = $derived.by(() => {
     if (isChatRoute) {
       return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
@@ -323,6 +393,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   onMount(() => {
+    restoreTheme();
     restoreSidebarState();
     void auth.bootstrap().finally(() => {
       bootstrapped = true;
@@ -330,6 +401,11 @@ import X from 'lucide-svelte/icons/x';
 
     window.addEventListener('keydown', handleGlobalShortcuts);
     window.addEventListener('resize', syncMobileHeaderOffset);
+    const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleThemeMediaChange = (): void => {
+      if (themeMode === 'system') applyTheme('system');
+    };
+    themeMedia.addEventListener('change', handleThemeMediaChange);
 
     // Pages that hide the global mobile header (chat detail) use this
     // signal to open the main nav drawer from their own hamburger button.
@@ -346,6 +422,7 @@ import X from 'lucide-svelte/icons/x';
       resetOverlayState();
       window.removeEventListener('keydown', handleGlobalShortcuts);
       window.removeEventListener('resize', syncMobileHeaderOffset);
+      themeMedia.removeEventListener('change', handleThemeMediaChange);
       setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
       stopWorkspace();
@@ -387,20 +464,20 @@ import X from 'lucide-svelte/icons/x';
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="fixed inset-x-0 top-0 h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
+  <div class="fixed inset-x-0 top-0 h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-[color:var(--theme-bg)]">
     <div class={`mx-auto flex h-full max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[var(--app-shell-bottom-offset,0px)]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
       <aside
-        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-[color:var(--theme-border)] bg-[color:var(--theme-panel)] shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
-            <div class="space-y-2 border-b border-slate-800/80 pb-5">
-              <p class="text-sm font-medium uppercase tracking-[0.3em] text-amber-300">Cognis</p>
-              <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
+            <div class="space-y-2 border-b border-[color:var(--theme-border)] pb-5">
+              <p class="text-sm font-medium uppercase tracking-[0.3em] brand-text">Cognis</p>
+              <h1 class="text-xl font-semibold text-[color:var(--theme-text)]">Agent workspace</h1>
             </div>
           {:else}
-            <div class="flex justify-center border-b border-slate-800/80 pb-4">
-              <span class="text-lg font-bold text-amber-300">C</span>
+            <div class="flex justify-center border-b border-[color:var(--theme-border)] pb-4">
+              <span class="text-lg font-bold brand-text">C</span>
             </div>
           {/if}
 
@@ -418,7 +495,7 @@ import X from 'lucide-svelte/icons/x';
               {#if sidebarExpanded}
                 <a
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'brand-bg-soft text-[color:var(--theme-text)]' : 'text-[color:var(--theme-text-muted)] hover:bg-[color:var(--theme-panel-muted)] hover:text-[color:var(--theme-text)]'} gap-3 px-4 py-3`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -428,7 +505,7 @@ import X from 'lucide-svelte/icons/x';
                 <a
                   use:sidebarTooltip={item.label}
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'brand-bg-soft text-[color:var(--theme-text)]' : 'text-[color:var(--theme-text-muted)] hover:bg-[color:var(--theme-panel-muted)] hover:text-[color:var(--theme-text)]'}`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -438,13 +515,13 @@ import X from 'lucide-svelte/icons/x';
           </nav>
         </div>
 
-        <div class={`shrink-0 space-y-4 border-t border-slate-800/80 ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
+        <div class={`shrink-0 space-y-4 border-t border-[color:var(--theme-border)] ${sidebarExpanded ? 'pt-6' : 'pt-4'}`}>
           {#if sidebarExpanded}
             <div class="space-y-1">
-              <p class="text-sm font-medium text-white">{$auth.user?.name ?? $auth.user?.email}</p>
-              <p class="text-xs text-slate-400">{$auth.user?.email}</p>
+              <p class="text-sm font-medium text-[color:var(--theme-text)]">{$auth.user?.name ?? $auth.user?.email}</p>
+              <p class="text-xs text-[color:var(--theme-text-muted)]">{$auth.user?.email}</p>
             </div>
-            <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+            <div class="space-y-2 rounded-2xl border border-[color:var(--theme-border)] bg-[color:var(--theme-bg)] px-3 py-3 text-sm text-[color:var(--theme-text-muted)]">
               <div class="flex items-center justify-between gap-3">
                 <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
                 <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
@@ -452,6 +529,23 @@ import X from 'lucide-svelte/icons/x';
               <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
                 <span>WebSocket</span>
                 <span class="text-right">{websocketStatusLabel()}</span>
+              </div>
+              <div class="rounded-xl border border-[color:var(--theme-border)] bg-[color:var(--theme-panel-muted)] p-1">
+                <div class="grid grid-cols-3 gap-1">
+                  {#each themeOptions as option}
+                    <Button
+                      aria-label={`Use ${option.label.toLowerCase()} theme`}
+                      class={`min-h-[32px] px-2 py-1 text-[11px] ${themeMode === option.mode ? 'bg-[color:var(--theme-accent-strong)] text-slate-950 hover:bg-[color:var(--theme-accent)]' : ''}`}
+                      size="sm"
+                      variant={themeMode === option.mode ? 'primary' : 'ghost'}
+                      onclick={() => setTheme(option.mode)}
+                      title={`${option.label} theme${option.mode === 'system' ? ` (${resolvedTheme})` : ''}`}
+                    >
+                      <option.icon class="mr-1 h-3.5 w-3.5" />
+                      {option.label}
+                    </Button>
+                  {/each}
+                </div>
               </div>
               <div class="flex gap-2">
                 <Button class="flex-1 justify-center" size="sm" variant="secondary" onclick={openShortcutHelp}>
@@ -491,6 +585,11 @@ import X from 'lucide-svelte/icons/x';
                   <CircleHelp class="h-4 w-4" />
                 </Button>
               </div>
+              <div use:sidebarTooltip={`Theme: ${currentThemeLabel()}${themeMode === 'system' ? ` (${resolvedTheme})` : ''}`} class="inline-flex">
+                <Button aria-label="Cycle theme" class="h-9 w-9" size="icon" variant="ghost" onclick={cycleTheme}>
+                  <CurrentThemeIcon class="h-4 w-4" />
+                </Button>
+              </div>
               {#if $auth.user?.role === 'admin'}
                 <div use:sidebarTooltip={'Getting started'} class="inline-flex">
                   <Button aria-label="Open getting started guide" class="h-9 w-9" size="icon" variant="ghost" onclick={() => goto('/getting-started')}>
@@ -510,7 +609,7 @@ import X from 'lucide-svelte/icons/x';
           {#if sidebarCollapsed}
             <button
               use:sidebarTooltip={'Expand sidebar'}
-              class="flex w-full items-center justify-center rounded-xl py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              class="flex w-full items-center justify-center rounded-xl py-2 text-xs text-[color:var(--theme-text-muted)] transition hover:bg-[color:var(--theme-panel-muted)] hover:text-[color:var(--theme-text)]"
               onclick={toggleSidebar}
               type="button"
               aria-label="Expand sidebar"
@@ -519,7 +618,7 @@ import X from 'lucide-svelte/icons/x';
             </button>
           {:else}
             <button
-              class="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs text-slate-400 transition hover:bg-slate-800 hover:text-white"
+              class="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs text-[color:var(--theme-text-muted)] transition hover:bg-[color:var(--theme-panel-muted)] hover:text-[color:var(--theme-text)]"
               onclick={toggleSidebar}
               type="button"
               aria-label="Collapse sidebar"
@@ -548,13 +647,13 @@ import X from 'lucide-svelte/icons/x';
           top by `env(safe-area-inset-top)` so the hamburger + title sit
           below the camera cutout instead of being obscured by it.
         -->
-        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
+        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-[color:var(--theme-border)] bg-[color:color-mix(in_srgb,var(--theme-bg)_95%,transparent)] px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
-              <h2 class="truncate text-base font-semibold text-white sm:text-lg">{currentTitle($page.url.pathname)}</h2>
+              <h2 class="truncate text-base font-semibold text-[color:var(--theme-text)] sm:text-lg">{currentTitle($page.url.pathname)}</h2>
             </div>
           </div>
 
@@ -663,8 +762,8 @@ import X from 'lucide-svelte/icons/x';
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
         <div>
-          <p class="text-sm uppercase tracking-[0.25em] text-amber-300">Cognis</p>
-          <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
+          <p class="text-sm uppercase tracking-[0.25em] brand-text">Cognis</p>
+          <p class="mt-1 text-sm text-[color:var(--theme-text-muted)]">{$auth.user?.email}</p>
         </div>
         <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
           <X class="h-4 w-4" />
@@ -675,7 +774,7 @@ import X from 'lucide-svelte/icons/x';
     <nav class="space-y-2">
       {#each navigationItems as item}
         <a
-          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'bg-amber-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'brand-bg-soft text-[color:var(--theme-text)]' : 'text-[color:var(--theme-text-muted)] hover:bg-[color:var(--theme-panel-muted)] hover:text-[color:var(--theme-text)]'}`}
           href={item.href}
           onclick={closeMobileNav}
         >
@@ -685,8 +784,8 @@ import X from 'lucide-svelte/icons/x';
       {/each}
     </nav>
 
-    <div class="mt-6 space-y-3 border-t border-slate-800 pt-5">
-      <div class="space-y-2 rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+    <div class="mt-6 space-y-3 border-t border-[color:var(--theme-border)] pt-5">
+      <div class="space-y-2 rounded-2xl border border-[color:var(--theme-border)] bg-[color:var(--theme-bg)] px-3 py-3 text-sm text-[color:var(--theme-text-muted)]">
         <div class="flex items-center justify-between gap-3">
           <span class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Workspace</span>
           <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
@@ -694,6 +793,22 @@ import X from 'lucide-svelte/icons/x';
         <div class="flex items-center justify-between gap-3 text-xs text-slate-400">
           <span>WebSocket</span>
           <span class="text-right">{websocketStatusLabel()}</span>
+        </div>
+        <div class="rounded-xl border border-[color:var(--theme-border)] bg-[color:var(--theme-panel-muted)] p-1">
+          <div class="grid grid-cols-3 gap-1">
+            {#each themeOptions as option}
+              <Button
+                aria-label={`Use ${option.label.toLowerCase()} theme`}
+                class={`min-h-[36px] px-2 py-1 text-xs ${themeMode === option.mode ? 'bg-[color:var(--theme-accent-strong)] text-slate-950 hover:bg-[color:var(--theme-accent)]' : ''}`}
+                size="sm"
+                variant={themeMode === option.mode ? 'primary' : 'ghost'}
+                onclick={() => setTheme(option.mode)}
+              >
+                <option.icon class="mr-1 h-3.5 w-3.5" />
+                {option.label}
+              </Button>
+            {/each}
+          </div>
         </div>
         <div class="flex gap-2">
           <Button class="flex-1 justify-center" variant="secondary" onclick={() => { closeMobileNav(); openShortcutHelp(); }}>

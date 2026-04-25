@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /**
- * Generate PWA PNG icons and Apple splash images from static/favicon.svg.
+ * Generate favicon and PWA assets from the canonical root Logo.JPG raster.
  *
  * Usage (requires sharp, added as a devDependency):
  *   node scripts/generate-pwa-assets.mjs
  *
  * Generates:
+ *   static/favicon.svg              (SVG wrapper around the raster source)
+ *   static/favicon.ico              (PNG-compressed ICO, 16/32/48px)
+ *   static/pwa/icon.svg             (SVG wrapper around the raster source)
  *   static/pwa/icon-192.png
  *   static/pwa/icon-512.png
  *   static/pwa/icon-maskable-512.png   (80% safe zone)
@@ -15,16 +18,50 @@
  * On CI/local without sharp, this script is a no-op if sharp is missing.
  */
 
-import { mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, '..');
-const outDir = resolve(root, 'static/pwa');
-const sourceSvg = resolve(root, 'static/favicon.svg');
+const staticDir = resolve(root, 'static');
+const outDir = resolve(staticDir, 'pwa');
+const sourceLogo = resolve(root, '..', 'Logo.JPG');
 
-const BG = { r: 2, g: 6, b: 23 };
+const BG = { r: 4, g: 12, b: 15 };
+
+function makeRasterSvg(dataUri) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Cognis">
+  <image href="${dataUri}" width="1024" height="1024" preserveAspectRatio="xMidYMid slice" />
+</svg>
+`;
+}
+
+function makeIco(entries) {
+  const headerSize = 6;
+  const directorySize = entries.length * 16;
+  let imageOffset = headerSize + directorySize;
+  const header = Buffer.alloc(headerSize + directorySize);
+
+  header.writeUInt16LE(0, 0); // reserved
+  header.writeUInt16LE(1, 2); // icon
+  header.writeUInt16LE(entries.length, 4);
+
+  entries.forEach((entry, index) => {
+    const dirOffset = headerSize + index * 16;
+    header.writeUInt8(entry.size >= 256 ? 0 : entry.size, dirOffset);
+    header.writeUInt8(entry.size >= 256 ? 0 : entry.size, dirOffset + 1);
+    header.writeUInt8(0, dirOffset + 2); // color count
+    header.writeUInt8(0, dirOffset + 3); // reserved
+    header.writeUInt16LE(1, dirOffset + 4); // color planes
+    header.writeUInt16LE(32, dirOffset + 6); // bits per pixel
+    header.writeUInt32LE(entry.buffer.length, dirOffset + 8);
+    header.writeUInt32LE(imageOffset, dirOffset + 12);
+    imageOffset += entry.buffer.length;
+  });
+
+  return Buffer.concat([header, ...entries.map((entry) => entry.buffer)]);
+}
 
 const iconTargets = [
   { name: 'icon-192.png', size: 192, maskable: false },
@@ -56,13 +93,29 @@ async function main() {
     return;
   }
 
-  if (!existsSync(sourceSvg)) {
-    console.error('[pwa-assets] source favicon missing at', sourceSvg);
+  if (!existsSync(sourceLogo)) {
+    console.error('[pwa-assets] source logo missing at', sourceLogo);
     process.exit(1);
   }
+  mkdirSync(staticDir, { recursive: true });
   mkdirSync(outDir, { recursive: true });
 
-  const svgBuffer = readFileSync(sourceSvg);
+  const logoBuffer = readFileSync(sourceLogo);
+  const logoDataUri = `data:image/jpeg;base64,${logoBuffer.toString('base64')}`;
+  const svgWrapper = makeRasterSvg(logoDataUri);
+  writeFileSync(resolve(staticDir, 'favicon.svg'), svgWrapper);
+  writeFileSync(resolve(outDir, 'icon.svg'), svgWrapper);
+  console.log('[pwa-assets] wrote favicon.svg');
+  console.log('[pwa-assets] wrote icon.svg');
+
+  const icoEntries = await Promise.all(
+    [16, 32, 48].map(async (size) => ({
+      size,
+      buffer: await sharp(logoBuffer).resize(size, size, { fit: 'cover' }).png().toBuffer()
+    }))
+  );
+  writeFileSync(resolve(staticDir, 'favicon.ico'), makeIco(icoEntries));
+  console.log('[pwa-assets] wrote favicon.ico');
 
   for (const target of iconTargets) {
     const size = target.size;
@@ -78,7 +131,7 @@ async function main() {
       }
     });
 
-    const logo = await sharp(svgBuffer).resize(inner, inner).png().toBuffer();
+    const logo = await sharp(logoBuffer).resize(inner, inner, { fit: 'cover' }).png().toBuffer();
 
     await canvas
       .composite([{ input: logo, left: pad, top: pad }])
@@ -102,7 +155,7 @@ async function main() {
       }
     });
 
-    const logo = await sharp(svgBuffer).resize(inner, inner).png().toBuffer();
+    const logo = await sharp(logoBuffer).resize(inner, inner, { fit: 'cover' }).png().toBuffer();
 
     await canvas
       .composite([{ input: logo, left: leftPad, top: topPad }])

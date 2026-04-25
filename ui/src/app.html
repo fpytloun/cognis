@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#07111A" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#06130F" />
+    <meta name="color-scheme" content="dark light" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Cognis" />
@@ -13,7 +13,7 @@
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" sizes="180x180" href="/pwa/apple-touch-icon.png" />
-    <link rel="mask-icon" href="/favicon.svg" color="#D97706" />
+    <link rel="mask-icon" href="/favicon.svg" color="#5FD0AA" />
     <link rel="manifest" href="/manifest.webmanifest" />
 
     <!-- Apple splash images per device. Media queries follow Apple's
@@ -41,6 +41,34 @@
 
     <script>
       (() => {
+        const THEME_KEY = 'cognis-theme';
+        const DARK_THEME_COLOR = '#06130F';
+        const LIGHT_THEME_COLOR = '#F6FBF7';
+
+        function preferredTheme() {
+          try {
+            const stored = localStorage.getItem(THEME_KEY);
+            if (stored === 'light' || stored === 'dark' || stored === 'system') return stored;
+          } catch {}
+          return 'system';
+        }
+
+        function resolveTheme(mode) {
+          if (mode === 'light' || mode === 'dark') return mode;
+          return matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+
+        function applyTheme(mode) {
+          const resolved = resolveTheme(mode);
+          document.documentElement.dataset.themeMode = mode;
+          document.documentElement.dataset.theme = resolved;
+          document.documentElement.classList.toggle('dark', resolved === 'dark');
+          document.documentElement.style.colorScheme = resolved;
+          document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolved === 'dark' ? DARK_THEME_COLOR : LIGHT_THEME_COLOR);
+        }
+
+        applyTheme(preferredTheme());
+
         const RECOVERY_KEY = 'cognis-startup-recovery-attempted';
         const CHUNK_ERROR_RE = /Failed to fetch dynamically imported module|Importing a module script failed|ChunkLoadError|error loading dynamically imported module/i;
 
@@ -75,13 +103,13 @@
 
             const wrapper = document.createElement('div');
             wrapper.id = 'cognis-startup-recovery';
-            wrapper.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;background:#07111A;color:#fef3c7;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+            wrapper.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;padding:24px;background:#06130F;color:#ECFDF5;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
             wrapper.innerHTML = [
               '<div style="max-width:420px;width:100%;border:1px solid rgba(51,65,85,.8);border-radius:24px;background:rgba(15,23,42,.96);padding:24px;box-shadow:0 24px 64px rgba(0,0,0,.45);">',
               '<h1 style="margin:0 0 12px;font-size:20px;font-weight:700;color:#fff;">Reload Cognis</h1>',
-              '<p style="margin:0 0 12px;line-height:1.6;color:#fde68a;">The app code on this device is out of date and Safari could not load the latest version.</p>',
-              message ? `<p style="margin:0 0 16px;font-size:12px;line-height:1.5;color:#d6b56d;word-break:break-word;">${message.replace(/[<>&]/g, '')}</p>` : '',
-              '<button id="cognis-recovery-reload" type="button" style="width:100%;min-height:44px;border:0;border-radius:14px;background:#F4D35E;color:#07111A;font-size:15px;font-weight:700;cursor:pointer;">Reload app</button>',
+              '<p style="margin:0 0 12px;line-height:1.6;color:#A7F3D0;">The app code on this device is out of date and Safari could not load the latest version.</p>',
+              message ? `<p style="margin:0 0 16px;font-size:12px;line-height:1.5;color:#6EE7B7;word-break:break-word;">${message.replace(/[<>&]/g, '')}</p>` : '',
+              '<button id="cognis-recovery-reload" type="button" style="width:100%;min-height:44px;border:0;border-radius:14px;background:#34D399;color:#06130F;font-size:15px;font-weight:700;cursor:pointer;">Reload app</button>',
               '</div>'
             ].join('');
             document.body.appendChild(wrapper);

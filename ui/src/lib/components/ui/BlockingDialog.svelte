@@ -114,7 +114,7 @@
   <div class={cn('fixed inset-0 z-[90] isolate', className)} role="presentation">
     <button
       aria-label={`Dismiss ${label}`}
-      class="absolute inset-0 bg-slate-950/80 backdrop-blur"
+      class="absolute inset-0 bg-[color:color-mix(in_srgb,var(--theme-bg-deep)_80%,transparent)] backdrop-blur"
       onclick={closeFromBackdrop}
       tabindex="-1"
       type="button"
@@ -130,14 +130,14 @@
         aria-labelledby={titleId}
         aria-modal="true"
         class={cn(
-          'relative flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-card',
+          'relative flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-[color:var(--theme-border)] bg-[color:var(--theme-bg)] shadow-card',
           panelClass
         )}
         role="dialog"
         tabindex="-1"
       >
         {#if header}
-          <div class="shrink-0 border-b border-slate-800/80 px-5 py-4 sm:px-6">
+          <div class="shrink-0 border-b border-[color:var(--theme-border)] px-5 py-4 sm:px-6">
             {@render header()}
           </div>
         {/if}
@@ -147,7 +147,7 @@
         </div>
 
         {#if footer}
-          <div class="shrink-0 border-t border-slate-800/80 px-5 py-4 sm:px-6">
+          <div class="shrink-0 border-t border-[color:var(--theme-border)] px-5 py-4 sm:px-6">
             {@render footer()}
           </div>
         {/if}

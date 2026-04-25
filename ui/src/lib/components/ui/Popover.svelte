@@ -98,7 +98,7 @@
     {@const isHorizontal = placement === 'left' || placement === 'right'}
     <span
       role="tooltip"
-      class={`pointer-events-none absolute z-50 whitespace-normal rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-normal leading-relaxed text-slate-300 shadow-lg ${
+      class={`pointer-events-none absolute z-50 whitespace-normal rounded-xl border border-[color:var(--theme-border)] bg-[color:var(--theme-panel)] px-3 py-2 text-xs font-normal leading-relaxed text-[color:var(--theme-text-muted)] shadow-lg ${
         placement === 'top'
           ? 'bottom-full left-1/2 mb-2 -translate-x-1/2'
           : placement === 'bottom'
@@ -113,13 +113,13 @@
     >
       {text}
       {#if placement === 'top'}
-        <span class="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-slate-700"></span>
+        <span class="absolute left-1/2 top-full -translate-x-1/2 border-4 border-transparent border-t-[color:var(--theme-border)]"></span>
       {:else if placement === 'bottom'}
-        <span class="absolute left-1/2 bottom-full -translate-x-1/2 border-4 border-transparent border-b-slate-700"></span>
+        <span class="absolute left-1/2 bottom-full -translate-x-1/2 border-4 border-transparent border-b-[color:var(--theme-border)]"></span>
       {:else if placement === 'right'}
-        <span class="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-slate-700"></span>
+        <span class="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-[color:var(--theme-border)]"></span>
       {:else}
-        <span class="absolute left-full top-1/2 -translate-y-1/2 border-4 border-transparent border-l-slate-700"></span>
+        <span class="absolute left-full top-1/2 -translate-y-1/2 border-4 border-transparent border-l-[color:var(--theme-border)]"></span>
       {/if}
     </span>
   {/if}

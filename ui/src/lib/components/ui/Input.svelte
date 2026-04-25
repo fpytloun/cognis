@@ -29,7 +29,7 @@
 
 <input
   class={cn(
-    'w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 text-base text-slate-100 placeholder:text-slate-500 min-h-[44px] py-2.5 md:min-h-[36px] md:py-2 md:text-sm',
+    'w-full rounded-xl border border-[color:var(--theme-border)] bg-[color:var(--theme-bg)] px-3 text-base text-[color:var(--theme-text)] placeholder:text-[color:var(--theme-text-muted)] min-h-[44px] py-2.5 md:min-h-[36px] md:py-2 md:text-sm',
     className
   )}
   {type}

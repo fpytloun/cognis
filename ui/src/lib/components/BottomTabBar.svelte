@@ -81,7 +81,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
 {#if !hidden && !$blockingOverlayActive}
   <nav
     bind:this={navEl}
-    class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
+    class="fixed inset-x-0 bottom-0 z-[60] border-t border-[color:var(--theme-border)] bg-[color:color-mix(in_srgb,var(--theme-bg)_95%,transparent)] backdrop-blur lg:hidden"
     style="padding-bottom: env(safe-area-inset-bottom, 0); padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
     aria-label="Primary"
   >
@@ -93,10 +93,10 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
           <a
             class={`flex min-h-[56px] flex-col items-center justify-center gap-0.5 px-2 py-1.5 text-[11px] transition ${
               active
-                ? 'text-amber-300'
+                ? 'text-[color:var(--theme-accent)]'
                 : isOnTabRoute
-                  ? 'text-slate-400 hover:text-white'
-                  : 'text-slate-500 hover:text-slate-300'
+                  ? 'text-[color:var(--theme-text-muted)] hover:text-[color:var(--theme-text)]'
+                  : 'text-[color:color-mix(in_srgb,var(--theme-text-muted)_65%,transparent)] hover:text-[color:var(--theme-text-muted)]'
             }`}
             href={tab.href}
             aria-current={active ? 'page' : undefined}
@@ -108,7 +108,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
       {/each}
     </ul>
     {#if !isOnTabRoute}
-      <p class="pb-0.5 text-center text-[10px] text-slate-600">Use ☰ for more pages</p>
+      <p class="pb-0.5 text-center text-[10px] text-[color:var(--theme-text-muted)]">Use ☰ for more pages</p>
     {/if}
   </nav>
 {/if}
