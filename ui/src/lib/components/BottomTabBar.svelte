@@ -100,7 +100,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
         {@const Icon = tab.icon}
         <li class="contents">
           <a
-            class={`flex min-h-[56px] flex-col items-center justify-center gap-0.5 px-2 py-1.5 text-[11px] transition ${
+            class={`flex min-h-[44px] flex-col items-center justify-center gap-1 px-2 py-1 text-[11px] transition ${
               active
                 ? 'text-sky-300'
                 : isOnTabRoute

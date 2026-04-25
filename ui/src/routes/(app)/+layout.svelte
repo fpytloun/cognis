@@ -271,7 +271,7 @@ import X from 'lucide-svelte/icons/x';
     if (isChatRoute) {
       return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
     }
-    return 'min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 pb-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 sm:pb-4 lg:px-0 lg:pb-0 lg:pt-0';
+    return 'min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 lg:px-0 lg:pb-0 lg:pt-0';
   });
 
   $effect(() => {

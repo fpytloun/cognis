@@ -628,7 +628,7 @@
                 {/each}
               {/if}
               {#if (column.id === 'done' ? doneTaskGroups.length : tasksForColumn(column.id).length) === 0}
-                <p class="py-8 text-center text-sm text-slate-500">No tasks.</p>
+                <p class="py-6 text-center text-sm text-slate-500">No tasks.</p>
               {/if}
             </div>
           </section>
