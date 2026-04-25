@@ -43,7 +43,8 @@
 <div class="flex min-h-[100dvh] items-center justify-center overflow-y-auto px-4 py-6" style="padding-left: max(1rem, env(safe-area-inset-left)); padding-right: max(1rem, env(safe-area-inset-right)); padding-top: calc(env(safe-area-inset-top) + 1.5rem); padding-bottom: calc(env(safe-area-inset-bottom) + 1.5rem);">
   <Card class="w-full max-w-sm p-8 sm:p-10">
     <div class="space-y-6">
-      <div class="space-y-1 text-center">
+      <div class="space-y-3 text-center">
+        <img alt="" class="mx-auto h-16 w-16 rounded-3xl shadow-card" src="/pwa/icon-192.png" />
         <h1 class="text-2xl font-semibold text-white">Cognis</h1>
         <p class="text-sm text-slate-400">User sign-in</p>
       </div>

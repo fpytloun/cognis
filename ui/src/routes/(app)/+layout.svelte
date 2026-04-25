@@ -394,13 +394,16 @@ import X from 'lucide-svelte/icons/x';
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
-            <div class="space-y-2 border-b border-slate-800/80 pb-5">
-              <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
-              <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
+            <div class="flex items-center gap-3 border-b border-slate-800/80 pb-5">
+              <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
+              <div class="min-w-0 space-y-1">
+                <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
+                <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
+              </div>
             </div>
           {:else}
             <div class="flex justify-center border-b border-slate-800/80 pb-4">
-              <span class="text-lg font-bold text-sky-300">C</span>
+              <img alt="Cognis" class="h-9 w-9 rounded-xl shadow-card" src="/pwa/icon-192.png" />
             </div>
           {/if}
 
@@ -662,9 +665,12 @@ import X from 'lucide-svelte/icons/x';
   <Sheet open={mobileNavOpen} onClose={closeMobileNav} side="left" label="Navigation menu">
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
-        <div>
-          <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
-          <p class="mt-1 text-sm text-slate-400">{$auth.user?.email}</p>
+        <div class="flex min-w-0 items-center gap-3">
+          <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
+          <div class="min-w-0">
+            <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Cognis</p>
+            <p class="mt-1 truncate text-sm text-slate-400">{$auth.user?.email}</p>
+          </div>
         </div>
         <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
           <X class="h-4 w-4" />

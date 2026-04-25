@@ -110,6 +110,7 @@
       <p class="text-sm text-slate-300">Loading setup status…</p>
     {:else if setupComplete && !setupAvailable}
       <div class="space-y-4">
+        <img alt="" class="h-16 w-16 rounded-3xl shadow-card" src="/pwa/icon-192.png" />
         <p class="text-sm uppercase tracking-[0.3em] text-sky-300">Setup complete</p>
         <h1 class="text-3xl font-semibold text-white">Cognis is already configured</h1>
         <p class="text-sm leading-6 text-slate-400">Open the login page to sign in with an existing account.</p>
@@ -118,6 +119,7 @@
     {:else}
       <div class="space-y-6">
         <div>
+          <img alt="" class="mb-5 h-16 w-16 rounded-3xl shadow-card" src="/pwa/icon-192.png" />
           <p class="text-sm uppercase tracking-[0.3em] text-sky-300">First run</p>
           <h1 class="mt-3 text-3xl font-semibold text-white">Create the first admin account</h1>
           <p class="mt-3 text-sm leading-6 text-slate-400">
