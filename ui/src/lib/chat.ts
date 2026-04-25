@@ -999,14 +999,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const itemId = `message:${event.message_id}:${next.length}`;
     const index = findOpenPhaseAssistantIndex(next, turnId);
     const attachments = normalizeEventAttachments(event.attachments);
+    const finalContent = typeof event.content === 'string' ? event.content : null;
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
+      const completeContent = finalContent ?? message.content;
       // Finalize and release the streamer for this message.
       const streamer = getStreamer(message.id);
-      const finalHtml = streamer.finalize(message.content);
+      const finalHtml = streamer.finalize(completeContent);
       releaseStreamer(message.id);
       next[index] = {
         ...message,
+        content: completeContent,
         html: finalHtml,
         seq: event.seq,
         streaming: false,
@@ -1016,10 +1019,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       return next;
     }
 
-    if (attachments.length > 0) {
+    if (finalContent || attachments.length > 0) {
       upsertAssistantTurnMessage(next, {
         id: itemId,
-        content: '',
+        content: finalContent ?? '',
         timestamp: new Date().toISOString(),
         seq: event.seq,
         messageId: event.message_id,

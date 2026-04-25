@@ -108,6 +108,59 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('repairs missing streamed prefix from message_complete content', () => {
+    const streamed = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      content: 'tail only',
+      index: 1
+    });
+
+    const completed = applyWebSocketEvent(streamed, {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      content: 'full message with missing prefix and tail only',
+      seq: 4,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0,
+    });
+
+    expect(completed[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'full message with missing prefix and tail only',
+      seq: 4,
+      streaming: false,
+    });
+  });
+
+  it('creates a full assistant bubble from message_complete content without prior chunks', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_full',
+      content: 'completed reply',
+      seq: 5,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0,
+    });
+
+    expect(items[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'completed reply',
+      seq: 5,
+      streaming: false,
+    });
+  });
+
   it('keeps attachment-only assistant messages in normalized history', () => {
     const items = normalizeHistory([
       {

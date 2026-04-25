@@ -278,6 +278,7 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
             conversation_id="conv-1",
             session_id="sess-1",
             message_id="msg-1",
+            final_content="Final answer",
             attachments=[
                 {
                     "artifact_id": "img_1",
@@ -292,6 +293,7 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
     )
 
     payload = manager.send_to_conversation.await_args.args[1]
+    assert payload["content"] == "Final answer"
     assert payload["attachments"] == [
         {
             "artifact_id": "img_1",

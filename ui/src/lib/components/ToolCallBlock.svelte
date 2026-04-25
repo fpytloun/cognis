@@ -267,21 +267,21 @@
   }
 </script>
 
-<article class={`rounded-2xl border bg-slate-900/80 text-sm shadow-card ${borderColor()}`}>
+<article class={`min-w-0 overflow-hidden rounded-2xl border bg-slate-900/80 text-sm shadow-card ${borderColor()}`}>
   <!-- Header row (always visible, clickable) -->
   <button
-    class="flex w-full items-center gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40"
+    class="flex min-w-0 w-full items-start gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40 sm:items-center"
     onclick={toggle}
     type="button"
   >
     <span class="text-xs text-slate-500">{expanded ? '\u25BC' : '\u25B6'}</span>
-    <span class="font-semibold text-cyan-300">{item.toolName}</span>
-    {#if subtitle()}
-      <span class="min-w-0 flex-1 truncate text-xs text-slate-400">{subtitle()}</span>
-    {:else}
-      <span class="flex-1"></span>
-    {/if}
-    <span class={`flex items-center gap-1.5 text-xs font-medium ${statusColor()}`}>
+    <span class="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
+      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]">{item.toolName}</span>
+      {#if subtitle()}
+        <span class="min-w-0 text-xs text-slate-400 sm:flex-1 sm:truncate">{subtitle()}</span>
+      {/if}
+    </span>
+    <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
       {#if item.status === 'started'}
         <span class="inline-block h-3 w-3 animate-spin rounded-full border border-sky-400 border-t-transparent"></span>
         <span>running</span>

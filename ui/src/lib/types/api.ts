@@ -1203,6 +1203,7 @@ export interface WebSocketMessageCompleteEvent {
   session_id?: string;
   message_id: string;
   turn_id?: string | null;
+  content?: string;
   seq: number;
   token_usage: Record<string, unknown> | null;
   context_usage: ContextUsage | null;

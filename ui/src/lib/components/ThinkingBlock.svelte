@@ -8,6 +8,14 @@
   let { item, compact = false } = $props<{ item: ThinkingTimelineItem; compact?: boolean }>();
 
   let expanded = $state(false);
+  let initializedFromCompact = $state(false);
+
+  $effect(() => {
+    if (initializedFromCompact) return;
+    // Log views start expanded for scanability, but still remain collapsible.
+    expanded = compact;
+    initializedFromCompact = true;
+  });
 
   function toggle(): void {
     expanded = !expanded;
@@ -74,7 +82,7 @@
   </button>
 
   <!-- Expanded body -->
-  {#if expanded || (compact && item.blocks.length > 0)}
+  {#if expanded}
     <div class="mx-3 mb-2 overflow-hidden rounded-lg border border-cyan-500/20 bg-cyan-950/20">
       {#each item.blocks as block, i (block.block_id)}
         {#if i > 0}
