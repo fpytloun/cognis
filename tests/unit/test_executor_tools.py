@@ -95,6 +95,15 @@ class TestDefinitions:
             if tool.name in {"read", "glob", "grep", "list_directory"}:
                 assert tool.read_only, f"{tool.name} should be read_only"
 
+    def test_apply_patch_schema_is_openai_responses_function_compatible(self) -> None:
+        tool = next(tool for tool in ALL_EXECUTOR_TOOLS if tool.name == "apply_patch")
+        forbidden_top_level = {"oneOf", "anyOf", "allOf", "enum", "not"}
+
+        assert tool.parameters.get("type") == "object"
+        assert not (forbidden_top_level & set(tool.parameters))
+        assert "patchText" in tool.parameters.get("properties", {})
+        assert "operation" in tool.parameters.get("properties", {})
+
 
 class TestReadTool:
     """Test the read filesystem tool."""

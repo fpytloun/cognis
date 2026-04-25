@@ -406,7 +406,9 @@ def _looks_like_openai_apply_patch_model(model_name: str) -> bool:
     normalized = model_name.strip().lower()
     if "gpt-oss" in normalized:
         return False
-    return "codex" in normalized or normalized.startswith(("gpt-5.1", "openai/gpt-5.1"))
+    return "codex" in normalized or normalized.startswith(
+        ("gpt-5.1", "openai/gpt-5.1", "gpt-5.5", "openai/gpt-5.5")
+    )
 
 
 def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -1150,10 +1152,10 @@ class LiteLLMProvider:
             return False, "disabled_by_config"
         if not use_responses_api:
             return False, "responses_api_not_active"
-        if not bool(model_info.supports_openai_apply_patch):
-            return False, "model_capability_missing"
         if setting is True:
             return True, "enabled_by_config"
+        if not bool(model_info.supports_openai_apply_patch):
+            return False, "model_capability_missing"
         return True, "model_capability"
 
     async def resolve_tool_exposure_contract(

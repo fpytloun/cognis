@@ -170,6 +170,7 @@ APPLY_PATCH_TOOL = ToolDefinition(
     ),
     parameters={
         "type": "object",
+        "description": "Provide either patchText or operation.",
         "properties": {
             "patchText": {
                 "type": "string",
@@ -189,7 +190,6 @@ APPLY_PATCH_TOOL = ToolDefinition(
                 "required": ["type", "path"],
             },
         },
-        "anyOf": [{"required": ["patchText"]}, {"required": ["operation"]}],
     },
     source=_EXECUTOR_SOURCE,
     category="filesystem",

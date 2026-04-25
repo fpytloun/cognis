@@ -861,6 +861,32 @@ async def test_litellm_provider_does_not_infer_native_apply_patch_for_compatible
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_infers_native_apply_patch_for_gpt55_direct_openai(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-5.5"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("gpt-5.5", provider_id="openai")
+
+    assert model_info.supports_responses_api is True
+    assert model_info.supports_openai_apply_patch is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_resolves_native_apply_patch_toggle(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -903,7 +929,7 @@ async def test_litellm_provider_resolves_native_apply_patch_toggle(tmp_path: obj
 
 
 @pytest.mark.asyncio
-async def test_litellm_provider_does_not_force_native_apply_patch_without_capability(
+async def test_litellm_provider_explicitly_forces_native_apply_patch_without_capability(
     tmp_path: object,
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
@@ -939,8 +965,8 @@ async def test_litellm_provider_does_not_force_native_apply_patch_without_capabi
         allow_tool_search=False,
     )
 
-    assert contract.native_apply_patch is False
-    assert contract.native_apply_patch_reason == "model_capability_missing"
+    assert contract.native_apply_patch is True
+    assert contract.native_apply_patch_reason == "enabled_by_config"
     await engine.dispose()
 
 
