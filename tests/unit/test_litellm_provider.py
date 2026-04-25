@@ -1329,6 +1329,179 @@ async def test_litellm_provider_generate_uses_responses_bridge_for_supported_mod
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_responses_sets_cache_key_and_store_false(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "prompt_cache_retention": "24h",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "hello"}]}
+                ],
+            }
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "system", "content": "immutable prefix"},
+            {"role": "user", "content": "hi"},
+        ],
+        model="gpt-5.4",
+        max_tokens=32,
+        cache_breakpoint_index=0,
+    )
+
+    assert captured["instructions"] == "immutable prefix"
+    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["store"] is False
+    assert str(captured["prompt_cache_key"]).startswith("cognis-")
+    assert captured["prompt_cache_retention"] == "24h"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_responses_respects_provider_cache_overrides(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "responses_store": True,
+                    "prompt_cache_key": "provider-cache-key",
+                    "prompt_cache_retention": "1h",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "system", "content": "immutable prefix"},
+            {"role": "user", "content": "hi"},
+        ],
+        model="gpt-5.4",
+        max_tokens=32,
+        cache_breakpoint_index=0,
+    )
+
+    assert captured["store"] is True
+    assert captured["prompt_cache_key"] == "provider-cache-key"
+    assert captured["prompt_cache_retention"] == "1h"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_responses_respects_call_cache_overrides(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "responses_store": False,
+                    "prompt_cache_key": "provider-cache-key",
+                    "prompt_cache_retention": "1h",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "system", "content": "immutable prefix"},
+            {"role": "user", "content": "hi"},
+        ],
+        model="gpt-5.4",
+        max_tokens=32,
+        cache_breakpoint_index=0,
+        store=True,
+        prompt_cache_key="call-cache-key",
+        prompt_cache_retention="2h",
+    )
+
+    assert captured["store"] is True
+    assert captured["prompt_cache_key"] == "call-cache-key"
+    assert captured["prompt_cache_retention"] == "2h"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_responses_bridge_translates_tools_shape(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,

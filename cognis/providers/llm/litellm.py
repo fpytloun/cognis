@@ -323,6 +323,56 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _responses_prompt_cache_key(
+    *, provider: LLMProviderRow | None, resolved_model: str, instructions: str
+) -> str:
+    provider_id = provider.provider_id if provider is not None else "default"
+    material = f"v1\0{provider_id}\0{resolved_model}\0{instructions}".encode()
+    return f"cognis-{hashlib.sha256(material).hexdigest()[:48]}"
+
+
+def _apply_responses_request_defaults(
+    responses_kwargs: dict[str, Any],
+    *,
+    provider: LLMProviderRow | None,
+    resolved_model: str,
+    instructions: str | None,
+) -> dict[str, Any]:
+    """Apply Cognis defaults for OpenAI Responses requests.
+
+    Cognis owns durable history in Intaris, so Responses storage is disabled by
+    default. Prompt cache affinity is keyed by the immutable instructions prefix
+    unless the caller or provider explicitly supplies a key.
+    """
+
+    result = dict(responses_kwargs)
+    config = dict(provider.config) if provider is not None and isinstance(provider.config, dict) else {}
+
+    if "store" not in result:
+        configured_store = config.get("responses_store")
+        result["store"] = configured_store if isinstance(configured_store, bool) else False
+
+    if "prompt_cache_retention" not in result:
+        retention = config.get("prompt_cache_retention")
+        if isinstance(retention, str) and retention.strip():
+            result["prompt_cache_retention"] = retention.strip()
+
+    if "prompt_cache_key" not in result:
+        configured_key = config.get("prompt_cache_key")
+        if isinstance(configured_key, str) and configured_key.strip():
+            result["prompt_cache_key"] = configured_key.strip()
+        elif config.get("use_prompt_cache_key") is not False and isinstance(instructions, str):
+            stripped_instructions = instructions.strip()
+            if stripped_instructions:
+                result["prompt_cache_key"] = _responses_prompt_cache_key(
+                    provider=provider,
+                    resolved_model=resolved_model,
+                    instructions=stripped_instructions,
+                )
+
+    return result
+
+
 def _looks_like_image_generation_model(model_name: str) -> bool:
     normalized = model_name.strip().lower().replace("_", "-")
     return any(
@@ -1552,6 +1602,12 @@ class LiteLLMProvider:
             responses_kwargs = responses_request_kwargs(request_kwargs)
             if responses_instructions is not None:
                 responses_kwargs["instructions"] = responses_instructions
+            responses_kwargs = _apply_responses_request_defaults(
+                responses_kwargs,
+                provider=provider,
+                resolved_model=resolved_model,
+                instructions=responses_instructions,
+            )
             try:
                 response = await with_llm_retry(
                     litellm.aresponses,
@@ -1753,6 +1809,12 @@ class LiteLLMProvider:
             responses_kwargs = responses_request_kwargs(request_kwargs)
             if responses_instructions is not None:
                 responses_kwargs["instructions"] = responses_instructions
+            responses_kwargs = _apply_responses_request_defaults(
+                responses_kwargs,
+                provider=provider,
+                resolved_model=resolved_model,
+                instructions=responses_instructions,
+            )
             try:
                 stream = await with_llm_retry(
                     litellm.aresponses,
