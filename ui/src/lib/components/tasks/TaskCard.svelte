@@ -15,9 +15,9 @@
 
   const statusColors: Record<string, string> = {
     draft: 'border-slate-600 text-slate-400',
-    queued: 'border-amber-700 text-amber-300',
-    ready: 'border-amber-700 text-amber-300',
-    running: 'border-amber-700 text-amber-300',
+    queued: 'border-sky-700 text-sky-300',
+    ready: 'border-sky-700 text-sky-300',
+    running: 'border-sky-700 text-sky-300',
     paused: 'border-yellow-700 text-yellow-300',
     completed: 'border-emerald-700 text-emerald-300',
     failed: 'border-rose-700 text-rose-300',
@@ -26,7 +26,7 @@
 </script>
 
 <div
-  class="cursor-pointer rounded-2xl border p-3 transition-colors hover:bg-slate-800/40 {selected ? 'border-amber-500/60 bg-amber-950/20' : 'border-slate-800 bg-slate-950/70'}"
+  class="cursor-pointer rounded-2xl border p-3 transition-colors hover:bg-slate-800/40 {selected ? 'border-sky-500/60 bg-sky-950/20' : 'border-slate-800 bg-slate-950/70'}"
   onclick={onclick}
   role="button"
   tabindex="0"
@@ -35,7 +35,7 @@
   <div class="flex items-start justify-between gap-2">
     <a
       href="/tasks/{task.task_id}"
-      class="text-sm font-medium text-white hover:text-amber-300 hover:underline"
+      class="text-sm font-medium text-white hover:text-sky-300 hover:underline"
       onclick={(e) => e.stopPropagation()}
     >
       {task.title}

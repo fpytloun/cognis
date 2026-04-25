@@ -10,7 +10,7 @@
     return normalized === 'healthy' || normalized === 'active'
       ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
       : normalized === 'degraded'
-        ? 'border-amber-500/40 bg-amber-500/10 text-amber-100'
+        ? 'border-sky-500/40 bg-sky-500/10 text-sky-100'
         : normalized === 'disabled' || normalized === 'unknown'
           ? 'border-slate-700 bg-slate-900/80 text-slate-300'
           : 'border-rose-500/40 bg-rose-500/10 text-rose-100';

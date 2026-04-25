@@ -9,7 +9,7 @@
   }>();
 </script>
 
-<article class="rounded-3xl border border-orange-500/30 bg-orange-500/10 px-4 py-4 text-orange-100 shadow-card">
+<article class="rounded-3xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-4 text-cyan-100 shadow-card">
   <div class="flex flex-wrap items-center justify-between gap-4">
     <div>
       <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">Session compacted</p>

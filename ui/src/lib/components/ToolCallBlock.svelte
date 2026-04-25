@@ -106,7 +106,7 @@
   function statusColor(): string {
     if (item.status === 'completed') return 'text-emerald-400';
     if (item.status === 'failed') return 'text-rose-400';
-    return 'text-amber-400';
+    return 'text-sky-400';
   }
 
   function durationText(): string {
@@ -177,13 +177,13 @@
   function evalDecisionColor(decision: string): string {
     if (decision === 'approve') return 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10';
     if (decision === 'deny') return 'text-rose-400 border-rose-500/40 bg-rose-500/10';
-    if (decision === 'escalate') return 'text-amber-400 border-amber-500/40 bg-amber-500/10';
+    if (decision === 'escalate') return 'text-sky-400 border-sky-500/40 bg-sky-500/10';
     return 'text-slate-400 border-slate-700 bg-slate-800/40';
   }
 
   function evalRiskColor(risk: string): string {
     if (risk === 'critical') return 'text-rose-400';
-    if (risk === 'high') return 'text-amber-400';
+    if (risk === 'high') return 'text-sky-400';
     if (risk === 'medium') return 'text-yellow-400';
     return 'text-slate-400';
   }
@@ -253,7 +253,7 @@
     {/if}
     <span class={`flex items-center gap-1.5 text-xs font-medium ${statusColor()}`}>
       {#if item.status === 'started'}
-        <span class="inline-block h-3 w-3 animate-spin rounded-full border border-amber-400 border-t-transparent"></span>
+        <span class="inline-block h-3 w-3 animate-spin rounded-full border border-sky-400 border-t-transparent"></span>
         <span>running</span>
       {:else}
         <span>{statusIcon()}</span>
@@ -277,15 +277,15 @@
       {#if isStepRequestInput()}
         <div>
           <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Question</p>
-          <div class="rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-sm text-amber-50">
+          <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
             <p class="leading-6">{stepRequestQuestion() || 'The agent requested more input.'}</p>
             {#if stepRequestContext()}
-              <p class="mt-2 text-xs text-amber-100/80">{stepRequestContext()}</p>
+              <p class="mt-2 text-xs text-sky-100/80">{stepRequestContext()}</p>
             {/if}
             {#if stepRequestOptions().length > 0}
               <div class="mt-3 flex flex-wrap gap-2">
                 {#each stepRequestOptions() as option}
-                  <span class="rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-[11px] text-amber-100">{option}</span>
+                  <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100">{option}</span>
                 {/each}
               </div>
             {/if}
@@ -322,7 +322,7 @@
             <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
             {#if inputData.hiddenCount > 0}
               <button
-                class="mt-1 text-xs text-amber-400 hover:text-amber-300"
+                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
                 onclick={() => { inputExpanded = !inputExpanded; }}
                 type="button"
               >
@@ -340,7 +340,7 @@
             <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
             {#if outputData.hiddenCount > 0}
               <button
-                class="mt-1 text-xs text-amber-400 hover:text-amber-300"
+                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
                 onclick={() => { outputExpanded = !outputExpanded; }}
                 type="button"
               >

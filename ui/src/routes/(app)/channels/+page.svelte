@@ -551,7 +551,7 @@
         { id: 'contacts', label: `Verified senders (${contacts.length})` },
       ] as tab}
         <button
-          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-emerald-500 text-slate-950' : 'border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 hover:text-white'}`}
+          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-sky-500 text-slate-950' : 'border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 hover:text-white'}`}
           onclick={() => handleTabChange(tab.id as ChannelsTab)}
           type="button"
         >
@@ -622,7 +622,7 @@
               <p class="text-xs uppercase tracking-[0.24em] text-slate-500">Account editor</p>
               <h2 class="mt-2 text-lg font-semibold text-white">Choose a platform or existing account</h2>
               <p class="mt-2">Select an account to edit, or start a new account setup to see platform-specific guidance here.</p>
-              <button class="mt-4 rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-slate-950" onclick={beginCreateDefault} type="button">Add channel</button>
+              <button class="mt-4 rounded-xl bg-sky-500 px-4 py-2 text-sm font-medium text-slate-950" onclick={beginCreateDefault} type="button">Add channel</button>
             </Card>
           {:else}
             <ChannelAccountEditor

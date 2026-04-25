@@ -19,7 +19,7 @@
       <div class="flex flex-wrap items-center gap-2">
         <h2 class="text-lg font-semibold text-white">{request.sender_name || request.sender_id}</h2>
         <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{request.channel_type}</span>
-        <span class="rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-xs text-amber-300">{formatRemaining(request.expires_at)}</span>
+        <span class="rounded-full border border-sky-500/20 bg-sky-500/10 px-3 py-1 text-xs text-sky-300">{formatRemaining(request.expires_at)}</span>
       </div>
       <div class="mt-3 space-y-1 text-sm text-slate-400">
         <p>Account: {request.account_display_name || request.account_id}</p>

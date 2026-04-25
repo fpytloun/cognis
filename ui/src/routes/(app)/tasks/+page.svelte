@@ -541,7 +541,7 @@
         </label>
       </div>
       {#if filtersActive}
-        <p class="mt-3 text-sm text-amber-200">Priority drag reordering is disabled while filters are active.</p>
+        <p class="mt-3 text-sm text-sky-200">Priority drag reordering is disabled while filters are active.</p>
       {/if}
     </Card>
 
@@ -555,7 +555,7 @@
             role="tab"
             aria-selected={mobileActiveColumn === column.id}
             onclick={() => (mobileActiveColumn = column.id)}
-            class={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${mobileActiveColumn === column.id ? 'border-emerald-400 bg-emerald-500/15 text-white' : 'border-slate-800 bg-slate-900/60 text-slate-300'}`}
+            class={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition ${mobileActiveColumn === column.id ? 'border-sky-400 bg-sky-500/15 text-white' : 'border-slate-800 bg-slate-900/60 text-slate-300'}`}
           >
             {column.label}
             <span class="ml-1.5 rounded-full bg-slate-950/60 px-2 py-0.5 text-xs text-slate-400">{count}</span>
@@ -642,7 +642,7 @@
         <div class="grid min-w-[1200px] gap-4 lg:grid-cols-5">
         {#each TASK_BOARD_COLUMNS as column}
           <section
-            class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-emerald-500/50 bg-emerald-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+            class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
             ondragover={(event: DragEvent) => {
               if (dragState && isDragTransitionValid(dragState.column, column.id)) {
                 event.preventDefault();

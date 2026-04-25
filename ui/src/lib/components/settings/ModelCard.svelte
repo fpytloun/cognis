@@ -43,7 +43,7 @@
       <!-- Model ID + default star -->
       <div class="flex items-center gap-2">
         {#if isDefault}
-          <span class="text-amber-400" title="Default model">&#9733;</span>
+          <span class="text-sky-400" title="Default model">&#9733;</span>
         {/if}
         <span class="text-sm font-bold text-slate-100">{model.display_name ?? model.model_id}</span>
         {#if model.display_name}

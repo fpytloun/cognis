@@ -23,7 +23,7 @@
     <p class="mt-4 text-sm leading-6 text-slate-300">{message()}</p>
     <div class="mt-8 flex flex-wrap gap-3">
       <button
-        class="rounded-xl bg-amber-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-amber-400"
+        class="rounded-xl bg-sky-500 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-sky-400"
         onclick={goHome}
       >
         Return home

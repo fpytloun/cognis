@@ -611,16 +611,16 @@
             <div class="flex flex-wrap items-center justify-end gap-2">
               <Badge>{skill.source}</Badge>
               {#if skill.is_system}
-                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">system</Badge>
+                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">system</Badge>
               {/if}
               {#if skill.attach_to_all_agents ?? skill.auto_load}
-                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">attached to all agents</Badge>
+                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">attached to all agents</Badge>
               {/if}
               {#if savedSteps.length > 0}
                 <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">workflow</Badge>
               {/if}
               {#if currentVersion?.decomposition_stale}
-                <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">decomposition stale</Badge>
+                <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">decomposition stale</Badge>
               {/if}
             </div>
           {/if}
@@ -705,7 +705,7 @@
                       <Badge>read-only</Badge>
                     {/if}
                     {#if tool.recipe && typeof tool.recipe === 'object' && tool.recipe !== null}
-                      <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">{String((tool.recipe as Record<string, unknown>).mode ?? 'recipe')}</Badge>
+                      <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{String((tool.recipe as Record<string, unknown>).mode ?? 'recipe')}</Badge>
                     {/if}
                   </div>
                   <p class="mt-1 text-xs text-slate-400">{String(tool.description ?? '')}</p>
@@ -1126,7 +1126,7 @@
             <button aria-label="Workflow decomposition help" class={tooltipButtonClass} title="Workflow decomposition help" type="button"><Info class="h-4 w-4" /></button>
           </Tooltip>
           {#if currentVersion?.decomposition_stale}
-            <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">stale</Badge>
+            <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">stale</Badge>
           {/if}
         </div>
 
@@ -1158,7 +1158,7 @@
             <div class="flex items-center justify-between gap-2">
               <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Saved on skill</p>
               {#if currentVersion?.decomposition_stale}
-                <p class="text-xs text-amber-300">Refresh suggested steps before relying on them.</p>
+                <p class="text-xs text-sky-300">Refresh suggested steps before relying on them.</p>
               {/if}
             </div>
             {#if savedSteps.length > 0}
@@ -1186,7 +1186,7 @@
           <div class="space-y-2">
             <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Latest suggestion</p>
             {#if decompositionPreview && decompositionPreview.length > 0}
-              <div class="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-slate-200">
+              <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-3 text-xs text-slate-200">
                 {#if decompositionRationale}
                   <p class="text-slate-300">{decompositionRationale}</p>
                 {/if}
@@ -1228,7 +1228,7 @@
                   <p class="mt-1 text-xs text-slate-500">{asset.content_type} · {asset.size_bytes} bytes · {asset.content_hash.slice(0, 8)}</p>
                 </div>
                 {#if asset.url}
-                  <a class="inline-flex items-center gap-1 text-xs text-amber-300 hover:text-amber-200" href={asset.url} rel="noreferrer" target="_blank">
+                  <a class="inline-flex items-center gap-1 text-xs text-sky-300 hover:text-sky-200" href={asset.url} rel="noreferrer" target="_blank">
                     <Download class="h-3.5 w-3.5" /> Download
                   </a>
                 {/if}
@@ -1261,7 +1261,7 @@
                         <Badge class="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">current</Badge>
                       {/if}
                       {#if version.version_id === latestVersionId}
-                        <Badge class="border-amber-500/30 bg-amber-500/10 text-amber-300">latest</Badge>
+                        <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">latest</Badge>
                       {/if}
                     </div>
                     <p class="mt-1 text-xs text-slate-500">{formatTimestamp(version.created_at)} · {version.version_id} · {version.content_hash.slice(0, 8)}</p>

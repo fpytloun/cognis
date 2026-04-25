@@ -1,13 +1,13 @@
 <script lang="ts">
   let {
     label = '',
-    tone = 'amber',
+    tone = 'sky',
     size = 'md',
     inline = false,
     class: className = ''
   } = $props<{
     label?: string;
-    tone?: 'sky' | 'slate' | 'amber';
+    tone?: 'sky' | 'slate' | 'cyan';
     size?: 'sm' | 'md';
     inline?: boolean;
     class?: string;
@@ -15,11 +15,11 @@
 
   function dotClass(): string {
     const palette = {
-      sky: 'bg-amber-400',
+      sky: 'bg-sky-400',
       slate: 'bg-slate-400',
-      amber: 'bg-amber-300'
+      cyan: 'bg-cyan-300'
     } as const;
-    const safeTone: keyof typeof palette = tone === 'slate' || tone === 'sky' ? tone : 'amber';
+    const safeTone: keyof typeof palette = tone === 'slate' || tone === 'cyan' || tone === 'sky' ? tone : 'sky';
     const dimensions = size === 'sm' ? 'h-1.5 w-1.5' : 'h-2 w-2';
     return `${dimensions} rounded-full ${palette[safeTone]}`;
   }

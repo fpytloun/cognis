@@ -7,8 +7,8 @@
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],
   "orientation": "any",
-  "background_color": "#06130F",
-  "theme_color": "#06130F",
+  "background_color": "#07111A",
+  "theme_color": "#07111A",
   "categories": ["productivity", "developer"],
   "icons": [
     { "src": "/pwa/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },

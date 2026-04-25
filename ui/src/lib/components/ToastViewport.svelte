@@ -16,11 +16,11 @@ import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
       icon: AlertCircle
     },
     warning: {
-      className: 'border-amber-500/40 bg-amber-500/15 text-amber-50',
+      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
       icon: TriangleAlert
     },
     info: {
-      className: 'border-amber-500/40 bg-amber-500/15 text-amber-50',
+      className: 'border-sky-500/40 bg-sky-500/15 text-sky-50',
       icon: Info
     }
   } as const;

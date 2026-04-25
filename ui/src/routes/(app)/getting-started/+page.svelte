@@ -56,7 +56,7 @@
     <Card class="p-6">
       <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <p class="text-sm uppercase tracking-[0.25em] text-emerald-300">Getting started</p>
+          <p class="text-sm uppercase tracking-[0.25em] text-sky-300">Getting started</p>
           <h1 class="mt-2 text-2xl font-semibold text-white">Set up Cognis end to end</h1>
           <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">
             Use this checklist to verify companion services, add an LLM provider, create an agent, and start your first chat.
@@ -84,7 +84,7 @@
           <a class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5" href={step.href}>
             <div class="flex items-center justify-between gap-3">
               <p class="font-medium text-white">{step.label}</p>
-              <span class={`rounded-full px-3 py-1 text-xs ${step.done ? 'bg-emerald-500/20 text-emerald-200' : 'bg-amber-500/20 text-amber-200'}`}>
+              <span class={`rounded-full px-3 py-1 text-xs ${step.done ? 'bg-emerald-500/20 text-emerald-200' : 'bg-sky-500/20 text-sky-200'}`}>
                 {step.done ? 'Done' : 'Pending'}
               </span>
             </div>

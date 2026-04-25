@@ -3,42 +3,18 @@
 @tailwind utilities;
 
 :root {
-  color-scheme: dark light;
+  color-scheme: dark;
   --app-viewport-height: 100dvh;
   --app-bottom-inset: env(safe-area-inset-bottom, 0px);
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
-  --theme-bg: #040c0f;
-  --theme-bg-deep: #020607;
-  --theme-panel: #071411;
-  --theme-panel-muted: #0b2019;
-  --theme-border: #18372f;
-  --theme-text: #ecfdf5;
-  --theme-text-muted: #9fb9ae;
-  --theme-accent: #5fd0aa;
-  --theme-accent-strong: #34d399;
-  --theme-accent-soft: rgb(52 211 153 / 0.14);
-  --theme-focus: #6ee7b7;
-  --theme-link: #6ee7b7;
-  --theme-link-hover: #a7f3d0;
-  --theme-app-color: #06130f;
-}
-
-:root[data-theme='light'] {
-  --theme-bg: #f6fbf7;
-  --theme-bg-deep: #eaf5ef;
-  --theme-panel: #ffffff;
-  --theme-panel-muted: #edf7f1;
-  --theme-border: #cfe2d8;
-  --theme-text: #0f241d;
-  --theme-text-muted: #557066;
-  --theme-accent: #047857;
-  --theme-accent-strong: #059669;
-  --theme-accent-soft: rgb(5 150 105 / 0.12);
-  --theme-focus: #10b981;
-  --theme-link: #047857;
-  --theme-link-hover: #065f46;
-  --theme-app-color: #f6fbf7;
+  --theme-void: #020617;
+  --theme-obsidian: #07111a;
+  --theme-ink: #122a35;
+  --theme-line: #1f3540;
+  --theme-accent: #38bdf8;
+  --theme-accent-strong: #0284c7;
+  --theme-accent-soft: #06b6d4;
 }
 
 html {
@@ -84,50 +60,40 @@ body,
 }
 
 body {
-  @apply antialiased;
-  background-color: var(--theme-bg);
-  color: var(--theme-text);
+  @apply bg-slate-950 text-slate-100 antialiased;
   min-height: 100dvh;
-  /* Emerald command-deck backdrop matching the Cognis mark while staying cheap to render. */
+  /* Subtle command-deck backdrop that keeps the dark shell readable. */
   background-image:
-    radial-gradient(circle at 18% 0%, rgb(95 208 170 / 0.18), transparent 32%),
-    radial-gradient(circle at 86% 10%, rgb(16 185 129 / 0.1), transparent 30%),
-    linear-gradient(180deg, var(--theme-panel) 0%, var(--theme-bg-deep) 56%, var(--theme-bg) 100%);
+    radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.12), transparent 32%),
+    radial-gradient(circle at 88% 8%, rgb(6 182 212 / 0.08), transparent 30%),
+    linear-gradient(180deg, var(--theme-obsidian) 0%, var(--theme-void) 54%, #0f1719 100%);
   background-attachment: fixed;
   overflow-x: hidden;
   overscroll-behavior-y: none;
 }
 
-:root[data-theme='light'] body {
-  background-image:
-    radial-gradient(circle at 14% 0%, rgb(16 185 129 / 0.16), transparent 34%),
-    radial-gradient(circle at 86% 8%, rgb(95 208 170 / 0.12), transparent 32%),
-    linear-gradient(180deg, #ffffff 0%, var(--theme-bg) 48%, var(--theme-bg-deep) 100%);
-}
-
 .skip-link {
-  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl px-4 py-2 font-medium shadow-card focus:not-sr-only;
+  @apply sr-only fixed left-4 top-4 z-[100] rounded-xl px-4 py-2 font-medium text-slate-950 shadow-card focus:not-sr-only;
   background: var(--theme-accent);
-  color: var(--theme-bg-deep);
 }
 
 a {
   @apply transition-colors;
-  color: var(--theme-link);
+  color: #38bdf8;
 }
 
 a:hover {
-  color: var(--theme-link-hover);
+  color: #bae6fd;
 }
 
 /* JSON syntax highlighting for tool-call input/output blocks. Colours
    stay close to the assistant bubble palette so highlighted payloads
    read as part of the conversation, not a separate dev tool. */
-.json-key { @apply text-amber-300; }
+.json-key { @apply text-sky-300; }
 .json-string { @apply text-emerald-300; }
-.json-number { @apply text-amber-200; }
-.json-boolean { @apply text-orange-300; }
-.json-null { @apply text-orange-300 italic; }
+.json-number { @apply text-sky-200; }
+.json-boolean { @apply text-cyan-300; }
+.json-null { @apply text-cyan-300 italic; }
 .json-punct { @apply text-slate-500; }
 
 button:focus-visible,
@@ -135,8 +101,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--theme-bg-deep), 0 0 0 4px var(--theme-focus);
+  @apply outline-none ring-2 ring-sky-300 ring-offset-2 ring-offset-slate-950;
 }
 
 ::-webkit-scrollbar {
@@ -145,91 +110,11 @@ textarea:focus-visible,
 }
 
 ::-webkit-scrollbar-thumb {
-  border-radius: 9999px;
-  background: color-mix(in srgb, var(--theme-text-muted) 42%, transparent);
+  @apply rounded-full bg-slate-700;
 }
 
 ::-webkit-scrollbar-track {
-  background: color-mix(in srgb, var(--theme-panel-muted) 70%, transparent);
-}
-
-/* Temporary compatibility layer while screens move from hard-coded slate/amber
-   utilities to semantic theme tokens. Dark mode keeps the Tailwind palette;
-   light mode maps the common shell/card/text utilities to readable surfaces. */
-:root[data-theme='light'] .bg-slate-950,
-:root[data-theme='light'] .bg-slate-950\/95,
-:root[data-theme='light'] .bg-slate-950\/90,
-:root[data-theme='light'] .bg-slate-950\/80,
-:root[data-theme='light'] .bg-slate-950\/70,
-:root[data-theme='light'] .bg-slate-950\/60,
-:root[data-theme='light'] .bg-slate-950\/50 {
-  background-color: color-mix(in srgb, var(--theme-bg) 92%, transparent) !important;
-}
-
-:root[data-theme='light'] .bg-slate-900,
-:root[data-theme='light'] .bg-slate-900\/95,
-:root[data-theme='light'] .bg-slate-900\/90,
-:root[data-theme='light'] .bg-slate-900\/80,
-:root[data-theme='light'] .bg-slate-900\/70,
-:root[data-theme='light'] .bg-slate-900\/60,
-:root[data-theme='light'] .bg-slate-900\/50,
-:root[data-theme='light'] .bg-slate-800,
-:root[data-theme='light'] .bg-slate-800\/80,
-:root[data-theme='light'] .bg-slate-800\/60,
-:root[data-theme='light'] .bg-zinc-900,
-:root[data-theme='light'] .bg-zinc-900\/80,
-:root[data-theme='light'] .bg-zinc-800,
-:root[data-theme='light'] .bg-zinc-800\/50 {
-  background-color: color-mix(in srgb, var(--theme-panel) 90%, transparent) !important;
-}
-
-:root[data-theme='light'] .border-slate-800,
-:root[data-theme='light'] .border-slate-800\/80,
-:root[data-theme='light'] .border-slate-700,
-:root[data-theme='light'] .border-slate-700\/80,
-:root[data-theme='light'] .border-slate-600,
-:root[data-theme='light'] .border-zinc-800,
-:root[data-theme='light'] .border-zinc-700,
-:root[data-theme='light'] .border-zinc-600 {
-  border-color: var(--theme-border) !important;
-}
-
-:root[data-theme='light'] .text-white,
-:root[data-theme='light'] .text-slate-50,
-:root[data-theme='light'] .text-slate-100,
-:root[data-theme='light'] .text-slate-200,
-:root[data-theme='light'] .text-zinc-100,
-:root[data-theme='light'] .text-zinc-200 {
-  color: var(--theme-text) !important;
-}
-
-:root[data-theme='light'] .text-slate-300,
-:root[data-theme='light'] .text-slate-400,
-:root[data-theme='light'] .text-slate-500,
-:root[data-theme='light'] .text-zinc-300,
-:root[data-theme='light'] .text-zinc-400,
-:root[data-theme='light'] .text-zinc-500 {
-  color: var(--theme-text-muted) !important;
-}
-
-:root[data-theme='light'] .placeholder\:text-slate-500::placeholder {
-  color: color-mix(in srgb, var(--theme-text-muted) 75%, transparent) !important;
-}
-
-:root[data-theme='light'] .shadow-card {
-  box-shadow: 0 18px 48px -28px rgb(6 78 59 / 0.24), 0 0 0 1px rgb(6 78 59 / 0.06) !important;
-}
-
-.brand-text {
-  color: var(--theme-accent);
-}
-
-.brand-bg-soft {
-  background: var(--theme-accent-soft);
-}
-
-.brand-border-soft {
-  border-color: color-mix(in srgb, var(--theme-accent-strong) 34%, transparent);
+  @apply bg-slate-900/60;
 }
 
 .chat-markdown {

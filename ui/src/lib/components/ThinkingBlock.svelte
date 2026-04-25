@@ -47,15 +47,15 @@
   <button
     type="button"
     onclick={toggle}
-    class="flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-orange-500/5 focus:outline-none"
+    class="flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-cyan-500/5 focus:outline-none"
     aria-expanded={expanded}
   >
     <Brain
       class="mt-0.5 h-3.5 w-3.5 shrink-0 {item.streaming
-        ? 'text-orange-400 animate-pulse'
-        : 'text-orange-500/70'}"
+        ? 'text-cyan-400 animate-pulse'
+        : 'text-cyan-500/70'}"
     />
-    <span class="min-w-0 flex-1 truncate font-medium text-orange-300/80">
+    <span class="min-w-0 flex-1 truncate font-medium text-cyan-300/80">
       {#if item.streaming && item.blocks.length === 0}
         Thinking…
       {:else}
@@ -75,21 +75,21 @@
 
   <!-- Expanded body -->
   {#if expanded || (compact && item.blocks.length > 0)}
-    <div class="mx-3 mb-2 overflow-hidden rounded-lg border border-orange-500/20 bg-orange-950/20">
+    <div class="mx-3 mb-2 overflow-hidden rounded-lg border border-cyan-500/20 bg-cyan-950/20">
       {#each item.blocks as block, i (block.block_id)}
         {#if i > 0}
-          <hr class="border-orange-500/10" />
+          <hr class="border-cyan-500/10" />
         {/if}
         <div class="px-3 py-2.5">
           {#if !(i === 0 && displayTitle(block.title) === headerTitle)}
-            <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-orange-400/60">
+            <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-cyan-400/60">
               Thinking: {displayTitle(block.title)}
             </p>
           {/if}
           <!-- Markdown-rendered thinking content -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="prose prose-sm prose-invert max-w-none text-slate-300/80 prose-p:my-1 prose-ul:my-1 prose-li:my-0 prose-code:text-orange-200 prose-code:bg-orange-900/30"
+            class="prose prose-sm prose-invert max-w-none text-slate-300/80 prose-p:my-1 prose-ul:my-1 prose-li:my-0 prose-code:text-cyan-200 prose-code:bg-cyan-900/30"
           >
             {#if hasRenderedBody(block)}
               {@html block.html}
@@ -97,7 +97,7 @@
               <p class="my-1 text-sm text-slate-400/80">Thinking details unavailable.</p>
             {/if}
             {#if !block.complete}
-              <span class="inline-block h-3 w-0.5 animate-pulse bg-orange-400/60 align-middle"></span>
+              <span class="inline-block h-3 w-0.5 animate-pulse bg-cyan-400/60 align-middle"></span>
             {/if}
           </div>
         </div>

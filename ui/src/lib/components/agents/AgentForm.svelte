@@ -343,7 +343,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {#if mode === 'create' && !form.customId}
               <span class="text-xs text-slate-400">Auto-generated from name. Type here to override.</span>
             {:else if mode === 'create' && form.customId}
-              <button type="button" class="text-xs text-amber-400 hover:text-amber-300" onclick={() => { form.customId = false; form.agentId = slugify(form.name); }}>Reset to auto</button>
+              <button type="button" class="text-xs text-sky-400 hover:text-sky-300" onclick={() => { form.customId = false; form.agentId = slugify(form.name); }}>Reset to auto</button>
             {/if}
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -386,7 +386,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     </button>
                     <button
                       type="button"
-                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-amber-400 hover:bg-slate-700 hover:text-amber-300"
+                      class="rounded-lg border border-slate-700 bg-slate-800/60 px-2.5 py-1 text-xs text-sky-400 hover:bg-slate-700 hover:text-sky-300"
                       onclick={() => { showAvatarModal = true; }}
                     >
                       Generate
@@ -412,7 +412,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             {#if !readonly}
               <button
                 type="button"
-                class="flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300 disabled:opacity-50"
+                class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50"
                 disabled={generatingField === 'description'}
                 onclick={() => generateField('description', () => form.description, (v) => { form.description = v; })}
                 title="Generate with AI"
@@ -434,7 +434,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <div class="flex items-center justify-between">
                 <span>Tone</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-amber-400 hover:text-amber-300 disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'tone'} onclick={() => generateField('tone', () => form.tone, (v) => { form.tone = v; })} title="Generate with AI">
                     {#if generatingField === 'tone'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
@@ -446,7 +446,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <div class="flex items-center justify-between">
                 <span>Temperament</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-amber-400 hover:text-amber-300 disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'temperament'} onclick={() => generateField('temperament', () => form.temperament, (v) => { form.temperament = v; })} title="Generate with AI">
                     {#if generatingField === 'temperament'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
@@ -458,7 +458,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               <div class="flex items-center justify-between">
                 <span>Purpose</span>
                 {#if !readonly && !isSystemAsset}
-                  <button type="button" class="text-amber-400 hover:text-amber-300 disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
+                  <button type="button" class="text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'purpose'} onclick={() => generateField('purpose', () => form.purpose, (v) => { form.purpose = v; })} title="Generate with AI">
                     {#if generatingField === 'purpose'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                   </button>
                 {/if}
@@ -470,7 +470,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <div class="flex items-center justify-between">
               <span>Behavioral rules (one per line)</span>
               {#if !readonly && !isSystemAsset}
-                <button type="button" class="flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300 disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
+                <button type="button" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300 disabled:opacity-50" disabled={generatingField === 'behavioral_rules'} onclick={() => generateField('behavioral_rules', () => form.behavioralRules, (v) => { form.behavioralRules = v; })} title="Generate with AI">
                   {#if generatingField === 'behavioral_rules'}<Loader2 class="h-3 w-3 animate-spin" />{:else}<Sparkles class="h-3 w-3" />{/if}
                 </button>
               {/if}
@@ -684,7 +684,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 {@const selected = (form.intarisMcpServers || []).includes(server.name)}
                 <button
                   type="button"
-                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-amber-500/20 border-amber-500/50 text-amber-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                  class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-sky-500/20 border-sky-500/50 text-sky-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
                   onclick={() => {
                     const current = form.intarisMcpServers || [];
                     if (selected) {
@@ -705,9 +705,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         {/if}
 
         {#if form.mcpServers.length > 0}
-          <div class="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div class="mt-4 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <p class="font-medium">This agent still has legacy inline MCP server definitions.</p>
-            <p class="mt-1 text-amber-50/90">Create these servers in Settings → Tools and assign them to an executor. Existing inline MCP config is preserved for backward compatibility.</p>
+            <p class="mt-1 text-sky-50/90">Create these servers in Settings → Tools and assign them to an executor. Existing inline MCP config is preserved for backward compatibility.</p>
           </div>
         {/if}
       </Card>

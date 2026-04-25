@@ -94,7 +94,7 @@
               type="checkbox"
               checked={selected}
               disabled={existing}
-              class="shrink-0 rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300"
+              class="shrink-0 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300"
               tabindex={-1}
               onclick={(e) => e.stopPropagation()}
               onchange={() => toggleModel(entry.model_id)}

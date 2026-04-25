@@ -7,7 +7,7 @@ const config: Config = {
   theme: {
     extend: {
       boxShadow: {
-        card: '0 18px 48px -24px rgb(2 6 23 / 0.6), 0 0 0 1px rgb(244 211 94 / 0.05)'
+        card: '0 18px 48px -24px rgb(2 6 23 / 0.6), 0 0 0 1px rgb(56 189 248 / 0.05)'
       }
     }
   },

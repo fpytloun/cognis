@@ -380,8 +380,8 @@ import X from 'lucide-svelte/icons/x';
   function todoStatusDot(status: string): string {
     if (status === 'completed') return 'bg-emerald-400';
     if (status === 'cancelled') return 'bg-slate-600';
-    if (status === 'in_progress') return 'bg-amber-400';
-    return 'bg-amber-400';
+    if (status === 'in_progress') return 'bg-sky-400';
+    return 'bg-sky-400';
   }
 
   function todoPriorityClass(priority: string): string {
@@ -2533,7 +2533,7 @@ import X from 'lucide-svelte/icons/x';
         <div class="flex items-center justify-between gap-3 border-t border-slate-800/60 pt-3">
           <h2 class="text-sm font-semibold text-white">History</h2>
           <button
-            class="text-xs font-medium text-emerald-400 transition hover:text-emerald-300"
+            class="text-xs font-medium text-sky-400 transition hover:text-sky-300"
             onclick={openNewConversationModal}
             type="button"
           >+ New</button>
@@ -2571,14 +2571,14 @@ import X from 'lucide-svelte/icons/x';
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
               <a
-                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-emerald-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
+                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={closeMobileList}
               >
                 <div class="relative shrink-0">
                   <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
                   {#if unread}
-                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-emerald-400"></span>
+                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-sky-400"></span>
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
@@ -2625,9 +2625,9 @@ import X from 'lucide-svelte/icons/x';
         <div class="pointer-events-none absolute inset-0 z-20 bg-slate-950/35 backdrop-blur-[1px]"></div>
       {/if}
       {#if showDropZone}
-        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-emerald-400 bg-emerald-500/10 backdrop-blur-sm">
+        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-sky-400 bg-sky-500/10 backdrop-blur-sm">
           <div class="rounded-2xl bg-slate-900/90 px-6 py-4 text-center">
-            <p class="text-lg font-medium text-emerald-300">Drop files here to attach</p>
+            <p class="text-lg font-medium text-sky-300">Drop files here to attach</p>
             <p class="mt-1 text-sm text-slate-400">Images, PDFs, audio, and other files</p>
           </div>
         </div>
@@ -2676,7 +2676,7 @@ import X from 'lucide-svelte/icons/x';
               {#if editingTitle}
                 <!-- svelte-ignore a11y_autofocus -->
                 <input
-                  class="min-w-0 flex-1 rounded-lg border border-emerald-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-emerald-300 sm:text-xl"
+                  class="min-w-0 flex-1 rounded-lg border border-sky-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-sky-300 sm:text-xl"
                   bind:value={editTitleValue}
                   onblur={saveTitle}
                   onkeydown={handleTitleKeydown}
@@ -2684,7 +2684,7 @@ import X from 'lucide-svelte/icons/x';
                 />
               {:else}
                 <button
-                  class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-emerald-300 sm:text-xl"
+                  class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-sky-300 sm:text-xl"
                   onclick={startEditTitle}
                   type="button"
                   title="Click to edit title"
@@ -2733,7 +2733,7 @@ import X from 'lucide-svelte/icons/x';
                 {#if conversationTaskId(currentConversation)}
                   <a
                     href="/tasks/{conversationTaskId(currentConversation)}"
-                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-emerald-400/40 hover:text-emerald-200"
+                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
                   >
                     {contextTypeBadge(currentConversation)}
                   </a>
@@ -2751,11 +2751,11 @@ import X from 'lucide-svelte/icons/x';
 
                 <!-- Context usage badge (right-aligned) -->
                 {#if contextUsage}
-                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-amber-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | thinking: ${contextUsage.reasoning_effort}` : ''}">
+                  <span class="ml-auto flex items-center gap-1.5 text-[10px] font-medium {contextUsage.percentage > 85 ? 'text-rose-400' : contextUsage.percentage > 60 ? 'text-sky-400' : 'text-slate-400'}" title="Context: {contextUsage.prompt_tokens.toLocaleString()} / {contextUsage.max_context_tokens.toLocaleString()} tokens ({contextUsage.model}){contextUsage.reasoning_effort ? ` | thinking: ${contextUsage.reasoning_effort}` : ''}">
                     <span class="font-mono">{contextUsage.prompt_tokens.toLocaleString()}</span>
                     <span class="opacity-50">({contextUsage.percentage}%)</span>
                     {#if contextUsage.reasoning_effort}
-                      <span class="rounded border border-orange-500/30 px-1 text-orange-400">{contextUsage.reasoning_effort}</span>
+                      <span class="rounded border border-cyan-500/30 px-1 text-cyan-400">{contextUsage.reasoning_effort}</span>
                     {/if}
                   </span>
                 {/if}
@@ -2822,7 +2822,7 @@ import X from 'lucide-svelte/icons/x';
             {#if conversationTaskId(currentConversation)}
               <a
                 href="/tasks/{conversationTaskId(currentConversation)}"
-                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-emerald-400/40 hover:text-emerald-200"
+                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-sky-400/40 hover:text-sky-200"
               >
                 {contextTypeBadge(currentConversation)}
               </a>
@@ -2870,7 +2870,7 @@ import X from 'lucide-svelte/icons/x';
               <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
               <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
               <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
-              <span class="text-amber-400">{sessionInfo.escalated_count} escalated</span>
+              <span class="text-sky-400">{sessionInfo.escalated_count} escalated</span>
             </div>
           {:else}
             <p class="text-xs text-slate-500">Unable to load session details.</p>
@@ -2895,13 +2895,13 @@ import X from 'lucide-svelte/icons/x';
       <!-- Message area + composer -->
       <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 pt-2 pb-0 sm:gap-4 sm:px-4 sm:py-4">
         {#if isMemoryDegraded()}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             Memory is currently unavailable — this conversation won't have access to past context.
           </div>
         {/if}
 
         {#if queuedCount > 0}
-          <p class="rounded-2xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100">
+          <p class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
             {queuedCount} additional message{queuedCount === 1 ? '' : 's'} queued for this conversation.
           </p>
         {/if}
@@ -2928,11 +2928,11 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if initialLoadTimedOut && !currentConversation && !error}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p class="font-medium">Still loading conversation</p>
-                <p class="mt-1 text-amber-100/80">History or live session setup is taking longer than expected.</p>
+                <p class="mt-1 text-sky-100/80">History or live session setup is taking longer than expected.</p>
               </div>
               <div class="flex gap-2">
                 <Button size="sm" variant="secondary" onclick={() => void openConversation(conversationIdFromRoute())}>Retry</Button>
@@ -2943,7 +2943,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if sessionsError && !isPreSessionConversation}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-3 text-sm text-amber-100">
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Session details are temporarily unavailable: {sessionsError}</p>
               <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry</Button>
@@ -2952,7 +2952,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if historyError && !isPreSessionConversation}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Conversation history is temporarily unavailable: {historyError}</p>
               <Button size="sm" variant="secondary" onclick={retryConversationSubloads}>Retry history</Button>
@@ -2961,7 +2961,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if escalationError}
-          <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Escalation updates are temporarily unavailable: {escalationError}</p>
               <Button size="sm" variant="secondary" onclick={() => refreshEscalations()}>Refresh escalations</Button>
@@ -3022,7 +3022,7 @@ import X from 'lucide-svelte/icons/x';
                 {:else if item.kind === 'system_message'}
                   <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
                 {:else}
-                  <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
+                  <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
                     <h3 class="font-semibold">{item.title}</h3>
                     <p class="mt-2 leading-6">{item.description}</p>
                   </article>
@@ -3032,13 +3032,13 @@ import X from 'lucide-svelte/icons/x';
 
             <!-- Escalation prompts (sequential: show one at a time) -->
             {#if escalationResolutionPending}
-              <div class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 shadow-card">
+              <div class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 shadow-card">
                 <div class="flex flex-wrap items-center justify-between gap-4">
                   <div>
-                    <p class="text-xs font-medium uppercase tracking-[0.25em] text-amber-200">Approval submitted</p>
+                    <p class="text-xs font-medium uppercase tracking-[0.25em] text-sky-200">Approval submitted</p>
                     <h3 class="mt-1 text-base font-semibold text-white">{escalationResolutionPending.tool_name ?? 'Escalated action'}</h3>
                   </div>
-                  <LiveDots inline={true} size="sm" tone="amber" label="Waiting for controller acknowledgement" />
+                  <LiveDots inline={true} size="sm" tone="sky" label="Waiting for controller acknowledgement" />
                 </div>
               </div>
             {:else if escalations.length > 0}
@@ -3127,7 +3127,7 @@ import X from 'lucide-svelte/icons/x';
               This conversation has been deleted.
             </div>
           {:else if isSessionBlocked()}
-            <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-center text-sm text-amber-100">
+            <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-center text-sm text-sky-100">
               {#if activeSessionStatus() === 'suspended'}
                 This session is suspended.
               {:else if activeSessionStatus() === 'terminated'}
@@ -3155,7 +3155,7 @@ import X from 'lucide-svelte/icons/x';
                     onmousedown={(e: MouseEvent) => { e.preventDefault(); acceptSlashSuggestion(i); }}
                     type="button"
                   >
-                    <span class="font-mono font-medium text-amber-400">{suggestion.command}</span>
+                    <span class="font-mono font-medium text-sky-400">{suggestion.command}</span>
                     <span class="opacity-70">{suggestion.description}</span>
                   </button>
                 {/each}
@@ -3163,7 +3163,7 @@ import X from 'lucide-svelte/icons/x';
             {/if}
 
             {#if pendingDirectQuestion}
-              <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-50">
+              <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-50">
                 <div class="flex items-center justify-between gap-3">
                   <p class="font-semibold">Assistant requested more input</p>
                   {#if directQuestionSubmitting}
@@ -3172,13 +3172,13 @@ import X from 'lucide-svelte/icons/x';
                 </div>
                 <p class="mt-1 leading-6">{pendingDirectQuestion.question}</p>
                 {#if pendingDirectQuestion.context}
-                  <p class="mt-2 text-xs text-emerald-100/80">{pendingDirectQuestion.context}</p>
+                  <p class="mt-2 text-xs text-sky-100/80">{pendingDirectQuestion.context}</p>
                 {/if}
                 {#if pendingDirectQuestion.options.length > 0}
                   <div class="mt-3 flex flex-wrap gap-2">
                     {#each pendingDirectQuestion.options as option}
                       <button
-                        class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
+                        class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-xs text-sky-100 transition hover:bg-sky-400/20"
                         type="button"
                         disabled={directQuestionSubmitting}
                         onclick={() => { composer = option; syncComposerHeight(); focusActiveComposer(); }}
@@ -3215,7 +3215,7 @@ import X from 'lucide-svelte/icons/x';
                 submits, and the stored Enter-to-send preference still
                 applies for users who opted in.
             -->
-            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-emerald-400/50 focus-within:ring-2 focus-within:ring-emerald-300/20">
+            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-300/20">
               <label
                 aria-label="Attach files"
                 class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting ? 'pointer-events-none opacity-40' : ''}`}
@@ -3263,7 +3263,7 @@ import X from 'lucide-svelte/icons/x';
                   type="submit"
                   aria-label={pendingDirectQuestion ? 'Answer' : 'Send'}
                   title={pendingDirectQuestion ? 'Answer' : 'Send'}
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-slate-950 transition hover:bg-emerald-400 disabled:opacity-50"
+                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
                   disabled={directQuestionSubmitting}
                 >
                   <ArrowUp class="h-4 w-4" stroke-width="2.5" />
@@ -3315,7 +3315,7 @@ import X from 'lucide-svelte/icons/x';
               </div>
             </div>
             <button
-              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-emerald-300"
+              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
               onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; if (subSessionInfoOpen && !subSessionInfo) void loadSubSessionInfo(); }}
               type="button"
               title="Session details"
@@ -3347,7 +3347,7 @@ import X from 'lucide-svelte/icons/x';
                   <span>Calls: <span class="text-slate-200">{subSessionInfo.total_calls}</span></span>
                   <span class="text-emerald-400">{subSessionInfo.approved_count} approved</span>
                   <span class="text-rose-400">{subSessionInfo.denied_count} denied</span>
-                  <span class="text-amber-400">{subSessionInfo.escalated_count} escalated</span>
+                  <span class="text-sky-400">{subSessionInfo.escalated_count} escalated</span>
                 </div>
               {:else}
                 <p class="text-xs text-slate-500">Unable to load session details.</p>

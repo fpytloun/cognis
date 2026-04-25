@@ -1704,7 +1704,7 @@ import { onMount, tick } from 'svelte';
               <p class="text-sm text-slate-400">Provider management is available to admin users only.</p>
             {:else}
               {#each providers as provider}
-                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
+                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
                   <div class="flex items-center justify-between gap-3">
                     <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
                     <ProviderStatusBadge status={provider.status} />
@@ -1766,9 +1766,9 @@ import { onMount, tick } from 'svelte';
           </div>
 
           {#if providerForm.location === 'executor'}
-            <div class="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 space-y-3">
+            <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4 space-y-3">
               <div>
-                <p class="text-xs uppercase tracking-[0.25em] text-amber-200/80">Executor routing</p>
+                <p class="text-xs uppercase tracking-[0.25em] text-sky-200/80">Executor routing</p>
                 <p class="mt-2 text-sm text-slate-300">This provider stays configured normally, but requests are executed from a matching remote executor instead of the controller.</p>
               </div>
               <label class="space-y-2 text-sm font-medium text-slate-200 block">
@@ -1820,7 +1820,7 @@ import { onMount, tick } from 'svelte';
                     {#if providerForm.auth_secret_name}
                       <span class="block text-xs text-slate-400">Using credential: {providerForm.auth_secret_name}</span>
                     {:else}
-                      <span class="block text-xs text-amber-300">No credential selected. Create or select one.</span>
+                      <span class="block text-xs text-sky-300">No credential selected. Create or select one.</span>
                     {/if}
                   </div>
                 {/if}
@@ -1838,7 +1838,7 @@ import { onMount, tick } from 'svelte';
 
           {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
-              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-emerald-400 focus:ring-emerald-300" />
+              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
               <span class="space-y-1">
                 <span class="block font-medium">Use OpenAI Responses transport when supported</span>
                 <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
@@ -2006,7 +2006,7 @@ import { onMount, tick } from 'svelte';
         </div>
 
         {#if routingWarnings().length > 0}
-          <div class="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <div class="mt-4 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             {#each routingWarnings() as warning}
               <p>{warning}</p>
             {/each}
@@ -2238,7 +2238,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if WEB_BACKEND_INFO[webKeySetup.backend]?.link}
                 <p class="text-xs text-slate-400">
-                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-amber-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
+                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-sky-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
                 </p>
               {/if}
               <div class="flex gap-2">
@@ -2290,7 +2290,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if isAdmin}
                 <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
-                  <input bind:checked={executorForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
+                  <input bind:checked={executorForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
                   <span>Shared executor available to all users</span>
                 </label>
               {/if}
@@ -2342,10 +2342,10 @@ import { onMount, tick } from 'svelte';
                   <span class="text-slate-300">{executorRuntimeLabel(exec)}</span>
                 </span>
                 {#if exec.is_default}
-                  <span class="px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded">default</span>
+                  <span class="px-2 py-0.5 bg-sky-500/20 text-sky-300 text-xs rounded">default</span>
                 {/if}
                 {#if exec.shared}
-                  <span class="px-2 py-0.5 bg-orange-500/20 text-orange-300 text-xs rounded">shared</span>
+                  <span class="px-2 py-0.5 bg-cyan-500/20 text-cyan-300 text-xs rounded">shared</span>
                 {/if}
               </div>
               <div class="flex gap-2">
@@ -2399,17 +2399,17 @@ import { onMount, tick } from 'svelte';
               <div class="text-xs text-slate-500">{executorObservedNote(exec)}</div>
             {/if}
             {#if executorRuntimeSummary(exec)}
-              <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-amber-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
+              <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-sky-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
             {/if}
             {#if executorMcpFailureDetails(exec).length > 0}
-              <div class="space-y-1 rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-100/90">
+              <div class="space-y-1 rounded-xl border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
                 {#each executorMcpFailureDetails(exec) as failure}
                   <p>{failure}</p>
                 {/each}
               </div>
             {/if}
             {#if exec.desired_config_version !== exec.applied_config_version}
-              <div class="text-xs text-amber-300">
+              <div class="text-xs text-sky-300">
                 config pending: desired v{exec.desired_config_version}, applied v{exec.applied_config_version}
               </div>
             {/if}
@@ -2517,7 +2517,7 @@ import { onMount, tick } from 'svelte';
                   >
                     <span class="font-mono">{tool.name}</span>
                     {#if tool.non_bypassable}
-                      <span class="text-amber-400 ml-0.5" title="Non-bypassable">!</span>
+                      <span class="text-sky-400 ml-0.5" title="Non-bypassable">!</span>
                     {/if}
                   </button>
                 {/each}
@@ -3109,9 +3109,9 @@ import { onMount, tick } from 'svelte';
                           <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.mode}</span>
                           <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-xs text-slate-300">{profile.matrix.length} groups</span>
                           {#if profile.is_custom}
-                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">custom</span>
+                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-300">custom</span>
                           {:else if profile.has_override}
-                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs text-amber-300">customized</span>
+                            <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-300">customized</span>
                           {/if}
                         </div>
                         <p class="mt-1 text-xs text-slate-500">{profile.profile_id}</p>
@@ -3285,7 +3285,7 @@ import { onMount, tick } from 'svelte';
                   <span>Command</span>
                   <Input bind:value={mcpForm.command} placeholder="e.g. npx" />
                   {#if validateStdioCommand(mcpForm.command)}
-                    <p class="text-xs text-amber-300">{validateStdioCommand(mcpForm.command)}</p>
+                    <p class="text-xs text-sky-300">{validateStdioCommand(mcpForm.command)}</p>
                   {:else}
                     <p class="text-xs text-slate-500">Use only the executable name or absolute path here. Put flags and package names into Arguments.</p>
                   {/if}
@@ -3302,7 +3302,7 @@ import { onMount, tick } from 'svelte';
               </label>
               {#if isAdmin}
                 <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
-                  <input bind:checked={mcpForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
+                  <input bind:checked={mcpForm.shared} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
                   <span>Shared MCP server available to all users</span>
                 </label>
               {/if}
@@ -3388,7 +3388,7 @@ import { onMount, tick } from 'svelte';
                 <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{srv.transport}</span>
                 <span class="px-2 py-0.5 rounded text-xs {srv.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{srv.status}</span>
                 {#if srv.shared}
-                  <span class="px-2 py-0.5 bg-orange-500/20 text-orange-300 text-xs rounded">shared</span>
+                  <span class="px-2 py-0.5 bg-cyan-500/20 text-cyan-300 text-xs rounded">shared</span>
                 {/if}
               </div>
               <div class="flex gap-2">
@@ -3431,7 +3431,7 @@ import { onMount, tick } from 'svelte';
               <p class="text-sm text-slate-400">{srv.description}</p>
             {/if}
             {#if srv.invalid_reason}
-              <p class="text-sm text-amber-300">{srv.invalid_reason}</p>
+              <p class="text-sm text-sky-300">{srv.invalid_reason}</p>
             {/if}
             <div class="text-xs text-slate-500 font-mono">ID: {srv.server_id}</div>
             {#if !canManageMcp}
@@ -3646,14 +3646,14 @@ import { onMount, tick } from 'svelte';
             {/if}
             <div class="mt-1.5 flex flex-wrap gap-2 text-[11px]">
               {#if enabledByGroup}
-                <span class="text-amber-300">via group</span>
+                <span class="text-sky-300">via group</span>
               {:else if enabled}
                 <span class="text-emerald-300">enabled</span>
               {:else}
                 <span class="text-slate-500">disabled</span>
               {/if}
               {#if tool.non_bypassable}
-                <span class="text-amber-400">non-bypassable</span>
+                <span class="text-sky-400">non-bypassable</span>
               {/if}
             </div>
           </button>

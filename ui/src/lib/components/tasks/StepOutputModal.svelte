@@ -168,7 +168,7 @@
             <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 uppercase tracking-wide">Attempt #{stepRun.attempt}</span>
             <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 uppercase tracking-wide">{visibleStatus}</span>
             {#if latestDeliverableVersion}
-              <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 uppercase tracking-wide text-amber-200">Deliverable v{latestDeliverableVersion.version}</span>
+              <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-1 uppercase tracking-wide text-sky-200">Deliverable v{latestDeliverableVersion.version}</span>
             {/if}
             <span class="inline-flex items-center gap-2 text-slate-300">
               <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-5 w-5 rounded-lg" />
@@ -189,7 +189,7 @@
       {/if}
 
       {#if stepRun.deliverables.length > 0}
-        <section class="rounded-3xl border border-amber-500/20 bg-amber-500/5 p-4 sm:p-5">
+        <section class="rounded-3xl border border-sky-500/20 bg-sky-500/5 p-4 sm:p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Deliverable</p>
@@ -199,7 +199,7 @@
             </div>
             <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
               {#each stepRun.deliverables as deliverable}
-                <span class={`rounded-full border px-2.5 py-1 ${deliverable.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : deliverable.status === 'approved' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : deliverable.status === 'rejected' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
+                <span class={`rounded-full border px-2.5 py-1 ${deliverable.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : deliverable.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : deliverable.status === 'rejected' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
                   v{deliverable.version} {deliverable.status}
                 </span>
               {/each}
@@ -209,8 +209,8 @@
             <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html deliverableHtml}</div>
           {/if}
           {#if latestDeliverableVersion?.evaluator_feedback}
-            <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-              <p class="font-medium uppercase tracking-wide text-[11px] text-amber-300">Latest evaluator feedback</p>
+            <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+              <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Latest evaluator feedback</p>
               <p class="mt-1">{latestDeliverableVersion.evaluator_feedback}</p>
             </div>
           {/if}
@@ -235,8 +235,8 @@
         {/if}
 
         {#if outcomeStatus !== 'success'}
-          <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-            <p class="font-medium uppercase tracking-wide text-[11px] text-amber-300">Outcome marker</p>
+          <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+            <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Outcome marker</p>
             <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
           </div>
         {/if}
@@ -251,7 +251,7 @@
         {#if stepRun.evaluation}
           {@const evalDecision = String(stepRun.evaluation.decision ?? '')}
           {@const evalReasoning = String(stepRun.evaluation.reasoning ?? '')}
-          {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-amber-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-amber-400'}
+          {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-sky-400'}
           <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
             <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
             <p class="mt-1 text-sm text-slate-300">

@@ -338,22 +338,22 @@
       <h1 class="mt-1 text-2xl font-semibold text-white">{agent?.name ?? 'Agent'}</h1>
     </div>
     {#if agent && !agent.personality_synced && agent.agent_type === 'primary' && !agent.is_system}
-      <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
+      <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p class="font-medium">Personality was not synced to Mnemory.</p>
-            <p class="mt-1 text-amber-50/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
+            <p class="mt-1 text-sky-50/90">{agent.personality_sync_error ?? 'Retry the sync to bootstrap this agent into memory.'}</p>
           </div>
           <Button size="sm" variant="secondary" onclick={retrySyncPersonality}>Retry sync</Button>
         </div>
       </div>
     {/if}
     {#if agent?.is_system}
-      <div class="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-100">
+      <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p class="font-medium">System agent</p>
-            <p class="mt-1 text-amber-100/80">This shipped agent stays immutable. You can only tune selected runtime fields here, or duplicate it for full customization.</p>
+            <p class="mt-1 text-sky-100/80">This shipped agent stays immutable. You can only tune selected runtime fields here, or duplicate it for full customization.</p>
           </div>
           <div class="flex flex-wrap gap-2">
             <Button size="sm" variant="secondary" onclick={duplicateSystemAgent}>Duplicate</Button>
@@ -366,9 +366,9 @@
       </div>
     {/if}
     {#if agent?.is_shared_with_me}
-      <div class="rounded-2xl border border-orange-500/30 bg-orange-500/10 px-4 py-4 text-sm text-orange-100">
+      <div class="rounded-2xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-4 text-sm text-cyan-100">
         <p class="font-medium">Shared agent</p>
-        <p class="mt-1 text-orange-100/80">Shared by {agent.shared_by_email ?? agent.owner_email}. You can use this agent, but only the owner can edit or manage sharing.</p>
+        <p class="mt-1 text-cyan-100/80">Shared by {agent.shared_by_email ?? agent.owner_email}. You can use this agent, but only the owner can edit or manage sharing.</p>
       </div>
     {/if}
     {#if canManageShares()}
@@ -388,14 +388,14 @@
               bind:value={shareEmail}
               type="email"
               placeholder="user@example.com"
-              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
+              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-400"
               disabled={shareSaving}
               required
             />
           </label>
           <label class="space-y-1 text-sm text-slate-300">
             <span>Executor access</span>
-            <select bind:value={shareExecutorScope} class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400" disabled={shareSaving}>
+            <select bind:value={shareExecutorScope} class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-400" disabled={shareSaving}>
               <option value="owner_executor">Use owner executor setup</option>
               <option value="grantee_executor">Use grantee executor setup</option>
             </select>
@@ -406,7 +406,7 @@
               bind:value={shareNote}
               type="text"
               placeholder="Why this user has access"
-              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
+              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-400"
               disabled={shareSaving}
             />
           </label>
@@ -431,7 +431,7 @@
                 <select
                   value={grant.executor_scope}
                   onchange={(event) => updateShareScope(grant, event)}
-                  class="rounded-xl border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 outline-none focus:border-emerald-400"
+                  class="rounded-xl border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 outline-none focus:border-sky-400"
                   disabled={updatingShareId === grant.grant_id}
                 >
                   <option value="owner_executor">Owner executor</option>
