@@ -93,6 +93,14 @@ def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
     assert "Avoid using `bash` to run Python, Perl, Ruby" in instructions
 
 
+def test_chat_prompt_prefers_structured_tools_for_file_inspection() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`" in instructions
+    assert "when structured" in instructions
+    assert "Do not chain file inspection commands with `&&`, `;`, or separator output" in instructions
+
+
 def test_prompt_does_not_assume_patch_is_visible() -> None:
     instructions = build_system_instructions(PromptContext.CHAT, model_id="gpt-5.4")
     assert instructions is not None
@@ -187,3 +195,12 @@ def test_coding_skill_preserves_user_facing_diacritics_and_workspace_hygiene() -
     assert "Do not force natural-language documents to ASCII" in content
     assert "Do not add backward-compatibility code unless there is a concrete need" in content
     assert "Never revert, overwrite, or clean up changes you did not make" in content
+
+
+def test_coding_skill_prefers_structured_tools_for_file_inspection() -> None:
+    skill = get_system_skill_default("cognis-coding")
+    assert skill is not None
+    content = str(skill["instructions"])
+    assert "Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`" in content
+    assert "structured tools such as `read`, `grep`, `glob`, or `list_directory`" in content
+    assert "Do not chain file inspection commands with `&&`, `;`, or separator output" in content

@@ -117,6 +117,8 @@ Use this skill when the agent is doing software engineering work and should foll
 
 - Prefer `read`, `grep`, and `glob` for code inspection.
 - Use `lsp` for semantic navigation such as definitions, references, hover, and symbols when available.
+- Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, `sed`, or `echo` separators for file/code inspection when structured tools such as `read`, `grep`, `glob`, or `list_directory` are visible.
+- Do not chain file inspection commands with `&&`, `;`, or separator output. Use independent structured tool calls in parallel instead.
 - Prefer the dedicated file editing tools exposed for the current model. Use `apply_patch` when that is the visible edit tool; otherwise use `edit`, `multiedit`, and `write` for file-content changes.
 - Use `bash` for git, tests, builds, package managers, and atomic filesystem operations.
 - Avoid shell or interpreter one-liners that rewrite files when dedicated edit tools fit the task.

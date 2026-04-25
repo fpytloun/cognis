@@ -103,6 +103,11 @@ _TOOL_GUIDANCE_TEMPLATE = """\
 
 - Use the most direct tool for the operation.
 - Use `read`, `grep`, and `glob` for file contents and code inspection.
+- Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, \
+  `sed`, or `echo` separators for file/code inspection when structured \
+  tools such as `read`, `grep`, `glob`, or `list_directory` are visible.
+- Do not chain file inspection commands with `&&`, `;`, or separator output. \
+  Use independent structured tool calls in parallel instead.
 {edit_guidance}
 - Use `bash` for terminal-native operations and atomic filesystem \
   operations such as `mv`, `cp`, `rm`, `mkdir`, `chmod`, `git`, build, \
