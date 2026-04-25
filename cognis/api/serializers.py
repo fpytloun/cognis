@@ -280,6 +280,7 @@ def step_run_to_response(
         require_deliverable=getattr(row, "require_deliverable", None),
         output=_coerce_dict_or_none(row.output),
         evaluation=_coerce_dict_or_none(row.evaluation),
+        runtime_info=_coerce_dict_or_none(getattr(row, "runtime_info", None)),
         deliverables=deliverables or [],
         todos=_coerce_list_of_dicts(getattr(row, "todos", None)),
         started_at=row.started_at,

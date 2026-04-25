@@ -15,7 +15,7 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
-from cognis.core.executor_policy import load_executor_policy
+from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_resolution import select_executor_for_agent
 from cognis.core.runtime import (
     ResolvedStepRuntime,
@@ -103,6 +103,83 @@ class RemoteInventoryMergeResult:
 
 async def noop_cleanup() -> None:
     """No-op cleanup callback."""
+
+
+def _agent_executor_binding(agent: AgentDefinition) -> tuple[str, bool]:
+    execution = agent.execution if isinstance(agent.execution, dict) else {}
+    if execution.get("executor_id"):
+        return "explicit", True
+    if execution.get("executor_selector"):
+        return "selector", True
+    return "default", False
+
+
+def _environment_payload(snapshot: Any | None) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    return {
+        "available": bool(getattr(snapshot, "available", False)),
+        "executor_id": getattr(snapshot, "executor_id", None),
+        "executor_type": getattr(snapshot, "executor_type", None),
+        "user": getattr(snapshot, "user", None),
+        "home": getattr(snapshot, "home", None),
+        "cwd": getattr(snapshot, "cwd", None),
+        "hostname": getattr(snapshot, "hostname", None),
+        "platform_os": getattr(snapshot, "platform_os", None),
+        "platform_arch": getattr(snapshot, "platform_arch", None),
+        "source": getattr(snapshot, "source", None),
+        "observed_at": getattr(snapshot, "observed_at", None),
+    }
+
+
+def _runtime_info(
+    *,
+    executor_config: dict[str, Any] | None,
+    selection_source: str,
+    hard_bound: bool,
+    runtime_source: str,
+    fallback_used: bool,
+    environment: Any | None,
+    inventory_tool_count: int,
+    visible_tool_count: int | None = None,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "executor_id": executor_config.get("executor_id") if executor_config else None,
+        "executor_type": executor_config.get("executor_type") if executor_config else None,
+        "executor_owner_email": executor_config.get("executor_owner_email") if executor_config else None,
+        "selected_executor_owner_email": executor_config.get("owner_email") if executor_config else None,
+        "selection_source": selection_source,
+        "hard_bound": hard_bound,
+        "runtime_source": runtime_source,
+        "fallback_used": fallback_used,
+        "failure_reason": failure_reason,
+        "environment": _environment_payload(environment),
+        "inventory_tool_count": inventory_tool_count,
+        "visible_tool_count": visible_tool_count,
+    }
+
+
+def _raise_runtime_resolution_error(
+    message: str,
+    *,
+    executor_config: dict[str, Any] | None,
+    selection_source: str,
+    hard_bound: bool,
+) -> None:
+    logger.warning(
+        "executor runtime resolution failed",
+        extra={
+            "extra_data": {
+                "executor_id": executor_config.get("executor_id") if executor_config else None,
+                "executor_type": executor_config.get("executor_type") if executor_config else None,
+                "selection_source": selection_source,
+                "hard_bound": hard_bound,
+                "reason": message,
+            }
+        },
+    )
+    raise RuntimeError(message)
 
 
 def static_tool_definitions() -> list[ToolDefinition]:
@@ -310,20 +387,34 @@ def build_step_runtime_factory(
         agent: AgentDefinition,
         user_email: str,
     ) -> ResolvedStepRuntime:
-        session_factory_for_policy = getattr(providers, "_session_factory", None)
+        session_factory_for_policy = getattr(providers, "_session_factory", None) or session_factory
         policy = (
             await load_executor_policy(session_factory_for_policy)
             if session_factory_for_policy is not None
             else None
         )
         # Resolve executor config from DB
+        selection_source, hard_bound_executor = _agent_executor_binding(agent)
         executor_config = await _resolve_executor_config(providers, agent, user_email)
         if (
             executor_config
             and executor_config.get("unresolved")
             and executor_config.get("requires_owner_executor")
         ):
-            raise RuntimeError("No eligible owner executor is available for this shared agent")
+            _raise_runtime_resolution_error(
+                "No eligible owner executor is available for this shared agent",
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
+        if executor_config and executor_config.get("unresolved") and hard_bound_executor:
+            _raise_runtime_resolution_error(
+                "No eligible executor matches the agent's configured executor binding",
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
+
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
 
@@ -434,6 +525,18 @@ def build_step_runtime_factory(
         resolved_type = (
             executor_config.get("executor_type", "in_process") if executor_config else "in_process"
         )
+        if (
+            executor_config
+            and not executor_config.get("unresolved")
+            and policy is not None
+            and not is_executor_type_allowed(resolved_type, policy)
+        ):
+            _raise_runtime_resolution_error(
+                f"Executor type '{resolved_type}' is disabled by deployment policy",
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
 
         # Resolve MCP servers for local in-process execution first, then legacy inline fallback.
         # Remote executors advertise executor-assigned MCP tools through tool.list.
@@ -443,6 +546,13 @@ def build_step_runtime_factory(
         if not mcp_servers:
             mcp_servers = _parse_local_mcp_servers(agent)
         if mcp_servers:
+            if policy is not None and not policy.allow_in_process:
+                _raise_runtime_resolution_error(
+                    "In-process MCP runtime is disabled by deployment policy",
+                    executor_config=executor_config,
+                    selection_source=selection_source,
+                    hard_bound=hard_bound_executor,
+                )
             secret_owner_email = (
                 executor_config.get("executor_owner_email", user_email) if executor_config else user_email
             )
@@ -462,14 +572,24 @@ def build_step_runtime_factory(
             async def cleanup() -> None:
                 await providers.executor.cancel(handle)
 
+            env_snapshot = build_local_executor_environment(
+                executor_id=handle.executor_id,
+                executor_type=handle.executor_type,
+                source="in_process_mcp_runtime",
+            )
             return ResolvedStepRuntime(
                 tool_registry=registry,
                 executor_connection=connection,
                 cleanup=cleanup,
-                executor_environment=build_local_executor_environment(
-                    executor_id=handle.executor_id,
-                    executor_type=handle.executor_type,
-                    source="in_process_mcp_runtime",
+                executor_environment=env_snapshot,
+                runtime_info=_runtime_info(
+                    executor_config=executor_config,
+                    selection_source=selection_source,
+                    hard_bound=hard_bound_executor,
+                    runtime_source="in_process_mcp_runtime",
+                    fallback_used=executor_config is None,
+                    environment=env_snapshot,
+                    inventory_tool_count=len(registry.list_tools()),
                 ),
             )
 
@@ -568,12 +688,37 @@ def build_step_runtime_factory(
                         executor_connection=conn,
                         cleanup=noop_cleanup,
                         executor_environment=env_snapshot,
+                        runtime_info=_runtime_info(
+                            executor_config=executor_config,
+                            selection_source=selection_source,
+                            hard_bound=hard_bound_executor,
+                            runtime_source="remote_executor",
+                            fallback_used=False,
+                            environment=env_snapshot,
+                            inventory_tool_count=len(all_tools),
+                        ),
                     )
-                except Exception:
+                except Exception as exc:
+                    message = f"Selected executor '{executor_id}' failed while listing tools"
                     logger.warning(
-                        "Failed to get tools from remote executor, falling back to in-process",
-                        extra={"extra_data": {"executor_id": executor_id}},
+                        "Failed to get tools from selected remote executor",
+                        extra={
+                            "extra_data": {
+                                "executor_id": executor_id,
+                                "selection_source": selection_source,
+                                "hard_bound": hard_bound_executor,
+                            }
+                        },
+                        exc_info=True,
                     )
+                    raise RuntimeError(message) from exc
+            message = f"Selected executor '{executor_id}' is not connected or not ready"
+            _raise_runtime_resolution_error(
+                message,
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
 
         if isinstance(shared_connection, InProcessExecutorConnection) and not (
             policy is not None and not policy.allow_in_process
@@ -595,31 +740,63 @@ def build_step_runtime_factory(
                 runtime_metadata,
                 internal_handlers=getattr(shared_connection, "internal_handlers", None),
             )
+            env_snapshot = build_local_executor_environment(
+                executor_id=getattr(shared_connection.handle, "executor_id", None),
+                executor_type=getattr(shared_connection.handle, "executor_type", "in_process"),
+                source="shared_in_process_runtime",
+            )
             return ResolvedStepRuntime(
                 tool_registry=registry,
                 executor_connection=connection,
                 cleanup=noop_cleanup,
-                executor_environment=build_local_executor_environment(
-                    executor_id=getattr(shared_connection.handle, "executor_id", None),
-                    executor_type=getattr(shared_connection.handle, "executor_type", "in_process"),
-                    source="shared_in_process_runtime",
+                executor_environment=env_snapshot,
+                runtime_info=_runtime_info(
+                    executor_config=executor_config,
+                    selection_source=selection_source,
+                    hard_bound=hard_bound_executor,
+                    runtime_source="shared_in_process_runtime",
+                    fallback_used=executor_config is None or bool(executor_config.get("unresolved")),
+                    environment=env_snapshot,
+                    inventory_tool_count=len(registry.list_tools()),
                 ),
             )
 
         if shared_connection is None:
             raise RuntimeError("No eligible executor is available for this agent")
+        shared_handle = getattr(shared_connection, "handle", None)
+        shared_executor_type = getattr(shared_handle, "executor_type", "in_process")
+        if policy is not None and not is_executor_type_allowed(shared_executor_type, policy):
+            _raise_runtime_resolution_error(
+                f"Fallback executor type '{shared_executor_type}' is disabled by deployment policy",
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
+        if hard_bound_executor:
+            _raise_runtime_resolution_error(
+                "Refusing fallback because the agent is bound to a specific executor",
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+            )
+        env_snapshot = build_local_executor_environment(
+            executor_id=getattr(shared_handle, "executor_id", None),
+            executor_type=shared_executor_type,
+            source="shared_runtime_fallback",
+        )
         return ResolvedStepRuntime(
             tool_registry=shared_registry,
             executor_connection=shared_connection,
             cleanup=noop_cleanup,
-            executor_environment=build_local_executor_environment(
-                executor_id=getattr(
-                    getattr(shared_connection, "handle", None), "executor_id", None
-                ),
-                executor_type=getattr(
-                    getattr(shared_connection, "handle", None), "executor_type", "in_process"
-                ),
-                source="shared_runtime_fallback",
+            executor_environment=env_snapshot,
+            runtime_info=_runtime_info(
+                executor_config=executor_config,
+                selection_source=selection_source,
+                hard_bound=hard_bound_executor,
+                runtime_source="shared_runtime_fallback",
+                fallback_used=True,
+                environment=env_snapshot,
+                inventory_tool_count=len(shared_registry.list_tools()),
             ),
         )
 

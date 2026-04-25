@@ -211,6 +211,7 @@ class WorkflowEngine:
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
+            runtime_info=runtime.runtime_info or {},
             workspace_root=current_workspace_root.get(),
             working_directory=current_effective_working_directory.get(),
             cancel_event=cancel_event,
@@ -825,11 +826,52 @@ class WorkflowEngine:
             )
         )
 
-        # Resolve tool registry and executor for this step
-        runtime = await self._resolve_step_runtime(
-            agent=agent,
-            user_email=task.created_by,
-        )
+        # Resolve tool registry and executor for this step.
+        try:
+            runtime = await self._resolve_step_runtime(
+                agent=agent,
+                user_email=task.created_by,
+            )
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.warning(
+                "workflow: failed to resolve step runtime",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step_name": step_def.name,
+                        "agent_id": agent.agent_id,
+                        "error_type": exc.__class__.__name__,
+                    }
+                },
+                exc_info=True,
+            )
+            async with self._session_factory() as db_session:
+                await update_step_run(
+                    db_session,
+                    step_run_id,
+                    status="failed",
+                    output={
+                        "summary": "Failed to resolve step runtime.",
+                        "error": error,
+                    },
+                    runtime_info={
+                        "runtime_source": "unresolved",
+                        "failure_reason": error,
+                        "agent_id": agent.agent_id,
+                    },
+                    completed_at=datetime.now(UTC),
+                )
+                await db_session.commit()
+            return None, step_run_id
+        if runtime.runtime_info is not None:
+            async with self._session_factory() as db_session:
+                await update_step_run(
+                    db_session,
+                    step_run_id,
+                    runtime_info=runtime.runtime_info,
+                )
+                await db_session.commit()
 
         # Log resolved step input for debugging.  Prior step context is
         # delivered through event forking (type="full") or the step prompt
@@ -882,6 +924,7 @@ class WorkflowEngine:
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
+            runtime_info=runtime.runtime_info or {},
             workflow_state=state,
             workflow_steps=workflow.steps,
             step_index=step_index,

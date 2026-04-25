@@ -2138,6 +2138,7 @@ async def create_step_run(
     working_directory: str | None = None,
     deliverable_id: str | None = None,
     require_deliverable: bool | None = None,
+    runtime_info: dict[str, object] | None = None,
 ) -> StepRun:
     """Create a new step run record."""
     row = StepRun(
@@ -2152,6 +2153,7 @@ async def create_step_run(
         conversation_id=conversation_id,
         deliverable_id=deliverable_id,
         require_deliverable=require_deliverable,
+        runtime_info=runtime_info,
     )
     session.add(row)
     await session.flush()
@@ -2186,6 +2188,7 @@ async def update_step_run(
     output: dict[str, object] | None | object = _UNSET,
     evaluation: dict[str, object] | None | object = _UNSET,
     todos: list[dict[str, object]] | None | object = _UNSET,
+    runtime_info: dict[str, object] | None | object = _UNSET,
     started_at: datetime | None | object = _UNSET,
     completed_at: datetime | None | object = _UNSET,
 ) -> bool:
@@ -2220,6 +2223,8 @@ async def update_step_run(
         values["evaluation"] = evaluation
     if todos is not _UNSET:
         values["todos"] = todos
+    if runtime_info is not _UNSET:
+        values["runtime_info"] = runtime_info
     if started_at is not _UNSET:
         values["started_at"] = started_at
     if completed_at is not _UNSET:

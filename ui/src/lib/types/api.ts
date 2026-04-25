@@ -814,6 +814,7 @@ export interface StepRun {
   require_deliverable: boolean | null;
   output: Record<string, unknown> | null;
   evaluation: Record<string, unknown> | null;
+  runtime_info: Record<string, unknown> | null;
   deliverables: Deliverable[];
   todos: Array<Record<string, unknown>>;
   started_at: string | null;

@@ -351,6 +351,34 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     return typeof reason === 'string' ? reason : '';
   }
 
+  function runtimeString(value: unknown): string {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    return '';
+  }
+
+  function runtimeEnvironment(stepRun: StepRun): Record<string, unknown> {
+    const env = stepRun.runtime_info?.environment;
+    return env && typeof env === 'object' ? (env as Record<string, unknown>) : {};
+  }
+
+  function runtimeRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const info = stepRun.runtime_info;
+    if (!info) return [];
+    const env = runtimeEnvironment(stepRun);
+    return [
+      { label: 'Executor', value: runtimeString(info.executor_id) || 'unresolved' },
+      { label: 'Type', value: runtimeString(info.executor_type) || 'unknown' },
+      { label: 'Runtime', value: runtimeString(info.runtime_source) || 'unknown' },
+      { label: 'Selection', value: runtimeString(info.selection_source) || 'unknown' },
+      { label: 'Fallback', value: runtimeString(info.fallback_used) },
+      { label: 'User', value: runtimeString(env.user) || 'unknown' },
+      { label: 'Home', value: runtimeString(env.home) || 'unknown' },
+      { label: 'CWD', value: runtimeString(env.cwd) || 'unknown' },
+      { label: 'Tools', value: runtimeString(info.visible_tool_count) || runtimeString(info.inventory_tool_count) || 'unknown' }
+    ].filter((row) => row.value !== '');
+  }
+
   function displayStepStatus(stepRun: StepRun): string {
     const outcomeStatus = stepOutcomeStatus(stepRun);
     if (stepRun.status === 'approved' && outcomeStatus === 'rejected') {
@@ -1321,6 +1349,20 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
                         <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Outcome marker</p>
                         <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
+                      </div>
+                    {/if}
+
+                    {#if runtimeRows(latestAttempt).length > 0}
+                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+                        <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                          {#each runtimeRows(latestAttempt) as row}
+                            <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
+                              <dt class="text-slate-500">{row.label}</dt>
+                              <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                            </div>
+                          {/each}
+                        </dl>
                       </div>
                     {/if}
 

@@ -464,6 +464,24 @@ class CommandDispatcher:
             lines.append(f"Thinking effort: {reasoning}")
         tool_runtime = self._session_cache.get_tool_runtime_info(current_session.session_id)
         if tool_runtime:
+            executor_id = tool_runtime.get("executor_id")
+            executor_type = tool_runtime.get("executor_type")
+            if isinstance(executor_id, str) and executor_id:
+                if isinstance(executor_type, str) and executor_type:
+                    lines.append(f"Executor: {executor_id} ({executor_type})")
+                else:
+                    lines.append(f"Executor: {executor_id}")
+            runtime_source = tool_runtime.get("runtime_source")
+            if isinstance(runtime_source, str) and runtime_source:
+                lines.append(f"Runtime source: {runtime_source}")
+            environment = tool_runtime.get("environment")
+            if isinstance(environment, dict):
+                home = environment.get("home")
+                cwd = environment.get("cwd")
+                if isinstance(home, str) and home:
+                    lines.append(f"Executor home: {home}")
+                if isinstance(cwd, str) and cwd:
+                    lines.append(f"Executor cwd: {cwd}")
             strategy = tool_runtime.get("strategy")
             if isinstance(strategy, str) and strategy:
                 lines.append(f"Tool exposure mode: {strategy}")

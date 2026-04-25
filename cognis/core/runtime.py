@@ -56,6 +56,7 @@ class ResolvedStepRuntime:
     executor_connection: Any
     cleanup: Callable[[], Awaitable[None]]
     executor_environment: ExecutorEnvironmentSnapshot | None
+    runtime_info: dict[str, Any] | None = None
 
 
 def build_local_executor_environment(

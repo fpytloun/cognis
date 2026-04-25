@@ -525,6 +525,7 @@ class StepRun(Base):
     output: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     evaluation: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     todos: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    runtime_info: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(

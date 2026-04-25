@@ -4,13 +4,18 @@ from types import SimpleNamespace
 
 import pytest
 
+from cognis.api import runtime_support
 from cognis.api.runtime_support import (
     _build_remote_runtime_registry,
     _merge_remote_runtime_inventory,
     _resolve_intaris_mcp_tools,
 )
+from cognis.core.executor_policy import ExecutorPolicy
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ToolDefinition, ToolSource, sanitize_mcp_tool_name
+from cognis.models.tool import ExecutorHandle, ToolDefinition, ToolSource, sanitize_mcp_tool_name
+from cognis.providers.executor.in_process import InProcessExecutorConnection
+from cognis.tools.registry import ToolRegistry
+from cognis.tools.skills import ResolvedSkillSet
 
 
 def _agent(*, tools: dict[str, object] | None = None) -> AgentDefinition:
@@ -495,3 +500,173 @@ def test_build_remote_runtime_registry_attaches_only_builtin_handlers() -> None:
     executor_tool = registry.get("read")
     assert executor_tool is not None
     assert executor_tool.handler is None
+
+
+class _MissingWebSocketProvider:
+    def get_connection(self, executor_id: str) -> None:
+        del executor_id
+        return None
+
+    def get_handle_metadata(self, executor_id: str) -> dict[str, object]:
+        del executor_id
+        return {}
+
+
+class _RuntimeSessionFactory:
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+def _runtime_session_factory() -> _RuntimeSessionFactory:
+    return _RuntimeSessionFactory()
+
+
+def _shared_in_process_connection() -> InProcessExecutorConnection:
+    return InProcessExecutorConnection(
+        ExecutorHandle(executor_id="controller_shared_builtin", executor_type="in_process"),
+        ToolRegistry(),
+        breaker=object(),  # type: ignore[arg-type]
+    )
+
+
+def _runtime_providers() -> SimpleNamespace:
+    return SimpleNamespace(
+        _session_factory=_runtime_session_factory,
+        executor=SimpleNamespace(websocket=_MissingWebSocketProvider(), status_provider=None),
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_blocks_existing_in_process_fallback_when_policy_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(_: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=False, allow_subprocess=False)
+
+    async def _executor_config(*_: object, **__: object) -> None:
+        return None
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {"web_available_backends": ["direct"], "web_backend": "direct"}
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(runtime_support, "_resolve_executor_config", _executor_config)
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers(),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="disabled by deployment policy"):
+        await factory(
+            agent=AgentDefinition(
+                agent_id="agent-1",
+                owner_email="alice@example.com",
+                name="Agent",
+            ),
+            user_email="alice@example.com",
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_refuses_explicit_websocket_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(_: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
+
+    async def _executor_config(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "executor_id": "alice_exec",
+            "executor_type": "websocket",
+            "enabled_tools": [],
+            "enabled_tool_groups": [],
+            "config": {},
+            "executor_owner_email": "alice@example.com",
+            "owner_email": "alice@example.com",
+            "runtime_state": "active",
+            "desired_config_version": 1,
+            "applied_config_version": 1,
+        }
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {"web_available_backends": ["direct"], "web_backend": "direct"}
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(runtime_support, "_resolve_executor_config", _executor_config)
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers(),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="not connected or not ready"):
+        await factory(
+            agent=AgentDefinition(
+                agent_id="agent-1",
+                owner_email="alice@example.com",
+                name="Agent",
+                execution={"executor_id": "alice_exec"},
+            ),
+            user_email="alice@example.com",
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_returns_runtime_diagnostics_for_shared_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(_: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
+
+    async def _executor_config(*_: object, **__: object) -> None:
+        return None
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {"web_available_backends": ["direct"], "web_backend": "direct"}
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(runtime_support, "_resolve_executor_config", _executor_config)
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers(),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+
+    runtime = await factory(
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+        ),
+        user_email="alice@example.com",
+    )
+
+    assert runtime.runtime_info is not None
+    assert runtime.runtime_info["runtime_source"] == "shared_in_process_runtime"
+    assert runtime.runtime_info["fallback_used"] is True
+    assert runtime.runtime_info["environment"]

@@ -642,6 +642,7 @@ class StepRunResponse(BaseModel):
     require_deliverable: bool | None = None
     output: dict[str, Any] | None = None
     evaluation: dict[str, Any] | None = None
+    runtime_info: dict[str, Any] | None = None
     deliverables: list[DeliverableResponse] = Field(default_factory=list)
     todos: list[dict[str, Any]] = Field(default_factory=list)
     started_at: datetime | None = None

@@ -1482,6 +1482,7 @@ class StepContext:
     tool_registry: Any = None  # ToolRegistry instance for this step
     executor_connection: Any = None  # ExecutorConnection for this step
     executor_environment: ExecutorEnvironmentSnapshot | None = None
+    runtime_info: dict[str, Any] = field(default_factory=dict)
     workflow_state: WorkflowState | None = None
     workflow_steps: list[StepDefinition] | None = None  # All steps for source resolution
     step_index: int = 0  # Index of current step in workflow
@@ -2569,40 +2570,47 @@ class AgentLoop:
                 "update_tool_runtime_info",
                 None,
             )
+            tool_runtime_info = {
+                **(ctx.runtime_info or {}),
+                "strategy": exposure.debug_metadata.get("strategy"),
+                "step_profile_id": resolved_profile.profile_id,
+                "step_profile_mode": (
+                    str(resolved_profile.mode)
+                    if resolved_profile.mode is not None
+                    else None
+                ),
+                "allow_tool_search": allow_tool_search,
+                "llm_api": str(exposure_contract.llm_api),
+                "discovery_mode": (
+                    str(ToolDiscoveryMode.CONTROLLER_SEARCH)
+                    if any(
+                        tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+                        for tool in exposure.tools
+                        if isinstance(tool, dict)
+                    )
+                    else str(ToolDiscoveryMode.NONE)
+                ),
+                "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
+                "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
+                "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
+                "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
+                "promoted_requested_count": exposure.debug_metadata.get(
+                    "promoted_requested_count"
+                ),
+                "promoted_visible_count": exposure.debug_metadata.get(
+                    "promoted_visible_count"
+                ),
+            }
             if callable(update_tool_runtime_info):
-                update_tool_runtime_info(
-                    ctx.session.session_id,
-                    {
-                        "strategy": exposure.debug_metadata.get("strategy"),
-                        "step_profile_id": resolved_profile.profile_id,
-                        "step_profile_mode": (
-                            str(resolved_profile.mode)
-                            if resolved_profile.mode is not None
-                            else None
-                        ),
-                        "allow_tool_search": allow_tool_search,
-                        "llm_api": str(exposure_contract.llm_api),
-                        "discovery_mode": (
-                            str(ToolDiscoveryMode.CONTROLLER_SEARCH)
-                            if any(
-                                tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
-                                for tool in exposure.tools
-                                if isinstance(tool, dict)
-                            )
-                            else str(ToolDiscoveryMode.NONE)
-                        ),
-                        "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
-                        "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
-                        "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
-                        "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
-                        "promoted_requested_count": exposure.debug_metadata.get(
-                            "promoted_requested_count"
-                        ),
-                        "promoted_visible_count": exposure.debug_metadata.get(
-                            "promoted_visible_count"
-                        ),
-                    },
-                )
+                update_tool_runtime_info(ctx.session.session_id, tool_runtime_info)
+            if ctx.step_run_id and self._session_factory is not None:
+                async with self._session_factory() as db_session:
+                    await update_step_run(
+                        db_session,
+                        ctx.step_run_id,
+                        runtime_info=tool_runtime_info,
+                    )
+                    await db_session.commit()
             logger.info(
                 "tool exposure prepared",
                 extra={

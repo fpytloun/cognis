@@ -196,6 +196,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
+        await conn.run_sync(_ensure_step_run_runtime_info_column)
         await conn.run_sync(_ensure_workflow_lifecycle_columns)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
         await conn.run_sync(_ensure_agent_grants_table)
@@ -690,6 +691,20 @@ def _ensure_step_run_deliverable_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE step_runs ADD COLUMN deliverable_id VARCHAR"))
     if "require_deliverable" not in columns:
         execute(text("ALTER TABLE step_runs ADD COLUMN require_deliverable BOOLEAN"))
+
+
+def _ensure_step_run_runtime_info_column(sync_conn: object) -> None:
+    """Add runtime diagnostics to step_runs when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("step_runs")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "runtime_info" not in columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN runtime_info JSON"))
 
 
 def _ensure_workflow_lifecycle_columns(sync_conn: object) -> None:

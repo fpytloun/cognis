@@ -59,6 +59,7 @@ def _step_run_row(**overrides: object) -> _FakeRow:
         "intaris_session_id": None,
         "output": None,
         "evaluation": None,
+        "runtime_info": None,
         "todos": None,
         "started_at": None,
         "completed_at": None,
@@ -96,6 +97,11 @@ class TestStepRunTodosContract:
     def test_non_dict_items_are_filtered(self) -> None:
         response = step_run_to_response(_step_run_row(todos=[{"ok": True}, "garbage"]))
         assert response.todos == [{"ok": True}]
+
+    def test_runtime_info_round_trip(self) -> None:
+        payload = {"executor_id": "exec-1", "environment": {"home": "/home/alice"}}
+        response = step_run_to_response(_step_run_row(runtime_info=payload))
+        assert response.runtime_info == payload
 
     def test_response_rejects_non_list_when_constructed_directly(self) -> None:
         with pytest.raises(ValidationError):
