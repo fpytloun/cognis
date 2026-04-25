@@ -188,35 +188,55 @@ textarea:focus-visible,
   min-width: max-content;
 }
 
-.chat-code-copy-button {
-  position: absolute;
-  top: 0.75rem;
-  right: 0.75rem;
+.copy-icon-button {
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  border: 1px solid rgb(71 85 105 / 0.85);
-  border-radius: 9999px;
-  background: rgb(15 23 42 / 0.92);
-  color: rgb(148 163 184);
-  padding: 0.5rem 0.8rem; /* larger tap target on mobile */
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: 1px solid rgb(51 65 85 / 0.5);
+  border-radius: 0.375rem;
+  background: rgb(2 6 23 / 0.75);
+  color: rgb(100 116 139);
   transition: color 120ms ease, border-color 120ms ease, background-color 120ms ease;
-  min-height: 36px;
 }
 
-.chat-code-copy-button:hover {
-  border-color: rgb(56 189 248 / 0.8);
-  background: rgb(15 23 42 / 1);
-  color: rgb(226 232 240);
+.copy-icon-button:hover {
+  border-color: rgb(71 85 105);
+  background: rgb(15 23 42);
+  color: rgb(203 213 225);
 }
 
-.chat-code-copy-button svg {
-  width: 0.9rem;
-  height: 0.9rem;
+.copy-icon-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgb(100 116 139 / 0.7);
+}
+
+.copy-icon-button svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.chat-code-wrap {
+  position: relative;
+  max-width: 100%;
+}
+
+.chat-markdown .chat-code-wrap {
+  margin-top: 1.7142857em;
+  margin-bottom: 1.7142857em;
+}
+
+.chat-markdown .chat-code-wrap pre {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.chat-code-copy-button {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 1;
 }
 
 @media (max-width: 640px) {

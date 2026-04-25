@@ -353,7 +353,7 @@
             <div class="relative">
               <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 pr-10 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
               <button
-                class="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700/50 bg-slate-950/75 text-slate-500 transition hover:border-slate-600 hover:bg-slate-900 hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70"
+                class="copy-icon-button absolute right-2 top-2"
                 onclick={() => void copyBox('input', inputText)}
                 type="button"
                 title="Copy input"
@@ -386,7 +386,7 @@
             <div class="relative">
               <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
               <button
-                class="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700/50 bg-slate-950/75 text-slate-500 transition hover:border-slate-600 hover:bg-slate-900 hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70"
+                class="copy-icon-button absolute right-2 top-2"
                 onclick={() => void copyBox('output', outputText)}
                 type="button"
                 title="Copy output"

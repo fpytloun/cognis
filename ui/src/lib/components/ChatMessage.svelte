@@ -1,6 +1,6 @@
 <script lang="ts">
   import Check from 'lucide-svelte/icons/check';
-import Copy from 'lucide-svelte/icons/copy';
+  import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import type { MessageTimelineItem } from '$lib/chat';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -92,6 +92,13 @@ import Copy from 'lucide-svelte/icons/copy';
     }
   }
 
+  function codeCopyIcon(copied: boolean): string {
+    if (copied) {
+      return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="sr-only">Copied code block</span>';
+    }
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span class="sr-only">Copy code block</span>';
+  }
+
   /**
    * Idempotent code-copy button mounter.
    *
@@ -111,9 +118,9 @@ import Copy from 'lucide-svelte/icons/copy';
     node: HTMLDivElement,
     _html: string
   ): { update: (_html: string) => void; destroy: () => void } {
-    // Track which pre element a copyKey currently maps to, so we can clear
+    // Track which button a copyKey currently maps to, so we can clear
     // timers for keys whose pre has been replaced.
-    const labelByKey = new Map<string, HTMLElement>();
+    const buttonByKey = new Map<string, HTMLButtonElement>();
 
     const cancelTimer = (copyKey: string): void => {
       const existing = codeCopyResetTimers.get(copyKey);
@@ -123,19 +130,19 @@ import Copy from 'lucide-svelte/icons/copy';
       }
     };
 
-    const markCopied = (copyKey: string, label: HTMLElement): void => {
+    const markCopied = (copyKey: string, button: HTMLButtonElement): void => {
       copiedCodeBlocks = new Set([...copiedCodeBlocks, copyKey]);
-      label.textContent = 'Copied';
+      button.innerHTML = codeCopyIcon(true);
       cancelTimer(copyKey);
       const reset = window.setTimeout(() => {
         const next = new Set(copiedCodeBlocks);
         next.delete(copyKey);
         copiedCodeBlocks = next;
         codeCopyResetTimers.delete(copyKey);
-        // Only touch the label if it's still in the DOM — if the streaming
+        // Only touch the button if it's still in the DOM — if the streaming
         // rerender replaced the <pre>, we'd be writing to a detached node.
-        const current = labelByKey.get(copyKey);
-        if (current && current.isConnected) current.textContent = 'Copy';
+        const current = buttonByKey.get(copyKey);
+        if (current && current.isConnected) current.innerHTML = codeCopyIcon(false);
       }, 2000);
       codeCopyResetTimers.set(copyKey, reset);
     };
@@ -155,37 +162,42 @@ import Copy from 'lucide-svelte/icons/copy';
         block.classList.add('chat-code-block');
         block.dataset.copyMounted = '1';
 
+        let wrapper = block.parentElement;
+        if (!wrapper?.classList.contains('chat-code-wrap')) {
+          wrapper = document.createElement('div');
+          wrapper.className = 'chat-code-wrap';
+          block.before(wrapper);
+          wrapper.append(block);
+        }
+
         const button = document.createElement('button');
-        const label = document.createElement('span');
-        label.textContent = copiedCodeBlocks.has(copyKey) ? 'Copied' : 'Copy';
         button.type = 'button';
-        button.className = 'chat-code-copy-button';
+        button.className = 'copy-icon-button chat-code-copy-button';
         button.setAttribute('aria-label', 'Copy code block');
-        button.innerHTML =
-          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
-        button.append(label);
+        button.title = 'Copy code block';
+        button.innerHTML = codeCopyIcon(copiedCodeBlocks.has(copyKey));
 
         const onClick = async (): Promise<void> => {
           try {
             await navigator.clipboard.writeText(code.textContent ?? '');
-            markCopied(copyKey, label);
+            markCopied(copyKey, button);
           } catch {
             addToast('Failed to copy code block', 'error');
           }
         };
 
         button.addEventListener('click', onClick);
-        block.append(button);
-        labelByKey.set(copyKey, label);
+        wrapper.append(button);
+        buttonByKey.set(copyKey, button);
       }
 
       // Cancel timers for copyKeys whose <pre> has been removed by a
       // streaming tail rebuild, so we don't attempt to restore text on a
       // detached label.
-      for (const copyKey of labelByKey.keys()) {
+      for (const copyKey of buttonByKey.keys()) {
         if (!seenKeys.has(copyKey)) {
           cancelTimer(copyKey);
-          labelByKey.delete(copyKey);
+          buttonByKey.delete(copyKey);
         }
       }
     };
@@ -199,8 +211,8 @@ import Copy from 'lucide-svelte/icons/copy';
         sync();
       },
       destroy() {
-        for (const copyKey of labelByKey.keys()) cancelTimer(copyKey);
-        labelByKey.clear();
+        for (const copyKey of buttonByKey.keys()) cancelTimer(copyKey);
+        buttonByKey.clear();
       }
     };
   }
@@ -265,16 +277,16 @@ import Copy from 'lucide-svelte/icons/copy';
           {/if}
           {#if !item.streaming}
             <button
-              class="inline-flex h-10 w-10 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/80 hover:text-slate-100 md:h-8 md:w-8"
+              class="copy-icon-button"
               onclick={copyMessage}
               type="button"
               title="Copy raw markdown"
               aria-label="Copy raw markdown"
             >
               {#if messageCopied}
-                <Check class="h-4 w-4 md:h-3.5 md:w-3.5" />
+                <Check />
               {:else}
-                <Copy class="h-4 w-4 md:h-3.5 md:w-3.5" />
+                <Copy />
               {/if}
             </button>
           {/if}
