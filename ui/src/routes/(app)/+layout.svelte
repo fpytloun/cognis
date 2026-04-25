@@ -29,6 +29,7 @@ import X from 'lucide-svelte/icons/x';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { scrollPersist } from '$lib/actions/scrollPersist';
   import { sidebarTooltip } from '$lib/actions/sidebarTooltip';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -642,11 +643,13 @@ import X from 'lucide-svelte/icons/x';
         -->
         <div
           class={contentShellClass}
+          data-app-content="true"
           role="presentation"
           onpointerdown={isChatDetailRoute ? undefined : onLeftEdgePointerDown}
           onpointermove={isChatDetailRoute ? undefined : onLeftEdgePointerMove}
           onpointerup={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
           onpointercancel={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
+          use:scrollPersist={{ key: $page.url.pathname, disabled: isChatDetailRoute }}
         >
             {@render children()}
         </div>

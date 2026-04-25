@@ -20,7 +20,9 @@ import { onMount, tick } from 'svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import { getIntarisUiUrl, getMnemoryUiUrl } from '$lib/config';
+  import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
+  import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import { thinkingEffortLabel } from '$lib/thinking';
@@ -1622,9 +1624,22 @@ import { onMount, tick } from 'svelte';
   onMount(() => {
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadSettings();
+
+    // Same-tab tap on Settings: reset to the default sub-tab (providers)
+    // and scroll the content shell to the top. The bottom tab bar has
+    // already navigated to `/settings` (bare path) so the `?tab=` query
+    // is cleared; we only need to reset local state and scroll.
+    const unsubTabReset = onTabReset('/settings', () => {
+      activeTab = 'providers';
+      clearPersistedScroll('/settings');
+      const el = document.querySelector<HTMLElement>('[data-app-content="true"]');
+      if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+
     return () => {
       if (executorPollTimer) clearInterval(executorPollTimer);
       cleanup();
+      unsubTabReset();
     };
   });
 

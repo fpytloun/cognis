@@ -7,19 +7,52 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
+  import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import { api, asApiError } from '$lib/api/client';
   import { confirmAction } from '$lib/stores/confirm';
+  import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Workflow } from '$lib/types/api';
+
+  // Expanded-group state survives tab switches via sessionStorage.
+  // Falls back to expanded-by-default on first visit and when storage is
+  // unavailable (e.g. Safari private mode).
+  const AGENTS_PRIMARY_EXPANDED_KEY = 'cognis-agents:primaryExpanded';
+  const AGENTS_SECONDARY_EXPANDED_KEY = 'cognis-agents:secondaryExpanded';
+
+  function readExpanded(key: string, fallback: boolean): boolean {
+    if (typeof sessionStorage === 'undefined') return fallback;
+    try {
+      const raw = sessionStorage.getItem(key);
+      if (raw === null) return fallback;
+      return raw === '1';
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeExpanded(key: string, value: boolean): void {
+    if (typeof sessionStorage === 'undefined') return;
+    try {
+      sessionStorage.setItem(key, value ? '1' : '0');
+    } catch {
+      // non-fatal
+    }
+  }
 
   let loading = true;
   let error = '';
   let agents: Agent[] = [];
   let workflows: Workflow[] = [];
-  let primaryExpanded = true;
-  let secondaryExpanded = true;
+  let primaryExpanded = readExpanded(AGENTS_PRIMARY_EXPANDED_KEY, true);
+  let secondaryExpanded = readExpanded(AGENTS_SECONDARY_EXPANDED_KEY, true);
   let lightboxUrl: string | null = null;
   let lightboxAlt = '';
+
+  // Persist expanded state whenever it changes so the next mount picks
+  // it up. `$:` blocks run on every reactive update.
+  $: writeExpanded(AGENTS_PRIMARY_EXPANDED_KEY, primaryExpanded);
+  $: writeExpanded(AGENTS_SECONDARY_EXPANDED_KEY, secondaryExpanded);
 
   $: primaryAgents = agents.filter((a) => a.agent_type === 'primary');
   $: secondaryAgents = agents.filter((a) => a.agent_type === 'secondary');
@@ -89,6 +122,19 @@
 
   onMount(() => {
     void loadAgents();
+
+    // Same-tab tap resets the accordion and scrolls to the top.
+    const unsubTabReset = onTabReset('/agents', () => {
+      primaryExpanded = true;
+      secondaryExpanded = true;
+      clearPersistedScroll('/agents');
+      const el = document.querySelector<HTMLElement>('[data-app-content="true"]');
+      if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+
+    return () => {
+      unsubTabReset();
+    };
   });
 </script>
 

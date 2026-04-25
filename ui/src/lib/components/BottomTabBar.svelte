@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import Bot from 'lucide-svelte/icons/bot';
 import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
   import { blockingOverlayActive } from '$lib/stores/overlays';
+  import { emitTabReset } from '$lib/stores/tabReset';
   import { viewportMetrics } from '$lib/stores/viewport';
 
   /**
@@ -109,6 +111,20 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
             }`}
             href={tab.href}
             aria-current={active ? 'page' : undefined}
+            onclick={(event: MouseEvent) => {
+              if (!active) return;
+              // Active-tab tap: navigate to the bare href to clear any
+              // `?filter=...` state, then broadcast a reset signal so the
+              // current page also scrolls to top and drops expanded UI
+              // state. Intercept the anchor so SvelteKit does not treat
+              // this as a same-URL no-op when filters are already clean.
+              event.preventDefault();
+              const current = $page.url.pathname + $page.url.search;
+              if (current !== tab.href) {
+                void goto(tab.href, { replaceState: false, noScroll: true, keepFocus: true });
+              }
+              emitTabReset(tab.href);
+            }}
           >
             <Icon class="h-5 w-5" aria-hidden="true" />
             <span class="font-medium">{tab.label}</span>

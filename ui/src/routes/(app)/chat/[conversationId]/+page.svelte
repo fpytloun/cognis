@@ -52,9 +52,11 @@ import X from 'lucide-svelte/icons/x';
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
+  import { scrollPersist } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
   import { requestOpenMobileNav } from '$lib/stores/mobileNav';
   import { registerOverlay } from '$lib/stores/overlays';
+  import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
@@ -92,6 +94,38 @@ import X from 'lucide-svelte/icons/x';
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
+
+  // Composer drafts persist across tab switches (per conversation) via
+  // sessionStorage. A single draft key is kept up to date with the
+  // current conversation; loading a different conversation saves the
+  // prior draft first, then hydrates the new one.
+  const DRAFT_PREFIX = 'cognis-chat-draft:';
+  let currentDraftKey: string | null = null;
+  let draftSaveTimer: number | null = null;
+
+  function readDraft(key: string): string {
+    if (typeof sessionStorage === 'undefined') return '';
+    try {
+      return sessionStorage.getItem(key) ?? '';
+    } catch {
+      return '';
+    }
+  }
+
+  function writeDraft(key: string, value: string): void {
+    if (typeof sessionStorage === 'undefined') return;
+    try {
+      if (value) sessionStorage.setItem(key, value);
+      else sessionStorage.removeItem(key);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  function clearDraft(key: string | null): void {
+    if (!key) return;
+    writeDraft(key, '');
+  }
   let showDropZone = $state(false);
   let dragCounter = 0;
   let selectedAgentId = $state('');
@@ -1677,6 +1711,9 @@ import X from 'lucide-svelte/icons/x';
     }
     error = '';
     composer = '';
+    // Drop any persisted draft synchronously so a quick tab-away right
+    // after send does not repopulate the pill from storage.
+    clearDraft(currentDraftKey);
     // Clear the native value synchronously and let Svelte flush the
     // reactive binding before measuring scrollHeight. Without the tick,
     // `syncComposerHeight` runs while the textarea still holds the
@@ -2360,6 +2397,34 @@ import X from 'lucide-svelte/icons/x';
 
   let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
 
+  // Sync composer draft with the active conversation. On conversation
+  // switch, save the current draft under the previous key and hydrate
+  // the new one. Runs before the composer-watching effect thanks to
+  // declaration order.
+  $effect(() => {
+    const id = currentConversation?.conversation_id;
+    const nextKey = id ? DRAFT_PREFIX + id : null;
+    if (nextKey === currentDraftKey) return;
+    if (currentDraftKey) writeDraft(currentDraftKey, composer);
+    const loaded = nextKey ? readDraft(nextKey) : '';
+    if (composer !== loaded) composer = loaded;
+    currentDraftKey = nextKey;
+  });
+
+  // Debounce-persist the composer draft on every change. Clears the
+  // entry when composer becomes empty so we do not leave stale drafts.
+  $effect(() => {
+    const key = currentDraftKey;
+    const value = composer;
+    if (!key) return;
+    if (typeof window === 'undefined') return;
+    if (draftSaveTimer !== null) window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = window.setTimeout(() => {
+      draftSaveTimer = null;
+      writeDraft(key, value);
+    }, 300);
+  });
+
   onMount(() => {
     restoreEnterToSendPreference();
     restoreSelectedChannel();
@@ -2398,6 +2463,18 @@ import X from 'lucide-svelte/icons/x';
 
     void initialize();
 
+    // Same-tab tap on the Chat tab:
+    //   * Mobile: open the conversation list drawer so the user can
+    //     switch conversations or start a new one without retyping.
+    //   * Desktop: just scroll the timeline to the newest message.
+    const unsubTabReset = onTabReset('/chat', () => {
+      if (isMobileViewport()) {
+        mobileListOpen = true;
+      } else {
+        scrollToBottom(true);
+      }
+    });
+
     return () => {
       mobileListOverlayCleanup?.();
       mobileListOverlayCleanup = null;
@@ -2405,6 +2482,14 @@ import X from 'lucide-svelte/icons/x';
       unsubscribeWs?.();
       unsubscribeComposerFocus?.();
       unsubscribeCancelTurn?.();
+      unsubTabReset();
+      if (draftSaveTimer !== null) {
+        window.clearTimeout(draftSaveTimer);
+        draftSaveTimer = null;
+      }
+      // Flush a final draft write on unmount so the sessionStorage
+      // value reflects the last in-memory state.
+      if (currentDraftKey) writeDraft(currentDraftKey, composer);
       stopEscalationCountdown();
       stopNotificationRefreshPolling();
       if (visibilityHandler) {

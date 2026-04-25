@@ -1,9 +1,11 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
 
   import { api, asApiError } from '$lib/api/client';
+  import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import TaskCard from '$lib/components/tasks/TaskCard.svelte';
@@ -12,6 +14,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import { confirmAction } from '$lib/stores/confirm';
+  import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import { workspaceHealth } from '$lib/system';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
@@ -58,6 +61,86 @@
     agentId: '',
     workflowId: '',
     status: ''
+  });
+
+  // ---------------------------------------------------------------------------
+  // URL-persisted filters + mobile column selection
+  //
+  // Filters live in the URL query so switching tabs and coming back keeps
+  // the user's view, and reloading the page preserves the state. The
+  // `mobileActiveColumn` choice is persisted as `?col=` because it
+  // changes which column is visible on small screens.
+  // ---------------------------------------------------------------------------
+
+  let urlHydrated = false;
+  let urlSyncTimer: number | null = null;
+
+  function hydrateFiltersFromUrl(): void {
+    const sp = $page.url.searchParams;
+    const next: TaskFilterState = {
+      search: sp.get('q') ?? '',
+      agentId: sp.get('agent') ?? '',
+      workflowId: sp.get('workflow') ?? '',
+      status: sp.get('status') ?? ''
+    };
+    if (
+      next.search !== filters.search ||
+      next.agentId !== filters.agentId ||
+      next.workflowId !== filters.workflowId ||
+      next.status !== filters.status
+    ) {
+      filters = next;
+    }
+    const col = sp.get('col') as TaskBoardColumnId | null;
+    if (col && col !== mobileActiveColumn && TASK_BOARD_COLUMNS.some((c) => c.id === col)) {
+      mobileActiveColumn = col;
+    }
+  }
+
+  function buildFiltersUrl(): string {
+    const sp = new URLSearchParams();
+    if (filters.search) sp.set('q', filters.search);
+    if (filters.agentId) sp.set('agent', filters.agentId);
+    if (filters.workflowId) sp.set('workflow', filters.workflowId);
+    if (filters.status) sp.set('status', filters.status);
+    if (mobileActiveColumn !== 'running') sp.set('col', mobileActiveColumn);
+    const query = sp.toString();
+    return query ? `/tasks?${query}` : '/tasks';
+  }
+
+  function scheduleFiltersUrlSync(): void {
+    if (typeof window === 'undefined') return;
+    if (!urlHydrated) return;
+    if (urlSyncTimer !== null) window.clearTimeout(urlSyncTimer);
+    urlSyncTimer = window.setTimeout(() => {
+      urlSyncTimer = null;
+      const next = buildFiltersUrl();
+      const current = $page.url.pathname + $page.url.search;
+      if (next !== current) {
+        void goto(next, { replaceState: true, noScroll: true, keepFocus: true });
+      }
+    }, 200);
+  }
+
+  // Sync: URL → local state. Fires when the user navigates (back/forward
+  // buttons or active-tab tap). The hydrate guards against assignment
+  // when the URL already matches local state, so this does not loop with
+  // `scheduleFiltersUrlSync`.
+  $effect(() => {
+    void $page.url.search;
+    hydrateFiltersFromUrl();
+    urlHydrated = true;
+  });
+
+  // Sync: local state → URL (debounced). Reads all filter fields so
+  // Svelte tracks them; writes through `scheduleFiltersUrlSync`.
+  $effect(() => {
+    void filters.search;
+    void filters.agentId;
+    void filters.workflowId;
+    void filters.status;
+    void mobileActiveColumn;
+    scheduleFiltersUrlSync();
   });
 
   // ---------------------------------------------------------------------------
@@ -435,12 +518,32 @@
     };
     document.addEventListener('visibilitychange', visibilityHandler);
     void loadBoardData().then(() => startPolling());
+
+    // Same-tab tap on the bottom tab bar: clear filters, drop expanded
+    // UI state, and scroll the content shell to the top. The tab bar
+    // has already navigated to `/tasks` (bare path) at this point, so
+    // the URL-hydrate effect will clear the `filters` object reactively;
+    // we only need to reset ephemeral state and the scroll container.
+    const unsubTabReset = onTabReset('/tasks', () => {
+      expandedDoneGroups = new Set();
+      selectedIds = new Set();
+      mobileActiveColumn = 'running';
+      clearPersistedScroll('/tasks');
+      const el = document.querySelector<HTMLElement>('[data-app-content="true"]');
+      if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+
     return () => {
       stopPolling();
       if (loadTimeoutTimer !== null) {
         window.clearTimeout(loadTimeoutTimer);
       }
+      if (urlSyncTimer !== null) {
+        window.clearTimeout(urlSyncTimer);
+        urlSyncTimer = null;
+      }
       if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
+      unsubTabReset();
     };
   });
 </script>
