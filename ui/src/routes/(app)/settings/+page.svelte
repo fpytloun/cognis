@@ -1704,7 +1704,7 @@ import { onMount, tick } from 'svelte';
               <p class="text-sm text-slate-400">Provider management is available to admin users only.</p>
             {:else}
               {#each providers as provider}
-                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-amber-400/40 bg-amber-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
+                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
                   <div class="flex items-center justify-between gap-3">
                     <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
                     <ProviderStatusBadge status={provider.status} />
@@ -1838,7 +1838,7 @@ import { onMount, tick } from 'svelte';
 
           {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
-              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-amber-400 focus:ring-amber-300" />
+              <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-emerald-400 focus:ring-emerald-300" />
               <span class="space-y-1">
                 <span class="block font-medium">Use OpenAI Responses transport when supported</span>
                 <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>

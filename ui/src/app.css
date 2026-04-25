@@ -175,7 +175,11 @@ textarea:focus-visible,
 :root[data-theme='light'] .bg-slate-900\/50,
 :root[data-theme='light'] .bg-slate-800,
 :root[data-theme='light'] .bg-slate-800\/80,
-:root[data-theme='light'] .bg-slate-800\/60 {
+:root[data-theme='light'] .bg-slate-800\/60,
+:root[data-theme='light'] .bg-zinc-900,
+:root[data-theme='light'] .bg-zinc-900\/80,
+:root[data-theme='light'] .bg-zinc-800,
+:root[data-theme='light'] .bg-zinc-800\/50 {
   background-color: color-mix(in srgb, var(--theme-panel) 90%, transparent) !important;
 }
 
@@ -183,20 +187,28 @@ textarea:focus-visible,
 :root[data-theme='light'] .border-slate-800\/80,
 :root[data-theme='light'] .border-slate-700,
 :root[data-theme='light'] .border-slate-700\/80,
-:root[data-theme='light'] .border-slate-600 {
+:root[data-theme='light'] .border-slate-600,
+:root[data-theme='light'] .border-zinc-800,
+:root[data-theme='light'] .border-zinc-700,
+:root[data-theme='light'] .border-zinc-600 {
   border-color: var(--theme-border) !important;
 }
 
 :root[data-theme='light'] .text-white,
 :root[data-theme='light'] .text-slate-50,
 :root[data-theme='light'] .text-slate-100,
-:root[data-theme='light'] .text-slate-200 {
+:root[data-theme='light'] .text-slate-200,
+:root[data-theme='light'] .text-zinc-100,
+:root[data-theme='light'] .text-zinc-200 {
   color: var(--theme-text) !important;
 }
 
 :root[data-theme='light'] .text-slate-300,
 :root[data-theme='light'] .text-slate-400,
-:root[data-theme='light'] .text-slate-500 {
+:root[data-theme='light'] .text-slate-500,
+:root[data-theme='light'] .text-zinc-300,
+:root[data-theme='light'] .text-zinc-400,
+:root[data-theme='light'] .text-zinc-500 {
   color: var(--theme-text-muted) !important;
 }
 

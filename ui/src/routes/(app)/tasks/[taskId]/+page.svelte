@@ -1103,7 +1103,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 {#each stepGroups as group}
                   {@const liveStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
                   <button
-                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-amber-400/60 bg-amber-500/10 text-amber-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
                     onclick={() => openStepDetail(group.stepName)}
                     type="button"
                   >
@@ -1200,7 +1200,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   {#if (activePause.options ?? []).length > 0}
                     <div class="flex flex-wrap gap-2">
                       {#each activePause.options ?? [] as option}
-                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-amber-400/40 hover:bg-amber-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
+                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-emerald-400/40 hover:bg-emerald-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
                       {/each}
                     </div>
                   {/if}
@@ -1244,7 +1244,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
                 {@const groupAgent = agentFor(group.latest?.agent_id ?? null)}
                 <button
-                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-amber-400/50 bg-amber-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
+                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-emerald-400/50 bg-emerald-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
                   onclick={() => openStepDetail(group.stepName, { mobileDrawer: false })}
                   type="button"
                 >

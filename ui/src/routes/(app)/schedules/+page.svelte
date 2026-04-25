@@ -534,7 +534,7 @@ import Zap from 'lucide-svelte/icons/zap';
             <div class="flex flex-wrap gap-2 pt-1">
               {#each cronPresets as preset}
                 <button
-                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.cron_expr === preset.value ? 'border-amber-500/50 bg-amber-500/10 text-amber-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.cron_expr === preset.value ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400' : ''}"
                   onclick={() => (form.cron_expr = preset.value)}
                   type="button"
                 >
@@ -557,7 +557,7 @@ import Zap from 'lucide-svelte/icons/zap';
             <div class="flex flex-wrap gap-2">
               {#each intervalPresets as preset}
                 <button
-                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.interval_seconds === preset.value ? 'border-amber-500/50 bg-amber-500/10 text-amber-400' : ''}"
+                  class="rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-200 md:py-1 md:text-xs {form.interval_seconds === preset.value ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-400' : ''}"
                   onclick={() => (form.interval_seconds = preset.value)}
                   type="button"
                 >

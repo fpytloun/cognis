@@ -13,7 +13,7 @@
 
 <section class="space-y-6">
   <Card class="p-4 sm:p-6">
-    <p class="text-sm uppercase tracking-[0.25em] text-amber-300">Docs</p>
+    <p class="text-sm uppercase tracking-[0.25em] text-emerald-300">Docs</p>
     <h1 class="mt-2 text-2xl font-semibold text-white">Embedded user guides</h1>
     <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">
       Read setup and workspace guidance directly inside Cognis. These pages are bundled with the UI, so they stay available in self-hosted deployments without opening GitHub.
@@ -31,7 +31,7 @@
       </div>
       <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {#each group.docs as doc}
-          <a class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 transition hover:border-amber-400/50 hover:bg-slate-950/90" href={`/docs/${doc.slug}`}>
+          <a class="rounded-2xl border border-slate-800 bg-slate-950/70 p-5 transition hover:border-emerald-400/50 hover:bg-slate-950/90" href={`/docs/${doc.slug}`}>
             <p class="font-medium text-white">{doc.title}</p>
             <p class="mt-3 text-sm leading-6 text-slate-400">{doc.description}</p>
           </a>

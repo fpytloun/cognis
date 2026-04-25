@@ -551,7 +551,7 @@
         { id: 'contacts', label: `Verified senders (${contacts.length})` },
       ] as tab}
         <button
-          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-amber-500 text-slate-950' : 'border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 hover:text-white'}`}
+          class={`shrink-0 rounded-full px-4 py-2 text-sm font-medium transition ${activeTab === tab.id ? 'bg-emerald-500 text-slate-950' : 'border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 hover:text-white'}`}
           onclick={() => handleTabChange(tab.id as ChannelsTab)}
           type="button"
         >

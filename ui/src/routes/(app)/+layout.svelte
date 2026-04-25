@@ -471,13 +471,16 @@ import X from 'lucide-svelte/icons/x';
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
-            <div class="space-y-2 border-b border-[color:var(--theme-border)] pb-5">
-              <p class="text-sm font-medium uppercase tracking-[0.3em] brand-text">Cognis</p>
-              <h1 class="text-xl font-semibold text-[color:var(--theme-text)]">Agent workspace</h1>
+            <div class="flex items-center gap-3 border-b border-[color:var(--theme-border)] pb-5">
+              <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
+              <div class="min-w-0">
+                <p class="text-sm font-medium uppercase tracking-[0.3em] brand-text">Cognis</p>
+                <h1 class="truncate text-xl font-semibold text-[color:var(--theme-text)]">Agent workspace</h1>
+              </div>
             </div>
           {:else}
             <div class="flex justify-center border-b border-[color:var(--theme-border)] pb-4">
-              <span class="text-lg font-bold brand-text">C</span>
+              <img alt="Cognis" class="h-9 w-9 rounded-xl shadow-card" src="/pwa/icon-192.png" />
             </div>
           {/if}
 
@@ -761,9 +764,12 @@ import X from 'lucide-svelte/icons/x';
   <Sheet open={mobileNavOpen} onClose={closeMobileNav} side="left" label="Navigation menu">
     {#snippet header()}
       <div class="flex items-center justify-between gap-3">
-        <div>
+        <div class="flex min-w-0 items-center gap-3">
+          <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
+          <div class="min-w-0">
           <p class="text-sm uppercase tracking-[0.25em] brand-text">Cognis</p>
           <p class="mt-1 text-sm text-[color:var(--theme-text-muted)]">{$auth.user?.email}</p>
+          </div>
         </div>
         <Button aria-label="Close navigation" class="h-11 w-11 md:h-9 md:w-9" size="icon" variant="secondary" onclick={closeMobileNav}>
           <X class="h-4 w-4" />

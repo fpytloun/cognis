@@ -564,7 +564,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         <Card class="p-4">
           <div class="space-y-2">
             {#each workflows as workflow}
-              <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-amber-400/40 bg-amber-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
+              <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${workflow.workflow_id === selectedWorkflow?.workflow_id ? 'border-emerald-400/40 bg-emerald-500/10 text-white' : 'border-slate-800 bg-slate-950/70 text-slate-200 hover:border-slate-700'}`} onclick={() => selectWorkflow(workflow)}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <span class="min-w-0 flex-1 truncate font-medium">{workflow.name}</span>
                   <span class="shrink-0 rounded-full border border-slate-700 px-2.5 py-1 text-[11px] uppercase tracking-[0.2em] text-slate-400">{workflow.disabled ? 'disabled' : workflow.lifecycle === 'ephemeral' ? 'ephemeral' : workflow.is_system ? 'system' : 'user'}</span>
@@ -783,7 +783,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   </div>
                   <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-amber-600/40 text-amber-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
                   {#if step.agentOverride && step.type === 'run'}
-                    <span class="break-all rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">{step.agentOverride}</span>
+                    <span class="break-all rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-300">{step.agentOverride}</span>
                   {/if}
                 </div>
 

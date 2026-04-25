@@ -62,7 +62,7 @@ import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
 {#if loading}
   <LoadingState label="Opening chat" description="Resolving your default conversation." />
 {:else if noAgents}
-  <section class="rounded-3xl border border-amber-500/30 bg-amber-500/10 px-6 py-10 text-center text-sm text-amber-100">
+  <section class="rounded-3xl border border-emerald-500/30 bg-emerald-500/10 px-6 py-10 text-center text-sm text-emerald-100">
     <p>Create an agent first before starting a conversation.</p>
     <div class="mt-4 flex justify-center gap-3">
       <Button onclick={() => goto('/agents')}>Open agents</Button>

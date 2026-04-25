@@ -2533,7 +2533,7 @@ import X from 'lucide-svelte/icons/x';
         <div class="flex items-center justify-between gap-3 border-t border-slate-800/60 pt-3">
           <h2 class="text-sm font-semibold text-white">History</h2>
           <button
-            class="text-xs font-medium text-amber-400 transition hover:text-amber-300"
+            class="text-xs font-medium text-emerald-400 transition hover:text-emerald-300"
             onclick={openNewConversationModal}
             type="button"
           >+ New</button>
@@ -2571,14 +2571,14 @@ import X from 'lucide-svelte/icons/x';
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
               <a
-                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-amber-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
+                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-emerald-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={closeMobileList}
               >
                 <div class="relative shrink-0">
                   <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
                   {#if unread}
-                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-amber-400"></span>
+                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-emerald-400"></span>
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
@@ -2625,9 +2625,9 @@ import X from 'lucide-svelte/icons/x';
         <div class="pointer-events-none absolute inset-0 z-20 bg-slate-950/35 backdrop-blur-[1px]"></div>
       {/if}
       {#if showDropZone}
-        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-amber-400 bg-amber-500/10 backdrop-blur-sm">
+        <div class="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-3xl border-2 border-dashed border-emerald-400 bg-emerald-500/10 backdrop-blur-sm">
           <div class="rounded-2xl bg-slate-900/90 px-6 py-4 text-center">
-            <p class="text-lg font-medium text-amber-300">Drop files here to attach</p>
+            <p class="text-lg font-medium text-emerald-300">Drop files here to attach</p>
             <p class="mt-1 text-sm text-slate-400">Images, PDFs, audio, and other files</p>
           </div>
         </div>
@@ -2676,7 +2676,7 @@ import X from 'lucide-svelte/icons/x';
               {#if editingTitle}
                 <!-- svelte-ignore a11y_autofocus -->
                 <input
-                  class="min-w-0 flex-1 rounded-lg border border-amber-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-amber-300 sm:text-xl"
+                  class="min-w-0 flex-1 rounded-lg border border-emerald-500/50 bg-slate-950/80 px-2 py-1 text-lg font-semibold text-white focus:outline-none focus:ring-1 focus:ring-emerald-300 sm:text-xl"
                   bind:value={editTitleValue}
                   onblur={saveTitle}
                   onkeydown={handleTitleKeydown}
@@ -2684,7 +2684,7 @@ import X from 'lucide-svelte/icons/x';
                 />
               {:else}
                 <button
-                  class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-amber-300 sm:text-xl"
+                  class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-emerald-300 sm:text-xl"
                   onclick={startEditTitle}
                   type="button"
                   title="Click to edit title"
@@ -2733,7 +2733,7 @@ import X from 'lucide-svelte/icons/x';
                 {#if conversationTaskId(currentConversation)}
                   <a
                     href="/tasks/{conversationTaskId(currentConversation)}"
-                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-amber-400/40 hover:text-amber-200"
+                    class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-emerald-400/40 hover:text-emerald-200"
                   >
                     {contextTypeBadge(currentConversation)}
                   </a>
@@ -2822,7 +2822,7 @@ import X from 'lucide-svelte/icons/x';
             {#if conversationTaskId(currentConversation)}
               <a
                 href="/tasks/{conversationTaskId(currentConversation)}"
-                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-amber-400/40 hover:text-amber-200"
+                class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-slate-400 transition hover:border-emerald-400/40 hover:text-emerald-200"
               >
                 {contextTypeBadge(currentConversation)}
               </a>
@@ -2901,7 +2901,7 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if queuedCount > 0}
-          <p class="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-100">
+          <p class="rounded-2xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-100">
             {queuedCount} additional message{queuedCount === 1 ? '' : 's'} queued for this conversation.
           </p>
         {/if}
@@ -3172,13 +3172,13 @@ import X from 'lucide-svelte/icons/x';
                 </div>
                 <p class="mt-1 leading-6">{pendingDirectQuestion.question}</p>
                 {#if pendingDirectQuestion.context}
-                  <p class="mt-2 text-xs text-amber-100/80">{pendingDirectQuestion.context}</p>
+                  <p class="mt-2 text-xs text-emerald-100/80">{pendingDirectQuestion.context}</p>
                 {/if}
                 {#if pendingDirectQuestion.options.length > 0}
                   <div class="mt-3 flex flex-wrap gap-2">
                     {#each pendingDirectQuestion.options as option}
                       <button
-                        class="rounded-full border border-amber-400/30 bg-amber-400/10 px-3 py-1 text-xs text-amber-100 transition hover:bg-amber-400/20"
+                        class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs text-emerald-100 transition hover:bg-emerald-400/20"
                         type="button"
                         disabled={directQuestionSubmitting}
                         onclick={() => { composer = option; syncComposerHeight(); focusActiveComposer(); }}
@@ -3215,7 +3215,7 @@ import X from 'lucide-svelte/icons/x';
                 submits, and the stored Enter-to-send preference still
                 applies for users who opted in.
             -->
-            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-amber-400/50 focus-within:ring-2 focus-within:ring-amber-300/20">
+            <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-emerald-400/50 focus-within:ring-2 focus-within:ring-emerald-300/20">
               <label
                 aria-label="Attach files"
                 class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting ? 'pointer-events-none opacity-40' : ''}`}
@@ -3263,7 +3263,7 @@ import X from 'lucide-svelte/icons/x';
                   type="submit"
                   aria-label={pendingDirectQuestion ? 'Answer' : 'Send'}
                   title={pendingDirectQuestion ? 'Answer' : 'Send'}
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-500 text-slate-950 transition hover:bg-amber-400 disabled:opacity-50"
+                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-slate-950 transition hover:bg-emerald-400 disabled:opacity-50"
                   disabled={directQuestionSubmitting}
                 >
                   <ArrowUp class="h-4 w-4" stroke-width="2.5" />
@@ -3315,7 +3315,7 @@ import X from 'lucide-svelte/icons/x';
               </div>
             </div>
             <button
-              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-amber-300"
+              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-emerald-300"
               onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; if (subSessionInfoOpen && !subSessionInfo) void loadSubSessionInfo(); }}
               type="button"
               title="Session details"

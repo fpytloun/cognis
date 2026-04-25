@@ -388,14 +388,14 @@
               bind:value={shareEmail}
               type="email"
               placeholder="user@example.com"
-              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-amber-400"
+              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
               disabled={shareSaving}
               required
             />
           </label>
           <label class="space-y-1 text-sm text-slate-300">
             <span>Executor access</span>
-            <select bind:value={shareExecutorScope} class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-amber-400" disabled={shareSaving}>
+            <select bind:value={shareExecutorScope} class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400" disabled={shareSaving}>
               <option value="owner_executor">Use owner executor setup</option>
               <option value="grantee_executor">Use grantee executor setup</option>
             </select>
@@ -406,7 +406,7 @@
               bind:value={shareNote}
               type="text"
               placeholder="Why this user has access"
-              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-amber-400"
+              class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-emerald-400"
               disabled={shareSaving}
             />
           </label>
@@ -431,7 +431,7 @@
                 <select
                   value={grant.executor_scope}
                   onchange={(event) => updateShareScope(grant, event)}
-                  class="rounded-xl border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 outline-none focus:border-amber-400"
+                  class="rounded-xl border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-100 outline-none focus:border-emerald-400"
                   disabled={updatingShareId === grant.grant_id}
                 >
                   <option value="owner_executor">Owner executor</option>

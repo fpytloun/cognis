@@ -21,7 +21,7 @@
   export let onDelete: () => void;
 </script>
 
-<Card class={`p-5 ${selected ? 'border-amber-400/40 bg-amber-500/10' : ''}`}>
+<Card class={`p-5 ${selected ? 'border-emerald-400/40 bg-emerald-500/10' : ''}`}>
   <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
     <div class="min-w-0 space-y-3">
       <div class="flex flex-wrap items-center gap-2">
