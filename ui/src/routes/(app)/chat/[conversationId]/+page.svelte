@@ -2971,7 +2971,7 @@ import X from 'lucide-svelte/icons/x';
 
         <!-- Timeline -->
         <div
-          class="relative min-h-0 flex-1 overflow-y-auto px-2.5 py-1.5 sm:p-4"
+          class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-1.5 sm:p-4"
           bind:this={timelineEl}
           onscroll={handleTimelineScroll}
           onpointerdown={closeHeaderInfo}

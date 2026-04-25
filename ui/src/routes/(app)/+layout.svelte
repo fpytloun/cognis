@@ -387,7 +387,7 @@ import X from 'lucide-svelte/icons/x';
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="fixed inset-x-0 top-0 h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
+  <div class="fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
     <div class={`mx-auto flex h-full max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[var(--app-shell-bottom-offset,0px)]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}

@@ -6,6 +6,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
   import { blockingOverlayActive } from '$lib/stores/overlays';
+  import { viewportMetrics } from '$lib/stores/viewport';
 
   /**
    * Mobile bottom tab bar. Shown only below `lg` breakpoint (matches `isMobile`
@@ -36,6 +37,15 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   // True when the current route is represented by one of the four tabs.
   const isOnTabRoute = $derived(tabs.some((tab) => isActive(tab.href, $page.url.pathname)));
 
+  // Hide the tab bar while the on-screen keyboard is open. The bar is
+  // `position: fixed; bottom: 0` anchored to the layout viewport, so when
+  // iOS/Android slide the keyboard up it would otherwise be stuck
+  // underneath it. Collapsing it also frees the `--app-shell-bottom-offset`
+  // reservation, so the shell uses the full visible height above the
+  // keyboard.
+  const keyboardOpen = $derived($viewportMetrics.keyboardOpen);
+  const visible = $derived(!hidden && !$blockingOverlayActive && !keyboardOpen);
+
   function setBottomOffset(value: number): void {
     if (typeof document === 'undefined') return;
     document.documentElement.style.setProperty('--app-shell-bottom-offset', `${Math.max(0, Math.round(value))}px`);
@@ -43,14 +53,13 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
 
   function syncBottomOffset(): void {
     if (typeof window === 'undefined') return;
-    const shouldReserve = !hidden && !$blockingOverlayActive && window.innerWidth < 1024;
+    const shouldReserve = visible && window.innerWidth < 1024;
     setBottomOffset(shouldReserve ? navEl?.offsetHeight ?? 0 : 0);
   }
 
   $effect(() => {
     if (typeof window === 'undefined') return;
-    void hidden;
-    void $blockingOverlayActive;
+    void visible;
     void navEl;
     const rafId = window.requestAnimationFrame(syncBottomOffset);
     return () => window.cancelAnimationFrame(rafId);
@@ -78,7 +87,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   });
 </script>
 
-{#if !hidden && !$blockingOverlayActive}
+{#if visible}
   <nav
     bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"

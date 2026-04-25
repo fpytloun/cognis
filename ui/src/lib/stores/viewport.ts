@@ -32,19 +32,25 @@ export function isTouch(): boolean {
 
 interface ViewportMetrics {
   height: number;
+  offsetTop: number;
   keyboardOpen: boolean;
 }
 
 function readViewportMetrics(): ViewportMetrics {
   if (typeof window === 'undefined') {
-    return { height: 0, keyboardOpen: false };
+    return { height: 0, offsetTop: 0, keyboardOpen: false };
   }
   const vv = window.visualViewport;
-  const visualBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
-  const height = Math.min(window.innerHeight, Math.max(0, visualBottom));
-  const keyboardOverlap = vv ? window.innerHeight - visualBottom : 0;
+  // Use the visible *height* of the viewport (not offsetTop + height) so the
+  // shell is sized to the area above the keyboard. `offsetTop` is published
+  // separately so the shell can shift down when iOS moves the visual
+  // viewport to keep a focused input visible.
+  const height = vv ? vv.height : window.innerHeight;
+  const offsetTop = vv ? vv.offsetTop : 0;
+  const keyboardOverlap = vv ? window.innerHeight - (offsetTop + height) : 0;
   return {
-    height,
+    height: Math.max(0, height),
+    offsetTop: Math.max(0, offsetTop),
     keyboardOpen: keyboardOverlap > 80,
   };
 }
@@ -52,14 +58,19 @@ function readViewportMetrics(): ViewportMetrics {
 function syncViewportVariables(metrics = readViewportMetrics()): void {
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
   const height = metrics.height || window.innerHeight;
-  document.documentElement.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
-  document.documentElement.style.setProperty(
+  const root = document.documentElement;
+  root.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
+  root.style.setProperty('--app-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
+  root.style.setProperty(
     '--app-bottom-inset',
     metrics.keyboardOpen ? '0px' : 'env(safe-area-inset-bottom, 0px)',
   );
+  root.dataset.keyboard = metrics.keyboardOpen ? 'open' : 'closed';
 }
 
-export const viewportMetrics = readable<ViewportMetrics>({ height: 0, keyboardOpen: false }, (set) => {
+export const viewportMetrics = readable<ViewportMetrics>(
+  { height: 0, offsetTop: 0, keyboardOpen: false },
+  (set) => {
   if (typeof window === 'undefined') return;
   const vv = window.visualViewport;
   const scheduledTimers = new Set<number>();
@@ -110,7 +121,10 @@ export const viewportMetrics = readable<ViewportMetrics>({ height: 0, keyboardOp
     document.removeEventListener('visibilitychange', scheduleUpdate);
     window.removeEventListener('focusin', scheduleUpdate, true);
     window.removeEventListener('focusout', scheduleUpdate, true);
-    document.documentElement.style.setProperty('--app-viewport-height', '100dvh');
-    document.documentElement.style.setProperty('--app-bottom-inset', 'env(safe-area-inset-bottom, 0px)');
+    const root = document.documentElement;
+    root.style.setProperty('--app-viewport-height', '100dvh');
+    root.style.setProperty('--app-viewport-offset-top', '0px');
+    root.style.setProperty('--app-bottom-inset', 'env(safe-area-inset-bottom, 0px)');
+    delete root.dataset.keyboard;
   };
 });
