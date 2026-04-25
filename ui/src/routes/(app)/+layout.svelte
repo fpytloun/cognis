@@ -29,6 +29,7 @@ import X from 'lucide-svelte/icons/x';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
   import { sidebarTooltip } from '$lib/actions/sidebarTooltip';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
@@ -66,48 +67,22 @@ import X from 'lucide-svelte/icons/x';
     mobileNavOpen = true;
   }
 
-  // Left-edge swipe gesture to open the mobile nav drawer on non-chat
-  // routes. Mirrors the iOS/Android convention where a horizontal drag
-  // from the left bezel reveals the navigation. We use pointer events
-  // so touch and pencil both trigger; mouse is ignored so desktop
-  // users don't accidentally open the drawer while selecting text.
-  const EDGE_WIDTH_PX = 24;
-  const SWIPE_THRESHOLD_PX = 60;
-  let swipeTracking = false;
-  let swipeStartX = 0;
-  let swipeStartY = 0;
-
-  function onLeftEdgePointerDown(event: PointerEvent): void {
-    if (event.pointerType === 'mouse') return;
-    if (mobileNavOpen) return;
-    if (event.clientX > EDGE_WIDTH_PX) return;
-    swipeTracking = true;
-    swipeStartX = event.clientX;
-    swipeStartY = event.clientY;
-  }
-
-  function onLeftEdgePointerMove(event: PointerEvent): void {
-    if (!swipeTracking) return;
-    const dx = event.clientX - swipeStartX;
-    const dy = event.clientY - swipeStartY;
-    // Mostly-vertical gestures belong to the page scroller, not to the
-    // drawer. Abort so the user can still scroll without us hijacking.
-    if (Math.abs(dy) > Math.abs(dx)) {
-      swipeTracking = false;
-      return;
-    }
-    if (dx >= SWIPE_THRESHOLD_PX) {
-      swipeTracking = false;
-      openMobileNav();
-    }
-  }
-
-  function onLeftEdgePointerReset(): void {
-    swipeTracking = false;
-  }
-
   function closeMobileNav(): void {
     mobileNavOpen = false;
+  }
+
+  // Edge-swipe handlers. The `edgeSwipe` action owns the gesture
+  // detection (touch + pointer) and prevents iOS from claiming the
+  // bezel swipe for native back/forward navigation. Left edge opens
+  // the mobile nav drawer; right edge closes it again.
+  function handleLeftEdgeSwipe(): void {
+    if (mobileNavOpen) return;
+    openMobileNav();
+  }
+
+  function handleRightEdgeSwipe(): void {
+    if (!mobileNavOpen) return;
+    closeMobileNav();
   }
 
   function restoreSidebarState(): void {
@@ -388,7 +363,7 @@ import X from 'lucide-svelte/icons/x';
   <ToastViewport />
   <ConfirmDialog />
   <ShortcutHelp />
-  <div class="fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
+  <div class="app-shell-viewport fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
     <div class={`mx-auto flex h-full max-w-[1600px] overflow-hidden ${shouldReserveBottomTabSpace ? 'pb-[var(--app-shell-bottom-offset,0px)]' : 'pb-0'} lg:gap-6 lg:px-6 lg:py-4 lg:pb-4`}>
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
@@ -645,11 +620,9 @@ import X from 'lucide-svelte/icons/x';
           class={contentShellClass}
           data-app-content="true"
           role="presentation"
-          onpointerdown={isChatDetailRoute ? undefined : onLeftEdgePointerDown}
-          onpointermove={isChatDetailRoute ? undefined : onLeftEdgePointerMove}
-          onpointerup={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
-          onpointercancel={isChatDetailRoute ? undefined : onLeftEdgePointerReset}
           use:scrollPersist={{ key: $page.url.pathname, disabled: isChatDetailRoute }}
+          use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen }}
+          use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: isChatDetailRoute || !mobileNavOpen }}
         >
             {@render children()}
         </div>

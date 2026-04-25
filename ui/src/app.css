@@ -261,3 +261,18 @@ textarea:focus-visible,
   top: var(--app-shell-top-offset, 0px);
   bottom: var(--app-shell-bottom-offset, 0px);
 }
+
+/*
+ * Reserve horizontal gestures for the app. iOS PWA standalone mode
+ * otherwise routes left/right edge swipes to the system back/forward
+ * navigation, even while our `edgeSwipe` action is listening. Setting
+ * `pan-y` on the outer shell tells iOS that horizontal pans belong to
+ * the page, and the action's touchmove/preventDefault claim closes the
+ * remaining gap on older iOS versions. Children that genuinely need
+ * horizontal pan (code blocks, wide tables, image lightbox) override
+ * via their own `overflow-x: auto` which carries an implicit
+ * `touch-action: auto` for the scrollable region.
+ */
+.app-shell-viewport {
+  touch-action: pan-y;
+}

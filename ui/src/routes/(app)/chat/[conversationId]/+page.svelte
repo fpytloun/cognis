@@ -52,6 +52,7 @@ import X from 'lucide-svelte/icons/x';
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
+  import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
   import { requestOpenMobileNav } from '$lib/stores/mobileNav';
@@ -997,6 +998,25 @@ import X from 'lucide-svelte/icons/x';
   function openMobileList(): void {
     mobileDrawerPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     mobileListOpen = true;
+  }
+
+  // Edge-swipe handlers for the chat detail viewport. The action gates
+  // them by `disabled` so we don't open the conversation list on
+  // desktop, and we suppress the right-edge gesture entirely while the
+  // composer / textarea is focused (would otherwise close the info
+  // panel mid-typing on rare misfires).
+  function handleChatLeftEdgeSwipe(): void {
+    if (!isMobileViewport()) return;
+    if (mobileListOpen) return;
+    openMobileList();
+  }
+
+  function handleChatRightEdgeSwipe(): void {
+    if (mobileListOpen) {
+      closeMobileList();
+      return;
+    }
+    headerInfoOpen = !headerInfoOpen;
   }
 
   function closeMobileList(): void {
@@ -2523,7 +2543,11 @@ import X from 'lucide-svelte/icons/x';
 {#if initializing && !conversationIdFromRoute()}
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
-  <div class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'lg:grid lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-4'}`}>
+  <div
+    class={`relative flex h-full min-h-0 flex-col gap-3 overflow-hidden ${chatSidebarCollapsed ? '' : 'lg:grid lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-4'}`}
+    use:edgeSwipe={{ edge: 'left', onTrigger: handleChatLeftEdgeSwipe }}
+    use:edgeSwipe={{ edge: 'right', onTrigger: handleChatRightEdgeSwipe }}
+  >
     {#if mobileListOpen}
       <button
         aria-label="Close conversation list"
