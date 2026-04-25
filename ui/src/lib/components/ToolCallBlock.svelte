@@ -1,7 +1,11 @@
 <script lang="ts">
+  import Check from 'lucide-svelte/icons/check';
+  import Copy from 'lucide-svelte/icons/copy';
+  import { onMount } from 'svelte';
   import type { ToolCallTimelineItem } from '$lib/chat';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import { addToast } from '$lib/stores/toasts';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
@@ -12,6 +16,8 @@
   let outputExpanded = $state(false);
   let evalExpanded = $state(false);
   let autoExpanded = $state(false);
+  let copiedBox = $state<'input' | 'output' | null>(null);
+  let copyResetTimer: number | null = null;
   const nowDate = new Date();
 
   const LINES_PER_PAGE = 50;
@@ -22,6 +28,14 @@
       expanded = true;
       autoExpanded = true;
     }
+  });
+
+  onMount(() => {
+    return () => {
+      if (copyResetTimer !== null) {
+        window.clearTimeout(copyResetTimer);
+      }
+    };
   });
 
   function toggle(): void {
@@ -121,6 +135,22 @@
       return JSON.stringify(item.arguments, null, 2);
     } catch {
       return String(item.arguments);
+    }
+  }
+
+  async function copyBox(kind: 'input' | 'output', text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+      copiedBox = kind;
+      if (copyResetTimer !== null) {
+        window.clearTimeout(copyResetTimer);
+      }
+      copyResetTimer = window.setTimeout(() => {
+        copiedBox = null;
+        copyResetTimer = null;
+      }, 1600);
+    } catch {
+      addToast(`Failed to copy ${kind}`, 'error');
     }
   }
 
@@ -316,10 +346,26 @@
 
       {:else}
         {#if item.arguments && Object.keys(item.arguments).length > 0}
-          {@const inputData = formatMaybeJson(formatArguments(), inputExpanded)}
+          {@const inputText = formatArguments()}
+          {@const inputData = formatMaybeJson(inputText, inputExpanded)}
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
-            <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
+            <div class="relative">
+              <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 pr-10 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
+              <button
+                class="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700/50 bg-slate-950/75 text-slate-500 transition hover:border-slate-600 hover:bg-slate-900 hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70"
+                onclick={() => void copyBox('input', inputText)}
+                type="button"
+                title="Copy input"
+                aria-label="Copy input"
+              >
+                {#if copiedBox === 'input'}
+                  <Check class="h-3.5 w-3.5" />
+                {:else}
+                  <Copy class="h-3.5 w-3.5" />
+                {/if}
+              </button>
+            </div>
             {#if inputData.hiddenCount > 0}
               <button
                 class="mt-1 text-xs text-sky-400 hover:text-sky-300"
@@ -333,11 +379,26 @@
         {/if}
 
         {#if item.result != null}
-          {@const cleaned = cleanResult(item.result)}
-          {@const outputData = formatMaybeJson(cleaned, outputExpanded)}
+          {@const outputText = cleanResult(item.result)}
+          {@const outputData = formatMaybeJson(outputText, outputExpanded)}
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-            <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
+            <div class="relative">
+              <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
+              <button
+                class="absolute right-2 top-2 inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-700/50 bg-slate-950/75 text-slate-500 transition hover:border-slate-600 hover:bg-slate-900 hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500/70"
+                onclick={() => void copyBox('output', outputText)}
+                type="button"
+                title="Copy output"
+                aria-label="Copy output"
+              >
+                {#if copiedBox === 'output'}
+                  <Check class="h-3.5 w-3.5" />
+                {:else}
+                  <Copy class="h-3.5 w-3.5" />
+                {/if}
+              </button>
+            </div>
             {#if outputData.hiddenCount > 0}
               <button
                 class="mt-1 text-xs text-sky-400 hover:text-sky-300"
