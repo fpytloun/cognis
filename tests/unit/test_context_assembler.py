@@ -6,7 +6,11 @@ from time import monotonic
 
 import pytest
 
-from cognis.core.context import ContextAssembler, _build_environment_info
+from cognis.core.context import (
+    ContextAssembler,
+    _build_environment_info,
+    _load_project_instructions,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMode,
@@ -433,6 +437,30 @@ async def test_context_assembler_loads_root_project_instructions(tmp_path: Path)
     assert not any("README.md" in content for content in system_messages)
     assert "Instructions for project at" in str(result.messages[1]["content"])
     assert "AGENTS.md" in str(result.messages[1]["content"])
+
+
+def test_project_instruction_loader_prefers_agents_over_nested_readme(tmp_path: Path) -> None:
+    nested = tmp_path / "src" / "feature"
+    nested.mkdir(parents=True)
+    (tmp_path / "AGENTS.md").write_text("# Project instructions\nUse pytest.\n")
+    (nested / "README.md").write_text("# Feature readme\nNested overview.\n")
+
+    instructions = _load_project_instructions(
+        workspace_root=str(tmp_path),
+        effective_working_directory=str(nested),
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-1",
+            executor_type="in_process",
+            cwd=str(nested),
+            home=str(tmp_path),
+        ),
+    )
+
+    assert len(instructions) == 1
+    assert "AGENTS.md" in instructions[0]
+    assert "Use pytest" in instructions[0]
+    assert "Nested overview" not in instructions[0]
 
 
 @pytest.mark.asyncio
@@ -1015,6 +1043,7 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "<available_skills>" in content
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
+    assert "skill_write" not in content
     assert "<critical_rules>" in content
     assert "IMPORTANT: If the task names a skill" in content
     assert "This is a continuation from a previous session." in content
@@ -1031,6 +1060,33 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert recalled_messages == [
         '<memory_context trust="untrusted">\nRecalled memories:\n- (0.90) Mutable recalled memory\n</memory_context>'
     ]
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_mentions_skill_write_only_when_visible() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_skills(),
+        user_message="hello",
+        tool_definitions=[_profile_tool("skill_write", category="skills", read_only=False)],
+        skip_memory=True,
+        prompt_context=PromptContext.CHAT,
+    )
+
+    content = str(result.messages[0]["content"])
+    assert "<skills_guidance>" in content
+    assert "skill_write" in content
 
 
 @pytest.mark.asyncio

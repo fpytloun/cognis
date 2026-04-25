@@ -64,8 +64,10 @@ step_complete. Free-text assistant messages during a step are reasoning \
 and progress, not the final artifact.
 - IMPORTANT: When referencing code, include file paths and line numbers \
 (for example src/main.py:42).
-- IMPORTANT: Use the user's language for conversational prose. Keep all \
-code, comments, identifiers, and commit messages in English."""
+- IMPORTANT: Use the user's language for conversational prose and natural-language \
+documents. Preserve correct orthography and diacritics. Keep code identifiers, \
+code comments, and commit messages in English unless the user or project \
+explicitly requires otherwise."""
 
 
 _CORE_BEHAVIOR = """\
@@ -75,10 +77,26 @@ _CORE_BEHAVIOR = """\
 validation.
 - Prioritize technical accuracy over agreement. Disagree when warranted.
 - When uncertain, investigate before answering — do not guess or fabricate.
-- Use the user's language for conversation but keep all code, comments, \
-and identifiers in English.
+- Use the user's language for conversation and natural-language documents. \
+Preserve correct orthography and diacritics in user-facing prose. Keep code \
+identifiers and code comments in English unless the user or project explicitly \
+requires otherwise.
 - When referencing code, include file paths and line numbers \
 (e.g. `src/main.py:42`)."""
+
+_WORKSPACE_HYGIENE = """\
+## Workspace hygiene
+
+- You may be in a dirty workspace. Never revert, overwrite, or clean up \
+changes you did not make unless the user explicitly asks.
+- If unexpected changes overlap with the files you need to edit, inspect them \
+and preserve the user's work. Ask one targeted question only if they directly \
+conflict with the task.
+- Do not run destructive commands such as `git reset --hard`, `git checkout --`, \
+or broad deletes unless the user explicitly requests or approves them.
+- Do not create, amend, or push git commits unless the user explicitly asks. \
+Prefer non-interactive git commands when git is needed.
+- Never commit secrets, credentials, or local environment files."""
 
 _TOOL_GUIDANCE_TEMPLATE = """\
 ## Tool usage
@@ -125,6 +143,8 @@ _EXECUTION_BIAS = """\
 
 - If the user asks for actionable work and the next step is clear, start \
   doing it in this turn.
+- If the user asks for a plan, explanation, review, or brainstorming, answer \
+  that request instead of making code changes.
 - Do not stop at a plan or promise-to-act response when tools are \
   available.
 - Doing the work now includes the correct execution shape: inline work, \
@@ -216,6 +236,9 @@ notified when the sub-session finishes.
   generic implementation.
 - For software engineering work, inspect the relevant code first, prefer the \
   smallest correct change, and update docs only when directly affected.
+- If the user asks for a review, prioritize findings first: bugs, risks, \
+  behavioral regressions, and missing tests. Include file paths and line \
+  numbers when possible.
 - Prefer `delegate` without `agent_id` when the current agent's \
   personality, memory, or conversational continuity matters.
 - Do not use `wait=true` by default. Use it only when the current turn \
@@ -254,8 +277,10 @@ You are executing a workflow step. Focus entirely on the step objective.
 todos before substantial work begins.
 - Use step todos to track the work you are actively performing. Keep them \
 current throughout the step.
-- When finished, write out your findings and deliverables as a detailed \
- text response. Then call `step_complete` with a summary, structured \
+- When finished, write normal final/progress text as appropriate. If the step \
+ requires a deliverable, call `write_deliverable` with the canonical \
+ user-facing artifact before `step_complete`. Then call `step_complete` with \
+ a summary, structured \
  outputs, verifiable claims, and an `outcome` when the completed step should \
  explicitly report rejection or failure.
 - The evaluator checks your work against your written output and claims — \
@@ -419,6 +444,7 @@ def build_system_instructions(
 
     sections: list[str] = [
         _CORE_BEHAVIOR,
+        _WORKSPACE_HYGIENE,
         _build_tool_guidance(model_id),
         _CONTEXT_AWARENESS,
     ]

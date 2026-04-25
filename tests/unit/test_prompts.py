@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from cognis.core.prompts import (
     PromptContext,
+    build_critical_rules,
     build_system_instructions,
     build_visible_edit_tool_guidance,
 )
+from cognis.core.system_skills import get_system_skill_default
 
 
 def test_chat_prompt_describes_turn_local_todos() -> None:
@@ -55,7 +57,33 @@ def test_chat_prompt_has_execution_bias() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
     assert "If the user asks for actionable work" in instructions
+    assert "If the user asks for a plan, explanation, review, or brainstorming" in instructions
     assert "Doing the work now includes the correct execution shape" in instructions
+
+
+def test_chat_prompt_preserves_diacritics_in_user_facing_prose() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    rules = build_critical_rules()
+    assert instructions is not None
+    assert rules is not None
+    assert "Preserve correct orthography and diacritics" in instructions
+    assert "natural-language documents" in instructions
+    assert "Preserve correct orthography and diacritics" in rules
+
+
+def test_chat_prompt_includes_workspace_hygiene() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "You may be in a dirty workspace" in instructions
+    assert "Never revert, overwrite, or clean up" in instructions
+    assert "Do not create, amend, or push git commits" in instructions
+
+
+def test_chat_prompt_defaults_review_to_findings_first() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "If the user asks for a review" in instructions
+    assert "prioritize findings first" in instructions
 
 
 def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
@@ -91,8 +119,6 @@ def test_critical_rules_cover_truncated_output_recovery_and_placeholder_bleed() 
     # Placeholder and tool-output recovery rules are now carried in
     # build_critical_rules() so they land at the very top of the prompt,
     # right after <identity>.
-    from cognis.core.prompts import build_critical_rules
-
     rules = build_critical_rules()
     assert rules is not None
     assert "cleared from context" in rules
@@ -124,6 +150,7 @@ def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None
     assert "For non-trivial work, first make a short execution plan" in instructions
+    assert "call `write_deliverable` with the canonical" in instructions
     assert (
         "Do not call `step_complete` until every remaining todo is `done` or `cancelled`"
         in instructions
@@ -151,3 +178,12 @@ def test_follow_up_notify_prompt_keeps_updates_separate() -> None:
     assert "historical context" in instructions
     assert "separate update" in instructions
     assert "Do not resume or continue an older conversation thread" in instructions
+
+
+def test_coding_skill_preserves_user_facing_diacritics_and_workspace_hygiene() -> None:
+    skill = get_system_skill_default("cognis-coding")
+    assert skill is not None
+    content = str(skill["instructions"])
+    assert "Do not force natural-language documents to ASCII" in content
+    assert "Do not add backward-compatibility code unless there is a concrete need" in content
+    assert "Never revert, overwrite, or clean up changes you did not make" in content

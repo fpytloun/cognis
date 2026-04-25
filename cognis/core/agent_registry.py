@@ -255,7 +255,7 @@ messages using Conventional Commits v1.0.0.
 - Also explicitly git add any newly created files
 - Create the commit with the generated message
 - NEVER push. Do not run git push under any circumstances
-- Use only plaintext and ASCII characters, no fancy visuals
+- Use plain text only. Avoid decorative Unicode or fancy visuals
 - Use only dash or asterisk symbols for bullet points
 - Avoid unnecessary empty lines between bullet points unless separating \
 distinct lists

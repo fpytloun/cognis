@@ -88,6 +88,20 @@ Use this skill when the agent is doing software engineering work and should foll
 - Keep new abstractions minimal unless reuse is clear.
 - Stay within scope and avoid unrelated cleanup.
 - When there is a simpler implementation that still satisfies the requirement, choose it.
+- Do not add backward-compatibility code unless there is a concrete need such as persisted data, shipped behavior, external consumers, or an explicit user requirement.
+- Before introducing a dependency, verify the project already uses it or that adding it is explicitly required.
+- Preserve user-facing prose in the target language, including correct diacritics. Do not force natural-language documents to ASCII.
+- Keep code identifiers, code comments, and commit messages in English unless the user or project explicitly requires otherwise.
+- Add comments sparingly, only when they explain non-obvious intent or constraints.
+
+# Workspace Hygiene
+
+- You may be in a dirty workspace. Never revert, overwrite, or clean up changes you did not make unless the user explicitly asks.
+- If unexpected changes overlap with your intended edits, inspect them and preserve the user's work; ask one targeted question only if they directly conflict with the task.
+- Do not run destructive commands such as `git reset --hard`, `git checkout --`, or broad deletes unless the user explicitly requests or approves them.
+- Do not create, amend, or push git commits unless the user explicitly asks.
+- Prefer non-interactive git commands when git is needed.
+- Never commit secrets, credentials, or local environment files.
 
 # Routing
 

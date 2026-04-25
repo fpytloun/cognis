@@ -342,11 +342,17 @@ def _load_project_instructions(
         directories.append(root_path)
 
     seen_dirs: set[Path] = set()
+    unique_directories: list[Path] = []
     for directory in directories:
         if directory in seen_dirs or not directory.is_dir():
             continue
         seen_dirs.add(directory)
-        for filename in ("AGENTS.md", "CLAUDE.md", "README.md"):
+        unique_directories.append(directory)
+
+    # Prefer agent-specific instructions at any relevant level before falling
+    # back to generic human README content from a nested directory.
+    for filename in ("AGENTS.md", "CLAUDE.md", "README.md"):
+        for directory in unique_directories:
             candidate = directory / filename
             if not candidate.is_file():
                 continue
@@ -685,6 +691,7 @@ class ContextAssembler:
             prompt_context=prompt_context,
             prefix_entries=prefix_entries,
             resolved_model=resolved_model,
+            visible_tool_names={tool.name for tool in tool_definitions or []},
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
@@ -1049,6 +1056,7 @@ class ContextAssembler:
             prompt_context=prompt_context,
             prefix_entries=prefix_entries,
             resolved_model=resolved_model,
+            visible_tool_names={tool.name for tool in tool_definitions or []},
         )
         system_prompt_tokens, tool_schema_tokens = self._count_static_tokens(
             resolved_model=resolved_model,
@@ -1615,6 +1623,7 @@ class ContextAssembler:
         prompt_context: PromptContext,
         prefix_entries: list[ImmutablePrefixEntry],
         resolved_model: str,
+        visible_tool_names: set[str] | None = None,
     ) -> str | None:
         """Compose the cacheable immutable system prefix as one message."""
         sections: list[str] = []
@@ -1667,14 +1676,21 @@ class ContextAssembler:
         skill_metadata = self._get_available_skills_metadata(agent)
         if skill_metadata:
             sections.append(skill_metadata)
-            tagged_skills_guidance = _tagged_section(
-                "skills_guidance",
+            skill_guidance = (
                 "You have skills that extend your capabilities. Review the "
                 "list above and use skill_load to load any skills relevant "
                 "to the current task. Skills marked as attached are preferred "
                 "defaults for this agent. Follow loaded skill instructions "
-                "carefully. You can also create new skills with skill_write "
-                "to remember procedures for future use.",
+                "carefully."
+            )
+            if visible_tool_names is not None and "skill_write" in visible_tool_names:
+                skill_guidance += (
+                    " You can also create new skills with skill_write to remember "
+                    "procedures for future use."
+                )
+            tagged_skills_guidance = _tagged_section(
+                "skills_guidance",
+                skill_guidance,
             )
             if tagged_skills_guidance:
                 sections.append(tagged_skills_guidance)
