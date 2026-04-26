@@ -18,14 +18,15 @@
 
   // Task delegations have IDs starting with "task_". Sub-session cards should
   // only offer "View session" for real session identifiers.
-  let isTaskDelegation = $derived(item.taskId.startsWith('task_'));
+  let isTaskDelegation = $derived(item.taskId.startsWith('task_') || item.id.startsWith('delegation:task_'));
   let isSessionDelegation = $derived(item.taskId.startsWith('sess_'));
+  let cardLabel = $derived(isTaskDelegation ? 'Task' : 'Delegation');
 </script>
 
 <article class={`rounded-3xl border px-4 py-4 shadow-card ${toneClass()}`}>
   <div class="flex flex-wrap items-center justify-between gap-4">
     <div>
-      <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">Delegation</p>
+      <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">{cardLabel}</p>
       <h3 class="mt-1 text-base font-semibold">{item.taskLabel}</h3>
       <p class="mt-2 text-xs uppercase tracking-[0.2em] opacity-75" title={formatAbsoluteTime(item.timestamp)}>
         {formatRelativeTime(item.timestamp)}

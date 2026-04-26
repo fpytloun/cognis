@@ -41,7 +41,7 @@ import Target from 'lucide-svelte/icons/target';
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
-  import { workflowToFormState } from '$lib/workflows';
+  import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
 import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
@@ -88,7 +88,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   const statusColors: Record<string, string> = {
     pending: 'border-slate-600 text-slate-400',
     running: 'border-sky-600 text-sky-300',
-    evaluating: 'border-cyan-600 text-cyan-300',
+    evaluating: 'border-violet-600 text-violet-300',
     approved: 'border-emerald-700 text-emerald-300',
     completed: 'border-emerald-700 text-emerald-300',
     failed: 'border-rose-700 text-rose-300',
@@ -362,25 +362,87 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     return env && typeof env === 'object' ? (env as Record<string, unknown>) : {};
   }
 
-  function runtimeRows(stepRun: StepRun): Array<{ label: string; value: string }> {
-    const info = stepRun.runtime_info;
-    if (!info) return [];
-    const env = runtimeEnvironment(stepRun);
+  function runtimeInfo(stepRun: StepRun): Record<string, unknown> {
+    return stepRun.runtime_info && typeof stepRun.runtime_info === 'object' ? stepRun.runtime_info : {};
+  }
+
+  function toolsLoadedLabel(info: Record<string, unknown>): string {
+    const visible = runtimeString(info.visible_tool_count);
+    const inventory = runtimeString(info.inventory_tool_count);
+    if (visible && inventory && visible !== inventory) return `${visible} visible / ${inventory} loaded`;
+    if (visible || inventory) return `${visible || inventory} loaded`;
+    return '';
+  }
+
+  function runtimeSummaryRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const info = runtimeInfo(stepRun);
+    if (Object.keys(info).length === 0) return [];
     return [
       { label: 'Executor', value: runtimeString(info.executor_id) || 'unresolved' },
-      { label: 'Type', value: runtimeString(info.executor_type) || 'unknown' },
+      { label: 'Tools loaded', value: toolsLoadedLabel(info) },
+      { label: 'Model target', value: runtimeString(info.resolved_model) || runtimeString(info.model) },
+      { label: 'Reasoning', value: runtimeString(info.reasoning_effort) }
+    ].filter((row) => row.value !== '');
+  }
+
+  function runtimeDebugRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const info = runtimeInfo(stepRun);
+    if (Object.keys(info).length === 0) return [];
+    const env = runtimeEnvironment(stepRun);
+    return [
+      { label: 'Provider target', value: runtimeString(info.resolved_provider_id) },
+      { label: 'Executor type', value: runtimeString(info.executor_type) || 'unknown' },
       { label: 'Runtime', value: runtimeString(info.runtime_source) || 'unknown' },
       { label: 'Selection', value: runtimeString(info.selection_source) || 'unknown' },
       { label: 'Fallback', value: runtimeString(info.fallback_used) },
+      { label: 'Tool strategy', value: runtimeString(info.strategy) },
+      { label: 'Discovery', value: runtimeString(info.discovery_mode) },
+      { label: 'Step profile', value: runtimeString(info.step_profile_id) },
+      { label: 'Profile mode', value: runtimeString(info.step_profile_mode) },
       { label: 'User', value: runtimeString(env.user) || 'unknown' },
       { label: 'Home', value: runtimeString(env.home) || 'unknown' },
-      { label: 'CWD', value: runtimeString(env.cwd) || 'unknown' },
-      { label: 'Tools', value: runtimeString(info.visible_tool_count) || runtimeString(info.inventory_tool_count) || 'unknown' }
+      { label: 'CWD', value: runtimeString(env.cwd) || 'unknown' }
     ].filter((row) => row.value !== '');
+  }
+
+  function runtimeRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    return [...runtimeSummaryRows(stepRun), ...runtimeDebugRows(stepRun)];
   }
 
   function runtimeMissingMessage(stepRun: StepRun): string {
     return stepRun.runtime_info ? '' : 'Runtime not recorded for this attempt.';
+  }
+
+  function workflowStepSpec(stepName: string): WorkflowStepFormState | null {
+    return diagramSteps.find((step) => step.name === stepName) ?? null;
+  }
+
+  function stepSpecRows(group: StepGroup | null, stepRun: StepRun | null): Array<{ label: string; value: string }> {
+    if (!group) return [];
+    const spec = workflowStepSpec(group.stepName);
+    const runtime = stepRun ? runtimeInfo(stepRun) : {};
+    const reasoning = spec?.reasoningEffort || runtimeString(runtime.reasoning_effort) || 'default';
+    const input = spec
+      ? spec.inputText
+        ? `${spec.inputMode}: ${spec.inputText}`
+        : spec.inputMode
+      : '';
+    const profile = spec
+      ? spec.stepProfileId
+        ? `${spec.stepProfileId} (${spec.stepProfileMode})`
+        : `default (${spec.stepProfileMode})`
+      : '';
+    return [
+      { label: 'Step type', value: group.stepType === 'gate' ? 'Gate' : 'Run' },
+      { label: 'Configured reasoning', value: reasoning },
+      { label: 'Evaluation', value: spec?.type === 'run' ? (spec.evaluate ? `enabled, max ${spec.maxAttempts}` : 'disabled') : '' },
+      { label: 'Deliverable', value: spec ? (spec.requireDeliverable ? 'required' : 'optional') : '' },
+      { label: 'Input', value: input },
+      { label: 'Agent override', value: spec?.agentOverride ?? '' },
+      { label: 'Step profile', value: profile },
+      { label: 'Tool search', value: spec ? (spec.stepProfileAllowToolSearch ? 'enabled' : 'disabled') : '' },
+      { label: 'Questions', value: spec ? (spec.allowQuestions ? 'allowed' : 'not allowed') : '' }
+    ].filter((row) => row.value !== '');
   }
 
   function displayStepStatus(stepRun: StepRun): string {
@@ -1356,8 +1418,23 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                     {/if}
 
+                    {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
+                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</p>
+                        <p class="mt-1 text-xs text-slate-500">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
+                        <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                          {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
+                            <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
+                              <dt class="text-slate-500">{row.label}</dt>
+                              <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                            </div>
+                          {/each}
+                        </dl>
+                      </div>
+                    {/if}
+
                     <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</p>
                       {#if runtimeRows(latestAttempt).length > 0}
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each runtimeRows(latestAttempt) as row}
@@ -1779,13 +1856,13 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   {#if mobileStepDetailOpen && selectedStepGroup}
     <Sheet open={mobileStepDetailOpen} onClose={closeMobileStepDetail} side="bottom" label={`Step detail for ${selectedStepGroup.stepName}`} maxHeight="88dvh">
       {#snippet header()}
-        <div class="flex items-start justify-between gap-3">
-          <div>
+        <div class="flex min-w-0 items-start justify-between gap-3">
+          <div class="min-w-0 flex-1">
             <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Step detail</p>
-            <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup.stepName}</h2>
+            <h2 class="mt-1 break-words text-lg font-semibold text-white">{selectedStepGroup.stepName}</h2>
             <p class="mt-1 text-sm text-slate-400">{selectedStepGroup.stepType === 'gate' ? 'Gate step' : 'Execution step'} with {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}.</p>
           </div>
-          <Button size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
+          <Button class="shrink-0" size="sm" variant="secondary" onclick={closeMobileStepDetail}>Close</Button>
         </div>
       {/snippet}
 
@@ -1805,17 +1882,49 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             {#if summary}
               <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
             {/if}
-            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
-              {#if runtimeRows(latestAttempt).length > 0}
+            {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
+              <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs uppercase tracking-[0.25em] text-slate-500">
+                  Current workflow spec
+                  <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                </summary>
                 <dl class="mt-3 grid gap-2 text-xs">
-                  {#each runtimeRows(latestAttempt) as row}
+                  {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
                     <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
                       <dt class="text-slate-500">{row.label}</dt>
                       <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
                     </div>
                   {/each}
                 </dl>
+              </details>
+            {/if}
+            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+              {#if runtimeSummaryRows(latestAttempt).length > 0}
+                <dl class="mt-3 grid gap-2 text-xs">
+                  {#each runtimeSummaryRows(latestAttempt) as row}
+                    <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
+                      <dt class="text-slate-500">{row.label}</dt>
+                      <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                    </div>
+                  {/each}
+                </dl>
+                {#if runtimeDebugRows(latestAttempt).length > 0}
+                  <details class="mt-3 rounded-xl border border-slate-800/70 bg-slate-900/30 px-3 py-2">
+                    <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-medium text-slate-300">
+                      Debug runtime details
+                      <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                    </summary>
+                    <dl class="mt-3 grid gap-2 text-xs">
+                      {#each runtimeDebugRows(latestAttempt) as row}
+                        <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-950/50 px-2.5 py-2">
+                          <dt class="text-slate-500">{row.label}</dt>
+                          <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
+                        </div>
+                      {/each}
+                    </dl>
+                  </details>
+                {/if}
               {:else}
                 <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
               {/if}

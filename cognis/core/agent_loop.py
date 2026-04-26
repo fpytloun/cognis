@@ -2577,6 +2577,9 @@ class AgentLoop:
             )
             tool_runtime_info = {
                 **(ctx.runtime_info or {}),
+                "resolved_model": current_model,
+                "resolved_provider_id": current_provider_id,
+                "reasoning_effort": reasoning_effort,
                 "strategy": exposure.debug_metadata.get("strategy"),
                 "step_profile_id": resolved_profile.profile_id,
                 "step_profile_mode": (

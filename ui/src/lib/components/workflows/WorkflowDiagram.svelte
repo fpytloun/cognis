@@ -115,19 +115,28 @@ import Logs from 'lucide-svelte/icons/logs';
     return PAD_TOP + (totalArcs - 1 - arcIndex) * 18;
   }
 
-  // Status-based styling for task mode
-  function nodeStroke(stepName: string, defaultStroke: string): string {
-    if (!isTaskMode) return defaultStroke;
+  // Status-based styling for task mode. Status stays authoritative even when
+  // selected, otherwise a completed selected step looks blue until focus moves.
+  function statusColor(stepName: string, fallback: string): string {
+    if (!isTaskMode) return fallback;
     if (skippedSteps.includes(stepName)) return '#334155';
-    if (stepName === activeStepName) return '#0ea5e9';
     const status = stepStatuses[stepName];
-    if (!status) return '#334155';
+    if (!status) return stepName === activeStepName ? '#0ea5e9' : fallback;
     if (status === 'approved' || status === 'completed') return '#059669';
     if (status === 'failed' || status === 'cancelled') return '#dc2626';
     if (status === 'rejected' || status === 'revise') return '#0284c7';
-    if (status === 'running' || status === 'evaluating') return '#0ea5e9';
+    if (status === 'evaluating') return '#a855f7';
+    if (status === 'running') return '#0ea5e9';
     if (status === 'paused') return '#eab308';
-    return defaultStroke;
+    return fallback;
+  }
+
+  function nodeStroke(stepName: string, defaultStroke: string): string {
+    return statusColor(stepName, defaultStroke);
+  }
+
+  function nodeAccent(stepName: string): string {
+    return statusColor(stepName, '#0ea5e9');
   }
 
   function nodeStrokeWidth(stepName: string): string {
@@ -139,12 +148,16 @@ import Logs from 'lucide-svelte/icons/logs';
     return selectedStepName !== '' && selectedStepName === stepName;
   }
 
-  function nodeFill(stepName: string, defaultFill: string): string {
+  function nodeFill(stepName: string, defaultFill: string, selected = false): string {
     if (!isTaskMode) return defaultFill;
     if (skippedSteps.includes(stepName)) return '#0c0a0940';
     const status = stepStatuses[stepName];
-    if (status === 'approved' || status === 'completed') return '#05966910';
-    if (status === 'failed' || status === 'cancelled') return '#dc262610';
+    if (status === 'approved' || status === 'completed') return selected ? '#05966924' : '#05966910';
+    if (status === 'failed' || status === 'cancelled') return selected ? '#dc262624' : '#dc262610';
+    if (status === 'evaluating') return selected ? '#a855f724' : '#a855f710';
+    if (status === 'running') return selected ? '#0ea5e924' : '#0ea5e910';
+    if (status === 'paused') return selected ? '#eab30824' : '#eab30810';
+    if (selected) return '#0ea5e914';
     return defaultFill;
   }
 
@@ -303,8 +316,8 @@ import Logs from 'lucide-svelte/icons/logs';
           >
             <polygon
               points="{x + NODE_W / 2},{y} {x + NODE_W},{y + NODE_H / 2} {x + NODE_W / 2},{y + NODE_H} {x},{y + NODE_H / 2}"
-              fill={selected ? '#0ea5e914' : nodeFill(step.name, '#1c1917')}
-              stroke={selected ? '#38bdf8' : nodeStroke(step.name, '#0284c7')}
+              fill={nodeFill(step.name, '#1c1917', selected)}
+              stroke={selected ? nodeAccent(step.name) : nodeStroke(step.name, '#0284c7')}
               stroke-width={selected ? '2.5' : nodeStrokeWidth(step.name)}
               class={isActive ? 'node-active' : ''}
             />
@@ -327,8 +340,8 @@ import Logs from 'lucide-svelte/icons/logs';
             </text>
             {#if isActive}
               <g>
-                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke="#0ea5e933" stroke-width="2" />
-                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
+                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke={`${nodeAccent(step.name)}33`} stroke-width="2" />
+                <circle cx={x + NODE_W - 18} cy={y + 18} r="7" fill="none" stroke={nodeAccent(step.name)} stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
               </g>
             {/if}
             {#if attempt}
@@ -381,8 +394,8 @@ import Logs from 'lucide-svelte/icons/logs';
               width={NODE_W}
               height={NODE_H}
               rx="12"
-              fill={selected ? '#0ea5e914' : nodeFill(step.name, '#0c0a09')}
-              stroke={selected ? '#38bdf8' : isActive ? '#0ea5e9' : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
+              fill={nodeFill(step.name, '#0c0a09', selected)}
+              stroke={selected ? nodeAccent(step.name) : isActive ? nodeAccent(step.name) : nodeStroke(step.name, hasAgent ? '#0ea5e9' : '#334155')}
               stroke-width={selected ? '2.5' : nodeStrokeWidth(step.name)}
               class={isActive ? 'node-active' : ''}
             />
@@ -407,8 +420,8 @@ import Logs from 'lucide-svelte/icons/logs';
             {/if}
             {#if isActive}
               <g>
-                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#0ea5e933" stroke-width="2" />
-                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke={`${nodeAccent(step.name)}33`} stroke-width="2" />
+                <circle cx={x + NODE_W - 16} cy={y + 16} r="7" fill="none" stroke={nodeAccent(step.name)} stroke-width="2" stroke-linecap="round" stroke-dasharray="9 19" class="node-spinner" />
               </g>
             {/if}
             {#if attempt}

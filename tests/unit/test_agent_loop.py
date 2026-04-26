@@ -2505,6 +2505,9 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
     assert "search_tools" in fake_llm.tool_sets[1]
     assert all(name != "tool_search" for name in fake_llm.tool_sets[1])
     assert session_cache.tool_runtime_info is not None
+    assert session_cache.tool_runtime_info["resolved_model"] == "gpt-5.4"
+    assert session_cache.tool_runtime_info["resolved_provider_id"] == "proxy"
+    assert "reasoning_effort" in session_cache.tool_runtime_info
     assert session_cache.tool_runtime_info["strategy"] in {
         "generic_search_tools",
         "openai_responses_controller_search_fallback",
