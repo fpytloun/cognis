@@ -193,6 +193,8 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "auto_install": runtime_metadata.get("browser_auto_install", False),
         "headed_allowed": runtime_metadata.get("browser_headed_allowed", False),
         "engine": runtime_metadata.get("browser_engine", "chromium"),
+        "runtime": runtime_metadata.get("browser_runtime", "playwright"),
+        "channel": runtime_metadata.get("browser_channel"),
         "max_sessions": runtime_metadata.get("browser_max_sessions", BROWSER_DEFAULT_MAX_SESSIONS),
         "idle_timeout_seconds": runtime_metadata.get(
             "browser_idle_timeout_seconds", BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS
@@ -210,7 +212,25 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "timezone_id": runtime_metadata.get("browser_timezone_id"),
         "viewport_width": runtime_metadata.get("browser_viewport_width", 1365),
         "viewport_height": runtime_metadata.get("browser_viewport_height", 900),
+        "stealth_enabled": runtime_metadata.get("browser_stealth_enabled"),
+        "stealth_evasions": runtime_metadata.get("browser_stealth_evasions"),
+        "realistic_user_agent": runtime_metadata.get("browser_realistic_user_agent", True),
+        "default_timezone_id": runtime_metadata.get("browser_default_timezone_id", "UTC"),
+        "default_accept_language": runtime_metadata.get(
+            "browser_default_accept_language", "en-US,en;q=0.9"
+        ),
     }
+
+
+def _coerce_evasions(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+        return [item for item in items if item]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return None
 
 
 def _get_manager(context: ToolExecutionContext) -> BrowserManager:
@@ -218,10 +238,16 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
     if isinstance(existing, BrowserManager):
         return existing
     cfg = _browser_config(context.runtime_metadata)
+    stealth_enabled_raw = cfg.get("stealth_enabled")
+    stealth_enabled: bool | None = (
+        None if stealth_enabled_raw is None else bool(stealth_enabled_raw)
+    )
     manager = BrowserManager(
         enabled=bool(cfg.get("enabled", True)),
         auto_install=bool(cfg.get("auto_install", False)),
         engine=str(cfg.get("engine", "chromium")),
+        runtime=str(cfg.get("runtime") or "playwright"),
+        channel=(str(cfg.get("channel")) if cfg.get("channel") else None),
         headed_allowed=bool(cfg.get("headed_allowed", False)),
         max_sessions=int(cfg.get("max_sessions", BROWSER_DEFAULT_MAX_SESSIONS)),
         idle_timeout_seconds=int(
@@ -238,6 +264,13 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
         timezone_id=(str(cfg.get("timezone_id")) if cfg.get("timezone_id") else None),
         viewport_width=int(cfg.get("viewport_width", 1365)),
         viewport_height=int(cfg.get("viewport_height", 900)),
+        stealth_enabled=stealth_enabled,
+        stealth_evasions=_coerce_evasions(cfg.get("stealth_evasions")),
+        realistic_user_agent=bool(cfg.get("realistic_user_agent", True)),
+        default_timezone_id=(
+            str(cfg.get("default_timezone_id")) if cfg.get("default_timezone_id") else None
+        ),
+        default_accept_language=str(cfg.get("default_accept_language") or "en-US,en;q=0.9"),
     )
     context.runtime_metadata[BROWSER_MANAGER_KEY] = manager
     return manager

@@ -561,6 +561,8 @@ export interface ExecutorBrowserConfig {
   auto_install?: boolean;
   headed_allowed?: boolean;
   engine?: string;
+  runtime?: 'playwright' | 'patchright';
+  channel?: string;
   max_sessions?: number;
   idle_timeout_seconds?: number;
   persistent_profiles_enabled?: boolean;
@@ -572,6 +574,11 @@ export interface ExecutorBrowserConfig {
   timezone_id?: string;
   viewport_width?: number;
   viewport_height?: number;
+  stealth_enabled?: boolean;
+  stealth_evasions?: string[] | string;
+  realistic_user_agent?: boolean;
+  default_timezone_id?: string;
+  default_accept_language?: string;
 }
 
 export interface ExecutorRuntimeConfig {

@@ -15,7 +15,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from cognis.logging import get_logger
-from cognis.tools.executor.browser.install import ensure_playwright_browser
+from cognis.tools.executor.browser.install import (
+    RUNTIME_PATCHRIGHT,
+    RUNTIME_PLAYWRIGHT,
+    SUPPORTED_RUNTIMES,
+    ensure_browser_runtime,
+    ensure_playwright_browser,
+)
 
 logger = get_logger(__name__)
 
@@ -26,6 +32,16 @@ BROWSER_DEFAULT_PROFILE_MODE = "persistent_local"
 BROWSER_DEFAULT_VIEWPORT_WIDTH = 1365
 BROWSER_DEFAULT_VIEWPORT_HEIGHT = 900
 BROWSER_DIAGNOSTIC_EVENT_LIMIT = 200
+
+# Pinned recent Chrome desktop UA used as the realistic-UA fallback when we
+# cannot probe the running Chromium build at startup. Update periodically.
+BROWSER_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/127.0.0.0 Safari/537.36"
+)
+BROWSER_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+BROWSER_DEFAULT_TIMEZONE_ID = "UTC"
 
 
 @dataclass
@@ -56,6 +72,8 @@ class BrowserManager:
         enabled: bool = True,
         auto_install: bool = False,
         engine: str = "chromium",
+        runtime: str = RUNTIME_PLAYWRIGHT,
+        channel: str | None = None,
         headed_allowed: bool = False,
         max_sessions: int = BROWSER_DEFAULT_MAX_SESSIONS,
         idle_timeout_seconds: int = BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS,
@@ -68,10 +86,31 @@ class BrowserManager:
         timezone_id: str | None = None,
         viewport_width: int = BROWSER_DEFAULT_VIEWPORT_WIDTH,
         viewport_height: int = BROWSER_DEFAULT_VIEWPORT_HEIGHT,
+        stealth_enabled: bool | None = None,
+        stealth_evasions: list[str] | None = None,
+        realistic_user_agent: bool = True,
+        default_timezone_id: str | None = BROWSER_DEFAULT_TIMEZONE_ID,
+        default_accept_language: str = BROWSER_DEFAULT_ACCEPT_LANGUAGE,
     ) -> None:
         self.enabled = enabled
         self.auto_install = auto_install
         self.engine = engine
+        runtime_normalized = (runtime or RUNTIME_PLAYWRIGHT).strip().lower()
+        if runtime_normalized not in SUPPORTED_RUNTIMES:
+            raise ValueError(
+                f"Unsupported browser runtime: {runtime!r}. "
+                f"Expected one of {', '.join(SUPPORTED_RUNTIMES)}."
+            )
+        self.runtime = runtime_normalized
+        # Patchright works best with real Chrome stable; default to that
+        # channel when the user hasn't pinned one explicitly.
+        if (
+            self.runtime == RUNTIME_PATCHRIGHT
+            and (channel is None or not str(channel).strip())
+            and engine == "chromium"
+        ):
+            channel = "chrome"
+        self.channel = (channel or "").strip() or None
         self.headed_allowed = headed_allowed
         self.max_sessions = max_sessions
         self.idle_timeout_seconds = idle_timeout_seconds
@@ -84,6 +123,17 @@ class BrowserManager:
         self.timezone_id = timezone_id
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        # Stealth defaults: ON for vanilla Playwright, OFF for Patchright (it
+        # already covers the same evasions and stacking can introduce
+        # inconsistencies). Explicit user setting always wins.
+        if stealth_enabled is None:
+            stealth_enabled = self.runtime != RUNTIME_PATCHRIGHT
+        self.stealth_enabled = bool(stealth_enabled)
+        self.stealth_evasions = list(stealth_evasions) if stealth_evasions else []
+        self.realistic_user_agent = realistic_user_agent
+        self.default_timezone_id = default_timezone_id
+        self.default_accept_language = default_accept_language
+        self._stealth: Any | None = None  # Lazily instantiated
         self._browser: Any | None = None
         self._playwright: Any | None = None
         self._sessions: dict[str, BrowserSession] = {}
@@ -97,6 +147,7 @@ class BrowserManager:
         self._playwright_display: str | None = None
         self._headed_open_in_flight = 0
         self._open_in_flight = 0
+        self._patchright_persistent_warning_emitted = False
 
     @property
     def active_session_count(self) -> int:
@@ -182,6 +233,7 @@ class BrowserManager:
             profile_id=profile_id,
             url=url,
         )
+        self._maybe_emit_patchright_persistent_warning(profile_mode=resolved_mode)
         async with self._lock:
             if len(self._sessions) + self._open_in_flight >= self.max_sessions:
                 raise RuntimeError("Browser session limit exceeded")
@@ -426,9 +478,20 @@ class BrowserManager:
             await self._ensure_playwright_ready_locked(headless=headless)
 
     async def _ensure_playwright_ready_locked(self, *, headless: bool) -> str | None:
-        ok, reason = await ensure_playwright_browser(
-            auto_install=self.auto_install, engine=self.engine
-        )
+        # Use the back-compat shim when the manager is running vanilla
+        # Playwright with no channel pin, so existing tests that monkeypatch
+        # ``ensure_playwright_browser`` keep working unchanged.
+        if self.runtime == RUNTIME_PLAYWRIGHT and not self.channel:
+            ok, reason = await ensure_playwright_browser(
+                auto_install=self.auto_install, engine=self.engine
+            )
+        else:
+            ok, reason = await ensure_browser_runtime(
+                runtime=self.runtime,
+                engine=self.engine,
+                channel=self.channel,
+                auto_install=self.auto_install,
+            )
         if not ok:
             raise RuntimeError(f"Browser runtime unavailable: {reason}")
         if self._needs_virtual_display(headless=headless):
@@ -439,8 +502,7 @@ class BrowserManager:
                 raise RuntimeError("Browser runtime already active for a different display")
             await self._stop_playwright_locked()
         if self._playwright is None:
-            from playwright.async_api import async_playwright
-
+            async_playwright = self._resolve_async_playwright()
             self._playwright = await async_playwright().start()
             self._playwright_display = display
             self._runtime_generation += 1
@@ -450,6 +512,16 @@ class BrowserManager:
                 display=display,
             )
         return display
+
+    def _resolve_async_playwright(self) -> Any:
+        """Import the ``async_playwright`` factory for the active runtime."""
+        if self.runtime == RUNTIME_PATCHRIGHT:
+            from patchright.async_api import async_playwright as patchright_async
+
+            return patchright_async
+        from playwright.async_api import async_playwright as playwright_async
+
+        return playwright_async
 
     def _needs_virtual_display(self, *, headless: bool) -> bool:
         return (
@@ -557,6 +629,8 @@ class BrowserManager:
         kwargs: dict[str, Any] = {"headless": headless, "env": self._launch_env(display)}
         if args:
             kwargs["args"] = args
+        if self.channel:
+            kwargs["channel"] = self.channel
         return kwargs
 
     def _context_kwargs(self, *, auth_state: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -564,20 +638,87 @@ class BrowserManager:
             "viewport": {"width": self.viewport_width, "height": self.viewport_height},
             "locale": self.locale,
         }
-        if self.timezone_id:
-            kwargs["timezone_id"] = self.timezone_id
+        timezone_id = self.timezone_id or (
+            self.default_timezone_id if self.stealth_enabled else None
+        )
+        if timezone_id:
+            kwargs["timezone_id"] = timezone_id
+        if self.stealth_enabled:
+            if self.realistic_user_agent:
+                kwargs["user_agent"] = BROWSER_DEFAULT_USER_AGENT
+            if self.default_accept_language:
+                kwargs["extra_http_headers"] = {
+                    "Accept-Language": self.default_accept_language,
+                }
         if auth_state is not None:
             kwargs["storage_state"] = auth_state
         return kwargs
 
-    async def _apply_context_defaults(self, context: Any) -> None:
-        if not self.realistic_launch:
+    def _build_stealth(self) -> Any | None:
+        """Construct (and cache) the ``Stealth`` runner for this manager.
+
+        Returns ``None`` when stealth is disabled or the optional dependency
+        is not importable. Per-evasion exclusion list is applied by setting
+        the matching ``Stealth`` boolean to ``False``.
+        """
+        if not self.stealth_enabled:
+            return None
+        if self._stealth is not None:
+            return self._stealth
+        try:
+            from playwright_stealth import Stealth  # type: ignore[import-untyped]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "browser: playwright_stealth unavailable; falling back to launch-arg only "
+                "evasions (%s)",
+                type(exc).__name__,
+            )
+            return None
+        kwargs: dict[str, Any] = {}
+        for evasion in self.stealth_evasions:
+            normalized = (evasion or "").strip()
+            if normalized:
+                kwargs[normalized] = False
+        # ``init_scripts_only`` is the safer default for Patchright since
+        # Patchright already patches CDP-level leaks; layering stealth's
+        # CDP-based evasions on top can introduce inconsistencies.
+        if self.runtime == RUNTIME_PATCHRIGHT:
+            kwargs.setdefault("init_scripts_only", True)
+        try:
+            self._stealth = Stealth(**kwargs)
+        except TypeError as exc:
+            logger.warning(
+                "browser: playwright_stealth rejected configuration (%s); falling back to defaults",
+                exc,
+            )
+            self._stealth = Stealth()
+        return self._stealth
+
+    def _maybe_emit_patchright_persistent_warning(self, *, profile_mode: str) -> None:
+        if self._patchright_persistent_warning_emitted:
             return
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            """
+        if self.runtime != RUNTIME_PATCHRIGHT:
+            return
+        if profile_mode == "persistent_local":
+            return
+        logger.warning(
+            "browser: patchright runtime is most effective with persistent profiles "
+            "and channel=chrome (current channel=%s, profile_mode=%s)",
+            self.channel,
+            profile_mode,
         )
+        self._patchright_persistent_warning_emitted = True
+
+    async def _apply_context_defaults(self, context: Any) -> None:
+        stealth = self._build_stealth()
+        if stealth is not None:
+            try:
+                await stealth.apply_stealth_async(context)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "browser: failed to apply stealth to context (%s); continuing without",
+                    type(exc).__name__,
+                )
 
     async def _open_persistent_context(
         self,
@@ -750,6 +891,9 @@ class BrowserManager:
             "active_session_count": len(self._sessions),
             "headed_session_count": sum(1 for item in self._sessions.values() if not item.headless),
             "engine": self.engine,
+            "runtime": self.runtime,
+            "channel": self.channel,
+            "stealth_enabled": self.stealth_enabled,
         }
         if session is not None:
             extra_data.update(

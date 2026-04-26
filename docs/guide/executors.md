@@ -128,8 +128,14 @@ In `Settings -> Executors`, the browser section stores executor config like:
     "realistic_launch": true,
     "xvfb_auto": true,
     "engine": "chromium",
+    "runtime": "playwright",
+    "channel": null,
     "max_sessions": 4,
-    "idle_timeout_seconds": 600
+    "idle_timeout_seconds": 600,
+    "stealth_enabled": true,
+    "realistic_user_agent": true,
+    "default_timezone_id": "UTC",
+    "default_accept_language": "en-US,en;q=0.9"
   }
 }
 ```
@@ -139,11 +145,67 @@ The default human-like setup for a sticky local executor is now:
 - `profile_mode_default = "persistent_local"`
 - `persistent_profiles_enabled = true`
 - `realistic_launch = true`
+- `stealth_enabled = true` (applies `playwright-stealth` evasions to every new context)
 - `xvfb_auto = true` for headed Linux executors without a real display
 
 This keeps cookies, local storage, and other profile state in a local
 Playwright user data directory on that executor. It is best for sites that are
 hostile to clean ephemeral contexts, but it is explicitly executor-local.
+
+### Stealth defaults
+
+By default Cognis applies `playwright-stealth` evasions to every new browser
+context (override per-evasion via the *Disable specific evasions* field in the
+UI, or disable globally with `stealth_enabled = false`). When stealth is on the
+context also gets:
+
+- a current Chrome desktop `User-Agent` (turn off with `realistic_user_agent =
+  false`)
+- `Accept-Language: en-US,en;q=0.9` (override via `default_accept_language`)
+- `timezone_id = "UTC"` when no `timezone_id` is configured (override via
+  `default_timezone_id`)
+
+Honest disclaimer: stealth helps against the JavaScript-detection layer
+(`navigator.webdriver`, plugin/codec lists, WebGL vendor, canvas, etc.) but
+does **not** fix TLS/JA3 fingerprinting and is not a Cloudflare managed
+challenge or Turnstile silver bullet. For hard sites, headed mode + Xvfb +
+persistent profile + `channel = "chrome"` remains the most reliable setup.
+
+### Browser runtimes (Playwright vs Patchright)
+
+Cognis ships two browser runtimes side by side. Pick one per executor:
+
+| Runtime | When to use | Notes |
+| --- | --- | --- |
+| `playwright` (default) | Most sites. Combined with stealth, handles low- and mid-tier WAFs. | Bundled Chromium just works; set `channel = "chrome"` to use installed Chrome stable. |
+| `patchright` | Sites that detect CDP `Runtime.enable` (Cloudflare bot fight, Datadome lite, Brotector). | Set `channel = "chrome"` (auto-set when you pick `patchright`). Stealth defaults to *off* because Patchright already covers the same evasions. |
+
+Patchright is most effective with `runtime = "patchright"` + `channel =
+"chrome"` + `profile_mode_default = "persistent_local"` + headed mode (with
+`xvfb_auto = true` on Linux executors without a real display). It is **not** a
+silver bullet for headless Cloudflare; the same operational disclaimer above
+applies.
+
+The default executor image bundles **Chromium** (Playwright build) and
+**Chrome stable**. Firefox and WebKit are *not* pre-installed in the default
+image; they auto-install on first use, or rebuild the image with:
+
+```
+docker build --build-arg COGNIS_EXECUTOR_BROWSERS="chromium chrome firefox webkit" -f Dockerfile.executor .
+```
+
+To pre-warm browsers on a fresh host without waiting for the first session,
+run:
+
+```
+cognis-executor browser-install --all-defaults
+# or, equivalently:
+cognis-controller executor browser-install --all-defaults
+```
+
+This pre-installs Playwright's Chromium, Playwright's Chrome stable, and
+Patchright's Chrome stable so first-session latency is instant. Add
+`--runtime patchright --channel chrome` for a single combination.
 
 Saved browser auth state can still be stored in Cognis as an encrypted
 credential record. Use that when you need controller-owned, portable auth state

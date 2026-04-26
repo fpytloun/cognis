@@ -11,6 +11,13 @@ import typer
 
 executor_app = typer.Typer(help="Executor management commands")
 
+# Default fleet pre-warm matrix: (runtime, engine, channel)
+_DEFAULT_PREWARM_TARGETS: tuple[tuple[str, str, str | None], ...] = (
+    ("playwright", "chromium", None),
+    ("playwright", "chromium", "chrome"),
+    ("patchright", "chromium", "chrome"),
+)
+
 
 def _setup_logging(level_name: str) -> None:
     """Configure logging for the executor process."""
@@ -102,3 +109,81 @@ def _is_localhost(url: str) -> bool:
         if url.startswith(prefix):
             return True
     return False
+
+
+@executor_app.command("browser-install")
+def browser_install(
+    runtime: str = typer.Option(
+        "all",
+        "--runtime",
+        help="Browser runtime to install: playwright, patchright, or all.",
+    ),
+    engine: str = typer.Option(
+        "chromium",
+        "--engine",
+        help="Browser engine: chromium, firefox, or webkit (chromium is the only one supported by patchright).",
+    ),
+    channel: str | None = typer.Option(
+        None,
+        "--channel",
+        help="Browser channel (chrome, msedge, chrome-beta, ...). Leave unset for the bundled engine build.",
+    ),
+    all_defaults: bool = typer.Option(
+        False,
+        "--all-defaults",
+        help="Pre-install the default fleet matrix: chromium + chrome (both runtimes).",
+    ),
+    log_level: str | None = typer.Option(
+        None,
+        "--log-level",
+        help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info).",
+    ),
+) -> None:
+    """Pre-install browser runtimes/binaries on this host.
+
+    Useful for fleet pre-warming, CI builds, and air-gapped deployments where
+    you want to avoid the first-session install latency on remote executors.
+    """
+    import asyncio
+
+    from cognis.tools.executor.browser.install import (
+        SUPPORTED_RUNTIMES,
+        ensure_browser_runtime,
+    )
+
+    _setup_logging(log_level or os.environ.get("COGNIS_LOG_LEVEL", "info"))
+
+    targets: list[tuple[str, str, str | None]]
+    if all_defaults:
+        targets = list(_DEFAULT_PREWARM_TARGETS)
+    elif runtime == "all":
+        targets = [(rt, engine, channel) for rt in SUPPORTED_RUNTIMES]
+    else:
+        targets = [(runtime, engine, channel)]
+
+    async def _install_all() -> int:
+        failures = 0
+        for rt, eng, ch in targets:
+            target_label = f"{rt}/{eng}" + (f"@{ch}" if ch else "")
+            typer.echo(f"Installing {target_label} ...")
+            ok, reason = await ensure_browser_runtime(
+                runtime=rt,
+                engine=eng,
+                channel=ch,
+                auto_install=True,
+            )
+            if ok:
+                typer.echo(f"  -> {reason}")
+            else:
+                typer.echo(f"  -> FAILED: {reason}", err=True)
+                failures += 1
+        return failures
+
+    try:
+        failures = asyncio.run(_install_all())
+    except ValueError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    if failures:
+        raise typer.Exit(code=1)

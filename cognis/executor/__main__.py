@@ -26,8 +26,87 @@ def _setup_logging(level_name: str) -> None:
         logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _run_browser_install(args: argparse.Namespace) -> int:
+    """Pre-install browser runtimes/binaries on the local host."""
+    log_level = args.log_level or os.environ.get("COGNIS_LOG_LEVEL", "info")
+    _setup_logging(log_level)
+
+    from cognis.tools.executor.browser.install import (
+        SUPPORTED_RUNTIMES,
+        ensure_browser_runtime,
+    )
+
+    if args.all_defaults:
+        targets: list[tuple[str, str, str | None]] = [
+            ("playwright", "chromium", None),
+            ("playwright", "chromium", "chrome"),
+            ("patchright", "chromium", "chrome"),
+        ]
+    elif args.runtime == "all":
+        targets = [(rt, args.engine, args.channel or None) for rt in SUPPORTED_RUNTIMES]
+    else:
+        targets = [(args.runtime, args.engine, args.channel or None)]
+
+    async def _install_all() -> int:
+        failures = 0
+        for rt, eng, ch in targets:
+            target_label = f"{rt}/{eng}" + (f"@{ch}" if ch else "")
+            sys.stdout.write(f"Installing {target_label} ...\n")
+            sys.stdout.flush()
+            ok, reason = await ensure_browser_runtime(
+                runtime=rt,
+                engine=eng,
+                channel=ch,
+                auto_install=True,
+            )
+            if ok:
+                sys.stdout.write(f"  -> {reason}\n")
+            else:
+                sys.stderr.write(f"  -> FAILED: {reason}\n")
+                failures += 1
+        return failures
+
+    try:
+        return asyncio.run(_install_all())
+    except ValueError as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cognis executor runner")
+    subparsers = parser.add_subparsers(dest="command")
+
+    install_parser = subparsers.add_parser(
+        "browser-install",
+        help="Pre-install browser runtimes/binaries on this host (fleet pre-warm).",
+    )
+    install_parser.add_argument(
+        "--runtime",
+        default="all",
+        help="Browser runtime to install: playwright, patchright, or all (default: all).",
+    )
+    install_parser.add_argument(
+        "--engine",
+        default="chromium",
+        help="Browser engine: chromium, firefox, or webkit (default: chromium).",
+    )
+    install_parser.add_argument(
+        "--channel",
+        default="",
+        help="Browser channel (chrome, msedge, chrome-beta, ...). Leave empty for bundled.",
+    )
+    install_parser.add_argument(
+        "--all-defaults",
+        action="store_true",
+        help="Pre-install the default fleet matrix: chromium + chrome (both runtimes).",
+    )
+    install_parser.add_argument(
+        "--log-level",
+        default="",
+        help="Log level: debug, info, warning, error (default: info).",
+    )
+
     parser.add_argument(
         "--controller-url",
         required=False,
@@ -47,6 +126,10 @@ def main() -> None:
         help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info)",
     )
     args = parser.parse_args()
+
+    if args.command == "browser-install":
+        rc = _run_browser_install(args)
+        raise SystemExit(rc)
 
     log_level = args.log_level or os.environ.get("COGNIS_LOG_LEVEL", "info")
     _setup_logging(log_level)

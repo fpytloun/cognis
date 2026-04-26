@@ -2631,6 +2631,21 @@ import { onMount, tick } from 'svelte';
             {@const browserPersistentProfilesEnabled = browserConfig.persistent_profiles_enabled !== false}
             {@const browserRealisticLaunch = browserConfig.realistic_launch !== false}
             {@const browserXvfbAuto = browserConfig.xvfb_auto !== false}
+            {@const browserRuntime = String(browserConfig.runtime ?? 'playwright')}
+            {@const browserChannel = String(browserConfig.channel ?? '')}
+            {@const browserStealthEnabledRaw = browserConfig.stealth_enabled}
+            {@const browserStealthEnabled = browserStealthEnabledRaw === undefined
+              ? browserRuntime !== 'patchright'
+              : browserStealthEnabledRaw !== false}
+            {@const browserRealisticUserAgent = browserConfig.realistic_user_agent !== false}
+            {@const browserDefaultTimezoneId = String(browserConfig.default_timezone_id ?? 'UTC')}
+            {@const browserDefaultAcceptLanguage = String(browserConfig.default_accept_language ?? 'en-US,en;q=0.9')}
+            {@const browserStealthEvasionsRaw = browserConfig.stealth_evasions}
+            {@const browserStealthEvasions = Array.isArray(browserStealthEvasionsRaw)
+              ? browserStealthEvasionsRaw.map((entry) => String(entry)).join(', ')
+              : typeof browserStealthEvasionsRaw === 'string'
+                ? browserStealthEvasionsRaw
+                : ''}
             <details class="group">
               <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
                 Browser Automation
@@ -2679,16 +2694,56 @@ import { onMount, tick } from 'svelte';
                 </div>
                 <div class="grid gap-3 md:grid-cols-3">
                   <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Runtime</span>
+                    <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      value={browserRuntime}
+                      disabled={!browserEnabled}
+                      onchange={async (e) => {
+                        const value = e.currentTarget.value as 'playwright' | 'patchright';
+                        const next: Record<string, unknown> = { ...browserConfig, runtime: value };
+                        // Patchright works best with channel=chrome; preselect when switching.
+                        if (value === 'patchright' && !browserChannel) {
+                          next.channel = 'chrome';
+                        }
+                        const cfg = { ...(exec.config || {}), browser: next };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Browser runtime set to ${value}.`, 'success');
+                      }}>
+                      <option value="playwright">Playwright (default)</option>
+                      <option value="patchright">Patchright (anti-detect)</option>
+                    </select>
+                    <span class="block text-xs text-slate-500">
+                      Patchright reduces CDP detection but is not a Cloudflare/Turnstile silver bullet. Headed mode + Xvfb + persistent profile + channel=chrome remains the most reliable setup for hard sites.
+                    </span>
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Browser engine</span>
                     <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
                       value={String(browserConfig.engine ?? 'chromium')}
+                      disabled={!browserEnabled}
                       onchange={async (e) => {
                         const cfg = { ...(exec.config || {}), browser: { ...browserConfig, engine: e.currentTarget.value } };
                         await api.executor.update(exec.executor_id, { config: cfg });
                         await refreshPageState();
                       }}>
                       <option value="chromium">Chromium</option>
+                      <option value="firefox">Firefox</option>
+                      <option value="webkit">WebKit</option>
                     </select>
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Channel</span>
+                    <Input value={browserChannel} disabled={!browserEnabled}
+                      placeholder={browserRuntime === 'patchright' ? 'chrome (recommended)' : 'leave empty for bundled'}
+                      onchange={async (e) => {
+                        const value = e.currentTarget.value.trim();
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, channel: value || undefined } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    <span class="block text-xs text-slate-500">Use chrome, msedge, chrome-beta, etc. Required by Patchright (auto-set to chrome).</span>
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Max sessions</span>
@@ -2831,6 +2886,78 @@ import { onMount, tick } from 'svelte';
                   />
                   Use realistic launch defaults (persistent profile friendly desktop viewport and reduced automation signals)
                 </label>
+                <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3 space-y-3">
+                  <div class="text-xs uppercase tracking-wider text-slate-400">
+                    Stealth defaults
+                    <span class="ml-1 text-slate-500">{browserStealthEnabled ? '(enabled)' : '(disabled)'}</span>
+                  </div>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserStealthEnabled} disabled={!browserEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, stealth_enabled: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Browser stealth ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Enable playwright-stealth evasions for new contexts
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserRealisticUserAgent} disabled={!browserEnabled || !browserStealthEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, realistic_user_agent: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    Send a realistic Chrome desktop user agent (avoids HeadlessChrome leak)
+                  </label>
+                  <div class="grid gap-3 md:grid-cols-2">
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Default timezone (when not overridden)</span>
+                      <Input value={browserDefaultTimezoneId} disabled={!browserEnabled || !browserStealthEnabled}
+                        placeholder="UTC"
+                        onchange={async (e) => {
+                          const value = e.currentTarget.value.trim();
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, default_timezone_id: value || undefined } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}
+                      />
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Accept-Language header</span>
+                      <Input value={browserDefaultAcceptLanguage} disabled={!browserEnabled || !browserStealthEnabled}
+                        placeholder="en-US,en;q=0.9"
+                        onchange={async (e) => {
+                          const value = e.currentTarget.value.trim();
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, default_accept_language: value || 'en-US,en;q=0.9' } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Disable specific evasions (comma-separated)</span>
+                    <Input value={browserStealthEvasions} disabled={!browserEnabled || !browserStealthEnabled}
+                      placeholder="navigator_languages, webgl_vendor"
+                      onchange={async (e) => {
+                        const items = e.currentTarget.value.split(',').map((entry) => entry.trim()).filter(Boolean);
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, stealth_evasions: items.length ? items : undefined } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    <span class="block text-xs text-slate-500">
+                      Names from playwright_stealth.Stealth (e.g. <code>navigator_webdriver</code>, <code>webgl_vendor</code>). Use to skip an evasion that breaks a specific site.
+                    </span>
+                  </label>
+                </div>
               </div>
             </details>
 

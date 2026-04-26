@@ -75,10 +75,18 @@ COPY pyproject.toml README.md build.py ./
 COPY cognis/ ./cognis/
 COPY docs/ ./docs/
 
+# Default browser pre-warm matrix. Override via:
+#   docker build --build-arg COGNIS_EXECUTOR_BROWSERS="chromium,chrome,firefox,webkit" .
+# Accepts any space- or comma-separated list of `playwright install` targets.
+# Default: chromium (Playwright bundled) + chrome stable (used by Patchright +
+# `channel=chrome`). Firefox/WebKit are auto-installed lazily on first use,
+# or pre-bundle them by adding to this list.
+ARG COGNIS_EXECUTOR_BROWSERS="chromium chrome"
+
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir ".[postgres,s3,redis]" \
     && python -m pip install --no-cache-dir "ruff>=0.5.0" uv \
-    && python -m playwright install --with-deps chromium firefox webkit \
+    && python -m playwright install --with-deps $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') \
     && npm install -g --ignore-scripts \
         @vue/language-server@2.2.8 \
         bash-language-server@5.4.2 \

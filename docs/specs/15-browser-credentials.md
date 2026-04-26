@@ -487,6 +487,11 @@ schedule work safely.
 Required capability fields:
 
 - `browser.playwright = true`
+- `browser.runtime` (`"playwright"` or `"patchright"`)
+- `browser.channel` (e.g. `"chrome"`, `"msedge"`, or `null` for the bundled
+  engine build)
+- `browser.stealth` (whether `playwright-stealth` evasions are applied to new
+  contexts on this executor)
 - supported browser engines
 - headless support
 - headed support
@@ -494,10 +499,25 @@ Required capability fields:
 - download support
 - upload support
 - max artifact size
-- Playwright/runtime version
+- Playwright/Patchright version
+
+The runtime axis is orthogonal to the engine axis: `runtime` selects which
+Python package drives Chromium (vanilla Playwright vs Patchright's patched
+fork), while `engine` selects the browser family (`chromium`, `firefox`,
+`webkit`). Patchright only ships Chromium in practice and is most effective
+with `channel = "chrome"`.
+
+Stealth defaults are runtime-aware: ON for `runtime = "playwright"`, OFF for
+`runtime = "patchright"` (Patchright already covers the same JS-layer
+evasions). Both defaults are user-overridable per executor.
 
 Production deployments should standardize a browser-capable executor image or
-executor class to reduce drift.
+executor class to reduce drift. The published executor image bundles Chromium
++ Chrome stable by default; Firefox and WebKit auto-install lazily on first
+use or can be pre-bundled with the `COGNIS_EXECUTOR_BROWSERS` build arg. Use
+`cognis-executor browser-install --all-defaults` (or
+`cognis-controller executor browser-install --all-defaults`) to pre-warm a
+host without waiting for the first session.
 
 ## Browser Tool Set
 
