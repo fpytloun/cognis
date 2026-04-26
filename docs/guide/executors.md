@@ -171,6 +171,52 @@ does **not** fix TLS/JA3 fingerprinting and is not a Cloudflare managed
 challenge or Turnstile silver bullet. For hard sites, headed mode + Xvfb +
 persistent profile + `channel = "chrome"` remains the most reliable setup.
 
+### Behaviour layer (autoconsent, humanizer, fingerprint hardening)
+
+Three additional behaviour-layer enhancements ship on top of stealth and are
+runtime-agnostic — they apply to both `runtime = "playwright"` and
+`runtime = "patchright"` without any extra configuration. All three default
+ON when stealth is enabled and OFF when it is disabled, with per-executor
+overrides.
+
+**Cookie-consent auto-dismiss** (`auto_consent`). Cognis ships a curated
+CMP-killer that auto-clicks the configured action on common cookie banners
+(OneTrust, Cookiebot, Quantcast, Sourcepoint, Didomi, TrustArc, Iubenda,
+Usercentrics, CookieYes, Borlabs, Osano, Klaro, Termly, Moove GDPR,
+Complianz, CookieLawInfo) plus a heuristic fallback for unknown banners.
+Defaults to `"accept"` (faster page render). Switch to `"reject"` for
+privacy-first, or `"off"` to disable. Per-host opt-out via
+`auto_consent_disabled_domains`. The script bundle is vendored at
+`cognis/tools/executor/browser/assets/autoconsent.bundle.js`; bump
+`cognis/tools/executor/browser/assets/VERSION.txt` and edit the JS file in
+place when adding new selector rules.
+
+**Input humanizer** (`humanize_input`, `humanize_intensity`). `browser_click`,
+`browser_fill`, and `browser_type` move the mouse along Bezier paths and
+emit per-key delays sampled from a normal distribution, defeating naive
+trajectory-based bot detection. Default intensity is `"low"` (~150 ms
+overhead). Each call may override with an `intensity` argument: `off`, `low`,
+`medium`, `high`. Set `humanize_input = false` on the executor to fall back
+to the legacy direct `click()`/`fill()`/`type()` semantics.
+
+**Fingerprint hardening** (`fingerprint_hardening`). Three small init
+scripts:
+
+- `audio_context`: adds tiny per-profile-deterministic noise to
+  `AudioBuffer.getChannelData()` so audio fingerprint probes see a stable
+  but non-baseline value
+- `battery_api`: stubs `navigator.getBattery()` with a per-profile-stable
+  plausible value (defeats the headless-Chrome flat-baseline tell)
+- `viewport_jitter`: ±2% jitter on `window.innerWidth/innerHeight` for
+  ephemeral sessions only (skipped on persistent profiles to preserve
+  identity stability)
+
+The seed is derived from the persistent profile id (or the runtime
+generation for ephemeral sessions) so re-visits to the same site see a
+consistent fingerprint. Disable individual scripts by adding
+`audio_context`, `battery_api`, or `viewport_jitter` to the
+*Disable specific evasions* field.
+
 ### Browser runtimes (Playwright vs Patchright)
 
 Cognis ships two browser runtimes side by side. Pick one per executor:

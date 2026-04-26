@@ -1,0 +1,15 @@
+cognis-autoconsent: 1.0.0
+fingerprint_audio:  1.0.0
+fingerprint_battery: 1.0.0
+fingerprint_viewport_jitter: 1.0.0
+
+cognis-autoconsent is a curated, self-contained CMP-killer maintained
+in-tree (cognis/tools/executor/browser/assets/autoconsent.bundle.js). It
+covers the major commercial CMPs (OneTrust, Cookiebot, Quantcast,
+Sourcepoint, Didomi, TrustArc, Iubenda, Usercentrics, CookieYes, Borlabs,
+Osano, Klaro, Termly, Moove GDPR, Complianz, CookieLawInfo) plus a
+heuristic fallback for unknown banners.
+
+Updates to selectors should be made by hand here; bump the version above
+and add a CHANGELOG entry. Refresh procedure documented in
+docs/guide/executors.md.

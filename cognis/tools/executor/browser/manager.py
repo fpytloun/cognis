@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -15,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from cognis.logging import get_logger
+from cognis.tools.executor.browser.assets import load_asset
 from cognis.tools.executor.browser.install import (
     RUNTIME_PATCHRIGHT,
     RUNTIME_PLAYWRIGHT,
@@ -42,6 +45,27 @@ BROWSER_DEFAULT_USER_AGENT = (
 )
 BROWSER_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 BROWSER_DEFAULT_TIMEZONE_ID = "UTC"
+
+# Stage C defaults
+BROWSER_DEFAULT_AUTO_CONSENT_DELAY_MS = 800
+BROWSER_DEFAULT_HUMANIZE_INTENSITY = "low"
+SUPPORTED_HUMANIZE_INTENSITIES: tuple[str, ...] = ("off", "low", "medium", "high")
+SUPPORTED_AUTO_CONSENT_ACTIONS: tuple[str, ...] = ("accept", "reject", "off")
+
+# Asset filenames (kept here so tests can monkey-patch the loader).
+_AUTOCONSENT_ASSET = "autoconsent.bundle.js"
+_FP_AUDIO_ASSET = "fingerprint_audio.js"
+_FP_BATTERY_ASSET = "fingerprint_battery.js"
+_FP_VIEWPORT_ASSET = "fingerprint_viewport_jitter.js"
+
+# Per-evasion exclusion names usable in ``stealth_evasions`` to disable a
+# specific Stage C hardening init script. Names are namespaced so they do
+# not collide with playwright-stealth's evasion keys.
+FP_EXCLUSION_KEYS: dict[str, str] = {
+    "audio_context": _FP_AUDIO_ASSET,
+    "battery_api": _FP_BATTERY_ASSET,
+    "viewport_jitter": _FP_VIEWPORT_ASSET,
+}
 
 
 @dataclass
@@ -91,6 +115,12 @@ class BrowserManager:
         realistic_user_agent: bool = True,
         default_timezone_id: str | None = BROWSER_DEFAULT_TIMEZONE_ID,
         default_accept_language: str = BROWSER_DEFAULT_ACCEPT_LANGUAGE,
+        auto_consent: str | None = None,
+        auto_consent_disabled_domains: list[str] | None = None,
+        auto_consent_delay_ms: int = BROWSER_DEFAULT_AUTO_CONSENT_DELAY_MS,
+        humanize_input: bool | None = None,
+        humanize_intensity: str = BROWSER_DEFAULT_HUMANIZE_INTENSITY,
+        fingerprint_hardening: bool | None = None,
     ) -> None:
         self.enabled = enabled
         self.auto_install = auto_install
@@ -133,6 +163,42 @@ class BrowserManager:
         self.realistic_user_agent = realistic_user_agent
         self.default_timezone_id = default_timezone_id
         self.default_accept_language = default_accept_language
+
+        # Stage C defaults: anchored to ``stealth_enabled`` so users who
+        # disable stealth get a clean baseline, but each can be overridden
+        # explicitly.
+        if auto_consent is None:
+            auto_consent_value = "accept" if self.stealth_enabled else "off"
+        else:
+            auto_consent_value = str(auto_consent).strip().lower() or "off"
+        if auto_consent_value not in SUPPORTED_AUTO_CONSENT_ACTIONS:
+            raise ValueError(
+                f"Unsupported auto_consent action: {auto_consent!r}. "
+                f"Expected one of {', '.join(SUPPORTED_AUTO_CONSENT_ACTIONS)}."
+            )
+        self.auto_consent = auto_consent_value
+        self.auto_consent_disabled_domains = [
+            str(item).strip().lower()
+            for item in (auto_consent_disabled_domains or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        self.auto_consent_delay_ms = max(0, int(auto_consent_delay_ms))
+
+        if humanize_input is None:
+            humanize_input = self.stealth_enabled
+        self.humanize_input = bool(humanize_input)
+        intensity_normalized = (humanize_intensity or "low").strip().lower()
+        if intensity_normalized not in SUPPORTED_HUMANIZE_INTENSITIES:
+            raise ValueError(
+                f"Unsupported humanize_intensity: {humanize_intensity!r}. "
+                f"Expected one of {', '.join(SUPPORTED_HUMANIZE_INTENSITIES)}."
+            )
+        self.humanize_intensity = intensity_normalized
+
+        if fingerprint_hardening is None:
+            fingerprint_hardening = self.stealth_enabled
+        self.fingerprint_hardening = bool(fingerprint_hardening)
+
         self._stealth: Any | None = None  # Lazily instantiated
         self._browser: Any | None = None
         self._playwright: Any | None = None
@@ -709,7 +775,7 @@ class BrowserManager:
         )
         self._patchright_persistent_warning_emitted = True
 
-    async def _apply_context_defaults(self, context: Any) -> None:
+    async def _apply_context_defaults(self, context: Any, *, profile_id: str | None = None) -> None:
         stealth = self._build_stealth()
         if stealth is not None:
             try:
@@ -717,6 +783,66 @@ class BrowserManager:
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning(
                     "browser: failed to apply stealth to context (%s); continuing without",
+                    type(exc).__name__,
+                )
+        await self._apply_autoconsent_init_script(context, profile_id=profile_id)
+        await self._apply_fingerprint_hardening_init_scripts(context, profile_id=profile_id)
+
+    async def _apply_autoconsent_init_script(
+        self, context: Any, *, profile_id: str | None = None
+    ) -> None:
+        if self.auto_consent == "off":
+            return
+        bundle = load_asset(_AUTOCONSENT_ASSET)
+        if bundle is None:
+            return
+        config = {
+            "action": self.auto_consent,
+            "delayMs": self.auto_consent_delay_ms,
+            "disabledHosts": self.auto_consent_disabled_domains,
+        }
+        prefix = f"window.__cognis_autoconsent = {json.dumps(config)};"
+        try:
+            await context.add_init_script(prefix + "\n" + bundle)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "browser: failed to install autoconsent init script (%s); continuing without",
+                type(exc).__name__,
+            )
+
+    async def _apply_fingerprint_hardening_init_scripts(
+        self, context: Any, *, profile_id: str | None = None
+    ) -> None:
+        if not self.fingerprint_hardening:
+            return
+        # Per-profile deterministic seed so re-visits to the same site see a
+        # consistent fingerprint. Persistent profile sessions take precedence;
+        # ephemeral sessions get a per-runtime-generation seed instead.
+        seed_source = profile_id or f"runtime-{self._runtime_generation}"
+        seed_value = hashlib.sha256(seed_source.encode("utf-8")).hexdigest()[:32]
+        seed_prefix = f"window.__cognis_fp_seed = {json.dumps(seed_value)};"
+
+        excluded = {
+            FP_EXCLUSION_KEYS[name] for name in self.stealth_evasions if name in FP_EXCLUSION_KEYS
+        }
+        # Viewport jitter is suppressed for persistent profiles too:
+        # "viewport changed between visits" is a tell, and persistent profile
+        # sessions are already stable identity-wise.
+        if profile_id:
+            excluded.add(_FP_VIEWPORT_ASSET)
+
+        for asset_name in (_FP_AUDIO_ASSET, _FP_BATTERY_ASSET, _FP_VIEWPORT_ASSET):
+            if asset_name in excluded:
+                continue
+            payload = load_asset(asset_name)
+            if payload is None:
+                continue
+            try:
+                await context.add_init_script(seed_prefix + "\n" + payload)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "browser: failed to install fingerprint asset %s (%s); continuing",
+                    asset_name,
                     type(exc).__name__,
                 )
 
@@ -761,7 +887,7 @@ class BrowserManager:
                         failure_category=failure_category,
                         retry_count=retry_count,
                     )
-        await self._apply_context_defaults(context)
+        await self._apply_context_defaults(context, profile_id=profile_id)
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])
         page = context.pages[0] if context.pages else await context.new_page()
@@ -894,6 +1020,10 @@ class BrowserManager:
             "runtime": self.runtime,
             "channel": self.channel,
             "stealth_enabled": self.stealth_enabled,
+            "auto_consent": self.auto_consent,
+            "humanize_input": self.humanize_input,
+            "humanize_intensity": self.humanize_intensity,
+            "fingerprint_hardening": self.fingerprint_hardening,
         }
         if session is not None:
             extra_data.update(

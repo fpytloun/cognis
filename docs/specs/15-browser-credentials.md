@@ -492,6 +492,13 @@ Required capability fields:
   engine build)
 - `browser.stealth` (whether `playwright-stealth` evasions are applied to new
   contexts on this executor)
+- `browser.auto_consent` (`"accept"` / `"reject"` / `"off"`) — runtime-
+  agnostic CMP auto-dismiss behaviour
+- `browser.humanize_input` + `browser.humanize_intensity` — Bezier mouse-path
+  + jittered key-cadence humanization for `browser_click`/`browser_fill`/
+  `browser_type`
+- `browser.fingerprint_hardening` — AudioContext noise, Battery API stub,
+  viewport jitter init scripts
 - supported browser engines
 - headless support
 - headed support

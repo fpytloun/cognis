@@ -74,11 +74,15 @@ class _FakeLocator:
     async def fill(self, value: str) -> None:
         self.filled = value
 
-    async def click(self) -> None:
+    async def click(self, *, button: str = "left", click_count: int = 1) -> None:
+        del button, click_count
         self.clicked = True
 
     async def focus(self) -> None:
         self.focused = True
+
+    async def type(self, text: str) -> None:
+        self.typed = (text, None)
 
     async def press_sequentially(self, text: str, delay: int | None = None) -> None:
         self.typed = (text, delay)
@@ -277,6 +281,12 @@ class _FakeManager:
             console_events=[{"level": "error", "text": "boom"}],
             network_events=[{"resource_type": "xhr", "status": 400}],
         )
+        # Stage C surface used by handlers._resolve_intensity. Default to
+        # humanization off so existing assertions about ``locator.click``,
+        # ``locator.fill`` and ``locator.type`` still hold (the humanizer
+        # passes through to the locator API when intensity is "off").
+        self.humanize_input = False
+        self.humanize_intensity = "off"
 
     async def open_session(self, **kwargs: Any) -> Any:
         self.open_calls.append(kwargs)

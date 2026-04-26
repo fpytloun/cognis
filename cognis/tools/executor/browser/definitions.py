@@ -182,6 +182,15 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "session_id": {"type": "string"},
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["off", "low", "medium", "high"],
+                        "description": (
+                            "Mouse-movement humanization intensity for this click. "
+                            "Defaults to the executor's configured value. Set to 'off' "
+                            "for the fastest possible click."
+                        ),
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -205,6 +214,14 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "selector": {"type": "string"},
                     "value": {"type": "string"},
                     "value_ref": {"type": "string"},
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["off", "low", "medium", "high"],
+                        "description": (
+                            "Humanization intensity for the clear+type sequence. "
+                            "Defaults to the executor's configured value."
+                        ),
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -242,7 +259,21 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
                     "text": {"type": "string"},
-                    "delay_ms": {"type": "integer"},
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": (
+                            "Per-key delay in milliseconds. Only honoured when "
+                            "intensity='off'; otherwise the humanizer's distribution applies."
+                        ),
+                    },
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["off", "low", "medium", "high"],
+                        "description": (
+                            "Keystroke-cadence humanization intensity. Defaults to the "
+                            "executor's configured value."
+                        ),
+                    },
                 },
                 "required": ["session_id", "text"],
             },

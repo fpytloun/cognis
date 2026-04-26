@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.browser import humanizer
 from cognis.tools.executor.browser.manager import (
     BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS,
     BROWSER_DEFAULT_MAX_SESSIONS,
@@ -15,6 +16,22 @@ from cognis.tools.executor.browser.manager import (
     BrowserManager,
 )
 from cognis.tools.registry import ToolExecutionContext
+
+
+def _resolve_intensity(arguments: dict[str, Any], manager: BrowserManager) -> str:
+    """Resolve humanizer intensity for a single tool call.
+
+    Falls back to ``off`` when the executor disables humanization globally;
+    otherwise uses the per-call ``intensity`` argument if present and valid,
+    else the executor's configured default.
+    """
+    if not manager.humanize_input:
+        return "off"
+    raw = arguments.get("intensity")
+    if isinstance(raw, str) and raw.strip():
+        return humanizer.normalize_intensity(raw)
+    return manager.humanize_intensity
+
 
 _CANDIDATE_DISCOVERY_SCRIPT = r"""
 (payload) => {
@@ -219,6 +236,14 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "default_accept_language": runtime_metadata.get(
             "browser_default_accept_language", "en-US,en;q=0.9"
         ),
+        "auto_consent": runtime_metadata.get("browser_auto_consent"),
+        "auto_consent_disabled_domains": runtime_metadata.get(
+            "browser_auto_consent_disabled_domains"
+        ),
+        "auto_consent_delay_ms": runtime_metadata.get("browser_auto_consent_delay_ms", 800),
+        "humanize_input": runtime_metadata.get("browser_humanize_input"),
+        "humanize_intensity": runtime_metadata.get("browser_humanize_intensity", "low"),
+        "fingerprint_hardening": runtime_metadata.get("browser_fingerprint_hardening"),
     }
 
 
@@ -242,6 +267,25 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
     stealth_enabled: bool | None = (
         None if stealth_enabled_raw is None else bool(stealth_enabled_raw)
     )
+    humanize_input_raw = cfg.get("humanize_input")
+    humanize_input: bool | None = None if humanize_input_raw is None else bool(humanize_input_raw)
+    fingerprint_hardening_raw = cfg.get("fingerprint_hardening")
+    fingerprint_hardening: bool | None = (
+        None if fingerprint_hardening_raw is None else bool(fingerprint_hardening_raw)
+    )
+    auto_consent_disabled_domains_raw = cfg.get("auto_consent_disabled_domains")
+    if isinstance(auto_consent_disabled_domains_raw, str):
+        auto_consent_disabled_domains = [
+            entry.strip() for entry in auto_consent_disabled_domains_raw.split(",") if entry.strip()
+        ]
+    elif isinstance(auto_consent_disabled_domains_raw, list):
+        auto_consent_disabled_domains = [
+            str(entry).strip() for entry in auto_consent_disabled_domains_raw if str(entry).strip()
+        ]
+    else:
+        auto_consent_disabled_domains = []
+    auto_consent_value = cfg.get("auto_consent")
+    auto_consent: str | None = None if auto_consent_value is None else str(auto_consent_value)
     manager = BrowserManager(
         enabled=bool(cfg.get("enabled", True)),
         auto_install=bool(cfg.get("auto_install", False)),
@@ -271,6 +315,12 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
             str(cfg.get("default_timezone_id")) if cfg.get("default_timezone_id") else None
         ),
         default_accept_language=str(cfg.get("default_accept_language") or "en-US,en;q=0.9"),
+        auto_consent=auto_consent,
+        auto_consent_disabled_domains=auto_consent_disabled_domains,
+        auto_consent_delay_ms=int(cfg.get("auto_consent_delay_ms") or 800),
+        humanize_input=humanize_input,
+        humanize_intensity=str(cfg.get("humanize_intensity") or "low"),
+        fingerprint_hardening=fingerprint_hardening,
     )
     context.runtime_metadata[BROWSER_MANAGER_KEY] = manager
     return manager
@@ -597,12 +647,14 @@ async def handle_browser_click(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    await chosen.click()
+    intensity = _resolve_intensity(arguments, manager)
+    await humanizer.humanize_click(session.page, chosen, intensity=intensity)
     return ToolResult(
         output=json.dumps(
             {
                 "action": "click",
                 "source": source,
+                "intensity": intensity,
                 "target": _candidate_summary(info),
             },
             ensure_ascii=False,
@@ -628,12 +680,14 @@ async def handle_browser_fill(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    await chosen.fill(value)
+    intensity = _resolve_intensity(arguments, manager)
+    await humanizer.humanize_fill(session.page, chosen, value, intensity=intensity)
     return ToolResult(
         output=json.dumps(
             {
                 "action": "fill",
                 "source": source,
+                "intensity": intensity,
                 "target": _candidate_summary(info),
             },
             ensure_ascii=False,
@@ -683,15 +737,26 @@ async def handle_browser_type(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    await chosen.focus()
+    intensity = _resolve_intensity(arguments, manager)
     delay = int(arguments.get("delay_ms", 0) or 0)
-    if delay > 0:
-        await chosen.press_sequentially(text, delay=delay)
+    if intensity == "off":
+        # Preserve the legacy behaviour exactly when humanization is off so
+        # existing callers using ``delay_ms`` keep working.
+        await chosen.focus()
+        if delay > 0:
+            await chosen.press_sequentially(text, delay=delay)
+        else:
+            await chosen.press_sequentially(text)
     else:
-        await chosen.press_sequentially(text)
+        await humanizer.humanize_type(session.page, chosen, text, intensity=intensity)
     return ToolResult(
         output=json.dumps(
-            {"action": "type", "source": source, "target": _candidate_summary(info)},
+            {
+                "action": "type",
+                "source": source,
+                "intensity": intensity,
+                "target": _candidate_summary(info),
+            },
             ensure_ascii=False,
         )
     )

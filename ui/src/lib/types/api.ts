@@ -579,6 +579,12 @@ export interface ExecutorBrowserConfig {
   realistic_user_agent?: boolean;
   default_timezone_id?: string;
   default_accept_language?: string;
+  auto_consent?: 'accept' | 'reject' | 'off';
+  auto_consent_disabled_domains?: string[] | string;
+  auto_consent_delay_ms?: number;
+  humanize_input?: boolean;
+  humanize_intensity?: 'off' | 'low' | 'medium' | 'high';
+  fingerprint_hardening?: boolean;
 }
 
 export interface ExecutorRuntimeConfig {

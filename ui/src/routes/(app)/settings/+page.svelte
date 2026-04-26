@@ -2646,6 +2646,23 @@ import { onMount, tick } from 'svelte';
               : typeof browserStealthEvasionsRaw === 'string'
                 ? browserStealthEvasionsRaw
                 : ''}
+            {@const browserAutoConsent = String(browserConfig.auto_consent ?? (browserStealthEnabled ? 'accept' : 'off'))}
+            {@const browserAutoConsentDelayMs = Number(browserConfig.auto_consent_delay_ms ?? 800)}
+            {@const browserAutoConsentDisabledRaw = browserConfig.auto_consent_disabled_domains}
+            {@const browserAutoConsentDisabled = Array.isArray(browserAutoConsentDisabledRaw)
+              ? browserAutoConsentDisabledRaw.map((entry) => String(entry)).join(', ')
+              : typeof browserAutoConsentDisabledRaw === 'string'
+                ? browserAutoConsentDisabledRaw
+                : ''}
+            {@const browserHumanizeInputRaw = browserConfig.humanize_input}
+            {@const browserHumanizeInput = browserHumanizeInputRaw === undefined
+              ? browserStealthEnabled
+              : browserHumanizeInputRaw !== false}
+            {@const browserHumanizeIntensity = String(browserConfig.humanize_intensity ?? 'low')}
+            {@const browserFingerprintHardeningRaw = browserConfig.fingerprint_hardening}
+            {@const browserFingerprintHardening = browserFingerprintHardeningRaw === undefined
+              ? browserStealthEnabled
+              : browserFingerprintHardeningRaw !== false}
             <details class="group">
               <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
                 Browser Automation
@@ -2945,7 +2962,7 @@ import { onMount, tick } from 'svelte';
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Disable specific evasions (comma-separated)</span>
                     <Input value={browserStealthEvasions} disabled={!browserEnabled || !browserStealthEnabled}
-                      placeholder="navigator_languages, webgl_vendor"
+                      placeholder="navigator_languages, webgl_vendor, audio_context, battery_api, viewport_jitter"
                       onchange={async (e) => {
                         const items = e.currentTarget.value.split(',').map((entry) => entry.trim()).filter(Boolean);
                         const cfg = { ...(exec.config || {}), browser: { ...browserConfig, stealth_evasions: items.length ? items : undefined } };
@@ -2954,8 +2971,101 @@ import { onMount, tick } from 'svelte';
                       }}
                     />
                     <span class="block text-xs text-slate-500">
-                      Names from playwright_stealth.Stealth (e.g. <code>navigator_webdriver</code>, <code>webgl_vendor</code>). Use to skip an evasion that breaks a specific site.
+                      Names from playwright_stealth.Stealth (e.g. <code>navigator_webdriver</code>, <code>webgl_vendor</code>) plus cognis fingerprint scripts (<code>audio_context</code>, <code>battery_api</code>, <code>viewport_jitter</code>). Use to skip an evasion that breaks a specific site.
                     </span>
+                  </label>
+                </div>
+                <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3 space-y-3">
+                  <div class="text-xs uppercase tracking-wider text-slate-400">
+                    Behaviour
+                  </div>
+                  <div class="grid gap-3 md:grid-cols-3">
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Cookie consent</span>
+                      <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        value={browserAutoConsent}
+                        disabled={!browserEnabled}
+                        onchange={async (e) => {
+                          const value = e.currentTarget.value as 'accept' | 'reject' | 'off';
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, auto_consent: value } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                          addToast(`Cookie consent set to ${value}.`, 'success');
+                        }}>
+                        <option value="accept">Accept all (faster page render)</option>
+                        <option value="reject">Reject all (privacy-first)</option>
+                        <option value="off">Off</option>
+                      </select>
+                      <span class="block text-xs text-slate-500">Auto-clicks the chosen action on common cookie banners (OneTrust, Cookiebot, Quantcast, Sourcepoint, Didomi, ...).</span>
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Banner detection delay (ms)</span>
+                      <Input value={browserAutoConsentDelayMs} disabled={!browserEnabled || browserAutoConsent === 'off'}
+                        type="number" min="0" max="15000" step="50"
+                        onchange={async (e) => {
+                          const val = parseInt(e.currentTarget.value, 10);
+                          if (isNaN(val)) return;
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, auto_consent_delay_ms: val } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}
+                      />
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Disable on these hosts (comma-separated)</span>
+                      <Input value={browserAutoConsentDisabled} disabled={!browserEnabled || browserAutoConsent === 'off'}
+                        placeholder="example.com, foo.bar"
+                        onchange={async (e) => {
+                          const items = e.currentTarget.value.split(',').map((entry) => entry.trim()).filter(Boolean);
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, auto_consent_disabled_domains: items.length ? items : undefined } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div class="grid gap-3 md:grid-cols-2">
+                    <label class="flex items-center gap-2 text-sm text-slate-300">
+                      <input type="checkbox" checked={browserHumanizeInput} disabled={!browserEnabled}
+                        class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                        onchange={async (e) => {
+                          const checked = e.currentTarget.checked;
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, humanize_input: checked } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}
+                      />
+                      Humanize click and type (Bezier mouse paths + jittered key intervals)
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-300">
+                      <span class="text-xs text-slate-400">Humanize intensity</span>
+                      <select class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        value={browserHumanizeIntensity}
+                        disabled={!browserEnabled || !browserHumanizeInput}
+                        onchange={async (e) => {
+                          const value = e.currentTarget.value as 'off' | 'low' | 'medium' | 'high';
+                          const cfg = { ...(exec.config || {}), browser: { ...browserConfig, humanize_intensity: value } };
+                          await api.executor.update(exec.executor_id, { config: cfg });
+                          await refreshPageState();
+                        }}>
+                        <option value="off">off (passthrough)</option>
+                        <option value="low">low (~150 ms overhead)</option>
+                        <option value="medium">medium (~300 ms overhead)</option>
+                        <option value="high">high (~500 ms overhead)</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={browserFingerprintHardening} disabled={!browserEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), browser: { ...browserConfig, fingerprint_hardening: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    Inject AudioContext / Battery / viewport-jitter fingerprint hardening
                   </label>
                 </div>
               </div>
