@@ -61,7 +61,14 @@ import X from 'lucide-svelte/icons/x';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
-  import { isSupported as notificationsSupported, isGranted as notificationsGranted, requestPermission, notifyIfHidden, hasAskedPermission } from '$lib/notifications';
+  import {
+    enableWebPush,
+    hasEnabledWebPush,
+    isWebPushSupported,
+    needsIosHomeScreenInstall,
+    notifyIfHidden,
+    permissionState
+  } from '$lib/notifications';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
   import {
@@ -159,6 +166,10 @@ import X from 'lucide-svelte/icons/x';
   let escalationError = $state('');
   let escalationCountdownTimer: number | null = null;
   let notificationRefreshTimer: number | null = null;
+  let pushPromptDismissed = $state(false);
+  let pushSubscriptionKnownEnabled = $state(hasEnabledWebPush());
+  let pushPromptBusy = $state(false);
+  let pushPromptError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
   let lastSubmittedMessage = '';
@@ -262,6 +273,37 @@ import X from 'lucide-svelte/icons/x';
 
   function isWebConversation(conversation: Conversation | null): boolean {
     return conversation?.context?.type?.toLowerCase() === 'web';
+  }
+
+  let showPushPrompt = $derived.by(() => {
+    if (!currentConversation || !isWebConversation(currentConversation)) return false;
+    if (pushPromptDismissed || pushSubscriptionKnownEnabled) return false;
+    if (permissionState() === 'denied') return false;
+    return isWebPushSupported() || needsIosHomeScreenInstall();
+  });
+
+  function pushPromptText(): string {
+    if (needsIosHomeScreenInstall()) {
+      return 'Install Cognis to your Home Screen, then open it there to enable native iOS notifications.';
+    }
+    return 'Enable native notifications for new web chat replies, task updates, and approval prompts.';
+  }
+
+  async function enableChatNotifications(): Promise<void> {
+    pushPromptBusy = true;
+    pushPromptError = '';
+    try {
+      const result = await enableWebPush();
+      if (result.ok) {
+        pushSubscriptionKnownEnabled = true;
+        pushPromptDismissed = true;
+        addToast(result.message, 'success');
+      } else {
+        pushPromptError = result.message;
+      }
+    } finally {
+      pushPromptBusy = false;
+    }
   }
 
   function isReadOnly(conversation: Conversation | null): boolean {
@@ -1449,9 +1491,6 @@ import X from 'lucide-svelte/icons/x';
       stopInitialLoadTimeout();
     }
 
-    if (notificationsSupported() && !notificationsGranted() && !hasAskedPermission()) {
-      setTimeout(() => { void requestPermission(); }, 5000);
-    }
   }
 
   function preferredNewConversationAgentId(): string {
@@ -3043,6 +3082,35 @@ import X from 'lucide-svelte/icons/x';
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             Memory is currently unavailable — this conversation won't have access to past context.
+          </div>
+        {/if}
+
+        {#if showPushPrompt}
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="min-w-0 flex-1">
+                <p class="font-medium">Native notifications</p>
+                <p class="mt-1 text-sky-100/80">{pushPromptText()}</p>
+                {#if pushPromptError}
+                  <p class="mt-2 text-xs text-rose-200">{pushPromptError}</p>
+                {/if}
+              </div>
+              <div class="flex shrink-0 items-center gap-2">
+                {#if !needsIosHomeScreenInstall()}
+                  <Button size="sm" variant="secondary" disabled={pushPromptBusy} onclick={() => void enableChatNotifications()}>
+                    {pushPromptBusy ? 'Enabling…' : 'Enable'}
+                  </Button>
+                {/if}
+                <button
+                  aria-label="Dismiss notification prompt"
+                  class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-sky-100 transition hover:bg-sky-500/20"
+                  onclick={() => { pushPromptDismissed = true; }}
+                  type="button"
+                >
+                  <X class="h-4 w-4" />
+                </button>
+              </div>
+            </div>
           </div>
         {/if}
 

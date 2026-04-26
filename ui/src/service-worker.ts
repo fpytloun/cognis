@@ -70,6 +70,78 @@ sw.addEventListener('message', (event) => {
   }
 });
 
+type WebPushPayload = {
+  title?: string;
+  body?: string;
+  url?: string;
+  tag?: string;
+  kind?: string;
+};
+
+function parsePushPayload(event: PushEvent): WebPushPayload {
+  if (!event.data) return {};
+  try {
+    return event.data.json() as WebPushPayload;
+  } catch {
+    return { body: event.data.text() };
+  }
+}
+
+async function hasVisibleClientFor(pathname: string): Promise<boolean> {
+  const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return clients.some((client) => {
+    const windowClient = client as WindowClient;
+    try {
+      const url = new URL(windowClient.url);
+      return url.origin === sw.location.origin
+        && url.pathname === pathname
+        && windowClient.visibilityState === 'visible';
+    } catch {
+      return false;
+    }
+  });
+}
+
+sw.addEventListener('push', (event) => {
+  const payload = parsePushPayload(event);
+  event.waitUntil(
+    (async () => {
+      const target = new URL(payload.url || '/chat', sw.location.origin);
+      if (await hasVisibleClientFor(target.pathname)) return;
+      await sw.registration.showNotification(payload.title || 'Cognis', {
+        body: payload.body || 'Cognis needs your attention.',
+        icon: '/pwa/icon-192.png',
+        badge: '/pwa/icon-192.png',
+        tag: payload.tag || 'cognis',
+        data: { url: target.pathname, kind: payload.kind || 'notification' },
+      });
+    })()
+  );
+});
+
+sw.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    (async () => {
+      const data = event.notification.data as { url?: string } | undefined;
+      const target = new URL(data?.url || '/chat', sw.location.origin).href;
+      const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const client of clients) {
+        const windowClient = client as WindowClient;
+        try {
+          if (new URL(windowClient.url).origin !== sw.location.origin) continue;
+          await windowClient.focus();
+          await windowClient.navigate(target);
+          return;
+        } catch {
+          // Try the next window client.
+        }
+      }
+      await sw.clients.openWindow(target);
+    })()
+  );
+});
+
 /**
  * Returns true if the request must bypass the SW entirely (no caching, no
  * offline fallback). This covers:

@@ -29,6 +29,7 @@ from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
 from cognis.api.routes.notifications import router as notifications_router
+from cognis.api.routes.push import router as push_router
 from cognis.api.routes.schedules import router as schedules_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
@@ -367,6 +368,7 @@ def create_app() -> FastAPI:
         # Unified notification service — created early so recovery code
         # can use it.  Must be before recover_paused_tasks().
         from cognis.core.notifications import NotificationService
+        from cognis.core.web_push import WebPushService, load_web_push_config
 
         notification_service = NotificationService(
             session_factory=session_factory,
@@ -376,6 +378,12 @@ def create_app() -> FastAPI:
         )
         agent_loop.notification_service = notification_service
         workflow_engine._notification_service = notification_service  # noqa: SLF001
+
+        web_push_service = WebPushService(
+            session_factory=session_factory,
+            event_bus=event_bus,
+            config=load_web_push_config(config_runtime),
+        )
 
         # Reconcile pending notifications from before restart (re-registers
         # PauseWaiters from DB so gates/escalations/step-questions survive).
@@ -517,6 +525,7 @@ def create_app() -> FastAPI:
         app.state.startup_invariant_reports = [report.as_dict() for report in invariant_reports]
 
         app.state.notification_service = notification_service
+        app.state.web_push_service = web_push_service
         app.state.turn_scheduler = turn_scheduler
         app.state.command_dispatcher = command_dispatcher
 
@@ -651,6 +660,7 @@ def create_app() -> FastAPI:
     app.include_router(executors_router)
     app.include_router(escalations_router)
     app.include_router(notifications_router)
+    app.include_router(push_router)
     app.include_router(users_router)
 
     @app.exception_handler(StarletteHTTPException)

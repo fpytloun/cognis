@@ -75,6 +75,12 @@ class CognisConfig:
     # Production crypto
     require_external_crypto: bool
 
+    # Web Push (VAPID)
+    vapid_private_key: str
+    vapid_public_key: str
+    vapid_private_key_path: Path
+    vapid_subject: str
+
     # Redis (session cache L2)
     redis_url: str
 
@@ -177,6 +183,15 @@ def load_config() -> CognisConfig:
         .strip()
         .lower()
         in {"1", "true", "yes", "on"},
+        vapid_private_key=os.environ.get("COGNIS_VAPID_PRIVATE_KEY", "").strip(),
+        vapid_public_key=os.environ.get("COGNIS_VAPID_PUBLIC_KEY", "").strip(),
+        vapid_private_key_path=_expand_path(
+            os.environ.get(
+                "COGNIS_VAPID_PRIVATE_KEY_PATH",
+                str(data_dir / "keys" / "vapid_private.pem"),
+            )
+        ),
+        vapid_subject=os.environ.get("COGNIS_VAPID_SUBJECT", "mailto:admin@localhost").strip(),
         redis_url=os.environ.get("COGNIS_REDIS_URL", ""),
         tool_output_backend=os.environ.get("COGNIS_TOOL_OUTPUT_BACKEND", "filesystem"),
         tool_output_s3_endpoint=os.environ.get(
@@ -216,6 +231,12 @@ ENV_TEMPLATE = """\
 # COGNIS_JWT_PUBLIC_KEY_PATH=~/.cognis/keys/public.pem
 # COGNIS_SECRETS_KEY_PATH=~/.cognis/secrets.key
 # COGNIS_REQUIRE_EXTERNAL_CRYPTO=false
+
+# Web Push / PWA notifications (mount from Kubernetes Secret in stateless deployments)
+# COGNIS_VAPID_PRIVATE_KEY=
+# COGNIS_VAPID_PUBLIC_KEY=
+# COGNIS_VAPID_PRIVATE_KEY_PATH=~/.cognis/keys/vapid_private.pem
+# COGNIS_VAPID_SUBJECT=mailto:admin@localhost
 
 # Logging
 # COGNIS_LOG_LEVEL=info

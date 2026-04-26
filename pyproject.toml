@@ -47,6 +47,7 @@ dependencies = [
     "playwright>=1.53.0",
     "playwright-stealth>=2.0.0",
     "patchright>=1.55.0",
+    "pywebpush>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -137,5 +138,6 @@ module = [
     "ddgs.*",
     "croniter.*",
     "dateutil.*",
+    "pywebpush.*",
 ]
 ignore_missing_imports = true

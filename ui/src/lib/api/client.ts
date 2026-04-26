@@ -37,6 +37,8 @@ import type {
   MCPServerUpdateRequest,
   MessageHistoryResponse,
   Notification,
+  PushSubscriptionPayload,
+  PushSubscriptionResponse,
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
@@ -65,6 +67,7 @@ import type {
   UserDetail,
   UserSummary,
   UserUpdatePayload,
+  VapidPublicKeyResponse,
   WebConfigStatus,
   Workflow,
   WorkflowRun
@@ -1215,6 +1218,26 @@ export const api = {
       return request<{ ok: boolean; notification_id: string; decision: string }>(`/api/v1/notifications/${notificationId}/resolve`, {
         method: 'POST',
         body: JSON.stringify(payload)
+      });
+    }
+  },
+
+  push: {
+    vapidPublicKey(): Promise<VapidPublicKeyResponse> {
+      return request<VapidPublicKeyResponse>('/api/v1/push/vapid-public-key');
+    },
+
+    subscribe(payload: PushSubscriptionPayload): Promise<PushSubscriptionResponse> {
+      return request<PushSubscriptionResponse>('/api/v1/push/subscriptions', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    unsubscribe(endpoint: string): Promise<{ ok: boolean; removed: boolean }> {
+      return request<{ ok: boolean; removed: boolean }>('/api/v1/push/subscriptions/unsubscribe', {
+        method: 'POST',
+        body: JSON.stringify({ endpoint })
       });
     }
   }

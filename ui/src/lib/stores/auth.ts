@@ -26,6 +26,33 @@ const store = writable<AuthState>(initialState);
 
 let bootstrapPromise: Promise<void> | null = null;
 let refreshPromise: Promise<boolean> | null = null;
+const WEB_PUSH_ENABLED_KEY = 'cognis_web_push_enabled';
+
+async function clearWebPushSubscription(notifyServer: boolean): Promise<void> {
+  if (!browser || !('serviceWorker' in navigator) || !('PushManager' in window)) {
+    return;
+  }
+  try {
+    const registration = await navigator.serviceWorker.getRegistration();
+    if (!registration) return;
+    const subscription = await registration.pushManager.getSubscription();
+    if (subscription?.endpoint && notifyServer) {
+      await fetch(apiUrl('/api/v1/push/subscriptions/unsubscribe'), {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: subscription.endpoint })
+      }).catch((error: unknown) => {
+        reportError('Push unsubscribe request failed', error);
+      });
+    }
+    await subscription?.unsubscribe();
+  } catch (error) {
+    reportError('Push subscription cleanup failed', error);
+  } finally {
+    window.localStorage.removeItem(WEB_PUSH_ENABLED_KEY);
+  }
+}
 
 function setAuthenticated(user: UserSummary, expiresAt: number | null, error: string | null = null): void {
   store.set({
@@ -106,6 +133,7 @@ async function refreshBrowserSession(): Promise<boolean> {
   }
 
   if (response.status === 401) {
+    void clearWebPushSubscription(false);
     setAnonymous('Your session has expired. Please log in again.');
     return false;
   }
@@ -187,6 +215,7 @@ export const auth = {
 
   async logout(): Promise<void> {
     try {
+      await clearWebPushSubscription(true);
       await fetch(apiUrl('/api/auth/logout'), {
         method: 'POST',
         credentials: 'include'
@@ -224,6 +253,7 @@ export const auth = {
   },
 
   clear(error: string | null = null): void {
+    void clearWebPushSubscription(false);
     setAnonymous(error);
   }
 };

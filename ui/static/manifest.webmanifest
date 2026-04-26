@@ -1,5 +1,6 @@
 {
   "name": "Cognis",
+  "id": "/",
   "short_name": "Cognis",
   "description": "Cognis — decoupled control plane for AI agents",
   "start_url": "/chat",

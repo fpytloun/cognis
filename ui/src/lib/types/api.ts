@@ -1178,6 +1178,27 @@ export interface Notification {
   resolved_at: string | null;
 }
 
+export interface VapidPublicKeyResponse {
+  enabled: boolean;
+  public_key: string | null;
+  reason: string | null;
+}
+
+export interface PushSubscriptionResponse {
+  subscription_id: string;
+  enabled: boolean;
+}
+
+export interface PushSubscriptionPayload {
+  endpoint: string;
+  expirationTime?: number | null;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+  platform?: string | null;
+}
+
 export interface WebSocketAuthenticatedEvent {
   type: 'authenticated';
 }
