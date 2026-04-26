@@ -770,7 +770,10 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     captured_tool_registry: list[object] = []
     captured_contexts: list[object] = []
 
-    async def _runtime_factory(*, agent: AgentDefinition, user_email: str) -> ResolvedStepRuntime:
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del executor_agent
         runtime_calls.append((agent.agent_id, user_email))
 
         async def _cleanup() -> None:
@@ -853,8 +856,6 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
             ),
             task_description="Do the thing",
             parent_intaris_session_id="parent-intaris",
-            tool_registry="parent-registry",
-            executor_connection="parent-executor",
             deliverable_step_run_id="sr-parent",
         )
     finally:
