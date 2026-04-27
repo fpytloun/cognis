@@ -20,12 +20,18 @@ _POSITIVE_INT_KEYS = {
     "web.concurrency.browser_cap",
     "web.browser_fetch.session_idle_seconds",
     "web.browser_fetch.wait_timeout_seconds",
+    "web.browser_fetch.navigation_timeout_seconds",
+}
+
+_NON_NEGATIVE_INT_KEYS = {
+    "web.browser_fetch.network_idle_after_dom_seconds",
 }
 
 _ENUM_KEYS: dict[str, set[str]] = {
     "web.backend": {"direct", "tavily", "brave", "searxng"},
     "web.search_backend": {"direct", "tavily", "brave", "searxng"},
     "web.fetch_backend": {"direct", "tavily", "browser"},
+    "web.browser_fetch.wait_until": {"commit", "domcontentloaded", "load", "networkidle"},
 }
 
 
@@ -59,6 +65,8 @@ def validate_setting_value(key: str, value: Any) -> None:
             raise ValueError(f"Setting {key} must be an integer")
         if key in _POSITIVE_INT_KEYS and value <= 0:
             raise ValueError(f"Setting {key} must be greater than zero")
+        if key in _NON_NEGATIVE_INT_KEYS and value < 0:
+            raise ValueError(f"Setting {key} must be zero or greater")
         return
     if isinstance(expected, float):
         if isinstance(value, bool) or not isinstance(value, (int, float)):

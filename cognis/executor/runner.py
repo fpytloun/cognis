@@ -401,6 +401,15 @@ class ExecutorRunner:
                 "web_browser_fetch_wait_timeout_seconds": web_config_raw.get(
                     "web_browser_fetch_wait_timeout_seconds", 30
                 ),
+                "web_browser_fetch_navigation_timeout_seconds": web_config_raw.get(
+                    "web_browser_fetch_navigation_timeout_seconds", 60
+                ),
+                "web_browser_fetch_wait_until": web_config_raw.get(
+                    "web_browser_fetch_wait_until", "domcontentloaded"
+                ),
+                "web_browser_fetch_network_idle_after_dom_seconds": web_config_raw.get(
+                    "web_browser_fetch_network_idle_after_dom_seconds", 3
+                ),
                 "web_browser_fetch_headed_fallback_enabled": web_config_raw.get(
                     "web_browser_fetch_headed_fallback_enabled", False
                 ),

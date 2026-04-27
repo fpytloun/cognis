@@ -17,6 +17,7 @@ from cognis.tools.executor.web.backends import (
     resolve_fetch_backend,
     resolve_search_backend,
 )
+from cognis.tools.executor.web.backends.browser import _classify_browser_extract_quality
 
 # ---------------------------------------------------------------------------
 # Resolver split between search and fetch axes
@@ -126,7 +127,7 @@ class _FakeManager:
         profile_mode: str = "default",
         wait_for_slot: bool = False,
         wait_timeout_seconds: float = 30.0,
-        **_: Any,
+        **extra: Any,
     ) -> Any:
         self.opened.append(
             {
@@ -136,6 +137,7 @@ class _FakeManager:
                 "profile_mode": profile_mode,
                 "wait_for_slot": wait_for_slot,
                 "wait_timeout_seconds": wait_timeout_seconds,
+                **extra,
             }
         )
         if self._raise is not None:
@@ -155,8 +157,45 @@ async def test_browser_fetch_returns_markdown_via_trafilatura() -> None:
     assert "Headline" in result.output or "headline" in result.output.lower()
     assert manager.opened[0]["wait_for_slot"] is True
     assert manager.opened[0]["headless"] is True
+    assert manager.opened[0]["lifecycle"] == "ephemeral"
+    assert manager.opened[0]["navigation_timeout_seconds"] == 60.0
+    assert manager.opened[0]["wait_until"] == "domcontentloaded"
+    assert manager.opened[0]["network_idle_after_dom_seconds"] == 3.0
     assert manager.closed == [manager.opened[0]["session_id"]]
     assert (result.metadata or {}).get("browser_fetch") is True
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_passes_navigation_settings() -> None:
+    manager = _FakeManager(html="<html><body><h1>Headline</h1><p>Body text here.</p></body></html>")
+    backend = BrowserFetchBackend(
+        manager,  # type: ignore[arg-type]
+        navigation_timeout_seconds=75,
+        wait_until="load",
+        network_idle_after_dom_seconds=0,
+    )
+
+    await backend.fetch("https://example.com")
+
+    assert manager.opened[0]["navigation_timeout_seconds"] == 75
+    assert manager.opened[0]["wait_until"] == "load"
+    assert manager.opened[0]["network_idle_after_dom_seconds"] == 0
+
+
+def test_classify_browser_extract_quality_flags_empty_block() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "empty", "extraction_score": 0.0, "title": "reuters.com"},
+        "",
+    )
+    assert signal == "empty_extraction"
+
+
+def test_classify_browser_extract_quality_flags_interstitial() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "readability", "extraction_score": 120.0},
+        "Verify you are human before continuing. Cloudflare Turnstile challenge page.",
+    )
+    assert signal == "interstitial"
 
 
 @pytest.mark.asyncio
@@ -780,12 +819,8 @@ async def test_web_fetch_fallback_uses_manager_from_shared_runtime_metadata(
             browser_used = True
             return ToolResult(output="rendered from browser")
 
-    monkeypatch.setattr(
-        handlers, "resolve_fetch_backend", lambda *a, **k: _FakePrimary()
-    )
-    monkeypatch.setattr(
-        handlers, "get_browser_fetch_backend", lambda metadata: _FakeBrowser()
-    )
+    monkeypatch.setattr(handlers, "resolve_fetch_backend", lambda *a, **k: _FakePrimary())
+    monkeypatch.setattr(handlers, "get_browser_fetch_backend", lambda metadata: _FakeBrowser())
 
     manager = BrowserManager(enabled=True)
     shared = {

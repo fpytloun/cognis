@@ -30,8 +30,12 @@ from cognis.tools.executor.browser.install import (
 logger = get_logger(__name__)
 
 BROWSER_MANAGER_KEY = "browser_manager"
-BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS = 600
-BROWSER_DEFAULT_MAX_SESSIONS = 4
+BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS = 1800
+BROWSER_DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECONDS = 60
+BROWSER_DEFAULT_MAX_SESSIONS = 8
+BROWSER_DEFAULT_NAVIGATION_TIMEOUT_SECONDS = 60
+BROWSER_DEFAULT_WAIT_UNTIL = "domcontentloaded"
+BROWSER_DEFAULT_NETWORK_IDLE_AFTER_DOM_SECONDS = 3
 BROWSER_DEFAULT_PROFILE_MODE = "persistent_local"
 BROWSER_DEFAULT_VIEWPORT_WIDTH = 1365
 BROWSER_DEFAULT_VIEWPORT_HEIGHT = 900
@@ -85,6 +89,9 @@ class BrowserSession:
     console_events: list[dict[str, Any]] = field(default_factory=list)
     network_events: list[dict[str, Any]] = field(default_factory=list)
     last_used_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_activity_bump_at: float = 0.0
+    lifecycle: str = "explicit"
+    idle_timeout_seconds: float | None = None
     runtime_generation: int = 0
 
 
@@ -122,6 +129,9 @@ class BrowserManager:
         humanize_input: bool | None = None,
         humanize_intensity: str = BROWSER_DEFAULT_HUMANIZE_INTENSITY,
         fingerprint_hardening: bool | None = None,
+        navigation_timeout_seconds: int = BROWSER_DEFAULT_NAVIGATION_TIMEOUT_SECONDS,
+        wait_until: str = BROWSER_DEFAULT_WAIT_UNTIL,
+        network_idle_after_dom_seconds: int = BROWSER_DEFAULT_NETWORK_IDLE_AFTER_DOM_SECONDS,
     ) -> None:
         self.enabled = enabled
         self.auto_install = auto_install
@@ -197,6 +207,12 @@ class BrowserManager:
         if fingerprint_hardening is None:
             fingerprint_hardening = self.stealth_enabled
         self.fingerprint_hardening = bool(fingerprint_hardening)
+        self.navigation_timeout_seconds = max(1, int(navigation_timeout_seconds))
+        wait_until_normalized = (wait_until or BROWSER_DEFAULT_WAIT_UNTIL).strip().lower()
+        if wait_until_normalized not in {"commit", "domcontentloaded", "load", "networkidle"}:
+            wait_until_normalized = BROWSER_DEFAULT_WAIT_UNTIL
+        self.wait_until = wait_until_normalized
+        self.network_idle_after_dom_seconds = max(0, int(network_idle_after_dom_seconds))
 
         self._stealth: Any | None = None  # Lazily instantiated
         # Stage B: per-mode browser instances so headless and headed can run
@@ -218,6 +234,8 @@ class BrowserManager:
         self._headed_open_in_flight = 0
         self._open_in_flight = 0
         self._patchright_persistent_warning_emitted = False
+        self._idle_reaper_task: asyncio.Task[None] | None = None
+        self._reap_orphan_profile_locks()
 
     @property
     def active_session_count(self) -> int:
@@ -237,6 +255,8 @@ class BrowserManager:
                     "headless": session.headless,
                     "display": session.display,
                     "last_used_at": session.last_used_at.isoformat(),
+                    "lifecycle": getattr(session, "lifecycle", "explicit"),
+                    "idle_deadline_at": self._session_idle_deadline_at(session),
                     "auth_origin": session.auth_origin,
                     "console_event_count": len(getattr(session, "console_events", [])),
                     "network_event_count": len(getattr(session, "network_events", [])),
@@ -285,14 +305,26 @@ class BrowserManager:
         profile_id: str | None = None,
         wait_for_slot: bool = False,
         wait_timeout_seconds: float = 30.0,
+        lifecycle: str = "explicit",
+        session_idle_seconds: float | None = None,
+        navigation_timeout_seconds: float | None = None,
+        wait_until: str | None = None,
+        network_idle_after_dom_seconds: float | None = None,
     ) -> BrowserSession:
+        self._ensure_idle_reaper()
         await self._cleanup_idle_sessions()
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is not None and not self._session_is_idle(session):
                 session.last_used_at = datetime.now(UTC)
         if session is not None and not self._session_is_idle(session):
-            await session.page.goto(url)
+            await self._goto(
+                session.page,
+                url,
+                navigation_timeout_seconds=navigation_timeout_seconds,
+                wait_until=wait_until,
+                network_idle_after_dom_seconds=network_idle_after_dom_seconds,
+            )
             return session
         resolved_mode, resolved_profile_id = self._resolve_profile_settings(
             profile_mode=profile_mode,
@@ -330,6 +362,8 @@ class BrowserManager:
                     user_data_dir=str(user_data_dir),
                     headless=headless,
                     display=display,
+                    lifecycle=self._normalize_lifecycle(lifecycle),
+                    idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
                 )
                 try:
@@ -346,7 +380,13 @@ class BrowserManager:
                 )
                 try:
                     await self._attach_session_observers(session)
-                    await page.goto(url)
+                    await self._goto(
+                        page,
+                        url,
+                        navigation_timeout_seconds=navigation_timeout_seconds,
+                        wait_until=wait_until,
+                        network_idle_after_dom_seconds=network_idle_after_dom_seconds,
+                    )
                 except Exception:
                     await self.close_session(session_id)
                     raise
@@ -369,6 +409,8 @@ class BrowserManager:
                     profile_id=resolved_profile_id,
                     headless=headless,
                     display=display,
+                    lifecycle=self._normalize_lifecycle(lifecycle),
+                    idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
                 )
                 try:
@@ -384,7 +426,13 @@ class BrowserManager:
                     raise
                 try:
                     await self._attach_session_observers(session)
-                    await page.goto(url)
+                    await self._goto(
+                        page,
+                        url,
+                        navigation_timeout_seconds=navigation_timeout_seconds,
+                        wait_until=wait_until,
+                        network_idle_after_dom_seconds=network_idle_after_dom_seconds,
+                    )
                 except Exception:
                     await self.close_session(session_id)
                     raise
@@ -447,6 +495,11 @@ class BrowserManager:
                 await self._stop_virtual_display_locked()
 
     async def cleanup(self) -> None:
+        if self._idle_reaper_task is not None:
+            self._idle_reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._idle_reaper_task
+            self._idle_reaper_task = None
         for session_id in list(self._sessions):
             await self.close_session(session_id)
         async with self._lock:
@@ -548,13 +601,134 @@ class BrowserManager:
             self._reserved_profile_ids.add(profile_id)
 
     def _session_is_idle(self, session: BrowserSession | Any) -> bool:
-        if self.idle_timeout_seconds <= 0:
+        timeout_seconds = self._session_idle_timeout_seconds(session)
+        if timeout_seconds <= 0:
             return False
         last_used_at = getattr(session, "last_used_at", None)
         if last_used_at is None:
             return False
-        cutoff = datetime.now(UTC).timestamp() - self.idle_timeout_seconds
+        cutoff = datetime.now(UTC).timestamp() - timeout_seconds
         return last_used_at.timestamp() < cutoff
+
+    def _session_idle_timeout_seconds(self, session: BrowserSession | Any) -> float:
+        configured = getattr(session, "idle_timeout_seconds", None)
+        if isinstance(configured, int | float) and configured > 0:
+            return float(configured)
+        return float(self.idle_timeout_seconds)
+
+    def _session_idle_deadline_at(self, session: BrowserSession | Any) -> str | None:
+        timeout_seconds = self._session_idle_timeout_seconds(session)
+        if timeout_seconds <= 0:
+            return None
+        last_used_at = getattr(session, "last_used_at", None)
+        if last_used_at is None:
+            return None
+        return datetime.fromtimestamp(
+            last_used_at.timestamp() + timeout_seconds, tz=UTC
+        ).isoformat()
+
+    def _ensure_idle_reaper(self) -> None:
+        if self._idle_reaper_task is not None and not self._idle_reaper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._idle_reaper_task = loop.create_task(
+            self._idle_reaper_loop(), name="browser-idle-reaper"
+        )
+
+    async def _idle_reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self._cleanup_idle_sessions()
+            except Exception:
+                logger.debug("browser: idle session reaper failed", exc_info=True)
+
+    def _normalize_lifecycle(self, lifecycle: str) -> str:
+        normalized = (lifecycle or "explicit").strip().lower()
+        return normalized if normalized in {"ephemeral", "explicit"} else "explicit"
+
+    async def _goto(
+        self,
+        page: Any,
+        url: str,
+        *,
+        navigation_timeout_seconds: float | None = None,
+        wait_until: str | None = None,
+        network_idle_after_dom_seconds: float | None = None,
+    ) -> None:
+        timeout_seconds = (
+            float(navigation_timeout_seconds)
+            if navigation_timeout_seconds is not None and navigation_timeout_seconds > 0
+            else float(self.navigation_timeout_seconds)
+        )
+        wait_until_value = (
+            (wait_until or self.wait_until or BROWSER_DEFAULT_WAIT_UNTIL).strip().lower()
+        )
+        if wait_until_value not in {"commit", "domcontentloaded", "load", "networkidle"}:
+            wait_until_value = BROWSER_DEFAULT_WAIT_UNTIL
+        await page.goto(url, timeout=int(timeout_seconds * 1000), wait_until=wait_until_value)
+        soft_wait = (
+            float(network_idle_after_dom_seconds)
+            if network_idle_after_dom_seconds is not None
+            else float(self.network_idle_after_dom_seconds)
+        )
+        if soft_wait > 0 and wait_until_value != "networkidle":
+            with contextlib.suppress(Exception):
+                await page.wait_for_load_state("networkidle", timeout=int(soft_wait * 1000))
+
+    def _bump_session_activity(self, session: BrowserSession) -> None:
+        now = time.monotonic()
+        if now - session.last_activity_bump_at < 1.0:
+            return
+        session.last_activity_bump_at = now
+        session.last_used_at = datetime.now(UTC)
+
+    def _reap_orphan_profile_locks(self) -> None:
+        if not self.profile_base_dir.exists():
+            return
+        for lock_path in self.profile_base_dir.glob("**/SingletonLock"):
+            if not self._profile_lock_looks_orphaned(lock_path):
+                continue
+            try:
+                lock_path.unlink()
+                logger.warning(
+                    "browser: removed orphaned profile lock",
+                    extra={"extra_data": {"path": str(lock_path)}},
+                )
+            except OSError:
+                logger.debug("browser: failed to remove orphaned profile lock", exc_info=True)
+
+    def _profile_lock_looks_orphaned(self, lock_path: Path) -> bool:
+        try:
+            if lock_path.is_symlink():
+                target = os.readlink(lock_path)
+                pid_match = re.search(r"(?:^|[^0-9])(\d{2,})(?:[^0-9]|$)", target)
+                if pid_match:
+                    return not self._pid_is_alive(int(pid_match.group(1)))
+                return True
+            if not lock_path.exists():
+                return False
+            if time.time() - lock_path.stat().st_mtime < 24 * 60 * 60:
+                return False
+            content = lock_path.read_text(errors="ignore")[:200]
+            pid_match = re.search(r"\b(\d{2,})\b", content)
+            return not (pid_match and self._pid_is_alive(int(pid_match.group(1))))
+        except OSError:
+            return False
+
+    def _pid_is_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
 
     def _resolve_profile_base_dir(self, configured: str | None) -> Path:
         if configured:
@@ -1172,6 +1346,7 @@ class BrowserManager:
 
         def _response_listener(response: Any) -> None:
             request = response.request
+            self._bump_session_activity(session)
             _push_network(
                 {
                     "phase": "response",

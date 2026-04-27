@@ -130,8 +130,11 @@ In `Settings -> Executors`, the browser section stores executor config like:
     "engine": "chromium",
     "runtime": "playwright",
     "channel": null,
-    "max_sessions": 4,
-    "idle_timeout_seconds": 600,
+    "max_sessions": 8,
+    "idle_timeout_seconds": 1800,
+    "navigation_timeout_seconds": 60,
+    "wait_until": "domcontentloaded",
+    "network_idle_after_dom_seconds": 3,
     "stealth_enabled": true,
     "realistic_user_agent": true,
     "default_timezone_id": "UTC",
@@ -151,6 +154,14 @@ The default human-like setup for a sticky local executor is now:
 This keeps cookies, local storage, and other profile state in a local
 Playwright user data directory on that executor. It is best for sites that are
 hostile to clean ephemeral contexts, but it is explicitly executor-local.
+
+Browser fetches use short-lived ephemeral sessions and separate web settings:
+`web.browser_fetch.session_idle_seconds`, `navigation_timeout_seconds`,
+`wait_until`, and `network_idle_after_dom_seconds`. The default fetch navigation
+waits for `domcontentloaded`, then does a short best-effort `networkidle` wait so
+slow ad/analytics requests do not block extraction indefinitely. Explicit
+`browser_open` sessions use the executor browser idle timeout, which defaults to
+30 minutes.
 
 ### Stealth defaults
 

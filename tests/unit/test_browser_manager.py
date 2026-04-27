@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.tools.executor.browser.manager import BrowserManager
+from cognis.tools.executor.browser.manager import BrowserManager, BrowserSession
 
 
 def test_browser_manager_derives_persistent_profile_from_origin() -> None:
@@ -32,6 +32,63 @@ def test_browser_manager_ephemeral_mode_discards_profile_id() -> None:
     )
     assert mode == "ephemeral"
     assert profile_id is None
+
+
+def test_browser_manager_defaults_match_explicit_session_lifecycle() -> None:
+    manager = BrowserManager()
+
+    assert manager.max_sessions == 8
+    assert manager.idle_timeout_seconds == 1800
+    assert manager.navigation_timeout_seconds == 60
+    assert manager.wait_until == "domcontentloaded"
+    assert manager.network_idle_after_dom_seconds == 3
+
+
+def test_browser_manager_uses_per_session_idle_timeout() -> None:
+    manager = BrowserManager(idle_timeout_seconds=1800)
+    session = SimpleNamespace(
+        idle_timeout_seconds=60,
+        last_used_at=datetime.now(UTC) - timedelta(seconds=90),
+    )
+
+    assert manager._session_is_idle(session) is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_goto_uses_domcontentloaded_and_soft_networkidle() -> None:
+    manager = BrowserManager()
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class _Page:
+        async def goto(self, url: str, **kwargs: object) -> None:
+            calls.append((url, dict(kwargs)))
+
+        async def wait_for_load_state(self, state: str, **kwargs: object) -> None:
+            calls.append((state, dict(kwargs)))
+
+    await manager._goto(_Page(), "https://example.com")  # noqa: SLF001
+
+    assert calls[0] == (
+        "https://example.com",
+        {"timeout": 60000, "wait_until": "domcontentloaded"},
+    )
+    assert calls[1] == ("networkidle", {"timeout": 3000})
+
+
+def test_browser_manager_response_activity_bump_is_throttled() -> None:
+    manager = BrowserManager()
+    session = BrowserSession(
+        session_id="s",
+        context=SimpleNamespace(),
+        page=SimpleNamespace(),
+        last_used_at=datetime.now(UTC) - timedelta(seconds=10),
+    )
+
+    manager._bump_session_activity(session)  # noqa: SLF001
+    first = session.last_used_at
+    manager._bump_session_activity(session)  # noqa: SLF001
+
+    assert session.last_used_at == first
 
 
 def test_browser_manager_needs_xvfb_for_headed_linux_without_display(

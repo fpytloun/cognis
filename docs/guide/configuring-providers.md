@@ -128,16 +128,19 @@ use through the `web_search`, `web_fetch`, `web_crawl`, `web_map`, and
 | `searxng` | self-hosted SearXNG | — | Free; user runs the SearXNG instance. |
 | `browser` | — | Playwright/Patchright headless | Auto-fallback target for Cloudflare/JS-required pages. |
 
-### Auto-fallback to the headless browser
+### Browser fallback
 
 When the direct fetch backend hits a Cloudflare/5xx/connection error and
 `web.fetch_fallback_browser` is enabled (default `true`), the request is
-automatically retried through the executor's headless browser. The Stage
-A-C stealth stack (patchright, autoconsent, humanizer, fingerprint
-hardening) applies, so the second attempt usually succeeds for the
-common JS-required and Cloudflare-bot-fight cases. Hard cases
-(Cloudflare managed challenge, Turnstile) still fail; the agent should
-treat that as a real signal rather than retrying mechanically.
+automatically retried through the executor's headless browser. Browser fetch
+navigation defaults to `wait_until=domcontentloaded`, a 60 second navigation
+timeout, and a short best-effort `networkidle` soft wait.
+
+If `web.browser_fetch.headed_fallback_enabled` is enabled and the executor also
+sets `browser.headed_allowed=true`, Cognis retries once more in headed mode when
+headless fetch fails or extracts an empty/interstitial page. Hard cases
+(Cloudflare managed challenge, Turnstile) can still fail; the agent should treat
+that as a real signal rather than retrying mechanically.
 
 ### `web_crawl` / `web_map` / `web_research` availability
 

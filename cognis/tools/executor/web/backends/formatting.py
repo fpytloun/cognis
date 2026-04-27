@@ -253,6 +253,11 @@ def _document_metadata_lines(document: dict[str, object]) -> list[str]:
         ("Language", "language"),
     )
     lines: list[str] = []
+    extraction_status = document.get("extraction_status")
+    if isinstance(extraction_status, str) and extraction_status.strip():
+        lines.append(
+            f"Extraction status: {_compact_field(extraction_status.strip(), max_chars=200)}"
+        )
     for label, key in fields:
         value = document.get(key)
         if isinstance(value, str) and value.strip():

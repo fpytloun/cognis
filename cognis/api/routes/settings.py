@@ -417,6 +417,24 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
         search_backend = await get_setting_value(session, "web.search_backend", legacy_backend)
         fetch_backend = await get_setting_value(session, "web.fetch_backend", legacy_backend)
         fetch_fallback = await get_setting_value(session, "web.fetch_fallback_browser", True)
+        browser_fetch_session_idle = await get_setting_value(
+            session, "web.browser_fetch.session_idle_seconds", 60
+        )
+        browser_fetch_wait_timeout = await get_setting_value(
+            session, "web.browser_fetch.wait_timeout_seconds", 30
+        )
+        browser_fetch_navigation_timeout = await get_setting_value(
+            session, "web.browser_fetch.navigation_timeout_seconds", 60
+        )
+        browser_fetch_wait_until = await get_setting_value(
+            session, "web.browser_fetch.wait_until", "domcontentloaded"
+        )
+        browser_fetch_network_idle = await get_setting_value(
+            session, "web.browser_fetch.network_idle_after_dom_seconds", 3
+        )
+        browser_fetch_headed_fallback = await get_setting_value(
+            session, "web.browser_fetch.headed_fallback_enabled", False
+        )
         searxng_url = await get_setting_value(session, "web.searxng_url", "")
 
     tavily_configured = False
@@ -456,6 +474,30 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
         search_backend=(str(search_backend) if isinstance(search_backend, str) else "direct"),
         fetch_backend=(str(fetch_backend) if isinstance(fetch_backend, str) else "direct"),
         fetch_fallback_browser=bool(fetch_fallback) if fetch_fallback is not None else True,
+        browser_fetch_session_idle_seconds=(
+            int(browser_fetch_session_idle) if isinstance(browser_fetch_session_idle, int) else 60
+        ),
+        browser_fetch_wait_timeout_seconds=(
+            int(browser_fetch_wait_timeout) if isinstance(browser_fetch_wait_timeout, int) else 30
+        ),
+        browser_fetch_navigation_timeout_seconds=(
+            int(browser_fetch_navigation_timeout)
+            if isinstance(browser_fetch_navigation_timeout, int)
+            else 60
+        ),
+        browser_fetch_wait_until=(
+            str(browser_fetch_wait_until)
+            if isinstance(browser_fetch_wait_until, str)
+            else "domcontentloaded"
+        ),
+        browser_fetch_network_idle_after_dom_seconds=(
+            int(browser_fetch_network_idle) if isinstance(browser_fetch_network_idle, int) else 3
+        ),
+        browser_fetch_headed_fallback_enabled=(
+            bool(browser_fetch_headed_fallback)
+            if browser_fetch_headed_fallback is not None
+            else False
+        ),
         tavily_configured=tavily_configured,
         brave_configured=brave_configured,
         searxng_url=str(searxng_url) if isinstance(searxng_url, str) else "",

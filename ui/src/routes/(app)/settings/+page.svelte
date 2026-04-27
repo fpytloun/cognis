@@ -163,6 +163,12 @@ import { onMount, tick } from 'svelte';
     search_backend: 'direct',
     fetch_backend: 'direct',
     fetch_fallback_browser: true,
+    browser_fetch_session_idle_seconds: 60,
+    browser_fetch_wait_timeout_seconds: 30,
+    browser_fetch_navigation_timeout_seconds: 60,
+    browser_fetch_wait_until: 'domcontentloaded',
+    browser_fetch_network_idle_after_dom_seconds: 3,
+    browser_fetch_headed_fallback_enabled: false,
     tavily_configured: false,
     brave_configured: false,
     searxng_url: '',
@@ -175,6 +181,12 @@ import { onMount, tick } from 'svelte';
   let webSearchBackendForm = $state('direct');
   let webFetchBackendForm = $state('direct');
   let webFetchFallbackBrowserForm = $state(true);
+  let webBrowserFetchSessionIdleForm = $state(60);
+  let webBrowserFetchWaitTimeoutForm = $state(30);
+  let webBrowserFetchNavigationTimeoutForm = $state(60);
+  let webBrowserFetchWaitUntilForm = $state('domcontentloaded');
+  let webBrowserFetchNetworkIdleForm = $state(3);
+  let webBrowserFetchHeadedFallbackForm = $state(false);
   let webSearxngUrlForm = $state('');
   let webKeySetup = $state<{ backend: string; value: string } | null>(null);
   let showExecutorForm = $state(false);
@@ -997,6 +1009,12 @@ import { onMount, tick } from 'svelte';
         search_backend: 'direct',
         fetch_backend: 'direct',
         fetch_fallback_browser: true,
+        browser_fetch_session_idle_seconds: 60,
+        browser_fetch_wait_timeout_seconds: 30,
+        browser_fetch_navigation_timeout_seconds: 60,
+        browser_fetch_wait_until: 'domcontentloaded',
+        browser_fetch_network_idle_after_dom_seconds: 3,
+        browser_fetch_headed_fallback_enabled: false,
         tavily_configured: false,
         brave_configured: false,
         searxng_url: '',
@@ -1010,6 +1028,12 @@ import { onMount, tick } from 'svelte';
     webSearchBackendForm = webConfig.search_backend ?? webConfig.backend;
     webFetchBackendForm = webConfig.fetch_backend ?? webConfig.backend;
     webFetchFallbackBrowserForm = webConfig.fetch_fallback_browser ?? true;
+    webBrowserFetchSessionIdleForm = webConfig.browser_fetch_session_idle_seconds ?? 60;
+    webBrowserFetchWaitTimeoutForm = webConfig.browser_fetch_wait_timeout_seconds ?? 30;
+    webBrowserFetchNavigationTimeoutForm = webConfig.browser_fetch_navigation_timeout_seconds ?? 60;
+    webBrowserFetchWaitUntilForm = webConfig.browser_fetch_wait_until ?? 'domcontentloaded';
+    webBrowserFetchNetworkIdleForm = webConfig.browser_fetch_network_idle_after_dom_seconds ?? 3;
+    webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? false;
     webSearxngUrlForm = webConfig.searxng_url ?? '';
 
     // Initialize account name form
@@ -1405,11 +1429,23 @@ import { onMount, tick } from 'svelte';
       await api.settings.update('web.search_backend', webSearchBackendForm);
       await api.settings.update('web.fetch_backend', webFetchBackendForm);
       await api.settings.update('web.fetch_fallback_browser', webFetchFallbackBrowserForm);
+      await api.settings.update('web.browser_fetch.session_idle_seconds', Number(webBrowserFetchSessionIdleForm));
+      await api.settings.update('web.browser_fetch.wait_timeout_seconds', Number(webBrowserFetchWaitTimeoutForm));
+      await api.settings.update('web.browser_fetch.navigation_timeout_seconds', Number(webBrowserFetchNavigationTimeoutForm));
+      await api.settings.update('web.browser_fetch.wait_until', webBrowserFetchWaitUntilForm);
+      await api.settings.update('web.browser_fetch.network_idle_after_dom_seconds', Number(webBrowserFetchNetworkIdleForm));
+      await api.settings.update('web.browser_fetch.headed_fallback_enabled', webBrowserFetchHeadedFallbackForm);
       await api.settings.update('web.searxng_url', webSearxngUrlForm.trim());
       webConfig = await api.webConfig.status();
       webSearchBackendForm = webConfig.search_backend ?? 'direct';
       webFetchBackendForm = webConfig.fetch_backend ?? 'direct';
       webFetchFallbackBrowserForm = webConfig.fetch_fallback_browser ?? true;
+      webBrowserFetchSessionIdleForm = webConfig.browser_fetch_session_idle_seconds ?? 60;
+      webBrowserFetchWaitTimeoutForm = webConfig.browser_fetch_wait_timeout_seconds ?? 30;
+      webBrowserFetchNavigationTimeoutForm = webConfig.browser_fetch_navigation_timeout_seconds ?? 60;
+      webBrowserFetchWaitUntilForm = webConfig.browser_fetch_wait_until ?? 'domcontentloaded';
+      webBrowserFetchNetworkIdleForm = webConfig.browser_fetch_network_idle_after_dom_seconds ?? 3;
+      webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? false;
       webSearxngUrlForm = webConfig.searxng_url ?? '';
       notice = 'Web backend updated.';
       addToast('Web backend updated.', 'success');
@@ -2278,6 +2314,40 @@ import { onMount, tick } from 'svelte';
                 <span class="block text-xs leading-5 text-slate-400">Retry direct fetch failures through the executor browser on Cloudflare/JS-required pages. This is recommended for normal direct fetch usage and ignored when fetch backend is set to always use the browser.</span>
               </span>
             </label>
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-200">
+              <input bind:checked={webBrowserFetchHeadedFallbackForm} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
+              <span class="space-y-1">
+                <span class="block font-medium text-slate-100">Headed last-resort fallback</span>
+                <span class="block text-xs leading-5 text-slate-400">After headless browser fetch fails or extracts an empty/block page, retry in headed mode when the executor also enables headed browser sessions.</span>
+              </span>
+            </label>
+            <div class="grid gap-3 md:grid-cols-2">
+              <label class="space-y-1 text-sm text-slate-300">
+                <span class="text-xs text-slate-400">Navigation timeout (seconds)</span>
+                <Input bind:value={webBrowserFetchNavigationTimeoutForm} type="number" min="5" max="300" step="5" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-300">
+                <span class="text-xs text-slate-400">Initial wait state</span>
+                <select bind:value={webBrowserFetchWaitUntilForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="commit">commit</option>
+                  <option value="domcontentloaded">domcontentloaded</option>
+                  <option value="load">load</option>
+                  <option value="networkidle">networkidle</option>
+                </select>
+              </label>
+              <label class="space-y-1 text-sm text-slate-300">
+                <span class="text-xs text-slate-400">Network idle soft wait (seconds)</span>
+                <Input bind:value={webBrowserFetchNetworkIdleForm} type="number" min="0" max="30" step="1" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-300">
+                <span class="text-xs text-slate-400">Fetch session idle (seconds)</span>
+                <Input bind:value={webBrowserFetchSessionIdleForm} type="number" min="10" max="3600" step="10" />
+              </label>
+              <label class="space-y-1 text-sm text-slate-300">
+                <span class="text-xs text-slate-400">Pool wait timeout (seconds)</span>
+                <Input bind:value={webBrowserFetchWaitTimeoutForm} type="number" min="1" max="300" step="1" />
+              </label>
+            </div>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>SearXNG instance URL (search backend = searxng)</span>
               <Input bind:value={webSearxngUrlForm} placeholder="http://localhost:8888" />
@@ -2824,10 +2894,6 @@ import { onMount, tick } from 'svelte';
                       onchange={async (e) => {
                         const value = e.currentTarget.value as 'playwright' | 'patchright';
                         const next: Record<string, unknown> = { ...browserConfig, runtime: value };
-                        // Patchright works best with channel=chrome; preselect when switching.
-                        if (value === 'patchright' && !browserChannel) {
-                          next.channel = 'chrome';
-                        }
                         const cfg = { ...(exec.config || {}), browser: next };
                         await api.executor.update(exec.executor_id, { config: cfg });
                         await refreshPageState();
@@ -2837,7 +2903,7 @@ import { onMount, tick } from 'svelte';
                       <option value="patchright">Patchright (anti-detect)</option>
                     </select>
                     <span class="block text-xs text-slate-500">
-                      Patchright reduces CDP detection but is not a Cloudflare/Turnstile silver bullet. Headed mode + Xvfb + persistent profile + channel=chrome remains the most reliable setup for hard sites.
+                      Patchright reduces CDP detection but is not a Cloudflare/Turnstile silver bullet. Leave channel empty for bundled Chromium, or set chrome only after installing system Chrome yourself.
                     </span>
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
@@ -2866,11 +2932,11 @@ import { onMount, tick } from 'svelte';
                         await refreshPageState();
                       }}
                     />
-                    <span class="block text-xs text-slate-500">Use chrome, msedge, chrome-beta, etc. Required by Patchright (auto-set to chrome).</span>
+                    <span class="block text-xs text-slate-500">Use chrome, msedge, chrome-beta, etc. only when that system browser is already installed. Leave empty for bundled Chromium.</span>
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Max sessions</span>
-                    <Input value={Number(browserConfig.max_sessions ?? 4)} disabled={!browserEnabled}
+                    <Input value={Number(browserConfig.max_sessions ?? 8)} disabled={!browserEnabled}
                       type="number" min="1" max="16" step="1"
                       onchange={async (e) => {
                         const val = parseInt(e.currentTarget.value, 10);
@@ -2883,7 +2949,7 @@ import { onMount, tick } from 'svelte';
                   </label>
                   <label class="space-y-1 text-sm text-slate-300">
                     <span class="text-xs text-slate-400">Idle timeout (seconds)</span>
-                    <Input value={Number(browserConfig.idle_timeout_seconds ?? 600)} disabled={!browserEnabled}
+                    <Input value={Number(browserConfig.idle_timeout_seconds ?? 1800)} disabled={!browserEnabled}
                       type="number" min="60" max="3600" step="60"
                       onchange={async (e) => {
                         const val = parseInt(e.currentTarget.value, 10);

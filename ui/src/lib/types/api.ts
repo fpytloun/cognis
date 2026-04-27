@@ -1134,6 +1134,12 @@ export interface WebConfigStatus {
   search_backend: string;
   fetch_backend: string;
   fetch_fallback_browser: boolean;
+  browser_fetch_session_idle_seconds: number;
+  browser_fetch_wait_timeout_seconds: number;
+  browser_fetch_navigation_timeout_seconds: number;
+  browser_fetch_wait_until: string;
+  browser_fetch_network_idle_after_dom_seconds: number;
+  browser_fetch_headed_fallback_enabled: boolean;
   tavily_configured: boolean;
   brave_configured: boolean;
   searxng_url: string;

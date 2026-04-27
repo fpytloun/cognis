@@ -40,11 +40,17 @@ class BrowserFetchBackend:
         *,
         wait_timeout_seconds: float = 30.0,
         session_idle_seconds: float = 60.0,
+        navigation_timeout_seconds: float = 60.0,
+        wait_until: str = "domcontentloaded",
+        network_idle_after_dom_seconds: float = 3.0,
         headed: bool = False,
     ) -> None:
         self._manager = manager
         self._wait_timeout_seconds = wait_timeout_seconds
         self._session_idle_seconds = session_idle_seconds
+        self._navigation_timeout_seconds = navigation_timeout_seconds
+        self._wait_until = wait_until
+        self._network_idle_after_dom_seconds = network_idle_after_dom_seconds
         self._headed = bool(headed)
 
     @property
@@ -83,6 +89,11 @@ class BrowserFetchBackend:
                 profile_mode="ephemeral",
                 wait_for_slot=True,
                 wait_timeout_seconds=self._wait_timeout_seconds,
+                lifecycle="ephemeral",
+                session_idle_seconds=self._session_idle_seconds,
+                navigation_timeout_seconds=self._navigation_timeout_seconds,
+                wait_until=self._wait_until,
+                network_idle_after_dom_seconds=self._network_idle_after_dom_seconds,
             )
         except TimeoutError:
             return ToolResult(
@@ -169,4 +180,38 @@ class BrowserFetchBackend:
             output_format=output_format,
             options=options,
         )
-        return document.content, {"extracted_document": document.as_dict()}
+        document_data = document.as_dict()
+        block_signal = _classify_browser_extract_quality(document_data, document.content)
+        if block_signal:
+            document_data["browser_block_signal"] = block_signal
+            document_data["extraction_status"] = f"blocked_or_empty:{block_signal}"
+        else:
+            document_data["extraction_status"] = "ok"
+        return document.content, {"extracted_document": document_data}
+
+
+def _classify_browser_extract_quality(document: dict[str, Any], content: str) -> str | None:
+    """Classify browser-rendered pages that loaded but did not yield usable content."""
+    normalized = " ".join((content or "").lower().split())
+    extractor = str(document.get("extractor") or "").lower()
+    score = document.get("extraction_score")
+    score_float = float(score) if isinstance(score, int | float) else 0.0
+    block_markers = (
+        "verify you are human",
+        "checking your browser",
+        "enable javascript and cookies",
+        "access denied",
+        "temporarily unavailable",
+        "are you a robot",
+        "captcha",
+        "cloudflare",
+        "turnstile",
+    )
+    if any(marker in normalized for marker in block_markers):
+        return "interstitial"
+    if extractor == "empty" or score_float <= 0 or len(normalized) < 80:
+        return "empty_extraction"
+    title = str(document.get("title") or "").strip().lower()
+    if title in {"reuters.com", "just a moment...", "access denied"} and len(normalized) < 500:
+        return "thin_block_page"
+    return None

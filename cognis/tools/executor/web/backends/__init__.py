@@ -105,16 +105,24 @@ def _get_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
     manager = metadata.get(BROWSER_MANAGER_KEY)
     if not isinstance(manager, BrowserManager) or not manager.enabled:
         return None
-    wait_timeout, idle_timeout = _browser_fetch_timeouts(metadata)
+    wait_timeout, idle_timeout, navigation_timeout, wait_until, network_idle = (
+        _browser_fetch_timeouts(metadata)
+    )
     if (
         _browser_fetch is None
         or _browser_fetch_manager is not manager
         or _browser_fetch._wait_timeout_seconds != wait_timeout  # noqa: SLF001
+        or _browser_fetch._navigation_timeout_seconds != navigation_timeout  # noqa: SLF001
+        or _browser_fetch._wait_until != wait_until  # noqa: SLF001
+        or _browser_fetch._network_idle_after_dom_seconds != network_idle  # noqa: SLF001
     ):
         _browser_fetch = BrowserFetchBackend(
             manager,
             wait_timeout_seconds=wait_timeout,
             session_idle_seconds=idle_timeout,
+            navigation_timeout_seconds=navigation_timeout,
+            wait_until=wait_until,
+            network_idle_after_dom_seconds=network_idle,
             headed=False,
         )
         _browser_fetch_manager = manager
@@ -129,25 +137,36 @@ def _get_headed_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend |
         return None
     if not getattr(manager, "headed_allowed", False):
         return None
-    wait_timeout, idle_timeout = _browser_fetch_timeouts(metadata)
+    wait_timeout, idle_timeout, navigation_timeout, wait_until, network_idle = (
+        _browser_fetch_timeouts(metadata)
+    )
     if (
         _browser_fetch_headed is None
         or _browser_fetch_headed_manager is not manager
         or _browser_fetch_headed._wait_timeout_seconds != wait_timeout  # noqa: SLF001
+        or _browser_fetch_headed._navigation_timeout_seconds != navigation_timeout  # noqa: SLF001
+        or _browser_fetch_headed._wait_until != wait_until  # noqa: SLF001
+        or _browser_fetch_headed._network_idle_after_dom_seconds != network_idle  # noqa: SLF001
     ):
         _browser_fetch_headed = BrowserFetchBackend(
             manager,
             wait_timeout_seconds=wait_timeout,
             session_idle_seconds=idle_timeout,
+            navigation_timeout_seconds=navigation_timeout,
+            wait_until=wait_until,
+            network_idle_after_dom_seconds=network_idle,
             headed=True,
         )
         _browser_fetch_headed_manager = manager
     return _browser_fetch_headed
 
 
-def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float]:
+def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float, float, str, float]:
     wait_timeout_raw = metadata.get("web_browser_fetch_wait_timeout_seconds", 30.0)
     idle_raw = metadata.get("web_browser_fetch_session_idle_seconds", 60.0)
+    navigation_raw = metadata.get("web_browser_fetch_navigation_timeout_seconds", 60.0)
+    wait_until_raw = metadata.get("web_browser_fetch_wait_until", "domcontentloaded")
+    network_idle_raw = metadata.get("web_browser_fetch_network_idle_after_dom_seconds", 3.0)
     try:
         wait_timeout = float(wait_timeout_raw)
     except (TypeError, ValueError):
@@ -156,7 +175,18 @@ def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float]:
         idle_timeout = float(idle_raw)
     except (TypeError, ValueError):
         idle_timeout = 60.0
-    return wait_timeout, idle_timeout
+    try:
+        navigation_timeout = float(navigation_raw)
+    except (TypeError, ValueError):
+        navigation_timeout = 60.0
+    wait_until = str(wait_until_raw or "domcontentloaded").strip().lower()
+    if wait_until not in {"commit", "domcontentloaded", "load", "networkidle"}:
+        wait_until = "domcontentloaded"
+    try:
+        network_idle = float(network_idle_raw)
+    except (TypeError, ValueError):
+        network_idle = 3.0
+    return wait_timeout, idle_timeout, navigation_timeout, wait_until, max(0.0, network_idle)
 
 
 def _resolve_backend_name(metadata: dict[str, Any], override: str | None, *, axis: str) -> str:

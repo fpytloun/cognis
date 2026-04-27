@@ -165,6 +165,12 @@ class WebConfigStatusResponse(BaseModel):
     search_backend: str = "direct"
     fetch_backend: str = "direct"
     fetch_fallback_browser: bool = True
+    browser_fetch_session_idle_seconds: int = 60
+    browser_fetch_wait_timeout_seconds: int = 30
+    browser_fetch_navigation_timeout_seconds: int = 60
+    browser_fetch_wait_until: str = "domcontentloaded"
+    browser_fetch_network_idle_after_dom_seconds: int = 3
+    browser_fetch_headed_fallback_enabled: bool = False
     tavily_configured: bool = False
     brave_configured: bool = False
     searxng_url: str = ""

@@ -244,6 +244,13 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "humanize_input": runtime_metadata.get("browser_humanize_input"),
         "humanize_intensity": runtime_metadata.get("browser_humanize_intensity", "low"),
         "fingerprint_hardening": runtime_metadata.get("browser_fingerprint_hardening"),
+        "navigation_timeout_seconds": runtime_metadata.get(
+            "browser_navigation_timeout_seconds", 60
+        ),
+        "wait_until": runtime_metadata.get("browser_wait_until", "domcontentloaded"),
+        "network_idle_after_dom_seconds": runtime_metadata.get(
+            "browser_network_idle_after_dom_seconds", 3
+        ),
     }
 
 
@@ -291,7 +298,9 @@ def build_manager_from_config(runtime_metadata: dict[str, Any]) -> BrowserManage
         ),
         persistent_profiles_enabled=bool(cfg.get("persistent_profiles_enabled", True)),
         profile_mode_default=str(cfg.get("profile_mode_default", "persistent_local")),
-        profile_base_dir=(str(cfg.get("profile_base_dir")) if cfg.get("profile_base_dir") else None),
+        profile_base_dir=(
+            str(cfg.get("profile_base_dir")) if cfg.get("profile_base_dir") else None
+        ),
         realistic_launch=bool(cfg.get("realistic_launch", True)),
         xvfb_auto=bool(cfg.get("xvfb_auto", True)),
         locale=str(cfg.get("locale", "en-US")),
@@ -311,6 +320,9 @@ def build_manager_from_config(runtime_metadata: dict[str, Any]) -> BrowserManage
         humanize_input=humanize_input,
         humanize_intensity=str(cfg.get("humanize_intensity") or "low"),
         fingerprint_hardening=fingerprint_hardening,
+        navigation_timeout_seconds=int(cfg.get("navigation_timeout_seconds") or 60),
+        wait_until=str(cfg.get("wait_until") or "domcontentloaded"),
+        network_idle_after_dom_seconds=int(cfg.get("network_idle_after_dom_seconds") or 3),
     )
 
 

@@ -845,6 +845,9 @@ async def _resolve_web_config(
     searxng_language = ""
     browser_fetch_session_idle = 60
     browser_fetch_wait_timeout = 30
+    browser_fetch_navigation_timeout = 60
+    browser_fetch_wait_until = "domcontentloaded"
+    browser_fetch_network_idle = 3
     browser_fetch_headed_fallback = False
     concurrency: dict[str, Any] = {
         "global_cap": 32,
@@ -915,6 +918,21 @@ async def _resolve_web_config(
                 )
                 if isinstance(wait_value, int) and wait_value > 0:
                     browser_fetch_wait_timeout = wait_value
+                navigation_value = await get_setting_value(
+                    session, "web.browser_fetch.navigation_timeout_seconds", 60
+                )
+                if isinstance(navigation_value, int) and navigation_value > 0:
+                    browser_fetch_navigation_timeout = navigation_value
+                wait_until_value = await get_setting_value(
+                    session, "web.browser_fetch.wait_until", "domcontentloaded"
+                )
+                if isinstance(wait_until_value, str) and wait_until_value:
+                    browser_fetch_wait_until = wait_until_value
+                network_idle_value = await get_setting_value(
+                    session, "web.browser_fetch.network_idle_after_dom_seconds", 3
+                )
+                if isinstance(network_idle_value, int) and network_idle_value >= 0:
+                    browser_fetch_network_idle = network_idle_value
                 headed_value = await get_setting_value(
                     session, "web.browser_fetch.headed_fallback_enabled", False
                 )
@@ -995,6 +1013,9 @@ async def _resolve_web_config(
         "web_searxng_language": searxng_language,
         "web_browser_fetch_session_idle_seconds": browser_fetch_session_idle,
         "web_browser_fetch_wait_timeout_seconds": browser_fetch_wait_timeout,
+        "web_browser_fetch_navigation_timeout_seconds": browser_fetch_navigation_timeout,
+        "web_browser_fetch_wait_until": browser_fetch_wait_until,
+        "web_browser_fetch_network_idle_after_dom_seconds": browser_fetch_network_idle,
         "web_browser_fetch_headed_fallback_enabled": browser_fetch_headed_fallback,
         "web_concurrency": concurrency,
         "web_secrets": web_secrets,

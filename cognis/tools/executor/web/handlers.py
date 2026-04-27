@@ -120,6 +120,15 @@ def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
     return any(token in output for token in _BROWSER_FALLBACK_HINT_TOKENS)
 
 
+def _browser_block_signal(result: ToolResult) -> str | None:
+    metadata = result.metadata or {}
+    document = metadata.get("extracted_document")
+    if not isinstance(document, dict):
+        return None
+    signal = document.get("browser_block_signal")
+    return str(signal) if isinstance(signal, str) and signal else None
+
+
 def _annotate_fallback_metadata(
     result: ToolResult,
     *,
@@ -206,6 +215,7 @@ def _explain_skipped_fallback(
         )
     elif get_browser_fetch_backend(runtime_metadata) is None:
         from cognis.tools.executor.browser.manager import BrowserManager
+
         manager = runtime_metadata.get(BROWSER_MANAGER_KEY)
         if isinstance(manager, BrowserManager) and not manager.enabled:
             metadata["browser_fallback_skipped_reason"] = "browser_disabled"
@@ -587,7 +597,8 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         options=fetch_options,
     )
     modes_attempted.append("headless")
-    if not headless_result.is_error:
+    headless_block_signal = _browser_block_signal(headless_result)
+    if not headless_result.is_error and not headless_block_signal:
         return build_fetch_tool_result(
             url=url,
             content=headless_result.output,
@@ -598,6 +609,15 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
                 modes_attempted=modes_attempted,
                 primary_backend=primary_label,
             ).metadata,
+        )
+    if headless_block_signal:
+        headless_result = ToolResult(
+            output=(
+                f"Headless browser loaded the page but extraction looked blocked or empty "
+                f"({headless_block_signal})."
+            ),
+            is_error=True,
+            metadata=headless_result.metadata,
         )
     fallback_attempts.append(("headless", headless_result))
 
