@@ -21,7 +21,7 @@ from cognis.tools.executor.web.backends.formatting import build_search_tool_resu
 from cognis.tools.executor.web.headers import (
     clamp_timeout,
     fetch_with_retry,
-    format_response,
+    format_response_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,9 @@ class DirectBackend:
             return result
 
         # result is an httpx.Response
-        return ToolResult(output=format_response(result, output_format))
+        response_url = str(getattr(result, "url", "") or "")
+        final_url = response_url if response_url.startswith(("http://", "https://")) else url
+        return format_response_result(result, output_format, source_url=final_url, options=options)
 
     async def search(
         self,

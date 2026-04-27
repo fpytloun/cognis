@@ -231,3 +231,31 @@ def format_response(response: httpx.Response, output_format: str) -> str:
     if "text/html" in content_type:
         return convert_html(raw_text, output_format, url=str(response.url))
     return raw_text
+
+
+def format_response_result(
+    response: httpx.Response,
+    output_format: str,
+    *,
+    source_url: str | None = None,
+    options: dict[str, object] | None = None,
+) -> ToolResult:
+    """Extract response content and attach structured document metadata."""
+
+    content_type = response.headers.get("content-type", "")
+    raw_text = truncate_content(response.text)
+    if "text/html" not in content_type:
+        return ToolResult(output=raw_text)
+
+    from cognis.tools.executor.web.extraction import extract_document
+
+    document = extract_document(
+        raw_text,
+        url=source_url or str(response.url),
+        output_format=output_format,
+        options=options,
+    )
+    return ToolResult(
+        output=document.content,
+        metadata={"extracted_document": document.as_dict()},
+    )

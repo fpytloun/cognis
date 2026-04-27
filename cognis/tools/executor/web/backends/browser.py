@@ -24,7 +24,6 @@ from cognis.models.tool import ToolResult
 from cognis.tools.executor.browser.manager import BrowserManager
 from cognis.tools.executor.web.headers import (
     clamp_timeout,
-    convert_html,
     sanitise_url,
     truncate_content,
 )
@@ -58,7 +57,7 @@ class BrowserFetchBackend:
         timeout: int = 30,
         options: dict[str, Any] | None = None,
     ) -> ToolResult:
-        del options  # not used for browser fetch yet
+        options = options or {}
         timeout = clamp_timeout(timeout)
         try:
             url = sanitise_url(url)
@@ -102,7 +101,13 @@ class BrowserFetchBackend:
 
         try:
             try:
-                content = await self._extract(session, output_format=output_format, url=url)
+                final_url = str(getattr(session.page, "url", "") or url)
+                content, metadata = await self._extract(
+                    session,
+                    output_format=output_format,
+                    url=final_url,
+                    options=options,
+                )
             except Exception as exc:
                 logger.warning(
                     "web: browser fetch extraction failed (%s)",
@@ -120,10 +125,17 @@ class BrowserFetchBackend:
 
         return ToolResult(
             output=content,
-            metadata={"browser_fetch": True},
+            metadata={"browser_fetch": True, **metadata},
         )
 
-    async def _extract(self, session: Any, *, output_format: str, url: str) -> str:
+    async def _extract(
+        self,
+        session: Any,
+        *,
+        output_format: str,
+        url: str,
+        options: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
         page = session.page
         # Always ask for the rendered HTML — browser fetch's value is JS
         # execution. We can downgrade to text/markdown via the existing
@@ -131,8 +143,12 @@ class BrowserFetchBackend:
         # ``innerText`` for content extraction.
         html = await page.content()
         html = truncate_content(html)
-        if output_format == "html":
-            return html
-        # convert_html prefers trafilatura when available and falls back to
-        # markdownify; both run synchronously on the html string.
-        return convert_html(html, output_format, url=url)
+        from cognis.tools.executor.web.extraction import extract_document
+
+        document = extract_document(
+            html,
+            url=url,
+            output_format=output_format,
+            options=options,
+        )
+        return document.content, {"extracted_document": document.as_dict()}

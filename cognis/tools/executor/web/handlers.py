@@ -387,7 +387,14 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
 
     options = _collect_optional_options(
         arguments,
-        ("query", "extract_depth", "chunks_per_source", "include_images"),
+        (
+            "query",
+            "extract_depth",
+            "chunks_per_source",
+            "include_images",
+            "include_media",
+            "media_limit",
+        ),
     )
 
     runtime_metadata = context.runtime_metadata

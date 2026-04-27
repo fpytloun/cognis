@@ -128,6 +128,17 @@ def _build_web_fetch(
             "description": "Output format (default: markdown)",
         },
         "timeout": {"type": "integer", "description": "Timeout in seconds (max 120)"},
+        "include_media": {
+            "type": "string",
+            "enum": ["none", "metadata"],
+            "description": "Direct/browser: return extracted media references such as hero and inline images (default: metadata)",
+        },
+        "media_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 50,
+            "description": "Maximum media references to include (default: 10, max 50)",
+        },
     }
 
     if has_multiple:
