@@ -163,8 +163,12 @@ def _runtime_info(
         "executor_agent_owner_email": executor_agent.owner_email if executor_agent else None,
         "executor_id": executor_config.get("executor_id") if executor_config else None,
         "executor_type": executor_config.get("executor_type") if executor_config else None,
-        "executor_owner_email": executor_config.get("executor_owner_email") if executor_config else None,
-        "selected_executor_owner_email": executor_config.get("owner_email") if executor_config else None,
+        "executor_owner_email": executor_config.get("executor_owner_email")
+        if executor_config
+        else None,
+        "selected_executor_owner_email": executor_config.get("owner_email")
+        if executor_config
+        else None,
         "selection_source": selection_source,
         "hard_bound": hard_bound,
         "runtime_source": runtime_source,
@@ -547,6 +551,10 @@ def build_step_runtime_factory(
             web_tool_definitions(
                 web_config["web_available_backends"],
                 default_backend=web_config.get("web_backend"),
+                available_search_backends=web_config.get("web_available_search_backends"),
+                available_fetch_backends=web_config.get("web_available_fetch_backends"),
+                default_search_backend=web_config.get("web_search_backend"),
+                default_fetch_backend=web_config.get("web_fetch_backend"),
             )
         )
 
@@ -570,7 +578,9 @@ def build_step_runtime_factory(
                     tool_agent.skills["_attached_skill_tool_ids"] = sorted(
                         attached_skill_tool_ids(resolved_skills)
                     )
-                    tool_agent.skills["_attached_skill_tool_ids_by_skill"] = attached_tool_ids_by_skill
+                    tool_agent.skills["_attached_skill_tool_ids_by_skill"] = (
+                        attached_tool_ids_by_skill
+                    )
                     tool_agent.skills["_runtime_skill_summaries"] = [
                         {
                             "skill_id": skill.skill_id,
@@ -624,9 +634,7 @@ def build_step_runtime_factory(
                 filtered.append(tool)
         agent_tools = filtered
 
-        resolved_type = (
-            executor_config.get("executor_type", "in_process")
-        )
+        resolved_type = executor_config.get("executor_type", "in_process")
         if not is_executor_type_allowed(resolved_type, policy):
             _raise_runtime_resolution_error(
                 f"Executor type '{resolved_type}' is disabled by deployment policy",
@@ -816,32 +824,129 @@ def build_step_runtime_factory(
 
     return factory
 
+
 async def _resolve_web_config(
     providers: Any,
     user_email: str,
 ) -> dict[str, Any]:
     """Resolve web backend configuration from settings and secrets.
 
-    Returns a dict with keys suitable for merging into runtime_metadata:
-    - web_backend: str — default backend name ("direct", "tavily", "brave")
-    - web_secrets: dict — API keys for configured backends
-    - web_available_backends: list[str] — backends that have API keys configured
+    Search and fetch are now selected independently. The legacy single
+    ``web.backend`` setting is honoured as a fallback for executors that
+    have not yet been migrated.
     """
-    web_backend = "direct"
+    legacy_backend = "direct"
+    search_backend = "direct"
+    fetch_backend = "direct"
+    fetch_fallback_browser = True
+    searxng_url = ""
+    searxng_engines = ""
+    searxng_categories = ""
+    searxng_language = ""
+    browser_fetch_session_idle = 60
+    browser_fetch_wait_timeout = 30
+    concurrency: dict[str, Any] = {
+        "global_cap": 32,
+        "per_host_cap": 4,
+        "backend_caps": {
+            "direct": 16,
+            "tavily": 8,
+            "brave": 2,
+            "searxng": 4,
+            "browser": 4,
+        },
+        "rate_limits_qps": {
+            "direct": 0.0,
+            "tavily": 5.0,
+            "brave": 1.0,
+            "searxng": 5.0,
+            "browser": 0.0,
+        },
+    }
     web_secrets: dict[str, str] = {}
 
-    # Read web.backend setting from DB
     session_factory = getattr(providers, "_session_factory", None)
     if session_factory is not None:
         try:
             from cognis.store.queries import get_setting_value
 
             async with session_factory() as session:
-                value = await get_setting_value(session, "web.backend", "direct")
-                if isinstance(value, str):
-                    web_backend = value
+                legacy_value = await get_setting_value(session, "web.backend", "direct")
+                if isinstance(legacy_value, str) and legacy_value:
+                    legacy_backend = legacy_value
+                # Split keys win when set; fall back to legacy single axis.
+                search_value = await get_setting_value(
+                    session, "web.search_backend", legacy_backend
+                )
+                if isinstance(search_value, str) and search_value:
+                    search_backend = search_value
+                fetch_value = await get_setting_value(session, "web.fetch_backend", legacy_backend)
+                if isinstance(fetch_value, str) and fetch_value:
+                    fetch_backend = fetch_value
+                fallback_value = await get_setting_value(
+                    session, "web.fetch_fallback_browser", True
+                )
+                if isinstance(fallback_value, bool):
+                    fetch_fallback_browser = fallback_value
+                for key, target in (
+                    ("web.searxng_url", "searxng_url"),
+                    ("web.searxng_engines", "searxng_engines"),
+                    ("web.searxng_categories", "searxng_categories"),
+                    ("web.searxng_language", "searxng_language"),
+                ):
+                    raw = await get_setting_value(session, key, "")
+                    if isinstance(raw, str):
+                        if target == "searxng_url":
+                            searxng_url = raw
+                        elif target == "searxng_engines":
+                            searxng_engines = raw
+                        elif target == "searxng_categories":
+                            searxng_categories = raw
+                        else:
+                            searxng_language = raw
+                idle_value = await get_setting_value(
+                    session, "web.browser_fetch.session_idle_seconds", 60
+                )
+                if isinstance(idle_value, int) and idle_value > 0:
+                    browser_fetch_session_idle = idle_value
+                wait_value = await get_setting_value(
+                    session, "web.browser_fetch.wait_timeout_seconds", 30
+                )
+                if isinstance(wait_value, int) and wait_value > 0:
+                    browser_fetch_wait_timeout = wait_value
+
+                async def _read_int(key: str, default: int) -> int:
+                    raw = await get_setting_value(session, key, default)
+                    return int(raw) if isinstance(raw, int) and raw > 0 else default
+
+                async def _read_float(key: str, default: float) -> float:
+                    raw = await get_setting_value(session, key, default)
+                    if isinstance(raw, (int, float)) and raw >= 0:
+                        return float(raw)
+                    return default
+
+                concurrency["global_cap"] = await _read_int("web.concurrency.global_cap", 32)
+                concurrency["per_host_cap"] = await _read_int("web.concurrency.per_host_cap", 4)
+                for backend_name, default_cap in (
+                    ("direct", 16),
+                    ("tavily", 8),
+                    ("brave", 2),
+                    ("searxng", 4),
+                    ("browser", 4),
+                ):
+                    concurrency["backend_caps"][backend_name] = await _read_int(
+                        f"web.concurrency.{backend_name}_cap", default_cap
+                    )
+                for backend_name, default_qps in (
+                    ("tavily", 5.0),
+                    ("brave", 1.0),
+                    ("searxng", 5.0),
+                ):
+                    concurrency["rate_limits_qps"][backend_name] = await _read_float(
+                        f"web.rate_limit.{backend_name}_qps", default_qps
+                    )
         except Exception:
-            logger.debug("web: failed to read web.backend setting", exc_info=True)
+            logger.debug("web: failed to read web settings", exc_info=True)
 
     # Read API keys from secrets provider
     if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_secret"):
@@ -855,16 +960,40 @@ async def _resolve_web_config(
             except Exception:
                 logger.debug("web: failed to read secret %s", secret_name)
 
-    available = ["direct"]
+    available_search = ["direct"]
     if web_secrets.get("tavily_api_key"):
-        available.append("tavily")
+        available_search.append("tavily")
     if web_secrets.get("brave_api_key"):
-        available.append("brave")
+        available_search.append("brave")
+    if searxng_url.strip():
+        available_search.append("searxng")
+
+    available_fetch = ["direct"]
+    if web_secrets.get("tavily_api_key"):
+        available_fetch.append("tavily")
+    # ``browser`` becomes available iff the executor exposes a BrowserManager,
+    # which we resolve at executor configure time. Add a hint here so the
+    # remote executor knows it's allowed once it has a manager.
+    available_fetch.append("browser")
+
+    available_union = sorted({*available_search, *available_fetch})
 
     return {
-        "web_backend": web_backend,
+        "web_backend": legacy_backend,
+        "web_search_backend": search_backend,
+        "web_fetch_backend": fetch_backend,
+        "web_fetch_fallback_browser": fetch_fallback_browser,
+        "web_searxng_url": searxng_url,
+        "web_searxng_engines": searxng_engines,
+        "web_searxng_categories": searxng_categories,
+        "web_searxng_language": searxng_language,
+        "web_browser_fetch_session_idle_seconds": browser_fetch_session_idle,
+        "web_browser_fetch_wait_timeout_seconds": browser_fetch_wait_timeout,
+        "web_concurrency": concurrency,
         "web_secrets": web_secrets,
-        "web_available_backends": available,
+        "web_available_backends": available_union,
+        "web_available_search_backends": available_search,
+        "web_available_fetch_backends": available_fetch,
     }
 
 
@@ -888,7 +1017,9 @@ async def _resolve_executor_mcp_servers(
             row = await get_mcp_server(
                 session,
                 str(sid),
-                owner_email=executor_config.get("executor_owner_email") if executor_config else None,
+                owner_email=executor_config.get("executor_owner_email")
+                if executor_config
+                else None,
                 include_shared=True,
             )
             if row is None:

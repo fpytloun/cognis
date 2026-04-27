@@ -413,7 +413,11 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
     from cognis.store.queries import get_setting_value
 
     async with request.app.state.session_factory() as session:
-        backend = await get_setting_value(session, "web.backend", "direct")
+        legacy_backend = await get_setting_value(session, "web.backend", "direct")
+        search_backend = await get_setting_value(session, "web.search_backend", legacy_backend)
+        fetch_backend = await get_setting_value(session, "web.fetch_backend", legacy_backend)
+        fetch_fallback = await get_setting_value(session, "web.fetch_fallback_browser", True)
+        searxng_url = await get_setting_value(session, "web.searxng_url", "")
 
     tavily_configured = False
     brave_configured = False
@@ -431,17 +435,34 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
             except Exception:
                 pass  # Provider error — treat as not configured
 
-    available = ["direct"]
+    searxng_configured = bool(isinstance(searxng_url, str) and searxng_url.strip())
+
+    available_search = ["direct"]
     if tavily_configured:
-        available.append("tavily")
+        available_search.append("tavily")
     if brave_configured:
-        available.append("brave")
+        available_search.append("brave")
+    if searxng_configured:
+        available_search.append("searxng")
+
+    available_fetch = ["direct", "browser"]
+    if tavily_configured:
+        available_fetch.insert(1, "tavily")
+
+    available_union = sorted({*available_search, *available_fetch})
 
     return WebConfigStatusResponse(
-        backend=str(backend) if isinstance(backend, str) else "direct",
+        backend=str(legacy_backend) if isinstance(legacy_backend, str) else "direct",
+        search_backend=(str(search_backend) if isinstance(search_backend, str) else "direct"),
+        fetch_backend=(str(fetch_backend) if isinstance(fetch_backend, str) else "direct"),
+        fetch_fallback_browser=bool(fetch_fallback) if fetch_fallback is not None else True,
         tavily_configured=tavily_configured,
         brave_configured=brave_configured,
-        available_backends=available,
+        searxng_url=str(searxng_url) if isinstance(searxng_url, str) else "",
+        searxng_configured=searxng_configured,
+        available_backends=available_union,
+        available_search_backends=available_search,
+        available_fetch_backends=available_fetch,
     )
 
 

@@ -112,6 +112,72 @@ For example:
 - `OPENAI_API_KEY` may power provider traffic
 - a stored secret may be injected into a GitHub MCP server or other tool runtime
 
+## Web tool backends
+
+The `Settings -> Web` page configures the search and fetch backends agents
+use through the `web_search`, `web_fetch`, `web_crawl`, `web_map`, and
+`web_research` tools. Search and fetch are independent: each agent's
+`web_search` uses the configured **search backend** and `web_fetch` uses the
+**fetch backend**.
+
+| Backend | Search | Fetch | Notes |
+| --- | --- | --- | --- |
+| `direct` | DuckDuckGo (`ddgs`) | httpx + trafilatura | Free; no API key. The default. |
+| `tavily` | tavily.com | tavily.com | Paid. Also unlocks Tavily-native `web_crawl` / `web_map` / `web_research`. |
+| `brave` | api.search.brave.com | — | Paid. Search-only. |
+| `searxng` | self-hosted SearXNG | — | Free; user runs the SearXNG instance. |
+| `browser` | — | Playwright/Patchright headless | Auto-fallback target for Cloudflare/JS-required pages. |
+
+### Auto-fallback to the headless browser
+
+When the direct fetch backend hits a Cloudflare/5xx/connection error and
+`web.fetch_fallback_browser` is enabled (default `true`), the request is
+automatically retried through the executor's headless browser. The Stage
+A-C stealth stack (patchright, autoconsent, humanizer, fingerprint
+hardening) applies, so the second attempt usually succeeds for the
+common JS-required and Cloudflare-bot-fight cases. Hard cases
+(Cloudflare managed challenge, Turnstile) still fail; the agent should
+treat that as a real signal rather than retrying mechanically.
+
+### `web_crawl` / `web_map` / `web_research` availability
+
+`web_crawl` and `web_map` are available on every executor (W3): when the
+fetch backend is `tavily` they route to Tavily's native engines;
+otherwise an in-tree DIY crawler / sitemap discovery is used. The DIY
+path inherits the auto-browser-fallback so JS-heavy sites still produce
+usable results.
+
+`web_research` is **only exposed when Tavily is configured**. The free
+research path is the agent loop itself: the `cognis-web-research` skill
+(`Settings > Skills`) gives the agent a recipe for diversified
+searches, parallel fetches, and cited synthesis. Frontier models do
+this well without a special tool.
+
+### Running your own SearXNG
+
+cognis does not run SearXNG itself. The simplest setup uses the upstream
+Docker image:
+
+```
+docker run -d --name searxng -p 8888:8080 searxng/searxng
+```
+
+Then set `web.searxng_url` to `http://localhost:8888` (or wherever your
+instance is reachable from the executor). For higher-quality results
+configure a curated engine list in your SearXNG instance (defaults to
+Google + Bing + DuckDuckGo + Mojeek + Qwant). Public community SearXNG
+instances are not recommended for agent fleets — they get rate-limited
+quickly.
+
+### Concurrency
+
+Parallel agent calls share a per-executor concurrency controller with
+configurable global / per-backend / per-host caps and per-backend qps
+limits. Defaults are tuned for free-tier Brave (1 qps), generous for
+direct/tavily, and bounded by the browser session pool for the browser
+backend. Knobs live under `web.concurrency.*` and `web.rate_limit.*` in
+`Settings > Web`.
+
 ## Troubleshooting tips
 
 - Confirm the default model name is valid for the selected provider.

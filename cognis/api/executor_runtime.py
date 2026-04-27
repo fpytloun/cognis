@@ -262,15 +262,15 @@ async def _persist_runtime_state(
         return
     try:
         tool_defs = [
-            ToolDefinition.model_validate(item)
-            for item in observed_tools
-            if isinstance(item, dict)
+            ToolDefinition.model_validate(item) for item in observed_tools if isinstance(item, dict)
         ]
         await queue.enqueue_tools(tool_defs, owner_email=getattr(row, "owner_email", None))
     except Exception:
         _logger.warning(
             "executor_runtime: failed to enqueue tool classifications",
-            extra={"extra_data": {"executor_id": executor_id, "observed_tools": len(observed_tools)}},
+            extra={
+                "extra_data": {"executor_id": executor_id, "observed_tools": len(observed_tools)}
+            },
             exc_info=True,
         )
 
@@ -360,7 +360,27 @@ async def _build_configure_payload(
         "secrets": scoped_secrets,
         "web_config": {
             "web_backend": web_config.get("web_backend", "direct"),
+            "web_search_backend": web_config.get("web_search_backend", "direct"),
+            "web_fetch_backend": web_config.get("web_fetch_backend", "direct"),
+            "web_fetch_fallback_browser": web_config.get("web_fetch_fallback_browser", True),
+            "web_searxng_url": web_config.get("web_searxng_url", ""),
+            "web_searxng_engines": web_config.get("web_searxng_engines", ""),
+            "web_searxng_categories": web_config.get("web_searxng_categories", ""),
+            "web_searxng_language": web_config.get("web_searxng_language", ""),
+            "web_browser_fetch_session_idle_seconds": web_config.get(
+                "web_browser_fetch_session_idle_seconds", 60
+            ),
+            "web_browser_fetch_wait_timeout_seconds": web_config.get(
+                "web_browser_fetch_wait_timeout_seconds", 30
+            ),
+            "web_concurrency": web_config.get("web_concurrency", {}),
             "web_available_backends": web_config.get("web_available_backends", ["direct"]),
+            "web_available_search_backends": web_config.get(
+                "web_available_search_backends", ["direct"]
+            ),
+            "web_available_fetch_backends": web_config.get(
+                "web_available_fetch_backends", ["direct"]
+            ),
         },
         "skill_manifests": skill_manifests,
     }

@@ -158,8 +158,23 @@ import { onMount, tick } from 'svelte';
   let executorConfigs = $state<ExecutorConfig[]>([]);
   let executorTools = $state<ToolDefinitionSummary[]>([]);
   let editingExecutor = $state<ExecutorConfig | null>(null);
-  let webConfig = $state<WebConfigStatus>({ backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] });
+  let webConfig = $state<WebConfigStatus>({
+    backend: 'direct',
+    search_backend: 'direct',
+    fetch_backend: 'direct',
+    fetch_fallback_browser: true,
+    tavily_configured: false,
+    brave_configured: false,
+    searxng_url: '',
+    searxng_configured: false,
+    available_backends: ['direct'],
+    available_search_backends: ['direct'],
+    available_fetch_backends: ['direct'],
+  });
   let webBackendForm = $state('direct');
+  let webSearchBackendForm = $state('direct');
+  let webFetchBackendForm = $state('direct');
+  let webSearxngUrlForm = $state('');
   let webKeySetup = $state<{ backend: string; value: string } | null>(null);
   let showExecutorForm = $state(false);
   let executorForm = $state({ executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false });
@@ -972,9 +987,24 @@ import { onMount, tick } from 'svelte';
     if (isAdmin) {
       webConfig = await api.webConfig.status().catch(() => webConfig);
     } else {
-      webConfig = { backend: 'direct', tavily_configured: false, brave_configured: false, available_backends: ['direct'] };
+      webConfig = {
+        backend: 'direct',
+        search_backend: 'direct',
+        fetch_backend: 'direct',
+        fetch_fallback_browser: true,
+        tavily_configured: false,
+        brave_configured: false,
+        searxng_url: '',
+        searxng_configured: false,
+        available_backends: ['direct'],
+        available_search_backends: ['direct'],
+        available_fetch_backends: ['direct'],
+      };
     }
     webBackendForm = webConfig.backend;
+    webSearchBackendForm = webConfig.search_backend ?? webConfig.backend;
+    webFetchBackendForm = webConfig.fetch_backend ?? webConfig.backend;
+    webSearxngUrlForm = webConfig.searxng_url ?? '';
 
     // Initialize account name form
     accountNameForm = auth.getSnapshot().user?.name ?? '';
@@ -1314,18 +1344,27 @@ import { onMount, tick } from 'svelte';
 
   const WEB_BACKEND_INFO: Record<string, { label: string; description: string; link?: string }> = {
     direct: {
-      label: 'Direct (DuckDuckGo)',
-      description: 'Uses DuckDuckGo for search and direct HTTP for page fetching. Free, no API key needed. DuckDuckGo is community-maintained and may occasionally be unavailable.'
+      label: 'Direct (DuckDuckGo + trafilatura)',
+      description: 'DuckDuckGo for search and httpx + trafilatura for high-quality content extraction. Free, no API key needed. DuckDuckGo is community-maintained and may occasionally be unavailable.'
     },
     tavily: {
       label: 'Tavily',
-      description: 'AI-optimized search with answer generation, content extraction, website crawling, and deep research. Unlocks web_crawl, web_map, and web_research tools.',
+      description: 'AI-optimized search and extract with answer generation, content reranking, website crawling, and deep research. When chosen for fetch, also unlocks Tavily-native web_crawl/web_map/web_research.',
       link: 'https://tavily.com'
     },
     brave: {
       label: 'Brave Search',
-      description: 'Search from Brave\'s index with freshness filters, extra snippets, and country targeting. Search only \u2014 page fetching uses direct HTTP.',
+      description: 'Search from Brave\'s index with freshness filters, extra snippets, and country targeting. Search-only.',
       link: 'https://brave.com/search/api/'
+    },
+    searxng: {
+      label: 'SearXNG (self-hosted)',
+      description: 'Free metasearch aggregator that federates Google, Bing, DuckDuckGo, Mojeek, Qwant and others. Configure the instance URL below — cognis does not run SearXNG itself.',
+      link: 'https://searxng.org/'
+    },
+    browser: {
+      label: 'Headless browser',
+      description: 'Playwright/Patchright headless fetch — used as the auto-fallback for Cloudflare/JS-required sites. Honours the executor\'s stealth stack (UA, autoconsent, fingerprint hardening).'
     }
   };
 
@@ -1334,7 +1373,13 @@ import { onMount, tick } from 'svelte';
     error = '';
     try {
       await api.settings.update('web.backend', webBackendForm);
+      await api.settings.update('web.search_backend', webSearchBackendForm);
+      await api.settings.update('web.fetch_backend', webFetchBackendForm);
+      await api.settings.update('web.searxng_url', webSearxngUrlForm.trim());
       webConfig = await api.webConfig.status();
+      webSearchBackendForm = webConfig.search_backend ?? 'direct';
+      webFetchBackendForm = webConfig.fetch_backend ?? 'direct';
+      webSearxngUrlForm = webConfig.searxng_url ?? '';
       notice = 'Web backend updated.';
       addToast('Web backend updated.', 'success');
       initialSnapshot = snapshotState();
@@ -2166,26 +2211,41 @@ import { onMount, tick } from 'svelte';
       </div>
     {:else if activeTab === 'web'}
       <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
-        <!-- Left: backend selector -->
+        <!-- Left: split search + fetch backend selectors -->
         <Card class="p-5">
           <div class="space-y-4">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Web search</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Default backend</h2>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Web tools</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Search and fetch backends</h2>
             </div>
             <p class="text-sm leading-6 text-slate-400">
-              Configure how agents search and fetch web content. The default backend is used unless the agent overrides it per-call.
+              Search and fetch are independent. Each agent's <code>web_search</code> uses the search backend; <code>web_fetch</code> uses the fetch backend with auto-fallback to the headless browser on Cloudflare/JS-required errors.
             </p>
             <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>Backend</span>
-              <select bind:value={webBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <span>Search backend</span>
+              <select bind:value={webSearchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="direct">{WEB_BACKEND_INFO.direct.label}</option>
                 <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
                 <option value="brave" disabled={!webConfig.brave_configured}>{WEB_BACKEND_INFO.brave.label}{webConfig.brave_configured ? '' : ' (not configured)'}</option>
+                <option value="searxng" disabled={!webConfig.searxng_configured}>{WEB_BACKEND_INFO.searxng.label}{webConfig.searxng_configured ? '' : ' (URL not set)'}</option>
               </select>
             </label>
-            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webBackendForm]?.description ?? ''}</p>
-            <Button class="w-full justify-center" onclick={saveWebBackend} disabled={!isAdmin || busy || webBackendForm === webConfig.backend}>Save backend</Button>
+            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webSearchBackendForm]?.description ?? ''}</p>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Fetch backend</span>
+              <select bind:value={webFetchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="direct">{WEB_BACKEND_INFO.direct.label}</option>
+                <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
+                <option value="browser">{WEB_BACKEND_INFO.browser.label}</option>
+              </select>
+            </label>
+            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webFetchBackendForm]?.description ?? ''}</p>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>SearXNG instance URL (search backend = searxng)</span>
+              <Input bind:value={webSearxngUrlForm} placeholder="http://localhost:8888" />
+              <span class="block text-xs text-slate-500">Run your own SearXNG (e.g. <code>docker run -p 8888:8080 searxng/searxng</code>) and point cognis at it. cognis does not orchestrate SearXNG itself.</span>
+            </label>
+            <Button class="w-full justify-center" onclick={saveWebBackend} disabled={!isAdmin || busy}>Save</Button>
           </div>
         </Card>
 

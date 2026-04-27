@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 from typing import Any
 
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.web.backends import (
+    get_browser_fetch_backend,
     resolve_fetch_backend,
     resolve_search_backend,
 )
 from cognis.tools.executor.web.backends.tavily import TavilyBackend
+from cognis.tools.executor.web.concurrency import (
+    WebConcurrencyController,
+    get_or_create_controller,
+    host_for,
+)
 from cognis.tools.registry import ToolExecutionContext
+
+logger = logging.getLogger(__name__)
+
+# Heuristic markers that indicate the direct backend hit a wall the
+# headless browser fallback can usually clear.
+_BROWSER_FALLBACK_HINT_TOKENS: tuple[str, ...] = (
+    "cloudflare",
+    "circuit breaker",
+    "rate limited (http 429)",
+    "http 403",
+    "http 503",
+    "http 502",
+    "request failed",
+    "request timed out",
+)
 
 _TAVILY_SEARCH_DEPTHS = {"basic", "advanced", "fast", "ultra-fast"}
 _TAVILY_TOPICS = {"general", "news", "finance"}
@@ -59,8 +81,75 @@ def _selected_search_backend(arguments: dict[str, Any], context: ToolExecutionCo
     backend = arguments.get("backend")
     if isinstance(backend, str) and backend:
         return backend
-    configured = context.runtime_metadata.get("web_backend", "direct")
+    configured = context.runtime_metadata.get("web_search_backend") or (
+        context.runtime_metadata.get("web_backend", "direct")
+    )
     return configured if isinstance(configured, str) and configured else "direct"
+
+
+def _backend_label(backend: Any, default: str = "direct") -> str:
+    """Return a short identifier for a resolved backend object."""
+    if backend is None:
+        return default
+    name = type(backend).__name__.lower()
+    if "tavily" in name:
+        return "tavily"
+    if "brave" in name:
+        return "brave"
+    if "searxng" in name:
+        return "searxng"
+    if "browser" in name:
+        return "browser"
+    return default
+
+
+def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
+    """Return True when ``result`` looks like a transient/blocked failure
+    that the headless browser fallback can usually overcome."""
+    if not result.is_error:
+        return False
+    metadata = result.metadata or {}
+    if metadata.get("cloudflare_blocked"):
+        return True
+    output = (result.output or "").lower()
+    return any(token in output for token in _BROWSER_FALLBACK_HINT_TOKENS)
+
+
+def _annotate_browser_fallback(result: ToolResult, *, fallback_used: bool) -> ToolResult:
+    if not fallback_used:
+        return result
+    merged = dict(result.metadata or {})
+    merged["browser_fallback"] = True
+    result.metadata = merged
+    return result
+
+
+def _should_attempt_browser_fallback(
+    *,
+    result: ToolResult,
+    primary_backend_name: str,
+    runtime_metadata: dict[str, Any],
+    user_override: str | None,
+) -> bool:
+    """Decide if we should retry a failed fetch through the browser backend.
+
+    Skips when:
+    * caller explicitly asked for a specific backend,
+    * fallback is disabled via ``web.fetch_fallback_browser`` setting,
+    * we're already on the browser backend,
+    * the failure is not the kind a browser would fix,
+    * no BrowserManager is available on this executor.
+    """
+    if user_override:
+        return False
+    if primary_backend_name == "browser":
+        return False
+    if not _result_is_browser_fallback_candidate(result):
+        return False
+    fallback_setting = runtime_metadata.get("web_fetch_fallback_browser", True)
+    if fallback_setting is False:
+        return False
+    return get_browser_fetch_backend(runtime_metadata) is not None
 
 
 def _normalize_tavily_string_option(
@@ -287,20 +376,92 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
 
     output_format = arguments.get("format", "markdown")
     timeout = arguments.get("timeout", 30)
-    backend_name = arguments.get("backend")
+    user_backend_override = arguments.get("backend")
+    backend_name = (
+        str(user_backend_override).strip().lower()
+        if isinstance(user_backend_override, str)
+        else None
+    )
 
     options = _collect_optional_options(
         arguments,
         ("query", "extract_depth", "chunks_per_source", "include_images"),
     )
 
-    backend = resolve_fetch_backend(context.runtime_metadata, backend_name)
-    return await backend.fetch(
-        url,
+    runtime_metadata = context.runtime_metadata
+    controller = get_or_create_controller(runtime_metadata)
+
+    primary_backend = resolve_fetch_backend(runtime_metadata, backend_name)
+    primary_label = _backend_label(primary_backend)
+
+    timeout_int = int(timeout) if timeout else 30
+    fetch_options = options if options else None
+
+    primary_result = await _run_fetch_with_concurrency(
+        controller=controller,
+        backend=primary_backend,
+        backend_label=primary_label,
+        url=url,
         output_format=output_format,
-        timeout=int(timeout) if timeout else 30,
-        options=options if options else None,
+        timeout=timeout_int,
+        options=fetch_options,
     )
+
+    if not _should_attempt_browser_fallback(
+        result=primary_result,
+        primary_backend_name=primary_label,
+        runtime_metadata=runtime_metadata,
+        user_override=backend_name,
+    ):
+        return primary_result
+
+    browser_backend = get_browser_fetch_backend(runtime_metadata)
+    if browser_backend is None:
+        return primary_result
+
+    logger.info(
+        "web: fetch falling back to browser backend",
+        extra={
+            "extra_data": {
+                "url_host": host_for(url) or "unknown",
+                "primary_backend": primary_label,
+                "primary_error": primary_result.output[:120],
+            }
+        },
+    )
+    fallback_result = await _run_fetch_with_concurrency(
+        controller=controller,
+        backend=browser_backend,
+        backend_label="browser",
+        url=url,
+        output_format=output_format,
+        timeout=timeout_int,
+        options=fetch_options,
+    )
+    if fallback_result.is_error:
+        return fallback_result
+    return _annotate_browser_fallback(fallback_result, fallback_used=True)
+
+
+async def _run_fetch_with_concurrency(
+    *,
+    controller: WebConcurrencyController,
+    backend: Any,
+    backend_label: str,
+    url: str,
+    output_format: str,
+    timeout: int,
+    options: dict[str, Any] | None,
+) -> ToolResult:
+    """Run a single fetch through the controller's concurrency gates."""
+    async with controller.acquire(backend=backend_label, host=host_for(url), op="fetch"):
+        result: ToolResult = await backend.fetch(
+            url,
+            output_format=output_format,
+            timeout=timeout,
+            options=options,
+        )
+        return result
 
 
 async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -355,7 +516,10 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
     query_normalized = False
     retry_attempted = False
 
-    backend = resolve_search_backend(context.runtime_metadata, backend_name)
+    runtime_metadata = context.runtime_metadata
+    controller = get_or_create_controller(runtime_metadata)
+    backend = resolve_search_backend(runtime_metadata, backend_name)
+    backend_label = _backend_label(backend)
     is_tavily_backend = isinstance(backend, TavilyBackend)
     if is_tavily_backend:
         try:
@@ -364,11 +528,12 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             return ToolResult(output=str(exc), is_error=True)
         query_to_run, options, query_normalized = _normalize_tavily_query(query_to_run, options)
 
-    result = await backend.search(
-        query_to_run,
-        num_results=num_results,
-        options=options if options else None,
-    )
+    async with controller.acquire(backend=backend_label, op="search"):
+        result = await backend.search(
+            query_to_run,
+            num_results=num_results,
+            options=options if options else None,
+        )
 
     if is_tavily_backend and _is_empty_search_result(result):
         retry_query = _build_tavily_retry_query(query_to_run)
@@ -377,11 +542,12 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             retry_attempted = True
             if _identifier_like_tokens(retry_query) and "exact_match" not in retry_options:
                 retry_options["exact_match"] = True
-            retry_result = await backend.search(
-                retry_query,
-                num_results=num_results,
-                options=retry_options if retry_options else None,
-            )
+            async with controller.acquire(backend=backend_label, op="search"):
+                retry_result = await backend.search(
+                    retry_query,
+                    num_results=num_results,
+                    options=retry_options if retry_options else None,
+                )
             if not _is_empty_search_result(retry_result):
                 return _merge_result_metadata(
                     retry_result,
@@ -405,11 +571,13 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
 
 
 async def handle_web_crawl(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-    """Crawl a website starting from a URL (requires Tavily backend)."""
-    tavily = _require_tavily(context)
-    if isinstance(tavily, ToolResult):
-        return tavily
+    """Crawl a website starting from a URL.
 
+    Routes to Tavily's native crawler when ``fetch_backend=tavily`` (it
+    delivers significantly better extraction for paying users); otherwise
+    falls back to the in-tree DIY BFS crawler that uses whatever fetch
+    backend is configured (with auto-browser fallback inherited).
+    """
     url = arguments.get("url", "")
     if not url:
         return ToolResult(output="No URL provided.", is_error=True)
@@ -429,18 +597,41 @@ async def handle_web_crawl(arguments: dict[str, Any], context: ToolExecutionCont
             "extract_depth",
             "format",
             "include_images",
+            "timeout",
         ),
     )
 
-    return await tavily.crawl(url, options=options if options else None)
+    runtime_metadata = context.runtime_metadata
+    fetch_backend_name = (
+        runtime_metadata.get("web_fetch_backend") or runtime_metadata.get("web_backend") or "direct"
+    )
+    if fetch_backend_name == "tavily":
+        tavily = _require_tavily(context)
+        if isinstance(tavily, ToolResult):
+            return tavily
+        return await tavily.crawl(url, options=options if options else None)
+
+    from cognis.tools.executor.web.crawler import crawl_site
+
+    fetch_backend = resolve_fetch_backend(runtime_metadata)
+    backend_label = _backend_label(fetch_backend)
+    controller = get_or_create_controller(runtime_metadata)
+    return await crawl_site(
+        url=url,
+        fetch_backend=fetch_backend,
+        backend_label=backend_label,
+        controller=controller,
+        options=options if options else None,
+    )
 
 
 async def handle_web_map(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-    """Map a website's structure (requires Tavily backend)."""
-    tavily = _require_tavily(context)
-    if isinstance(tavily, ToolResult):
-        return tavily
+    """Map a website's URLs.
 
+    Uses Tavily's native mapper when ``fetch_backend=tavily``; otherwise
+    discovers URLs via ``sitemap.xml`` / ``sitemap_index.xml`` and falls
+    back to ``<a href>`` enumeration on the start page.
+    """
     url = arguments.get("url", "")
     if not url:
         return ToolResult(output="No URL provided.", is_error=True)
@@ -461,7 +652,39 @@ async def handle_web_map(arguments: dict[str, Any], context: ToolExecutionContex
         ),
     )
 
-    return await tavily.map_site(url, options=options if options else None)
+    runtime_metadata = context.runtime_metadata
+    fetch_backend_name = (
+        runtime_metadata.get("web_fetch_backend") or runtime_metadata.get("web_backend") or "direct"
+    )
+    if fetch_backend_name == "tavily":
+        tavily = _require_tavily(context)
+        if isinstance(tavily, ToolResult):
+            return tavily
+        return await tavily.map_site(url, options=options if options else None)
+
+    from cognis.tools.executor.web.sitemap import discover_sitemap_urls
+
+    limit = options.get("limit") if isinstance(options.get("limit"), int) else 200
+    same_host_only = not bool(options.get("allow_external"))
+    try:
+        urls, source = await discover_sitemap_urls(
+            url,
+            limit=int(limit) if isinstance(limit, int) else 200,
+            same_host_only=same_host_only,
+        )
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
+
+    if not urls:
+        return ToolResult(
+            output=f"No URLs discovered for {url}.",
+            metadata={"sitemap_source": source},
+        )
+    rendered = "\n".join(urls)
+    return ToolResult(
+        output=f"# URLs discovered ({source})\n\n{rendered}",
+        metadata={"sitemap_source": source, "url_count": len(urls)},
+    )
 
 
 async def handle_web_research(

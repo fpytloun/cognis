@@ -119,10 +119,12 @@ async def fetch_with_retry(
                     return ToolResult(
                         output=(
                             "This site is protected by Cloudflare and requires "
-                            "browser access. Try using the 'tavily' backend instead "
-                            "(configure in Settings > Web)."
+                            "browser access. Retry with backend='browser' (or enable "
+                            "web.fetch_fallback_browser in Settings > Web for "
+                            "automatic fallback)."
                         ),
                         is_error=True,
+                        metadata={"cloudflare_blocked": True},
                     )
 
             if response.status_code >= 500 and attempt < max_retries - 1:
@@ -176,21 +178,48 @@ def html_to_text(html: str) -> str:
     return text
 
 
-def html_to_markdown(html: str) -> str:
-    """Convert HTML to markdown using markdownify."""
-    from markdownify import markdownify  # type: ignore[import-untyped]
+def html_to_markdown(html: str, *, url: str | None = None) -> str:
+    """Convert HTML to markdown.
+
+    Prefers ``trafilatura.extract`` for boilerplate-free output (strips
+    nav/sidebar/ads/footer the way Reader View does). Falls back to
+    ``markdownify`` if trafilatura returns empty (it sometimes does on
+    JSON-rendered or unusual pages) so the agent always gets *something*.
+    """
+    try:
+        import trafilatura
+
+        extracted = trafilatura.extract(
+            html,
+            output_format="markdown",
+            include_links=True,
+            include_tables=True,
+            include_comments=False,
+            include_images=False,
+            url=url,
+            favor_recall=True,
+        )
+        if extracted and extracted.strip():
+            return str(extracted)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "web: trafilatura extraction failed (%s); falling back to markdownify",
+            type(exc).__name__,
+        )
+
+    from markdownify import markdownify
 
     result: str = markdownify(html, heading_style="ATX", strip=["script", "style"])
     return result
 
 
-def convert_html(html: str, output_format: str) -> str:
+def convert_html(html: str, output_format: str, *, url: str | None = None) -> str:
     """Convert HTML to the requested format."""
     if output_format == "html":
         return html
     if output_format == "text":
         return html_to_text(html)
-    return html_to_markdown(html)
+    return html_to_markdown(html, url=url)
 
 
 def format_response(response: httpx.Response, output_format: str) -> str:
@@ -200,5 +229,5 @@ def format_response(response: httpx.Response, output_format: str) -> str:
     raw_text = truncate_content(raw_text)
 
     if "text/html" in content_type:
-        return convert_html(raw_text, output_format)
+        return convert_html(raw_text, output_format, url=str(response.url))
     return raw_text

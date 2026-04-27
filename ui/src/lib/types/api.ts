@@ -1119,9 +1119,16 @@ export interface CredentialMetadata {
 
 export interface WebConfigStatus {
   backend: string;
+  search_backend: string;
+  fetch_backend: string;
+  fetch_fallback_browser: boolean;
   tavily_configured: boolean;
   brave_configured: boolean;
+  searxng_url: string;
+  searxng_configured: boolean;
   available_backends: string[];
+  available_search_backends: string[];
+  available_fetch_backends: string[];
 }
 
 export interface ProviderHealth {

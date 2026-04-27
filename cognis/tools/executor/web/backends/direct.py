@@ -121,7 +121,7 @@ async def _ddg_search(
     import asyncio
 
     def _sync_search() -> list[dict[str, str]]:
-        from ddgs import DDGS  # type: ignore[import-untyped]
+        from ddgs import DDGS
 
         return list(
             DDGS().text(
@@ -138,7 +138,7 @@ async def _ddg_search(
     if not results:
         return ToolResult(output="No search results found.")
 
-    formatted_results = [
+    formatted_results: list[dict[str, object]] = [
         {
             "title": r.get("title", ""),
             "url": r.get("href", r.get("link", "")),

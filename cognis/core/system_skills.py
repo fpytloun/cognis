@@ -278,6 +278,75 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
 - "Inspect this workflow and explain why it loops back to plan."
 """,
     },
+    "cognis-web-research": {
+        "skill_id": "cognis-web-research",
+        "content": """---
+name: Cognis Web Research
+description: Recipe for ad-hoc multi-source web research using web_search and web_fetch.
+tags:
+  - cognis
+  - web
+  - research
+linked_tool_ids:
+  - builtin:web_search
+  - builtin:web_fetch
+  - builtin:web_crawl
+  - builtin:web_map
+---
+
+# Purpose
+
+Use this skill when the user asks for research, fact-checking, deep dives,
+multi-source summaries, or anything else where the answer should be
+synthesised from multiple live web pages rather than from memory.
+
+The free path for research in Cognis is the agent loop itself: call
+`web_search` to discover sources, fetch the best ones via `web_fetch`,
+synthesise the result with citations. The dedicated `web_research` tool
+is only available when the Tavily backend is configured and is preferred
+over this skill for paid users who want a turnkey multi-source report.
+
+# Recipe
+
+1. **Diversify queries.** Run `web_search` with two or three different
+   phrasings of the question (e.g. one with the technical term and one
+   with the colloquial one). Combine results before picking sources.
+2. **Pick a small, varied set of sources.** Aim for 3-7. Prefer primary
+   sources (project docs, official blogs, datasheets, regulators) over
+   aggregators. Avoid stacking three results from the same domain.
+3. **Fetch in parallel.** Issue multiple `web_fetch` calls in the same
+   turn so the executor's concurrency controller can pipeline them.
+4. **Cross-check.** When sources disagree, surface the disagreement;
+   never paper over it. When they agree, you can compress.
+5. **Cite.** Every non-trivial claim in the synthesis should reference
+   the URL it came from. The user can audit. Use markdown links.
+6. **Escalate carefully.** If `web_fetch` returns a Cloudflare-blocked
+   error and `web.fetch_fallback_browser` is enabled, the headless
+   browser fallback already kicked in. If the fallback also fails,
+   suggest the user enable headed mode or pick a different source
+   instead of retrying mechanically.
+7. **Stop at "enough".** Quit when adding another source would be
+   redundant. Five high-quality citations beat fifteen low-quality ones.
+
+# Output Style
+
+- Lead with the direct answer.
+- Follow with the supporting reasoning organised by source.
+- End with a `## Sources` list of `[title](url)` markdown links.
+- Flag confidence (`high` / `medium` / `low`) when the question allows
+  for it.
+
+# Do Not Do
+
+- Do not synthesise without fetching real sources. The whole point is
+  to ground the answer in live web content rather than in memory.
+- Do not fan out hundreds of fetches. The executor caps concurrency
+  for a reason; staying inside the cap keeps page loads fast.
+- Do not call `web_research` when it isn't exposed in your tool list -
+  it requires Tavily and is unavailable on direct/SearXNG-only setups.
+- Do not silently ignore disagreements between sources.
+""",
+    },
 }
 
 

@@ -285,6 +285,8 @@ class BrowserManager:
         auth_state: dict[str, Any] | None = None,
         profile_mode: str = "default",
         profile_id: str | None = None,
+        wait_for_slot: bool = False,
+        wait_timeout_seconds: float = 30.0,
     ) -> BrowserSession:
         await self._cleanup_idle_sessions()
         async with self._lock:
@@ -300,12 +302,11 @@ class BrowserManager:
             url=url,
         )
         self._maybe_emit_patchright_persistent_warning(profile_mode=resolved_mode)
-        async with self._lock:
-            if len(self._sessions) + self._open_in_flight >= self.max_sessions:
-                raise RuntimeError("Browser session limit exceeded")
-            self._open_in_flight += 1
-            if not headless:
-                self._headed_open_in_flight += 1
+        await self._reserve_open_slot(
+            headless=headless,
+            wait_for_slot=wait_for_slot,
+            wait_timeout_seconds=wait_timeout_seconds,
+        )
         try:
             if resolved_mode == "persistent_local":
                 await self._reserve_profile_id(str(resolved_profile_id))
@@ -485,6 +486,47 @@ class BrowserManager:
         ]
         for session_id in stale:
             await self.close_session(session_id)
+
+    async def _reserve_open_slot(
+        self,
+        *,
+        headless: bool,
+        wait_for_slot: bool,
+        wait_timeout_seconds: float,
+    ) -> None:
+        """Reserve a session slot, optionally waiting until one is free.
+
+        ``wait_for_slot=False`` (default) preserves the legacy fast-fail
+        behaviour: if the pool is full the caller gets a ``RuntimeError``
+        immediately. ``wait_for_slot=True`` makes the caller block until a
+        slot becomes available or ``wait_timeout_seconds`` elapses, raising
+        ``TimeoutError`` in the latter case.
+        """
+        if not wait_for_slot:
+            async with self._lock:
+                if len(self._sessions) + self._open_in_flight >= self.max_sessions:
+                    raise RuntimeError("Browser session limit exceeded")
+                self._open_in_flight += 1
+                if not headless:
+                    self._headed_open_in_flight += 1
+            return
+
+        deadline = asyncio.get_running_loop().time() + max(0.0, wait_timeout_seconds)
+        while True:
+            async with self._lock:
+                if len(self._sessions) + self._open_in_flight < self.max_sessions:
+                    self._open_in_flight += 1
+                    if not headless:
+                        self._headed_open_in_flight += 1
+                    return
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for browser session slot (max_sessions={self.max_sessions})"
+                )
+            # Tunable polling interval. ``asyncio.sleep`` cooperates with
+            # other tasks releasing slots via ``close_session``.
+            await asyncio.sleep(min(0.2, max(0.05, deadline - now)))
 
     async def _reserve_profile_id(self, profile_id: str) -> None:
         async with self._lock:

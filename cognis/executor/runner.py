@@ -330,6 +330,10 @@ class ExecutorRunner:
         web_defs = web_tool_definitions(
             web_backends,
             default_backend=web_config_raw.get("web_backend"),
+            available_search_backends=web_config_raw.get("web_available_search_backends"),
+            available_fetch_backends=web_config_raw.get("web_available_fetch_backends"),
+            default_search_backend=web_config_raw.get("web_search_backend"),
+            default_fetch_backend=web_config_raw.get("web_fetch_backend"),
         )
         # Store web runtime metadata for handler context
         runtime_state = "degraded" if mcp_warnings else "active"
@@ -347,7 +351,31 @@ class ExecutorRunner:
                 "lsp_idle_timeout_seconds": effective_lsp_config.idle_timeout_seconds,
                 "lsp_max_concurrent_servers": effective_lsp_config.max_concurrent_servers,
                 "web_backend": web_config_raw.get("web_backend", "direct"),
+                "web_search_backend": web_config_raw.get("web_search_backend", "direct"),
+                "web_fetch_backend": web_config_raw.get("web_fetch_backend", "direct"),
+                "web_fetch_fallback_browser": web_config_raw.get(
+                    "web_fetch_fallback_browser", True
+                ),
+                "web_searxng_url": web_config_raw.get("web_searxng_url", ""),
+                "web_searxng_engines": web_config_raw.get("web_searxng_engines", ""),
+                "web_searxng_categories": web_config_raw.get("web_searxng_categories", ""),
+                "web_searxng_language": web_config_raw.get("web_searxng_language", ""),
+                "web_browser_fetch_session_idle_seconds": web_config_raw.get(
+                    "web_browser_fetch_session_idle_seconds", 60
+                ),
+                "web_browser_fetch_wait_timeout_seconds": web_config_raw.get(
+                    "web_browser_fetch_wait_timeout_seconds", 30
+                ),
+                "web_concurrency": web_config_raw.get("web_concurrency", {}),
                 "web_available_backends": web_backends,
+                "web_available_search_backends": web_config_raw.get(
+                    "web_available_search_backends",
+                    [b for b in web_backends if b != "browser"],
+                ),
+                "web_available_fetch_backends": web_config_raw.get(
+                    "web_available_fetch_backends",
+                    [b for b in web_backends if b not in {"brave", "searxng"}],
+                ),
                 "web_secrets": secrets,
                 "browser": browser_config if isinstance(browser_config, dict) else {},
                 "environment": _build_environment_payload(),
@@ -541,6 +569,7 @@ class ExecutorRunner:
             staging_dir = Path(tempfile.mkdtemp(prefix="cognis_skill_"))
             try:
                 try:
+
                     async def _run() -> str:
                         proc: asyncio.subprocess.Process | None = None
                         async with httpx.AsyncClient(timeout=recipe_timeout) as client:
@@ -571,7 +600,11 @@ class ExecutorRunner:
                                 env[placeholder] = secrets[placeholder]
                         env["SKILL_STAGING_DIR"] = str(staging_dir)
 
-                        cwd = resolve_staged_path(staging_dir, working_dir) if working_dir else staging_dir
+                        cwd = (
+                            resolve_staged_path(staging_dir, working_dir)
+                            if working_dir
+                            else staging_dir
+                        )
 
                         if mode == "script":
                             script_path = resolve_staged_path(staging_dir, entry)
@@ -715,15 +748,15 @@ class ExecutorRunner:
         await self._send_rpc_result(
             ws,
             msg_id,
-                {
-                    "call_id": call_id,
-                    "output": result.output,
-                    "is_error": result.is_error,
-                    "duration_ms": result.duration_ms,
-                    "metadata": result.metadata,
-                    "attachments": result.attachments,
-                },
-            )
+            {
+                "call_id": call_id,
+                "output": result.output,
+                "is_error": result.is_error,
+                "duration_ms": result.duration_ms,
+                "metadata": result.metadata,
+                "attachments": result.attachments,
+            },
+        )
 
     async def _handle_llm_complete(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]

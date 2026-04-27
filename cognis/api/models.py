@@ -159,10 +159,19 @@ class SystemDiagnosticsResponse(BaseModel):
 class WebConfigStatusResponse(BaseModel):
     """Web backend configuration status."""
 
+    # Legacy single-axis backend, retained for back-compat.
     backend: str = "direct"
+    # Split axes: search and fetch are independently configurable.
+    search_backend: str = "direct"
+    fetch_backend: str = "direct"
+    fetch_fallback_browser: bool = True
     tavily_configured: bool = False
     brave_configured: bool = False
+    searxng_url: str = ""
+    searxng_configured: bool = False
     available_backends: list[str] = Field(default_factory=lambda: ["direct"])
+    available_search_backends: list[str] = Field(default_factory=lambda: ["direct"])
+    available_fetch_backends: list[str] = Field(default_factory=lambda: ["direct"])
 
 
 class ConversationContextModel(BaseModel):

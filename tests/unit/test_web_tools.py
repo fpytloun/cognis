@@ -204,13 +204,17 @@ class TestDynamicWebDefinitions:
     def test_direct_only_no_backend_param(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
+        # web_crawl and web_map are now always available (W3 makes them
+        # backend-agnostic). web_research stays Tavily-only.
         defs = web_tool_definitions(["direct"])
         names = {d.name for d in defs}
-        assert names == {"web_fetch", "web_search"}
+        assert names == {"web_fetch", "web_search", "web_crawl", "web_map"}
 
-        for d in defs:
-            props = d.parameters.get("properties", {})
-            assert "backend" not in props, f"{d.name} should not have backend param"
+        # No backend selector is rendered when only one backend is configured.
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        search = next(d for d in defs if d.name == "web_search")
+        assert "backend" not in fetch.parameters.get("properties", {})
+        assert "backend" not in search.parameters.get("properties", {})
 
     def test_direct_only_no_tavily_params(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -225,7 +229,12 @@ class TestDynamicWebDefinitions:
     def test_tavily_adds_backend_and_params(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
+        defs = web_tool_definitions(
+            ["direct", "tavily"],
+            default_backend="tavily",
+            available_search_backends=["direct", "tavily"],
+            available_fetch_backends=["direct", "tavily"],
+        )
         search = next(d for d in defs if d.name == "web_search")
         props = search.parameters.get("properties", {})
         assert "backend" in props
@@ -247,44 +256,66 @@ class TestDynamicWebDefinitions:
     def test_fetch_uses_configured_default_backend_in_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
+        defs = web_tool_definitions(
+            ["direct", "tavily"],
+            default_backend="tavily",
+            available_search_backends=["direct", "tavily"],
+            available_fetch_backends=["direct", "tavily"],
+            default_fetch_backend="tavily",
+        )
         fetch = next(d for d in defs if d.name == "web_fetch")
         props = fetch.parameters.get("properties", {})
         assert "backend" in props
         assert "default: tavily" in props["backend"]["description"]
-        assert "configured default backend is 'tavily'" in fetch.description
 
     def test_invalid_default_backend_falls_back_to_first_available(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "tavily"], default_backend="brave")
+        defs = web_tool_definitions(
+            ["direct", "tavily"],
+            default_backend="brave",
+            available_search_backends=["direct", "tavily"],
+            available_fetch_backends=["direct", "tavily"],
+        )
         fetch = next(d for d in defs if d.name == "web_fetch")
         search = next(d for d in defs if d.name == "web_search")
         fetch_props = fetch.parameters.get("properties", {})
         search_props = search.parameters.get("properties", {})
+        # When the supplied default isn't in either axis, we land on the
+        # first axis-relevant option (direct here).
         assert "default: direct" in fetch_props["backend"]["description"]
         assert "default: direct" in search_props["backend"]["description"]
 
     def test_fetch_brave_default_falls_back_to_direct_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "brave"], default_backend="brave")
+        # Brave is search-only; supplied as a search backend, fetch only has
+        # 'direct' available, so no backend selector renders for fetch.
+        defs = web_tool_definitions(
+            ["direct", "brave"],
+            default_backend="brave",
+            available_search_backends=["direct", "brave"],
+            available_fetch_backends=["direct"],
+        )
         fetch = next(d for d in defs if d.name == "web_fetch")
         props = fetch.parameters.get("properties", {})
-        assert "backend" in props
-        assert props["backend"]["enum"] == ["direct"]
-        assert "default: direct" in props["backend"]["description"]
-        assert "configured default backend is 'direct'" not in fetch.description
+        assert "backend" not in props
 
     def test_tavily_only_tools_included(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
         defs_direct = web_tool_definitions(["direct"])
-        defs_tavily = web_tool_definitions(["direct", "tavily"], default_backend="tavily")
+        defs_tavily = web_tool_definitions(
+            ["direct", "tavily"],
+            default_backend="tavily",
+            available_search_backends=["direct", "tavily"],
+            available_fetch_backends=["direct", "tavily"],
+        )
         names_direct = {d.name for d in defs_direct}
         names_tavily = {d.name for d in defs_tavily}
-        assert "web_crawl" not in names_direct
-        assert "web_map" not in names_direct
+        # Crawl/map are now always available; only research is Tavily-gated.
+        assert "web_crawl" in names_direct
+        assert "web_map" in names_direct
         assert "web_research" not in names_direct
         assert "web_crawl" in names_tavily
         assert "web_map" in names_tavily
@@ -847,20 +878,49 @@ class TestTavilyRequiredTools:
     """Test tools that require Tavily backend."""
 
     @pytest.mark.asyncio()
-    async def test_crawl_without_tavily(self) -> None:
+    async def test_crawl_without_tavily_uses_diy_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without Tavily configured, web_crawl falls through to the in-tree
+        # DIY crawler (W3). It must not raise a "Tavily required" error.
+        from cognis.models.tool import ToolResult
         from cognis.tools.executor.web.handlers import handle_web_crawl
 
-        result = await handle_web_crawl({"url": "https://example.com"}, _DUMMY_CONTEXT)
-        assert result.is_error
-        assert "Tavily" in result.output
+        async def _fake_crawl(**kwargs: object) -> ToolResult:
+            return ToolResult(output="diy ok")
+
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.crawler.crawl_site", _fake_crawl
+        )
+        result = await handle_web_crawl(
+            {"url": "https://example.com"}, _DUMMY_CONTEXT
+        )
+        assert not result.is_error
+        assert "Tavily" not in result.output
 
     @pytest.mark.asyncio()
-    async def test_map_without_tavily(self) -> None:
+    async def test_map_without_tavily_uses_sitemap_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without Tavily configured, web_map falls through to sitemap.xml
+        # discovery (W3). It must not raise a "Tavily required" error.
         from cognis.tools.executor.web.handlers import handle_web_map
 
-        result = await handle_web_map({"url": "https://example.com"}, _DUMMY_CONTEXT)
-        assert result.is_error
-        assert "Tavily" in result.output
+        async def _fake_discover(
+            url: str, *, limit: int = 200, same_host_only: bool = True
+        ) -> tuple[list[str], str]:
+            del limit, same_host_only
+            return ["https://example.com/a"], "sitemap"
+
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.sitemap.discover_sitemap_urls",
+            _fake_discover,
+        )
+        result = await handle_web_map(
+            {"url": "https://example.com"}, _DUMMY_CONTEXT
+        )
+        assert not result.is_error
+        assert "Tavily" not in result.output
 
     @pytest.mark.asyncio()
     async def test_research_without_tavily(self) -> None:
@@ -1133,7 +1193,8 @@ class TestRetryLogic:
             assert isinstance(result, ToolResult)
             assert result.is_error
             assert "Cloudflare" in result.output
-            assert "tavily" in result.output.lower()
+            assert "browser" in result.output.lower()
+            assert result.metadata == {"cloudflare_blocked": True}
 
 
 class TestSettingsSchema:

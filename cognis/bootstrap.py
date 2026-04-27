@@ -58,6 +58,25 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
     "web.backend": ("web", "direct"),
+    "web.search_backend": ("web", "direct"),
+    "web.fetch_backend": ("web", "direct"),
+    "web.fetch_fallback_browser": ("web", True),
+    "web.searxng_url": ("web", ""),
+    "web.searxng_engines": ("web", ""),
+    "web.searxng_categories": ("web", ""),
+    "web.searxng_language": ("web", ""),
+    "web.browser_fetch.session_idle_seconds": ("web", 60),
+    "web.browser_fetch.wait_timeout_seconds": ("web", 30),
+    "web.concurrency.global_cap": ("web", 32),
+    "web.concurrency.per_host_cap": ("web", 4),
+    "web.concurrency.direct_cap": ("web", 16),
+    "web.concurrency.tavily_cap": ("web", 8),
+    "web.concurrency.brave_cap": ("web", 2),
+    "web.concurrency.searxng_cap": ("web", 4),
+    "web.concurrency.browser_cap": ("web", 4),
+    "web.rate_limit.tavily_qps": ("web", 5.0),
+    "web.rate_limit.brave_qps": ("web", 1.0),
+    "web.rate_limit.searxng_qps": ("web", 5.0),
     "executors.allow_in_process": ("executors", True),
     "executors.allow_subprocess": ("executors", True),
 }
@@ -856,7 +875,9 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                     existing.tools,
                     existing.linked_tool_ids,
                     existing.prompt_templates,
-                    steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+                    steps=defaults.get("steps")
+                    if isinstance(defaults.get("steps"), list)
+                    else None,
                 )
                 version_row = await create_skill_version(
                     session,
@@ -868,7 +889,9 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                     linked_tool_ids=existing.linked_tool_ids,
                     prompt_templates=existing.prompt_templates,
                     secret_placeholders=None,
-                    steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+                    steps=defaults.get("steps")
+                    if isinstance(defaults.get("steps"), list)
+                    else None,
                     decomposition_source_hash=None,
                 )
                 await set_current_version(session, existing.skill_id, version_row.version_id)

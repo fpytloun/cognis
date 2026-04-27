@@ -17,52 +17,85 @@ def web_tool_definitions(
     available_backends: list[str],
     *,
     default_backend: str | None = None,
+    available_search_backends: list[str] | None = None,
+    available_fetch_backends: list[str] | None = None,
+    default_search_backend: str | None = None,
+    default_fetch_backend: str | None = None,
 ) -> list[ToolDefinition]:
     """Generate web tool definitions based on configured backends.
 
+    Search and fetch backends are selected independently. The legacy
+    ``available_backends`` list is honoured when the per-axis lists are
+    not supplied (existing callers).
+
     Args:
-        available_backends: List of backend names that are configured
-            and usable (e.g. ``["direct"]`` or ``["direct", "tavily", "brave"]``).
-
-    Returns:
-        Tool definitions with schemas tailored to the available backends.
+        available_backends: Union of search + fetch backends (legacy).
+        available_search_backends: Search-capable backends only.
+        available_fetch_backends: Fetch-capable backends only.
+        default_backend: Legacy single-axis default.
+        default_search_backend: Default for ``web_search``.
+        default_fetch_backend: Default for ``web_fetch``.
     """
-    has_tavily = "tavily" in available_backends
-    has_brave = "brave" in available_backends
-    has_multiple = len(available_backends) > 1
-    resolved_default_backend = default_backend or available_backends[0]
-    if resolved_default_backend not in available_backends:
-        resolved_default_backend = available_backends[0]
+    search_backends = (
+        available_search_backends or [b for b in available_backends if b != "browser"] or ["direct"]
+    )
+    fetch_backends = (
+        available_fetch_backends
+        or [b for b in available_backends if b != "brave" and b != "searxng"]
+        or ["direct"]
+    )
 
-    fetch_default_backend = _resolve_capable_default_backend(
-        resolved_default_backend,
-        [backend for backend in available_backends if backend != "brave"],
+    has_tavily_search = "tavily" in search_backends
+    has_brave_search = "brave" in search_backends
+    has_searxng_search = "searxng" in search_backends
+    has_tavily_fetch = "tavily" in fetch_backends
+    has_browser_fetch = "browser" in fetch_backends
+
+    has_multiple_search = len(search_backends) > 1
+    has_multiple_fetch = len(fetch_backends) > 1
+
+    legacy_default = default_backend or available_backends[0] if available_backends else "direct"
+    if legacy_default not in available_backends and available_backends:
+        legacy_default = available_backends[0]
+
+    resolved_search_default = (
+        default_search_backend
+        or (legacy_default if legacy_default in search_backends else None)
+        or search_backends[0]
+    )
+    resolved_fetch_default = (
+        default_fetch_backend
+        or (legacy_default if legacy_default in fetch_backends else None)
+        or fetch_backends[0]
     )
 
     tools: list[ToolDefinition] = [
         _build_web_fetch(
-            available_backends,
-            has_tavily,
-            has_multiple,
-            default_backend=fetch_default_backend,
+            fetch_backends,
+            has_tavily_fetch,
+            has_browser_fetch,
+            has_multiple_fetch,
+            default_backend=resolved_fetch_default,
         ),
         _build_web_search(
-            available_backends,
-            has_tavily,
-            has_brave,
-            has_multiple,
-            default_backend=resolved_default_backend,
+            search_backends,
+            has_tavily_search,
+            has_brave_search,
+            has_searxng_search,
+            has_multiple_search,
+            default_backend=resolved_search_default,
         ),
+        # Crawl + map are always available — implementation auto-selects
+        # the Tavily-native engine when fetch_backend=tavily, otherwise the
+        # in-tree DIY orchestrator is used.
+        _build_web_crawl(has_tavily_fetch),
+        _build_web_map(has_tavily_fetch),
     ]
 
-    if has_tavily:
-        tools.extend(
-            [
-                _build_web_crawl(),
-                _build_web_map(),
-                _build_web_research(),
-            ]
-        )
+    # web_research stays Tavily-only by design: the agent loop is the
+    # default research path on top of web_search + web_fetch.
+    if has_tavily_search or has_tavily_fetch:
+        tools.append(_build_web_research())
 
     return tools
 
@@ -82,6 +115,7 @@ def _resolve_capable_default_backend(default_backend: str, supported_backends: l
 def _build_web_fetch(
     backends: list[str],
     has_tavily: bool,
+    has_browser: bool,
     has_multiple: bool,
     *,
     default_backend: str,
@@ -97,23 +131,28 @@ def _build_web_fetch(
     }
 
     if has_multiple:
-        fetch_backends = [b for b in backends if b != "brave"]  # brave has no fetch
         properties["backend"] = {
             "type": "string",
-            "enum": fetch_backends,
+            "enum": backends,
             "description": (
                 f"Backend to use (default: {default_backend}). "
                 "Omit this unless you need to override the configured default. "
-                f"{_fetch_backend_hints(fetch_backends)}"
+                f"{_fetch_backend_hints(backends)}"
             ),
         }
 
     desc = "Fetch content from a URL and return it as text or markdown."
+    extras: list[str] = []
     if has_tavily:
-        desc += (
-            f" The configured default backend is '{default_backend}'. "
-            "Use 'tavily' for higher-quality extraction with content reranking when you need to override it."
+        extras.append("Use 'tavily' for higher-quality extraction with content reranking.")
+    if has_browser:
+        extras.append(
+            "Use 'browser' for sites that need JS rendering or are blocked by Cloudflare. "
+            "On Cloudflare/JS errors the direct backend auto-falls-back to the headless "
+            "browser unless web.fetch_fallback_browser is disabled."
         )
+    if extras:
+        desc += " " + " ".join(extras)
 
     return ToolDefinition(
         name="web_fetch",
@@ -135,6 +174,7 @@ def _build_web_search(
     backends: list[str],
     has_tavily: bool,
     has_brave: bool,
+    has_searxng: bool,
     has_multiple: bool,
     *,
     default_backend: str,
@@ -273,7 +313,7 @@ def _build_web_search(
             ),
         }
 
-    desc = _search_description(backends, has_tavily, has_brave)
+    desc = _search_description(backends, has_tavily, has_brave, has_searxng)
 
     return ToolDefinition(
         name="web_search",
@@ -291,13 +331,16 @@ def _build_web_search(
 # ---------------------------------------------------------------------------
 
 
-def _build_web_crawl() -> ToolDefinition:
+def _build_web_crawl(has_tavily_fetch: bool) -> ToolDefinition:
+    desc = (
+        "Crawl a website starting from a URL. Extracts content from pages "
+        "with configurable depth and breadth."
+    )
+    if has_tavily_fetch:
+        desc += " Uses Tavily's native crawler when fetch_backend=tavily; otherwise the in-tree DIY orchestrator."
     return ToolDefinition(
         name="web_crawl",
-        description=(
-            "Crawl a website starting from a URL. Extracts content from pages "
-            "with configurable depth and breadth."
-        ),
+        description=desc,
         parameters={
             "type": "object",
             "properties": {
@@ -333,13 +376,16 @@ def _build_web_crawl() -> ToolDefinition:
     )
 
 
-def _build_web_map() -> ToolDefinition:
+def _build_web_map(has_tavily_fetch: bool) -> ToolDefinition:
+    desc = (
+        "Map a website's structure. Returns a list of URLs found starting "
+        "from the base URL. Useful for discovering site structure before crawling."
+    )
+    if has_tavily_fetch:
+        desc += " Uses Tavily's native mapper when fetch_backend=tavily; otherwise sitemap.xml + first-page link enumeration."
     return ToolDefinition(
         name="web_map",
-        description=(
-            "Map a website's structure. Returns a list of URLs found starting "
-            "from the base URL. Useful for discovering site structure before crawling."
-        ),
+        description=desc,
         parameters={
             "type": "object",
             "properties": {
@@ -404,8 +450,10 @@ def _build_web_research() -> ToolDefinition:
 # ---------------------------------------------------------------------------
 
 
-def _search_description(backends: list[str], has_tavily: bool, has_brave: bool) -> str:
-    if not has_tavily and not has_brave:
+def _search_description(
+    backends: list[str], has_tavily: bool, has_brave: bool, has_searxng: bool
+) -> str:
+    if not has_tavily and not has_brave and not has_searxng:
         return "Search the web using DuckDuckGo. Free, no API key needed."
 
     parts = ["Search the web for information. Backends:"]
@@ -415,6 +463,8 @@ def _search_description(backends: list[str], has_tavily: bool, has_brave: bool) 
         parts.append("'tavily' (AI-optimized, supports answer generation)")
     if has_brave:
         parts.append("'brave' (large index, freshness filters)")
+    if has_searxng:
+        parts.append("'searxng' (self-hosted metasearch aggregator, free)")
     description = " ".join(parts) + "."
     if has_tavily:
         description += (
@@ -430,9 +480,11 @@ def _fetch_backend_hints(backends: list[str]) -> str:
     hints = []
     for b in backends:
         if b == "direct":
-            hints.append("'direct': free httpx fetch")
+            hints.append("'direct': free httpx fetch with trafilatura extraction")
         elif b == "tavily":
             hints.append("'tavily': higher quality extraction")
+        elif b == "browser":
+            hints.append("'browser': headless Playwright for JS/Cloudflare-blocked sites")
     return ", ".join(hints) + "." if hints else ""
 
 
@@ -445,4 +497,6 @@ def _search_backend_hints(backends: list[str]) -> str:
             hints.append("'tavily': AI-optimized search")
         elif b == "brave":
             hints.append("'brave': large web index")
+        elif b == "searxng":
+            hints.append("'searxng': self-hosted metasearch")
     return ", ".join(hints) + "." if hints else ""

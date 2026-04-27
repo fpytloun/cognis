@@ -11,10 +11,21 @@ _POSITIVE_INT_KEYS = {
     "security.api_write_requests_per_minute",
     "session.step_timeout_seconds",
     "evaluator.timeout_ms",
+    "web.concurrency.global_cap",
+    "web.concurrency.per_host_cap",
+    "web.concurrency.direct_cap",
+    "web.concurrency.tavily_cap",
+    "web.concurrency.brave_cap",
+    "web.concurrency.searxng_cap",
+    "web.concurrency.browser_cap",
+    "web.browser_fetch.session_idle_seconds",
+    "web.browser_fetch.wait_timeout_seconds",
 }
 
 _ENUM_KEYS: dict[str, set[str]] = {
-    "web.backend": {"direct", "tavily", "brave"},
+    "web.backend": {"direct", "tavily", "brave", "searxng"},
+    "web.search_backend": {"direct", "tavily", "brave", "searxng"},
+    "web.fetch_backend": {"direct", "tavily", "browser"},
 }
 
 

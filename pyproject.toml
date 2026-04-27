@@ -48,6 +48,8 @@ dependencies = [
     "playwright-stealth>=2.0.0",
     "patchright>=1.55.0",
     "pywebpush>=2.0.0",
+    "trafilatura>=2.0.0",
+    "aiolimiter>=1.2.1",
 ]
 
 [project.optional-dependencies]
