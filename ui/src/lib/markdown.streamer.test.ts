@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { createMarkdownStreamer } from './markdown';
 
 describe('createMarkdownStreamer', () => {
+  const preCount = (html: string) => html.match(/<pre\b/g)?.length ?? 0;
+
   it('renders empty string for empty input', () => {
     const s = createMarkdownStreamer();
     expect(s.render('')).toBe('');
@@ -46,6 +48,26 @@ describe('createMarkdownStreamer', () => {
     const closed = intermediate + '```\n\nFollow-up.';
     const html2 = s.finalize(closed);
     expect(html2).toContain('Follow-up.');
+  });
+
+  it('does not close an outer streaming fence on an inner language fence opener', () => {
+    const s = createMarkdownStreamer();
+    const html = s.render(
+      [
+        '```text',
+        'Task: Keep all following content inside this block.',
+        '',
+        '```json',
+        '{"value": 1}',
+        '```',
+        '',
+        'Still part of the outer text block.',
+      ].join('\n')
+    );
+
+    expect(preCount(html)).toBe(1);
+    expect(html).toContain('Still part of the outer text block.');
+    expect(html).not.toContain('<p>Still part of the outer text block.</p>');
   });
 
   it('reset() drops the cache so next render parses fresh', () => {

@@ -8,6 +8,103 @@ marked.setOptions({
 
 const forbiddenAttributes = ['onerror', 'onclick', 'onload', 'onmouseover'];
 const forbiddenTags = ['iframe', 'script', 'style'];
+const genericEnclosingFenceLanguages = new Set(['', 'md', 'markdown', 'plain', 'plaintext', 'text', 'txt']);
+
+interface FenceLine {
+  indent: string;
+  char: '`' | '~';
+  length: number;
+  suffix: string;
+}
+
+function parseFenceOpener(line: string): FenceLine | null {
+  const match = line.match(/^([ \t]{0,3})(`{3,}|~{3,})(.*)$/);
+  if (!match) return null;
+
+  const marker = match[2];
+  const char = marker[0] as '`' | '~';
+  const suffix = match[3] ?? '';
+  if (char === '`' && suffix.includes('`')) return null;
+
+  return {
+    indent: match[1],
+    char,
+    length: marker.length,
+    suffix,
+  };
+}
+
+function parseClosingFence(line: string, char: '`' | '~', minLength: number): FenceLine | null {
+  const match = line.match(/^([ \t]{0,3})(`{3,}|~{3,})[ \t]*$/);
+  if (!match) return null;
+
+  const marker = match[2];
+  if (marker[0] !== char || marker.length < minLength) return null;
+
+  return {
+    indent: match[1],
+    char,
+    length: marker.length,
+    suffix: '',
+  };
+}
+
+function fenceLanguage(fence: FenceLine): string {
+  return fence.suffix.trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+}
+
+function leadingFenceRunLength(line: string, char: '`' | '~'): number {
+  const match = line.match(/^([ \t]{0,3})(`{3,}|~{3,})/);
+  if (!match || match[2][0] !== char) return 0;
+  return match[2].length;
+}
+
+function normalizeEnclosingFence(markdown: string): string {
+  if (!markdown.includes('```') && !markdown.includes('~~~')) return markdown;
+
+  const lines = markdown.split('\n');
+  const firstLineIndex = lines.findIndex((line) => line.trim() !== '');
+  if (firstLineIndex === -1) return markdown;
+
+  let lastLineIndex = lines.length - 1;
+  while (lastLineIndex >= firstLineIndex && lines[lastLineIndex].trim() === '') {
+    lastLineIndex -= 1;
+  }
+
+  const opener = parseFenceOpener(lines[firstLineIndex]);
+  if (!opener) return markdown;
+
+  if (!genericEnclosingFenceLanguages.has(fenceLanguage(opener))) return markdown;
+
+  let maxInnerFenceLength = 0;
+  let hasNestedLanguageFence = false;
+  for (let i = firstLineIndex + 1; i < lastLineIndex; i += 1) {
+    maxInnerFenceLength = Math.max(maxInnerFenceLength, leadingFenceRunLength(lines[i], opener.char));
+    const nestedOpener = parseFenceOpener(lines[i]);
+    if (
+      nestedOpener
+      && nestedOpener.char === opener.char
+      && nestedOpener.length >= opener.length
+      && fenceLanguage(nestedOpener) !== ''
+    ) {
+      hasNestedLanguageFence = true;
+    }
+  }
+
+  if (maxInnerFenceLength < opener.length) return markdown;
+
+  const closer = parseClosingFence(lines[lastLineIndex], opener.char, opener.length);
+  if (!closer && !hasNestedLanguageFence) return markdown;
+
+  const normalizedLength = Math.max(opener.length, closer?.length ?? 0, maxInnerFenceLength) + 1;
+  const normalizedMarker = opener.char.repeat(normalizedLength);
+  lines[firstLineIndex] = `${opener.indent}${normalizedMarker}${opener.suffix}`;
+  if (closer) {
+    lines[lastLineIndex] = `${closer.indent}${normalizedMarker}`;
+  }
+
+  return lines.join('\n');
+}
 
 function isOutgoingHref(href: string | null | undefined): boolean {
   if (!href) return false;
@@ -53,7 +150,7 @@ export function sanitizeHtml(html: string): string {
 }
 
 export function renderMarkdown(markdown: string): string {
-  const parsed = marked.parse(markdown, { async: false, renderer: createLinkRenderer() });
+  const parsed = marked.parse(normalizeEnclosingFence(markdown), { async: false, renderer: createLinkRenderer() });
   return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
 }
 
@@ -69,7 +166,7 @@ function createDocsRenderer(): Renderer {
 }
 
 export function renderDocsMarkdown(markdown: string): string {
-  const parsed = marked.parse(markdown, {
+  const parsed = marked.parse(normalizeEnclosingFence(markdown), {
     async: false,
     renderer: createDocsRenderer()
   });
@@ -105,10 +202,11 @@ export function createMarkdownStreamer(): MarkdownStreamer {
   function splitBlocks(text: string): { stable: string[]; tail: string } {
     // Walk chars and keep track of fenced code state so we don't split mid-fence.
     const blocks: string[] = [];
-    let start = 0;
-    let i = 0;
     let inFence = false;
-    let fenceMarker = '';
+    let fenceChar: '`' | '~' = '`';
+    let fenceLength = 0;
+    let fenceAllowsNestedFallback = false;
+    let nestedFenceDepth = 0;
 
     const lines = text.split('\n');
     let charIdx = 0;
@@ -116,14 +214,27 @@ export function createMarkdownStreamer(): MarkdownStreamer {
 
     for (let li = 0; li < lines.length; li++) {
       const line = lines[li];
-      const fenceMatch = line.match(/^(```+|~~~+)/);
-      if (fenceMatch) {
-        if (!inFence) {
+      if (!inFence) {
+        const opener = parseFenceOpener(line);
+        if (opener) {
           inFence = true;
-          fenceMarker = fenceMatch[1];
-        } else if (line.startsWith(fenceMarker)) {
+          fenceChar = opener.char;
+          fenceLength = opener.length;
+          fenceAllowsNestedFallback = genericEnclosingFenceLanguages.has(fenceLanguage(opener));
+          nestedFenceDepth = 0;
+        }
+      } else if (parseClosingFence(line, fenceChar, fenceLength)) {
+        if (nestedFenceDepth > 0) {
+          nestedFenceDepth -= 1;
+        } else {
           inFence = false;
-          fenceMarker = '';
+          fenceLength = 0;
+          fenceAllowsNestedFallback = false;
+        }
+      } else if (fenceAllowsNestedFallback) {
+        const nestedOpener = parseFenceOpener(line);
+        if (nestedOpener && nestedOpener.char === fenceChar && nestedOpener.length >= fenceLength) {
+          nestedFenceDepth += 1;
         }
       }
       const isBlockBreak = !inFence && line.trim() === '';
@@ -133,7 +244,6 @@ export function createMarkdownStreamer(): MarkdownStreamer {
         blockStart = charIdx + line.length + 1;
       }
       charIdx += line.length + 1;
-      i = li;
     }
 
     // Anything after the last block break is the tail. If we're not in a
@@ -144,7 +254,7 @@ export function createMarkdownStreamer(): MarkdownStreamer {
   }
 
   function parseSanitize(chunk: string): string {
-    const parsed = marked.parse(chunk, { async: false, renderer: createLinkRenderer() });
+    const parsed = marked.parse(normalizeEnclosingFence(chunk), { async: false, renderer: createLinkRenderer() });
     return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
   }
 
