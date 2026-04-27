@@ -184,6 +184,8 @@ class WebSocketTurnObserver:
         message_id: str,
         turn_id: str | None,
         delta: str,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         await self._manager.send_to_conversation(
             conversation_id,
@@ -194,7 +196,8 @@ class WebSocketTurnObserver:
                 "message_id": message_id,
                 "turn_id": turn_id,
                 "content": delta,
-                "index": 0,
+                "index": chunk_index if chunk_index is not None else 0,
+                "content_offset": content_offset if content_offset is not None else 0,
             },
         )
 
@@ -815,6 +818,16 @@ class WebSocketConnectionManager:
                     "reason": "controller_restart",
                 }
             )
+
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if turn_scheduler is not None:
+            for snapshot in await turn_scheduler.active_stream_snapshots(conversation_id):
+                await connection.send_json(
+                    {
+                        "type": "assistant_stream_snapshot",
+                        **snapshot,
+                    }
+                )
 
         await connection.send_json(
             {

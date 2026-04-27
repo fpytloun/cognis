@@ -16,10 +16,12 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
+    ActiveStreamSnapshotResponse,
     AgentGrantResponse,
     AgentResponse,
     DeliverableResponse,
     EffectiveToolItemResponse,
+    MessageHistoryResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
@@ -131,6 +133,27 @@ def test_deliverable_response_round_trip() -> None:
 
     assert response.outputs == {"tests": "passed"}
     assert response.status == "approved"
+
+
+def test_message_history_response_round_trips_active_streams() -> None:
+    response = MessageHistoryResponse(
+        items=[],
+        active_streams=[
+            ActiveStreamSnapshotResponse(
+                conversation_id="conv-1",
+                session_id="sess-1",
+                message_id="turn-1",
+                turn_id="turn-1",
+                content="partial assistant text",
+                chunk_count=3,
+                content_offset=22,
+                updated_at="2026-04-20T00:00:00Z",
+            )
+        ],
+    )
+
+    assert response.active_streams[0].content == "partial assistant text"
+    assert response.active_streams[0].chunk_count == 3
 
 
 def test_agent_response_round_trips_sharing_fields() -> None:

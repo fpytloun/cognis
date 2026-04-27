@@ -132,10 +132,22 @@ export interface AttachmentRef {
   url?: string | null;
 }
 
+export interface ActiveStreamSnapshot {
+  conversation_id: string;
+  session_id: string;
+  message_id: string;
+  turn_id?: string | null;
+  content: string;
+  chunk_count: number;
+  content_offset: number;
+  updated_at?: string | null;
+}
+
 export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;
   has_more: boolean;
+  active_streams?: ActiveStreamSnapshot[];
   active_session_id?: string | null;
   active_session_last_seq?: number;
   history_truncated?: boolean;
@@ -1218,6 +1230,11 @@ export interface WebSocketChunkEvent {
   turn_id?: string | null;
   content: string;
   index: number;
+  content_offset?: number;
+}
+
+export interface WebSocketAssistantStreamSnapshotEvent extends ActiveStreamSnapshot {
+  type: 'assistant_stream_snapshot';
 }
 
 export interface WebSocketChunkGapEvent {
@@ -1563,6 +1580,7 @@ export interface WebSocketUserMessageEvent {
 export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
+  | WebSocketAssistantStreamSnapshotEvent
   | WebSocketChunkGapEvent
   | WebSocketTurnStartedEvent
   | WebSocketTurnSettledEvent

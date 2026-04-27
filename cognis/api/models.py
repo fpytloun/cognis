@@ -221,10 +221,22 @@ class MessageEventResponse(BaseModel):
     timestamp: str | None = None
 
 
+class ActiveStreamSnapshotResponse(BaseModel):
+    conversation_id: str
+    session_id: str
+    message_id: str
+    turn_id: str | None = None
+    content: str
+    chunk_count: int = 0
+    content_offset: int = 0
+    updated_at: str | None = None
+
+
 class MessageHistoryResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
     has_more: bool = False
+    active_streams: list[ActiveStreamSnapshotResponse] = Field(default_factory=list)
     active_session_id: str | None = Field(
         default=None,
         description="Active session identifier for switching the client from lineage bootstrap to active-session replay.",

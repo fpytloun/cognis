@@ -84,6 +84,8 @@ class SSETurnObserver:
         message_id: str,
         turn_id: str | None,
         delta: str,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -96,6 +98,8 @@ class SSETurnObserver:
                     "message_id": message_id,
                     "turn_id": turn_id,
                     "delta": delta,
+                    "index": chunk_index if chunk_index is not None else 0,
+                    "content_offset": content_offset if content_offset is not None else 0,
                 },
             }
         )

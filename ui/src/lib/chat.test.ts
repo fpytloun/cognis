@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   annotateStepRequestInputWithNotification,
+  applyActiveStreamSnapshots,
   appendOptimisticUserMessage,
   applyWebSocketEvent,
   findPendingStepRequestInputCall,
@@ -159,6 +160,208 @@ describe('chat timeline helpers', () => {
       seq: 5,
       streaming: false,
     });
+  });
+
+  it('hydrates an active assistant stream snapshot after history reload', () => {
+    const history = normalizeHistory([
+      {
+        seq: 1,
+        type: 'user_message',
+        data: { content: 'hello', turn_id: 'turn_live' },
+        timestamp: '2026-04-20T00:00:00Z'
+      }
+    ]);
+
+    const hydrated = applyActiveStreamSnapshots(history, [
+      {
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_live',
+        turn_id: 'turn_live',
+        content: 'Already streamed',
+        chunk_count: 2,
+        content_offset: 16,
+        updated_at: '2026-04-20T00:00:01Z'
+      }
+    ]);
+
+    const continued = applyWebSocketEvent(hydrated, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_live',
+      turn_id: 'turn_live',
+      content: ' and new',
+      index: 2,
+      content_offset: 16
+    });
+
+    expect(continued[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'Already streamed and new',
+      streaming: true,
+    });
+  });
+
+  it('ignores duplicate chunks by content offset and chunk index', () => {
+    const first = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_dup',
+      turn_id: 'turn_dup',
+      content: 'Hello',
+      index: 0,
+      content_offset: 0
+    });
+
+    const duplicate = applyWebSocketEvent(first, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_dup',
+      turn_id: 'turn_dup',
+      content: 'Hello',
+      index: 0,
+      content_offset: 0
+    });
+
+    expect(duplicate[0]).toMatchObject({ content: 'Hello' });
+  });
+
+  it('ignores stale stream snapshots that arrive after newer chunks', () => {
+    const streamed = [
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_stale',
+        turn_id: 'turn_stale',
+        content: 'Hello',
+        index: 0,
+        content_offset: 0
+      },
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_stale',
+        turn_id: 'turn_stale',
+        content: ' world',
+        index: 1,
+        content_offset: 5
+      }
+    ].reduce((items, event) => applyWebSocketEvent(items, event), [] as ReturnType<typeof normalizeHistory>);
+
+    const afterSnapshot = applyWebSocketEvent(streamed, {
+      type: 'assistant_stream_snapshot',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_stale',
+      turn_id: 'turn_stale',
+      content: 'Hello',
+      chunk_count: 1,
+      content_offset: 5,
+      updated_at: '2026-04-20T00:00:01Z'
+    });
+
+    expect(afterSnapshot[0]).toMatchObject({ content: 'Hello world' });
+  });
+
+  it('buffers ahead-of-offset chunks until a snapshot fills the prefix', () => {
+    const ahead = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_gap',
+      turn_id: 'turn_gap',
+      content: ' world',
+      index: 1,
+      content_offset: 5
+    });
+
+    expect(ahead).toHaveLength(0);
+
+    const recovered = applyWebSocketEvent(ahead, {
+      type: 'assistant_stream_snapshot',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_gap',
+      turn_id: 'turn_gap',
+      content: 'Hello',
+      chunk_count: 1,
+      content_offset: 5,
+      updated_at: '2026-04-20T00:00:01Z'
+    });
+
+    expect(recovered[0]).toMatchObject({ content: 'Hello world', streaming: true });
+  });
+
+  it('buffers out-of-order chunks after a stream has started', () => {
+    const first = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_out_of_order',
+      turn_id: 'turn_out_of_order',
+      content: 'Hello',
+      index: 0,
+      content_offset: 0
+    });
+
+    const ahead = applyWebSocketEvent(first, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_out_of_order',
+      turn_id: 'turn_out_of_order',
+      content: ' again',
+      index: 2,
+      content_offset: 11
+    });
+
+    expect(ahead[0]).toMatchObject({ content: 'Hello' });
+
+    const filled = applyWebSocketEvent(ahead, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'turn_out_of_order',
+      turn_id: 'turn_out_of_order',
+      content: ' world',
+      index: 1,
+      content_offset: 5
+    });
+
+    expect(filled[0]).toMatchObject({ content: 'Hello world again', streaming: true });
+  });
+
+  it('finalizes a streamed assistant segment when a tool call starts', () => {
+    const timeline = [
+      {
+        type: 'chunk' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        message_id: 'turn_tool_boundary',
+        turn_id: 'turn_tool_boundary',
+        content: 'Checking',
+        index: 0,
+        content_offset: 0
+      },
+      {
+        type: 'tool_call' as const,
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_boundary',
+        tool_name: 'read_file',
+        status: 'started',
+        turn_id: 'turn_tool_boundary'
+      }
+    ].reduce((items, event) => applyWebSocketEvent(items, event), [] as ReturnType<typeof normalizeHistory>);
+
+    expect(timeline[0]).toMatchObject({ kind: 'message', content: 'Checking', streaming: false });
+    expect(timeline[1]).toMatchObject({ kind: 'tool_call', callId: 'call_boundary' });
   });
 
   it('keeps attachment-only assistant messages in normalized history', () => {

@@ -129,6 +129,12 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
     return attachment_placeholder_text(attachment.kind for attachment in attachments)
 
 
+def _utf16_code_units(value: str) -> int:
+    """Return the string length in JavaScript-compatible UTF-16 code units."""
+
+    return len(value.encode("utf-16-le")) // 2
+
+
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -165,6 +171,31 @@ class TurnResult:
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
     attachments: list[dict[str, Any]] | None = None
+
+
+@dataclass(slots=True)
+class ActiveStreamState:
+    """Volatile snapshot of the currently unpersisted assistant stream."""
+
+    conversation_id: str
+    session_id: str
+    message_id: str
+    turn_id: str | None
+    content: str = ""
+    chunk_count: int = 0
+    updated_at: datetime = field(default_factory=_utcnow)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
+            "message_id": self.message_id,
+            "turn_id": self.turn_id,
+            "content": self.content,
+            "chunk_count": self.chunk_count,
+            "content_offset": _utf16_code_units(self.content),
+            "updated_at": self.updated_at.isoformat(),
+        }
 
 
 @dataclass(slots=True)
@@ -227,6 +258,8 @@ class TurnObserver(Protocol):
         message_id: str,
         turn_id: str | None,
         delta: str,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None: ...
 
     async def on_tool_call(
@@ -330,6 +363,8 @@ class TurnScheduler:
         self._escalation_notice_pause_ids: dict[str, str] = {}
         self._pending_follow_ups: set[tuple[str, str]] = set()
         self._handled_follow_ups: dict[tuple[str, str], float] = {}
+        self._active_streams: dict[str, ActiveStreamState] = {}
+        self._active_streams_lock = asyncio.Lock()
 
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
@@ -378,6 +413,57 @@ class TurnScheduler:
                 empty_keys.append(cid)
         for cid in empty_keys:
             del self._observers[cid]
+
+    async def active_stream_snapshots(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Return volatile in-flight assistant stream snapshots for a conversation."""
+
+        async with self._active_streams_lock:
+            snapshot = self._active_streams.get(conversation_id)
+            if snapshot is None or not snapshot.content:
+                return []
+            return [snapshot.snapshot()]
+
+    async def _append_active_stream_chunk(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        turn_id: str | None,
+        delta: str,
+    ) -> tuple[int, int]:
+        """Append a live token to the volatile stream snapshot.
+
+        Returns the zero-based chunk index and starting content offset for the
+        chunk. Transport clients use these values to make chunk application
+        idempotent across reconnects and foreground reconciliation.
+        """
+
+        async with self._active_streams_lock:
+            stream = self._active_streams.get(conversation_id)
+            if (
+                stream is None
+                or stream.session_id != session_id
+                or stream.message_id != message_id
+                or stream.turn_id != turn_id
+            ):
+                stream = ActiveStreamState(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                )
+                self._active_streams[conversation_id] = stream
+            index = stream.chunk_count
+            offset = _utf16_code_units(stream.content)
+            stream.content += delta
+            stream.chunk_count += 1
+            stream.updated_at = _utcnow()
+            return index, offset
+
+    async def _reset_active_stream(self, conversation_id: str) -> None:
+        async with self._active_streams_lock:
+            self._active_streams.pop(conversation_id, None)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1615,6 +1701,13 @@ class TurnScheduler:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
+            chunk_index, content_offset = await self._append_active_stream_chunk(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                message_id=message_id,
+                turn_id=turn_id,
+                delta=delta,
+            )
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -1626,6 +1719,8 @@ class TurnScheduler:
                         message_id,
                         turn_id,
                         delta,
+                        chunk_index,
+                        content_offset,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1667,6 +1762,7 @@ class TurnScheduler:
             call_id: str,
             arguments: dict[str, Any] | None = None,
         ) -> None:
+            await self._reset_active_stream(conversation_id)
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -1777,6 +1873,7 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
+        await self._reset_active_stream(result.conversation_id)
         await asyncio.gather(
             *(
                 self._call_observer(
@@ -1831,6 +1928,7 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
+        await self._reset_active_stream(conversation_id)
         await asyncio.gather(
             *(
                 self._call_observer(

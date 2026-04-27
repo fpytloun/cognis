@@ -825,6 +825,8 @@ class ChannelTurnObserver:
         message_id: str,
         turn_id: str | None,
         delta: str,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         """Accumulate tokens and send typing indicator."""
         self._turn_active = True

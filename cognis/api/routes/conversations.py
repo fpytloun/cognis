@@ -442,6 +442,12 @@ async def conversation_messages(
         has_more = False
 
     await _hydrate_event_attachments(request, all_events, conversation_id=conversation_id)
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    active_streams = (
+        await turn_scheduler.active_stream_snapshots(conversation_id)
+        if turn_scheduler is not None
+        else []
+    )
 
     return MessageHistoryResponse(
         items=serialize_event_rows(
@@ -454,6 +460,7 @@ async def conversation_messages(
         ),
         last_seq=last_seq_value,
         has_more=has_more,
+        active_streams=active_streams,
         active_session_id=active_session_id,
         active_session_last_seq=active_session_last_seq,
         history_truncated=history_truncated,

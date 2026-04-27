@@ -73,10 +73,11 @@ import X from 'lucide-svelte/icons/x';
   import { workspaceHealth } from '$lib/system';
   import {
     annotateStepRequestInputWithNotification,
+    applyActiveStreamSnapshots,
+    applyWebSocketEvent,
     appendOptimisticUserMessage,
     findPendingStepRequestInputCall,
     optimisticallyResolveStepRequestInput,
-    applyWebSocketEvent,
     normalizeHistory,
     type ThinkingTimelineItem,
     type TimelineItem,
@@ -747,6 +748,7 @@ import X from 'lucide-svelte/icons/x';
     let afterSeq = 0;
     let activeSessionId: string | null | undefined = null;
     let activeSessionLastSeq = 0;
+    let activeStreams: import('$lib/types/api').ActiveStreamSnapshot[] = [];
     let historyTruncated = false;
     let truncationReason: string | null | undefined = null;
 
@@ -755,6 +757,7 @@ import X from 'lucide-svelte/icons/x';
       events.push(...response.items);
       activeSessionId = response.active_session_id;
       activeSessionLastSeq = response.active_session_last_seq ?? activeSessionLastSeq;
+      activeStreams = response.active_streams ?? activeStreams;
       historyTruncated = response.history_truncated ?? historyTruncated;
       truncationReason = response.truncation_reason ?? truncationReason;
       if (!response.has_more || response.items.length === 0) {
@@ -762,6 +765,7 @@ import X from 'lucide-svelte/icons/x';
           items: events,
           last_seq: response.last_seq,
           has_more: response.has_more,
+          active_streams: activeStreams,
           active_session_id: activeSessionId,
           active_session_last_seq: activeSessionLastSeq,
           history_truncated: historyTruncated,
@@ -775,6 +779,7 @@ import X from 'lucide-svelte/icons/x';
           items: events,
           last_seq: response.last_seq,
           has_more: response.has_more,
+          active_streams: activeStreams,
           active_session_id: activeSessionId,
           active_session_last_seq: activeSessionLastSeq,
           history_truncated: historyTruncated,
@@ -1190,6 +1195,7 @@ import X from 'lucide-svelte/icons/x';
             items: [],
             last_seq: 0,
             has_more: false,
+            active_streams: [],
             active_session_id: null,
             active_session_last_seq: 0,
             history_truncated: false,
@@ -1224,7 +1230,14 @@ import X from 'lucide-svelte/icons/x';
 
     if (reloadHistory && historyResult.status === 'fulfilled') {
       nextActiveSessionId = historyResult.value.active_session_id ?? nextActiveSessionId;
-      timeline = normalizeHistory(historyResult.value.items);
+      timeline = applyActiveStreamSnapshots(
+        normalizeHistory(historyResult.value.items),
+        historyResult.value.active_streams,
+      );
+      turnInProgress = hasActiveTurnTimelineItem();
+      if (turnInProgress) {
+        awaitingAssistantStart = false;
+      }
       syncConversationActiveSession(nextActiveSessionId);
       syncVisibleWindow();
       userScrolledUp = false;
@@ -1310,6 +1323,21 @@ import X from 'lucide-svelte/icons/x';
       text,
     });
     syncVisibleWindow();
+  }
+
+  function hasActiveTurnTimelineItem(): boolean {
+    return timeline.some((item) => {
+      if (item.kind === 'message') {
+        return item.role === 'assistant' && item.streaming === true;
+      }
+      if (item.kind === 'tool_call') {
+        return !['completed', 'failed', 'cancelled'].includes(item.status);
+      }
+      if (item.kind === 'delegation') {
+        return item.status === 'started' || item.status === 'running' || item.status === 'paused';
+      }
+      return false;
+    });
   }
 
   async function reconcileActiveConversation(): Promise<void> {
@@ -2137,7 +2165,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'tool_call' || event.type === 'delegation_started') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'tool_call' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
     }
@@ -2258,7 +2286,7 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'reconnected') {
       awaitingAssistantStart = false;
-      turnInProgress = false;
+      turnInProgress = hasActiveTurnTimelineItem();
     }
 
     // Handle conversation_created: navigate to new conversation
@@ -2306,7 +2334,7 @@ import X from 'lucide-svelte/icons/x';
     }
 
     // Auto-scroll on new content
-    if (event.type === 'chunk' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
       scrollToBottom();
     }
 

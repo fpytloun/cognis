@@ -44,6 +44,8 @@ class _RecordingObserver:
         message_id: str,
         turn_id: str | None,
         delta: str,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         self.tokens.append(delta)
 
@@ -134,6 +136,55 @@ async def test_has_running_turn_hides_settled_cleanup_state() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    on_token, _on_thinking, on_tool_call, _on_tool_result = scheduler._build_callbacks(
+        "conv-1",
+        "sess-1",
+        "turn-1",
+        "turn-1",
+        turn_observers=(observer,),
+    )
+
+    await on_token("Hello")
+    await on_token(" world")
+
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert snapshots == [
+        {
+            "conversation_id": "conv-1",
+            "session_id": "sess-1",
+            "message_id": "turn-1",
+            "turn_id": "turn-1",
+            "content": "Hello world",
+            "chunk_count": 2,
+            "content_offset": 11,
+            "updated_at": snapshots[0]["updated_at"],
+        }
+    ]
+    assert observer.tokens == ["Hello", " world"]
+
+    await on_tool_call("example_tool", "call-1", {})
+    assert await scheduler.active_stream_snapshots("conv-1") == []
 
 
 @pytest.mark.asyncio

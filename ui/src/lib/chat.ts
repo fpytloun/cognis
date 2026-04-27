@@ -1,5 +1,5 @@
 import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
-import type { AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
+import type { ActiveStreamSnapshot, AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
 
 /**
  * Per-message markdown streamers. Streaming assistant replies accumulate
@@ -10,6 +10,14 @@ import type { AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/typ
 const streamers = new Map<string, MarkdownStreamer>();
 /** Per-thinking-block markdown streamers (keyed by block_id). */
 const thinkingStreamers = new Map<string, MarkdownStreamer>();
+
+interface PendingStreamChunk {
+  delta: string;
+  chunkIndex: number | null;
+  contentOffset: number;
+}
+
+const pendingStreamChunks = new Map<string, PendingStreamChunk[]>();
 
 function getStreamer(messageId: string): MarkdownStreamer {
   let streamer = streamers.get(messageId);
@@ -27,6 +35,33 @@ function getThinkingStreamer(blockId: string): MarkdownStreamer {
     thinkingStreamers.set(blockId, streamer);
   }
   return streamer;
+}
+
+function streamKey(messageId: string, turnId: string | null): string {
+  return `${turnId ?? messageId}:${messageId}`;
+}
+
+function bufferPendingChunk(messageId: string, turnId: string | null, chunk: PendingStreamChunk): void {
+  const key = streamKey(messageId, turnId);
+  const chunks = pendingStreamChunks.get(key) ?? [];
+  if (
+    chunks.some(
+      (existing) => existing.chunkIndex === chunk.chunkIndex && existing.contentOffset === chunk.contentOffset,
+    )
+  ) {
+    return;
+  }
+  chunks.push(chunk);
+  chunks.sort((left, right) => {
+    if (left.contentOffset !== right.contentOffset) return left.contentOffset - right.contentOffset;
+    return (left.chunkIndex ?? 0) - (right.chunkIndex ?? 0);
+  });
+  pendingStreamChunks.set(key, chunks);
+}
+
+function clearPendingChunks(messageId: string | undefined, turnId: string | null): void {
+  if (!messageId) return;
+  pendingStreamChunks.delete(streamKey(messageId, turnId));
 }
 
 export function releaseStreamer(messageId: string): void {
@@ -86,6 +121,8 @@ export interface MessageTimelineItem {
   streaming?: boolean;
   attachments?: AttachmentRef[];
   optimistic?: boolean;
+  streamChunkCount?: number;
+  streamContentOffset?: number;
 }
 
 export interface ToolCallEvaluation {
@@ -198,6 +235,7 @@ function createMessageItem(
   attachments: AttachmentRef[] = [],
   optimistic = false,
   turnId: string | null = null,
+  streamChunkCount = streaming && content ? 1 : 0,
 ): MessageTimelineItem {
   return {
     id,
@@ -211,7 +249,9 @@ function createMessageItem(
     messageId,
     streaming,
     attachments,
-    optimistic
+    optimistic,
+    streamChunkCount,
+    streamContentOffset: content.length,
   };
 }
 
@@ -462,6 +502,150 @@ function upsertAssistantTurnMessage(
   items.push(
     createMessageItem(id, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId),
   );
+}
+
+function applyChunkToMessage(
+  message: MessageTimelineItem,
+  delta: string,
+  chunkIndex: number | null,
+  contentOffset: number | null,
+): MessageTimelineItem | null {
+  if (chunkIndex !== null && message.streamChunkCount !== undefined && chunkIndex < message.streamChunkCount) {
+    return null;
+  }
+
+  if (contentOffset !== null) {
+    if (contentOffset < message.content.length) {
+      const existing = message.content.slice(contentOffset, contentOffset + delta.length);
+      if (existing === delta) {
+        return null;
+      }
+      return null;
+    }
+    if (contentOffset > message.content.length) {
+      return null;
+    }
+  }
+
+  const content = `${message.content}${delta}`;
+  const streamer = getStreamer(message.id);
+  return {
+    ...message,
+    content,
+    html: streamer.render(content),
+    streaming: true,
+    streamChunkCount: chunkIndex !== null ? chunkIndex + 1 : (message.streamChunkCount ?? 0) + 1,
+    streamContentOffset: content.length,
+  } satisfies MessageTimelineItem;
+}
+
+function applyBufferedChunksToMessage(message: MessageTimelineItem, turnId: string | null): MessageTimelineItem {
+  if (!message.messageId) return message;
+  const key = streamKey(message.messageId, turnId);
+  let chunks = pendingStreamChunks.get(key);
+  if (!chunks?.length) return message;
+
+  let current = message;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    chunks = pendingStreamChunks.get(key);
+    if (!chunks?.length) break;
+    const nextIndex = chunks.findIndex((chunk) => chunk.contentOffset <= current.content.length);
+    if (nextIndex < 0) break;
+    const [chunk] = chunks.splice(nextIndex, 1);
+    if (chunks.length > 0) {
+      pendingStreamChunks.set(key, chunks);
+    } else {
+      pendingStreamChunks.delete(key);
+    }
+    const updated = applyChunkToMessage(current, chunk.delta, chunk.chunkIndex, chunk.contentOffset);
+    if (updated) {
+      current = updated;
+    }
+    changed = true;
+  }
+  return current;
+}
+
+function finalizeOpenPhaseAssistant(items: TimelineItem[], turnId: string | null): TimelineItem[] {
+  const index = findOpenPhaseAssistantIndex(items, turnId);
+  if (index < 0 || items[index]?.kind !== 'message') return items;
+  const message = items[index] as MessageTimelineItem;
+  if (!message.streaming) return items;
+  const streamer = getStreamer(message.id);
+  const next = [...items];
+  next[index] = {
+    ...message,
+    html: streamer.finalize(message.content),
+    streaming: false,
+    streamChunkCount: undefined,
+    streamContentOffset: undefined,
+  } satisfies MessageTimelineItem;
+  releaseStreamer(message.id);
+  clearPendingChunks(message.messageId, turnId);
+  return next;
+}
+
+function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStreamSnapshot): TimelineItem[] {
+  const content = typeof snapshot.content === 'string' ? snapshot.content : '';
+  if (!content) return items;
+
+  const turnId = normalizeEventTurnId(snapshot.turn_id) ?? snapshot.message_id;
+  const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
+  if (existingIndex >= 0 && items[existingIndex]?.kind === 'message') {
+    const existing = items[existingIndex] as MessageTimelineItem;
+    if (
+      existing.streaming
+      && snapshot.chunk_count <= (existing.streamChunkCount ?? 0)
+      && content.length <= existing.content.length
+    ) {
+      return items;
+    }
+    if (!existing.streaming && existing.content === content) {
+      return items;
+    }
+    const streamer = getStreamer(existing.id);
+    const next = [...items];
+    next[existingIndex] = applyBufferedChunksToMessage({
+      ...existing,
+      content,
+      html: streamer.render(content),
+      streaming: true,
+      messageId: snapshot.message_id,
+      turnId,
+      streamChunkCount: snapshot.chunk_count,
+      streamContentOffset: snapshot.content_offset,
+      timestamp: existing.timestamp ?? snapshot.updated_at ?? new Date().toISOString(),
+    } satisfies MessageTimelineItem, turnId);
+    return next;
+  }
+
+  const item = createMessageItem(
+    `message:${snapshot.message_id}:${items.length}`,
+    'assistant',
+    content,
+    snapshot.updated_at ?? new Date().toISOString(),
+    null,
+    snapshot.message_id,
+    true,
+    [],
+    false,
+    turnId,
+    snapshot.chunk_count,
+  );
+  return [
+    ...items,
+    applyBufferedChunksToMessage(item, turnId),
+  ];
+}
+
+export function applyActiveStreamSnapshots(
+  items: TimelineItem[],
+  snapshots: ActiveStreamSnapshot[] | undefined | null,
+): TimelineItem[] {
+  if (!snapshots?.length) return items;
+  return snapshots.reduce((next, snapshot) => applyActiveStreamSnapshot(next, snapshot), items);
 }
 
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
@@ -969,29 +1153,61 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'chunk') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+    const chunkIndex = typeof event.index === 'number' ? event.index : null;
+    const contentOffset = typeof event.content_offset === 'number' ? event.content_offset : null;
     const index = findOpenPhaseAssistantIndex(next, turnId);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
-      const content = `${message.content}${event.content}`;
-      // Use the per-message streamer: finalized blocks are memoized, only the
-      // in-progress tail is re-parsed. See docstring on createMarkdownStreamer.
-      const streamer = getStreamer(message.id);
-      next[index] = {
-        ...message,
-        content,
-        html: streamer.render(content),
-        streaming: true,
+      if (contentOffset !== null && contentOffset > message.content.length) {
+        bufferPendingChunk(event.message_id, turnId, {
+          delta: event.content,
+          chunkIndex,
+          contentOffset,
+        });
+        return next;
+      }
+      const updated = applyChunkToMessage(message, event.content, chunkIndex, contentOffset);
+      if (!updated) return next;
+      const withBuffered = applyBufferedChunksToMessage(
+        { ...updated, turnId, timestamp: message.timestamp ?? new Date().toISOString() },
         turnId,
-        timestamp: message.timestamp ?? new Date().toISOString()
+      );
+      next[index] = {
+        ...withBuffered,
+        turnId,
       };
       return next;
     }
 
+    if (contentOffset !== null && contentOffset > 0) {
+      bufferPendingChunk(event.message_id, turnId, {
+        delta: event.content,
+        chunkIndex,
+        contentOffset,
+      });
+      return next;
+    }
+
     const itemId = `message:${event.message_id}:${next.length}`;
-    next.push(
-      createMessageItem(itemId, 'assistant', event.content, new Date().toISOString(), null, event.message_id, true, [], false, turnId)
-    );
+    const item = createMessageItem(
+        itemId,
+        'assistant',
+        event.content,
+        new Date().toISOString(),
+        null,
+        event.message_id,
+        true,
+        [],
+        false,
+        turnId,
+        chunkIndex !== null ? chunkIndex + 1 : 1,
+      );
+    next.push(applyBufferedChunksToMessage(item, turnId));
     return next;
+  }
+
+  if (event.type === 'assistant_stream_snapshot') {
+    return applyActiveStreamSnapshot(next, event);
   }
 
   if (event.type === 'message_complete') {
@@ -1007,6 +1223,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       const streamer = getStreamer(message.id);
       const finalHtml = streamer.finalize(completeContent);
       releaseStreamer(message.id);
+      clearPendingChunks(event.message_id, turnId);
       next[index] = {
         ...message,
         content: completeContent,
@@ -1014,12 +1231,15 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         seq: event.seq,
         streaming: false,
         turnId,
-        attachments: attachments.length > 0 ? attachments : message.attachments
+        attachments: attachments.length > 0 ? attachments : message.attachments,
+        streamChunkCount: undefined,
+        streamContentOffset: undefined,
       };
       return next;
     }
 
     if (finalContent || attachments.length > 0) {
+      clearPendingChunks(event.message_id, turnId);
       upsertAssistantTurnMessage(next, {
         id: itemId,
         content: finalContent ?? '',
@@ -1226,6 +1446,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'tool_call') {
     const turnId = normalizeEventTurnId(event.turn_id);
+    next = finalizeOpenPhaseAssistant(next, turnId);
     // Orchestration tools are displayed as delegation cards, not tool blocks
     if (['delegate', 'fork'].includes(event.tool_name)) return next;
     const itemId = `tool:${event.call_id}`;
