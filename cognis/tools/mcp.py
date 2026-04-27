@@ -227,8 +227,22 @@ class _SessionMCPClient:
                 if not suppress_cancelled:
                     raise
                 logger.debug("MCP: %s close cancelled during transport teardown", self.config.name)
-            except Exception:
-                pass
+            except BaseException as exc:
+                # Catches Exception as well as BaseExceptionGroup (Python 3.11+
+                # and the anyio exceptiongroup backport on 3.10), which is
+                # raised when anyio detects that aclose() is being called from
+                # a different task than the one that entered the cancel scope.
+                # We must not propagate: callers suppress only Exception and
+                # CancelledError, so an unhandled BaseExceptionGroup would
+                # bypass run()'s except Exception and exit the executor.
+                # Re-raise process-level signals so shutdown is never blocked.
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.debug(
+                    "MCP: %s close raised during transport teardown; suppressing",
+                    self.config.name,
+                    exc_info=True,
+                )
             self._exit_stack = None
             self._session = None
         logger.debug("MCP: %s closed", self.config.name)
@@ -380,7 +394,9 @@ def normalize_streamable_http_url(url: str) -> str:
 
     parsed = urlsplit(url)
     if parsed.path.endswith("/mcp/"):
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path[:-1], parsed.query, parsed.fragment))
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path[:-1], parsed.query, parsed.fragment)
+        )
     return url
 
 

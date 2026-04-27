@@ -12,7 +12,13 @@ import pytest
 
 from cognis.executor import __main__ as executor_main
 from cognis.executor.runner import ExecutorRunner, _normalize_result
-from cognis.models.tool import ExecutorConfig, MCPServerConfig, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import (
+    ExecutorConfig,
+    MCPServerConfig,
+    ToolDefinition,
+    ToolResult,
+    ToolSource,
+)
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
 from cognis.tools.mcp import MCPClientError
 
@@ -530,3 +536,152 @@ def test_executor_main_suppresses_cancelled_error(monkeypatch: pytest.MonkeyPatc
     with open(os.devnull) as devnull:
         monkeypatch.setattr(sys, "stdin", devnull)
         executor_main.main()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: reconfigure shutdown caused by anyio cross-task teardown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_clients_swallows_base_exception_group() -> None:
+    """_close_clients must not let BaseExceptionGroup escape to the caller.
+
+    When anyio detects that exit stacks entered in one task are being
+    aclose()d from a different task, it raises BaseExceptionGroup.  The
+    runner's except Exception: guard does NOT catch BaseExceptionGroup
+    (it is a BaseException subclass, not Exception), so we must handle it
+    explicitly to prevent the executor from shutting down on reconfigure.
+    """
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    closed: list[str] = []
+
+    class _FakeClient:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            if self.name == "bomb":
+                raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+            closed.append(self.name)
+
+    clients = {"ok": _FakeClient("ok"), "bomb": _FakeClient("bomb"), "ok2": _FakeClient("ok2")}
+
+    # Must not raise and must continue iterating past the "bomb" client.
+    await runner._close_clients(clients, suppress_cancelled=True)  # type: ignore[arg-type]
+
+    assert "ok" in closed
+    assert "ok2" in closed
+    assert "bomb" not in closed
+
+
+@pytest.mark.asyncio
+async def test_close_clients_reraises_cancelled_when_not_suppressed() -> None:
+    """_close_clients propagates CancelledError when suppress_cancelled=False."""
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    class _CancellingClient:
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            raise asyncio.CancelledError()
+
+    clients = {"c": _CancellingClient()}
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._close_clients(clients, suppress_cancelled=False)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_spawn_background_close_does_not_block_caller() -> None:
+    """_spawn_background_close returns immediately; the close runs in a task."""
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    close_started = asyncio.Event()
+    close_done = asyncio.Event()
+
+    class _SlowClient:
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            close_started.set()
+            await asyncio.sleep(0.05)
+            close_done.set()
+
+    runner._spawn_background_close({"slow": _SlowClient()})  # type: ignore[arg-type]
+
+    # The method returns before the close finishes.
+    assert not close_done.is_set()
+    # Allow the background task to run to completion.
+    await asyncio.wait_for(close_done.wait(), timeout=2)
+    assert close_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_finally_drains_pending_closes() -> None:
+    """run() cancels + awaits _pending_closes before exiting.
+
+    Stale subprocess transports must be cleaned up before the event loop
+    closes so that BaseSubprocessTransport.__del__ doesn't fire with
+    'Event loop is closed' at interpreter shutdown.
+    """
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    task_was_cancelled: list[bool] = []
+
+    async def _long_close() -> None:
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            task_was_cancelled.append(True)
+
+    async def _fake_connect_and_serve() -> None:
+        # Yield once so _long_close gets a chance to start and reach its
+        # first await (asyncio.sleep) before we set _running=False.
+        await asyncio.sleep(0)
+        runner._running = False
+
+    task: asyncio.Task[None] = asyncio.create_task(_long_close(), name="test-close")
+    runner._pending_closes.add(task)
+    runner._connect_and_serve = _fake_connect_and_serve  # type: ignore[method-assign]
+
+    await runner.run()
+
+    assert task.done(), "background close task must be done after run() returns"
+    assert task_was_cancelled == [True], "CancelledError must have been raised inside the task"
+    assert len(runner._pending_closes) == 0
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_uses_background_close_for_stale_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconfiguring must not call _close_clients inline for stale MCP clients.
+
+    Previously, _handle_configure awaited _close_clients(previous_clients) on
+    the configure task.  If anyio cross-task scope teardown raised
+    BaseExceptionGroup this escaped run()'s except Exception: guard and caused
+    the executor to exit.  The fix spawns teardown on a background task.
+    """
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    # First configure – establishes v1 state.
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    assert runner._config_version == 1
+    ws.sent.clear()
+
+    # Inject a fake stale MCP client that raises BaseExceptionGroup on close.
+    bomb_close_called = asyncio.Event()
+
+    class _BombClient:
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            bomb_close_called.set()
+            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+
+    runner._mcp_clients = {"bomb": _BombClient()}  # type: ignore[assignment]
+
+    # Second configure (reconfigure) – must succeed and NOT shut the runner down.
+    await runner._handle_configure(ws, "cfg-2", {"enabled_tools": ["glob"], "config": {}})
+
+    assert runner._config_version == 2
+    assert runner._configured is True
+    assert runner._running is True  # critical: runner must not exit
+    assert ws.sent[-1]["result"]["applied_version"] == 2
+
+    # The background close task should eventually call close() on the bomb client.
+    await asyncio.wait_for(bomb_close_called.wait(), timeout=2)

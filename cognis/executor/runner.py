@@ -109,6 +109,10 @@ class ExecutorRunner:
         self._channel_handler: Any | None = None
         self._runtime_metadata: dict[str, Any] = {}
         self._started_at = perf_counter()
+        # Background close tasks for stale MCP client sets.  Tracked so that
+        # run()'s finally block can cancel + drain them before tearing down the
+        # event loop, avoiding BaseSubprocessTransport.__del__ noise.
+        self._pending_closes: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         reconnect_delay = _RECONNECT_BASE
@@ -125,7 +129,16 @@ class ExecutorRunner:
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
             logger.info("Executor shutting down, cleaning up resources")
-            browser_manager = self._runtime_metadata.get(BROWSER_MANAGER_KEY)
+            # Drain any background close tasks spawned during reconfigure.
+            # Cancel them first so stale subprocess transports are cleaned up
+            # before the event loop closes, which eliminates the
+            # BaseSubprocessTransport.__del__ "Event loop is closed" noise.
+            if self._pending_closes:
+                for task in list(self._pending_closes):
+                    task.cancel()
+                await asyncio.gather(*self._pending_closes, return_exceptions=True)
+                self._pending_closes.clear()
+            browser_manager = self._runtime_metadata.get("browser_manager")
             if browser_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await browser_manager.cleanup()
@@ -455,9 +468,14 @@ class ExecutorRunner:
             self._channel_handler.set_executor_config(config)
 
             if old_clients is not previous_clients:
-                await self._close_clients(old_clients, suppress_cancelled=True)
+                self._spawn_background_close(old_clients)
             elif previous_clients is not staged_mcp_clients:
-                await self._close_clients(previous_clients, suppress_cancelled=True)
+                # Close the stale v_prev MCP clients on a separate task so that
+                # anyio cross-task cancel-scope teardown (when the exit stacks
+                # were entered in the previous configure task) cannot inject a
+                # deferred CancelledError or BaseExceptionGroup into the current
+                # configure task and cause the executor to exit.
+                self._spawn_background_close(previous_clients)
             old_browser_manager = previous_runtime_metadata.get(BROWSER_MANAGER_KEY)
             if (
                 old_browser_manager is not None
@@ -1141,6 +1159,24 @@ class ExecutorRunner:
 
         return _handler
 
+    def _spawn_background_close(self, clients: dict[str, MCPClient]) -> None:
+        """Schedule teardown of stale MCP clients on a dedicated background task.
+
+        Running the close off the configure-handler task prevents anyio
+        cross-task cancel-scope violations from injecting a deferred
+        CancelledError or BaseExceptionGroup into the current task, which
+        would otherwise cause the executor message loop to exit.
+
+        The task is tracked in ``_pending_closes`` so ``run()``'s finally
+        block can cancel and drain it before the event loop is closed.
+        """
+        task: asyncio.Task[None] = asyncio.create_task(
+            self._close_clients(clients, suppress_cancelled=True),
+            name="mcp-stale-close",
+        )
+        self._pending_closes.add(task)
+        task.add_done_callback(self._pending_closes.discard)
+
     async def _close_mcp_clients(self) -> None:
         await self._close_clients(self._mcp_clients, suppress_cancelled=True)
         self._mcp_clients = {}
@@ -1149,8 +1185,25 @@ class ExecutorRunner:
         self, clients: dict[str, MCPClient], *, suppress_cancelled: bool = False
     ) -> None:
         for client in clients.values():
-            with contextlib.suppress(Exception):
+            try:
                 await client.close(suppress_cancelled=suppress_cancelled)
+            except asyncio.CancelledError:
+                if not suppress_cancelled:
+                    raise
+                logger.debug("MCP client close cancelled; suppressed during stale client teardown")
+            except BaseException as exc:
+                # Catches Exception, BaseExceptionGroup (Python 3.11+ / anyio
+                # exceptiongroup backport), and other BaseException subclasses
+                # raised by anyio cross-task cancel-scope teardown.  We must
+                # not let these propagate: they would bypass run()'s except
+                # Exception handler and cause the executor to exit.
+                # Re-raise process-level signals so shutdown is never blocked.
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.debug(
+                    "MCP client close raised; suppressed during stale client teardown",
+                    exc_info=True,
+                )
 
     def _public_runtime_metadata(self) -> dict[str, Any]:
         metadata = dict(self._runtime_metadata)

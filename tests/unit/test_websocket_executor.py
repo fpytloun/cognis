@@ -350,3 +350,33 @@ async def test_provider_cleanup_does_not_send_executor_cancel() -> None:
     assert conn.closed is True
     assert provider._connections == {}
     assert provider._handles["exec-1"].status == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_provider_reconnect_closes_old_connection() -> None:
+    """register_connection must schedule close() on the previous connection.
+
+    Previously the old connection was only pop()ped from _connections but
+    not closed, leaving its receiver task running and pending RPCs dangling.
+    """
+    provider = WebSocketExecutorProvider()
+
+    old_conn = CloseTrackingConnection()
+    provider._connections["exec-1"] = old_conn  # type: ignore[assignment]
+    provider._handles["exec-1"] = ExecutorHandle(
+        executor_id="exec-1",
+        executor_type="websocket",
+        capabilities=ExecutorCapabilities(),
+        status="ready",
+    )
+
+    # Register a new connection for the same executor_id.
+    new_ws = FakeWebSocket()
+    new_conn = provider.register_connection("exec-1", new_ws, ExecutorCapabilities())
+
+    # Allow the background close task to run.
+    await asyncio.sleep(0)
+
+    assert old_conn.closed is True, "Old connection must be closed on reconnect"
+    assert new_conn is not old_conn
+    assert provider._connections["exec-1"] is new_conn

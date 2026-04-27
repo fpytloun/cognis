@@ -13,9 +13,9 @@ from cognis.tools.mcp import (
     MCPClientError,
     StdioMCPClient,
     StreamableHTTPMCPClient,
-    _SessionMCPClient,
     _normalize_call_result,
     _safe_message,
+    _SessionMCPClient,
     _strip_empty_optionals,
     mcp_tools_to_definitions,
     normalize_streamable_http_url,
@@ -204,7 +204,9 @@ async def test_connect_failure_cleanup_does_not_mask_primary_error() -> None:
             raise BaseExceptionGroup("cleanup failed", [RuntimeError("cleanup")])
 
     class _BrokenClient(_SessionMCPClient):
-        async def _enter_transport(self, exit_stack: mcp_module.AsyncExitStack) -> tuple[object, object]:
+        async def _enter_transport(
+            self, exit_stack: mcp_module.AsyncExitStack
+        ) -> tuple[object, object]:
             await exit_stack.enter_async_context(_BadContext())
             raise RuntimeError("primary failure")
 
@@ -392,6 +394,45 @@ def test_strip_empty_optionals_nested_object() -> None:
     args = {"config": {"host": "localhost", "port": ""}}
     result = _strip_empty_optionals(args, schema)
     assert result["config"] == {"host": "localhost"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_close_suppresses_base_exception_group_suppress_true() -> None:
+    """BaseExceptionGroup from anyio cross-task teardown is silently swallowed."""
+    client = StdioMCPClient(MCPServerConfig(name="broken", command="/bin/echo", timeout_seconds=5))
+
+    class _ExitStack:
+        async def aclose(self) -> None:
+            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+
+    client._exit_stack = _ExitStack()
+    client._session = SimpleNamespace()
+
+    # Must not raise and must clear both references.
+    await client.close(suppress_cancelled=True)
+
+    assert client._exit_stack is None
+    assert client._session is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_close_suppresses_base_exception_group_suppress_false() -> None:
+    """BaseExceptionGroup is always suppressed (it is not a real CancelledError)."""
+    client = StdioMCPClient(MCPServerConfig(name="broken", command="/bin/echo", timeout_seconds=5))
+
+    class _ExitStack:
+        async def aclose(self) -> None:
+            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+
+    client._exit_stack = _ExitStack()
+    client._session = SimpleNamespace()
+
+    # BaseExceptionGroup is not re-raised even when suppress_cancelled=False;
+    # it is an anyio artifact, not a genuine task cancellation.
+    await client.close(suppress_cancelled=False)
+
+    assert client._exit_stack is None
+    assert client._session is None
 
 
 def test_runtime_mcp_server_key_falls_back_safely() -> None:

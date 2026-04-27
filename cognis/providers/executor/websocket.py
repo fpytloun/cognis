@@ -225,7 +225,9 @@ class WebSocketExecutorConnection:
                 output=str(result.get("output", "")),
                 is_error=bool(result.get("is_error", False)),
                 duration_ms=result.get("duration_ms"),
-                metadata=result.get("metadata") if isinstance(result.get("metadata"), dict) else None,
+                metadata=result.get("metadata")
+                if isinstance(result.get("metadata"), dict)
+                else None,
                 attachments=result.get("attachments"),
             )
         except (TimeoutError, asyncio.CancelledError):
@@ -500,14 +502,17 @@ class WebSocketExecutorProvider:
         conn = WebSocketExecutorConnection(ws, executor_id, capabilities or ExecutorCapabilities())
         conn.start_receiver()
 
-        # If this is a reconnection, close the old connection first
+        # If this is a reconnection, close the old connection so its receiver
+        # task stops and pending RPCs fail fast.  The old handle_executor_websocket
+        # coroutine is in wait_until_closed(); closing the connection unblocks it.
         old = self._connections.pop(executor_id, None)
         if old is not None:
             EXECUTOR_WS_RECONNECTIONS.inc()
             _logger.info(
-                "executor_ws: executor reconnected",
+                "executor_ws: executor reconnected, closing previous connection",
                 extra={"extra_data": {"executor_id": executor_id}},
             )
+            asyncio.create_task(old.close(), name=f"executor-old-conn-close-{executor_id}")
 
         self._connections[executor_id] = conn
         EXECUTOR_WS_CONNECTIONS.inc()
