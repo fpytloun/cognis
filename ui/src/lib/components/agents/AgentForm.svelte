@@ -65,7 +65,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     onBindingsChange?: ((bindings: string[]) => void | Promise<void>) | null;
   }>();
 
-  let localBindings = $state<string[]>([...secondaryBindings]);
+  let localBindings = $state<string[]>([]);
   let showAvatarModal = $state(false);
   let showAvatarLightbox = $state(false);
   let skillDetailId = $state<string | null>(null);
@@ -73,6 +73,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   let fileInput: HTMLInputElement | undefined = $state();
   const editableFieldSet = $derived(new Set(editableFields));
   const selectedSkillDetail = $derived(skills.find((skill: Skill) => skill.skill_id === skillDetailId) ?? null);
+
+  $effect(() => {
+    localBindings = [...secondaryBindings];
+  });
 
   function canEditField(field: string): boolean {
     if (!isSystemAsset) return !readonly;

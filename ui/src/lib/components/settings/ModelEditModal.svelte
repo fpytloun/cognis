@@ -2,7 +2,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
-  import type { ModelEntry } from '$lib/types/api';
+  import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
 
   let { model, onclose, onsave } = $props<{
     model: ModelEntry;
@@ -10,18 +10,37 @@
     onsave: (updated: ModelEntry) => void;
   }>();
 
+  function cloneModel(source: ModelEntry): ModelEntry {
+    return {
+      ...JSON.parse(JSON.stringify(source)),
+      display_name: source.display_name ?? '',
+    };
+  }
+
+  function emptyModel(): ModelEntry {
+    return {
+      ...defaultModelEntry(''),
+      display_name: '',
+      input_cost_per_mtok: undefined,
+      output_cost_per_mtok: undefined,
+    };
+  }
+
   // Deep clone model so edits don't affect the original until save.
   // Ensure optional string/number fields have safe defaults for binding
   // (Svelte 5 $bindable props reject undefined).
-  let draft: ModelEntry = $state({
-    ...JSON.parse(JSON.stringify(model)),
-    display_name: model.display_name ?? '',
-  });
+  let draft: ModelEntry = $state(emptyModel());
 
   // Cost fields need separate state since they're optional (number | undefined)
   // but Input bind:value rejects undefined.
-  let inputCost = $state(String(model.input_cost_per_mtok ?? ''));
-  let outputCost = $state(String(model.output_cost_per_mtok ?? ''));
+  let inputCost = $state('');
+  let outputCost = $state('');
+
+  $effect(() => {
+    draft = cloneModel(model);
+    inputCost = String(model.input_cost_per_mtok ?? '');
+    outputCost = String(model.output_cost_per_mtok ?? '');
+  });
 
   const tiers = ['nano', 'mini', 'standard', 'premium'];
 

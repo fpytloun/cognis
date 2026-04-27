@@ -305,14 +305,13 @@ import Logs from 'lucide-svelte/icons/logs';
 
         {#if isGate}
           <!-- Gate: diamond shape -->
-          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_tabindex -->
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
           <g
             opacity={nodeOpacity(step.name)}
             onclick={() => handleNodeSelect(step.name)}
             onkeydown={(event) => handleNodeKeydown(event, step.name)}
             class={isTaskMode ? 'cursor-pointer' : ''}
             role={isTaskMode ? 'button' : undefined}
-            tabindex={isTaskMode ? 0 : undefined}
           >
             <polygon
               points="{x + NODE_W / 2},{y} {x + NODE_W},{y + NODE_H / 2} {x + NODE_W / 2},{y + NODE_H} {x},{y + NODE_H / 2}"
@@ -379,14 +378,13 @@ import Logs from 'lucide-svelte/icons/logs';
           </g>
         {:else}
           <!-- Run: rounded rectangle -->
-          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions a11y_no_noninteractive_tabindex -->
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
           <g
             opacity={nodeOpacity(step.name)}
             onclick={() => handleNodeSelect(step.name)}
             onkeydown={(event) => handleNodeKeydown(event, step.name)}
             class={isTaskMode ? 'cursor-pointer' : ''}
             role={isTaskMode ? 'button' : undefined}
-            tabindex={isTaskMode ? 0 : undefined}
           >
             <rect
               {x}
