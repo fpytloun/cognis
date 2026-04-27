@@ -351,8 +351,10 @@ async def test_open_session_closes_shared_browser_after_failed_navigation_when_n
         raise RuntimeError("nav failed")
 
     async def _fake_ensure_runtime(*, headless: bool) -> None:
-        del headless
-        manager._browser = _Browser()  # noqa: SLF001
+        b = _Browser()
+        manager._browsers[headless] = b  # noqa: SLF001
+        manager._browser = b  # noqa: SLF001
+        manager._browser_generations[headless] = 1  # noqa: SLF001
         manager._runtime_generation = 1  # noqa: SLF001
 
     monkeypatch.setattr(manager, "ensure_runtime", _fake_ensure_runtime)  # type: ignore[arg-type]
@@ -708,3 +710,135 @@ def test_log_lifecycle_emits_safe_fields_only(caplog: pytest.LogCaptureFixture) 
     assert "failure_category" not in extra
     assert "arguments" not in extra
     assert "output" not in extra
+
+
+# ---------------------------------------------------------------------------
+# Stage B: parallel headless + headed modes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_headless_and_headed_browsers_can_run_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two browsers (headless and headed) can coexist in the same manager."""
+    manager = BrowserManager(headed_allowed=True, profile_mode_default="ephemeral")
+    launched: list[bool] = []  # records headless argument for each launch
+
+    class _FakeBrowser:
+        def __init__(self, headless: bool) -> None:
+            self._headless = headless
+            self.closed = False
+
+        async def new_context(self, **_: object) -> object:
+            return _FakeContext()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class _FakeContext:
+        async def close(self) -> None:
+            pass
+
+        async def new_page(self) -> object:
+            return SimpleNamespace(url="https://example.com", goto=_noop_goto)
+
+        async def add_init_script(self, _script: str) -> None:
+            pass
+
+    async def _noop_goto(*_a: object, **_k: object) -> None:
+        pass
+
+    async def _fake_launch_shared_browser_locked(*, headless: bool) -> None:
+        b = _FakeBrowser(headless)
+        manager._browsers[headless] = b  # noqa: SLF001
+        manager._browser = b  # noqa: SLF001
+        manager._runtime_generation += 1  # noqa: SLF001
+        manager._browser_generations[headless] = manager._runtime_generation  # noqa: SLF001
+        launched.append(headless)
+
+    monkeypatch.setattr(
+        manager, "_launch_shared_browser_locked", _fake_launch_shared_browser_locked
+    )
+
+    await manager.open_session(
+        session_id="headless-1",
+        url="https://example.com",
+        headless=True,
+        profile_mode="ephemeral",
+    )
+    await manager.open_session(
+        session_id="headed-1",
+        url="https://example.com",
+        headless=False,
+        profile_mode="ephemeral",
+    )
+
+    assert True in manager._browsers  # noqa: SLF001
+    assert False in manager._browsers  # noqa: SLF001
+    assert len(manager._sessions) == 2  # noqa: SLF001
+    assert True in launched and False in launched
+
+
+@pytest.mark.asyncio
+async def test_close_headless_session_does_not_affect_headed_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the headless session tears down only the headless browser."""
+    manager = BrowserManager(headed_allowed=True, profile_mode_default="ephemeral")
+    headless_closed: list[bool] = []
+    headed_closed: list[bool] = []
+
+    class _FakeBrowser:
+        def __init__(self, closed_recorder: list[bool]) -> None:
+            self._closed_recorder = closed_recorder
+
+        async def new_context(self, **_: object) -> object:
+            return _FakeContext()
+
+        async def close(self) -> None:
+            self._closed_recorder.append(True)
+
+    class _FakeContext:
+        async def close(self) -> None:
+            pass
+
+        async def new_page(self) -> object:
+            return SimpleNamespace(url="https://example.com", goto=_noop_goto)
+
+        async def add_init_script(self, _script: str) -> None:
+            pass
+
+    async def _noop_goto(*_a: object, **_k: object) -> None:
+        pass
+
+    async def _fake_launch_shared_browser_locked(*, headless: bool) -> None:
+        b = _FakeBrowser(headless_closed if headless else headed_closed)
+        manager._browsers[headless] = b  # noqa: SLF001
+        manager._browser = b  # noqa: SLF001
+        manager._runtime_generation += 1  # noqa: SLF001
+        manager._browser_generations[headless] = manager._runtime_generation  # noqa: SLF001
+
+    monkeypatch.setattr(
+        manager, "_launch_shared_browser_locked", _fake_launch_shared_browser_locked
+    )
+
+    await manager.open_session(
+        session_id="headless-1",
+        url="https://example.com",
+        headless=True,
+        profile_mode="ephemeral",
+    )
+    await manager.open_session(
+        session_id="headed-1",
+        url="https://example.com",
+        headless=False,
+        profile_mode="ephemeral",
+    )
+
+    await manager.close_session("headless-1")
+
+    assert headless_closed == [True]
+    assert headed_closed == []
+    assert len(manager._sessions) == 1  # noqa: SLF001
+    assert "headed-1" in manager._sessions  # noqa: SLF001

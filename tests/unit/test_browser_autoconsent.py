@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import pytest
 
@@ -242,20 +241,18 @@ def test_handler_browser_config_passes_stage_c_keys() -> None:
 
 
 def test_handler_get_manager_constructs_with_stage_c_args() -> None:
-    from cognis.tools.executor.browser import handlers
+    from cognis.tools.executor.browser.handlers import build_manager_from_config
 
-    class _Ctx:
-        runtime_metadata: dict[str, Any] = {
-            "browser": {
-                "auto_consent": "reject",
-                "auto_consent_disabled_domains": "first.com, second.com",
-                "humanize_input": True,
-                "humanize_intensity": "medium",
-                "fingerprint_hardening": True,
-            }
+    runtime_metadata = {
+        "browser": {
+            "auto_consent": "reject",
+            "auto_consent_disabled_domains": "first.com, second.com",
+            "humanize_input": True,
+            "humanize_intensity": "medium",
+            "fingerprint_hardening": True,
         }
-
-    manager = handlers._get_manager(_Ctx())  # noqa: SLF001
+    }
+    manager = build_manager_from_config(runtime_metadata)
     assert manager.auto_consent == "reject"
     assert manager.auto_consent_disabled_domains == ["first.com", "second.com"]
     assert manager.humanize_input is True
@@ -264,11 +261,8 @@ def test_handler_get_manager_constructs_with_stage_c_args() -> None:
 
 
 def test_handler_get_manager_handles_humanize_input_undefined() -> None:
-    from cognis.tools.executor.browser import handlers
+    from cognis.tools.executor.browser.handlers import build_manager_from_config
 
-    class _Ctx:
-        runtime_metadata: dict[str, Any] = {"browser": {}}
-
-    manager = handlers._get_manager(_Ctx())  # noqa: SLF001
+    manager = build_manager_from_config({"browser": {}})
     # humanize_input falls back to manager's stealth-anchored default.
     assert manager.humanize_input is True

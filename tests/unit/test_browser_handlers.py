@@ -834,3 +834,59 @@ async def test_browser_wait_for_rejects_mixed_selector_syntax(
             },
             _context(),
         )
+
+
+# ---------------------------------------------------------------------------
+# Stage A: _get_manager reads from shared_runtime_metadata
+# ---------------------------------------------------------------------------
+
+
+def test_get_manager_reads_from_shared_runtime_metadata() -> None:
+    from cognis.models.tool import ExecutorHandle
+    from cognis.tools.executor.browser.handlers import _get_manager
+    from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
+    from cognis.tools.registry import ToolExecutionContext
+
+    manager = BrowserManager(enabled=True)
+    shared: dict = {BROWSER_MANAGER_KEY: manager}
+    per_call: dict = {}
+
+    ctx = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="test"),
+        runtime_metadata=per_call,
+        shared_runtime_metadata=shared,
+    )
+    found = _get_manager(ctx)
+    assert found is manager
+    # Should also be mirrored into per_call for subsequent lookups
+    assert per_call.get(BROWSER_MANAGER_KEY) is manager
+
+
+def test_get_manager_raises_when_absent_from_both_dicts() -> None:
+    from cognis.models.tool import ExecutorHandle
+    from cognis.tools.executor.browser.handlers import _get_manager
+    from cognis.tools.registry import ToolExecutionContext
+
+    ctx = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="test"),
+        runtime_metadata={},
+        shared_runtime_metadata={},
+    )
+    with pytest.raises(RuntimeError, match="Browser manager is not available"):
+        _get_manager(ctx)
+
+
+def test_require_manager_returns_error_result_when_absent() -> None:
+    from cognis.models.tool import ExecutorHandle
+    from cognis.tools.executor.browser.handlers import _require_manager
+    from cognis.tools.registry import ToolExecutionContext
+
+    ctx = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="test"),
+        runtime_metadata={},
+        shared_runtime_metadata={},
+    )
+    result = _require_manager(ctx)
+    assert result.is_error
+    assert "Browser manager is not available" in result.output
+    assert (result.metadata or {}).get("browser_unavailable") is True

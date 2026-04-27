@@ -8,6 +8,7 @@ from datetime import date
 from typing import Any
 
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY
 from cognis.tools.executor.web.backends import (
     get_browser_fetch_backend,
     get_headed_browser_fetch_backend,
@@ -204,11 +205,20 @@ def _explain_skipped_fallback(
             "no headless or headed retry was attempted."
         )
     elif get_browser_fetch_backend(runtime_metadata) is None:
-        metadata["browser_fallback_skipped_reason"] = "browser_unavailable"
-        suffix = (
-            "Browser fallback is enabled but no browser runtime is wired into "
-            "this executor; no retry was attempted."
-        )
+        from cognis.tools.executor.browser.manager import BrowserManager
+        manager = runtime_metadata.get(BROWSER_MANAGER_KEY)
+        if isinstance(manager, BrowserManager) and not manager.enabled:
+            metadata["browser_fallback_skipped_reason"] = "browser_disabled"
+            suffix = (
+                "Browser fallback is enabled in web settings but browser tools are "
+                "disabled on this executor (browser.enabled=false)."
+            )
+        else:
+            metadata["browser_fallback_skipped_reason"] = "browser_unavailable"
+            suffix = (
+                "Browser fallback is enabled but no browser runtime is configured on "
+                "this executor. Enable browser tools in the executor settings."
+            )
     else:
         # Failure profile didn't look browser-fixable (e.g. plain 404).
         metadata["browser_fallback_skipped_reason"] = "not_browser_fixable"
@@ -505,7 +515,13 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         ),
     )
 
+    # Stage C: web_fetch fallback must see the persistent BrowserManager.
+    # Merge BROWSER_MANAGER_KEY from shared_runtime_metadata into the per-call
+    # dict so all resolver helpers find it without extra traversal.
     runtime_metadata = context.runtime_metadata
+    shared = context.shared_runtime_metadata or {}
+    if BROWSER_MANAGER_KEY not in runtime_metadata and BROWSER_MANAGER_KEY in shared:
+        runtime_metadata[BROWSER_MANAGER_KEY] = shared[BROWSER_MANAGER_KEY]
     controller = get_or_create_controller(runtime_metadata)
 
     primary_backend = resolve_fetch_backend(runtime_metadata, backend_name)

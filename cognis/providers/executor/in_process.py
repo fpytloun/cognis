@@ -24,6 +24,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
+from cognis.tools.executor.browser.handlers import build_manager_from_config
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.executor.file_freshness import get_file_freshness_tracker
@@ -210,6 +211,9 @@ class InProcessExecutorProvider:
             lsp_manager: LSPManager | None = None
             runtime_metadata = dict(config.metadata)
             get_file_freshness_tracker(runtime_metadata)
+            # Stage A: eagerly build the BrowserManager so all tool calls for
+            # this executor share a single persistent instance.
+            _wire_browser_manager(runtime_metadata)
             try:
                 lsp_manager = build_lsp_manager(config.metadata)
                 if lsp_manager is not None:
@@ -539,6 +543,27 @@ def _normalize_tool_result(result: Any, duration_ms: int) -> ToolResult:
     else:
         output = str(result)
     return ToolResult(output=output, duration_ms=duration_ms)
+
+
+def _wire_browser_manager(runtime_metadata: dict[str, Any]) -> None:
+    """Build and inject a BrowserManager into the persistent runtime dict.
+
+    Skips silently when browser is disabled or config is absent so the
+    caller never has to special-case missing browser support.
+    """
+    if BROWSER_MANAGER_KEY in runtime_metadata:
+        return  # already wired (e.g. from a previous configure cycle)
+    browser_cfg = runtime_metadata.get("browser")
+    if not isinstance(browser_cfg, dict) or not browser_cfg.get("enabled", True):
+        return
+    try:
+        manager = build_manager_from_config(runtime_metadata)
+        runtime_metadata[BROWSER_MANAGER_KEY] = manager
+    except Exception as exc:
+        _logger.warning(
+            "browser: failed to build BrowserManager for in-process executor: %s",
+            exc,
+        )
 
 
 def _validate_unique_server_names(config: ExecutorConfig) -> None:

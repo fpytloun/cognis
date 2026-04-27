@@ -247,22 +247,14 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _coerce_evasions(value: Any) -> list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        items = [item.strip() for item in value.split(",")]
-        return [item for item in items if item]
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return None
+def build_manager_from_config(runtime_metadata: dict[str, Any]) -> BrowserManager:
+    """Construct a BrowserManager from ``runtime_metadata['browser']``.
 
-
-def _get_manager(context: ToolExecutionContext) -> BrowserManager:
-    existing = context.runtime_metadata.get(BROWSER_MANAGER_KEY)
-    if isinstance(existing, BrowserManager):
-        return existing
-    cfg = _browser_config(context.runtime_metadata)
+    This is the canonical factory shared by the remote executor runner and
+    the in-process executor provider so both paths create managers with
+    exactly the same configuration logic.
+    """
+    cfg = _browser_config(runtime_metadata)
     stealth_enabled_raw = cfg.get("stealth_enabled")
     stealth_enabled: bool | None = (
         None if stealth_enabled_raw is None else bool(stealth_enabled_raw)
@@ -286,7 +278,7 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
         auto_consent_disabled_domains = []
     auto_consent_value = cfg.get("auto_consent")
     auto_consent: str | None = None if auto_consent_value is None else str(auto_consent_value)
-    manager = BrowserManager(
+    return BrowserManager(
         enabled=bool(cfg.get("enabled", True)),
         auto_install=bool(cfg.get("auto_install", False)),
         engine=str(cfg.get("engine", "chromium")),
@@ -299,9 +291,7 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
         ),
         persistent_profiles_enabled=bool(cfg.get("persistent_profiles_enabled", True)),
         profile_mode_default=str(cfg.get("profile_mode_default", "persistent_local")),
-        profile_base_dir=(
-            str(cfg.get("profile_base_dir")) if cfg.get("profile_base_dir") else None
-        ),
+        profile_base_dir=(str(cfg.get("profile_base_dir")) if cfg.get("profile_base_dir") else None),
         realistic_launch=bool(cfg.get("realistic_launch", True)),
         xvfb_auto=bool(cfg.get("xvfb_auto", True)),
         locale=str(cfg.get("locale", "en-US")),
@@ -322,8 +312,53 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
         humanize_intensity=str(cfg.get("humanize_intensity") or "low"),
         fingerprint_hardening=fingerprint_hardening,
     )
-    context.runtime_metadata[BROWSER_MANAGER_KEY] = manager
-    return manager
+
+
+def _coerce_evasions(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+        return [item for item in items if item]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return None
+
+
+def _get_manager(context: ToolExecutionContext) -> BrowserManager:
+    """Return the BrowserManager for this executor context.
+
+    Look-up order (most to least persistent):
+    1. ``shared_runtime_metadata`` — the long-lived per-executor dict that
+       the runner/in-process provider populates at configure time.
+    2. ``runtime_metadata`` — the per-call shallow copy; written here if the
+       manager was found in shared so subsequent helpers see it without having
+       to traverse the chain again.
+
+    Lazy creation (build_manager_from_config) is intentionally removed: the
+    manager must now be pre-populated by the executor lifecycle (Stage A fix).
+    If it is missing, the executor was not configured for browser access and
+    the caller should surface an actionable error.
+    """
+    shared = context.shared_runtime_metadata or {}
+    per_call = context.runtime_metadata
+
+    manager = per_call.get(BROWSER_MANAGER_KEY)
+    if isinstance(manager, BrowserManager):
+        return manager
+
+    manager = shared.get(BROWSER_MANAGER_KEY)
+    if isinstance(manager, BrowserManager):
+        # Mirror into the per-call dict so callers downstream in this
+        # call (e.g. web_fetch) find it without extra traversal.
+        per_call[BROWSER_MANAGER_KEY] = manager
+        return manager
+
+    raise RuntimeError(
+        "Browser manager is not available on this executor. "
+        "Ensure browser tools are enabled and the executor is configured with "
+        "browser access."
+    )
 
 
 def _validate_css_selector(tool_name: str, selector: str) -> None:
@@ -461,10 +496,21 @@ async def _resolve_selector_target(
     return locator.nth(0), target
 
 
+def _require_manager(context: ToolExecutionContext) -> BrowserManager | ToolResult:
+    """Return the BrowserManager or a clear ToolResult error if unavailable."""
+    try:
+        return _get_manager(context)
+    except RuntimeError as exc:
+        return ToolResult(output=str(exc), is_error=True, metadata={"browser_unavailable": True})
+
+
 async def handle_browser_open(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
-    manager = _get_manager(context)
+    result_or_manager = _require_manager(context)
+    if isinstance(result_or_manager, ToolResult):
+        return result_or_manager
+    manager = result_or_manager
     session = await manager.open_session(
         session_id=str(arguments.get("session_id", "")),
         url=str(arguments.get("url", "")),

@@ -283,8 +283,13 @@ async def test_wait_for_slot_times_out_when_pool_stays_full() -> None:
 
 
 class _FakeContext:
-    def __init__(self, runtime_metadata: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        runtime_metadata: dict[str, Any],
+        shared_runtime_metadata: dict[str, Any] | None = None,
+    ) -> None:
         self.runtime_metadata = runtime_metadata
+        self.shared_runtime_metadata = shared_runtime_metadata or {}
 
 
 @pytest.mark.asyncio
@@ -749,3 +754,51 @@ async def test_browser_fetch_headed_mode_opens_headless_false() -> None:
     metadata = result.metadata or {}
     assert metadata.get("browser_fetch_mode") == "headed"
     assert metadata.get("browser_fetch") is True
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_fallback_uses_manager_from_shared_runtime_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BrowserManager wired in shared_runtime_metadata is found by web_fetch."""
+    from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Direct HTTP fetch was blocked by Cloudflare",
+                is_error=True,
+                metadata={"cloudflare_blocked": True},
+            )
+
+    browser_used = False
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            nonlocal browser_used
+            browser_used = True
+            return ToolResult(output="rendered from browser")
+
+    monkeypatch.setattr(
+        handlers, "resolve_fetch_backend", lambda *a, **k: _FakePrimary()
+    )
+    monkeypatch.setattr(
+        handlers, "get_browser_fetch_backend", lambda metadata: _FakeBrowser()
+    )
+
+    manager = BrowserManager(enabled=True)
+    shared = {
+        BROWSER_MANAGER_KEY: manager,
+        "web_fetch_fallback_browser": True,
+    }
+    per_call = {
+        "web_fetch_backend": "direct",
+        "web_fetch_fallback_browser": True,
+    }
+
+    ctx = _FakeContext(per_call, shared_runtime_metadata=shared)
+    result = await handlers.handle_web_fetch({"url": "https://example.com"}, ctx)
+
+    assert not result.is_error
+    assert browser_used is True

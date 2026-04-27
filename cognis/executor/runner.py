@@ -24,6 +24,8 @@ from cognis.models.tool import (
     ToolResult,
     ToolSource,
 )
+from cognis.tools.executor.browser.handlers import build_manager_from_config
+from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
 from cognis.tools.executor.file_freshness import _FILE_FRESHNESS_KEY, get_file_freshness_tracker
 from cognis.tools.executor.lsp import (
@@ -56,6 +58,21 @@ _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 60.0
 _MCP_PREPARE_TOTAL_TIMEOUT_SECONDS = 90.0
 _RUNTIME_METADATA_SCHEMA_VERSION = 1
+
+
+def _build_browser_manager(browser_config: dict[str, Any]) -> BrowserManager | None:
+    """Build a BrowserManager from the browser config block.
+
+    Returns ``None`` when browser is disabled so callers can skip the
+    BROWSER_MANAGER_KEY assignment gracefully.
+    """
+    try:
+        if not browser_config.get("enabled", True):
+            return None
+        return build_manager_from_config({"browser": browser_config})
+    except Exception as exc:
+        logger.warning("executor: failed to build BrowserManager: %s", exc)
+        return None
 
 
 def _build_environment_payload() -> dict[str, str]:
@@ -108,7 +125,7 @@ class ExecutorRunner:
                 reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
         finally:
             logger.info("Executor shutting down, cleaning up resources")
-            browser_manager = self._runtime_metadata.get("browser_manager")
+            browser_manager = self._runtime_metadata.get(BROWSER_MANAGER_KEY)
             if browser_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await browser_manager.cleanup()
@@ -335,6 +352,11 @@ class ExecutorRunner:
             default_search_backend=web_config_raw.get("web_search_backend"),
             default_fetch_backend=web_config_raw.get("web_fetch_backend"),
         )
+        # Build or reuse the BrowserManager eagerly so every tool call shares
+        # the same persistent manager rather than allocating a new one per call.
+        browser_config_dict = browser_config if isinstance(browser_config, dict) else {}
+        new_browser_manager = _build_browser_manager(browser_config_dict)
+
         # Store web runtime metadata for handler context
         runtime_state = "degraded" if mcp_warnings else "active"
         try:
@@ -380,11 +402,13 @@ class ExecutorRunner:
                     [b for b in web_backends if b not in {"brave", "searxng"}],
                 ),
                 "web_secrets": secrets,
-                "browser": browser_config if isinstance(browser_config, dict) else {},
+                "browser": browser_config_dict,
                 "environment": _build_environment_payload(),
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
             }
+            if new_browser_manager is not None:
+                self._runtime_metadata[BROWSER_MANAGER_KEY] = new_browser_manager
             get_file_freshness_tracker(self._runtime_metadata)
             try:
                 lsp_manager = build_lsp_manager(config if isinstance(config, dict) else {})
@@ -434,10 +458,10 @@ class ExecutorRunner:
                 await self._close_clients(old_clients, suppress_cancelled=True)
             elif previous_clients is not staged_mcp_clients:
                 await self._close_clients(previous_clients, suppress_cancelled=True)
-            old_browser_manager = previous_runtime_metadata.get("browser_manager")
+            old_browser_manager = previous_runtime_metadata.get(BROWSER_MANAGER_KEY)
             if (
                 old_browser_manager is not None
-                and old_browser_manager is not self._runtime_metadata.get("browser_manager")
+                and old_browser_manager is not self._runtime_metadata.get(BROWSER_MANAGER_KEY)
             ):
                 with contextlib.suppress(Exception):
                     await old_browser_manager.cleanup()
@@ -1131,7 +1155,7 @@ class ExecutorRunner:
     def _public_runtime_metadata(self) -> dict[str, Any]:
         metadata = dict(self._runtime_metadata)
         metadata.pop("web_secrets", None)
-        metadata.pop("browser_manager", None)
+        metadata.pop(BROWSER_MANAGER_KEY, None)
         metadata.pop(LSP_MANAGER_KEY, None)
         metadata.pop(_FILE_FRESHNESS_KEY, None)
         return metadata

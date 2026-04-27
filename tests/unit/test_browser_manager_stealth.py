@@ -479,20 +479,18 @@ def test_handler_browser_config_legacy_keys_default_runtime_to_playwright() -> N
 
 
 def test_handler_get_manager_translates_config_to_constructor_arguments() -> None:
-    from cognis.tools.executor.browser import handlers
+    from cognis.tools.executor.browser.handlers import build_manager_from_config
 
-    class _Ctx:
-        runtime_metadata: dict[str, Any] = {
-            "browser": {
-                "runtime": "patchright",
-                "channel": "chrome-beta",
-                "stealth_enabled": True,
-                "stealth_evasions": "navigator_webdriver, webgl_vendor",
-                "default_timezone_id": "Europe/Prague",
-            }
+    runtime_metadata = {
+        "browser": {
+            "runtime": "patchright",
+            "channel": "chrome-beta",
+            "stealth_enabled": True,
+            "stealth_evasions": "navigator_webdriver, webgl_vendor",
+            "default_timezone_id": "Europe/Prague",
         }
-
-    manager = handlers._get_manager(_Ctx())  # noqa: SLF001
+    }
+    manager = build_manager_from_config(runtime_metadata)
     assert manager.runtime == "patchright"
     assert manager.channel == "chrome-beta"
     assert manager.stealth_enabled is True
