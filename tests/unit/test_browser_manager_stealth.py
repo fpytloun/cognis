@@ -153,10 +153,12 @@ async def test_apply_context_defaults_swallows_stealth_failures(
 # ---------------------------------------------------------------------------
 
 
-def test_patchright_runtime_defaults_channel_to_chrome_and_disables_stealth() -> None:
+def test_patchright_runtime_defaults_channel_to_none_and_disables_stealth() -> None:
+    # Channel is no longer auto-pinned to "chrome" for Patchright; auto-install
+    # of system-browser channels requires sudo which is unavailable in daemon mode.
     manager = BrowserManager(runtime="patchright")
     assert manager.runtime == "patchright"
-    assert manager.channel == "chrome"
+    assert manager.channel is None
     # Patchright already covers stealth's evasions; default off avoids double-up.
     assert manager.stealth_enabled is False
 
@@ -200,8 +202,9 @@ def test_resolve_async_playwright_imports_runtime_specific_module(
     assert pw_resolved is not fake_async_playwright
 
 
-def test_launch_kwargs_includes_channel_when_set() -> None:
-    manager = BrowserManager(runtime="patchright")
+def test_launch_kwargs_includes_channel_when_explicitly_set() -> None:
+    # Channel must be explicitly provided; Patchright no longer auto-pins "chrome".
+    manager = BrowserManager(runtime="patchright", channel="chrome")
     kwargs = manager._launch_kwargs(headless=True)  # noqa: SLF001
     assert kwargs["channel"] == "chrome"
 
@@ -312,7 +315,8 @@ async def test_ensure_ready_uses_new_helper_for_patchright(
 
     assert new_calls and not legacy_calls
     assert new_calls[0]["runtime"] == "patchright"
-    assert new_calls[0]["channel"] == "chrome"
+    # Channel is no longer auto-pinned; manager.channel is None.
+    assert new_calls[0]["channel"] is None
 
 
 @pytest.mark.asyncio
@@ -353,6 +357,8 @@ async def test_ensure_ready_uses_new_helper_when_channel_pinned(
 async def test_ensure_browser_runtime_invokes_correct_install_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    import shutil
+
     from cognis.tools.executor.browser import install as install_mod
 
     monkeypatch.setattr(install_mod, "_PREPARED", set())  # reset cache
@@ -372,6 +378,9 @@ async def test_ensure_browser_runtime_invokes_correct_install_command(
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_create_subprocess_exec)
 
+    # "chrome" is now a system-browser channel: install is skipped, binary is probed.
+    # Simulate the binary being present so the call succeeds.
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/google-chrome-stable")
     ok, _reason = await install_mod.ensure_browser_runtime(
         runtime="patchright",
         engine="chromium",
@@ -379,9 +388,9 @@ async def test_ensure_browser_runtime_invokes_correct_install_command(
         auto_install=True,
     )
     assert ok is True
-    assert captured_argv[-1][1:] == ["-m", "patchright", "install", "chrome"]
+    assert not captured_argv, "system-browser channel must NOT trigger subprocess install"
 
-    captured_argv.clear()
+    # Bundled engine install (no channel) still invokes the subprocess.
     monkeypatch.setattr(install_mod, "_PREPARED", set())
     ok, _reason = await install_mod.ensure_browser_runtime(
         runtime="playwright",

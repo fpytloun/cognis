@@ -133,14 +133,12 @@ class BrowserManager:
                 f"Expected one of {', '.join(SUPPORTED_RUNTIMES)}."
             )
         self.runtime = runtime_normalized
-        # Patchright works best with real Chrome stable; default to that
-        # channel when the user hasn't pinned one explicitly.
-        if (
-            self.runtime == RUNTIME_PATCHRIGHT
-            and (channel is None or not str(channel).strip())
-            and engine == "chromium"
-        ):
-            channel = "chrome"
+        # Channel is user-explicit only.  We intentionally do NOT auto-pin
+        # channel="chrome" for Patchright because installing system Chrome
+        # requires root (sudo apt-get) which fails in headless/daemon setups.
+        # Users who want the maximum-stealth real-Chrome path should install
+        # Chrome system-wide themselves and then set channel="chrome" in
+        # executor settings.
         self.channel = (channel or "").strip() or None
         self.headed_allowed = headed_allowed
         self.max_sessions = max_sessions
