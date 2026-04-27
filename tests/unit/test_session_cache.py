@@ -94,6 +94,73 @@ class _Guardrails:
         )()
 
 
+class _RestartGuardrails:
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    async def read_events(
+        self,
+        session_id: str,
+        after_seq: int = 0,
+        limit: int = 0,
+        types: list[str] | None = None,
+        last_n: int | None = None,
+        allow_missing_stream: bool = False,
+    ) -> object:
+        del session_id, allow_missing_stream, limit, types, last_n
+        self.calls.append(after_seq)
+        if after_seq == 0:
+            return type(
+                "EventRead",
+                (),
+                {
+                    "events": [
+                        {
+                            "seq": 1,
+                            "type": "developer_message",
+                            "data": {
+                                "role": "developer",
+                                "source": "core_memories",
+                                "content": "Existing identity.",
+                            },
+                        },
+                        {
+                            "seq": 2,
+                            "type": "context_snapshot",
+                            "data": {
+                                "source": "bootstrap",
+                                "entries": [
+                                    {
+                                        "role": "developer",
+                                        "source": "core_memories",
+                                        "seq": 1,
+                                    }
+                                ],
+                            },
+                        },
+                        {"seq": 3, "type": "user_message", "data": {"content": "before"}},
+                        {
+                            "seq": 4,
+                            "type": "assistant_message",
+                            "data": {"content": "previous reply"},
+                        },
+                        {
+                            "seq": 5,
+                            "type": "user_message",
+                            "data": {"content": "continued after restart"},
+                        },
+                    ],
+                    "last_seq": 5,
+                    "has_more": False,
+                },
+            )()
+        return type(
+            "EventRead",
+            (),
+            {"events": [], "last_seq": after_seq, "has_more": False},
+        )()
+
+
 def _session(session_id: str = "session-1") -> SessionModel:
     return SessionModel(
         session_id=session_id,
@@ -149,6 +216,36 @@ async def test_session_cache_warm_refresh_rebuilds_prefix_when_initialized_entry
     assert [item.source for item in cache.get_prefix_entries(session.session_id)] == [
         "memory_instructions",
         "core_memories",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_cache_hydrates_full_history_after_restart_append() -> None:
+    guardrails = _RestartGuardrails()
+    cache = SessionCache(guardrails, max_entries=10)
+    session = _session()
+
+    entry = await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="user_message", data={"content": "continued after restart"})],
+        EventAppendResult(ok=True, count=1, first_seq=5, last_seq=5),
+    )
+
+    assert entry.initialized is False
+    assert [event.seq for event in cache.get_events_since_compaction(session.session_id)] == [5]
+
+    refreshed = await cache.refresh(session)
+
+    assert refreshed.initialized is True
+    assert guardrails.calls == [0]
+    assert [event.seq for event in cache.get_events_since_compaction(session.session_id)] == [3, 4, 5]
+    assert [event.data["content"] for event in cache.get_events_since_compaction(session.session_id)] == [
+        "before",
+        "previous reply",
+        "continued after restart",
+    ]
+    assert [item.source for item in cache.get_prefix_entries(session.session_id)] == [
+        "core_memories"
     ]
 
 

@@ -419,7 +419,7 @@ class SessionCache:
                                 }
                             },
                         )
-                    self._rebuild_prefix_from_raw_events(entry, full_read.events)
+                    self._replace_from_intaris_events(entry, full_read.events)
                     entry.last_event_seq = max(entry.last_event_seq, full_read.last_seq)
                 entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
                 logger.debug(
@@ -449,6 +449,7 @@ class SessionCache:
 
         entry = await self._ensure_entry(session)
         async with entry.lock:
+            was_initialized = entry.initialized
             next_seq = append_result.first_seq
             recorded_events: list[CachedEvent] = []
             for event in events:
@@ -459,7 +460,10 @@ class SessionCache:
             if any(item.type in PREFIX_EVENT_TYPES for item in recorded_events):
                 self._rebuild_prefix_from_cached_events(entry, recorded_events)
             entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
-            entry.initialized = True
+            # If the first event seen by a fresh in-memory cache has a sequence greater than
+            # one, the controller restarted and recorded a new event before hydrating old
+            # history. Keep the entry cold so the next refresh performs a full Intaris load.
+            entry.initialized = was_initialized or append_result.first_seq <= 1
             entry.touched_at = monotonic()
         await self._redis_set(entry)
         return entry
@@ -914,10 +918,26 @@ class SessionCache:
                     }
                 },
             )
-        self._apply_intaris_events(entry, event_read.events)
-        self._rebuild_prefix_from_raw_events(entry, event_read.events)
+        self._replace_from_intaris_events(entry, event_read.events)
         entry.last_event_seq = event_read.last_seq
         entry.initialized = True
+
+    def _replace_from_intaris_events(
+        self, entry: CachedSessionState, raw_events: list[dict[str, Any]]
+    ) -> None:
+        """Replace event-derived cache state from a full Intaris stream read."""
+
+        entry.events = []
+        entry.last_event_seq = 0
+        entry.last_compaction_seq = 0
+        entry.last_compaction_summary = None
+        entry.prefix_entries = []
+        entry.context_snapshot_seq = 0
+        entry.context_snapshot_source = None
+        entry.prefix_repair_needed = False
+        entry.project_contexts = {}
+        self._apply_intaris_events(entry, raw_events)
+        self._rebuild_prefix_from_raw_events(entry, raw_events)
 
     def _apply_intaris_events(
         self, entry: CachedSessionState, raw_events: list[dict[str, Any]]
