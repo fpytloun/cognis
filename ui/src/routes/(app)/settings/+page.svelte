@@ -174,6 +174,7 @@ import { onMount, tick } from 'svelte';
   let webBackendForm = $state('direct');
   let webSearchBackendForm = $state('direct');
   let webFetchBackendForm = $state('direct');
+  let webFetchFallbackBrowserForm = $state(true);
   let webSearxngUrlForm = $state('');
   let webKeySetup = $state<{ backend: string; value: string } | null>(null);
   let showExecutorForm = $state(false);
@@ -332,7 +333,11 @@ import { onMount, tick } from 'svelte';
       passwordForm,
       newApiKeyName,
       newApiKeyExpiresInDays,
-      settingValueText
+      settingValueText,
+      webSearchBackendForm,
+      webFetchBackendForm,
+      webFetchFallbackBrowserForm,
+      webSearxngUrlForm
     });
   }
 
@@ -1004,6 +1009,7 @@ import { onMount, tick } from 'svelte';
     webBackendForm = webConfig.backend;
     webSearchBackendForm = webConfig.search_backend ?? webConfig.backend;
     webFetchBackendForm = webConfig.fetch_backend ?? webConfig.backend;
+    webFetchFallbackBrowserForm = webConfig.fetch_fallback_browser ?? true;
     webSearxngUrlForm = webConfig.searxng_url ?? '';
 
     // Initialize account name form
@@ -1344,8 +1350,8 @@ import { onMount, tick } from 'svelte';
 
   const WEB_BACKEND_INFO: Record<string, { label: string; description: string; link?: string }> = {
     direct: {
-      label: 'Direct (DuckDuckGo + trafilatura)',
-      description: 'DuckDuckGo for search and httpx + trafilatura for high-quality content extraction. Free, no API key needed. DuckDuckGo is community-maintained and may occasionally be unavailable.'
+      label: 'Direct',
+      description: 'Zero-setup path. DuckDuckGo powers direct search; httpx + trafilatura power direct fetch and extraction.'
     },
     tavily: {
       label: 'Tavily',
@@ -1363,22 +1369,47 @@ import { onMount, tick } from 'svelte';
       link: 'https://searxng.org/'
     },
     browser: {
-      label: 'Headless browser',
-      description: 'Playwright/Patchright headless fetch — used as the auto-fallback for Cloudflare/JS-required sites. Honours the executor\'s stealth stack (UA, autoconsent, fingerprint hardening).'
+      label: 'Always use headless browser',
+      description: 'Patchright/Playwright headless fetch for every request. Slower, but useful for JS-heavy sites or when you explicitly want rendered pages every time.'
     }
   };
+
+  function searchBackendDescription(backend: string): string {
+    if (backend === 'direct') {
+      return 'Direct search uses DuckDuckGo. Free and zero-setup, but community-maintained and occasionally less reliable than Brave, Tavily, or your own SearXNG instance.';
+    }
+    return WEB_BACKEND_INFO[backend]?.description ?? '';
+  }
+
+  function fetchBackendDescription(backend: string): string {
+    if (backend === 'direct') {
+      return webFetchFallbackBrowserForm
+        ? 'Direct fetch uses httpx + trafilatura for clean extraction, then automatically retries through the executor browser on Cloudflare/JS-required failures.'
+        : 'Direct fetch uses httpx + trafilatura for clean extraction. Browser fallback is disabled, so blocked or JS-required pages return the direct error.';
+    }
+    if (backend === 'tavily') {
+      return 'Tavily extract API for every fetch. Also enables Tavily-native web_crawl, web_map, and web_research.';
+    }
+    return WEB_BACKEND_INFO[backend]?.description ?? '';
+  }
 
   async function saveWebBackend(): Promise<void> {
     busy = true;
     error = '';
     try {
-      await api.settings.update('web.backend', webBackendForm);
+      const legacyBackend = webSearchBackendForm === 'tavily' && webFetchBackendForm === 'tavily'
+        ? 'tavily'
+        : 'direct';
+      webBackendForm = legacyBackend;
+      await api.settings.update('web.backend', legacyBackend);
       await api.settings.update('web.search_backend', webSearchBackendForm);
       await api.settings.update('web.fetch_backend', webFetchBackendForm);
+      await api.settings.update('web.fetch_fallback_browser', webFetchFallbackBrowserForm);
       await api.settings.update('web.searxng_url', webSearxngUrlForm.trim());
       webConfig = await api.webConfig.status();
       webSearchBackendForm = webConfig.search_backend ?? 'direct';
       webFetchBackendForm = webConfig.fetch_backend ?? 'direct';
+      webFetchFallbackBrowserForm = webConfig.fetch_fallback_browser ?? true;
       webSearxngUrlForm = webConfig.searxng_url ?? '';
       notice = 'Web backend updated.';
       addToast('Web backend updated.', 'success');
@@ -2219,27 +2250,34 @@ import { onMount, tick } from 'svelte';
               <h2 class="mt-1 text-lg font-semibold text-white">Search and fetch backends</h2>
             </div>
             <p class="text-sm leading-6 text-slate-400">
-              Search and fetch are independent. Each agent's <code>web_search</code> uses the search backend; <code>web_fetch</code> uses the fetch backend with auto-fallback to the headless browser on Cloudflare/JS-required errors.
+              Search and fetch are independent. Each agent's <code>web_search</code> uses the search backend. <code>web_fetch</code> should usually stay on direct extraction so browser fallback can rescue Cloudflare-blocked or JS-required pages automatically.
             </p>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Search backend</span>
               <select bind:value={webSearchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="direct">{WEB_BACKEND_INFO.direct.label}</option>
+                <option value="direct">Direct (DuckDuckGo)</option>
                 <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
                 <option value="brave" disabled={!webConfig.brave_configured}>{WEB_BACKEND_INFO.brave.label}{webConfig.brave_configured ? '' : ' (not configured)'}</option>
                 <option value="searxng" disabled={!webConfig.searxng_configured}>{WEB_BACKEND_INFO.searxng.label}{webConfig.searxng_configured ? '' : ' (URL not set)'}</option>
               </select>
             </label>
-            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webSearchBackendForm]?.description ?? ''}</p>
+            <p class="text-sm leading-6 text-slate-400">{searchBackendDescription(webSearchBackendForm)}</p>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Fetch backend</span>
               <select bind:value={webFetchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="direct">{WEB_BACKEND_INFO.direct.label}</option>
+                <option value="direct">Direct extraction (httpx + trafilatura)</option>
                 <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
                 <option value="browser">{WEB_BACKEND_INFO.browser.label}</option>
               </select>
             </label>
-            <p class="text-sm leading-6 text-slate-400">{WEB_BACKEND_INFO[webFetchBackendForm]?.description ?? ''}</p>
+            <p class="text-sm leading-6 text-slate-400">{fetchBackendDescription(webFetchBackendForm)}</p>
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-200">
+              <input bind:checked={webFetchFallbackBrowserForm} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" disabled={webFetchBackendForm === 'browser'} />
+              <span class="space-y-1">
+                <span class="block font-medium text-slate-100">Browser fallback</span>
+                <span class="block text-xs leading-5 text-slate-400">Retry direct fetch failures through the executor browser on Cloudflare/JS-required pages. This is recommended for normal direct fetch usage and ignored when fetch backend is set to always use the browser.</span>
+              </span>
+            </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>SearXNG instance URL (search backend = searxng)</span>
               <Input bind:value={webSearxngUrlForm} placeholder="http://localhost:8888" />
@@ -2257,10 +2295,18 @@ import { onMount, tick } from 'svelte';
             <!-- Direct -->
             <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
               <div>
-                <p class="font-medium text-white">{WEB_BACKEND_INFO.direct.label}</p>
-                <p class="text-xs text-slate-400">Always available, free</p>
+                <p class="font-medium text-white">Direct search + fetch path</p>
+                <p class="text-xs text-slate-400">DuckDuckGo for direct search, httpx + trafilatura for direct fetch. Always available, free.</p>
               </div>
               <ProviderStatusBadge status="healthy" />
+            </div>
+
+            <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <div>
+                <p class="font-medium text-white">Browser fallback</p>
+                <p class="text-xs text-slate-400">{webFetchFallbackBrowserForm ? 'Enabled for direct fetch failures on Cloudflare/JS-required pages.' : 'Disabled. Direct fetch errors are returned without browser retry.'}</p>
+              </div>
+              <ProviderStatusBadge status={webFetchFallbackBrowserForm ? 'healthy' : 'degraded'} />
             </div>
 
             <!-- Tavily -->
@@ -2296,7 +2342,7 @@ import { onMount, tick } from 'svelte';
             </div>
 
             <p class="text-xs text-slate-500">
-              Tavily-only tools (web_crawl, web_map, web_research) require a Tavily API key.
+              <code>web_crawl</code> and <code>web_map</code> work with any fetch backend. Tavily enables its native crawl/map engines, while <code>web_research</code> still requires Tavily.
             </p>
           </div>
 

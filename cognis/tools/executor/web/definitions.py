@@ -136,18 +136,22 @@ def _build_web_fetch(
             "enum": backends,
             "description": (
                 f"Backend to use (default: {default_backend}). "
-                "Omit this unless you need to override the configured default. "
+                "Advanced override: omit this unless you intentionally need a specific backend. "
+                "When omitted, the configured fetch backend runs first and automatic browser fallback can still apply. "
                 f"{_fetch_backend_hints(backends)}"
             ),
         }
 
-    desc = "Fetch content from a URL and return it as text or markdown."
+    desc = (
+        "Fetch content from a URL and return it as text or markdown. "
+        "Normally omit backend so the configured fetch path is used."
+    )
     extras: list[str] = []
     if has_tavily:
-        extras.append("Use 'tavily' for higher-quality extraction with content reranking.")
+        extras.append("Use 'tavily' only when you explicitly want Tavily extraction for this call.")
     if has_browser:
         extras.append(
-            "Use 'browser' for sites that need JS rendering or are blocked by Cloudflare. "
+            "Use 'browser' only when you want every fetch rendered in the headless browser. "
             "On Cloudflare/JS errors the direct backend auto-falls-back to the headless "
             "browser unless web.fetch_fallback_browser is disabled."
         )
@@ -193,7 +197,7 @@ def _build_web_search(
             "enum": backends,
             "description": (
                 f"Backend to use (default: {default_backend}). "
-                "Omit this unless you need to override the configured default. "
+                "Advanced override: omit this unless the user asked for a specific provider or the configured backend failed. "
                 f"{_search_backend_hints(backends)}"
             ),
         }
@@ -480,11 +484,11 @@ def _fetch_backend_hints(backends: list[str]) -> str:
     hints = []
     for b in backends:
         if b == "direct":
-            hints.append("'direct': free httpx fetch with trafilatura extraction")
+            hints.append("'direct': httpx + trafilatura extraction; recommended default")
         elif b == "tavily":
-            hints.append("'tavily': higher quality extraction")
+            hints.append("'tavily': Tavily extract API")
         elif b == "browser":
-            hints.append("'browser': headless Playwright for JS/Cloudflare-blocked sites")
+            hints.append("'browser': always use headless browser rendering for this call")
     return ", ".join(hints) + "." if hints else ""
 
 

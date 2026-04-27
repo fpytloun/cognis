@@ -160,6 +160,9 @@ async def test_crawl_site_visits_each_url_at_most_once(
 
     assert not result.is_error
     assert (result.metadata or {}).get("crawl_pages") == 3
+    assert "[[page:1]]" in result.output
+    assert (result.metadata or {}).get("stored_output")
+    assert (result.metadata or {}).get("output_anchors")
     assert sorted(fake_backend.calls) == [
         "https://example.com/",
         "https://example.com/about",
@@ -189,6 +192,7 @@ async def test_crawl_site_respects_limit(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     # 4 pages crawled (root + 3 children up to limit).
     assert (result.metadata or {}).get("crawl_pages") == 4
+    assert (result.metadata or {}).get("output_anchors")
     assert len(fake_backend.calls) == 4
 
 

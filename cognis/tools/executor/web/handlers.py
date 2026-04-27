@@ -13,6 +13,7 @@ from cognis.tools.executor.web.backends import (
     resolve_fetch_backend,
     resolve_search_backend,
 )
+from cognis.tools.executor.web.backends.formatting import build_fetch_tool_result
 from cognis.tools.executor.web.backends.tavily import TavilyBackend
 from cognis.tools.executor.web.concurrency import (
     WebConcurrencyController,
@@ -140,7 +141,7 @@ def _should_attempt_browser_fallback(
     * the failure is not the kind a browser would fix,
     * no BrowserManager is available on this executor.
     """
-    if user_override:
+    if user_override and user_override != "direct":
         return False
     if primary_backend_name == "browser":
         return False
@@ -413,7 +414,13 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         runtime_metadata=runtime_metadata,
         user_override=backend_name,
     ):
-        return primary_result
+        if primary_result.is_error:
+            return primary_result
+        return build_fetch_tool_result(
+            url=url,
+            content=primary_result.output,
+            metadata=primary_result.metadata,
+        )
 
     browser_backend = get_browser_fetch_backend(runtime_metadata)
     if browser_backend is None:
@@ -440,7 +447,11 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
     )
     if fallback_result.is_error:
         return fallback_result
-    return _annotate_browser_fallback(fallback_result, fallback_used=True)
+    return build_fetch_tool_result(
+        url=url,
+        content=fallback_result.output,
+        metadata=_annotate_browser_fallback(fallback_result, fallback_used=True).metadata,
+    )
 
 
 async def _run_fetch_with_concurrency(

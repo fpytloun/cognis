@@ -27,6 +27,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from cognis.models.tool import ToolResult
+from cognis.tools.executor.web.backends.formatting import build_crawl_tool_result
 from cognis.tools.executor.web.backends.protocol import WebFetchBackend
 from cognis.tools.executor.web.concurrency import (
     WebConcurrencyController,
@@ -176,7 +177,7 @@ async def crawl_site(
             deduped.append((url_, depth))
         queue = deduped
 
-    return _format_crawl_result(start_url, pages)
+    return build_crawl_tool_result(root_url=start_url, pages=pages)
 
 
 # ---------------------------------------------------------------------------
@@ -259,25 +260,3 @@ async def _discover_links(target: str, *, page_timeout: int) -> list[str]:
             if len(out) >= 200:
                 break
         return out
-
-
-def _format_crawl_result(root_url: str, pages: list[dict[str, Any]]) -> ToolResult:
-    if not pages:
-        return ToolResult(output=f"No pages crawled from {root_url}.")
-    chunks: list[str] = [f"# Crawl results for {root_url}", ""]
-    chunks.append(f"Pages: {len(pages)}")
-    chunks.append("")
-    for page in pages:
-        marker = "ERROR" if page["is_error"] else f"depth={page['depth']}"
-        chunks.append(f"## {page['url']} ({marker})")
-        body = page["content"]
-        if isinstance(body, str) and body:
-            # Per-page truncation so a huge crawl doesn't blow context budgets.
-            chunks.append(body[:8000])
-            if len(body) > 8000:
-                chunks.append("\n[truncated]")
-        chunks.append("")
-    return ToolResult(
-        output="\n".join(chunks),
-        metadata={"crawl_pages": len(pages)},
-    )

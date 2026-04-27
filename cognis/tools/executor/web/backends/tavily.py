@@ -13,7 +13,10 @@ import httpx
 
 from cognis.models.tool import ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
-from cognis.tools.executor.web.backends.formatting import build_search_tool_result
+from cognis.tools.executor.web.backends.formatting import (
+    build_crawl_tool_result,
+    build_search_tool_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,17 +293,15 @@ def _format_tavily_crawl(data: dict[str, Any]) -> ToolResult:
     if not results:
         return ToolResult(output="No pages crawled.")
 
-    lines: list[str] = [f"Crawled {len(results)} pages:", ""]
-    for r in results:
-        url = r.get("url", "")
-        title = r.get("title", "")
-        content = r.get("raw_content", r.get("content", ""))
-        lines.append(f"--- {title} ({url}) ---")
-        if content:
-            # Truncate individual page content to keep output manageable
-            if len(content) > 10_000:
-                content = content[:10_000] + "\n[content truncated]"
-            lines.append(content)
-        lines.append("")
-
-    return ToolResult(output="\n".join(lines))
+    pages = [
+        {
+            "url": r.get("url", ""),
+            "title": r.get("title", ""),
+            "content": r.get("raw_content", r.get("content", "")),
+            "is_error": False,
+        }
+        for r in results
+        if isinstance(r, dict)
+    ]
+    root_url = str(data.get("base_url") or pages[0].get("url") or "site")
+    return build_crawl_tool_result(root_url=root_url, pages=pages)

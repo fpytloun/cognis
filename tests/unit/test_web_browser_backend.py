@@ -331,12 +331,15 @@ async def test_handle_web_fetch_auto_fallback_uses_browser_on_cloudflare(
     assert primary_calls == ["https://example.com"]
     assert browser_calls == ["https://example.com"]
     assert not result.is_error
-    assert result.output == "rendered content"
+    assert "rendered content" in result.output
+    assert "[[page:1]]" in result.output
     assert (result.metadata or {}).get("browser_fallback") is True
+    assert (result.metadata or {}).get("stored_output")
+    assert (result.metadata or {}).get("output_anchors")
 
 
 @pytest.mark.asyncio
-async def test_handle_web_fetch_skips_fallback_when_user_overrides_backend(
+async def test_handle_web_fetch_explicit_direct_still_allows_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.tools.executor.web import handlers
@@ -377,8 +380,8 @@ async def test_handle_web_fetch_skips_fallback_when_user_overrides_backend(
     result = await handlers.handle_web_fetch(
         {"url": "https://example.com", "backend": "direct"}, ctx
     )
-    assert result.is_error
-    assert browser_used is False
+    assert not result.is_error
+    assert browser_used is True
 
 
 @pytest.mark.asyncio

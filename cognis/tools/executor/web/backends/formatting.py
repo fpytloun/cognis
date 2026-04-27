@@ -7,6 +7,10 @@ from urllib.parse import urlparse
 from cognis.core.anchored_output import AnchoredTextBuilder, compact_snippet
 from cognis.models.tool import ToolResult
 
+_FETCH_COMPACT_CHARS = 12_000
+_CRAWL_COMPACT_CHARS = 4_000
+_CRAWL_STORED_CHARS = 12_000
+
 
 def url_domain(url: str) -> str:
     """Return a normalized host name for display."""
@@ -81,3 +85,112 @@ def build_search_tool_result(
             "stored_output": stored_output,
         },
     )
+
+
+def build_fetch_tool_result(
+    *,
+    url: str,
+    content: str,
+    metadata: dict[str, object] | None = None,
+) -> ToolResult:
+    """Build compact + stored anchored output for a single fetched page."""
+
+    compact_builder = AnchoredTextBuilder()
+    stored_builder = AnchoredTextBuilder()
+    page_lines = [f"URL: {url}"]
+    domain = url_domain(url)
+    if domain:
+        page_lines.append(f"Domain: {domain}")
+    page_lines.append("")
+
+    compact_builder.add_section(
+        "page:1",
+        kind="page",
+        label=url,
+        lines=page_lines + [_truncate_block(content, max_chars=_FETCH_COMPACT_CHARS)],
+    )
+    stored_builder.add_section(
+        "page:1",
+        kind="page",
+        label=url,
+        lines=page_lines + [content],
+    )
+
+    output, anchors = compact_builder.build()
+    stored_output, _ = stored_builder.build()
+    merged_metadata = dict(metadata or {})
+    merged_metadata.update(
+        {
+            "output_anchors": anchors,
+            "stored_output": stored_output or output,
+            "source_url": url,
+            "original_size": len(content),
+        }
+    )
+    return ToolResult(output=output, metadata=merged_metadata)
+
+
+def build_crawl_tool_result(
+    *,
+    root_url: str,
+    pages: list[dict[str, object]],
+    metadata: dict[str, object] | None = None,
+) -> ToolResult:
+    """Build compact + stored anchored output for crawl results."""
+
+    if not pages:
+        return ToolResult(output=f"No pages crawled from {root_url}.", metadata=metadata)
+
+    compact_builder = AnchoredTextBuilder()
+    stored_builder = AnchoredTextBuilder()
+    compact_builder.add_line(f"# Crawl results for {root_url}")
+    compact_builder.add_line("")
+    compact_builder.add_line(f"Pages: {len(pages)}")
+    compact_builder.add_line("")
+    stored_builder.add_line(f"# Crawl results for {root_url}")
+    stored_builder.add_line("")
+    stored_builder.add_line(f"Pages: {len(pages)}")
+    stored_builder.add_line("")
+
+    for index, page in enumerate(pages, start=1):
+        url = str(page.get("url") or "")
+        depth = page.get("depth")
+        is_error = bool(page.get("is_error"))
+        title = str(page.get("title") or url or f"Page {index}")
+        content = str(page.get("content") or "")
+        page_lines = [f"URL: {url}"] if url else []
+        if depth is not None:
+            page_lines.append(f"Depth: {depth}")
+        page_lines.append(f"Status: {'error' if is_error else 'ok'}")
+        page_lines.append("")
+        compact_builder.add_section(
+            f"page:{index}",
+            kind="page",
+            label=title,
+            lines=page_lines + [_truncate_block(content, max_chars=_CRAWL_COMPACT_CHARS)],
+        )
+        stored_builder.add_section(
+            f"page:{index}",
+            kind="page",
+            label=title,
+            lines=page_lines + [_truncate_block(content, max_chars=_CRAWL_STORED_CHARS)],
+        )
+
+    output, anchors = compact_builder.build()
+    stored_output, _ = stored_builder.build()
+    merged_metadata = dict(metadata or {})
+    merged_metadata.update(
+        {
+            "crawl_pages": len(pages),
+            "output_anchors": anchors,
+            "stored_output": stored_output or output,
+        }
+    )
+    return ToolResult(output=output, metadata=merged_metadata)
+
+
+def _truncate_block(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    suffix = "\n[truncated]"
+    return text[: max_chars - len(suffix)].rstrip() + suffix

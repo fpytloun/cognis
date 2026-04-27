@@ -195,7 +195,16 @@ class TestDefinitions:
         names = {d.name for d in defs}
         assert "web_fetch" not in names
         assert "web_search" not in names
-        assert {"read", "write", "edit", "multiedit", "apply_patch", "grep", "glob", "bash"} <= names
+        assert {
+            "read",
+            "write",
+            "edit",
+            "multiedit",
+            "apply_patch",
+            "grep",
+            "glob",
+            "bash",
+        } <= names
 
 
 class TestDynamicWebDefinitions:
@@ -251,7 +260,7 @@ class TestDynamicWebDefinitions:
         assert "direct" in backend_enum
         assert "tavily" in backend_enum
         assert "default: tavily" in props["backend"]["description"]
-        assert "Omit this unless you need to override" in props["backend"]["description"]
+        assert "Advanced override" in props["backend"]["description"]
 
     def test_fetch_uses_configured_default_backend_in_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -384,7 +393,10 @@ class TestWebFetchHandler:
                 {"url": "https://example.com", "format": "text"}, _DUMMY_CONTEXT
             )
             assert not result.is_error
-            assert result.output == "test content"
+            assert "test content" in result.output
+            assert "[[page:1]]" in result.output
+            assert (result.metadata or {}).get("stored_output")
+            assert (result.metadata or {}).get("output_anchors")
             mock_backend.fetch.assert_awaited_once()
 
     @pytest.mark.asyncio()
@@ -889,12 +901,8 @@ class TestTavilyRequiredTools:
         async def _fake_crawl(**kwargs: object) -> ToolResult:
             return ToolResult(output="diy ok")
 
-        monkeypatch.setattr(
-            "cognis.tools.executor.web.crawler.crawl_site", _fake_crawl
-        )
-        result = await handle_web_crawl(
-            {"url": "https://example.com"}, _DUMMY_CONTEXT
-        )
+        monkeypatch.setattr("cognis.tools.executor.web.crawler.crawl_site", _fake_crawl)
+        result = await handle_web_crawl({"url": "https://example.com"}, _DUMMY_CONTEXT)
         assert not result.is_error
         assert "Tavily" not in result.output
 
@@ -916,9 +924,7 @@ class TestTavilyRequiredTools:
             "cognis.tools.executor.web.sitemap.discover_sitemap_urls",
             _fake_discover,
         )
-        result = await handle_web_map(
-            {"url": "https://example.com"}, _DUMMY_CONTEXT
-        )
+        result = await handle_web_map({"url": "https://example.com"}, _DUMMY_CONTEXT)
         assert not result.is_error
         assert "Tavily" not in result.output
 
