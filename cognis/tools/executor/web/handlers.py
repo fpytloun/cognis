@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 _BROWSER_FALLBACK_HINT_TOKENS: tuple[str, ...] = (
     "cloudflare",
     "circuit breaker",
+    "http 401",
     "rate limited (http 429)",
     "http 403",
     "http 503",

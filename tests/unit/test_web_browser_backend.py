@@ -435,7 +435,7 @@ async def test_handle_web_fetch_no_fallback_for_4xx_user_error(
 
     class _FakePrimary:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
-            # 404 / 401 are not browser-fixable, no fallback.
+            # Plain missing pages are not browser-fixable, so 404 should not retry.
             return ToolResult(output="HTTP 404: Not Found", is_error=True)
 
     browser_used = False
@@ -462,3 +462,45 @@ async def test_handle_web_fetch_no_fallback_for_4xx_user_error(
     assert result.is_error
     assert "404" in result.output
     assert browser_used is False
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_retries_401_through_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(output="HTTP 401: Unauthorized", is_error=True)
+
+    browser_used = False
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            nonlocal browser_used
+            browser_used = True
+            return ToolResult(output="rendered content")
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeBrowser(),
+    )
+
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+        }
+    )
+    result = await handlers.handle_web_fetch(
+        {"url": "https://example.com", "backend": "direct"}, ctx
+    )
+    assert not result.is_error
+    assert browser_used is True
