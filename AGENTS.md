@@ -579,6 +579,7 @@ Full architecture and design specifications are in `docs/specs/`:
 | `21-workflow-deliverables.md` | Typed deliverables, `write_deliverable` tool, step_complete gate, once-only channel delivery |
 | `22-step-profiles.md` | Step profiles (`unrestricted`/`research`/`coding`), tool classification, per-step overrides |
 | `28-agent-sharing.md` | User-to-user agent sharing, `agent_grants`, two-headed runtime identity, Mnemory `(user, owner)` keying, no admin bypass for user-owned resources |
+| `30-projects-and-revisions.md` | Projects with multi-source repos and `project_grants`, project-aware tasks/schedules/conversations, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, and human-as-evaluator revision flow |
 
 **Read the relevant spec before making changes in that area.**
 
