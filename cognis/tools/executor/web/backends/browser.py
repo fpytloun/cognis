@@ -40,14 +40,24 @@ class BrowserFetchBackend:
         *,
         wait_timeout_seconds: float = 30.0,
         session_idle_seconds: float = 60.0,
+        headed: bool = False,
     ) -> None:
         self._manager = manager
         self._wait_timeout_seconds = wait_timeout_seconds
         self._session_idle_seconds = session_idle_seconds
+        self._headed = bool(headed)
 
     @property
     def manager(self) -> BrowserManager:
         return self._manager
+
+    @property
+    def headed(self) -> bool:
+        return self._headed
+
+    @property
+    def mode(self) -> str:
+        return "headed" if self._headed else "headless"
 
     async def fetch(
         self,
@@ -69,7 +79,7 @@ class BrowserFetchBackend:
             session = await self._manager.open_session(
                 session_id=session_id,
                 url=url,
-                headless=True,
+                headless=not self._headed,
                 profile_mode="ephemeral",
                 wait_for_slot=True,
                 wait_timeout_seconds=self._wait_timeout_seconds,
@@ -82,21 +92,27 @@ class BrowserFetchBackend:
                     "Retry shortly or raise web.concurrency.browser_cap."
                 ),
                 is_error=True,
-                metadata={"browser_pool_timeout": True},
+                metadata={
+                    "browser_pool_timeout": True,
+                    "browser_fetch_mode": self.mode,
+                },
             )
         except RuntimeError as exc:
             return ToolResult(
-                output=f"Browser runtime unavailable: {exc}",
+                output=f"Browser runtime unavailable ({self.mode}): {exc}",
                 is_error=True,
+                metadata={"browser_fetch_mode": self.mode},
             )
         except Exception as exc:
             logger.warning(
-                "web: browser fetch open_session failed (%s)",
+                "web: browser fetch open_session failed (%s, mode=%s)",
                 type(exc).__name__,
+                self.mode,
             )
             return ToolResult(
-                output=f"Browser fetch failed to open session: {exc}",
+                output=f"Browser fetch failed to open session ({self.mode}): {exc}",
                 is_error=True,
+                metadata={"browser_fetch_mode": self.mode},
             )
 
         try:
@@ -110,12 +126,14 @@ class BrowserFetchBackend:
                 )
             except Exception as exc:
                 logger.warning(
-                    "web: browser fetch extraction failed (%s)",
+                    "web: browser fetch extraction failed (%s, mode=%s)",
                     type(exc).__name__,
+                    self.mode,
                 )
                 return ToolResult(
-                    output=f"Browser fetch failed: {exc}",
+                    output=f"Browser fetch failed ({self.mode}): {exc}",
                     is_error=True,
+                    metadata={"browser_fetch_mode": self.mode},
                 )
         finally:
             try:
@@ -125,7 +143,7 @@ class BrowserFetchBackend:
 
         return ToolResult(
             output=content,
-            metadata={"browser_fetch": True, **metadata},
+            metadata={"browser_fetch": True, "browser_fetch_mode": self.mode, **metadata},
         )
 
     async def _extract(

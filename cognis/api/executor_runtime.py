@@ -373,6 +373,9 @@ async def _build_configure_payload(
             "web_browser_fetch_wait_timeout_seconds": web_config.get(
                 "web_browser_fetch_wait_timeout_seconds", 30
             ),
+            "web_browser_fetch_headed_fallback_enabled": web_config.get(
+                "web_browser_fetch_headed_fallback_enabled", False
+            ),
             "web_concurrency": web_config.get("web_concurrency", {}),
             "web_available_backends": web_config.get("web_available_backends", ["direct"]),
             "web_available_search_backends": web_config.get(

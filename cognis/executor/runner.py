@@ -366,6 +366,9 @@ class ExecutorRunner:
                 "web_browser_fetch_wait_timeout_seconds": web_config_raw.get(
                     "web_browser_fetch_wait_timeout_seconds", 30
                 ),
+                "web_browser_fetch_headed_fallback_enabled": web_config_raw.get(
+                    "web_browser_fetch_headed_fallback_enabled", False
+                ),
                 "web_concurrency": web_config_raw.get("web_concurrency", {}),
                 "web_available_backends": web_backends,
                 "web_available_search_backends": web_config_raw.get(

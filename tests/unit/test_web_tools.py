@@ -1200,7 +1200,10 @@ class TestRetryLogic:
             assert result.is_error
             assert "Cloudflare" in result.output
             assert "browser" in result.output.lower()
-            assert result.metadata == {"cloudflare_blocked": True}
+            assert result.metadata == {
+                "cloudflare_blocked": True,
+                "direct_fetch_blocked": True,
+            }
 
 
 class TestSettingsSchema:

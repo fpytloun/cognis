@@ -10,6 +10,8 @@ from typing import Any
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.web.backends import (
     get_browser_fetch_backend,
+    get_headed_browser_fetch_backend,
+    headed_fallback_enabled,
     resolve_fetch_backend,
     resolve_search_backend,
 )
@@ -117,11 +119,25 @@ def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
     return any(token in output for token in _BROWSER_FALLBACK_HINT_TOKENS)
 
 
-def _annotate_browser_fallback(result: ToolResult, *, fallback_used: bool) -> ToolResult:
-    if not fallback_used:
+def _annotate_fallback_metadata(
+    result: ToolResult,
+    *,
+    fallback_used: bool,
+    fallback_mode: str | None,
+    modes_attempted: list[str],
+    primary_backend: str,
+) -> ToolResult:
+    if not (fallback_used or modes_attempted):
         return result
     merged = dict(result.metadata or {})
-    merged["browser_fallback"] = True
+    if fallback_used:
+        merged["browser_fallback"] = True
+        merged["browser_fallback_attempted"] = True
+    if fallback_mode:
+        merged["browser_fallback_mode"] = fallback_mode
+    if modes_attempted:
+        merged["browser_fallback_modes_attempted"] = list(modes_attempted)
+    merged.setdefault("primary_backend", primary_backend)
     result.metadata = merged
     return result
 
@@ -136,13 +152,13 @@ def _should_attempt_browser_fallback(
     """Decide if we should retry a failed fetch through the browser backend.
 
     Skips when:
-    * caller explicitly asked for a specific backend,
+    * caller forced a non-direct backend,
     * fallback is disabled via ``web.fetch_fallback_browser`` setting,
     * we're already on the browser backend,
     * the failure is not the kind a browser would fix,
     * no BrowserManager is available on this executor.
     """
-    if user_override and user_override != "direct":
+    if user_override and user_override.lower() not in {"", "direct"}:
         return False
     if primary_backend_name == "browser":
         return False
@@ -152,6 +168,98 @@ def _should_attempt_browser_fallback(
     if fallback_setting is False:
         return False
     return get_browser_fetch_backend(runtime_metadata) is not None
+
+
+def _explain_skipped_fallback(
+    *,
+    primary_label: str,
+    primary_result: ToolResult,
+    runtime_metadata: dict[str, Any],
+    user_override: str | None,
+) -> ToolResult:
+    """Annotate primary errors when no browser fallback was attempted.
+
+    The LLM (and user) need to know whether a browser retry happened, was
+    blocked, or was disabled — otherwise the new direct-fetch error message
+    keeps suggesting fallback that never runs.
+    """
+    metadata = dict(primary_result.metadata or {})
+    metadata.setdefault("primary_backend", primary_label)
+    metadata["browser_fallback_attempted"] = False
+    fallback_disabled = runtime_metadata.get("web_fetch_fallback_browser", True) is False
+    explicit_non_direct = bool(
+        user_override
+        and isinstance(user_override, str)
+        and user_override.lower() not in {"", "direct"}
+    )
+    suffix: str | None = None
+    if explicit_non_direct:
+        metadata["browser_fallback_skipped_reason"] = "explicit_backend_override"
+    elif primary_label == "browser":
+        metadata["browser_fallback_skipped_reason"] = "primary_is_browser"
+    elif fallback_disabled:
+        metadata["browser_fallback_skipped_reason"] = "fallback_disabled"
+        suffix = (
+            "Browser fallback is disabled (web.fetch_fallback_browser=false); "
+            "no headless or headed retry was attempted."
+        )
+    elif get_browser_fetch_backend(runtime_metadata) is None:
+        metadata["browser_fallback_skipped_reason"] = "browser_unavailable"
+        suffix = (
+            "Browser fallback is enabled but no browser runtime is wired into "
+            "this executor; no retry was attempted."
+        )
+    else:
+        # Failure profile didn't look browser-fixable (e.g. plain 404).
+        metadata["browser_fallback_skipped_reason"] = "not_browser_fixable"
+    if suffix:
+        primary_result = ToolResult(
+            output=f"{primary_result.output.rstrip()}\n{suffix}",
+            is_error=True,
+            metadata=metadata,
+        )
+    else:
+        primary_result.metadata = metadata
+    return primary_result
+
+
+def _combined_fallback_failure(
+    *,
+    primary_label: str,
+    primary_result: ToolResult,
+    fallback_results: list[tuple[str, ToolResult]],
+    modes_attempted: list[str],
+    headed_skipped_reason: str | None,
+) -> ToolResult:
+    """Build a combined diagnostic when every fallback mode fails."""
+    lines: list[str] = [
+        f"{primary_label} fetch failed: {primary_result.output.strip() or 'unknown error'}",
+    ]
+    for mode, result in fallback_results:
+        suffix = result.output.strip() or "unknown error"
+        lines.append(f"{mode.capitalize()} browser fallback failed: {suffix}")
+    if headed_skipped_reason:
+        lines.append(headed_skipped_reason)
+    metadata: dict[str, Any] = {
+        "primary_backend": primary_label,
+        "primary_error": primary_result.output[:500],
+        "browser_fallback_attempted": bool(fallback_results),
+        "browser_fallback_modes_attempted": list(modes_attempted),
+        "browser_fallback_success": False,
+    }
+    for mode, result in fallback_results:
+        if result.metadata:
+            metadata.setdefault(f"{mode}_fallback_metadata", dict(result.metadata))
+        metadata[f"{mode}_fallback_error"] = (result.output or "")[:500]
+    if primary_result.metadata:
+        for key in ("cloudflare_blocked", "direct_fetch_blocked"):
+            if primary_result.metadata.get(key):
+                metadata[key] = True
+    return ToolResult(
+        output="\n".join(lines),
+        is_error=True,
+        metadata=metadata,
+    )
 
 
 def _normalize_tavily_string_option(
@@ -423,7 +531,12 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         user_override=backend_name,
     ):
         if primary_result.is_error:
-            return primary_result
+            return _explain_skipped_fallback(
+                primary_label=primary_label,
+                primary_result=primary_result,
+                runtime_metadata=runtime_metadata,
+                user_override=backend_name,
+            )
         return build_fetch_tool_result(
             url=url,
             content=primary_result.output,
@@ -434,8 +547,12 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
     if browser_backend is None:
         return primary_result
 
+    fallback_attempts: list[tuple[str, ToolResult]] = []
+    modes_attempted: list[str] = []
+    headed_skipped_reason: str | None = None
+
     logger.info(
-        "web: fetch falling back to browser backend",
+        "web: fetch falling back to headless browser backend",
         extra={
             "extra_data": {
                 "url_host": host_for(url) or "unknown",
@@ -444,7 +561,7 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
             }
         },
     )
-    fallback_result = await _run_fetch_with_concurrency(
+    headless_result = await _run_fetch_with_concurrency(
         controller=controller,
         backend=browser_backend,
         backend_label="browser",
@@ -453,12 +570,73 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         timeout=timeout_int,
         options=fetch_options,
     )
-    if fallback_result.is_error:
-        return fallback_result
-    return build_fetch_tool_result(
-        url=url,
-        content=fallback_result.output,
-        metadata=_annotate_browser_fallback(fallback_result, fallback_used=True).metadata,
+    modes_attempted.append("headless")
+    if not headless_result.is_error:
+        return build_fetch_tool_result(
+            url=url,
+            content=headless_result.output,
+            metadata=_annotate_fallback_metadata(
+                headless_result,
+                fallback_used=True,
+                fallback_mode="headless",
+                modes_attempted=modes_attempted,
+                primary_backend=primary_label,
+            ).metadata,
+        )
+    fallback_attempts.append(("headless", headless_result))
+
+    headed_backend = (
+        get_headed_browser_fetch_backend(runtime_metadata)
+        if headed_fallback_enabled(runtime_metadata)
+        else None
+    )
+    if headed_backend is None:
+        if runtime_metadata.get("web_browser_fetch_headed_fallback_enabled"):
+            headed_skipped_reason = (
+                "Headed browser fallback is enabled but the executor browser "
+                "manager has not been opted in to headed mode (browser.headed_allowed)."
+            )
+    else:
+        logger.info(
+            "web: fetch escalating to headed browser fallback",
+            extra={
+                "extra_data": {
+                    "url_host": host_for(url) or "unknown",
+                    "primary_backend": primary_label,
+                    "headless_error": headless_result.output[:120],
+                }
+            },
+        )
+        headed_result = await _run_fetch_with_concurrency(
+            controller=controller,
+            backend=headed_backend,
+            backend_label="browser",
+            url=url,
+            output_format=output_format,
+            timeout=timeout_int,
+            options=fetch_options,
+        )
+        modes_attempted.append("headed")
+        if not headed_result.is_error:
+            return build_fetch_tool_result(
+                url=url,
+                content=headed_result.output,
+                metadata=_annotate_fallback_metadata(
+                    headed_result,
+                    fallback_used=True,
+                    fallback_mode="headed",
+                    modes_attempted=modes_attempted,
+                    primary_backend=primary_label,
+                ).metadata,
+            )
+        fallback_attempts.append(("headed", headed_result))
+
+    return _combined_fallback_failure(
+        primary_label=primary_label,
+        primary_result=primary_result,
+        fallback_results=fallback_attempts,
+        modes_attempted=modes_attempted,
+        headed_skipped_reason=headed_skipped_reason,
     )
 
 

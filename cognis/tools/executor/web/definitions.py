@@ -155,7 +155,10 @@ def _build_web_fetch(
 
     desc = (
         "Fetch content from a URL and return it as text or markdown. "
-        "Normally omit backend so the configured fetch path is used."
+        "Normally omit backend so the configured fetch path is used. "
+        "Direct fetches automatically retry through the headless browser, "
+        "and optionally a headed browser, when the controller is configured "
+        "to do so."
     )
     extras: list[str] = []
     if has_tavily:
@@ -163,8 +166,8 @@ def _build_web_fetch(
     if has_browser:
         extras.append(
             "Use 'browser' only when you want every fetch rendered in the headless browser. "
-            "On Cloudflare/JS errors the direct backend auto-falls-back to the headless "
-            "browser unless web.fetch_fallback_browser is disabled."
+            "When backend='browser' is set explicitly the controller does NOT silently "
+            "fall back to direct fetch."
         )
     if extras:
         desc += " " + " ".join(extras)

@@ -845,6 +845,7 @@ async def _resolve_web_config(
     searxng_language = ""
     browser_fetch_session_idle = 60
     browser_fetch_wait_timeout = 30
+    browser_fetch_headed_fallback = False
     concurrency: dict[str, Any] = {
         "global_cap": 32,
         "per_host_cap": 4,
@@ -914,6 +915,11 @@ async def _resolve_web_config(
                 )
                 if isinstance(wait_value, int) and wait_value > 0:
                     browser_fetch_wait_timeout = wait_value
+                headed_value = await get_setting_value(
+                    session, "web.browser_fetch.headed_fallback_enabled", False
+                )
+                if isinstance(headed_value, bool):
+                    browser_fetch_headed_fallback = headed_value
 
                 async def _read_int(key: str, default: int) -> int:
                     raw = await get_setting_value(session, key, default)
@@ -989,6 +995,7 @@ async def _resolve_web_config(
         "web_searxng_language": searxng_language,
         "web_browser_fetch_session_idle_seconds": browser_fetch_session_idle,
         "web_browser_fetch_wait_timeout_seconds": browser_fetch_wait_timeout,
+        "web_browser_fetch_headed_fallback_enabled": browser_fetch_headed_fallback,
         "web_concurrency": concurrency,
         "web_secrets": web_secrets,
         "web_available_backends": available_union,

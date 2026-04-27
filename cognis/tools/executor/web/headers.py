@@ -118,13 +118,15 @@ async def fetch_with_retry(
                 if cf_mitigated:
                     return ToolResult(
                         output=(
-                            "This site is protected by Cloudflare and requires "
-                            "browser access. Retry with backend='browser' (or enable "
-                            "web.fetch_fallback_browser in Settings > Web for "
-                            "automatic fallback)."
+                            "Direct HTTP fetch was blocked by Cloudflare browser "
+                            "verification. The controller may attempt headless "
+                            "(and optionally headed) browser fallback."
                         ),
                         is_error=True,
-                        metadata={"cloudflare_blocked": True},
+                        metadata={
+                            "cloudflare_blocked": True,
+                            "direct_fetch_blocked": True,
+                        },
                     )
 
             if response.status_code >= 500 and attempt < max_retries - 1:

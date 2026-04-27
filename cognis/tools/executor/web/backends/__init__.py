@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from cognis.models.tool import ToolResult
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.web.backends.brave import BraveBackend
 from cognis.tools.executor.web.backends.browser import BrowserFetchBackend
@@ -35,6 +36,9 @@ __all__ = [
     "available_search_backends",
     "available_backends",
     "get_tavily_backend",
+    "get_browser_fetch_backend",
+    "get_headed_browser_fetch_backend",
+    "headed_fallback_enabled",
     "resolve_fetch_backend",
     "resolve_search_backend",
 ]
@@ -47,6 +51,8 @@ _brave: BraveBackend | None = None
 _searxng: SearxngBackend | None = None
 _browser_fetch: BrowserFetchBackend | None = None
 _browser_fetch_manager: BrowserManager | None = None
+_browser_fetch_headed: BrowserFetchBackend | None = None
+_browser_fetch_headed_manager: BrowserManager | None = None
 
 
 def _get_tavily(secrets: dict[str, str]) -> TavilyBackend | None:
@@ -94,11 +100,52 @@ def _get_searxng(metadata: dict[str, Any]) -> SearxngBackend | None:
 
 
 def _get_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
-    """Construct (and cache) the browser fetch backend bound to this executor."""
+    """Construct (and cache) the headless browser fetch backend bound to this executor."""
     global _browser_fetch, _browser_fetch_manager  # noqa: PLW0603
     manager = metadata.get(BROWSER_MANAGER_KEY)
     if not isinstance(manager, BrowserManager) or not manager.enabled:
         return None
+    wait_timeout, idle_timeout = _browser_fetch_timeouts(metadata)
+    if (
+        _browser_fetch is None
+        or _browser_fetch_manager is not manager
+        or _browser_fetch._wait_timeout_seconds != wait_timeout  # noqa: SLF001
+    ):
+        _browser_fetch = BrowserFetchBackend(
+            manager,
+            wait_timeout_seconds=wait_timeout,
+            session_idle_seconds=idle_timeout,
+            headed=False,
+        )
+        _browser_fetch_manager = manager
+    return _browser_fetch
+
+
+def _get_headed_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
+    """Construct (and cache) the headed browser fetch backend, when allowed."""
+    global _browser_fetch_headed, _browser_fetch_headed_manager  # noqa: PLW0603
+    manager = metadata.get(BROWSER_MANAGER_KEY)
+    if not isinstance(manager, BrowserManager) or not manager.enabled:
+        return None
+    if not getattr(manager, "headed_allowed", False):
+        return None
+    wait_timeout, idle_timeout = _browser_fetch_timeouts(metadata)
+    if (
+        _browser_fetch_headed is None
+        or _browser_fetch_headed_manager is not manager
+        or _browser_fetch_headed._wait_timeout_seconds != wait_timeout  # noqa: SLF001
+    ):
+        _browser_fetch_headed = BrowserFetchBackend(
+            manager,
+            wait_timeout_seconds=wait_timeout,
+            session_idle_seconds=idle_timeout,
+            headed=True,
+        )
+        _browser_fetch_headed_manager = manager
+    return _browser_fetch_headed
+
+
+def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float]:
     wait_timeout_raw = metadata.get("web_browser_fetch_wait_timeout_seconds", 30.0)
     idle_raw = metadata.get("web_browser_fetch_session_idle_seconds", 60.0)
     try:
@@ -109,18 +156,7 @@ def _get_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
         idle_timeout = float(idle_raw)
     except (TypeError, ValueError):
         idle_timeout = 60.0
-    if (
-        _browser_fetch is None
-        or _browser_fetch_manager is not manager
-        or _browser_fetch._wait_timeout_seconds != wait_timeout  # noqa: SLF001
-    ):
-        _browser_fetch = BrowserFetchBackend(
-            manager,
-            wait_timeout_seconds=wait_timeout,
-            session_idle_seconds=idle_timeout,
-        )
-        _browser_fetch_manager = manager
-    return _browser_fetch
+    return wait_timeout, idle_timeout
 
 
 def _resolve_backend_name(metadata: dict[str, Any], override: str | None, *, axis: str) -> str:
@@ -147,18 +183,28 @@ def resolve_fetch_backend(
     metadata: dict[str, Any],
     backend_override: str | None = None,
 ) -> WebFetchBackend:
-    """Resolve the fetch backend from runtime metadata and optional override."""
+    """Resolve the fetch backend from runtime metadata and optional override.
+
+    When the caller forces ``backend='browser'`` we return a sentinel
+    :class:`_UnavailableBrowserBackend` instead of silently falling through to
+    direct fetch. That keeps the Cloudflare/JS framing intact instead of
+    sending the request via httpx and emitting the misleading direct error.
+    """
     backend_name = _resolve_backend_name(metadata, backend_override, axis="fetch").lower()
     secrets = metadata.get("web_secrets", {})
+    explicit_override = bool(backend_override and isinstance(backend_override, str))
 
     if backend_name == "tavily":
         tavily = _get_tavily(secrets)
         if tavily is not None:
             return tavily
+        if explicit_override:
+            return _UnavailableTavilyBackend()
     if backend_name == "browser":
         browser = _get_browser_fetch(metadata)
         if browser is not None:
             return browser
+        return _UnavailableBrowserBackend()
     # All other names (direct, brave, searxng) fall through to direct.
     # Brave + SearXNG are search-only; trying to fetch through them is a
     # no-op so we degrade gracefully.
@@ -195,8 +241,21 @@ def get_tavily_backend(metadata: dict[str, Any]) -> TavilyBackend | None:
 
 
 def get_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
-    """Return the browser fetch backend if a BrowserManager is wired in."""
+    """Return the headless browser fetch backend if a BrowserManager is wired in."""
     return _get_browser_fetch(metadata)
+
+
+def get_headed_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
+    """Return the headed browser fetch backend if it is allowed by config."""
+    return _get_headed_browser_fetch(metadata)
+
+
+def headed_fallback_enabled(metadata: dict[str, Any]) -> bool:
+    """Return True when both the manager and settings permit a headed retry."""
+    if not bool(metadata.get("web_browser_fetch_headed_fallback_enabled", False)):
+        return False
+    manager = metadata.get(BROWSER_MANAGER_KEY)
+    return bool(manager is not None and getattr(manager, "headed_allowed", False))
 
 
 def available_fetch_backends(metadata: dict[str, Any]) -> list[str]:
@@ -234,3 +293,59 @@ def available_backends(metadata: dict[str, Any]) -> list[str]:
         if name not in seen:
             seen.append(name)
     return seen
+
+
+class _UnavailableBrowserBackend:
+    """Sentinel returned when the LLM forces ``backend='browser'`` but the
+    executor has no browser runtime wired in.
+
+    Returning this sentinel from :func:`resolve_fetch_backend` instead of the
+    direct backend keeps the explicit override honest: the LLM gets a real
+    ``browser unavailable`` diagnostic instead of a silently-direct fetch and
+    the misleading Cloudflare retry hint that follows.
+    """
+
+    backend_name = "browser"
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        output_format: str = "markdown",
+        timeout: int = 30,
+        options: dict[str, Any] | None = None,
+    ) -> ToolResult:  # pragma: no cover - thin sentinel
+        del url, output_format, timeout, options
+        return ToolResult(
+            output=(
+                "Browser fetch backend is unavailable on this executor. "
+                "Enable browser tooling and a runtime, or omit backend so the "
+                "controller can use direct fetch with optional browser fallback."
+            ),
+            is_error=True,
+            metadata={"browser_unavailable": True},
+        )
+
+
+class _UnavailableTavilyBackend:
+    """Sentinel returned when ``backend='tavily'`` is forced without an API key."""
+
+    backend_name = "tavily"
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        output_format: str = "markdown",
+        timeout: int = 30,
+        options: dict[str, Any] | None = None,
+    ) -> ToolResult:  # pragma: no cover - thin sentinel
+        del url, output_format, timeout, options
+        return ToolResult(
+            output=(
+                "Tavily fetch backend is unavailable: configure a Tavily API key "
+                "or omit backend to use direct fetch."
+            ),
+            is_error=True,
+            metadata={"tavily_unavailable": True},
+        )

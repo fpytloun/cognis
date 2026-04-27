@@ -324,11 +324,14 @@ over this skill for paid users who want a turnkey multi-source report.
    never paper over it. When they agree, you can compress.
 6. **Cite.** Every non-trivial claim in the synthesis should reference
    the URL it came from. The user can audit. Use markdown links.
-7. **Escalate carefully.** If `web_fetch` returns a Cloudflare-blocked
-   error and `web.fetch_fallback_browser` is enabled, the headless
-   browser fallback already kicked in. If the fallback also fails,
-   suggest the user enable headed mode or pick a different source
-   instead of retrying mechanically.
+7. **Escalate carefully.** If `web_fetch` reports both a primary failure
+   and a "headless browser fallback failed" message in the same error,
+   the controller already exhausted the headless retry. Headed
+   fallback (if enabled via `web.browser_fetch.headed_fallback_enabled`)
+   runs automatically after that. Do not manually retry with
+   `backend='browser'` to "force" a browser fetch — it will only repeat
+   the same headless attempt. Pick a different source or escalate to
+   the user instead.
 8. **Stop at "enough".** Quit when adding another source would be
    redundant. Five high-quality citations beat fifteen low-quality ones.
 

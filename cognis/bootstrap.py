@@ -67,6 +67,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "web.searxng_language": ("web", ""),
     "web.browser_fetch.session_idle_seconds": ("web", 60),
     "web.browser_fetch.wait_timeout_seconds": ("web", 30),
+    "web.browser_fetch.headed_fallback_enabled": ("web", False),
     "web.concurrency.global_cap": ("web", 32),
     "web.concurrency.per_host_cap": ("web", 4),
     "web.concurrency.direct_cap": ("web", 16),
