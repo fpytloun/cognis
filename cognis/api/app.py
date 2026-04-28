@@ -300,6 +300,7 @@ def create_app() -> FastAPI:
             tool_output_store=tool_output_store,
             image_generation_provider=providers.image_generation,
             artifact_store=artifact_store,
+            event_bus=event_bus,
         )
         agent_registry = AgentRegistry(session_factory)
         workflow_registry = WorkflowRegistry(session_factory)
@@ -382,6 +383,7 @@ def create_app() -> FastAPI:
             agent_registry=agent_registry,
             llm_provider=providers.llm,
         )
+        tool_router._task_queue = task_queue
         agent_loop.set_task_queue(task_queue)
         # Unified notification service — created early so recovery code
         # can use it.  Must be before recover_paused_tasks().

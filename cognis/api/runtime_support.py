@@ -37,7 +37,12 @@ from cognis.models.tool import (
     tool_matches_identifier,
 )
 from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
-from cognis.runtime_context import current_effective_working_directory, current_workspace_root
+from cognis.runtime_context import (
+    RuntimeAccessContext,
+    current_effective_working_directory,
+    current_workspace_root,
+)
+from cognis.tools.builtin.agent_management import agent_management_tools
 from cognis.tools.builtin.artifact_tools import artifact_tools
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
@@ -60,6 +65,8 @@ from cognis.tools.skills import (
 )
 
 logger = get_logger(__name__)
+
+DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents"})
 
 INTARIS_MCP_FALLBACKS = Counter(
     "cognis_intaris_mcp_fallbacks_total",
@@ -367,6 +374,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *orchestration_tools(),
         *workflow_tools(),
         *memory_tools(),
+        *agent_management_tools(),
         *tool_output_tools(),
         *image_tools(),
         *skill_management_tools(),
@@ -376,20 +384,47 @@ def static_tool_definitions() -> list[ToolDefinition]:
     ]
 
 
-def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
+def _opted_in_builtin_tools(agent: Any | None) -> set[str]:
+    if agent is None or not isinstance(getattr(agent, "tools", None), dict):
+        return set()
+    raw = agent.tools.get("opt_in_builtin_tools")
+    if not isinstance(raw, list):
+        return set()
+    return {str(item) for item in raw if isinstance(item, str) and item.strip()}
+
+
+def _management_tools_allowed(
+    agent: Any | None,
+    access_context: RuntimeAccessContext | None,
+) -> bool:
+    if agent is None:
+        return False
+    if "manage_agents" not in _opted_in_builtin_tools(agent):
+        return False
+    if getattr(agent, "agent_type", "primary") == "secondary":
+        return False
+    return bool(access_context is not None and access_context.is_root_owner_primary_chat)
+
+
+def select_static_tools(
+    agent: Any | None = None,
+    *,
+    access_context: RuntimeAccessContext | None = None,
+) -> list[ToolDefinition]:
     """Filter static builtin tools for an agent definition."""
     definitions = static_tool_definitions()
-    if agent is None or not isinstance(agent.tools, dict):
-        return definitions
+    if agent is None:
+        return [tool for tool in definitions if tool.name not in DEFAULT_OFF_BUILTIN_TOOLS]
 
-    builtin_allow = agent.tools.get("builtin_tools")
+    agent_tools_config = agent.tools if isinstance(agent.tools, dict) else {}
+    builtin_allow = agent_tools_config.get("builtin_tools")
     allowlist = builtin_allow if isinstance(builtin_allow, list) else None
     skill_tool_names = load_skill_tool_names(agent)
     allow_all_builtins = allowlist is None or "*" in allowlist
-    delegation_enabled = bool(agent.tools.get("delegation_tools", True))
+    delegation_enabled = bool(agent_tools_config.get("delegation_tools", True))
 
-    disabled_categories = set(agent.tools.get("disabled_categories") or [])
-    disabled_tools = set(agent.tools.get("disabled_tools") or [])
+    disabled_categories = set(agent_tools_config.get("disabled_categories") or [])
+    disabled_tools = set(agent_tools_config.get("disabled_tools") or [])
     skill_mutation_tools = {
         "skill_write",
         "skill_delete",
@@ -402,10 +437,18 @@ def select_static_tools(agent: Any | None = None) -> list[ToolDefinition]:
 
     selected: list[ToolDefinition] = []
     for tool in definitions:
+        default_off_allowed = False
+        if tool.name in DEFAULT_OFF_BUILTIN_TOOLS:
+            default_off_allowed = _management_tools_allowed(agent, access_context)
+            if not default_off_allowed:
+                continue
         # Agent-level disable takes precedence
         if tool.category in disabled_categories or any(
             tool_matches_identifier(tool, identifier) for identifier in disabled_tools
         ):
+            continue
+        if default_off_allowed:
+            selected.append(tool)
             continue
         if tool.category == "orchestration":
             if delegation_enabled:
@@ -552,6 +595,7 @@ def build_step_runtime_factory(
         user_email: str,
         *,
         executor_agent: AgentDefinition | None = None,
+        access_context: RuntimeAccessContext | None = None,
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
@@ -596,7 +640,9 @@ def build_step_runtime_factory(
         # Filter tools by agent config AND executor enablement.
         # Exclude web-category tools — they are injected dynamically below
         # based on available backends.
-        agent_tools = [t for t in select_static_tools(tool_agent) if t.category != "web"]
+        agent_tools = [
+            t for t in select_static_tools(tool_agent, access_context=access_context) if t.category != "web"
+        ]
 
         # Add dynamic web tool definitions based on available backends
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -621,6 +667,12 @@ def build_step_runtime_factory(
                 resolved_skills = await resolve_skills_for_agent(
                     db_session, tool_agent, owner_email=user_email
                 )
+            if not _management_tools_allowed(tool_agent, access_context):
+                resolved_skills.skills = [
+                    skill
+                    for skill in resolved_skills.skills
+                    if skill.skill_id != "cognis-agent-manager"
+                ]
             if resolved_skills.skills:
                 # Build compact metadata for the immutable prompt prefix
                 metadata = build_available_skills_metadata(resolved_skills)
@@ -1177,6 +1229,12 @@ async def _merge_remote_runtime_inventory(
     merged_names: set[str] = set()
     collision_count = 0
 
+    builtin_defs = sorted(
+        [tool for tool in agent_tools if tool.source.type in ("builtin", "skill")],
+        key=_tool_collision_identity,
+    )
+    reserved_controller_names = set(DEFAULT_OFF_BUILTIN_TOOLS)
+
     remote_defs: list[ToolDefinition] = []
     for tool_data in remote_tools_data:
         tool_def = ToolDefinition.model_validate(tool_data)
@@ -1194,6 +1252,13 @@ async def _merge_remote_runtime_inventory(
         )
     )
     for tool in remote_defs:
+        if tool.name in reserved_controller_names:
+            collision_count += 1
+            _append_warning(
+                warnings,
+                "Remote executor tool was hidden because its name is reserved by a controller tool.",
+            )
+            continue
         if tool.name in merged_names:
             collision_count += 1
             _append_warning(
@@ -1204,10 +1269,6 @@ async def _merge_remote_runtime_inventory(
         merged.append(tool)
         merged_names.add(tool.name)
 
-    builtin_defs = sorted(
-        [tool for tool in agent_tools if tool.source.type in ("builtin", "skill")],
-        key=_tool_collision_identity,
-    )
     for tool in builtin_defs:
         if tool.name in merged_names:
             collision_count += 1

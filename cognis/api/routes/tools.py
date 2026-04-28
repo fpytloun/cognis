@@ -62,6 +62,7 @@ from cognis.models.tool import (
     tool_display_name,
 )
 from cognis.ownership import is_shared_owner_email
+from cognis.runtime_context import RuntimeAccessContext
 from cognis.store.models import ToolClassificationRow
 from cognis.store.queries import (
     create_mcp_server,
@@ -217,6 +218,12 @@ async def get_agent_effective_tools(request: Request, agent_id: str) -> Effectiv
         acting_user_email=access.user.email,
         executor_owner_email=executor_owner_email,
         require_default_executor=require_default_executor,
+        access_context=RuntimeAccessContext(
+            user_email=access.user.email,
+            agent_id=agent.agent_id,
+            agent_owner_email=agent.owner_email,
+            agent_type=agent.agent_type,
+        ),
     )
 
 
@@ -233,12 +240,19 @@ async def preview_effective_tools(
         tools=payload.tools,
         permissions=AgentPermissions.model_validate(payload.permissions or {}),
         execution=payload.execution,
+        agent_type=payload.agent_type,
     )
     return await _resolve_effective_tools_response(
         request,
         agent,
         acting_user_email=user.email,
         executor_owner_email=user.email,
+        access_context=RuntimeAccessContext(
+            user_email=user.email,
+            agent_id=agent.agent_id,
+            agent_owner_email=user.email,
+            agent_type=agent.agent_type,
+        ),
     )
 
 
@@ -356,6 +370,7 @@ async def _resolve_effective_tools_response(
     acting_user_email: str,
     executor_owner_email: str,
     require_default_executor: bool = False,
+    access_context: RuntimeAccessContext | None = None,
 ) -> EffectiveToolsResponse:
     session_factory = request.app.state.session_factory
     policy = await load_executor_policy(session_factory)
@@ -410,7 +425,9 @@ async def _resolve_effective_tools_response(
     )
 
     configured_tools: list[ToolDefinition] = []
-    for tool in [tool for tool in select_static_tools(agent) if tool.category != "web"]:
+    for tool in [
+        tool for tool in select_static_tools(agent, access_context=access_context) if tool.category != "web"
+    ]:
         if tool.source.type == "builtin" or is_tool_enabled(
             tool, selected.enabled_tools or [], selected.enabled_tool_groups or []
         ):
@@ -699,8 +716,14 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
     access = await check_agent_access(request, agent, required="view")
+    access_context = RuntimeAccessContext(
+        user_email=access.user.email,
+        agent_id=agent.agent_id,
+        agent_owner_email=agent.owner_email,
+        agent_type=agent.agent_type,
+    )
     classified_static = await resolve_tool_classifications(
-        select_static_tools(agent),
+        select_static_tools(agent, access_context=access_context),
         session_factory=request.app.state.session_factory,
         owner_email=agent.owner_email,
         queue=getattr(request.app.state, "tool_classification_queue", None),

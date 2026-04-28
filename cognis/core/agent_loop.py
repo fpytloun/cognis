@@ -111,6 +111,7 @@ from cognis.models.workflow import (
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import (  # noqa: F401 — used in delegation
+    RuntimeAccessContext,
     current_effective_working_directory,
     current_workspace_root,
     scoped_runtime_context,
@@ -1888,6 +1889,7 @@ class AgentLoop:
         agent: AgentDefinition,
         executor_agent: AgentDefinition,
         user_email: str,
+        access_context: RuntimeAccessContext | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
@@ -1896,6 +1898,7 @@ class AgentLoop:
                 agent=agent,
                 user_email=user_email,
                 executor_agent=executor_agent,
+                access_context=access_context,
             )
 
         raise RuntimeError("Step runtime factory unavailable; refusing delegation fallback")
@@ -1975,10 +1978,21 @@ class AgentLoop:
                 user_email=child_session.user_email,
             )
             child_executor_agent = self._executor_agent_for_child(agent, resolved_agent)
+            child_access_context = RuntimeAccessContext(
+                user_email=child_session.user_email,
+                agent_id=resolved_agent.agent_id,
+                agent_owner_email=resolved_agent.owner_email,
+                agent_type=resolved_agent.agent_type,
+                session_id=child_session.session_id,
+                parent_session_id=child_session.parent_session_id,
+                delegation_mode=child_session.delegation_mode,
+                workflow_step=False,
+            )
             child_runtime = await self._resolve_child_runtime(
                 agent=resolved_agent,
                 executor_agent=child_executor_agent,
                 user_email=child_session.user_email,
+                access_context=child_access_context,
             )
 
             child_step = StepDefinition(
@@ -2014,6 +2028,7 @@ class AgentLoop:
                 agent_owner_email=resolved_agent.owner_email,
                 workspace_root=current_workspace_root.get(),
                 effective_working_directory=current_effective_working_directory.get(),
+                access_context=child_access_context,
             ):
                 output = await self.run_step(
                     child_ctx,
@@ -9184,6 +9199,16 @@ class AgentLoop:
 
     def _tool_runtime_metadata(self, ctx: StepContext) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
+        metadata["runtime_access"] = {
+            "user_email": ctx.session.user_email,
+            "agent_id": ctx.agent.agent_id,
+            "agent_owner_email": ctx.agent.owner_email,
+            "agent_type": ctx.agent.agent_type,
+            "session_id": ctx.session.session_id,
+            "parent_session_id": ctx.session.parent_session_id,
+            "delegation_mode": ctx.session.delegation_mode,
+            "workflow_step": bool(ctx.task_id or ctx.step_run_id),
+        }
         if ctx.workspace_root:
             metadata["workspace_root"] = ctx.workspace_root
         if ctx.working_directory:

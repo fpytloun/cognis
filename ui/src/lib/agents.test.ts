@@ -85,6 +85,33 @@ describe('agent payload mapping', () => {
     });
   });
 
+  it('round-trips default-off builtin tool opt-ins', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: { opt_in_builtin_tools: ['manage_agents'], custom_flag: true }
+    } as never);
+
+    expect(form.optInBuiltinTools).toEqual(['manage_agents']);
+
+    const payload = formStateToPayload(form);
+    expect(payload.tools).toMatchObject({
+      custom_flag: true,
+      opt_in_builtin_tools: ['manage_agents']
+    });
+  });
+
+  it('omits default-off builtin tool opt-ins for secondary agents', () => {
+    const form = createEmptyAgentForm();
+    form.agentType = 'secondary';
+    form.optInBuiltinTools = ['manage_agents'];
+
+    const payload = formStateToPayload(form);
+
+    expect(payload.tools).not.toHaveProperty('opt_in_builtin_tools');
+  });
+
   it('returns empty preview when no identity is configured', () => {
     const form = createEmptyAgentForm();
     expect(buildSystemPromptPreview(form)).toBe('');
@@ -110,6 +137,7 @@ describe('agent payload mapping', () => {
 
     expect(payload).toEqual({
       agent_id: 'agent-1',
+      agent_type: 'primary',
       skills: {},
       tools: {
         delegation_tools: true,

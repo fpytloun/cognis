@@ -10,12 +10,23 @@ from cognis.api.runtime_support import (
     _build_remote_runtime_registry,
     _merge_remote_runtime_inventory,
     _resolve_intaris_mcp_tools,
+    select_static_tools,
 )
 from cognis.core.executor_policy import ExecutorPolicy
+from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ExecutorHandle, ToolDefinition, ToolSource, sanitize_mcp_tool_name
+from cognis.models.session import SessionModel
+from cognis.models.tool import (
+    ExecutorHandle,
+    ToolCall,
+    ToolDefinition,
+    ToolSource,
+    sanitize_mcp_tool_name,
+)
 from cognis.providers.executor.in_process import InProcessExecutorConnection
-from cognis.tools.registry import ToolRegistry
+from cognis.runtime_context import RuntimeAccessContext
+from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
+from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import ResolvedSkillSet
 
 
@@ -37,6 +48,227 @@ def _builtin_tool(name: str) -> ToolDefinition:
         category="system",
         read_only=True,
     )
+
+
+def test_manage_agents_is_default_off_without_opt_in() -> None:
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+
+    selected = {tool.name for tool in select_static_tools(agent)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_requires_opt_in_even_with_wildcard_builtin_tools() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"builtin_tools": ["*"]},
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_requires_explicit_runtime_context() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"opt_in_builtin_tools": ["manage_agents"]},
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_hidden_from_global_static_selection() -> None:
+    selected = {tool.name for tool in select_static_tools()}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_exposed_for_root_owner_primary_context() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"opt_in_builtin_tools": ["manage_agents"]},
+    )
+    access_context = RuntimeAccessContext(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
+
+    assert "manage_agents" in selected
+
+
+def test_manage_agents_opt_in_bypasses_narrow_builtin_allowlist() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"builtin_tools": ["list_agents"], "opt_in_builtin_tools": ["manage_agents"]},
+    )
+    access_context = RuntimeAccessContext(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
+
+    assert "manage_agents" in selected
+
+
+def test_manage_agents_hidden_for_shared_grantee_context() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="owner@example.com",
+        name="Agent",
+        tools={"opt_in_builtin_tools": ["manage_agents"]},
+    )
+    access_context = RuntimeAccessContext(
+        user_email="guest@example.com",
+        agent_id="agent-1",
+        agent_owner_email="owner@example.com",
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_hidden_for_delegated_context() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"opt_in_builtin_tools": ["manage_agents"]},
+    )
+    access_context = RuntimeAccessContext(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        parent_session_id="parent",
+        delegation_mode="worker",
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_hidden_for_unknown_agent_type() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"opt_in_builtin_tools": ["manage_agents"]},
+    )
+    access_context = RuntimeAccessContext(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        agent_type="custom",
+    )
+
+    selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
+
+    assert "manage_agents" not in selected
+
+
+def test_manage_agents_name_is_reserved_against_executor_shadowing() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="manage_agents",
+                description="shadow",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+            )
+        )
+    )
+    router = ToolRouter(guardrails=object())
+
+    assert router.classify("manage_agents", registry) is ToolRoute.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_manage_agents_execution_rechecks_explicit_opt_in() -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_AGENTS_TOOL))
+    router = ToolRouter(guardrails=object())
+
+    result = await router.execute(
+        ToolCall(
+            call_id="call-1",
+            name="manage_agents",
+            arguments={"action": "list"},
+            runtime_metadata={
+                "runtime_access": {
+                    "user_email": "user@example.com",
+                    "agent_id": "agent-1",
+                    "agent_owner_email": "user@example.com",
+                    "agent_type": "primary",
+                }
+            },
+        ),
+        SessionModel(session_id="s", conversation_id="c", user_email="user@example.com", agent_id="agent-1"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        registry,
+        executor=object(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["code"] == "agent_management_not_enabled"
+
+
+@pytest.mark.asyncio
+async def test_manage_agents_execution_validates_arguments_before_guardrails() -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_AGENTS_TOOL))
+    router = ToolRouter(guardrails=object())
+
+    result = await router.execute(
+        ToolCall(
+            call_id="call-1",
+            name="manage_agents",
+            arguments={"_raw": "not json"},
+            runtime_metadata={
+                "runtime_access": {
+                    "user_email": "user@example.com",
+                    "agent_id": "agent-1",
+                    "agent_owner_email": "user@example.com",
+                    "agent_type": "primary",
+                }
+            },
+        ),
+        SessionModel(
+            session_id="s",
+            conversation_id="c",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            tools={"opt_in_builtin_tools": ["manage_agents"]},
+        ),
+        registry,
+        executor=object(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["code"] == "invalid_tool_arguments"
+    assert "invalid_tool_arguments" in result.output
 
 
 class _Guardrails:

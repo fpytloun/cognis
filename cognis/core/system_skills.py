@@ -278,6 +278,49 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
 - "Inspect this workflow and explain why it loops back to plan."
 """,
     },
+    "cognis-agent-manager": {
+        "skill_id": "cognis-agent-manager",
+        "content": """---
+name: Cognis Agent Manager
+description: Safe operating procedure for managing user-owned Cognis agents from main chat.
+tags:
+  - cognis
+  - management
+  - agents
+linked_tool_ids:
+  - builtin:manage_agents
+---
+
+# Purpose
+
+Use this skill when the user asks the current primary agent to inspect, create, update, archive, activate, suspend, sync, bind, or share other agents owned by the same user.
+
+# Safety Rules
+
+- Inspect before mutating. Use `manage_agents` with `action="list"` or `action="get"` before editing an existing agent.
+- Never try to manage yourself. If the target agent is the current agent, explain that self-management is not allowed.
+- Only manage agents owned by the current user. Shared agents are use-only and cannot be edited or reshared by grantees.
+- Treat delete as archive-only. Use `action="archive"`; do not promise permanent deletion.
+- Share management can grant access to another user. Confirm the target email and executor scope with the user before calling `share_create`, `share_update`, or `share_revoke`.
+- Keep permission and tool changes minimal. Preserve existing unrelated settings.
+
+# Tool Usage
+
+- `list` and `get` for inspection.
+- `create` for new agents. Include full profile fields when the user provided them.
+- `update` for targeted edits to profile, tools, permissions, skills, LLM config, execution, and avatar fields.
+- `bindings_get` and `bindings_set` for primary-to-secondary agent bindings.
+- `shares_list`, `share_create`, `share_update`, and `share_revoke` for owner-only share management.
+- `sync_personality` after intentional identity/personality changes if synchronization is needed.
+
+# Do Not Do
+
+- Do not invent grantee email addresses.
+- Do not silently broaden permissions or tool access.
+- Do not mutate shared agents unless the current user is the owner.
+- Do not claim a share was created, updated, or revoked until the tool confirms it.
+""",
+    },
     "cognis-web-research": {
         "skill_id": "cognis-web-research",
         "content": """---

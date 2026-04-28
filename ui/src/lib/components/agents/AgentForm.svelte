@@ -260,6 +260,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   const globallyAttachedSkills = $derived(skills.filter((s: Skill) => attachedToAllAgents(s) && !form.selectedSkillIds.includes(s.skill_id)));
   const selectableSkills = $derived(skills.filter((s: Skill) => !attachedToAllAgents(s)));
+  const optionalBuiltinTools = [{ id: 'manage_agents', label: 'Manage agents', description: 'Create, edit, archive, bind, and share your other agents from chat.' }];
+
+  function toggleOptInBuiltinTool(toolId: string): void {
+    if (form.optInBuiltinTools.includes(toolId)) {
+      form.optInBuiltinTools = form.optInBuiltinTools.filter((value: string) => value !== toolId);
+    } else {
+      form.optInBuiltinTools = [...form.optInBuiltinTools, toolId];
+    }
+  }
 
   async function handleSubmit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
@@ -529,6 +538,28 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <span>Max delegation depth</span>
             <Input bind:value={form.maxDelegationDepth} type="number" disabled={readonly} />
           </label>
+        </div>
+
+        <div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
+          <p class="text-sm font-medium text-amber-100">Optional built-in tools</p>
+          <p class="mt-1 text-xs text-amber-100/70">These privileged controller tools are off by default and are not enabled by wildcard tool access.</p>
+          <div class="mt-3 space-y-2">
+            {#each optionalBuiltinTools as tool}
+              <label class="flex items-start gap-3 text-sm text-slate-200">
+                <input
+                  checked={form.optInBuiltinTools.includes(tool.id)}
+                  class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                  type="checkbox"
+                  onchange={() => toggleOptInBuiltinTool(tool.id)}
+                  disabled={readonly || form.agentType === 'secondary'}
+                />
+                <span>
+                  <span class="font-medium">{tool.label}</span>
+                  <span class="block text-xs text-slate-400">{tool.description}</span>
+                </span>
+              </label>
+            {/each}
+          </div>
         </div>
 
         {#if tools.length > 0}

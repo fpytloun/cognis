@@ -62,6 +62,7 @@ from cognis.models.workflow import (
     resolve_source_names,
 )
 from cognis.runtime_context import (
+    RuntimeAccessContext,
     current_effective_working_directory,
     current_workspace_root,
     scoped_runtime_context,
@@ -177,9 +178,20 @@ class WorkflowEngine:
         but the engine remains the owner of the orchestration entrypoint so
         metrics, runtime resolution, and future hooks stay centralized.
         """
+        access_context = RuntimeAccessContext(
+            user_email=session.user_email,
+            agent_id=agent.agent_id,
+            agent_owner_email=agent.owner_email,
+            agent_type=agent.agent_type,
+            session_id=session.session_id,
+            parent_session_id=session.parent_session_id,
+            delegation_mode=session.delegation_mode,
+            workflow_step=False,
+        )
         runtime = await self._resolve_step_runtime(
             agent=agent,
             user_email=session.user_email,
+            access_context=access_context,
         )
 
         direct_step = StepDefinition(
@@ -224,6 +236,7 @@ class WorkflowEngine:
                 agent_owner_email=agent.owner_email,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
+                access_context=access_context,
             ):
                 return await self._agent_loop.run_step(
                     ctx,
@@ -829,10 +842,21 @@ class WorkflowEngine:
         # Resolve tool registry and executor for this step.
         try:
             executor_agent = self._executor_agent_for_step(primary_agent, agent)
+            access_context = RuntimeAccessContext(
+                user_email=task.created_by,
+                agent_id=agent.agent_id,
+                agent_owner_email=agent.owner_email,
+                agent_type=agent.agent_type,
+                session_id=session.session_id,
+                parent_session_id=session.parent_session_id,
+                delegation_mode=session.delegation_mode,
+                workflow_step=True,
+            )
             runtime = await self._resolve_step_runtime(
                 agent=agent,
                 executor_agent=executor_agent,
                 user_email=task.created_by,
+                access_context=access_context,
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
@@ -938,7 +962,15 @@ class WorkflowEngine:
 
         # Run agent loop
         try:
-            output = await self._agent_loop.run_step(ctx, on_token=on_progress)
+            with scoped_runtime_context(
+                user_email=session.user_email,
+                agent_id=agent.agent_id,
+                agent_owner_email=agent.owner_email,
+                workspace_root=ctx.workspace_root,
+                effective_working_directory=ctx.working_directory,
+                access_context=access_context,
+            ):
+                output = await self._agent_loop.run_step(ctx, on_token=on_progress)
         except StepInterrupted:
             current_status = await self._read_task_status(task.task_id)
             async with self._session_factory() as db_session:
@@ -2572,6 +2604,7 @@ class WorkflowEngine:
         agent: AgentDefinition,
         user_email: str,
         executor_agent: AgentDefinition | None = None,
+        access_context: RuntimeAccessContext | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
@@ -2581,6 +2614,7 @@ class WorkflowEngine:
                     agent=agent,
                     user_email=user_email,
                     executor_agent=executor_agent,
+                    access_context=access_context,
                 ),
             )
 

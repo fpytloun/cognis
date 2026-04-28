@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.core.system_skills import get_system_skill_default
 
 
 def test_system_implement_agent_is_registered() -> None:
@@ -82,3 +83,12 @@ def test_system_agents_seed_reasoning_and_override_capabilities() -> None:
 
     assert explore.llm_config is not None
     assert explore.llm_config.reasoning_effort == "low"
+
+
+def test_agent_manager_system_skill_is_seeded_as_guidance_only() -> None:
+    skill = get_system_skill_default("cognis-agent-manager")
+
+    assert skill is not None
+    assert skill["auto_load"] is False
+    assert skill["linked_tool_ids"] == ["builtin:manage_agents"]
+    assert "Shared agents are use-only" in str(skill["instructions"])

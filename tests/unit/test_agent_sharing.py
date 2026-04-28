@@ -6,6 +6,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.agent_management import AgentManagementDependencies, handle_agent_management_action
+from cognis.runtime_context import RuntimeAccessContext
 from cognis.store.queries import (
     create_agent,
     create_agent_grant,
@@ -13,6 +15,7 @@ from cognis.store.queries import (
     create_executor,
     create_user,
 )
+from cognis.tools.builtin.agent_management import handle_agent_management_tool
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -292,6 +295,45 @@ def test_grantee_cannot_mutate_shared_agent_bindings(monkeypatch: object, tmp_pa
         assert response.status_code == 403
 
 
+def test_grantee_tool_listing_hides_owner_agent_management_opt_in(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                password_hash = client.app.state.password_hasher.hash("password123")
+                await create_user(session, email="owner@example.com", name="Owner", password_hash=password_hash)
+                await create_user(session, email="guest@example.com", name="Guest", password_hash=password_hash)
+                await create_agent(
+                    session,
+                    agent_id="shared-agent",
+                    owner_email="owner@example.com",
+                    name="Shared Agent",
+                    display_name="Shared Agent",
+                    tools={"opt_in_builtin_tools": ["manage_agents"]},
+                    status="active",
+                )
+                await create_agent_grant(
+                    session,
+                    agent_id="shared-agent",
+                    grantee_user_email="guest@example.com",
+                    executor_scope="owner_executor",
+                    granted_by="owner@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/agents/shared-agent/tools",
+            headers=_auth_headers(client.app, email="guest@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert all(item["name"] != "manage_agents" for item in response.json())
+
+
 def test_revoked_share_blocks_future_messages(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
 
@@ -382,3 +424,73 @@ def test_revoked_share_can_be_granted_again(monkeypatch: object, tmp_path: Path)
         assert revoke_response.status_code == 200
         assert regrant_response.status_code == 201
         assert regrant_response.json()["executor_scope"] == "grantee_executor"
+
+
+def test_agent_management_tool_denies_shared_grantee_runtime() -> None:
+    result = asyncio.run(
+        handle_agent_management_tool(
+            tool_name="manage_agents",
+            arguments={"action": "list"},
+            deps=AgentManagementDependencies(session_factory=lambda: None),
+            user_email="guest@example.com",
+            current_agent_id="shared-agent",
+            runtime_access=RuntimeAccessContext(
+                user_email="guest@example.com",
+                agent_id="shared-agent",
+                agent_owner_email="owner@example.com",
+            ),
+        )
+    )
+
+    assert result.is_error is True
+    assert result.metadata == {"code": "agent_management_context_denied"}
+
+
+def test_agent_management_service_can_create_and_revoke_share(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _run() -> None:
+            async with client.app.state.session_factory() as session:
+                password_hash = client.app.state.password_hasher.hash("password123")
+                await create_user(session, email="owner@example.com", name="Owner", password_hash=password_hash)
+                await create_user(session, email="guest@example.com", name="Guest", password_hash=password_hash)
+                await create_agent(
+                    session,
+                    agent_id="managed-agent",
+                    owner_email="owner@example.com",
+                    name="Managed Agent",
+                    display_name="Managed Agent",
+                    status="active",
+                )
+                await session.commit()
+
+            deps = AgentManagementDependencies(session_factory=client.app.state.session_factory)
+            created = await handle_agent_management_action(
+                deps=deps,
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                arguments={
+                    "action": "share_create",
+                    "agent_id": "managed-agent",
+                    "grantee_email": "guest@example.com",
+                    "executor_scope": "owner_executor",
+                },
+            )
+            grant_id = created["share"]["grant_id"]
+            revoked = await handle_agent_management_action(
+                deps=deps,
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                arguments={
+                    "action": "share_revoke",
+                    "agent_id": "managed-agent",
+                    "grant_id": grant_id,
+                },
+            )
+
+            assert created["status"] == "shared"
+            assert revoked == {"status": "revoked", "ok": True, "grant_id": grant_id}
+
+        asyncio.run(_run())

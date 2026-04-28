@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -26,8 +27,13 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.session import SessionModel
 from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
+from cognis.runtime_context import RuntimeAccessContext
 from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
 from cognis.tools.argument_normalization import strip_empty_optional_values
+from cognis.tools.builtin.agent_management import (
+    handle_agent_management_tool,
+    is_agent_management_tool,
+)
 from cognis.tools.builtin.artifact_tools import (
     analyze_attachment_ref,
     handle_artifact_tool,
@@ -81,6 +87,7 @@ class ToolRoute(StrEnum):
     TOOL_OUTPUT = "tool_output"
     ARTIFACT = "artifact"
     IMAGE = "image"
+    AGENT_MANAGEMENT = "agent_management"
     SKILL_MANAGEMENT = "skill_management"
     SCHEDULE = "schedule"
     INTARIS_MCP = "intaris_mcp"
@@ -117,6 +124,8 @@ class ToolRouter:
         session_factory: Any | None = None,
         notification_service: Any | None = None,
         pause_waiter: Any | None = None,
+        event_bus: Any | None = None,
+        task_queue: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.llm = llm
@@ -128,6 +137,8 @@ class ToolRouter:
         self._session_factory = session_factory
         self.notification_service = notification_service
         self.pause_waiter = pause_waiter
+        self.event_bus = event_bus
+        self._task_queue = task_queue
         self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
         self._decision_cache_ttl_seconds = 15.0
@@ -146,6 +157,8 @@ class ToolRouter:
         artifact_store: Any | None = None,
         notification_service: Any | None = None,
         pause_waiter: Any | None = None,
+        event_bus: Any | None = None,
+        task_queue: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -163,6 +176,8 @@ class ToolRouter:
             session_factory=session_factory,
             notification_service=notification_service,
             pause_waiter=pause_waiter,
+            event_bus=event_bus,
+            task_queue=task_queue,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -178,6 +193,11 @@ class ToolRouter:
             return ToolRoute.ARTIFACT
         if is_image_tool(tool_name):
             return ToolRoute.IMAGE
+        if is_agent_management_tool(tool_name):
+            registered_tool = registry.get(tool_name)
+            if registered_tool is not None and registered_tool.definition.source.type == "builtin":
+                return ToolRoute.AGENT_MANAGEMENT
+            return ToolRoute.UNKNOWN
         if is_skill_management_tool(tool_name):
             return ToolRoute.SKILL_MANAGEMENT
         if is_schedule_tool(tool_name):
@@ -474,6 +494,101 @@ class ToolRouter:
                 model=tool_call.arguments.get("model", "default"),
                 status=outcome,
             ).inc()
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                100_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+        if route is ToolRoute.AGENT_MANAGEMENT:
+            agent_tools = agent.tools if isinstance(agent.tools, dict) else {}
+            opt_in_tools = agent_tools.get("opt_in_builtin_tools")
+            if not isinstance(opt_in_tools, list) or tool_call.name not in opt_in_tools:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output="Agent management is not explicitly enabled for this agent.",
+                        is_error=True,
+                        metadata={"code": "agent_management_not_enabled"},
+                    ),
+                    50_000,
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
+            registered_tool = registry.get(tool_call.name)
+            validation_error = validate_tool_arguments(
+                tool_call.name,
+                tool_call.arguments,
+                schema=registered_tool.definition.parameters if registered_tool else None,
+            )
+            if validation_error is not None:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    ),
+                    50_000,
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
+            decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+            eval_meta: dict[str, Any] = {
+                "decision": decision.decision,
+                "reasoning": decision.reasoning,
+                "source": decision.source,
+                "risk": decision.risk,
+                "path": decision.path,
+                "latency_ms": decision.latency_ms,
+                "call_id": decision.call_id,
+            }
+            if decision.decision in {"deny", "escalate"}:
+                outcome = "denied" if decision.decision == "deny" else "escalated"
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=decision.reasoning
+                        or "Agent management requires explicit approval.",
+                        is_error=True,
+                        metadata={"evaluation": eval_meta},
+                    ),
+                    50_000,
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
+            from cognis.core.agent_management import AgentManagementDependencies
+            from cognis.runtime_context import current_agent_id, current_user_email
+
+            if self._session_factory is None:
+                result = ToolResult(output="Agent management not available.", is_error=True)
+            else:
+                result = await handle_agent_management_tool(
+                    tool_name=tool_call.name,
+                    arguments=dict(tool_call.arguments),
+                    deps=AgentManagementDependencies(
+                        session_factory=self._session_factory,
+                        memory=self.memory,
+                        event_bus=getattr(self, "event_bus", None),
+                        artifact_store=self.artifact_store,
+                        image_generation_provider=self.image_generation_provider,
+                        llm=self.llm,
+                        task_queue=getattr(self, "_task_queue", None),
+                    ),
+                    user_email=current_user_email.get() or session.user_email,
+                    current_agent_id=current_agent_id.get() or agent.agent_id,
+                    runtime_access=self._runtime_access_from_tool_call(tool_call),
+                )
+            combined_meta: dict[str, Any] = {"evaluation": eval_meta}
+            if result.metadata is not None:
+                combined_meta.update(result.metadata)
+            result = result.model_copy(update={"metadata": combined_meta})
+            outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(
                 tool_call.name,
@@ -1286,6 +1401,28 @@ class ToolRouter:
             metadata["hint"] = exc.hint
         output = exc.message if not exc.hint else f"{exc.message} Hint: {exc.hint}"
         return ToolResult(output=output, is_error=True, metadata=metadata)
+
+    @staticmethod
+    def _runtime_access_from_tool_call(tool_call: ToolCall) -> RuntimeAccessContext | None:
+        raw = tool_call.runtime_metadata.get("runtime_access")
+        if not isinstance(raw, dict):
+            return None
+        return RuntimeAccessContext(
+            user_email=raw.get("user_email") if isinstance(raw.get("user_email"), str) else None,
+            agent_id=raw.get("agent_id") if isinstance(raw.get("agent_id"), str) else None,
+            agent_owner_email=raw.get("agent_owner_email")
+            if isinstance(raw.get("agent_owner_email"), str)
+            else None,
+            agent_type=str(raw.get("agent_type") or "primary"),
+            session_id=raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
+            parent_session_id=raw.get("parent_session_id")
+            if isinstance(raw.get("parent_session_id"), str)
+            else None,
+            delegation_mode=raw.get("delegation_mode")
+            if isinstance(raw.get("delegation_mode"), str)
+            else None,
+            workflow_step=bool(raw.get("workflow_step")),
+        )
 
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
         if self.artifact_store is None:

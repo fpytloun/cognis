@@ -964,6 +964,7 @@ class EffectiveToolsPreviewRequest(BaseModel):
     execution: dict[str, Any] = Field(default_factory=dict)
     skills: dict[str, Any] = Field(default_factory=dict)
     agent_id: str | None = None
+    agent_type: Literal["primary", "secondary"] = "primary"
 
 
 class ToolClassificationRequeueRequest(BaseModel):

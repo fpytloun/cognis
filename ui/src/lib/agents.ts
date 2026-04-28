@@ -48,6 +48,7 @@ export interface AgentFormState {
   executorSelector: string;
   disabledCategories: string[];
   disabledTools: string[];
+  optInBuiltinTools: string[];
   selectedSkillIds: string[];
 }
 
@@ -110,6 +111,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     executorSelector: '',
     disabledCategories: [],
     disabledTools: [],
+    optInBuiltinTools: [],
     selectedSkillIds: []
   };
 }
@@ -205,6 +207,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     disabledTools: Array.isArray(tools.disabled_tools)
       ? tools.disabled_tools.filter((value): value is string => typeof value === 'string')
       : [],
+    optInBuiltinTools: Array.isArray(tools.opt_in_builtin_tools)
+      ? tools.opt_in_builtin_tools.filter((value): value is string => typeof value === 'string')
+      : [],
     selectedSkillIds: extractSkillIds(agent.skills),
     originalTools: tools
   };
@@ -237,6 +242,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     delegation_tools: _legacyDelegationTools,
     disabled_categories: _legacyDisabledCategories,
     disabled_tools: _legacyDisabledTools,
+    opt_in_builtin_tools: _legacyOptInBuiltinTools,
     intaris_mcp_servers: _legacyIntarisMcpServers,
     mcp_servers: _legacyMcpServers,
     ...preservedTools
@@ -279,6 +285,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         : {}),
       ...(form.disabledTools.length > 0
         ? { disabled_tools: [...new Set(form.disabledTools)] }
+        : {}),
+      ...(form.agentType === 'primary' && form.optInBuiltinTools.length > 0
+        ? { opt_in_builtin_tools: [...new Set(form.optInBuiltinTools)] }
         : {}),
       mcp_servers: form.mcpServers
         .filter((server) => server.name.trim() && server.command.trim())
@@ -345,6 +354,7 @@ export function formStateToEffectiveToolsPreviewPayload(form: AgentFormState): R
   const payload = formStateToPayload(form);
   return {
     agent_id: payload.agent_id ?? null,
+    agent_type: form.agentType,
     tools: payload.tools,
     permissions: payload.permissions,
     execution: payload.execution,
