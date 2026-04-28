@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
+import mimetypes
+import re
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -37,8 +42,22 @@ BROWSER_HEADERS: dict[str, str] = {
 _DEFAULT_TIMEOUT = 30
 _MAX_TIMEOUT = 120
 _MAX_RESPONSE_SIZE = 500_000
+_MAX_BINARY_ATTACHMENT_SIZE = 25 * 1024 * 1024
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.0  # seconds
+
+_TEXTUAL_MIME_PREFIXES = ("text/",)
+_TEXTUAL_MIME_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/rss+xml",
+    "application/atom+xml",
+    "application/csv",
+    "application/x-ndjson",
+}
+_TEXTUAL_MIME_SUFFIXES = ("+json", "+xml")
 
 
 def sanitise_url(url: str) -> str:
@@ -244,16 +263,37 @@ def format_response_result(
 ) -> ToolResult:
     """Extract response content and attach structured document metadata."""
 
-    content_type = response.headers.get("content-type", "")
+    content_type = _normalize_content_type(response.headers.get("content-type", ""))
+    raw_content = getattr(response, "content", b"")
+    content = raw_content if isinstance(raw_content, bytes) else str(response.text).encode("utf-8")
+    url = source_url or str(response.url)
+    filename = _filename_from_response(response, content_type=content_type)
+
+    binary_kind = _binary_kind(content, content_type, filename)
+    if binary_kind == "pdf":
+        return _format_pdf_response(content, content_type=content_type, filename=filename, url=url)
+    if binary_kind == "binary":
+        return _format_binary_response(
+            content, content_type=content_type, filename=filename, url=url
+        )
+
     raw_text = truncate_content(response.text)
     if "text/html" not in content_type:
-        return ToolResult(output=raw_text)
+        return ToolResult(
+            output=raw_text,
+            metadata={
+                "source_url": url,
+                "content_type": content_type or "text/plain",
+                "filename": filename,
+                "size_bytes": len(content),
+            },
+        )
 
     from cognis.tools.executor.web.extraction import extract_document
 
     document = extract_document(
         raw_text,
-        url=source_url or str(response.url),
+        url=url,
         output_format=output_format,
         options=options,
     )
@@ -261,3 +301,243 @@ def format_response_result(
         output=document.content,
         metadata={"extracted_document": document.as_dict()},
     )
+
+
+def _normalize_content_type(value: str) -> str:
+    return value.split(";", 1)[0].strip().lower()
+
+
+def _binary_kind(content: bytes, content_type: str, filename: str) -> str | None:
+    if _is_pdf(content, content_type, filename):
+        return "pdf"
+    if _is_textual_content_type(content_type):
+        return None
+    if _looks_textual_bytes(content):
+        return None
+    return "binary"
+
+
+def _is_pdf(content: bytes, content_type: str, filename: str) -> bool:
+    return (
+        content_type == "application/pdf"
+        or filename.lower().endswith(".pdf")
+        or content.startswith(b"%PDF-")
+    )
+
+
+def _is_textual_content_type(content_type: str) -> bool:
+    if not content_type:
+        return False
+    return (
+        content_type.startswith(_TEXTUAL_MIME_PREFIXES)
+        or content_type in _TEXTUAL_MIME_TYPES
+        or content_type.endswith(_TEXTUAL_MIME_SUFFIXES)
+    )
+
+
+def _looks_textual_bytes(content: bytes) -> bool:
+    sample = content[:1024]
+    if not sample:
+        return True
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _format_pdf_response(
+    content: bytes,
+    *,
+    content_type: str,
+    filename: str,
+    url: str,
+) -> ToolResult:
+    pdf_content_type = (
+        content_type
+        if content_type and content_type != "application/octet-stream"
+        else "application/pdf"
+    )
+    attachment = _binary_attachment(
+        content,
+        content_type=pdf_content_type,
+        filename=filename or "document.pdf",
+        url=url,
+        purpose="web_fetch",
+    )
+    page_texts, pdf_metadata = _extract_pdf_text(content)
+    lines = [
+        "[[metadata]]",
+        f"URL: {url}",
+        f"Filename: {filename}",
+        f"Content type: {pdf_content_type}",
+        f"Size bytes: {len(content)}",
+        f"Pages: {len(page_texts)}",
+    ]
+    if attachment:
+        lines.append("Original PDF: attached as artifact")
+    else:
+        lines.append(
+            f"Original PDF: not attached because it exceeds {_MAX_BINARY_ATTACHMENT_SIZE} bytes"
+        )
+    title = pdf_metadata.get("title")
+    author = pdf_metadata.get("author")
+    if title:
+        lines.append(f"Title: {title}")
+    if author:
+        lines.append(f"Author: {author}")
+    lines.append("")
+    if page_texts:
+        for index, page_text in enumerate(page_texts, start=1):
+            lines.append(f"[[page:{index}]]")
+            lines.append(page_text.strip() or "[no extractable text]")
+            lines.append("")
+    else:
+        lines.extend(["[[page:1]]", "[no extractable text]", ""])
+    return ToolResult(
+        output=truncate_content("\n".join(lines).strip()),
+        metadata={
+            "source_url": url,
+            "content_type": pdf_content_type,
+            "filename": filename,
+            "size_bytes": len(content),
+            "binary_content": True,
+            "binary_kind": "pdf",
+            "attachment_created": bool(attachment),
+            "pdf_page_count": len(page_texts),
+            "pdf_metadata": pdf_metadata,
+        },
+        attachments=[attachment] if attachment else None,
+    )
+
+
+def _format_binary_response(
+    content: bytes,
+    *,
+    content_type: str,
+    filename: str,
+    url: str,
+) -> ToolResult:
+    guessed_type = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    kind = "image" if guessed_type.startswith("image/") else "binary"
+    attachment = _binary_attachment(
+        content,
+        content_type=guessed_type,
+        filename=filename,
+        url=url,
+        purpose="web_fetch",
+    )
+    lines = [
+        "[[metadata]]",
+        f"URL: {url}",
+        f"Filename: {filename}",
+        f"Content type: {guessed_type}",
+        f"Size bytes: {len(content)}",
+        f"Binary kind: {kind}",
+    ]
+    if attachment:
+        lines.append("Binary content: attached as artifact")
+    else:
+        lines.append(
+            f"Binary content: not attached because it exceeds {_MAX_BINARY_ATTACHMENT_SIZE} bytes"
+        )
+    if guessed_type.startswith("image/"):
+        lines.append("Use artifact_read to analyze this image with a vision-capable model.")
+    return ToolResult(
+        output="\n".join(lines),
+        metadata={
+            "source_url": url,
+            "content_type": guessed_type,
+            "filename": filename,
+            "size_bytes": len(content),
+            "binary_content": True,
+            "binary_kind": kind,
+            "attachment_created": bool(attachment),
+        },
+        attachments=[attachment] if attachment else None,
+    )
+
+
+def _extract_pdf_text(content: bytes) -> tuple[list[str], dict[str, str]]:
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(content))
+        metadata_raw = getattr(reader, "metadata", None)
+        metadata = _pdf_metadata(metadata_raw)
+        pages = [str(page.extract_text() or "") for page in reader.pages]
+        return pages, metadata
+    except Exception as exc:  # pragma: no cover - defensive around malformed PDFs
+        logger.debug("web: PDF text extraction failed (%s)", type(exc).__name__)
+        return [], {}
+
+
+def _pdf_metadata(metadata: object) -> dict[str, str]:
+    if metadata is None:
+        return {}
+    result: dict[str, str] = {}
+    for key, label in (("/Title", "title"), ("/Author", "author")):
+        value = getattr(metadata, key.removeprefix("/"), None)
+        if value is None and hasattr(metadata, "get"):
+            try:
+                value = metadata.get(key)
+            except Exception:
+                value = None
+        if value:
+            result[label] = str(value)
+    return result
+
+
+def _binary_attachment(
+    content: bytes,
+    *,
+    content_type: str,
+    filename: str,
+    url: str,
+    purpose: str,
+) -> dict[str, object] | None:
+    if len(content) > _MAX_BINARY_ATTACHMENT_SIZE:
+        return None
+    return {
+        "filename": filename,
+        "mime_type": content_type or "application/octet-stream",
+        "size_bytes": len(content),
+        "source_url": url,
+        "purpose": purpose,
+        "content_b64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def _filename_from_response(response: httpx.Response, *, content_type: str) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    filename = _filename_from_content_disposition(disposition)
+    if not filename:
+        path = unquote(urlparse(str(response.url)).path)
+        filename = path.rsplit("/", 1)[-1] if path else ""
+    if not filename:
+        filename = "download"
+    if "." not in filename:
+        extension = mimetypes.guess_extension(content_type or "") or ""
+        filename = f"{filename}{extension}"
+    return _safe_filename(filename)
+
+
+def _filename_from_content_disposition(value: str) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"filename\*=UTF-8''([^;]+)", value, flags=re.IGNORECASE)
+    if match:
+        return unquote(match.group(1).strip().strip('"'))
+    match = re.search(r'filename="?([^";]+)"?', value, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _safe_filename(value: str) -> str:
+    filename = value.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].strip() or "download"
+    filename = filename.replace("..", "_")
+    filename = re.sub(r"[^A-Za-z0-9._ -]+", "_", filename)
+    return filename[:180] or "download"

@@ -316,6 +316,9 @@ over this skill for paid users who want a turnkey multi-source report.
    aggregators. Avoid stacking three results from the same domain.
 3. **Fetch in parallel.** Issue multiple `web_fetch` calls in the same
    turn so the executor's concurrency controller can pipeline them.
+   `web_fetch` also materializes PDFs, images, and other binary files as
+   artifacts. PDFs return extracted page text and keep the original PDF
+   attached for later use.
 4. **Do not force a backend unless you mean to.** Normally omit the
    optional `backend` parameter on `web_search` and `web_fetch` so the
    configured defaults apply. For fetches, omitting `backend` also keeps
@@ -324,6 +327,9 @@ over this skill for paid users who want a turnkey multi-source report.
    never paper over it. When they agree, you can compress.
 6. **Cite.** Every non-trivial claim in the synthesis should reference
    the URL it came from. The user can audit. Use markdown links.
+   When images matter, fetch the selected image URLs so they become
+   artifacts, then use `artifact_read` to analyze them through the
+   vision-capable model routing before embedding them in a document.
 7. **Escalate carefully.** If `web_fetch` reports both a primary failure
    and a "headless browser fallback failed" message in the same error,
    the controller already exhausted the headless retry. Headed

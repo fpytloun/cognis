@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -25,6 +26,7 @@ from cognis.tools.executor.web.headers import (
     clamp_timeout,
     convert_html,
     format_response,
+    format_response_result,
     html_to_text,
     sanitise_url,
     truncate_content,
@@ -130,6 +132,114 @@ class TestHtmlConversion:
         result = format_response(response, "text")
         assert "Hello world" in result
         assert "<" not in result
+
+    def test_format_response_result_text_plain_preserves_text(self) -> None:
+        response = httpx.Response(
+            200,
+            content=b"plain text body",
+            headers={"content-type": "text/plain"},
+            request=httpx.Request("GET", "https://example.com/readme.txt"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert result.output == "plain text body"
+        assert not result.attachments
+        assert (result.metadata or {}).get("content_type") == "text/plain"
+
+    def test_format_response_result_image_attaches_binary_without_dumping_bytes(self) -> None:
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
+        response = httpx.Response(
+            200,
+            content=image_bytes,
+            headers={"content-type": "image/png"},
+            request=httpx.Request("GET", "https://example.com/chart.png"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert "Binary content: attached as artifact" in result.output
+        assert "Use artifact_read" in result.output
+        assert "\x00" not in result.output
+        assert result.attachments and result.attachments[0]["filename"] == "chart.png"
+        assert result.attachments[0]["mime_type"] == "image/png"
+        assert base64.b64decode(str(result.attachments[0]["content_b64"])) == image_bytes
+        assert (result.metadata or {}).get("binary_kind") == "image"
+
+    def test_format_response_result_octet_stream_attaches_binary(self) -> None:
+        payload = b"\x00\x01\x02binary"
+        response = httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "application/octet-stream"},
+            request=httpx.Request("GET", "https://example.com/file.bin"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert "Binary kind: binary" in result.output
+        assert result.attachments and result.attachments[0]["filename"] == "file.bin"
+        assert (result.metadata or {}).get("binary_content") is True
+
+    def test_format_response_result_pdf_extracts_text_and_attaches_original(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FakePage:
+            def __init__(self, text: str) -> None:
+                self._text = text
+
+            def extract_text(self) -> str:
+                return self._text
+
+        class _FakeReader:
+            metadata = {"/Title": "Mini EX Manual", "/Author": "Brinsea"}
+            pages = [_FakePage("Page one text"), _FakePage("Page two text")]
+
+            def __init__(self, stream: object) -> None:
+                self.stream = stream
+
+        monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+        pdf_bytes = b"%PDF-1.5 fake content"
+        response = httpx.Response(
+            200,
+            content=pdf_bytes,
+            headers={"content-type": "application/pdf"},
+            request=httpx.Request("GET", "https://example.com/Mini-EX_GB.pdf"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert "[[metadata]]" in result.output
+        assert "Pages: 2" in result.output
+        assert "[[page:1]]" in result.output
+        assert "Page one text" in result.output
+        assert result.attachments and result.attachments[0]["filename"] == "Mini-EX_GB.pdf"
+        assert result.attachments[0]["mime_type"] == "application/pdf"
+        assert (result.metadata or {}).get("binary_kind") == "pdf"
+
+    def test_format_response_result_pdf_magic_overrides_missing_mime(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FakeReader:
+            metadata = {}
+            pages: list[object] = []
+
+            def __init__(self, stream: object) -> None:
+                self.stream = stream
+
+        monkeypatch.setattr("pypdf.PdfReader", _FakeReader)
+        response = httpx.Response(
+            200,
+            content=b"%PDF-1.7 fake content",
+            headers={"content-type": "application/octet-stream"},
+            request=httpx.Request("GET", "https://example.com/download"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert "Original PDF: attached as artifact" in result.output
+        assert result.attachments and result.attachments[0]["mime_type"] == "application/pdf"
+        assert (result.metadata or {}).get("binary_kind") == "pdf"
 
 
 class TestBackendResolution:
