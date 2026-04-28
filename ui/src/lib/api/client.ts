@@ -952,6 +952,17 @@ export const api = {
       });
     },
 
+    updateSource(projectId: string, sourceId: string, payload: Record<string, unknown>): Promise<ProjectSource> {
+      return request<ProjectSource>(`/api/v1/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(sourceId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    deleteSource(projectId: string, sourceId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' });
+    },
+
     attachWorkflow(projectId: string, workflowId: string): Promise<Project> {
       return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(workflowId)}`, { method: 'POST' });
     },
@@ -962,6 +973,21 @@ export const api = {
 
     grants(projectId: string): Promise<ProjectGrant[]> {
       return request<ProjectGrant[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants`);
+    },
+
+    createGrant(projectId: string, payload: Record<string, unknown>): Promise<ProjectGrant> {
+      return request<ProjectGrant>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    revokeGrant(projectId: string, grantId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants/${encodeURIComponent(grantId)}`, { method: 'DELETE' });
+    },
+
+    generateAvatar(projectId: string): Promise<{ avatar_image_id: string; avatar_url: string }> {
+      return request<{ avatar_image_id: string; avatar_url: string }>(`/api/v1/projects/${encodeURIComponent(projectId)}/avatar/generate`, { method: 'POST' });
     }
   },
 

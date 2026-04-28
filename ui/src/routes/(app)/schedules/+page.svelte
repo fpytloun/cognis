@@ -17,7 +17,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Conversation, Schedule, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Project, Schedule, Skill, Workflow } from '$lib/types/api';
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
 import Calendar from 'lucide-svelte/icons/calendar';
 import Clock from 'lucide-svelte/icons/clock';
@@ -34,6 +34,8 @@ import Zap from 'lucide-svelte/icons/zap';
   let schedules = $state<Schedule[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let projectWorkflows = $state<Workflow[]>([]);
+  let projects = $state<Project[]>([]);
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let search = $state('');
@@ -41,6 +43,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let filterEnabled = $state<string>('');
   let showCreateModal = $state(false);
   let creating = $state(false);
+  let lastAutoProjectWorkflow = $state('');
 
   // Detect local IANA timezone
   const localTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -77,6 +80,7 @@ import Zap from 'lucide-svelte/icons/zap';
     timezone: localTimezone,
     agent_id: '',
     workflow_source: '',
+    project_id: '',
     task_title: '',
     task_description: '',
     priority: 0,
@@ -122,16 +126,19 @@ import Zap from 'lucide-svelte/icons/zap';
   );
 
   let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
-  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
+  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent));
+  let workflowLoadKey = 0;
 
   async function loadData(): Promise<void> {
     loading = true;
     error = '';
     try {
-      [schedules, agents, workflows, skills, conversations] = await Promise.all([
+      [schedules, agents, workflows, projectWorkflows, projects, skills, conversations] = await Promise.all([
         api.schedules.list(),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
+        api.workflows.listAll({ project_id: null }),
+        api.projects.list(),
         api.skills.list(),
         api.conversations.listAll()
       ]);
@@ -143,6 +150,31 @@ import Zap from 'lucide-svelte/icons/zap';
       error = asApiError(e).message;
     } finally {
       loading = false;
+    }
+  }
+
+  async function loadWorkflowsForProject(projectId: string): Promise<void> {
+    const key = ++workflowLoadKey;
+    try {
+      const next = await api.workflows.listAll({ project_id: projectId || null });
+      if (key !== workflowLoadKey) return;
+      projectWorkflows = next;
+      const project = projects.find((item) => item.project_id === projectId);
+      if (form.workflow_source && form.workflow_source === lastAutoProjectWorkflow) {
+        form.workflow_source = '';
+        lastAutoProjectWorkflow = '';
+      }
+      if (project?.default_workflow_id && !form.workflow_source) {
+        lastAutoProjectWorkflow = `workflow:${project.default_workflow_id}`;
+        form.workflow_source = lastAutoProjectWorkflow;
+      }
+      const values = new Set(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent).map((option) => option.value));
+      if (form.workflow_source && !values.has(form.workflow_source)) {
+        form.workflow_source = '';
+        lastAutoProjectWorkflow = '';
+      }
+    } catch {
+      if (key === workflowLoadKey) projectWorkflows = workflows;
     }
   }
 
@@ -172,6 +204,7 @@ import Zap from 'lucide-svelte/icons/zap';
         agent_id: form.agent_id,
         workflow_id: workflowSource.workflow_id,
         skill_id: workflowSource.skill_id,
+        project_id: form.project_id || null,
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion
@@ -198,6 +231,7 @@ import Zap from 'lucide-svelte/icons/zap';
       timezone: localTimezone,
       agent_id: agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '',
       workflow_source: '',
+      project_id: '',
       task_title: '',
       task_description: '',
       priority: 0,
@@ -208,6 +242,15 @@ import Zap from 'lucide-svelte/icons/zap';
       allow_silent_completion: false
     };
   }
+
+  function projectName(projectId: string | null): string | null {
+    if (!projectId) return null;
+    return projects.find((project) => project.project_id === projectId)?.name ?? projectId;
+  }
+
+  $effect(() => {
+    void loadWorkflowsForProject(form.project_id);
+  });
 
   function openHeartbeatPreset(): void {
     resetForm();
@@ -403,6 +446,9 @@ import Zap from 'lucide-svelte/icons/zap';
                     {#if schedule.allow_silent_completion}
                       <Badge class="bg-cyan-500/20 text-cyan-400">Silent allowed</Badge>
                     {/if}
+                    {#if schedule.project_id}
+                      <Badge class="bg-violet-500/20 text-violet-300">{projectName(schedule.project_id)}</Badge>
+                    {/if}
                     {#if schedule.consecutive_errors > 0}
                       <Badge class="bg-red-500/20 text-red-400">
                         <AlertTriangle class="mr-1 h-3 w-3" />
@@ -588,9 +634,18 @@ import Zap from 'lucide-svelte/icons/zap';
           <div class="space-y-1">
             <label for="sched-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
             <select id="sched-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Auto</option>
+              <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
               {#each workflowSourceOptions as option}
                 <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="space-y-1 sm:col-span-2">
+            <label for="sched-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
+            <select id="sched-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">None</option>
+              {#each projects as project}
+                <option value={project.project_id}>{project.name}</option>
               {/each}
             </select>
           </div>

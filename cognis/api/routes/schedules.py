@@ -22,6 +22,7 @@ from cognis.api.models import (
 from cognis.core.workflow_management import (
     get_attached_skill_workflow_source,
 )
+from cognis.core.workflow_registry import SYSTEM_WORKFLOWS
 from cognis.models.schedule import ScheduleModel as _ScheduleModel
 from cognis.models.schedule import describe_schedule
 from cognis.models.workflow import CompletionDeliveryPolicy
@@ -32,6 +33,9 @@ from cognis.store.queries import (
     get_latest_schedule_task_runs,
     get_project,
     get_schedule,
+    get_workflow,
+    list_bound_workflow_ids,
+    list_project_workflow_ids,
     list_schedules,
     update_schedule,
 )
@@ -168,6 +172,41 @@ async def _validate_project_access(request: Request, project_id: str | None) -> 
     await check_project_access(request, project, required="use")
 
 
+async def _validate_project_access_in_session(
+    db: Any, request: Request, project_id: str | None
+) -> None:
+    if project_id is None:
+        return
+    project = await get_project(db, project_id)
+    if project is None or project.status != "active":
+        raise api_exception(404, "not_found", "Project not found")
+    await check_project_access(request, project, required="use")
+
+
+async def _validate_workflow_access(
+    db: Any,
+    request: Request,
+    workflow_id: str | None,
+    *,
+    project_id: str | None,
+) -> None:
+    if workflow_id is None:
+        return
+    user = require_current_user(request)
+    bound_ids = await list_bound_workflow_ids(db)
+    if workflow_id in bound_ids:
+        if project_id is None:
+            raise api_exception(404, "not_found", "Workflow not found")
+        project_workflow_ids = await list_project_workflow_ids(db, project_id)
+        if workflow_id not in set(project_workflow_ids):
+            raise api_exception(404, "not_found", "Workflow not found")
+    if workflow_id in SYSTEM_WORKFLOWS:
+        return
+    workflow = await get_workflow(db, workflow_id)
+    if workflow is None or workflow.owner_email != user.email:
+        raise api_exception(404, "not_found", "Workflow not found")
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -222,14 +261,8 @@ async def create_schedule_route(
             raise api_exception(404, "agent_not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
 
-    if body.workflow_id is not None:
-        workflow = await request.app.state.workflow_registry.get(
-            body.workflow_id,
-            owner_email=user.email,
-            project_id=body.project_id,
-        )
-        if workflow is None:
-            raise api_exception(404, "not_found", "Workflow not found")
+    async with request.app.state.session_factory() as db:
+        await _validate_workflow_access(db, request, body.workflow_id, project_id=body.project_id)
     await _validate_project_access(request, body.project_id)
 
     if body.skill_id is not None:
@@ -373,23 +406,24 @@ async def update_schedule_route(
                 raise api_exception(404, "agent_not_found", "Agent not found")
             await check_agent_access(request, agent, required="use")
         if body.project_id is not None:
-            await _validate_project_access(request, body.project_id)
+            await _validate_project_access_in_session(db, request, body.project_id)
         effective_project_id = (
-            body.project_id if body.project_id is not None else getattr(existing, "project_id", None)
+            body.project_id
+            if "project_id" in body.model_fields_set
+            else getattr(existing, "project_id", None)
         )
         effective_workflow_id = (
             body.workflow_id
-            if body.workflow_id is not None
+            if "workflow_id" in body.model_fields_set
             else (None if body.skill_id is not None else getattr(existing, "workflow_id", None))
         )
         if effective_workflow_id is not None:
-            workflow = await request.app.state.workflow_registry.get(
+            await _validate_workflow_access(
+                db,
+                request,
                 effective_workflow_id,
-                owner_email=user.email,
                 project_id=effective_project_id,
             )
-            if workflow is None:
-                raise api_exception(404, "not_found", "Workflow not found")
         if (
             body.agent_id is not None
             and body.workflow_id is None

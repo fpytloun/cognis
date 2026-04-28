@@ -2,6 +2,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
+  import { api } from '$lib/api/client';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
   import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
 
@@ -46,7 +47,10 @@
   const selectedAgent = $derived(
     primaryAgents.find((agent: Agent) => agent.agent_id === form.agent_id) ?? null
   );
-  const workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
+  let projectWorkflows = $state<Workflow[]>([]);
+  let workflowLoadKey = 0;
+  let lastAutoProjectWorkflow = $state('');
+  const workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent));
 
   let form = $state({
     title: '',
@@ -82,10 +86,43 @@
     });
   }
 
+  async function loadWorkflowsForProject(projectId: string): Promise<void> {
+    const key = ++workflowLoadKey;
+    try {
+      const next = await api.workflows.listAll({ project_id: projectId || null });
+      if (key !== workflowLoadKey) return;
+      projectWorkflows = next;
+      const selectedProject = projects.find((project: Project) => project.project_id === projectId);
+      if (form.workflow_source && form.workflow_source === lastAutoProjectWorkflow) {
+        form.workflow_source = '';
+        lastAutoProjectWorkflow = '';
+      }
+      if (selectedProject?.default_workflow_id && !form.workflow_source) {
+        lastAutoProjectWorkflow = `workflow:${selectedProject.default_workflow_id}`;
+        form.workflow_source = lastAutoProjectWorkflow;
+      }
+      const values = new Set(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent).map((option) => option.value));
+      if (form.workflow_source && !values.has(form.workflow_source)) {
+        form.workflow_source = '';
+        lastAutoProjectWorkflow = '';
+      }
+    } catch {
+      if (key === workflowLoadKey) projectWorkflows = workflows;
+    }
+  }
+
   $effect(() => {
     if (!form.agent_id && defaultAgentId) {
       form.agent_id = defaultAgentId;
     }
+  });
+
+  $effect(() => {
+    projectWorkflows = workflows;
+  });
+
+  $effect(() => {
+    void loadWorkflowsForProject(form.project_id);
   });
 </script>
 <BlockingDialog label="Create task" onClose={onclose} titleId="create-task-title">
@@ -136,7 +173,7 @@
         <div class="space-y-1">
           <label for="task-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
           <select id="task-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-            <option value="">Auto</option>
+            <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
             {#each workflowSourceOptions as option}
               <option value={option.value}>{option.label}</option>
             {/each}

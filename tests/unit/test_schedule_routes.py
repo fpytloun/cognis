@@ -8,10 +8,13 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.store.queries import (
+    attach_project_workflow,
     create_agent,
+    create_project,
     create_schedule,
     create_task,
     create_user,
+    create_workflow,
     update_schedule_fire_state,
 )
 
@@ -89,6 +92,121 @@ def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path
         detail_response = client.get(f"/api/v1/schedules/{schedule_id}", headers=headers)
         assert detail_response.status_code == 200
         assert detail_response.json()["last_run_status"] == "running"
+
+
+def test_schedule_create_rejects_other_user_workflow(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_user(
+                    session,
+                    email="other@example.com",
+                    name="Other",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                await create_workflow(
+                    session,
+                    workflow_id="wf_other_schedule",
+                    name="Other Schedule Workflow",
+                    definition={
+                        "workflow_id": "wf_other_schedule",
+                        "name": "Other Schedule Workflow",
+                        "steps": [{"name": "run", "type": "run"}],
+                        "owner_email": "other@example.com",
+                    },
+                    is_system=False,
+                    owner_email="other@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/schedules",
+            headers=_auth_headers(app, email="owner@example.com"),
+            json={
+                "name": "Schedule",
+                "schedule_type": "cron",
+                "cron_expr": "0 9 * * *",
+                "agent_id": "agent-1",
+                "workflow_id": "wf_other_schedule",
+            },
+        )
+
+        assert response.status_code == 404
+
+
+def test_schedule_update_rejects_clearing_project_for_bound_workflow(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                project = await create_project(
+                    session,
+                    project_id="project-bound",
+                    owner_email="owner@example.com",
+                    name="Project",
+                )
+                await attach_project_workflow(session, project.project_id, "system:research")
+                schedule = await create_schedule(
+                    session,
+                    created_by="owner@example.com",
+                    agent_id="agent-1",
+                    name="Schedule",
+                    schedule_type="cron",
+                    cron_expr="0 9 * * *",
+                    task_template={"title": "Scheduled task"},
+                    workflow_id="system:research",
+                    project_id=project.project_id,
+                )
+                await session.commit()
+                return schedule.schedule_id
+
+        schedule_id = asyncio.run(_seed())
+
+        response = client.put(
+            f"/api/v1/schedules/{schedule_id}",
+            headers=_auth_headers(app, email="owner@example.com"),
+            json={"project_id": None},
+        )
+
+        assert response.status_code == 404
 
 
 def test_schedule_routes_preserve_scheduler_failure_without_new_task(

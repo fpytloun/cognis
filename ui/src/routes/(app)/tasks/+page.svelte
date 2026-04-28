@@ -32,6 +32,7 @@
   let tasks = $state<Task[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let filterWorkflows = $state<Workflow[]>([]);
   let projects = $state<Project[]>([]);
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
@@ -54,6 +55,7 @@
   let visibilityHandler: (() => void) | null = null;
   let loadTimeoutTimer: number | null = null;
   let boardLoadRequestId = 0;
+  let workflowFilterLoadKey = 0;
 
   const TASK_BOARD_LOAD_TIMEOUT_MS = 10000;
 
@@ -287,6 +289,7 @@
       tasks = nextTasks;
       agents = nextAgents;
       workflows = nextWorkflows;
+      filterWorkflows = nextWorkflows;
       projects = nextProjects;
       skills = nextSkills;
       conversations = nextConversations;
@@ -303,6 +306,24 @@
       }
     }
   }
+
+  async function loadWorkflowFilterOptions(projectId: string): Promise<void> {
+    const key = ++workflowFilterLoadKey;
+    try {
+      const next = await api.workflows.listAll({ project_id: projectId || null });
+      if (key !== workflowFilterLoadKey) return;
+      filterWorkflows = next;
+      if (filters.workflowId && !next.some((workflow) => workflow.workflow_id === filters.workflowId)) {
+        filters.workflowId = '';
+      }
+    } catch {
+      if (key === workflowFilterLoadKey) filterWorkflows = workflows;
+    }
+  }
+
+  $effect(() => {
+    void loadWorkflowFilterOptions(filters.projectId);
+  });
 
   async function refreshTasksOnly(): Promise<void> {
     if (document.hidden) return;
@@ -631,7 +652,7 @@
           <span>Workflow</span>
           <select bind:value={filters.workflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
             <option value="">All</option>
-            {#each workflows as workflow}
+            {#each filterWorkflows as workflow}
               <option value={workflow.workflow_id}>{workflow.name}</option>
             {/each}
           </select>

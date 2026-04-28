@@ -68,6 +68,23 @@ async def _project_response(request: Request, project: Any, *, include_grants: b
     return project_to_response(project, sources=sources, workflow_ids=workflow_ids, grants=grants)
 
 
+async def _require_project_workflow(request: Request, *, workflow_id: str, project_id: str) -> None:
+    """Validate a workflow can be used by the caller's project."""
+
+    user = require_current_user(request)
+    workflow = await request.app.state.workflow_registry.get(
+        workflow_id,
+        owner_email=user.email,
+        project_id=project_id,
+    )
+    if workflow is None:
+        raise api_exception(404, "not_found", "Workflow not found")
+    owner_email = getattr(workflow, "owner_email", None)
+    is_system = bool(getattr(workflow, "is_system", False))
+    if not is_system and owner_email != user.email:
+        raise api_exception(404, "not_found", "Workflow not found")
+
+
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects(
     request: Request,
@@ -88,6 +105,17 @@ async def list_projects(
 async def create_project_route(request: Request, payload: ProjectCreateRequest) -> ProjectResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
+    if payload.default_workflow_id is not None:
+        workflow = await request.app.state.workflow_registry.get(
+            payload.default_workflow_id,
+            owner_email=user.email,
+            project_id=None,
+        )
+        if workflow is None or (
+            not bool(getattr(workflow, "is_system", False))
+            and getattr(workflow, "owner_email", None) != user.email
+        ):
+            raise api_exception(404, "not_found", "Workflow not found")
     async with request.app.state.session_factory() as session:
         row = await create_project(
             session,
@@ -119,6 +147,12 @@ async def update_project_route(
 ) -> ProjectResponse:
     forbid_mutation_for_viewer(request)
     await _require_project(request, project_id, required="manage")
+    if payload.default_workflow_id is not None:
+        await _require_project_workflow(
+            request,
+            workflow_id=payload.default_workflow_id,
+            project_id=project_id,
+        )
     async with request.app.state.session_factory() as session:
         row = await update_project(session, project_id, **payload.model_dump(exclude_unset=True))
         await session.commit()
@@ -194,6 +228,11 @@ async def delete_source_route(request: Request, project_id: str, source_id: str)
 async def attach_workflow_route(request: Request, project_id: str, workflow_id: str) -> ProjectResponse:
     forbid_mutation_for_viewer(request)
     project = await _require_project(request, project_id, required="manage")
+    await _require_project_workflow(
+        request,
+        workflow_id=workflow_id,
+        project_id=project_id,
+    )
     async with request.app.state.session_factory() as session:
         await attach_project_workflow(session, project_id, workflow_id)
         await session.commit()

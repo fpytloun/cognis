@@ -163,5 +163,79 @@ def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
 
         assert response.status_code == 200
         body = response.json()
-        assert body["name"] == "Owner Workflow Copy"
-        assert body["owner_email"] == "admin@example.com"
+    assert body["name"] == "Owner Workflow Copy"
+    assert body["owner_email"] == "admin@example.com"
+
+
+def test_project_workflow_binding_rejects_other_user_workflow(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app, email="owner@example.com"))
+        asyncio.run(_seed_user(client.app, email="other@example.com"))
+
+        async def _seed_workflow() -> None:
+            async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
+                await create_workflow(
+                    session,
+                    workflow_id="wf_other_private",
+                    name="Other Workflow",
+                    definition={
+                        "workflow_id": "wf_other_private",
+                        "name": "Other Workflow",
+                        "steps": [{"name": "plan", "type": "run"}],
+                        "is_system": False,
+                        "owner_email": "other@example.com",
+                    },
+                    is_system=False,
+                    owner_email="other@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed_workflow())
+        headers = _auth_headers(client.app, email="owner@example.com")
+        project = client.post("/api/v1/projects", headers=headers, json={"name": "Project"})
+        assert project.status_code == 201
+        project_id = project.json()["project_id"]
+
+        response = client.post(
+            f"/api/v1/projects/{project_id}/workflows/wf_other_private",
+            headers=headers,
+        )
+
+        assert response.status_code == 404
+
+
+def test_project_create_rejects_other_user_default_workflow(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app, email="owner@example.com"))
+        asyncio.run(_seed_user(client.app, email="other@example.com"))
+
+        async def _seed_workflow() -> None:
+            async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
+                await create_workflow(
+                    session,
+                    workflow_id="wf_other_default",
+                    name="Other Default",
+                    definition={
+                        "workflow_id": "wf_other_default",
+                        "name": "Other Default",
+                        "steps": [{"name": "plan", "type": "run"}],
+                        "is_system": False,
+                        "owner_email": "other@example.com",
+                    },
+                    is_system=False,
+                    owner_email="other@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed_workflow())
+        response = client.post(
+            "/api/v1/projects",
+            headers=_auth_headers(client.app, email="owner@example.com"),
+            json={"name": "Project", "default_workflow_id": "wf_other_default"},
+        )
+
+        assert response.status_code == 404
