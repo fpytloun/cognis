@@ -6,6 +6,7 @@ import {
   appendOptimisticUserMessage,
   applyWebSocketEvent,
   findPendingStepRequestInputCall,
+  latestTodoSnapshot,
   normalizeHistory,
   optimisticallyResolveStepRequestInput,
   type ThinkingTimelineItem,
@@ -855,6 +856,74 @@ describe('chat timeline helpers', () => {
       reconstructed: true,
       evaluation: { decision: 'approve', reasoning: 'ok' }
     });
+  });
+
+  it('keeps the previous todo snapshot when a repeated todo write is rejected', () => {
+    const items = normalizeHistory([
+      {
+        seq: 1,
+        type: 'tool_call',
+        data: {
+          call_id: 'call_todos_1',
+          name: 'step_todo_write',
+          arguments: JSON.stringify({
+            todos: [
+              { content: 'Investigate the failure', status: 'in_progress', priority: 'high' }
+            ]
+          })
+        },
+        timestamp: '2026-04-07T00:00:00Z'
+      },
+      {
+        seq: 2,
+        type: 'tool_result',
+        data: {
+          call_id: 'call_todos_1',
+          name: 'step_todo_write',
+          result: JSON.stringify({
+            status: 'updated',
+            todos: [
+              { content: 'Investigate the failure', status: 'in_progress', priority: 'high' }
+            ]
+          }),
+          is_error: false
+        },
+        timestamp: '2026-04-07T00:00:01Z'
+      },
+      {
+        seq: 3,
+        type: 'tool_call',
+        data: {
+          call_id: 'call_todos_2',
+          name: 'step_todo_write',
+          arguments: JSON.stringify({
+            todos: [
+              { content: 'Investigate the failure', status: 'in_progress', priority: 'high' }
+            ]
+          })
+        },
+        timestamp: '2026-04-07T00:00:02Z'
+      },
+      {
+        seq: 4,
+        type: 'tool_result',
+        data: {
+          call_id: 'call_todos_2',
+          name: 'step_todo_write',
+          result: JSON.stringify({
+            status: 'rejected',
+            reason: 'loop_detected',
+            tool: 'step_todo_write'
+          }),
+          is_error: true
+        },
+        timestamp: '2026-04-07T00:00:03Z'
+      }
+    ]);
+
+    expect(latestTodoSnapshot(items)).toEqual([
+      { content: 'Investigate the failure', status: 'in_progress', priority: 'high' }
+    ]);
   });
 
   it('keeps tool-result attachments in normalized history', () => {

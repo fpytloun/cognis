@@ -11,7 +11,7 @@
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
-  import { normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type ToolCallTimelineItem } from '$lib/chat';
+  import { latestTodoSnapshot, normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type TodoSnapshotItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
@@ -52,71 +52,9 @@
   let userScrolledUp = $state(false);
   let programmaticScroll = false;
 
-  interface SessionTodo {
-    content: string;
-    status: string;
-    priority: string;
-  }
+  type SessionTodo = TodoSnapshotItem;
 
   const terminalTodoStatuses = new Set(['completed', 'cancelled']);
-
-  function normalizeToolName(name: string): string {
-    return name.toLowerCase().replace(/_/g, '');
-  }
-
-  function parseTodos(value: unknown): SessionTodo[] {
-    if (!Array.isArray(value)) return [];
-    return value
-      .map((item) => {
-        if (!item || typeof item !== 'object') return null;
-        const record = item as Record<string, unknown>;
-        const content = typeof record.content === 'string' ? record.content.trim() : '';
-        if (!content) return null;
-        return {
-          content,
-          status: typeof record.status === 'string' ? record.status : 'pending',
-          priority: typeof record.priority === 'string' ? record.priority : 'medium'
-        } satisfies SessionTodo;
-      })
-      .filter((item): item is SessionTodo => item !== null);
-  }
-
-  function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
-    if (typeof item.result !== 'string') return null;
-    try {
-      const parsed = JSON.parse(item.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
-      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function latestSessionTodos(items: TimelineItem[]): SessionTodo[] {
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      const item = items[index];
-      if (item?.kind !== 'tool_call') continue;
-      const toolName = normalizeToolName(item.toolName);
-      if (toolName === 'steptodowrite') {
-        const parsed = parsedToolResult(item);
-        if (Array.isArray(parsed?.todos)) {
-          return parseTodos(parsed.todos);
-        }
-        if (item.status === 'started' && Array.isArray(item.arguments?.todos)) {
-          return parseTodos(item.arguments.todos);
-        }
-        return [];
-      }
-      if (toolName === 'steptodolist') {
-        const parsed = parsedToolResult(item);
-        if (Array.isArray(parsed?.todos)) {
-          return parseTodos(parsed.todos);
-        }
-        return [];
-      }
-    }
-
-    return [];
-  }
 
   function todoStatusDot(status: string): string {
     if (status === 'completed') return 'bg-emerald-400';
@@ -131,7 +69,7 @@
     return 'text-slate-400';
   }
 
-  let sessionTodos = $derived.by(() => latestSessionTodos(timeline));
+  let sessionTodos = $derived.by(() => latestTodoSnapshot(timeline));
   let activeSessionTodos = $derived.by(() => sessionTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
   let shouldShowTodoDrawer = $derived(sessionTodos.length > 0);
   let todoCounts = $derived.by(() => ({

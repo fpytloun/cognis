@@ -163,6 +163,81 @@ export interface ToolCallTimelineItem {
   notificationId?: string;
 }
 
+export interface TodoSnapshotItem {
+  content: string;
+  status: string;
+  priority: string;
+}
+
+function normalizeToolName(name: string): string {
+  return name.toLowerCase().replace(/_/g, '');
+}
+
+function parseTodoSnapshot(value: unknown): TodoSnapshotItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const record = item as Record<string, unknown>;
+      const content = typeof record.content === 'string' ? record.content.trim() : '';
+      if (!content) return null;
+      return {
+        content,
+        status: typeof record.status === 'string' ? record.status : 'pending',
+        priority: typeof record.priority === 'string' ? record.priority : 'medium'
+      } satisfies TodoSnapshotItem;
+    })
+    .filter((item): item is TodoSnapshotItem => item !== null);
+}
+
+function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
+  if (typeof item.result !== 'string') return null;
+  try {
+    const parsed = JSON.parse(item.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+export function latestTodoSnapshot(items: TimelineItem[], resetOnUserMessage = false): TodoSnapshotItem[] {
+  let lowerBound = 0;
+  if (resetOnUserMessage) {
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind === 'message' && item.role === 'user') {
+        lowerBound = index;
+        break;
+      }
+    }
+  }
+
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (index < lowerBound) break;
+    const item = items[index];
+    if (item?.kind !== 'tool_call') continue;
+    const toolName = normalizeToolName(item.toolName);
+    if (toolName === 'steptodowrite') {
+      const parsed = parsedToolResult(item);
+      if (Array.isArray(parsed?.todos)) {
+        return parseTodoSnapshot(parsed.todos);
+      }
+      if (item.status === 'started' && Array.isArray(item.arguments?.todos)) {
+        return parseTodoSnapshot(item.arguments.todos);
+      }
+      continue;
+    }
+    if (toolName === 'steptodolist') {
+      const parsed = parsedToolResult(item);
+      if (Array.isArray(parsed?.todos)) {
+        return parseTodoSnapshot(parsed.todos);
+      }
+      continue;
+    }
+  }
+  return [];
+}
+
 export interface DelegationTimelineItem {
   id: string;
   kind: 'delegation';

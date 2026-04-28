@@ -77,11 +77,12 @@ import X from 'lucide-svelte/icons/x';
     applyWebSocketEvent,
     appendOptimisticUserMessage,
     findPendingStepRequestInputCall,
+    latestTodoSnapshot,
     optimisticallyResolveStepRequestInput,
     normalizeHistory,
     type ThinkingTimelineItem,
     type TimelineItem,
-    type ToolCallTimelineItem
+    type TodoSnapshotItem
   } from '$lib/chat';
   import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
@@ -235,11 +236,7 @@ import X from 'lucide-svelte/icons/x';
     context: string;
   }
 
-  interface ChatTodo {
-    content: string;
-    status: string;
-    priority: string;
-  }
+  type ChatTodo = TodoSnapshotItem;
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
   let directQuestionSubmitting = $state(false);
@@ -328,10 +325,6 @@ import X from 'lucide-svelte/icons/x';
     return status !== null && BLOCKED_SESSION_STATES.has(status);
   }
 
-  function normalizeToolName(name: string): string {
-    return name.toLowerCase().replace(/_/g, '');
-  }
-
   function directQuestionOptions(options: unknown): string[] {
     if (!Array.isArray(options)) return [];
     return options
@@ -386,71 +379,6 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
-  function parseChatTodos(value: unknown): ChatTodo[] {
-    if (!Array.isArray(value)) return [];
-    return value
-      .map((item) => {
-        if (!item || typeof item !== 'object') return null;
-        const record = item as Record<string, unknown>;
-        const content = typeof record.content === 'string' ? record.content.trim() : '';
-        if (!content) return null;
-        return {
-          content,
-          status: typeof record.status === 'string' ? record.status : 'pending',
-          priority: typeof record.priority === 'string' ? record.priority : 'medium'
-        } satisfies ChatTodo;
-      })
-      .filter((item): item is ChatTodo => item !== null);
-  }
-
-  function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
-    if (typeof item.result !== 'string') return null;
-    try {
-      const parsed = JSON.parse(item.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
-      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function latestChatTodos(items: TimelineItem[], resetOnUserMessage = true): ChatTodo[] {
-    let lowerBound = 0;
-    if (resetOnUserMessage) {
-      for (let index = items.length - 1; index >= 0; index -= 1) {
-        const item = items[index];
-        if (item?.kind === 'message' && item.role === 'user') {
-          lowerBound = index;
-          break;
-        }
-      }
-    }
-
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      if (index < lowerBound) break;
-      const item = items[index];
-      if (item?.kind !== 'tool_call') continue;
-      const toolName = normalizeToolName(item.toolName);
-      if (toolName === 'steptodowrite') {
-        const parsed = parsedToolResult(item);
-        if (Array.isArray(parsed?.todos)) {
-          return parseChatTodos(parsed.todos);
-        }
-        if (item.status === 'started' && Array.isArray(item.arguments?.todos)) {
-          return parseChatTodos(item.arguments.todos);
-        }
-        return [];
-      }
-      if (toolName === 'steptodolist') {
-        const parsed = parsedToolResult(item);
-        if (Array.isArray(parsed?.todos)) {
-          return parseChatTodos(parsed.todos);
-        }
-        return [];
-      }
-    }
-    return [];
-  }
-
   /**
    * Compact status indicator for a todo row. Returns the background
    * colour for a tiny dot rendered next to the todo content — we drop
@@ -501,7 +429,7 @@ import X from 'lucide-svelte/icons/x';
   const terminalTodoStatuses = new Set(['completed', 'cancelled']);
 
   let chatTodos = $derived.by(() => {
-    const latestTodos = latestChatTodos(timeline, currentConversation?.context?.type === 'web');
+    const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       return latestTodos;
     }
@@ -2482,7 +2410,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    const latestTodos = latestChatTodos(timeline, currentConversation?.context?.type === 'web');
+    const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       retainedChatTodos = latestTodos;
       return;
