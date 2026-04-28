@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
+from sqlalchemy import or_, update
 
 from cognis.api.common import api_exception, require_admin, require_current_user
 from cognis.api.executor_runtime import schedule_executor_reconfigure
@@ -20,6 +21,7 @@ from cognis.core.executor_policy import (
     validate_executor_mcp_scope,
 )
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
+from cognis.store.models import ExecutorRow
 from cognis.store.queries import (
     create_executor,
     delete_executor,
@@ -86,6 +88,17 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
     )
 
 
+async def _clear_executor_defaults(session: Any, owner_email: str) -> None:
+    owner_filter = ExecutorRow.owner_email == owner_email
+    if owner_email == SYSTEM_USER_EMAIL:
+        owner_filter = or_(owner_filter, ExecutorRow.owner_email.is_(None))
+    await session.execute(
+        update(ExecutorRow)
+        .where(owner_filter)
+        .values(is_default=False)
+    )
+
+
 @router.get("/api/v1/executors", response_model=list[ExecutorConfigResponse])
 async def list_executors_route(request: Request) -> list[ExecutorConfigResponse]:
     user = require_current_user(request)
@@ -116,14 +129,17 @@ async def create_executor_route(
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
     async with request.app.state.session_factory() as session:
+        executor_owner = _resolve_executor_owner(user, body.shared)
         try:
             await validate_executor_mcp_scope(
                 session,
-                owner_email=_resolve_executor_owner(user, body.shared),
+                owner_email=executor_owner,
                 config=body.config or None,
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
+        if body.is_default:
+            await _clear_executor_defaults(session, executor_owner)
         row = await create_executor(
             session,
             executor_id=body.executor_id,
@@ -174,16 +190,19 @@ async def update_executor_route(
         _require_executor_mutation_access(request, existing)
         executor_type = str(updates.get("executor_type", existing.executor_type))
         next_shared = bool(updates.get("shared", _executor_is_shared(existing)))
+        executor_owner = _resolve_executor_owner(user, next_shared)
         _enforce_executor_creation_rules(user, executor_type=executor_type, shared=next_shared)
         try:
             ensure_executor_type_allowed(executor_type, policy)
             await validate_executor_mcp_scope(
                 session,
-                owner_email=_resolve_executor_owner(user, next_shared),
+                owner_email=executor_owner,
                 config=updates.get("config", existing.config or {}),
             )
         except ValueError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
+        if updates.get("is_default") is True:
+            await _clear_executor_defaults(session, executor_owner)
         row = await update_executor(
             session,
             executor_id,

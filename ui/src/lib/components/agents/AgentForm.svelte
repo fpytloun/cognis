@@ -488,10 +488,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       <Card class="p-5">
         <div class="mb-3 flex items-center justify-between gap-3">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt</p>
-          {#if !isSystemAsset}
+          {#if !readonly && !isSystemAsset}
             <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
-          {:else}
+          {:else if isSystemAsset}
             <span class="text-xs text-slate-500">Managed by the shipped system agent definition.</span>
+          {:else}
+            <span class="text-xs text-slate-500">Read-only because this agent is shared with you.</span>
           {/if}
         </div>
         <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise." disabled={readonly}></textarea>
@@ -520,12 +522,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         <div class="grid gap-4 md:grid-cols-2">
           <label class="flex items-center gap-3 text-sm font-medium text-slate-200">
-            <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" />
+            <input bind:checked={form.canDelegate} class="h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" disabled={readonly} />
             Can delegate
           </label>
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Max delegation depth</span>
-            <Input bind:value={form.maxDelegationDepth} type="number" />
+            <Input bind:value={form.maxDelegationDepth} type="number" disabled={readonly} />
           </label>
         </div>
 
@@ -616,6 +618,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     class="h-4 w-4 rounded border-slate-600 bg-slate-950"
                     type="checkbox"
                     onchange={() => toggleSecret(secret.name)}
+                    disabled={readonly}
                   />
                   {secret.name}
                   <span class="text-xs text-slate-400">({secret.scope})</span>
@@ -689,7 +692,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 <button
                   type="button"
                   class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-sky-500/20 border-sky-500/50 text-sky-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
+                  disabled={readonly}
                   onclick={() => {
+                    if (readonly) return;
                     const current = form.intarisMcpServers || [];
                     if (selected) {
                       form.intarisMcpServers = current.filter((n: string) => n !== server.name);
@@ -802,7 +807,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           <div class="grid gap-3 md:grid-cols-2">
             {#each workflows as workflow}
               <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
-                <input checked={form.availableWorkflowIds.includes(workflow.workflow_id)} class="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleWorkflow(workflow.workflow_id)} />
+                <input checked={form.availableWorkflowIds.includes(workflow.workflow_id)} class="mt-1 h-4 w-4 rounded border-slate-600 bg-slate-950" type="checkbox" onchange={() => toggleWorkflow(workflow.workflow_id)} disabled={readonly} />
                 <span>
                   <span class="block font-medium text-white">{workflow.name}</span>
                   <span class="mt-1 block text-xs text-slate-400">{workflow.workflow_id}</span>
@@ -814,7 +819,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           <div class="grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Default workflow</span>
-              <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
                 <option value="">Automatic (decision engine)</option>
                 {#each workflows as workflow}
                   {#if form.availableWorkflowIds.includes(workflow.workflow_id)}
@@ -826,7 +831,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Selection mode</span>
-              <select bind:value={form.workflowSelectionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={form.workflowSelectionMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
                 <option value="automatic">automatic</option>
                 <option value="always_ask">always_ask</option>
                 <option value="use_default">use_default</option>
@@ -836,7 +841,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
           <label class="block space-y-2 text-sm font-medium text-slate-200">
             <span>Step agent overrides (JSON)</span>
-            <textarea aria-invalid={errors.stepAgentOverridesJson ? 'true' : 'false'} bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500"></textarea>
+            <textarea aria-invalid={errors.stepAgentOverridesJson ? 'true' : 'false'} bind:value={form.stepAgentOverridesJson} class="min-h-[150px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100 placeholder:text-slate-500" disabled={readonly}></textarea>
             {#if errors.stepAgentOverridesJson}
               <span class="text-xs text-rose-300">{errors.stepAgentOverridesJson}</span>
             {/if}

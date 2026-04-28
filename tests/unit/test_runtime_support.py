@@ -605,6 +605,7 @@ def _executor_row(
     executor_type: str = "websocket",
     labels: dict[str, object] | None = None,
     status: str = "active",
+    is_default: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         executor_id=executor_id,
@@ -615,6 +616,7 @@ def _executor_row(
         enabled_tool_groups=[],
         config={},
         status=status,
+        is_default=is_default,
         owner_email=owner_email,
         desired_config_version=1,
         applied_config_version=1,
@@ -771,6 +773,69 @@ async def test_eligible_executor_selector_can_pick_shared_executor(
 
     assert config["executor_id"] == "shared_exec"
     assert config["selection_source"] == "selector"
+
+
+@pytest.mark.asyncio
+async def test_eligible_executor_uses_grantee_override_for_grantee_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_grant(*_: object, **__: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            executor_scope="grantee_executor",
+            grantee_overrides={"execution": {"executor_id": "guest_exec"}},
+        )
+
+    async def _get_executor_row(*_: object, **kwargs: object) -> SimpleNamespace | None:
+        assert kwargs["owner_email"] == "guest@example.com"
+        return _executor_row("guest_exec", owner_email="guest@example.com")
+
+    monkeypatch.setattr(store_queries, "get_active_agent_grant", _get_grant)
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={"executor_id": "owner_exec"},
+        ),
+        "guest@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+    )
+
+    assert config["executor_id"] == "guest_exec"
+    assert config["executor_owner_email"] == "guest@example.com"
+
+
+@pytest.mark.asyncio
+async def test_eligible_executor_falls_back_to_grantee_default_for_grantee_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_grant(*_: object, **__: object) -> SimpleNamespace:
+        return SimpleNamespace(executor_scope="grantee_executor", grantee_overrides={})
+
+    async def _list_executors(*_: object, **kwargs: object) -> list[SimpleNamespace]:
+        assert kwargs["owner_email"] == "guest@example.com"
+        return [_executor_row("guest_default", owner_email="guest@example.com", is_default=True)]
+
+    monkeypatch.setattr(store_queries, "get_active_agent_grant", _get_grant)
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={"executor_id": "owner_exec"},
+        ),
+        "guest@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+    )
+
+    assert config["executor_id"] == "guest_default"
+    assert config["selection_source"] == "default"
 
 
 @pytest.mark.asyncio

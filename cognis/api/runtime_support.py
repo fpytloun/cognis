@@ -36,7 +36,7 @@ from cognis.models.tool import (
     ToolDefinition,
     tool_matches_identifier,
 )
-from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
 from cognis.runtime_context import current_effective_working_directory, current_workspace_root
 from cognis.tools.builtin.artifact_tools import artifact_tools
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
@@ -119,6 +119,25 @@ def _agent_executor_binding(agent: AgentDefinition) -> tuple[str, bool]:
     if selector is not None:
         return "empty_selector", False
     return "none", False
+
+
+def _agent_executor_binding_from_execution(execution: dict[str, Any]) -> tuple[str, bool]:
+    if execution.get("executor_id"):
+        return "explicit", True
+    selector = execution.get("executor_selector")
+    if isinstance(selector, dict) and selector:
+        return "selector", True
+    if selector is not None:
+        return "empty_selector", False
+    return "none", False
+
+
+def _grant_execution(grant: Any | None) -> dict[str, Any]:
+    overrides = getattr(grant, "grantee_overrides", None)
+    if not isinstance(overrides, dict):
+        return {}
+    execution = overrides.get("execution")
+    return execution if isinstance(execution, dict) else {}
 
 
 def _environment_payload(snapshot: Any | None) -> dict[str, Any] | None:
@@ -244,41 +263,76 @@ async def _resolve_eligible_executor_config(
     if session_factory is None:
         raise RuntimeError("Session factory unavailable; cannot resolve executor")
 
-    execution = agent.execution if isinstance(agent.execution, dict) else {}
-    explicit_id = execution.get("executor_id")
-    selector = execution.get("executor_selector")
-    selection_source, _hard_bound = _agent_executor_binding(agent)
-    if not explicit_id and selector is not None and not (isinstance(selector, dict) and selector):
-        raise RuntimeError("Agent executor_selector must be a non-empty object")
-    if not explicit_id and not selector:
-        raise RuntimeError("Agent must explicitly configure executor_id or executor_selector")
+    from cognis.store.queries import get_active_agent_grant, get_executor_row, list_executors
 
-    from cognis.store.queries import get_executor_row, list_executors
+    executor_owner_email = user_email
+    execution = agent.execution if isinstance(agent.execution, dict) else {}
+    allow_default = False
 
     async with session_factory() as session:
+        if user_email != agent.owner_email:
+            grant = await get_active_agent_grant(session, agent.agent_id, user_email)
+            if grant is not None:
+                executor_scope = normalize_executor_scope(str(getattr(grant, "executor_scope", "")))
+                if executor_scope == "owner_executor":
+                    executor_owner_email = agent.owner_email
+                else:
+                    execution = _grant_execution(grant)
+                    allow_default = True
+
+        explicit_id = execution.get("executor_id")
+        selector = execution.get("executor_selector")
+        selection_source, _hard_bound = _agent_executor_binding_from_execution(execution)
+        if not explicit_id and selector is not None and not (isinstance(selector, dict) and selector):
+            raise RuntimeError("Agent executor_selector must be a non-empty object")
+
         if explicit_id:
             row = await get_executor_row(
                 session,
                 str(explicit_id),
-                owner_email=user_email,
+                owner_email=executor_owner_email,
                 include_shared=True,
             )
             if row is None:
                 raise RuntimeError(f"Executor '{explicit_id}' is not available to this user")
-            if not is_executor_row_usable(row, policy, owner_email=user_email):
+            if not is_executor_row_usable(row, policy, owner_email=executor_owner_email):
                 raise RuntimeError(f"Executor '{explicit_id}' is not active or allowed by policy")
             return _executor_config_from_row(
                 row,
-                executor_owner_email=user_email,
+                executor_owner_email=executor_owner_email,
                 selection_source="explicit",
             )
 
+        if not explicit_id and not selector:
+            if not allow_default:
+                raise RuntimeError("Agent must explicitly configure executor_id or executor_selector")
+            candidates = await list_executors(session, owner_email=executor_owner_email, include_shared=True)
+            default_matches = [
+                row
+                for row in candidates
+                if bool(getattr(row, "is_default", False))
+                and is_executor_row_usable(row, policy, owner_email=executor_owner_email)
+            ]
+            private_defaults = [
+                row for row in default_matches if getattr(row, "owner_email", None) == executor_owner_email
+            ]
+            selected = private_defaults[0] if private_defaults else (default_matches[0] if default_matches else None)
+            if selected is None:
+                raise RuntimeError(
+                    "No default executor is configured for this shared agent. Configure your executor on the agent page."
+                )
+            return _executor_config_from_row(
+                selected,
+                executor_owner_email=executor_owner_email,
+                selection_source="default",
+            )
+
+        candidates = await list_executors(session, owner_email=executor_owner_email, include_shared=True)
         assert isinstance(selector, dict)
-        candidates = await list_executors(session, owner_email=user_email, include_shared=True)
         matches = [
             row
             for row in candidates
-            if is_executor_row_usable(row, policy, owner_email=user_email)
+            if is_executor_row_usable(row, policy, owner_email=executor_owner_email)
             and labels_match(row.labels, {str(k): str(v) for k, v in selector.items()})
         ]
         if len(matches) != 1:
@@ -287,7 +341,7 @@ async def _resolve_eligible_executor_config(
             )
         return _executor_config_from_row(
             matches[0],
-            executor_owner_email=user_email,
+            executor_owner_email=executor_owner_email,
             selection_source=selection_source,
         )
 

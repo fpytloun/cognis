@@ -686,6 +686,7 @@ async def update_agent_grant(
     *,
     executor_scope: str | None = None,
     note: str | None = None,
+    grantee_overrides: dict[str, Any] | None | object = _UNSET,
     revoked_at: datetime | None | object = _UNSET,
     granted_at: datetime | None | object = _UNSET,
     granted_by: str | None | object = _UNSET,
@@ -699,6 +700,8 @@ async def update_agent_grant(
         row.executor_scope = executor_scope
     if note is not None:
         row.note = note
+    if grantee_overrides is not _UNSET:
+        row.grantee_overrides = grantee_overrides  # type: ignore[assignment]
     if revoked_at is not _UNSET:
         row.revoked_at = revoked_at
     if granted_at is not _UNSET:

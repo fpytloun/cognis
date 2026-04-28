@@ -6,7 +6,13 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_agent, create_agent_grant, create_conversation, create_user
+from cognis.store.queries import (
+    create_agent,
+    create_agent_grant,
+    create_conversation,
+    create_executor,
+    create_user,
+)
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -65,6 +71,155 @@ def test_grantee_can_list_and_view_shared_agent(monkeypatch: object, tmp_path: P
         assert payload["shared_by_email"] == "owner@example.com"
         assert payload["executor_scope"] == "owner_executor"
         assert payload["is_readonly_for_caller"] is True
+
+
+def test_grantee_can_load_shared_agent_avatar(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            image_id = "img_shared_avatar"
+            await client.app.state.artifact_store.async_save(
+                "avatars",
+                image_id,
+                "image",
+                b"avatar-bytes",
+                "image/png",
+                owner_email="owner@example.com",
+            )
+            async with client.app.state.session_factory() as session:
+                password_hash = client.app.state.password_hasher.hash("password123")
+                await create_user(session, email="owner@example.com", name="Owner", password_hash=password_hash)
+                await create_user(session, email="guest@example.com", name="Guest", password_hash=password_hash)
+                await create_user(session, email="other@example.com", name="Other", password_hash=password_hash)
+                await create_agent(
+                    session,
+                    agent_id="shared-agent",
+                    owner_email="owner@example.com",
+                    name="Shared Agent",
+                    display_name="Shared Agent",
+                    avatar_image_id=image_id,
+                    status="active",
+                )
+                await create_agent_grant(
+                    session,
+                    agent_id="shared-agent",
+                    grantee_user_email="guest@example.com",
+                    executor_scope="owner_executor",
+                    granted_by="owner@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        list_response = client.get(
+            "/api/v1/agents",
+            headers=_auth_headers(client.app, email="guest@example.com"),
+        )
+        assert list_response.status_code == 200
+        shared = next(item for item in list_response.json()["items"] if item["agent_id"] == "shared-agent")
+        assert shared["avatar_url"] == "/api/v1/images/img_shared_avatar"
+
+        image_response = client.get(
+            "/api/v1/images/img_shared_avatar",
+            headers=_auth_headers(client.app, email="guest@example.com"),
+        )
+        assert image_response.status_code == 200
+        assert image_response.content == b"avatar-bytes"
+
+        other_response = client.get(
+            "/api/v1/images/img_shared_avatar",
+            headers=_auth_headers(client.app, email="other@example.com"),
+        )
+        assert other_response.status_code == 404
+
+
+def test_grantee_can_update_own_executor_override(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                password_hash = client.app.state.password_hasher.hash("password123")
+                await create_user(session, email="owner@example.com", name="Owner", password_hash=password_hash)
+                await create_user(session, email="guest@example.com", name="Guest", password_hash=password_hash)
+                await create_agent(
+                    session,
+                    agent_id="shared-agent",
+                    owner_email="owner@example.com",
+                    name="Shared Agent",
+                    display_name="Shared Agent",
+                    status="active",
+                )
+                await create_agent_grant(
+                    session,
+                    agent_id="shared-agent",
+                    grantee_user_email="guest@example.com",
+                    executor_scope="grantee_executor",
+                    granted_by="owner@example.com",
+                )
+                await create_executor(
+                    session,
+                    executor_id="guest_exec",
+                    name="Guest Exec",
+                    executor_type="websocket",
+                    owner_email="guest@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.patch(
+            "/api/v1/agents/shared-agent/my-share",
+            headers=_auth_headers(client.app, email="guest@example.com"),
+            json={"execution": {"executor_id": "guest_exec"}},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["grantee_overrides"] == {"execution": {"executor_id": "guest_exec"}}
+
+        owner_response = client.get(
+            "/api/v1/agents/shared-agent/shares",
+            headers=_auth_headers(client.app, email="owner@example.com"),
+        )
+        assert owner_response.status_code == 200
+        assert owner_response.json()[0]["grantee_overrides"] is None
+
+
+def test_owner_executor_share_rejects_grantee_executor_override(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                password_hash = client.app.state.password_hasher.hash("password123")
+                await create_user(session, email="owner@example.com", name="Owner", password_hash=password_hash)
+                await create_user(session, email="guest@example.com", name="Guest", password_hash=password_hash)
+                await create_agent(
+                    session,
+                    agent_id="shared-agent",
+                    owner_email="owner@example.com",
+                    name="Shared Agent",
+                    display_name="Shared Agent",
+                    status="active",
+                )
+                await create_agent_grant(
+                    session,
+                    agent_id="shared-agent",
+                    grantee_user_email="guest@example.com",
+                    executor_scope="owner_executor",
+                    granted_by="owner@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.patch(
+            "/api/v1/agents/shared-agent/my-share",
+            headers=_auth_headers(client.app, email="guest@example.com"),
+            json={"execution": {"executor_id": "guest_exec"}},
+        )
+
+        assert response.status_code == 400
 
 
 def test_admin_has_no_bypass_for_shared_agent_access(monkeypatch: object, tmp_path: Path) -> None:

@@ -30,6 +30,10 @@
   let secondaryAgents = $state<Agent[]>([]);
   let secondaryBindings = $state<string[]>([]);
   let shares = $state<AgentGrant[]>([]);
+  let myShare = $state<AgentGrant | null>(null);
+  let shareExecutorId = $state('');
+  let shareExecutorSelector = $state('');
+  let shareOverrideSaving = $state(false);
   let shareEmail = $state('');
   let shareExecutorScope = $state<'owner_executor' | 'grantee_executor'>('owner_executor');
   let shareNote = $state('');
@@ -87,6 +91,69 @@
     return !!agent && !agent.is_system && !agent.is_shared_with_me && agent.owner_email === currentUser?.email;
   }
 
+  function granteeExecution(grant: AgentGrant | null): Record<string, unknown> {
+    const overrides = grant?.grantee_overrides;
+    const execution = overrides && typeof overrides === 'object' ? overrides.execution : null;
+    return execution && typeof execution === 'object' ? execution as Record<string, unknown> : {};
+  }
+
+  function selectorText(selector: unknown): string {
+    if (!selector || typeof selector !== 'object') return '';
+    return Object.entries(selector as Record<string, unknown>)
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join('\n');
+  }
+
+  function selectorFromText(value: string): Record<string, string> {
+    return Object.fromEntries(
+      value
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const [key, ...rest] = line.split('=');
+          return [key?.trim(), rest.join('=').trim()] as const;
+        })
+        .filter(([key, val]) => Boolean(key) && Boolean(val))
+    );
+  }
+
+  async function loadMyShare(): Promise<void> {
+    if (!agent?.is_shared_with_me) {
+      myShare = null;
+      return;
+    }
+    try {
+      myShare = await api.agents.myShare(agent.agent_id);
+      const execution = granteeExecution(myShare);
+      shareExecutorId = typeof execution.executor_id === 'string' ? execution.executor_id : '';
+      shareExecutorSelector = selectorText(execution.executor_selector);
+    } catch {
+      myShare = null;
+    }
+  }
+
+  async function saveShareExecutorOverride(): Promise<void> {
+    if (!agent?.is_shared_with_me || myShare?.executor_scope !== 'grantee_executor') return;
+    shareOverrideSaving = true;
+    try {
+      const selector = selectorFromText(shareExecutorSelector);
+      const execution: Record<string, unknown> = shareExecutorId
+        ? { executor_id: shareExecutorId }
+        : Object.keys(selector).length > 0
+          ? { executor_selector: selector }
+          : {};
+      myShare = await api.agents.updateMyShare(agent.agent_id, { execution });
+      addToast('Shared-agent executor saved.', 'success');
+      await loadAgent();
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save executor');
+    } finally {
+      shareOverrideSaving = false;
+    }
+  }
+
   async function loadShares(): Promise<void> {
     if (!agent || !canManageShares()) {
       shares = [];
@@ -133,15 +200,21 @@
         }
       }
       Object.assign(form, agentToFormState(agent));
-      // Load the full tool catalog without disabled filters so unchecked
-      // tools remain visible and can be re-enabled.
-      const fullCatalogPayload = formStateToEffectiveToolsPreviewPayload({
-        ...form,
-        disabledTools: [],
-        disabledCategories: [],
-      });
-      const fullCatalog = await api.agents.previewEffectiveTools(fullCatalogPayload);
-      tools = fullCatalog.configured_state.tools;
+      await loadMyShare();
+      if (agent.is_readonly_for_caller) {
+        const effective = await api.agents.effectiveTools(agent.agent_id);
+        tools = effective.configured_state.tools;
+      } else {
+        // Load the full tool catalog without disabled filters so unchecked
+        // tools remain visible and can be re-enabled.
+        const fullCatalogPayload = formStateToEffectiveToolsPreviewPayload({
+          ...form,
+          disabledTools: [],
+          disabledCategories: [],
+        });
+        const fullCatalog = await api.agents.previewEffectiveTools(fullCatalogPayload);
+        tools = fullCatalog.configured_state.tools;
+      }
       await loadShares();
       loading = false;
       await tick(); // Let AgentForm mount and settle select bindings before capturing snapshot
@@ -303,7 +376,7 @@
   });
 
   $effect(() => {
-    if (loading || !agent) return;
+    if (loading || !agent || agent.is_readonly_for_caller) return;
     // Load the full tool catalog without disabled filters so unchecked
     // tools remain visible and can be re-enabled. Only executor/skills
     // changes should refresh the catalog.
@@ -370,6 +443,33 @@
         <p class="font-medium">Shared agent</p>
         <p class="mt-1 text-cyan-100/80">Shared by {agent.shared_by_email ?? agent.owner_email}. You can use this agent, but only the owner can edit or manage sharing.</p>
       </div>
+    {/if}
+    {#if agent?.is_shared_with_me && myShare?.executor_scope === 'grantee_executor'}
+      <Card class="p-4 sm:p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-sm uppercase tracking-[0.22em] text-slate-500">Your runtime</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Executor for this shared agent</h2>
+            <p class="mt-1 text-sm text-slate-400">Choose your executor for this owner-shared agent. Leave both fields empty to use your default executor.</p>
+          </div>
+          <Button size="sm" disabled={shareOverrideSaving} onclick={saveShareExecutorOverride}>{shareOverrideSaving ? 'Saving...' : 'Save executor'}</Button>
+        </div>
+        <div class="mt-4 grid gap-3 md:grid-cols-2">
+          <label class="space-y-1 text-sm text-slate-300">
+            <span>Executor</span>
+            <select bind:value={shareExecutorId} class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-sky-400">
+              <option value="">Use default executor</option>
+              {#each executors as executor}
+                <option value={executor.executor_id}>{executor.name}{executor.is_default ? ' (default)' : ''} ({executor.executor_type})</option>
+              {/each}
+            </select>
+          </label>
+          <label class="space-y-1 text-sm text-slate-300">
+            <span>Executor selector</span>
+            <textarea bind:value={shareExecutorSelector} class="min-h-[72px] w-full rounded-2xl border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none focus:border-sky-400" disabled={!!shareExecutorId} placeholder="tier=standard&#10;location=local"></textarea>
+          </label>
+        </div>
+      </Card>
     {/if}
     {#if canManageShares()}
       <Card class="p-4 sm:p-5">

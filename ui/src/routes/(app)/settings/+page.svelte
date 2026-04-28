@@ -190,7 +190,7 @@ import { onMount, tick } from 'svelte';
   let webSearxngUrlForm = $state('');
   let webKeySetup = $state<{ backend: string; value: string } | null>(null);
   let showExecutorForm = $state(false);
-  let executorForm = $state({ executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false });
+  let executorForm = $state({ executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false, is_default: false });
   let executorToken = $state<ExecutorTokenResponse | null>(null);
   // Mobile tool-picker sheet: holds the executor id whose tool list should be
   // open, plus the current search query inside that picker. Setting both to
@@ -2447,7 +2447,7 @@ import { onMount, tick } from 'svelte';
               Executors handle tool execution. Enable tools on each executor to make them available to agents.
             </p>
           </div>
-          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
+          <Button variant="primary" size="sm" onclick={() => { executorForm = { executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false, is_default: false }; editingExecutor = null; executorToken = null; showExecutorForm = true; }}>New executor</Button>
         </div>
 
         {#if showExecutorForm}
@@ -2482,6 +2482,10 @@ import { onMount, tick } from 'svelte';
                   <span>Shared executor available to all users</span>
                 </label>
               {/if}
+              <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-200 md:col-span-2">
+                <input bind:checked={executorForm.is_default} type="checkbox" class="rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
+                <span>Use as default executor</span>
+              </label>
               {#if editingExecutor}
                 <label class="space-y-1 text-sm text-slate-200">
                   <span>Status</span>
@@ -2503,9 +2507,9 @@ import { onMount, tick } from 'svelte';
                 );
                 try {
                   if (editingExecutor) {
-                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels, status: executorForm.status, shared: executorForm.shared });
+                    await api.executor.update(editingExecutor.executor_id, { name: executorForm.name, labels, status: executorForm.status, shared: executorForm.shared, is_default: executorForm.is_default });
                   } else {
-                    await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels, shared: executorForm.shared });
+                    await api.executor.create({ executor_id: executorForm.executor_id || null, name: executorForm.name, executor_type: executorForm.executor_type, labels, shared: executorForm.shared, is_default: executorForm.is_default });
                   }
                   showExecutorForm = false;
                   await refreshPageState();
@@ -2546,7 +2550,8 @@ import { onMount, tick } from 'svelte';
                       executor_type: exec.executor_type,
                       labels: Object.entries(exec.labels || {}).map(([k, v]) => `${k}=${v}`).join(', '),
                       status: exec.status,
-                      shared: !!exec.shared
+                      shared: !!exec.shared,
+                      is_default: !!exec.is_default
                     };
                     showExecutorForm = true;
                   }}>Edit</Button>

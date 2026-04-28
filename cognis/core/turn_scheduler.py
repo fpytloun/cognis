@@ -62,6 +62,7 @@ from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionMode
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import (
     current_agent_id,
+    current_agent_owner_email,
     current_effective_working_directory,
     current_user_email,
     current_workspace_root,
@@ -1361,6 +1362,7 @@ class TurnScheduler:
         try:
             current_user_email.set(user_email)
             current_agent_id.set(agent.agent_id)
+            current_agent_owner_email.set(agent.owner_email)
             conversation_context = getattr(conversation, "context", None)
             platform_data = getattr(conversation_context, "platform_data", None) or {}
             current_workspace_root.set(platform_data.get("workspace_root"))

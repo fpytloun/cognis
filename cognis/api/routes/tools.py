@@ -48,7 +48,7 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
-from cognis.core.executor_policy import load_executor_policy
+from cognis.core.executor_policy import is_executor_row_usable, load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import (
@@ -202,13 +202,21 @@ async def get_agent_effective_tools(request: Request, agent_id: str) -> Effectiv
         raise api_exception(404, "not_found", "Agent not found")
     access = await check_agent_access(request, row, required="view")
     agent = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+    executor_owner_email = (
+        access.user.email if access.executor_scope == "grantee_executor" else agent.owner_email
+    )
+    require_default_executor = False
+    if access.executor_scope == "grantee_executor" and access.grant is not None:
+        overrides = getattr(access.grant, "grantee_overrides", None)
+        execution = overrides.get("execution") if isinstance(overrides, dict) else None
+        agent.execution = execution if isinstance(execution, dict) else {}
+        require_default_executor = not agent.execution
     return await _resolve_effective_tools_response(
         request,
         agent,
         acting_user_email=access.user.email,
-        executor_owner_email=(
-            access.user.email if access.executor_scope == "grantee_executor" else agent.owner_email
-        ),
+        executor_owner_email=executor_owner_email,
+        require_default_executor=require_default_executor,
     )
 
 
@@ -347,6 +355,7 @@ async def _resolve_effective_tools_response(
     *,
     acting_user_email: str,
     executor_owner_email: str,
+    require_default_executor: bool = False,
 ) -> EffectiveToolsResponse:
     session_factory = request.app.state.session_factory
     policy = await load_executor_policy(session_factory)
@@ -359,12 +368,24 @@ async def _resolve_effective_tools_response(
             owner_email=executor_owner_email,
             include_shared=True,
         )
-        selected = select_executor_for_agent(
-            executors,
-            agent.execution if isinstance(agent.execution, dict) else None,
-            owner_email=executor_owner_email,
-            policy=policy,
-        )
+        execution = agent.execution if isinstance(agent.execution, dict) else None
+        if require_default_executor and not execution:
+            selected = next(
+                (
+                    row
+                    for row in executors
+                    if bool(getattr(row, "is_default", False))
+                    and is_executor_row_usable(row, policy, owner_email=executor_owner_email)
+                ),
+                None,
+            )
+        else:
+            selected = select_executor_for_agent(
+                executors,
+                execution,
+                owner_email=executor_owner_email,
+                policy=policy,
+            )
 
     if selected is None:
         warnings.append("No executor could be resolved for this agent.")

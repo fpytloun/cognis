@@ -192,6 +192,7 @@ class AgentGrantRow(Base):
     )
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    grantee_overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class SystemAgentOverride(Base):

@@ -221,6 +221,7 @@ class WorkflowEngine:
             with scoped_runtime_context(
                 user_email=session.user_email,
                 agent_id=agent.agent_id,
+                agent_owner_email=agent.owner_email,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
             ):

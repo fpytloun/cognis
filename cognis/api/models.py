@@ -399,6 +399,11 @@ class AgentGrantResponse(BaseModel):
     granted_at: datetime | None = None
     revoked_at: datetime | None = None
     note: str | None = None
+    grantee_overrides: dict[str, Any] | None = None
+
+
+class AgentGrantOverrideUpdateRequest(BaseModel):
+    execution: dict[str, Any] | None = None
 
 
 class SettingResponse(BaseModel):

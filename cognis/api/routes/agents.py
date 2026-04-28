@@ -26,6 +26,7 @@ from cognis.api.models import (
     AgentCardResponse,
     AgentCreateRequest,
     AgentGrantCreateRequest,
+    AgentGrantOverrideUpdateRequest,
     AgentGrantResponse,
     AgentGrantUpdateRequest,
     AgentResponse,
@@ -46,6 +47,7 @@ from cognis.store.queries import (
     get_agent,
     get_agent_grant,
     get_agent_grant_for_user,
+    get_executor_row,
     get_system_agent_override,
     get_user,
     list_agent_grants,
@@ -81,7 +83,7 @@ def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, o
     }
 
 
-def _grant_to_response(row: object) -> AgentGrantResponse:
+def _grant_to_response(row: object, *, include_overrides: bool = False) -> AgentGrantResponse:
     return AgentGrantResponse(
         grant_id=row.grant_id,  # type: ignore[attr-defined]
         agent_id=row.agent_id,  # type: ignore[attr-defined]
@@ -94,7 +96,28 @@ def _grant_to_response(row: object) -> AgentGrantResponse:
         granted_at=getattr(row, "granted_at", None),
         revoked_at=getattr(row, "revoked_at", None),
         note=getattr(row, "note", None),
+        grantee_overrides=getattr(row, "grantee_overrides", None) if include_overrides else None,
     )
+
+
+def _normalized_grantee_execution(payload: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {}
+    execution: dict[str, object] = {}
+    executor_id = payload.get("executor_id")
+    if isinstance(executor_id, str) and executor_id.strip():
+        execution["executor_id"] = executor_id.strip()
+        return execution
+    selector = payload.get("executor_selector")
+    if isinstance(selector, dict):
+        normalized = {
+            str(key): str(value)
+            for key, value in selector.items()
+            if str(key).strip() and str(value).strip()
+        }
+        if normalized:
+            execution["executor_selector"] = normalized
+    return execution
 
 
 async def _persist_sync_metadata(
@@ -857,6 +880,61 @@ async def list_agent_shares(request: Request, agent_id: str) -> list[AgentGrantR
     return [_grant_to_response(grant) for grant in grants]
 
 
+@router.get("/{agent_id}/my-share", response_model=AgentGrantResponse)
+async def get_my_agent_share(request: Request, agent_id: str) -> AgentGrantResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        grant = await get_agent_grant_for_user(session, agent_id, user.email)
+        if grant is None or grant.revoked_at is not None:
+            raise api_exception(404, "not_found", "Grant not found")
+    return _grant_to_response(grant, include_overrides=True)
+
+
+@router.patch("/{agent_id}/my-share", response_model=AgentGrantResponse)
+async def update_my_agent_share(
+    request: Request,
+    agent_id: str,
+    payload: AgentGrantOverrideUpdateRequest,
+) -> AgentGrantResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    execution = _normalized_grantee_execution(payload.execution)
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        grant = await get_agent_grant_for_user(session, agent_id, user.email)
+        if grant is None or grant.revoked_at is not None:
+            raise api_exception(404, "not_found", "Grant not found")
+        if normalize_executor_scope(str(grant.executor_scope)) != "grantee_executor":
+            raise api_exception(
+                400,
+                "validation_error",
+                "Executor overrides are only available for grantee-executor shares",
+            )
+        if execution.get("executor_id"):
+            executor = await get_executor_row(
+                session,
+                str(execution["executor_id"]),
+                owner_email=user.email,
+                include_shared=True,
+            )
+            if executor is None:
+                raise api_exception(400, "validation_error", "Executor is not available")
+        overrides = {"execution": execution} if execution else {}
+        updated = await update_agent_grant(
+            session,
+            grant.grant_id,
+            grantee_overrides=overrides,
+        )
+        assert updated is not None
+        await session.commit()
+    return _grant_to_response(updated, include_overrides=True)
+
+
 @router.post("/{agent_id}/shares", response_model=AgentGrantResponse, status_code=201)
 async def create_agent_share(
     request: Request,
@@ -882,6 +960,7 @@ async def create_agent_share(
                 existing.grant_id,
                 executor_scope=payload.executor_scope,
                 note=payload.note,
+                grantee_overrides=None if payload.executor_scope == "owner_executor" else existing.grantee_overrides,
                 granted_at=datetime.now(UTC),
                 granted_by=user.email,
                 revoked_at=None,
@@ -921,6 +1000,9 @@ async def update_agent_share(
             grant_id,
             executor_scope=payload.executor_scope,
             note=payload.note,
+            grantee_overrides=(
+                None if payload.executor_scope == "owner_executor" else row.grantee_overrides
+            ),
         )
         assert updated is not None
         await session.commit()

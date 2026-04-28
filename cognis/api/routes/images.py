@@ -9,9 +9,12 @@ import httpx
 from fastapi import APIRouter, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import select
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.logging import get_logger
+from cognis.store.models import Agent
+from cognis.store.queries import get_active_agent_grant
 
 logger = get_logger(__name__)
 
@@ -48,21 +51,28 @@ async def serve_image(request: Request, image_id: str) -> Response:
     artifact_store = _get_artifact_store(request)
 
     # Try loading metadata to check ownership
+    namespace = "avatars"
     meta = await artifact_store.async_load_metadata("avatars", image_id, "image")
     if meta is None:
         # Also check "images" namespace (tool-generated images)
         meta = await artifact_store.async_load_metadata("images", image_id, "image")
         if meta is None:
             raise api_exception(404, "not_found", "Image not found")
+        namespace = "images"
 
     # Ownership check (admin bypasses)
-    if meta.owner_email and meta.owner_email != user.email and getattr(user, "role", "") != "admin":
+    if (
+        meta.owner_email
+        and meta.owner_email != user.email
+        and getattr(user, "role", "") != "admin"
+        and (
+            namespace != "avatars"
+            or not await _can_view_shared_agent_avatar(
+                request, image_id=image_id, owner_email=meta.owner_email, grantee_email=user.email
+            )
+        )
+    ):
         raise api_exception(404, "not_found", "Image not found")
-
-    # Determine namespace
-    namespace = "avatars"
-    if not await artifact_store.async_exists("avatars", image_id, "image"):
-        namespace = "images"
 
     try:
         content, content_type = await artifact_store.async_load(namespace, image_id, "image")
@@ -77,6 +87,27 @@ async def serve_image(request: Request, image_id: str) -> Response:
             "Content-Length": str(len(content)),
         },
     )
+
+
+async def _can_view_shared_agent_avatar(
+    request: Request,
+    *,
+    image_id: str,
+    owner_email: str,
+    grantee_email: str,
+) -> bool:
+    async with request.app.state.session_factory() as session:
+        result = await session.execute(
+            select(Agent.agent_id).where(
+                Agent.owner_email == owner_email,
+                Agent.avatar_image_id == image_id,
+            )
+        )
+        for agent_id in result.scalars().all():
+            grant = await get_active_agent_grant(session, str(agent_id), grantee_email)
+            if grant is not None:
+                return True
+    return False
 
 
 @router.post("/upload")

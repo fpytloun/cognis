@@ -240,6 +240,7 @@ export interface AgentGrant {
   granted_at: string | null;
   revoked_at: string | null;
   note: string | null;
+  grantee_overrides: Record<string, unknown> | null;
 }
 
 export interface ToolParameterProperty {

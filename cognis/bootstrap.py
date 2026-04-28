@@ -225,6 +225,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_workflow_lifecycle_columns)
         await conn.run_sync(_ensure_system_agent_override_skill_columns)
         await conn.run_sync(_ensure_agent_grants_table)
+        await conn.run_sync(_ensure_agent_grant_overrides_column)
         await conn.run_sync(_ensure_harness_recovery_tables)
         await conn.run_sync(_ensure_tool_classification_table)
         await conn.run_sync(_ensure_tool_classification_override_table)
@@ -315,6 +316,18 @@ def _ensure_agent_grants_table(sync_conn: object) -> None:
     from cognis.store.models import AgentGrantRow
 
     AgentGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_agent_grant_overrides_column(sync_conn: object) -> None:
+    """Add per-grantee override storage to existing agent grant tables."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("agent_grants")}
+    except Exception:
+        return
+    if "grantee_overrides" not in columns:
+        sync_conn.execute(text("ALTER TABLE agent_grants ADD COLUMN grantee_overrides JSON"))  # type: ignore[attr-defined]
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:

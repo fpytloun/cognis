@@ -479,6 +479,17 @@ export const api = {
       return request<AgentGrant[]>(`/api/v1/agents/${agentId}/shares`);
     },
 
+    myShare(agentId: string): Promise<AgentGrant> {
+      return request<AgentGrant>(`/api/v1/agents/${agentId}/my-share`);
+    },
+
+    updateMyShare(agentId: string, payload: { execution?: Record<string, unknown> | null }): Promise<AgentGrant> {
+      return request<AgentGrant>(`/api/v1/agents/${agentId}/my-share`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
     createShare(
       agentId: string,
       payload: { grantee_email: string; executor_scope: 'owner_executor' | 'grantee_executor'; note?: string | null }

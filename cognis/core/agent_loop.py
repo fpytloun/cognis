@@ -2011,6 +2011,7 @@ class AgentLoop:
             with scoped_runtime_context(
                 user_email=child_session.user_email,
                 agent_id=resolved_agent.agent_id,
+                agent_owner_email=resolved_agent.owner_email,
                 workspace_root=current_workspace_root.get(),
                 effective_working_directory=current_effective_working_directory.get(),
             ):
