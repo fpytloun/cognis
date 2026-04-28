@@ -96,7 +96,12 @@ def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_pa
         assert body["name"] == "Research Copy"
         assert body["is_system"] is False
         assert body["owner_email"] == "user@example.com"
-        assert len(body["steps"]) == 3
+        assert [step["name"] for step in body["steps"]] == [
+            "plan",
+            "pre_research_gate",
+            "research",
+            "synthesize",
+        ]
 
 
 def test_workflow_create_accepts_null_workflow_id(monkeypatch: object, tmp_path: Path) -> None:

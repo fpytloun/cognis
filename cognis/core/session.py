@@ -118,6 +118,7 @@ class SessionManager:
         title: str | None = None,
         title_source: str = "unset",
         conversation_id: str | None = None,
+        project_id: str | None = None,
     ) -> ConversationModel:
         """Create a conversation without creating a root session."""
 
@@ -134,6 +135,7 @@ class SessionManager:
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
                     conversation_id=conversation_id,
+                    project_id=project_id,
                 )
                 await db_session.commit()
             except Exception:
@@ -1049,6 +1051,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
             platform_data=row.context_data or {},
             memory_labels=row.memory_labels or {},
         ),
+        project_id=getattr(row, "project_id", None),
         active_session_id=row.active_session_id,
         status=row.status,
         last_message_at=row.last_message_at,

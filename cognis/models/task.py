@@ -41,6 +41,7 @@ class StepRunStatus(StrEnum):
     PAUSED = "paused"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
 
 
 class TaskDelivery(BaseModel):
@@ -68,6 +69,8 @@ class TaskModel(BaseModel):
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     workflow_id: str | None = None
+    project_id: str | None = None
+    attempt_number: int = 1
     workspace_root: str | None = None
     working_directory: str | None = None
     workflow_state: WorkflowState | None = None
@@ -92,6 +95,8 @@ class StepRunModel(BaseModel):
     step_type: str  # "run" | "gate"
     status: StepRunStatus = StepRunStatus.PENDING
     attempt: int = 1
+    attempt_number: int = 1
+    superseded_by_step_run_id: str | None = None
     agent_id: str
     workspace_root: str | None = None
     working_directory: str | None = None

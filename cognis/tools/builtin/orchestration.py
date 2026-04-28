@@ -195,7 +195,8 @@ CREATE_TASK_TOOL = ToolDefinition(
         "evaluation, and review. Use for substantial work: implementing features, "
         "deep research, multi-step analysis. The task runs independently — you "
         "define it and the result is delivered to the conversation when complete. "
-        "Tasks can spawn their own sub-sessions internally."
+        "Tasks can spawn their own sub-sessions internally. Do not assign a project "
+        "unless an exact project name, source path prefix, or remote URL match exists."
     ),
     parameters={
         "type": "object",
@@ -218,6 +219,10 @@ CREATE_TASK_TOOL = ToolDefinition(
                     "Optional workflow template ID. If omitted, the system "
                     "auto-selects based on the task description."
                 ),
+            },
+            "project_id": {
+                "type": "string",
+                "description": "Optional project ID. Only use when there is an exact project match.",
             },
             "priority": {
                 "type": "integer",
@@ -260,6 +265,10 @@ LIST_TASKS_TOOL = ToolDefinition(
                 ],
                 "description": "Filter by status. Default: all.",
                 "default": "all",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "Optional project ID filter.",
             },
         },
     },
@@ -341,6 +350,10 @@ UPDATE_TASK_TOOL = ToolDefinition(
             "workflow_id": {
                 "type": "string",
                 "description": "New workflow template ID.",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "Optional project ID. Only use when there is an exact project match.",
             },
         },
         "required": ["task_id"],

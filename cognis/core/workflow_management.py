@@ -12,8 +12,13 @@ from cognis.core.management import (
     count_active_task_references_for_workflow,
     validate_workflow_definition,
 )
-from cognis.store.queries import get_skill_scoped
-from cognis.store.queries import create_workflow, delete_workflow, get_workflow, update_workflow
+from cognis.store.queries import (
+    create_workflow,
+    delete_workflow,
+    get_skill_scoped,
+    get_workflow,
+    update_workflow,
+)
 
 
 class SkillWorkflowSource(BaseModel):
@@ -123,8 +128,8 @@ async def get_skill_workflow_source(
         steps = [
             item
             for item in (
-                ((getattr(version_row, "steps", None) if version_row is not None else None)
-                or (getattr(row, "steps", None) or []))
+                (getattr(version_row, "steps", None) if version_row is not None else None)
+                or (getattr(row, "steps", None) or [])
             )
             if isinstance(item, dict)
         ]
@@ -231,12 +236,12 @@ async def list_workflows_for_user(
 
 
 async def get_workflow_for_user(
-    *, workflow_registry: Any, workflow_id: str, owner_email: str
+    *, workflow_registry: Any, workflow_id: str, owner_email: str, project_id: str | None = None
 ) -> Any | None:
     """Return a visible workflow for the user."""
 
     workflow = await workflow_registry.get(
-        workflow_id, owner_email=owner_email, include_disabled=True
+        workflow_id, owner_email=owner_email, include_disabled=True, project_id=project_id
     )
     if workflow is None:
         return None

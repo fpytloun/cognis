@@ -19,11 +19,15 @@ from cognis.api.models import (
     MCPServerResponse,
     MessageEventResponse,
     PendingPauseResponse,
+    ProjectGrantResponse,
+    ProjectResponse,
+    ProjectSourceResponse,
     ProviderTestResultResponse,
     SecretResponse,
     SessionResponse,
     SettingResponse,
     StepRunResponse,
+    TaskCommentResponse,
     TaskDetailResponse,
     TaskResponse,
     ToolResponse,
@@ -49,6 +53,7 @@ def conversation_to_response(row: Any) -> ConversationResponse:
         conversation_id=row.conversation_id,
         user_email=row.user_email,
         agent_id=row.agent_id,
+        project_id=getattr(row, "project_id", None),
         title=row.title,
         context=ConversationContextModel(
             type=row.context_type if hasattr(row, "context_type") else row.context.type,
@@ -151,6 +156,71 @@ def agent_to_response(row: Any) -> AgentResponse:
     )
 
 
+def project_source_to_response(row: Any) -> ProjectSourceResponse:
+    return ProjectSourceResponse(
+        source_id=row.source_id,
+        project_id=row.project_id,
+        name=row.name,
+        local_path=row.local_path,
+        remote_url=row.remote_url,
+        default_branch=row.default_branch,
+        credential_ref=row.credential_ref,
+        instructions=row.instructions,
+        metadata=getattr(row, "metadata_json", None) or {},
+        created_at=getattr(row, "created_at", None),
+        updated_at=getattr(row, "updated_at", None),
+    )
+
+
+def project_grant_to_response(row: Any) -> ProjectGrantResponse:
+    return ProjectGrantResponse(
+        grant_id=row.grant_id,
+        project_id=row.project_id,
+        grantee_type=row.grantee_type,
+        grantee_user_email=row.grantee_user_email,
+        grantee_group_id=row.grantee_group_id,
+        permission=row.permission,
+        granted_by=row.granted_by,
+        granted_at=row.granted_at,
+        revoked_at=row.revoked_at,
+        note=row.note,
+    )
+
+
+def project_to_response(
+    row: Any,
+    *,
+    sources: list[Any] | None = None,
+    workflow_ids: list[str] | None = None,
+    grants: list[Any] | None = None,
+) -> ProjectResponse:
+    return ProjectResponse(
+        project_id=row.project_id,
+        owner_email=row.owner_email,
+        name=row.name,
+        description=row.description,
+        instructions=row.instructions,
+        default_workflow_id=row.default_workflow_id,
+        avatar_image_id=getattr(row, "avatar_image_id", None),
+        avatar_url=(
+            f"/api/v1/images/{row.avatar_image_id}"
+            if getattr(row, "avatar_image_id", None)
+            else getattr(row, "avatar_url", None)
+        ),
+        metadata=getattr(row, "metadata_json", None) or {},
+        status=row.status,
+        sources=[project_source_to_response(source) for source in sources or []],
+        workflow_ids=workflow_ids or [],
+        grants=[project_grant_to_response(grant) for grant in grants or []],
+        is_shared_with_me=bool(getattr(row, "is_shared_with_me", False)),
+        shared_by_email=getattr(row, "shared_by_email", None),
+        granted_permission=getattr(row, "granted_permission", None),
+        is_readonly_for_caller=bool(getattr(row, "is_readonly_for_caller", False)),
+        created_at=getattr(row, "created_at", None),
+        updated_at=getattr(row, "updated_at", None),
+    )
+
+
 def setting_to_response(row: Any) -> SettingResponse:
     return SettingResponse(
         key=row.key,
@@ -204,6 +274,8 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         completion_mode_family=task.completion_delivery.completion_mode_family,
         allow_silent_completion=task.completion_delivery.allow_silent_completion,
         workflow_id=task.workflow_id,
+        project_id=task.project_id,
+        attempt_number=task.attempt_number,
         workspace_root=task.workspace_root,
         working_directory=task.working_directory,
         workflow_state=task.workflow_state,
@@ -241,11 +313,30 @@ def dependency_to_response(row: Any) -> DependencyResponse:
     return DependencyResponse(task_id=row.task_id, depends_on=row.depends_on, required=row.required)
 
 
+def task_comment_to_response(row: Any) -> TaskCommentResponse:
+    return TaskCommentResponse(
+        comment_id=row.comment_id,
+        task_id=row.task_id,
+        author_email=row.author_email,
+        body=row.body,
+        intent=row.intent,
+        noop=row.noop,
+        target_step=row.target_step,
+        confidence=row.confidence,
+        applied=row.applied,
+        attempt_number=row.attempt_number,
+        metadata=getattr(row, "metadata_json", None) or {},
+        created_at=getattr(row, "created_at", None),
+        updated_at=getattr(row, "updated_at", None),
+    )
+
+
 def deliverable_to_response(row: Any) -> DeliverableResponse:
     return DeliverableResponse(
         deliverable_id=row.deliverable_id,
         step_run_id=row.step_run_id,
         version=row.version,
+        attempt_number=getattr(row, "attempt_number", 1),
         content=row.content,
         format=row.format,
         title=row.title,
@@ -270,6 +361,8 @@ def step_run_to_response(
         step_type=row.step_type,
         status=row.status,
         attempt=row.attempt,
+        attempt_number=getattr(row, "attempt_number", 1),
+        superseded_by_step_run_id=getattr(row, "superseded_by_step_run_id", None),
         agent_id=row.agent_id,
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
@@ -371,6 +464,8 @@ def workflow_run_to_response(
     return WorkflowRunResponse(
         task_id=task.task_id,
         workflow_id=task.workflow_id,
+        project_id=task.project_id,
+        attempt_number=task.attempt_number,
         workflow_state=task.workflow_state,
         current_step_name=current_step_name,
         pending_pause=pending_pause,

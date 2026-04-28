@@ -10,6 +10,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from cognis.api.common import (
     api_exception,
     check_agent_access,
+    check_project_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
@@ -41,6 +42,7 @@ from cognis.store.queries import (
     get_conversation,
     get_latest_active_conversation_for_agent,
     get_latest_root_session_for_conversation,
+    get_project,
     get_root_session_chain,
     get_session_row,
     list_conversation_sessions,
@@ -94,6 +96,7 @@ async def conversation_list(
     limit: int = Query(default=20, ge=1, le=100),
     context_type: str | None = Query(default=None),
     agent_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|archived|all)$"),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
@@ -103,6 +106,7 @@ async def conversation_list(
             user.email,
             context_type=context_type,
             agent_id=agent_id,
+            project_id=project_id,
             status=status,
         )
     items = [conversation_to_response(row) for row in rows]
@@ -167,6 +171,7 @@ async def create_conversation(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
+    await _validate_project_access(request, payload.project_id)
     conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
@@ -178,6 +183,7 @@ async def create_conversation(
         ),
         title=payload.title,
         title_source="manual" if payload.title else "unset",
+        project_id=payload.project_id,
     )
     return conversation_to_response(conversation)
 
@@ -212,6 +218,9 @@ async def update_conversation(
         if payload.title is not None:
             row.title = payload.title
             row.title_source = "manual" if payload.title.strip() else "unset"
+        if payload.project_id is not None:
+            await _validate_project_access(request, payload.project_id)
+            row.project_id = payload.project_id
         await session.commit()
         await session.refresh(row)
         return conversation_to_response(row)
@@ -227,6 +236,16 @@ async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
         await mark_conversation_read(session, conversation_id)
         await session.commit()
     return {"ok": True}
+
+
+async def _validate_project_access(request: Request, project_id: str | None) -> None:
+    if project_id is None:
+        return
+    async with request.app.state.session_factory() as session:
+        project = await get_project(session, project_id)
+    if project is None or project.status != "active":
+        raise api_exception(404, "not_found", "Project not found")
+    await check_project_access(request, project, required="use")
 
 
 @router.delete("/{conversation_id}", response_model=dict)

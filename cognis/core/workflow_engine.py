@@ -35,12 +35,14 @@ from cognis.core.agent_loop import (
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
+from cognis.core.gate_conditions import evaluate_gate_conditions
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
     ImmutablePrefixEntry,
     build_context_snapshot_event,
     build_prefix_message_events,
 )
+from cognis.core.project_runtime import build_project_context_message
 from cognis.core.runtime import ResolvedStepRuntime
 from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -75,6 +77,9 @@ from cognis.store.queries import (
     get_latest_approved_deliverable_for_step_run,
     get_latest_rejected_deliverable_for_step_run,
     get_latest_step_run_for_task_step,
+    get_project,
+    list_project_sources,
+    list_project_workflow_ids,
     list_step_runs_for_task,
     update_deliverable_status,
     update_step_run,
@@ -111,6 +116,7 @@ REVIEW_LOOPS = Counter(
 
 # Callback type for progress notifications
 ProgressCallback = TokenCallback
+
 
 class WorkflowEngine:
     """Orchestrates step execution for a task."""
@@ -441,7 +447,9 @@ class WorkflowEngine:
                             evaluation=evaluation.model_dump(mode="json"),
                             status=eval_status,
                             deliverable_id=(
-                                None if evaluation.decision == "revise" else step_result.deliverable_id
+                                None
+                                if evaluation.decision == "revise"
+                                else step_result.deliverable_id
                             ),
                         )
                         if step_result.deliverable_id is not None:
@@ -517,7 +525,9 @@ class WorkflowEngine:
                         continue
 
                 # Step approved or no evaluation — commit the output and advance.
-                if step_result.deliverable_id is not None and not (completion and completion.evaluate):
+                if step_result.deliverable_id is not None and not (
+                    completion and completion.evaluate
+                ):
                     async with self._session_factory() as db_session:
                         await update_deliverable_status(
                             db_session,
@@ -785,7 +795,7 @@ class WorkflowEngine:
         latest_step_run = None
         async with self._session_factory() as db_session:
             latest_step_run = await get_latest_step_run_for_task_step(
-                db_session, task.task_id, step_def.name
+                db_session, task.task_id, step_def.name, attempt_number=task.attempt_number
             )
             raw_todos = latest_step_run.todos if latest_step_run is not None else None
             if isinstance(raw_todos, list):
@@ -800,6 +810,7 @@ class WorkflowEngine:
                     step_type=step_def.type,
                     agent_id=agent.agent_id,
                     attempt=attempt,
+                    attempt_number=task.attempt_number,
                     step_run_id=step_run_id,
                     conversation_id=conversation.conversation_id,
                     workspace_root=task.workspace_root,
@@ -926,6 +937,8 @@ class WorkflowEngine:
             step_policy = WORKFLOW_POLICY
             step_orchestration = OrchestrationMode.DELEGATE_SYNC_ONLY
 
+        project_context = await self._build_project_context(task)
+
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
@@ -937,6 +950,7 @@ class WorkflowEngine:
             task_title=task.title,
             task_description=task.description,
             task_expected_output=task.expected_output,
+            project_context=project_context,
             completion_delivery=task.completion_delivery,
             workspace_root=task.workspace_root,
             working_directory=task.working_directory,
@@ -1020,7 +1034,9 @@ class WorkflowEngine:
                 db_session,
                 step_run_id,
                 status=initial_status,
-                deliverable_id=(output.deliverable_id if output and output.deliverable_id else None),
+                deliverable_id=(
+                    output.deliverable_id if output and output.deliverable_id else None
+                ),
                 output=output.model_dump(mode="json") if output else None,
                 completed_at=datetime.now(UTC),
             )
@@ -1084,6 +1100,24 @@ class WorkflowEngine:
         gate = step_def.gate
         if gate is None:
             return "continue"
+
+        if gate.conditions:
+            try:
+                should_pause = evaluate_gate_conditions(
+                    [condition.expression for condition in gate.conditions],
+                    step_outputs=state.step_outputs,
+                    thresholds=gate.thresholds,
+                )
+            except ValueError:
+                logger.warning(
+                    "gate condition evaluation failed; requiring conditional gate",
+                    extra={"extra_data": {"task_id": task.task_id, "step_name": step_def.name}},
+                    exc_info=True,
+                )
+                should_pause = True
+            if not should_pause:
+                GATES_TOTAL.labels(action="condition_skip").inc()
+                return "continue"
 
         # Build gate context from specified inputs
         gate_context: dict[str, Any] = {}
@@ -1664,6 +1698,19 @@ class WorkflowEngine:
             )
         return "\n\n".join(part for part in parts if part).strip()
 
+    async def _build_project_context(self, task: TaskModel) -> str | None:
+        """Build project metadata injected into workflow step prompts."""
+
+        if not task.project_id:
+            return None
+        async with self._session_factory() as db_session:
+            project = await get_project(db_session, task.project_id)
+            if project is None:
+                return None
+            sources = await list_project_sources(db_session, task.project_id)
+            workflow_ids = await list_project_workflow_ids(db_session, task.project_id)
+        return build_project_context_message(project, sources, workflow_ids)
+
     async def _record_evaluation_feedback(
         self,
         task: TaskModel,
@@ -2024,7 +2071,9 @@ class WorkflowEngine:
         if deliverable_already_delivered and final_deliverable_id is not None:
             logger.warning(
                 "task_delivery: deliverable already marked delivered, skipping duplicate direct send",
-                extra={"extra_data": {"task_id": task.task_id, "deliverable_id": final_deliverable_id}},
+                extra={
+                    "extra_data": {"task_id": task.task_id, "deliverable_id": final_deliverable_id}
+                },
             )
             return
 
@@ -2106,9 +2155,7 @@ class WorkflowEngine:
         final_content = result_data.get("final_channel_content")
         if not final_content and result_data.get("final_format") != "html":
             final_content = result_data.get("final_content")
-        final_content = (
-            final_content.strip() or None if isinstance(final_content, str) else None
-        )
+        final_content = final_content.strip() or None if isinstance(final_content, str) else None
         final_deliverable_id = result_data.get("final_deliverable_id")
         if not isinstance(final_deliverable_id, str):
             final_deliverable_id = None
@@ -2940,7 +2987,9 @@ class WorkflowEngine:
                 continue
 
             raw_output = state.step_outputs.get(step.name)
-            deliverable_id = raw_output.get("deliverable_id") if isinstance(raw_output, dict) else None
+            deliverable_id = (
+                raw_output.get("deliverable_id") if isinstance(raw_output, dict) else None
+            )
             if isinstance(deliverable_id, str) and deliverable_id:
                 async with self._session_factory() as db_session:
                     row = await get_deliverable(db_session, deliverable_id)
@@ -2966,7 +3015,9 @@ class WorkflowEngine:
                     )
 
             async with self._session_factory() as db_session:
-                prior_run = await get_latest_step_run_for_task_step(db_session, task.task_id, step.name)
+                prior_run = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step.name
+                )
                 if prior_run is None:
                     continue
                 row = await get_latest_approved_deliverable_for_step_run(

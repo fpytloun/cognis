@@ -13,6 +13,7 @@ from sqlalchemy import select
 from cognis.api.common import (
     api_exception,
     check_agent_access,
+    check_project_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
@@ -29,6 +30,9 @@ from cognis.api.models import (
     StepResponseRequest,
     StepRunResponse,
     TaskActionResponse,
+    TaskCommentCreateRequest,
+    TaskCommentResponse,
+    TaskCommentUpdateRequest,
     TaskCreateRequest,
     TaskDetailResponse,
     TaskRerunResponse,
@@ -40,6 +44,7 @@ from cognis.api.serializers import (
     deliverable_to_response,
     dependency_to_response,
     step_run_to_response,
+    task_comment_to_response,
     task_detail_to_response,
     task_to_response,
 )
@@ -59,14 +64,20 @@ from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
 from cognis.store.models import Task
 from cognis.store.queries import (
     add_task_dependency,
+    create_task_comment,
     get_agent,
     get_conversation,
+    get_project,
     get_step_run,
     get_task,
+    get_task_comment,
     get_task_dependencies,
     list_deliverables_for_step_run,
+    list_step_run_history,
     list_step_runs_for_task,
+    list_task_comments,
     remove_task_dependency,
+    update_task_comment,
 )
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
@@ -79,6 +90,7 @@ async def _resolve_completion_delivery(
     *,
     workflow_id: str | None,
     owner_email: str,
+    project_id: str | None,
     completion_mode_family: str | None,
     allow_silent_completion: bool | None,
 ) -> CompletionDeliveryPolicy:
@@ -90,7 +102,7 @@ async def _resolve_completion_delivery(
 
     if workflow_id is not None:
         workflow = await request.app.state.workflow_registry.get(
-            workflow_id, owner_email=owner_email
+            workflow_id, owner_email=owner_email, project_id=project_id
         )
         if workflow is not None:
             defaults = getattr(workflow, "defaults", None)
@@ -118,6 +130,7 @@ async def task_list(
     agent_id: str | None = None,
     queue: str | None = None,
     priority: int | None = None,
+    project_id: str | None = None,
 ) -> CursorPage[TaskResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
@@ -134,6 +147,8 @@ async def task_list(
             query = query.where(Task.queue_name == queue)
         if priority is not None:
             query = query.where(Task.priority == priority)
+        if project_id is not None:
+            query = query.where(Task.project_id == project_id)
         rows = list((await session.execute(query)).scalars().all())
     items = [task_to_response(_row_to_task(row)) for row in rows]
     page_items, next_cursor, has_more = paginate_items(
@@ -168,11 +183,14 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             "specific_conversation delivery requires delivery_target",
         )
     await _validate_agent_access(request, payload.agent_id)
-    await _validate_workflow_access(request, payload.workflow_id)
     if payload.source_type == "chat" and payload.source_ref is not None:
         await _validate_conversation_access(request, payload.source_ref)
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
+    project_id = await _resolve_task_project_id(
+        request, payload.project_id, payload.source_type, payload.source_ref
+    )
+    await _validate_workflow_access(request, payload.workflow_id, project_id=project_id)
     _validate_execution_paths(payload.workspace_root, payload.working_directory)
     resolved_workflow_id = payload.workflow_id
     created_workflow_id: str | None = None
@@ -208,6 +226,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         request,
         workflow_id=resolved_workflow_id,
         owner_email=user.email,
+        project_id=project_id,
         completion_mode_family=payload.completion_mode_family,
         allow_silent_completion=payload.allow_silent_completion,
     )
@@ -223,6 +242,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 workflow_id=resolved_workflow_id,
+                project_id=project_id,
                 workspace_root=payload.workspace_root,
                 working_directory=payload.working_directory,
                 source_type=payload.source_type,
@@ -241,6 +261,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 workflow_id=resolved_workflow_id,
+                project_id=project_id,
                 workspace_root=payload.workspace_root,
                 working_directory=payload.working_directory,
                 status=payload.status,
@@ -262,7 +283,10 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task(session, task_id)
         deliverables_by_step_run = {
-            row.step_run_id: [deliverable_to_response(item) for item in await list_deliverables_for_step_run(session, row.step_run_id)]
+            row.step_run_id: [
+                deliverable_to_response(item)
+                for item in await list_deliverables_for_step_run(session, row.step_run_id)
+            ]
             for row in step_rows
         }
     pending_pause = _task_pending_pause(request, task)
@@ -300,11 +324,7 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         )
     resolved_workflow_id = payload.workflow_id
     created_workflow_id: str | None = None
-    if payload.workflow_id is not None:
-        await _validate_workflow_access(
-            request, payload.workflow_id, owner_email=existing_row.created_by
-        )
-    elif payload.skill_id is not None:
+    if payload.skill_id is not None:
         agent_id = payload.agent_id or existing_row.agent_id
         agent = await request.app.state.agent_registry.get(
             agent_id,
@@ -334,6 +354,19 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             raise api_exception(status_code, "validation_error", message) from exc
         resolved_workflow_id = created_workflow.workflow_id
         created_workflow_id = created_workflow.workflow_id
+    if payload.project_id is not None:
+        await _validate_project_access(request, payload.project_id)
+    effective_project_id = (
+        payload.project_id if payload.project_id is not None else getattr(existing_row, "project_id", None)
+    )
+    effective_workflow_id = resolved_workflow_id or getattr(existing_row, "workflow_id", None)
+    if effective_workflow_id is not None:
+        await _validate_workflow_access(
+            request,
+            effective_workflow_id,
+            owner_email=existing_row.created_by,
+            project_id=effective_project_id,
+        )
     effective_delivery_mode = payload.delivery_mode or existing_row.delivery_mode
     effective_delivery_target = payload.delivery_target or existing_row.delivery_target
     effective_completion_mode_family = payload.completion_mode_family or getattr(
@@ -415,6 +448,75 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             )
         raise
     return task_to_response(_row_to_task(row))
+
+
+@router.get("/api/v1/tasks/{task_id}/comments", response_model=list[TaskCommentResponse])
+async def task_comments(request: Request, task_id: str) -> list[TaskCommentResponse]:
+    await _require_task(request, task_id)
+    async with request.app.state.session_factory() as session:
+        rows = await list_task_comments(session, task_id)
+    return [task_comment_to_response(row) for row in rows]
+
+
+@router.post(
+    "/api/v1/tasks/{task_id}/comments", response_model=TaskCommentResponse, status_code=201
+)
+async def task_comment_create(
+    request: Request,
+    task_id: str,
+    payload: TaskCommentCreateRequest,
+) -> TaskCommentResponse:
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    task = await _require_task(request, task_id)
+    async with request.app.state.session_factory() as session:
+        row = await create_task_comment(
+            session,
+            task_id=task_id,
+            author_email=user.email,
+            body=payload.body,
+            intent=payload.intent,
+            noop=payload.noop,
+            target_step=payload.target_step,
+            attempt_number=task.attempt_number,
+            metadata=payload.metadata,
+        )
+        await session.commit()
+        await session.refresh(row)
+    applied = False
+    if payload.intent == "answer_pause":
+        applied = await _apply_answer_pause_comment(request, task, row.comment_id, payload)
+    elif payload.intent == "request_revision":
+        applied = await _apply_request_revision_comment(request, task, row.comment_id, payload)
+    if applied:
+        async with request.app.state.session_factory() as session:
+            updated = await get_task_comment(session, row.comment_id)
+        if updated is not None:
+            row = updated
+    return task_comment_to_response(row)
+
+
+@router.patch("/api/v1/tasks/{task_id}/comments/{comment_id}", response_model=TaskCommentResponse)
+async def task_comment_update(
+    request: Request,
+    task_id: str,
+    comment_id: str,
+    payload: TaskCommentUpdateRequest,
+) -> TaskCommentResponse:
+    forbid_mutation_for_viewer(request)
+    await _require_task(request, task_id)
+    async with request.app.state.session_factory() as session:
+        existing = await get_task_comment(session, comment_id)
+        if existing is None or existing.task_id != task_id:
+            raise api_exception(404, "not_found", "Task comment not found")
+        row = await update_task_comment(
+            session, comment_id, **payload.model_dump(exclude_unset=True)
+        )
+        await session.commit()
+        if row is None:
+            raise api_exception(404, "not_found", "Task comment not found")
+        await session.refresh(row)
+    return task_comment_to_response(row)
 
 
 @router.delete("/api/v1/tasks/{task_id}", response_model=TaskActionResponse)
@@ -541,13 +643,16 @@ async def step_response(
 @router.post("/api/v1/tasks/batch-submit", response_model=BatchSubmitResponse)
 async def task_batch_submit(request: Request, payload: BatchSubmitRequest) -> BatchSubmitResponse:
     forbid_mutation_for_viewer(request)
+    agent_ids: set[str] = set()
     async with request.app.state.session_factory() as session:
         for task_id in payload.task_ids:
             row = await get_task(session, task_id)
             if row is None:
                 continue
             require_resource_owner(request, row.created_by)
-            await _validate_agent_access(request, row.agent_id)
+            agent_ids.add(row.agent_id)
+    for agent_id in agent_ids:
+        await _validate_agent_access(request, agent_id)
     result = await request.app.state.task_queue.batch_submit(payload.task_ids)
     return BatchSubmitResponse(**result)
 
@@ -558,7 +663,32 @@ async def task_steps(request: Request, task_id: str) -> list[StepRunResponse]:
     async with request.app.state.session_factory() as session:
         rows = await list_step_runs_for_task(session, task_id)
         deliverables_by_step_run = {
-            row.step_run_id: [deliverable_to_response(item) for item in await list_deliverables_for_step_run(session, row.step_run_id)]
+            row.step_run_id: [
+                deliverable_to_response(item)
+                for item in await list_deliverables_for_step_run(session, row.step_run_id)
+            ]
+            for row in rows
+        }
+    return [
+        step_run_to_response(row, deliverables=deliverables_by_step_run.get(row.step_run_id, []))
+        for row in rows
+    ]
+
+
+@router.get(
+    "/api/v1/tasks/{task_id}/steps/{step_name}/history", response_model=list[StepRunResponse]
+)
+async def task_step_history(
+    request: Request, task_id: str, step_name: str
+) -> list[StepRunResponse]:
+    await _require_task(request, task_id)
+    async with request.app.state.session_factory() as session:
+        rows = await list_step_run_history(session, task_id, step_name)
+        deliverables_by_step_run = {
+            row.step_run_id: [
+                deliverable_to_response(item)
+                for item in await list_deliverables_for_step_run(session, row.step_run_id)
+            ]
             for row in rows
         }
     return [
@@ -647,12 +777,13 @@ async def task_remove_dependency(
 
 
 async def _require_task(request: Request, task_id: str) -> TaskModel:
-    require_current_user(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         row = await get_task(session, task_id)
     if row is None:
         raise api_exception(404, "not_found", "Task not found")
-    require_resource_owner(request, row.created_by)
+    if row.created_by != user.email:
+        raise api_exception(404, "not_found", "Task not found")
     return _row_to_task(row)
 
 
@@ -667,13 +798,17 @@ async def _validate_agent_access(request: Request, agent_id: str | None) -> None
 
 
 async def _validate_workflow_access(
-    request: Request, workflow_id: str | None, *, owner_email: str | None = None
+    request: Request,
+    workflow_id: str | None,
+    *,
+    owner_email: str | None = None,
+    project_id: str | None = None,
 ) -> None:
     if workflow_id is None:
         return
     user = require_current_user(request)
     workflow = await request.app.state.workflow_registry.get(
-        workflow_id, owner_email=owner_email or user.email
+        workflow_id, owner_email=owner_email or user.email, project_id=project_id
     )
     if workflow is None:
         raise api_exception(404, "not_found", "Workflow not found")
@@ -689,6 +824,97 @@ async def _validate_conversation_access(request: Request, conversation_id: str |
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
     require_resource_owner(request, row.user_email)
+
+
+async def _validate_project_access(request: Request, project_id: str | None) -> None:
+    if project_id is None:
+        return
+    async with request.app.state.session_factory() as session:
+        row = await get_project(session, project_id)
+    if row is None or row.status != "active":
+        raise api_exception(404, "not_found", "Project not found")
+    await check_project_access(request, row, required="use")
+
+
+async def _resolve_task_project_id(
+    request: Request,
+    requested_project_id: str | None,
+    source_type: str,
+    source_ref: str | None,
+) -> str | None:
+    if requested_project_id is not None:
+        await _validate_project_access(request, requested_project_id)
+        return requested_project_id
+    if source_type != "chat" or source_ref is None:
+        return None
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, source_ref)
+    project_id = getattr(row, "project_id", None) if row is not None else None
+    if project_id is not None:
+        await _validate_project_access(request, project_id)
+    return project_id
+
+
+async def _apply_answer_pause_comment(
+    request: Request,
+    task: TaskModel,
+    comment_id: str,
+    payload: TaskCommentCreateRequest,
+) -> bool:
+    state = task.workflow_state
+    if state is None or state.pending_pause_type is None:
+        return False
+    try:
+        if state.pending_pause_type == "gate":
+            action = str(payload.metadata.get("action") or "continue")
+            await resolve_task_pause_action(
+                task=task,
+                requested_action=action,
+                note=payload.body,
+                pause_waiter=request.app.state.pause_waiter,
+                notification_service=getattr(request.app.state, "notification_service", None),
+                task_queue=request.app.state.task_queue,
+                session_factory=request.app.state.session_factory,
+                user_email=task.created_by,
+            )
+        elif state.pending_pause_type == "step_input":
+            await respond_task_input(
+                task=task,
+                response=payload.body,
+                pause_waiter=request.app.state.pause_waiter,
+                notification_service=getattr(request.app.state, "notification_service", None),
+                task_queue=request.app.state.task_queue,
+                session_factory=request.app.state.session_factory,
+                user_email=task.created_by,
+            )
+        else:
+            return False
+    except (RuntimeError, ValueError):
+        return False
+    async with request.app.state.session_factory() as session:
+        await update_task_comment(session, comment_id, applied=True)
+        await session.commit()
+    return True
+
+
+async def _apply_request_revision_comment(
+    request: Request,
+    task: TaskModel,
+    comment_id: str,
+    payload: TaskCommentCreateRequest,
+) -> bool:
+    try:
+        await request.app.state.task_queue.request_revision(
+            task.task_id,
+            target_step=payload.target_step,
+            instruction=payload.body,
+        )
+    except (RuntimeError, ValueError):
+        return False
+    async with request.app.state.session_factory() as session:
+        await update_task_comment(session, comment_id, applied=True)
+        await session.commit()
+    return True
 
 
 async def _build_workflow_run_response(
@@ -725,6 +951,8 @@ def _row_to_task(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         workflow_id=row.workflow_id,
+        project_id=getattr(row, "project_id", None),
+        attempt_number=getattr(row, "attempt_number", 1),
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
         workflow_state=WorkflowState.model_validate(row.workflow_state)

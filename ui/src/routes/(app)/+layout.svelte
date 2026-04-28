@@ -10,6 +10,7 @@ import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import CircleHelp from 'lucide-svelte/icons/circle-help';
 import Clock from 'lucide-svelte/icons/clock';
+import FolderKanban from 'lucide-svelte/icons/folder-kanban';
 import ListTodo from 'lucide-svelte/icons/list-todo';
 import Menu from 'lucide-svelte/icons/menu';
 import MessageSquareText from 'lucide-svelte/icons/message-square-text';
@@ -48,6 +49,7 @@ import X from 'lucide-svelte/icons/x';
   const navigationItems = [
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
     { href: '/agents', label: 'Agents', icon: Bot },
+    { href: '/projects', label: 'Projects', icon: FolderKanban },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
     { href: '/workflows', label: 'Workflows', icon: Workflow },
     { href: '/schedules', label: 'Schedules', icon: Clock },

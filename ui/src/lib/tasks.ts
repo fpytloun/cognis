@@ -53,6 +53,7 @@ export interface TaskFilterState {
   search: string;
   agentId: string;
   workflowId: string;
+  projectId: string;
   status: string;
 }
 
@@ -62,6 +63,10 @@ export function matchesTaskFilters(task: Task, filters: TaskFilterState): boolea
   }
 
   if (filters.workflowId && task.workflow_id !== filters.workflowId) {
+    return false;
+  }
+
+  if (filters.projectId && task.project_id !== filters.projectId) {
     return false;
   }
 

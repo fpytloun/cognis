@@ -44,6 +44,7 @@ from cognis.store.queries import (
     list_stale_running_tasks,
     list_tasks_by_status,
     pick_ready_task,
+    supersede_step_runs_for_revision,
     update_task_status,
     update_task_workflow_state,
     update_workflow,
@@ -248,6 +249,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         workflow_id: str | None = None,
+        project_id: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
         scheduled_for: datetime | None = None,
@@ -264,6 +266,7 @@ class TaskQueue:
         completion_delivery = completion_delivery or await self._resolve_completion_delivery_policy(
             workflow_id=workflow_id,
             owner_email=created_by,
+            project_id=project_id,
         )
 
         async with self._session_factory() as db_session:
@@ -283,6 +286,7 @@ class TaskQueue:
                 completion_mode_family=completion_delivery.completion_mode_family,
                 allow_silent_completion=completion_delivery.allow_silent_completion,
                 workflow_id=workflow_id,
+                project_id=project_id,
                 workspace_root=workspace_root,
                 working_directory=working_directory,
                 scheduled_for=scheduled_for,
@@ -313,11 +317,16 @@ class TaskQueue:
         *,
         workflow_id: str | None,
         owner_email: str,
+        project_id: str | None,
     ) -> CompletionDeliveryPolicy:
         if workflow_id is None:
             return CompletionDeliveryPolicy()
 
-        workflow = await self._workflow_registry.get(workflow_id, owner_email=owner_email)
+        workflow = await self._workflow_registry.get(
+            workflow_id,
+            owner_email=owner_email,
+            project_id=project_id,
+        )
         if workflow is None:
             return CompletionDeliveryPolicy()
 
@@ -348,6 +357,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         workflow_id: str | None = None,
+        project_id: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
         source_type: str = "api",
@@ -364,6 +374,7 @@ class TaskQueue:
             delivery=delivery,
             completion_delivery=completion_delivery,
             workflow_id=workflow_id,
+            project_id=project_id,
             workspace_root=workspace_root,
             working_directory=working_directory,
             source_type=source_type,
@@ -516,6 +527,102 @@ class TaskQueue:
         cloned = await self._clone_task_for_rerun(task)
         return TaskRerunResult(source_task_id=task_id, task=cloned, created_new=True)
 
+    async def request_revision(
+        self,
+        task_id: str,
+        *,
+        target_step: str | None,
+        instruction: str,
+    ) -> TaskModel:
+        """Re-enter a workflow from a human-selected step in-place."""
+
+        async with self._session_factory() as db_session:
+            task_row = await get_task(db_session, task_id)
+            if task_row is None:
+                raise ValueError("Task not found")
+            task = _row_to_task_model(task_row)
+            if task.workflow_id is None:
+                raise ValueError("Task has no workflow to revise")
+            workflow = await self._workflow_registry.get(
+                task.workflow_id,
+                owner_email=task.created_by,
+                project_id=task.project_id,
+                include_disabled=True,
+            )
+            if workflow is None:
+                raise ValueError("Workflow not found")
+
+        pending_pause = self._get_pending_interaction(task_id)
+        if pending_pause is not None:
+            notification_service = self._workflow_engine._notification_service  # noqa: SLF001
+            if notification_service is not None:
+                await notification_service.resolve(
+                    pending_pause.pause_id,
+                    "revise",
+                    {"note": instruction},
+                    user_email=task.created_by,
+                )
+            else:
+                self._workflow_engine._pause_waiter.resolve(  # noqa: SLF001
+                    pending_pause.pause_id,
+                    PauseResolution(decision="revise", data={"note": instruction}),
+                )
+        await self._cancel_active_run_for_revision(task_id)
+
+        async with self._session_factory() as db_session:
+            task_row = await get_task(db_session, task_id)
+            if task_row is None:
+                raise ValueError("Task not found")
+            task = _row_to_task_model(task_row)
+            state = task.workflow_state or WorkflowState()
+            step_names = [step.name for step in workflow.steps]
+            if not step_names:
+                raise ValueError("Workflow has no steps")
+            if target_step and target_step not in step_names:
+                raise ValueError("Target step not found")
+            target_index = (
+                step_names.index(target_step) if target_step else max(0, state.current_step_index)
+            )
+            new_attempt_number = int(getattr(task_row, "attempt_number", 1) or 1) + 1
+            state.current_step_index = target_index
+            state.status = "running"
+            state.current_step_status = None
+            state.pending_pause_type = None
+            state.pending_pause_payload = None
+            state.last_operator_instruction = instruction
+            state.last_revision_context = instruction
+            for step_name in step_names[target_index:]:
+                state.step_outputs.pop(step_name, None)
+            await supersede_step_runs_for_revision(
+                db_session,
+                task_id,
+                step_names[target_index:],
+                before_attempt_number=new_attempt_number,
+            )
+            task_row.attempt_number = new_attempt_number
+            task_row.status = "running"
+            task_row.completed_at = None
+            task_row.result_summary = None
+            task_row.result_data = None
+            task_row.workflow_state = state.model_dump(mode="json")
+            task_row.updated_at = datetime.now(UTC)
+            await db_session.commit()
+            await db_session.refresh(task_row)
+            task = _row_to_task_model(task_row)
+
+        self._launch_task_run(task)
+        return task
+
+    async def _cancel_active_run_for_revision(self, task_id: str) -> None:
+        """Stop an existing paused run so a revision starts from refreshed DB state."""
+
+        run_task = self._active_runs.get(task_id)
+        if run_task is None or run_task.done():
+            return
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
     async def _clone_task_for_rerun(self, source_task: TaskModel) -> TaskModel:
         """Clone a terminal task into a fresh submitted task."""
 
@@ -529,6 +636,7 @@ class TaskQueue:
             delivery=source_task.delivery,
             completion_delivery=source_task.completion_delivery,
             workflow_id=source_task.workflow_id,
+            project_id=source_task.project_id,
             workspace_root=source_task.workspace_root,
             working_directory=source_task.working_directory,
             source_type=source_task.source_type,
@@ -932,7 +1040,10 @@ class TaskQueue:
         from cognis.core.decision import select_workflow
 
         try:
-            available = await self._workflow_registry.list_all(owner_email=task.created_by)
+            available = await self._workflow_registry.list_all(
+                owner_email=task.created_by,
+                project_id=task.project_id,
+            )
             workflow_candidates = [
                 {
                     "workflow_id": workflow.workflow_id,
@@ -1033,7 +1144,7 @@ class TaskQueue:
                 else:
                     workflow_id = await self._select_workflow_for_task(task)
                 workflow = await self._workflow_registry.get(
-                    workflow_id, owner_email=task.created_by
+                    workflow_id, owner_email=task.created_by, project_id=task.project_id
                 )
                 if workflow is None:
                     logger.warning(
@@ -1209,6 +1320,8 @@ def _row_to_task_model(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         workflow_id=row.workflow_id,
+        project_id=getattr(row, "project_id", None),
+        attempt_number=getattr(row, "attempt_number", 1),
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
         workflow_state=(

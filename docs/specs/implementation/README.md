@@ -106,7 +106,7 @@ bring the codebase in line with the updated specs.
 | 30 | [Auto Routing for Agents and Workflows](stage-30-auto-routing.md) | PLANNED | `auto` / `self` routing semantics, shared routing helper, execution-envelope enforcement, classifier fallback, telemetry |
 | 31 | [Workflow Deliverables and Step Profiles](stage-31-workflow-deliverables.md) | PLANNED | Typed deliverables + `write_deliverable`, once-only channel delivery, step profiles (`research`/`coding`), tool classification, system workflow wiring |
 | 32 | [Workflow-First Composition and Ephemeral Workflows](stage-32-workflow-composition.md) | PLANNED | `compose_and_run_workflow`, hidden workflow-composer and skill-decomposer agents, ephemeral workflow lifecycle, coding workflow family, skill `steps:` extension, promote-from-task UX |
-| 33 | [Projects, Step Metadata Gating, and Human-as-Evaluator Revisions](stage-33-projects-and-revisions.md) | PLANNED | Projects with multi-source repos and shareable grants, project-aware tasks/schedules/conversations, project-bound workflow eligibility, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, human-driven revisions with classifier-selected re-entry steps and preserved step-run history |
+| 33 | [Projects, Step Metadata Gating, and Human-as-Evaluator Revisions](stage-33-projects-and-revisions.md) | DONE | Projects with multi-source repos and shareable grants, project-aware tasks/schedules/conversations, project-bound workflow eligibility, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, human-driven revisions with classifier-selected re-entry steps and preserved step-run history |
 
 ## Scope Boundary
 

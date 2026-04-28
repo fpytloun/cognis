@@ -105,6 +105,7 @@ export interface Conversation {
     conversation_id: string;
     user_email: string;
     agent_id: string;
+    project_id: string | null;
     title: string | null;
     context: ConversationContext;
     active_session_id: string | null;
@@ -114,6 +115,55 @@ export interface Conversation {
     has_unread: boolean;
     created_at: string | null;
     updated_at: string | null;
+}
+
+export interface ProjectSource {
+  source_id: string;
+  project_id: string;
+  name: string;
+  local_path: string | null;
+  remote_url: string | null;
+  default_branch: string | null;
+  credential_ref: string | null;
+  instructions: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ProjectGrant {
+  grant_id: string;
+  project_id: string;
+  grantee_type: string;
+  grantee_user_email: string | null;
+  grantee_group_id: string | null;
+  permission: string;
+  granted_by: string;
+  granted_at: string | null;
+  revoked_at: string | null;
+  note: string | null;
+}
+
+export interface Project {
+  project_id: string;
+  owner_email: string;
+  name: string;
+  description: string | null;
+  instructions: string | null;
+  default_workflow_id: string | null;
+  avatar_image_id: string | null;
+  avatar_url: string | null;
+  metadata: Record<string, unknown>;
+  status: string;
+  sources: ProjectSource[];
+  workflow_ids: string[];
+  grants: ProjectGrant[];
+  is_shared_with_me: boolean;
+  shared_by_email: string | null;
+  granted_permission: string | null;
+  is_readonly_for_caller: boolean;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface MessageEvent {
@@ -812,6 +862,7 @@ export interface Deliverable {
   deliverable_id: string;
   step_run_id: string;
   version: number;
+  attempt_number: number;
   content: string;
   format: 'markdown' | 'plain' | 'html' | string;
   title: string | null;
@@ -830,6 +881,8 @@ export interface StepRun {
   step_type: string;
   status: string;
   attempt: number;
+  attempt_number: number;
+  superseded_by_step_run_id: string | null;
   agent_id: string;
   workspace_root: string | null;
   working_directory: string | null;
@@ -851,6 +904,8 @@ export interface StepRun {
 export interface WorkflowRun {
   task_id: string;
   workflow_id: string | null;
+  project_id: string | null;
+  attempt_number: number;
   workflow_state: WorkflowState | null;
   current_step_name: string | null;
   pending_pause: PendingPause | null;
@@ -871,6 +926,8 @@ export interface Task {
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   workflow_id: string | null;
+  project_id: string | null;
+  attempt_number: number;
   workspace_root: string | null;
   working_directory: string | null;
   workflow_state: WorkflowState | null;
@@ -891,6 +948,22 @@ export interface TaskDetail extends Task {
   step_runs: StepRun[];
   workflow_run: WorkflowRun | null;
   pending_pause: PendingPause | null;
+}
+
+export interface TaskComment {
+  comment_id: string;
+  task_id: string;
+  author_email: string;
+  body: string;
+  intent: string;
+  noop: boolean;
+  target_step: string | null;
+  confidence: number | null;
+  applied: boolean;
+  attempt_number: number;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface TaskRerunResponse {
@@ -979,6 +1052,7 @@ export interface Schedule {
   timezone: string;
   agent_id: string;
   workflow_id: string | null;
+  project_id: string | null;
   skill_id: string | null;
   task_template: Record<string, unknown>;
   enabled: boolean;

@@ -40,6 +40,7 @@ class ScheduleModel(BaseModel):
     timezone: str = "UTC"
     agent_id: str
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     task_template: dict[str, Any]
     enabled: bool = True

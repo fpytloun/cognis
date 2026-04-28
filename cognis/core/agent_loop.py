@@ -501,6 +501,8 @@ def _task_row_to_model(task_row: Any) -> Any:
                 ),
             },
             "workflow_id": getattr(task_row, "workflow_id", None),
+            "project_id": getattr(task_row, "project_id", None),
+            "attempt_number": getattr(task_row, "attempt_number", 1),
             "workspace_root": getattr(task_row, "workspace_root", None),
             "working_directory": getattr(task_row, "working_directory", None),
             "workflow_state": getattr(task_row, "workflow_state", None),
@@ -1004,7 +1006,9 @@ class StreamAccumulator:
         # ---------------------------------------------------------------
         # Reasoning part boundary markers from responses_bridge
         # ---------------------------------------------------------------
-        reasoning_boundary = delta.get("reasoning_part_boundary") if isinstance(delta, dict) else None
+        reasoning_boundary = (
+            delta.get("reasoning_part_boundary") if isinstance(delta, dict) else None
+        )
         if isinstance(reasoning_boundary, dict):
             is_complete = bool(reasoning_boundary.get("complete", False))
             part_index = reasoning_boundary.get("part_index")
@@ -1564,6 +1568,7 @@ class StepContext:
     task_title: str = ""
     task_description: str = ""
     task_expected_output: str | None = None
+    project_context: str | None = None
     completion_delivery: CompletionDeliveryPolicy = field(default_factory=CompletionDeliveryPolicy)
     workspace_root: str | None = None
     working_directory: str | None = None
@@ -1725,9 +1730,7 @@ class AgentLoop:
                     default_max_retries=max_retries,
                 )
                 if isinstance(resolved, dict):
-                    idle_timeout = _positive_int(
-                        resolved.get("idle_timeout_seconds"), idle_timeout
-                    )
+                    idle_timeout = _positive_int(resolved.get("idle_timeout_seconds"), idle_timeout)
                     max_retries = max(0, _positive_int(resolved.get("max_retries"), max_retries))
             except Exception:
                 logger.warning(
@@ -2130,9 +2133,7 @@ class AgentLoop:
                     result_summary="Delegation failed",
                 )
             except Exception:
-                logger.warning(
-                    "delegation: failed to mark child session as failed", exc_info=True
-                )
+                logger.warning("delegation: failed to mark child session as failed", exc_info=True)
 
             try:
                 await self.providers.guardrails.record_events(
@@ -2740,9 +2741,7 @@ class AgentLoop:
                 "strategy": exposure.debug_metadata.get("strategy"),
                 "step_profile_id": resolved_profile.profile_id,
                 "step_profile_mode": (
-                    str(resolved_profile.mode)
-                    if resolved_profile.mode is not None
-                    else None
+                    str(resolved_profile.mode) if resolved_profile.mode is not None else None
                 ),
                 "allow_tool_search": allow_tool_search,
                 "llm_api": str(exposure_contract.llm_api),
@@ -2759,12 +2758,8 @@ class AgentLoop:
                 "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
                 "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
                 "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
-                "promoted_requested_count": exposure.debug_metadata.get(
-                    "promoted_requested_count"
-                ),
-                "promoted_visible_count": exposure.debug_metadata.get(
-                    "promoted_visible_count"
-                ),
+                "promoted_requested_count": exposure.debug_metadata.get("promoted_requested_count"),
+                "promoted_visible_count": exposure.debug_metadata.get("promoted_visible_count"),
             }
             if callable(update_tool_runtime_info):
                 update_tool_runtime_info(ctx.session.session_id, tool_runtime_info)
@@ -2785,12 +2780,16 @@ class AgentLoop:
                         "strategy": exposure.debug_metadata.get("strategy"),
                         "step_profile_id": resolved_profile.profile_id,
                         "step_profile_mode": (
-                            str(resolved_profile.mode) if resolved_profile.mode is not None else None
+                            str(resolved_profile.mode)
+                            if resolved_profile.mode is not None
+                            else None
                         ),
                         "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
                         "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
                         "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
-                        "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
+                        "hidden_searchable_count": exposure.debug_metadata.get(
+                            "hidden_searchable_count"
+                        ),
                         "promoted_requested_count": exposure.debug_metadata.get(
                             "promoted_requested_count"
                         ),
@@ -2921,7 +2920,9 @@ class AgentLoop:
             # (for example after tool calls or reprompts). The live WebSocket stream
             # reuses one message_id for the whole turn, so inject a paragraph break
             # before the first token of each later visible segment.
-            needs_stream_separator = bool(assistant_content_parts) and not continued_assistant_content
+            needs_stream_separator = (
+                bool(assistant_content_parts) and not continued_assistant_content
+            )
             await self._record_outgoing_audit_messages(
                 ctx,
                 pending_audit_messages,
@@ -3111,13 +3112,13 @@ class AgentLoop:
             # Drain any remaining thinking events (e.g. the final close event)
             if on_thinking:
                 for thinking_evt in accumulator.pop_thinking_events():
-                        await on_thinking(
-                            thinking_evt.block_id,
-                            thinking_evt.delta,
-                            thinking_evt.title,
-                            thinking_evt.complete,
-                            thinking_evt.content,
-                        )
+                    await on_thinking(
+                        thinking_evt.block_id,
+                        thinking_evt.delta,
+                        thinking_evt.title,
+                        thinking_evt.complete,
+                        thinking_evt.content,
+                    )
             # Record completed thinking blocks to Intaris
             if completed_thinking_blocks and mid_stream_error is None:
                 for block in completed_thinking_blocks:
@@ -4073,6 +4074,7 @@ class AgentLoop:
                             if isinstance(tc.arguments.get("outputs"), dict)
                             else {}
                         )
+                        self._validate_step_metadata_contract(ctx, tc.arguments)
                         step_output = StepOutput(
                             summary=tc.arguments.get("summary", ""),
                             content=(
@@ -4081,6 +4083,9 @@ class AgentLoop:
                                 else last_assistant_content
                             ),
                             outputs={**deliverable_outputs, **step_complete_outputs},
+                            metadata=tc.arguments.get("metadata", {})
+                            if isinstance(tc.arguments.get("metadata"), dict)
+                            else {},
                             claims=tc.arguments.get("claims", []),
                             outcome=tc.arguments.get("outcome"),
                             notification=tc.arguments.get("notification"),
@@ -5689,7 +5694,9 @@ class AgentLoop:
             task_workflow_run_response,
         )
         from cognis.store.queries import (
+            get_active_project_grant,
             get_agent,
+            get_project,
             get_session_row,
             get_task,
             list_step_runs_for_task,
@@ -5735,11 +5742,35 @@ class AgentLoop:
                     )
 
                 workflow_id = tc.arguments.get("workflow_id")
+                project_id = tc.arguments.get("project_id") or ctx.conversation.project_id
+                if project_id:
+                    async with self.session_manager.session_factory() as db:
+                        project = await get_project(db, str(project_id))
+                        project_access = project is not None and (
+                            project.status == "active"
+                        ) and (
+                            project.owner_email == ctx.session.user_email
+                            or await get_active_project_grant(
+                                db, str(project_id), ctx.session.user_email
+                            )
+                            is not None
+                        )
+                    if not project_access:
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": "Project not found or not accessible.",
+                                }
+                            ),
+                            is_error=True,
+                        )
                 if workflow_id:
                     workflow = await get_workflow_for_user(
                         workflow_registry=_workflow_registry_for_agent_loop(self),
                         workflow_id=str(workflow_id),
                         owner_email=ctx.session.user_email,
+                        project_id=str(project_id) if project_id else None,
                     )
                     if workflow is None:
                         return ToolResult(
@@ -5763,6 +5794,7 @@ class AgentLoop:
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
+                    project_id=str(project_id) if project_id else None,
                     workspace_root=ctx.workspace_root,
                     working_directory=ctx.working_directory,
                 )
@@ -5825,8 +5857,11 @@ class AgentLoop:
             statuses = None if status_filter == "all" else [status_filter]
             async with self.session_manager.session_factory() as db:
                 tasks = await list_tasks_for_agent(db, ctx.agent.agent_id, statuses=statuses)
+            project_filter = tc.arguments.get("project_id")
             items = []
             for t in tasks:
+                if project_filter and getattr(t, "project_id", None) != project_filter:
+                    continue
                 items.append(
                     {
                         "task_id": t.task_id,
@@ -5834,6 +5869,7 @@ class AgentLoop:
                         "status": t.status,
                         "priority": t.priority,
                         "workflow_id": t.workflow_id,
+                        "project_id": getattr(t, "project_id", None),
                         "created_at": str(t.created_at) if t.created_at else None,
                         "result_summary": t.result_summary,
                     }
@@ -6212,19 +6248,6 @@ class AgentLoop:
             from cognis.core.workflow_management import get_workflow_for_user
 
             workflow_id = tc.arguments.get("workflow_id")
-            if workflow_id:
-                workflow = await get_workflow_for_user(
-                    workflow_registry=_workflow_registry_for_agent_loop(self),
-                    workflow_id=str(workflow_id),
-                    owner_email=ctx.session.user_email,
-                )
-                if workflow is None:
-                    return ToolResult(
-                        output=json.dumps(
-                            {"status": "error", "message": "Workflow not found or not accessible."}
-                        ),
-                        is_error=True,
-                    )
             async with self.session_manager.session_factory() as db:
                 task_row = await get_task(db, task_id)
                 if task_row is None:
@@ -6255,6 +6278,45 @@ class AgentLoop:
                         ),
                         is_error=True,
                     )
+                project_id_arg = tc.arguments.get("project_id")
+                project_id = str(project_id_arg) if project_id_arg else task_row.project_id
+                if project_id_arg:
+                    project = await get_project(db, project_id)
+                    project_access = project is not None and (
+                        project.status == "active"
+                    ) and (
+                        project.owner_email == ctx.session.user_email
+                        or await get_active_project_grant(db, project_id, ctx.session.user_email)
+                        is not None
+                    )
+                    if not project_access:
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": "Project not found or not accessible.",
+                                }
+                            ),
+                            is_error=True,
+                        )
+                workflow_id_to_validate = workflow_id or task_row.workflow_id
+                if workflow_id_to_validate:
+                    workflow = await get_workflow_for_user(
+                        workflow_registry=_workflow_registry_for_agent_loop(self),
+                        workflow_id=str(workflow_id_to_validate),
+                        owner_email=ctx.session.user_email,
+                        project_id=project_id,
+                    )
+                    if workflow is None:
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": "Workflow not found or not accessible.",
+                                }
+                            ),
+                            is_error=True,
+                        )
                 ok = await update_task_fields(
                     db,
                     task_id,
@@ -6262,6 +6324,7 @@ class AgentLoop:
                     description=tc.arguments.get("description"),
                     priority=tc.arguments.get("priority"),
                     workflow_id=tc.arguments.get("workflow_id"),
+                    project_id=project_id_arg,
                 )
                 await db.commit()
             if ok:
@@ -9293,6 +9356,9 @@ class AgentLoop:
                 f"{str(ctx.completion_delivery.allow_silent_completion).lower()}\n\n"
             )
 
+        if ctx.project_context:
+            parts.append(f"## Project Context\n\n{ctx.project_context}\n\n")
+
         # Inject prior step outputs so the LLM has context from previous steps.
         # This resolves the step's input configuration and reads structured
         # outputs from workflow state, making them visible in session logs.
@@ -9461,12 +9527,17 @@ class AgentLoop:
         )
 
         def _to_schema(tool_def: Any) -> dict[str, Any]:
+            import copy
+
+            parameters = copy.deepcopy(tool_def.parameters)
+            if tool_def.name == STEP_COMPLETE_TOOL.name:
+                self._apply_step_metadata_contract_schema(ctx, parameters)
             return {
                 "type": "function",
                 "function": {
                     "name": tool_def.name,
                     "description": tool_def.description,
-                    "parameters": tool_def.parameters,
+                    "parameters": parameters,
                 },
             }
 
@@ -9537,6 +9608,90 @@ class AgentLoop:
             registry[tool_def.name] = tool_def
         tool_def = registry.get(tool_name)
         return tool_def.parameters if tool_def is not None else None
+
+    def _apply_step_metadata_contract_schema(
+        self,
+        ctx: StepContext,
+        parameters: dict[str, Any],
+    ) -> None:
+        """Overlay the current step's metadata contract onto step_complete."""
+
+        contract = getattr(ctx.step_definition, "metadata_contract", None)
+        fields = list(getattr(contract, "fields", []) or [])
+        if not fields:
+            return
+        properties = parameters.setdefault("properties", {})
+        metadata_schema: dict[str, Any] = {
+            "type": "object",
+            "description": "Metadata required by this workflow step.",
+            "properties": {},
+        }
+        required: list[str] = []
+        for metadata_field in fields:
+            field_schema: dict[str, Any] = {
+                "type": self._metadata_json_schema_type(metadata_field.type)
+            }
+            if metadata_field.description:
+                field_schema["description"] = metadata_field.description
+            if metadata_field.enum:
+                field_schema["enum"] = list(metadata_field.enum)
+            metadata_schema["properties"][metadata_field.name] = field_schema
+            if metadata_field.required:
+                required.append(metadata_field.name)
+        if required:
+            metadata_schema["required"] = required
+            parameters["required"] = sorted(
+                set(list(parameters.get("required", [])) + ["metadata"])
+            )
+        properties["metadata"] = metadata_schema
+
+    def _metadata_json_schema_type(self, field_type: str) -> str | list[str]:
+        return "number" if field_type == "number" else field_type
+
+    def _validate_step_metadata_contract(
+        self,
+        ctx: StepContext,
+        arguments: dict[str, Any],
+    ) -> None:
+        """Validate step_complete metadata against the current step contract."""
+
+        contract = getattr(ctx.step_definition, "metadata_contract", None)
+        fields = list(getattr(contract, "fields", []) or [])
+        if not fields:
+            return
+        metadata = arguments.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError("step_complete.metadata must be an object")
+        for metadata_field in fields:
+            value = metadata.get(metadata_field.name)
+            if value is None:
+                if metadata_field.required:
+                    raise ValueError(f"step_complete.metadata.{metadata_field.name} is required")
+                continue
+            if not self._metadata_value_matches_type(value, metadata_field.type):
+                raise ValueError(
+                    f"step_complete.metadata.{metadata_field.name} must be {metadata_field.type}"
+                )
+            if metadata_field.enum is not None and value not in metadata_field.enum:
+                allowed = ", ".join(str(item) for item in metadata_field.enum)
+                raise ValueError(
+                    f"step_complete.metadata.{metadata_field.name} must be one of: {allowed}"
+                )
+
+    def _metadata_value_matches_type(self, value: Any, field_type: str) -> bool:
+        if field_type == "string":
+            return isinstance(value, str)
+        if field_type == "number":
+            return isinstance(value, int | float) and not isinstance(value, bool)
+        if field_type == "boolean":
+            return isinstance(value, bool)
+        if field_type == "array":
+            return isinstance(value, list)
+        if field_type == "object":
+            return isinstance(value, dict)
+        return False
 
     def _validate_controller_tool_arguments(
         self,
@@ -10076,7 +10231,9 @@ class AgentLoop:
         # Build structured candidate lines with rich metadata.
         candidate_lines = []
         tool_by_id = {stable_tool_id(tool): tool for tool in candidate_tools}
-        for tool_id, tool in sorted(tool_by_id.items(), key=lambda item: (item[1].name.lower(), item[0])):
+        for tool_id, tool in sorted(
+            tool_by_id.items(), key=lambda item: (item[1].name.lower(), item[0])
+        ):
             source_label = tool.source.type
             if tool.source.server_name:
                 source_label = f"{tool.source.type}:{tool.source.server_name}"
@@ -10124,9 +10281,7 @@ class AgentLoop:
             )
 
         # Build structured skill context — tags + referenced services as hints.
-        skill_tags = [
-            str(t) for t in (activation.get("tags") or []) if isinstance(t, str)
-        ]
+        skill_tags = [str(t) for t in (activation.get("tags") or []) if isinstance(t, str)]
         instructions_text = str(activation.get("instructions") or "")
         referenced_services = self._scan_referenced_services(skill_tags, instructions_text)
 
@@ -10187,9 +10342,7 @@ class AgentLoop:
                         f"Candidate chunk: {chunk_index}/{len(candidate_chunks)}\n"
                         "Each candidate line: "
                         "- tool_id: name [category=X, profile=Y, source=Z, read_only=T/F] — description\n"
-                        "Candidate tools:\n"
-                        + "\n".join(candidate_chunk)
-                        + "\n\nReturn JSON only."
+                        "Candidate tools:\n" + "\n".join(candidate_chunk) + "\n\nReturn JSON only."
                     ),
                 },
             ]
@@ -10369,21 +10522,19 @@ class AgentLoop:
         # B2 — return a transparency notice for the model.
         # Keeps it short: tool names only, plus a self-correction hint.
         notice_lines = [
-            f"<skill_activation skill_id=\"{skill_id}\">",
+            f'<skill_activation skill_id="{skill_id}">',
             "The following tools were auto-enabled for this skill. "
             "If they do not match what the skill actually needs, call search_tools "
             "to find the correct ones.",
         ]
         for tool_id_str in sorted(resolved_tool_ids):
-            tool_obj = (
-                next(
-                    (
-                        t
-                        for t in (ctx.tool_registry.list_tools() if ctx.tool_registry else [])
-                        if stable_tool_id(t) == tool_id_str
-                    ),
-                    None,
-                )
+            tool_obj = next(
+                (
+                    t
+                    for t in (ctx.tool_registry.list_tools() if ctx.tool_registry else [])
+                    if stable_tool_id(t) == tool_id_str
+                ),
+                None,
             )
             name = tool_obj.name if tool_obj else tool_id_str
             notice_lines.append(f"- {name} ({tool_id_str})")

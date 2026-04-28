@@ -94,7 +94,11 @@ async def task_workflow_run_response(
     current_step_name: str | None = None
     if task.workflow_id:
         try:
-            workflow = await workflow_registry.get(task.workflow_id, owner_email=task.created_by)
+            workflow = await workflow_registry.get(
+                task.workflow_id,
+                owner_email=task.created_by,
+                project_id=task.project_id,
+            )
         except TypeError:
             workflow = await workflow_registry.get(task.workflow_id)
         if workflow is not None and task.workflow_state.current_step_index < len(workflow.steps):

@@ -33,6 +33,7 @@ class Deliverable(BaseModel):
     deliverable_id: str
     step_run_id: str
     version: int
+    attempt_number: int = 1
     content: str
     format: Literal["markdown", "plain", "html"] = DeliverableFormat.MARKDOWN
     title: str | None = None

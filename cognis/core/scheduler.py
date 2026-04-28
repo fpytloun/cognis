@@ -285,6 +285,7 @@ class Scheduler:
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 workflow_id=workflow_id,
+                project_id=getattr(sched, "project_id", None),
                 workspace_root=workspace_root,
                 working_directory=working_directory,
             )

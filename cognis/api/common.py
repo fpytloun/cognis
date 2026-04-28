@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from cognis.api.middleware import AuthenticatedUser
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.ownership import normalize_executor_scope
-from cognis.store.queries import get_active_agent_grant
+from cognis.store.queries import get_active_agent_grant, get_active_project_grant
 
 
 def api_exception(
@@ -154,6 +154,59 @@ def apply_agent_access_metadata(agent: Any, access: AgentAccess) -> Any:
     agent.executor_scope = access.executor_scope
     agent.is_readonly_for_caller = not access.is_owner
     return agent
+
+
+@dataclass(slots=True)
+class ProjectAccess:
+    """Resolved caller access to a project."""
+
+    user: AuthenticatedUser
+    owner_email: str
+    is_owner: bool
+    grant: Any | None = None
+
+    @property
+    def granted_permission(self) -> str | None:
+        return str(self.grant.permission) if self.grant is not None else None
+
+
+async def check_project_access(request: Request, project: Any, *, required: str) -> ProjectAccess:
+    """Resolve project access with no admin bypass.
+
+    ``required`` may be ``view``, ``use``, or ``manage``. Ownership is the
+    only mutation path; active ``use`` grants permit only ``view`` and ``use``.
+    """
+
+    user = require_current_user(request)
+    owner_email = str(getattr(project, "owner_email", "") or "")
+    if not owner_email:
+        raise api_exception(500, "internal_error", "Project owner is missing")
+    if user.email == owner_email:
+        return ProjectAccess(user=user, owner_email=owner_email, is_owner=True)
+
+    if required not in {"view", "use", "manage"}:
+        raise api_exception(500, "internal_error", f"Unsupported project access requirement: {required}")
+    if required not in {"view", "use"}:
+        raise api_exception(403, "forbidden", "Resource access denied")
+
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        raise api_exception(500, "internal_error", "Session factory unavailable")
+    async with session_factory() as session:
+        grant = await get_active_project_grant(session, str(project.project_id), user.email)
+    if grant is None:
+        raise api_exception(403, "forbidden", "Resource access denied")
+    return ProjectAccess(user=user, owner_email=owner_email, is_owner=False, grant=grant)
+
+
+def apply_project_access_metadata(project: Any, access: ProjectAccess) -> Any:
+    """Annotate a project row with caller-scoped sharing metadata."""
+
+    project.is_shared_with_me = not access.is_owner
+    project.shared_by_email = None if access.is_owner else access.owner_email
+    project.granted_permission = access.granted_permission
+    project.is_readonly_for_caller = not access.is_owner
+    return project
 
 
 def forbid_mutation_for_viewer(request: Request) -> None:

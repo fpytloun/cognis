@@ -19,6 +19,8 @@ function makeTask(overrides: Partial<Task>): Task {
     completion_mode_family: overrides.completion_mode_family ?? 'default',
     allow_silent_completion: overrides.allow_silent_completion ?? false,
     workflow_id: overrides.workflow_id ?? null,
+    project_id: overrides.project_id ?? null,
+    attempt_number: overrides.attempt_number ?? 1,
     workspace_root: overrides.workspace_root ?? null,
     working_directory: overrides.working_directory ?? null,
     workflow_state: overrides.workflow_state ?? null,

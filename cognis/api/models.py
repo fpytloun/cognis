@@ -197,11 +197,13 @@ class ConversationResolveRequest(BaseModel):
 class ConversationCreateRequest(BaseModel):
     agent_id: str
     title: str | None = None
+    project_id: str | None = None
     context: ConversationContextModel = Field(default_factory=ConversationContextModel)
 
 
 class ConversationUpdateRequest(BaseModel):
     title: str | None = None
+    project_id: str | None = None
     archived: bool | None = None
 
 
@@ -209,6 +211,7 @@ class ConversationResponse(BaseModel):
     conversation_id: str
     user_email: str
     agent_id: str
+    project_id: str | None = None
     title: str | None = None
     context: ConversationContextModel
     active_session_id: str | None = None
@@ -259,6 +262,109 @@ class MessageHistoryResponse(BaseModel):
         default=None,
         description="Machine-readable reason explaining why the history response was truncated.",
     )
+
+
+class ProjectSourceCreateRequest(BaseModel):
+    name: str
+    local_path: str | None = None
+    remote_url: str | None = None
+    default_branch: str | None = None
+    credential_ref: str | None = None
+    instructions: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectSourceUpdateRequest(BaseModel):
+    name: str | None = None
+    local_path: str | None = None
+    remote_url: str | None = None
+    default_branch: str | None = None
+    credential_ref: str | None = None
+    instructions: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class ProjectSourceResponse(BaseModel):
+    source_id: str
+    project_id: str
+    name: str
+    local_path: str | None = None
+    remote_url: str | None = None
+    default_branch: str | None = None
+    credential_ref: str | None = None
+    instructions: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ProjectGrantCreateRequest(BaseModel):
+    grantee_type: Literal["user", "group"] = "user"
+    grantee_user_email: str | None = None
+    grantee_group_id: str | None = None
+    permission: Literal["use"] = "use"
+    note: str | None = None
+
+
+class ProjectGrantResponse(BaseModel):
+    grant_id: str
+    project_id: str
+    grantee_type: str = "user"
+    grantee_user_email: str | None = None
+    grantee_group_id: str | None = None
+    permission: str = "use"
+    granted_by: str
+    granted_at: datetime | None = None
+    revoked_at: datetime | None = None
+    note: str | None = None
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: str | None = None
+    instructions: str | None = None
+    default_workflow_id: str | None = None
+    avatar_image_id: str | None = None
+    avatar_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+    default_workflow_id: str | None = None
+    avatar_image_id: str | None = None
+    avatar_url: str | None = None
+    metadata: dict[str, Any] | None = None
+    status: str | None = None
+
+
+class ProjectResponse(BaseModel):
+    project_id: str
+    owner_email: str
+    name: str
+    description: str | None = None
+    instructions: str | None = None
+    default_workflow_id: str | None = None
+    avatar_image_id: str | None = None
+    avatar_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    status: str = "active"
+    sources: list[ProjectSourceResponse] = Field(default_factory=list)
+    workflow_ids: list[str] = Field(default_factory=list)
+    grants: list[ProjectGrantResponse] = Field(default_factory=list)
+    is_shared_with_me: bool = False
+    shared_by_email: str | None = None
+    granted_permission: str | None = None
+    is_readonly_for_caller: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ProjectAvatarGenerateResponse(BaseModel):
+    avatar_image_id: str
+    avatar_url: str
 
 
 class SessionResponse(BaseModel):
@@ -515,6 +621,7 @@ class TaskCreateRequest(BaseModel):
     expected_output: str | None = None
     priority: int = 0
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     delivery_mode: str = "same_conversation"
     delivery_target: str | None = None
@@ -534,6 +641,7 @@ class TaskUpdateRequest(BaseModel):
     priority: int | None = None
     agent_id: str | None = None
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     delivery_mode: str | None = None
     delivery_target: str | None = None
@@ -584,6 +692,39 @@ class DependencyResponse(BaseModel):
     required: bool
 
 
+class TaskCommentCreateRequest(BaseModel):
+    body: str
+    intent: str = "record_only"
+    noop: bool = True
+    target_step: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskCommentUpdateRequest(BaseModel):
+    body: str | None = None
+    intent: str | None = None
+    noop: bool | None = None
+    target_step: str | None = None
+    applied: bool | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TaskCommentResponse(BaseModel):
+    comment_id: str
+    task_id: str
+    author_email: str
+    body: str
+    intent: str = "record_only"
+    noop: bool = True
+    target_step: str | None = None
+    confidence: float | None = None
+    applied: bool = False
+    attempt_number: int = 1
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 class TaskResponse(BaseModel):
     task_id: str
     title: str
@@ -599,6 +740,8 @@ class TaskResponse(BaseModel):
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     workflow_id: str | None = None
+    project_id: str | None = None
+    attempt_number: int = 1
     workspace_root: str | None = None
     working_directory: str | None = None
     workflow_state: WorkflowState | None = None
@@ -617,6 +760,8 @@ class TaskResponse(BaseModel):
 class WorkflowRunResponse(BaseModel):
     task_id: str
     workflow_id: str | None = None
+    project_id: str | None = None
+    attempt_number: int = 1
     workflow_state: WorkflowState | None = None
     current_step_name: str | None = None
     pending_pause: PendingPauseResponse | None = None
@@ -626,6 +771,7 @@ class DeliverableResponse(BaseModel):
     deliverable_id: str
     step_run_id: str
     version: int
+    attempt_number: int = 1
     content: str
     format: str = "markdown"
     title: str | None = None
@@ -664,6 +810,8 @@ class StepRunResponse(BaseModel):
     step_type: str
     status: str
     attempt: int = 1
+    attempt_number: int = 1
+    superseded_by_step_run_id: str | None = None
     agent_id: str
     workspace_root: str | None = None
     working_directory: str | None = None
@@ -704,6 +852,7 @@ class CreateScheduleRequest(BaseModel):
     timezone: str = "UTC"
     agent_id: str
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     task_template: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
@@ -739,6 +888,7 @@ class UpdateScheduleRequest(BaseModel):
     timezone: str | None = None
     agent_id: str | None = None
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     task_template: dict[str, Any] | None = None
     enabled: bool | None = None
@@ -759,6 +909,7 @@ class ScheduleResponse(BaseModel):
     timezone: str = "UTC"
     agent_id: str
     workflow_id: str | None = None
+    project_id: str | None = None
     skill_id: str | None = None
     task_template: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True

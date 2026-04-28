@@ -33,6 +33,10 @@ from cognis.store.models import (
     LLMProvider,
     MCPServerRow,
     ModelRouting,
+    ProjectGrantRow,
+    ProjectRow,
+    ProjectSourceRow,
+    ProjectWorkflowRow,
     Schedule,
     Secret,
     Session,
@@ -44,6 +48,7 @@ from cognis.store.models import (
     SystemAgentOverride,
     SystemWorkflowOverride,
     Task,
+    TaskCommentRow,
     TaskDependency,
     ToolClassificationOverrideRow,
     ToolClassificationRow,
@@ -957,6 +962,270 @@ async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvid
 # --- Conversations ---
 
 
+async def create_project(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    name: str,
+    description: str | None = None,
+    instructions: str | None = None,
+    default_workflow_id: str | None = None,
+    avatar_image_id: str | None = None,
+    avatar_url: str | None = None,
+    metadata: dict[str, object] | None = None,
+    project_id: str | None = None,
+) -> ProjectRow:
+    row = ProjectRow(
+        project_id=project_id or f"proj_{uuid.uuid4().hex}",
+        owner_email=owner_email,
+        name=name,
+        description=description,
+        instructions=instructions,
+        default_workflow_id=default_workflow_id,
+        avatar_image_id=avatar_image_id,
+        avatar_url=avatar_url,
+        metadata_json=metadata or {},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_project(session: AsyncSession, project_id: str) -> ProjectRow | None:
+    result = await session.execute(select(ProjectRow).where(ProjectRow.project_id == project_id))
+    return result.scalar_one_or_none()
+
+
+async def list_projects_for_user(
+    session: AsyncSession,
+    user_email: str,
+    *,
+    status: str | None = "active",
+    query: str | None = None,
+) -> list[ProjectRow]:
+    grant_project_ids = select(ProjectGrantRow.project_id).where(
+        ProjectGrantRow.grantee_type == "user",
+        ProjectGrantRow.grantee_user_email == user_email,
+        ProjectGrantRow.revoked_at.is_(None),
+    )
+    stmt = select(ProjectRow).where(
+        sa.or_(ProjectRow.owner_email == user_email, ProjectRow.project_id.in_(grant_project_ids))
+    )
+    if status and status != "all":
+        stmt = stmt.where(ProjectRow.status == status)
+    if query:
+        pattern = f"%{query}%"
+        stmt = stmt.where(
+            sa.or_(ProjectRow.name.ilike(pattern), ProjectRow.description.ilike(pattern))
+        )
+    result = await session.execute(
+        stmt.order_by(ProjectRow.updated_at.desc(), ProjectRow.name.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def update_project(
+    session: AsyncSession, project_id: str, **fields: Any
+) -> ProjectRow | None:
+    row = await get_project(session, project_id)
+    if row is None:
+        return None
+    allowed = {
+        "name",
+        "description",
+        "instructions",
+        "default_workflow_id",
+        "avatar_image_id",
+        "avatar_url",
+        "status",
+    }
+    for key, value in fields.items():
+        if key == "metadata":
+            row.metadata_json = value
+        elif key in allowed:
+            setattr(row, key, value)
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def create_project_source(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    name: str,
+    local_path: str | None = None,
+    remote_url: str | None = None,
+    default_branch: str | None = None,
+    credential_ref: str | None = None,
+    instructions: str | None = None,
+    metadata: dict[str, object] | None = None,
+    source_id: str | None = None,
+) -> ProjectSourceRow:
+    row = ProjectSourceRow(
+        source_id=source_id or f"psrc_{uuid.uuid4().hex}",
+        project_id=project_id,
+        name=name,
+        local_path=local_path,
+        remote_url=remote_url,
+        default_branch=default_branch,
+        credential_ref=credential_ref,
+        instructions=instructions,
+        metadata_json=metadata or {},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_project_sources(session: AsyncSession, project_id: str) -> list[ProjectSourceRow]:
+    result = await session.execute(
+        select(ProjectSourceRow)
+        .where(ProjectSourceRow.project_id == project_id)
+        .order_by(ProjectSourceRow.name.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_project_source(session: AsyncSession, source_id: str) -> ProjectSourceRow | None:
+    result = await session.execute(
+        select(ProjectSourceRow).where(ProjectSourceRow.source_id == source_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_project_source(
+    session: AsyncSession, source_id: str, **fields: Any
+) -> ProjectSourceRow | None:
+    row = await get_project_source(session, source_id)
+    if row is None:
+        return None
+    for key, value in fields.items():
+        if key == "metadata":
+            row.metadata_json = value
+        elif key in {
+            "name",
+            "local_path",
+            "remote_url",
+            "default_branch",
+            "credential_ref",
+            "instructions",
+        }:
+            setattr(row, key, value)
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def delete_project_source(session: AsyncSession, source_id: str) -> bool:
+    result = await session.execute(
+        delete(ProjectSourceRow).where(ProjectSourceRow.source_id == source_id)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def attach_project_workflow(
+    session: AsyncSession, project_id: str, workflow_id: str
+) -> ProjectWorkflowRow:
+    row = await session.get(
+        ProjectWorkflowRow, {"project_id": project_id, "workflow_id": workflow_id}
+    )
+    if row is not None:
+        return row
+    row = ProjectWorkflowRow(project_id=project_id, workflow_id=workflow_id)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def detach_project_workflow(session: AsyncSession, project_id: str, workflow_id: str) -> bool:
+    result = await session.execute(
+        delete(ProjectWorkflowRow).where(
+            ProjectWorkflowRow.project_id == project_id,
+            ProjectWorkflowRow.workflow_id == workflow_id,
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def list_project_workflow_ids(session: AsyncSession, project_id: str) -> list[str]:
+    result = await session.execute(
+        select(ProjectWorkflowRow.workflow_id).where(ProjectWorkflowRow.project_id == project_id)
+    )
+    return [str(item) for item in result.scalars().all()]
+
+
+async def list_bound_workflow_ids(session: AsyncSession) -> set[str]:
+    result = await session.execute(select(ProjectWorkflowRow.workflow_id).distinct())
+    return {str(item) for item in result.scalars().all()}
+
+
+async def create_project_grant(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    granted_by: str,
+    grantee_type: str = "user",
+    grantee_user_email: str | None = None,
+    grantee_group_id: str | None = None,
+    permission: str = "use",
+    note: str | None = None,
+) -> ProjectGrantRow:
+    row = ProjectGrantRow(
+        grant_id=f"pgrant_{uuid.uuid4().hex}",
+        project_id=project_id,
+        grantee_type=grantee_type,
+        grantee_user_email=grantee_user_email,
+        grantee_group_id=grantee_group_id,
+        permission=permission,
+        granted_by=granted_by,
+        note=note,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_active_project_grant(
+    session: AsyncSession,
+    project_id: str,
+    user_email: str,
+) -> ProjectGrantRow | None:
+    result = await session.execute(
+        select(ProjectGrantRow).where(
+            ProjectGrantRow.project_id == project_id,
+            ProjectGrantRow.grantee_type == "user",
+            ProjectGrantRow.grantee_user_email == user_email,
+            ProjectGrantRow.revoked_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_project_grants(session: AsyncSession, project_id: str) -> list[ProjectGrantRow]:
+    result = await session.execute(
+        select(ProjectGrantRow)
+        .where(ProjectGrantRow.project_id == project_id)
+        .order_by(ProjectGrantRow.granted_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_project_grant(session: AsyncSession, grant_id: str) -> ProjectGrantRow | None:
+    return await session.get(ProjectGrantRow, grant_id)
+
+
+async def revoke_project_grant(session: AsyncSession, grant_id: str) -> bool:
+    row = await session.get(ProjectGrantRow, grant_id)
+    if row is None:
+        return False
+    row.revoked_at = _utcnow()
+    await session.flush()
+    return True
+
+
 async def create_conversation(
     session: AsyncSession,
     user_email: str,
@@ -969,6 +1238,7 @@ async def create_conversation(
     context_data: dict[str, object] | None = None,
     memory_labels: dict[str, object] | None = None,
     conversation_id: str | None = None,
+    project_id: str | None = None,
 ) -> Conversation:
     """Create a new conversation row."""
 
@@ -980,6 +1250,7 @@ async def create_conversation(
         title_source=title_source,
         context_type=context_type,
         context_ref=context_ref,
+        project_id=project_id,
         context_data=context_data,
         memory_labels=memory_labels,
     )
@@ -1046,6 +1317,7 @@ async def list_conversations(
     context_type: str | None = None,
     agent_id: str | None = None,
     status: str = "active",
+    project_id: str | None = None,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
 
@@ -1077,6 +1349,8 @@ async def list_conversations(
         query = query.where(Conversation.context_type == context_type)
     if agent_id is not None:
         query = query.where(Conversation.agent_id == agent_id)
+    if project_id is not None:
+        query = query.where(Conversation.project_id == project_id)
     result = await session.execute(query)
     return list(result.scalars().all())
 
@@ -1122,6 +1396,7 @@ async def update_conversation(
     *,
     title: str | None = None,
     title_source: str | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Update mutable conversation fields."""
     row = await get_conversation(session, conversation_id)
@@ -1131,6 +1406,8 @@ async def update_conversation(
         row.title = title
     if title_source is not None:
         row.title_source = title_source
+    if project_id is not None:
+        row.project_id = project_id
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
@@ -1567,6 +1844,7 @@ async def create_task(
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
     workflow_id: str | None = None,
+    project_id: str | None = None,
     workspace_root: str | None = None,
     working_directory: str | None = None,
     workflow_state: dict[str, object] | None = None,
@@ -1596,6 +1874,7 @@ async def create_task(
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
         workflow_id=workflow_id,
+        project_id=project_id,
         workspace_root=workspace_root,
         working_directory=working_directory,
         workflow_state=workflow_state,
@@ -1624,6 +1903,68 @@ async def get_task(session: AsyncSession, task_id: str) -> Task | None:
     """Get a task by ID."""
     result = await session.execute(select(Task).where(Task.task_id == task_id))
     return result.scalar_one_or_none()
+
+
+async def create_task_comment(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    author_email: str,
+    body: str,
+    intent: str = "record_only",
+    noop: bool = True,
+    target_step: str | None = None,
+    attempt_number: int = 1,
+    metadata: dict[str, object] | None = None,
+) -> TaskCommentRow:
+    row = TaskCommentRow(
+        comment_id=f"tcmt_{uuid.uuid4().hex}",
+        task_id=task_id,
+        author_email=author_email,
+        body=body,
+        intent=intent,
+        noop=noop,
+        target_step=target_step,
+        attempt_number=attempt_number,
+        metadata_json=metadata or {},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_task_comments(session: AsyncSession, task_id: str) -> list[TaskCommentRow]:
+    result = await session.execute(
+        select(TaskCommentRow)
+        .where(TaskCommentRow.task_id == task_id)
+        .order_by(TaskCommentRow.created_at.asc(), TaskCommentRow.comment_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_task_comment(session: AsyncSession, comment_id: str) -> TaskCommentRow | None:
+    result = await session.execute(
+        select(TaskCommentRow).where(TaskCommentRow.comment_id == comment_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_task_comment(
+    session: AsyncSession,
+    comment_id: str,
+    **fields: Any,
+) -> TaskCommentRow | None:
+    row = await get_task_comment(session, comment_id)
+    if row is None:
+        return None
+    for key, value in fields.items():
+        if key == "metadata":
+            row.metadata_json = value
+        elif key in {"body", "intent", "noop", "target_step", "applied"}:
+            setattr(row, key, value)
+    row.updated_at = _utcnow()
+    await session.flush()
+    return row
 
 
 async def update_task_status(
@@ -1712,6 +2053,7 @@ async def update_task_fields(
     expected_output: str | None = None,
     priority: int | None = None,
     workflow_id: str | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Update mutable task fields.  Only allowed for draft/queued tasks."""
     values: dict[str, object] = {}
@@ -1725,6 +2067,8 @@ async def update_task_fields(
         values["priority"] = priority
     if workflow_id is not None:
         values["workflow_id"] = workflow_id
+    if project_id is not None:
+        values["project_id"] = project_id
     if not values:
         return False
     stmt = (
@@ -1992,6 +2336,7 @@ async def create_deliverable(
     target: str | None = None,
     outputs: dict[str, Any] | None = None,
     deliverable_id: str | None = None,
+    attempt_number: int | None = None,
 ) -> DeliverableRow:
     """Create a new versioned deliverable for a step run."""
 
@@ -1999,6 +2344,9 @@ async def create_deliverable(
         select(sa.func.max(DeliverableRow.version)).where(DeliverableRow.step_run_id == step_run_id)
     )
     next_version = int(version_result.scalar_one_or_none() or 0) + 1
+    if attempt_number is None:
+        step_run = await session.get(StepRun, step_run_id)
+        attempt_number = getattr(step_run, "attempt_number", 1) if step_run is not None else 1
 
     await session.execute(
         update(DeliverableRow)
@@ -2013,6 +2361,7 @@ async def create_deliverable(
         deliverable_id=deliverable_id or f"dlv_{uuid.uuid4().hex}",
         step_run_id=step_run_id,
         version=next_version,
+        attempt_number=attempt_number,
         content=content,
         format=format,
         title=title,
@@ -2135,6 +2484,7 @@ async def create_step_run(
     step_type: str,
     agent_id: str,
     attempt: int = 1,
+    attempt_number: int = 1,
     step_run_id: str | None = None,
     conversation_id: str | None = None,
     workspace_root: str | None = None,
@@ -2151,6 +2501,7 @@ async def create_step_run(
         step_type=step_type,
         agent_id=agent_id,
         attempt=attempt,
+        attempt_number=attempt_number,
         workspace_root=workspace_root,
         working_directory=working_directory,
         conversation_id=conversation_id,
@@ -2267,6 +2618,47 @@ async def list_step_runs_for_task(
     return list(result.scalars().all())
 
 
+async def list_step_run_history(
+    session: AsyncSession,
+    task_id: str,
+    step_name: str,
+) -> list[StepRun]:
+    """List all attempts for one task step."""
+
+    result = await session.execute(
+        select(StepRun)
+        .where(StepRun.task_id == task_id, StepRun.step_name == step_name)
+        .order_by(StepRun.attempt_number.asc(), StepRun.attempt.asc(), StepRun.started_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def supersede_step_runs_for_revision(
+    session: AsyncSession,
+    task_id: str,
+    step_names: list[str],
+    *,
+    before_attempt_number: int,
+) -> int:
+    """Mark historical step runs superseded when a human revision rewinds a task."""
+
+    if not step_names:
+        return 0
+    result = await session.execute(
+        update(StepRun)
+        .where(
+            StepRun.task_id == task_id,
+            StepRun.step_name.in_(step_names),
+            StepRun.attempt_number < before_attempt_number,
+            StepRun.status.in_(
+                ["pending", "running", "evaluating", "approved", "rejected", "paused", "failed"]
+            ),
+        )
+        .values(status="superseded", updated_at=_utcnow())
+    )
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
 async def get_step_run(session: AsyncSession, step_run_id: str) -> StepRun | None:
     """Get a step run by ID."""
     result = await session.execute(select(StepRun).where(StepRun.step_run_id == step_run_id))
@@ -2277,6 +2669,8 @@ async def get_latest_step_run_for_task_step(
     session: AsyncSession,
     task_id: str,
     step_name: str,
+    *,
+    attempt_number: int | None = None,
 ) -> StepRun | None:
     """Return the most recent step run for a given task and step name.
 
@@ -2285,15 +2679,16 @@ async def get_latest_step_run_for_task_step(
     even when duplicate attempt numbers exist.
     Used by the workflow engine to reuse a prior session on retry.
     """
+    stmt = select(StepRun).where(StepRun.task_id == task_id, StepRun.step_name == step_name)
+    if attempt_number is not None:
+        stmt = stmt.where(StepRun.attempt_number == attempt_number)
     result = await session.execute(
-        select(StepRun)
-        .where(StepRun.task_id == task_id, StepRun.step_name == step_name)
-        .order_by(
+        stmt.order_by(
+            StepRun.attempt_number.desc(),
             StepRun.attempt.desc(),
             StepRun.started_at.desc(),
             StepRun.step_run_id.desc(),
-        )
-        .limit(1)
+        ).limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -2579,6 +2974,7 @@ async def create_schedule(
     timezone: str = "UTC",
     agent_id: str,
     workflow_id: str | None = None,
+    project_id: str | None = None,
     skill_id: str | None = None,
     task_template: dict[str, object],
     enabled: bool = True,
@@ -2601,6 +2997,7 @@ async def create_schedule(
         timezone=timezone,
         agent_id=agent_id,
         workflow_id=workflow_id,
+        project_id=project_id,
         skill_id=skill_id,
         task_template=task_template,
         enabled=enabled,
@@ -2629,6 +3026,7 @@ async def list_schedules(
     enabled: bool | None = None,
     schedule_type: str | None = None,
     agent_id: str | None = None,
+    project_id: str | None = None,
 ) -> list[Schedule]:
     """List schedules with optional filters."""
     stmt = select(Schedule).order_by(Schedule.name)
@@ -2640,6 +3038,8 @@ async def list_schedules(
         stmt = stmt.where(Schedule.schedule_type == schedule_type)
     if agent_id is not None:
         stmt = stmt.where(Schedule.agent_id == agent_id)
+    if project_id is not None:
+        stmt = stmt.where(Schedule.project_id == project_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -2663,6 +3063,7 @@ async def update_schedule(
         "timezone",
         "agent_id",
         "workflow_id",
+        "project_id",
         "skill_id",
         "task_template",
         "enabled",
@@ -3110,7 +3511,10 @@ async def list_executors(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+                sa.or_(
+                    ExecutorRow.owner_email == owner_email,
+                    _shared_owner_clause(ExecutorRow.owner_email),
+                )
             )
         else:
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
@@ -3130,7 +3534,10 @@ async def get_executor_row(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+                sa.or_(
+                    ExecutorRow.owner_email == owner_email,
+                    _shared_owner_clause(ExecutorRow.owner_email),
+                )
             )
         else:
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
@@ -3149,7 +3556,10 @@ async def get_default_executor(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+                sa.or_(
+                    ExecutorRow.owner_email == owner_email,
+                    _shared_owner_clause(ExecutorRow.owner_email),
+                )
             )
         else:
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
@@ -3235,7 +3645,10 @@ async def delete_executor(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(ExecutorRow.owner_email == owner_email, _shared_owner_clause(ExecutorRow.owner_email))
+                sa.or_(
+                    ExecutorRow.owner_email == owner_email,
+                    _shared_owner_clause(ExecutorRow.owner_email),
+                )
             )
         else:
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
@@ -3470,7 +3883,10 @@ async def list_mcp_servers(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+                sa.or_(
+                    MCPServerRow.owner_email == owner_email,
+                    MCPServerRow.owner_email == SYSTEM_USER_EMAIL,
+                )
             )
         else:
             stmt = stmt.where(MCPServerRow.owner_email == owner_email)
@@ -3490,7 +3906,10 @@ async def get_mcp_server(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+                sa.or_(
+                    MCPServerRow.owner_email == owner_email,
+                    MCPServerRow.owner_email == SYSTEM_USER_EMAIL,
+                )
             )
         else:
             stmt = stmt.where(MCPServerRow.owner_email == owner_email)
@@ -3582,7 +4001,10 @@ async def delete_mcp_server(
     if owner_email is not None:
         if include_shared:
             stmt = stmt.where(
-                sa.or_(MCPServerRow.owner_email == owner_email, MCPServerRow.owner_email == SYSTEM_USER_EMAIL)
+                sa.or_(
+                    MCPServerRow.owner_email == owner_email,
+                    MCPServerRow.owner_email == SYSTEM_USER_EMAIL,
+                )
             )
         else:
             stmt = stmt.where(MCPServerRow.owner_email == owner_email)

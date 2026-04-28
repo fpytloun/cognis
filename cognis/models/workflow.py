@@ -79,6 +79,12 @@ class GateOption(BaseModel):
     prompt: bool = False
 
 
+class GateCondition(BaseModel):
+    """Declarative condition controlling whether a gate should fire."""
+
+    expression: str
+
+
 class GateConfig(BaseModel):
     """Configuration for a gate step.
 
@@ -90,6 +96,8 @@ class GateConfig(BaseModel):
     message: str
     input: list[str] = []
     options: list[GateOption] = []
+    conditions: list[GateCondition] = Field(default_factory=list)
+    thresholds: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = 3600
     timeout_action: Literal["fail", "continue", "cancel"] = "fail"
 
@@ -228,6 +236,29 @@ class StepProfileConfig(BaseModel):
     allow_tool_search: bool = True
 
 
+class StepRevisionConfig(BaseModel):
+    """Controls whether a step can be targeted by human revisions."""
+
+    allowed: bool = True
+    use_when: str = ""
+
+
+class StepCompletionMetadataField(BaseModel):
+    """One field in a step_complete metadata contract."""
+
+    name: str
+    type: Literal["string", "number", "boolean", "array", "object"]
+    required: bool = False
+    description: str = ""
+    enum: list[str] | None = None
+
+
+class StepCompletionContract(BaseModel):
+    """Structured metadata the step must or may emit on completion."""
+
+    fields: list[StepCompletionMetadataField] = Field(default_factory=list)
+
+
 class StepDefinition(BaseModel):
     """A single step within a workflow."""
 
@@ -247,6 +278,8 @@ class StepDefinition(BaseModel):
     on_reject: OnRejectConfig | None = None
     outcome_routes: list[OutcomeRoute] = Field(default_factory=list)
     require_deliverable: bool = True
+    revision: StepRevisionConfig = Field(default_factory=StepRevisionConfig)
+    metadata_contract: StepCompletionContract | None = None
 
     @field_validator("reasoning_effort")
     @classmethod
@@ -327,6 +360,7 @@ class StepOutput(BaseModel):
     summary: str
     content: str = ""  # Approved deliverable text mirror for downstream context.
     outputs: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
     claims: list[str] = []
     outcome: StepOutcome | None = None
     notification: StepCompletionNotification | None = None

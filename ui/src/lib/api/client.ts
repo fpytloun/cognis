@@ -42,6 +42,9 @@ import type {
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
+  Project,
+  ProjectGrant,
+  ProjectSource,
   Schedule,
   ScheduleRun,
     SecretMetadata,
@@ -60,6 +63,7 @@ import type {
   StepRun,
   StepProfileDefinition,
   Task,
+  TaskComment,
   TaskDetail,
   TaskRerunResponse,
   ToolDefinitionSummary,
@@ -886,6 +890,21 @@ export const api = {
       return request<StepRun[]>(`/api/v1/tasks/${taskId}/steps`);
     },
 
+    stepHistory(taskId: string, stepName: string): Promise<StepRun[]> {
+      return request<StepRun[]>(`/api/v1/tasks/${taskId}/steps/${encodeURIComponent(stepName)}/history`);
+    },
+
+    comments(taskId: string): Promise<TaskComment[]> {
+      return request<TaskComment[]>(`/api/v1/tasks/${taskId}/comments`);
+    },
+
+    addComment(taskId: string, payload: Record<string, unknown>): Promise<TaskComment> {
+      return request<TaskComment>(`/api/v1/tasks/${taskId}/comments`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
     workflowRun(taskId: string): Promise<WorkflowRun> {
       return request<WorkflowRun>(`/api/v1/tasks/${taskId}/workflow-run`);
     },
@@ -902,12 +921,56 @@ export const api = {
     }
   },
 
+  projects: {
+    list(params: { status?: string; q?: string } = {}): Promise<Project[]> {
+      return request<Project[]>(`/api/v1/projects${encodeQuery(params)}`);
+    },
+
+    detail(projectId: string): Promise<Project> {
+      return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}`);
+    },
+
+    create(payload: Record<string, unknown>): Promise<Project> {
+      return request<Project>('/api/v1/projects', { method: 'POST', body: JSON.stringify(payload) });
+    },
+
+    update(projectId: string, payload: Record<string, unknown>): Promise<Project> {
+      return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    remove(projectId: string): Promise<Project> {
+      return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+    },
+
+    addSource(projectId: string, payload: Record<string, unknown>): Promise<ProjectSource> {
+      return request<ProjectSource>(`/api/v1/projects/${encodeURIComponent(projectId)}/sources`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    attachWorkflow(projectId: string, workflowId: string): Promise<Project> {
+      return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(workflowId)}`, { method: 'POST' });
+    },
+
+    detachWorkflow(projectId: string, workflowId: string): Promise<Project> {
+      return request<Project>(`/api/v1/projects/${encodeURIComponent(projectId)}/workflows/${encodeURIComponent(workflowId)}`, { method: 'DELETE' });
+    },
+
+    grants(projectId: string): Promise<ProjectGrant[]> {
+      return request<ProjectGrant[]>(`/api/v1/projects/${encodeURIComponent(projectId)}/grants`);
+    }
+  },
+
   workflows: {
-    list(cursor: string | null = null, params?: { include_disabled?: boolean; include_ephemeral?: boolean }): Promise<CursorPage<Workflow>> {
+    list(cursor: string | null = null, params?: { include_disabled?: boolean; include_ephemeral?: boolean; project_id?: string | null }): Promise<CursorPage<Workflow>> {
       return request<CursorPage<Workflow>>(`/api/v1/workflows${encodeQuery({ cursor, limit: 100, ...params })}`);
     },
 
-    async listAll(params?: { include_disabled?: boolean; include_ephemeral?: boolean }): Promise<Workflow[]> {
+    async listAll(params?: { include_disabled?: boolean; include_ephemeral?: boolean; project_id?: string | null }): Promise<Workflow[]> {
       return collectCursorPages((cursor) => this.list(cursor, params));
     },
 

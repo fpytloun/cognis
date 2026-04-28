@@ -30,6 +30,10 @@ STEP_COMPLETE_TOOL = ToolDefinition(
                 "type": "object",
                 "description": "Structured outputs from this step (key-value pairs).",
             },
+            "metadata": {
+                "type": "object",
+                "description": "Structured metadata required by this step's metadata contract.",
+            },
             "claims": {
                 "type": "array",
                 "items": {"type": "string"},

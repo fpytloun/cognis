@@ -231,6 +231,10 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_tool_classification_override_table)
         await conn.run_sync(_ensure_browser_sessions_table)
         await conn.run_sync(_ensure_push_subscriptions_table)
+        await conn.run_sync(_ensure_projects_tables)
+        await conn.run_sync(_ensure_project_links_workflows_grants)
+        await conn.run_sync(_ensure_step_history_columns)
+        await conn.run_sync(_ensure_task_comments_table)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -308,6 +312,73 @@ def _ensure_push_subscriptions_table(sync_conn: object) -> None:
     from cognis.store.models import PushSubscriptionRow
 
     PushSubscriptionRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_projects_tables(sync_conn: object) -> None:
+    """Create durable project and project source tables."""
+
+    from cognis.store.models import ProjectRow, ProjectSourceRow
+
+    ProjectRow.__table__.create(bind=sync_conn, checkfirst=True)
+    ProjectSourceRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_project_links_workflows_grants(sync_conn: object) -> None:
+    """Create project link/grant tables and nullable project link columns."""
+
+    from cognis.store.models import ProjectGrantRow, ProjectWorkflowRow
+
+    ProjectWorkflowRow.__table__.create(bind=sync_conn, checkfirst=True)
+    ProjectGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    schedule_columns = {column["name"] for column in inspector.get_columns("schedules")}
+    conversation_columns = {column["name"] for column in inspector.get_columns("conversations")}
+    if "project_id" not in task_columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN project_id VARCHAR"))
+    if "attempt_number" not in task_columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1"))
+    if "project_id" not in schedule_columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN project_id VARCHAR"))
+    if "project_id" not in conversation_columns:
+        execute(text("ALTER TABLE conversations ADD COLUMN project_id VARCHAR"))
+    execute(text("CREATE INDEX IF NOT EXISTS ix_tasks_project_id ON tasks (project_id)"))
+    execute(text("CREATE INDEX IF NOT EXISTS ix_schedules_project_id ON schedules (project_id)"))
+    execute(
+        text("CREATE INDEX IF NOT EXISTS ix_conversations_project_id ON conversations (project_id)")
+    )
+
+
+def _ensure_step_history_columns(sync_conn: object) -> None:
+    """Add revision-history columns needed by later Stage 33 phases."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    step_columns = {column["name"] for column in inspector.get_columns("step_runs")}
+    deliverable_columns = {column["name"] for column in inspector.get_columns("deliverables")}
+    if "attempt_number" not in step_columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1"))
+    if "superseded_by_step_run_id" not in step_columns:
+        execute(text("ALTER TABLE step_runs ADD COLUMN superseded_by_step_run_id VARCHAR"))
+    if "attempt_number" not in deliverable_columns:
+        execute(
+            text("ALTER TABLE deliverables ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 1")
+        )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_step_runs_superseded_by "
+            "ON step_runs (superseded_by_step_run_id)"
+        )
+    )
+
+
+def _ensure_task_comments_table(sync_conn: object) -> None:
+    """Create durable task comments table."""
+
+    from cognis.store.models import TaskCommentRow
+
+    TaskCommentRow.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_grants_table(sync_conn: object) -> None:

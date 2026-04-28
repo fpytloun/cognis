@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query, Request
 from cognis.api.common import (
     api_exception,
     check_agent_access,
+    check_project_access,
     forbid_mutation_for_viewer,
     require_current_user,
 )
@@ -29,6 +30,7 @@ from cognis.store.queries import (
     delete_schedule,
     get_agent,
     get_latest_schedule_task_runs,
+    get_project,
     get_schedule,
     list_schedules,
     update_schedule,
@@ -94,6 +96,7 @@ def _row_to_response(
         timezone=row.timezone,
         agent_id=row.agent_id,
         workflow_id=row.workflow_id,
+        project_id=getattr(row, "project_id", None),
         skill_id=row.skill_id,
         task_template=row.task_template,
         enabled=row.enabled,
@@ -119,6 +122,7 @@ def _row_to_response(
         timezone=row.timezone,
         agent_id=row.agent_id,
         workflow_id=row.workflow_id,
+        project_id=getattr(row, "project_id", None),
         skill_id=row.skill_id,
         task_template=row.task_template,
         enabled=row.enabled,
@@ -154,6 +158,16 @@ async def _load_latest_task_run(
     return latest_runs.get(schedule_id)
 
 
+async def _validate_project_access(request: Request, project_id: str | None) -> None:
+    if project_id is None:
+        return
+    async with request.app.state.session_factory() as db:
+        project = await get_project(db, project_id)
+    if project is None or project.status != "active":
+        raise api_exception(404, "not_found", "Project not found")
+    await check_project_access(request, project, required="use")
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -165,6 +179,7 @@ async def list_schedules_route(
     enabled: bool | None = Query(None),
     schedule_type: str | None = Query(None),
     agent_id: str | None = Query(None),
+    project_id: str | None = Query(None),
 ) -> list[ScheduleResponse]:
     """List schedules for the current user."""
     user = require_current_user(request)
@@ -175,6 +190,7 @@ async def list_schedules_route(
             enabled=enabled,
             schedule_type=schedule_type,
             agent_id=agent_id,
+            project_id=project_id,
         )
         latest_runs = await get_latest_schedule_task_runs(
             db,
@@ -210,9 +226,11 @@ async def create_schedule_route(
         workflow = await request.app.state.workflow_registry.get(
             body.workflow_id,
             owner_email=user.email,
+            project_id=body.project_id,
         )
         if workflow is None:
             raise api_exception(404, "not_found", "Workflow not found")
+    await _validate_project_access(request, body.project_id)
 
     if body.skill_id is not None:
         agent = await request.app.state.agent_registry.get(body.agent_id, owner_email=user.email)
@@ -278,6 +296,7 @@ async def create_schedule_route(
             timezone=body.timezone,
             agent_id=body.agent_id,
             workflow_id=body.workflow_id,
+            project_id=body.project_id,
             skill_id=body.skill_id,
             task_template=task_template,
             enabled=body.enabled,
@@ -353,10 +372,21 @@ async def update_schedule_route(
             if agent is None:
                 raise api_exception(404, "agent_not_found", "Agent not found")
             await check_agent_access(request, agent, required="use")
-        if body.workflow_id is not None:
+        if body.project_id is not None:
+            await _validate_project_access(request, body.project_id)
+        effective_project_id = (
+            body.project_id if body.project_id is not None else getattr(existing, "project_id", None)
+        )
+        effective_workflow_id = (
+            body.workflow_id
+            if body.workflow_id is not None
+            else (None if body.skill_id is not None else getattr(existing, "workflow_id", None))
+        )
+        if effective_workflow_id is not None:
             workflow = await request.app.state.workflow_registry.get(
-                body.workflow_id,
+                effective_workflow_id,
                 owner_email=user.email,
+                project_id=effective_project_id,
             )
             if workflow is None:
                 raise api_exception(404, "not_found", "Workflow not found")
@@ -366,7 +396,9 @@ async def update_schedule_route(
             and body.skill_id is None
             and existing.skill_id is not None
         ):
-            agent = await request.app.state.agent_registry.get(body.agent_id, owner_email=user.email)
+            agent = await request.app.state.agent_registry.get(
+                body.agent_id, owner_email=user.email
+            )
             if agent is None:
                 raise api_exception(404, "agent_not_found", "Agent not found")
             try:

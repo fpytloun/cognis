@@ -11,6 +11,7 @@ from cognis.core.workflow_registry import (
     RESEARCH_WORKFLOW,
     SOFTWARE_DEVELOPMENT_WORKFLOW,
     SYSTEM_WORKFLOWS,
+    WorkflowRegistry,
     _validate_workflow,
 )
 from cognis.models.workflow import (
@@ -19,6 +20,9 @@ from cognis.models.workflow import (
     StepDefinition,
     Workflow,
 )
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.models import Base, User
+from cognis.store.queries import attach_project_workflow, create_project
 
 
 def test_system_workflows_are_registered() -> None:
@@ -292,3 +296,38 @@ def test_validate_all_system_workflows() -> None:
     """Validate that all bundled system workflows pass validation."""
     for wf in SYSTEM_WORKFLOWS.values():
         _validate_workflow(wf)
+
+
+@pytest.mark.asyncio
+async def test_project_bound_workflows_require_matching_project(tmp_path: object) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+
+    try:
+        async with factory() as session:
+            session.add(User(email="owner@example.com", name="Owner", role="user"))
+            await session.flush()
+            project = await create_project(
+                session,
+                project_id="project-1",
+                owner_email="owner@example.com",
+                name="Project",
+            )
+            await attach_project_workflow(session, project.project_id, "system:research")
+            await session.commit()
+
+        registry = WorkflowRegistry(factory)
+
+        assert await registry.get("system:research", project_id=None) is None
+        assert await registry.get("system:research", project_id="project-1") is not None
+
+        generic_ids = {workflow.workflow_id for workflow in await registry.list_all()}
+        project_ids = {
+            workflow.workflow_id for workflow in await registry.list_all(project_id="project-1")
+        }
+        assert "system:research" not in generic_ids
+        assert "system:research" in project_ids
+    finally:
+        await engine.dispose()

@@ -19,7 +19,7 @@
   import { workspaceHealth } from '$lib/system';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
-  import type { Agent, Conversation, Skill, Task, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Project, Skill, Task, Workflow } from '$lib/types/api';
 
   // ---------------------------------------------------------------------------
   // Reactive state
@@ -32,6 +32,7 @@
   let tasks = $state<Task[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let projects = $state<Project[]>([]);
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let showCreateModal = $state(false);
@@ -60,6 +61,7 @@
     search: '',
     agentId: '',
     workflowId: '',
+    projectId: '',
     status: ''
   });
 
@@ -81,12 +83,14 @@
       search: sp.get('q') ?? '',
       agentId: sp.get('agent') ?? '',
       workflowId: sp.get('workflow') ?? '',
+      projectId: sp.get('project') ?? '',
       status: sp.get('status') ?? ''
     };
     if (
       next.search !== filters.search ||
       next.agentId !== filters.agentId ||
       next.workflowId !== filters.workflowId ||
+      next.projectId !== filters.projectId ||
       next.status !== filters.status
     ) {
       filters = next;
@@ -102,6 +106,7 @@
     if (filters.search) sp.set('q', filters.search);
     if (filters.agentId) sp.set('agent', filters.agentId);
     if (filters.workflowId) sp.set('workflow', filters.workflowId);
+    if (filters.projectId) sp.set('project', filters.projectId);
     if (filters.status) sp.set('status', filters.status);
     if (mobileActiveColumn !== 'running') sp.set('col', mobileActiveColumn);
     const query = sp.toString();
@@ -138,6 +143,7 @@
     void filters.search;
     void filters.agentId;
     void filters.workflowId;
+    void filters.projectId;
     void filters.status;
     void mobileActiveColumn;
     scheduleFiltersUrlSync();
@@ -147,7 +153,7 @@
   // Derived state
   // ---------------------------------------------------------------------------
 
-  let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.status));
+  let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.projectId || filters.status));
   let filteredTasks = $derived(sortTasks(tasks.filter((task) => matchesTaskFilters(task, filters))));
   let selectedCount = $derived(selectedIds.size);
 
@@ -269,10 +275,11 @@
       }
     }, TASK_BOARD_LOAD_TIMEOUT_MS);
     try {
-      const [nextTasks, nextAgents, nextWorkflows, nextSkills, nextConversations] = await Promise.all([
+      const [nextTasks, nextAgents, nextWorkflows, nextProjects, nextSkills, nextConversations] = await Promise.all([
         api.tasks.listAll(),
         api.agents.listAll(),
         api.workflows.listAll(),
+        api.projects.list(),
         api.skills.list(),
         api.conversations.listAll()
       ]);
@@ -280,6 +287,7 @@
       tasks = nextTasks;
       agents = nextAgents;
       workflows = nextWorkflows;
+      projects = nextProjects;
       skills = nextSkills;
       conversations = nextConversations;
     } catch (caughtError) {
@@ -603,7 +611,7 @@
     {/if}
 
     <Card class="p-4 sm:p-5">
-      <div class="grid gap-4 md:grid-cols-4">
+      <div class="grid gap-4 md:grid-cols-5">
         <label class="space-y-2 text-sm font-medium text-slate-200">
           <span>Search</span>
           <Input bind:value={filters.search} placeholder="title or description" />
@@ -625,6 +633,15 @@
             <option value="">All</option>
             {#each workflows as workflow}
               <option value={workflow.workflow_id}>{workflow.name}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="space-y-2 text-sm font-medium text-slate-200">
+          <span>Project</span>
+          <select bind:value={filters.projectId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="">All</option>
+            {#each projects as project}
+              <option value={project.project_id}>{project.name}</option>
             {/each}
           </select>
         </label>
@@ -875,6 +892,7 @@
     <CreateTaskModal
       {agents}
       {workflows}
+      {projects}
       {skills}
       {conversations}
       {creating}

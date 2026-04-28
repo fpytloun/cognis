@@ -195,6 +195,109 @@ class AgentGrantRow(Base):
     grantee_overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
+class ProjectRow(Base):
+    """First-class project context owned by a user."""
+
+    __tablename__ = "projects"
+    __table_args__ = (Index("ix_projects_owner_email", "owner_email"),)
+
+    project_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    default_workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    avatar_image_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="active", server_default="active"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ProjectSourceRow(Base):
+    """Repository/source hint associated with a project."""
+
+    __tablename__ = "project_sources"
+    __table_args__ = (
+        Index("ix_project_sources_project_id", "project_id"),
+        Index("ix_project_sources_local_path", "local_path"),
+    )
+
+    source_id: Mapped[str] = mapped_column(String, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String, ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    default_branch: Mapped[str | None] = mapped_column(String, nullable=True)
+    credential_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ProjectWorkflowRow(Base):
+    """Project-to-workflow eligibility binding."""
+
+    __tablename__ = "project_workflows"
+
+    project_id: Mapped[str] = mapped_column(
+        String, ForeignKey("projects.project_id", ondelete="CASCADE"), primary_key=True
+    )
+    workflow_id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class ProjectGrantRow(Base):
+    """User-to-user sharing grant for a project."""
+
+    __tablename__ = "project_grants"
+    __table_args__ = (
+        Index(
+            "uq_project_grants_active_user",
+            "project_id",
+            "grantee_user_email",
+            unique=True,
+            sqlite_where=text("grantee_type = 'user' AND revoked_at IS NULL"),
+            postgresql_where=text("grantee_type = 'user' AND revoked_at IS NULL"),
+        ),
+        Index("ix_project_grants_grantee_user", "grantee_user_email"),
+        Index("ix_project_grants_project", "project_id"),
+    )
+
+    grant_id: Mapped[str] = mapped_column(String, primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        String, ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False
+    )
+    grantee_type: Mapped[str] = mapped_column(String, nullable=False, default="user")
+    grantee_user_email: Mapped[str | None] = mapped_column(
+        String, ForeignKey("users.email"), nullable=True
+    )
+    grantee_group_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    permission: Mapped[str] = mapped_column(String, nullable=False, default="use")
+    granted_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SystemAgentOverride(Base):
     """Per-user runtime tuning overlay for shipped system agents."""
 
@@ -233,6 +336,7 @@ class Conversation(Base):
     title_source: Mapped[str] = mapped_column(String, nullable=False, default="unset")
     context_type: Mapped[str] = mapped_column(String, nullable=False)
     context_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     context_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     memory_labels: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
@@ -423,6 +527,10 @@ class Task(Base):
         Boolean, nullable=False, default=False, server_default="0"
     )
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempt_number: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     workspace_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     working_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -515,6 +623,10 @@ class StepRun(Base):
     step_type: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     attempt: Mapped[int] = mapped_column(nullable=False, default=1)
+    attempt_number: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    superseded_by_step_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     workspace_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     working_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -551,6 +663,9 @@ class DeliverableRow(Base):
         nullable=False,
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    attempt_number: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     format: Mapped[str] = mapped_column(String, nullable=False, default="markdown")
     title: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -585,6 +700,7 @@ class Schedule(Base):
     timezone: Mapped[str] = mapped_column(String, nullable=False, default="UTC")
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     skill_id: Mapped[str | None] = mapped_column(String, nullable=True)
     task_template: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
@@ -610,6 +726,39 @@ class Schedule(Base):
     )
 
     __table_args__ = (Index("ix_schedules_enabled_next_fire", "enabled", "next_fire_at"),)
+
+
+class TaskCommentRow(Base):
+    """Human-authored task comment with explicit intent."""
+
+    __tablename__ = "task_comments"
+    __table_args__ = (Index("ix_task_comments_task", "task_id"),)
+
+    comment_id: Mapped[str] = mapped_column(String, primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False
+    )
+    author_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    intent: Mapped[str] = mapped_column(
+        String, nullable=False, default="record_only", server_default="record_only"
+    )
+    noop: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    target_step: Mapped[str | None] = mapped_column(String, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    applied: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    attempt_number: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
 
 
 class ExecutorRow(Base):
@@ -695,7 +844,9 @@ class ToolClassificationRow(Base):
     classification_confidence: Mapped[float | None] = mapped_column(nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_retry_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
-    last_attempt_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -728,7 +879,9 @@ class ToolClassificationOverrideRow(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("scope_key", "tool_id", name="uq_tool_classification_overrides_scope_tool"),
+        UniqueConstraint(
+            "scope_key", "tool_id", name="uq_tool_classification_overrides_scope_tool"
+        ),
     )
 
 

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query, Request
 
 from cognis.api.common import (
     api_exception,
+    check_project_access,
     forbid_mutation_for_viewer,
     paginate_items,
     require_current_user,
@@ -28,6 +29,7 @@ from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasonin
 from cognis.models.workflow import StepProfileConfig
 from cognis.store.queries import (
     delete_system_workflow_override,
+    get_project,
     get_system_workflow_override,
     upsert_system_workflow_override,
 )
@@ -78,12 +80,20 @@ async def workflow_list(
     limit: int = Query(default=20, ge=1, le=100),
     include_disabled: bool = Query(default=False),
     include_ephemeral: bool = Query(default=False),
+    project_id: str | None = Query(default=None),
 ) -> CursorPage[WorkflowResponse]:
     user = require_current_user(request)
+    if project_id is not None:
+        async with request.app.state.session_factory() as session:
+            project = await get_project(session, project_id)
+        if project is None or project.status != "active":
+            raise api_exception(404, "not_found", "Project not found")
+        await check_project_access(request, project, required="use")
     workflows = await request.app.state.workflow_registry.list_all(
         owner_email=user.email,
         include_disabled=include_disabled,
         include_ephemeral=include_ephemeral,
+        project_id=project_id,
     )
     items = [workflow_to_response(workflow) for workflow in workflows]
     page_items, next_cursor, has_more = paginate_items(
@@ -216,9 +226,9 @@ async def _update_system_workflow_route(
         step_profile = step_payload.get("step_profile")
         if isinstance(step_profile, dict):
             try:
-                override["step_profile"] = StepProfileConfig.model_validate(step_profile).model_dump(
-                    mode="json"
-                )
+                override["step_profile"] = StepProfileConfig.model_validate(
+                    step_profile
+                ).model_dump(mode="json")
             except Exception as exc:
                 raise api_exception(422, "invalid_step_profile", str(exc)) from exc
         if override:

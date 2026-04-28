@@ -3,11 +3,12 @@
   import Input from '$lib/components/ui/Input.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
-  import type { Agent, Conversation, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
 
   let {
     agents,
     workflows,
+    projects,
     skills,
     conversations,
     creating = false,
@@ -16,6 +17,7 @@
   } = $props<{
     agents: Agent[];
     workflows: Workflow[];
+    projects: Project[];
     skills: Skill[];
     conversations: Conversation[];
     creating?: boolean;
@@ -25,6 +27,7 @@
       description: string;
       agent_id: string;
       workflow_id: string | null;
+      project_id: string | null;
       skill_id: string | null;
       priority: number;
       expected_output: string | null;
@@ -50,6 +53,7 @@
     description: '',
     agent_id: '',
     workflow_source: '',
+    project_id: '',
     expected_output: '',
     priority: 0,
     delivery_mode: 'same_conversation',
@@ -67,6 +71,7 @@
       description: form.description,
       expected_output: form.expected_output || null,
       workflow_id: workflowSource.workflow_id,
+      project_id: form.project_id || null,
       skill_id: workflowSource.skill_id,
       priority: Number(form.priority),
       delivery_mode: form.delivery_mode,
@@ -134,6 +139,15 @@
             <option value="">Auto</option>
             {#each workflowSourceOptions as option}
               <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="space-y-1">
+          <label for="task-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
+          <select id="task-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="">None</option>
+            {#each projects as project}
+              <option value={project.project_id}>{project.name}</option>
             {/each}
           </select>
         </div>

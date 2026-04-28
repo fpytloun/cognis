@@ -6,11 +6,16 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.gate_conditions import validate_gate_conditions
 from cognis.logging import get_logger
 from cognis.models.workflow import (
     CompletionConfig,
+    GateConfig,
+    GateOption,
     InteractionMode,
     OutcomeRoute,
+    StepCompletionContract,
+    StepCompletionMetadataField,
     StepDefinition,
     StepInputConfig,
     StepProfileConfig,
@@ -24,6 +29,8 @@ from cognis.store.queries import (
     create_workflow,
     get_system_workflow_override,
     get_workflow,
+    list_bound_workflow_ids,
+    list_project_workflow_ids,
     list_workflows,
 )
 
@@ -127,10 +134,42 @@ RESEARCH_WORKFLOW = Workflow(
                 "- Expected deliverables and format\n\n"
                 "Write the plan itself as the step deliverable."
             ),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(name="confidence", type="number", required=True),
+                    StepCompletionMetadataField(
+                        name="risk", type="string", required=True, enum=["low", "medium", "high"]
+                    ),
+                    StepCompletionMetadataField(
+                        name="source_strategy", type="array", required=False
+                    ),
+                    StepCompletionMetadataField(name="open_questions", type="array", required=True),
+                ]
+            ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
+        ),
+        StepDefinition(
+            name="pre_research_gate",
+            type="gate",
+            gate=GateConfig(
+                message="Research plan confidence is low or risk is high. Approve to continue.",
+                input=["plan"],
+                options=[
+                    GateOption(label="Continue", action="continue"),
+                    GateOption(label="Revise plan", action="revise(plan)"),
+                    GateOption(label="Cancel", action="cancel"),
+                ],
+                thresholds={"min_confidence": 0.6},
+                conditions=[
+                    {
+                        "expression": "metadata.plan.confidence < thresholds.min_confidence or metadata.plan.risk == 'high'"
+                    }
+                ],
+            ),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="research",
@@ -204,6 +243,16 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "- Migration or compatibility concerns\n\n"
                 "Write the plan itself as the step deliverable."
             ),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(name="confidence", type="number", required=True),
+                    StepCompletionMetadataField(
+                        name="risk", type="string", required=True, enum=["low", "medium", "high"]
+                    ),
+                    StepCompletionMetadataField(name="decisions", type="array", required=True),
+                    StepCompletionMetadataField(name="open_questions", type="array", required=True),
+                ]
+            ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(
                 evaluate=True,
@@ -243,6 +292,26 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 OutcomeRoute(status="failed", action="gate"),
             ],
             require_deliverable=True,
+        ),
+        StepDefinition(
+            name="pre_implement_gate",
+            type="gate",
+            gate=GateConfig(
+                message="Implementation plan confidence is low or risk is high. Approve to continue.",
+                input=["plan", "architect_review"],
+                options=[
+                    GateOption(label="Continue", action="continue"),
+                    GateOption(label="Revise plan", action="revise(plan)"),
+                    GateOption(label="Cancel", action="cancel"),
+                ],
+                thresholds={"min_confidence": 0.6},
+                conditions=[
+                    {
+                        "expression": "metadata.plan.confidence < thresholds.min_confidence or metadata.plan.risk == 'high'"
+                    }
+                ],
+            ),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="implement",
@@ -442,9 +511,12 @@ class WorkflowRegistry:
         *,
         owner_email: str | None = None,
         include_disabled: bool = False,
+        project_id: str | None = None,
     ) -> Workflow | None:
         """Resolve a workflow by ID — checks system workflows first, then DB."""
         if workflow_id in SYSTEM_WORKFLOWS:
+            if not await self._workflow_eligible_for_project(workflow_id, project_id):
+                return None
             return await self._resolve_system_workflow(
                 SYSTEM_WORKFLOWS[workflow_id],
                 owner_email=owner_email,
@@ -455,6 +527,8 @@ class WorkflowRegistry:
             row = await get_workflow(db_session, workflow_id)
         if row is None:
             return None
+        if not await self._workflow_eligible_for_project(workflow_id, project_id):
+            return None
         return _row_to_workflow(row)
 
     async def list_all(
@@ -463,6 +537,7 @@ class WorkflowRegistry:
         owner_email: str | None = None,
         include_disabled: bool = False,
         include_ephemeral: bool = False,
+        project_id: str | None = None,
     ) -> list[Workflow]:
         """List all available workflows (system + user)."""
         result: list[Workflow] = []
@@ -479,8 +554,39 @@ class WorkflowRegistry:
                 include_system=False,
                 include_ephemeral=include_ephemeral,
             )
+            bound_ids = await list_bound_workflow_ids(db_session)
+            project_ids = (
+                await list_project_workflow_ids(db_session, project_id) if project_id else []
+            )
+        project_id_set = set(project_ids)
+        result = [
+            workflow
+            for workflow in result
+            if workflow.workflow_id not in bound_ids
+            or (project_id is not None and workflow.workflow_id in project_id_set)
+        ]
+        rows = [
+            row
+            for row in rows
+            if row.workflow_id not in bound_ids
+            or (project_id is not None and row.workflow_id in project_id_set)
+        ]
         result.extend(_row_to_workflow(r) for r in rows)
         return result
+
+    async def _workflow_eligible_for_project(
+        self,
+        workflow_id: str,
+        project_id: str | None,
+    ) -> bool:
+        async with self._session_factory() as db_session:
+            bound_ids = await list_bound_workflow_ids(db_session)
+            if workflow_id not in bound_ids:
+                return True
+            if project_id is None:
+                return False
+            project_ids = await list_project_workflow_ids(db_session, project_id)
+        return workflow_id in set(project_ids)
 
     async def create(
         self,
@@ -640,6 +746,8 @@ def _validate_workflow(workflow: Workflow) -> None:
         # Validate gate steps have gate config
         if step.type == "gate" and step.gate is None:
             raise ValueError(f"Gate step {step.name!r} must have gate configuration")
+
+    validate_gate_conditions(workflow)
 
 
 def _row_to_workflow(row: Any) -> Workflow:

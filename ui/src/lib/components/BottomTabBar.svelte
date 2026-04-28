@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import Clock from 'lucide-svelte/icons/clock';
+  import FolderKanban from 'lucide-svelte/icons/folder-kanban';
   import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
@@ -26,6 +27,7 @@
 
   const tabs = [
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
+    { href: '/projects', label: 'Projects', icon: FolderKanban },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
     { href: '/schedules', label: 'Schedules', icon: Clock },
     { href: '/settings', label: 'Settings', icon: Settings }
@@ -96,7 +98,7 @@
     style="padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
     aria-label="Primary"
   >
-    <ul class="grid grid-cols-4">
+    <ul class="grid grid-cols-5">
       {#each tabs as tab}
         {@const active = isActive(tab.href, $page.url.pathname)}
         {@const Icon = tab.icon}
