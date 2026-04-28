@@ -3,7 +3,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
   import Clock from 'lucide-svelte/icons/clock';
-import ListTodo from 'lucide-svelte/icons/list-todo';
+  import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
   import { blockingOverlayActive } from '$lib/stores/overlays';
@@ -56,7 +56,10 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   function syncBottomOffset(): void {
     if (typeof window === 'undefined') return;
     const shouldReserve = visible && window.innerWidth < 1024;
-    setBottomOffset(shouldReserve ? navEl?.offsetHeight ?? 0 : 0);
+    const measuredHeight = navEl?.offsetHeight ?? 0;
+    const computedBottom = navEl ? Number.parseFloat(getComputedStyle(navEl).bottom) : 0;
+    const bottomBleed = Number.isFinite(computedBottom) && computedBottom < 0 ? Math.abs(computedBottom) : 0;
+    setBottomOffset(shouldReserve ? Math.max(0, measuredHeight - bottomBleed) : 0);
   }
 
   $effect(() => {
@@ -93,7 +96,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   <nav
     bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
-    style="padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
+    style="--bottom-tab-bleed: min(env(safe-area-inset-bottom, 0px), 16px); bottom: calc(0px - var(--bottom-tab-bleed)); padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0); padding-bottom: var(--bottom-tab-bleed);"
     aria-label="Primary"
   >
     <ul class="grid grid-cols-4">
@@ -102,7 +105,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
         {@const Icon = tab.icon}
         <li class="contents">
           <a
-            class={`flex min-h-[38px] flex-col items-center justify-center gap-0.5 px-2 py-0.5 text-[10px] leading-none transition ${
+            class={`flex min-h-[44px] flex-col items-center justify-center gap-0.5 px-2 py-0.5 text-[10px] leading-none transition ${
               active
                 ? 'text-sky-300'
                 : isOnTabRoute
@@ -126,11 +129,14 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
               emitTabReset(tab.href);
             }}
           >
-            <Icon class="h-4 w-4" aria-hidden="true" />
+            <Icon class="h-5 w-5" aria-hidden="true" />
             <span class="font-medium">{tab.label}</span>
           </a>
         </li>
       {/each}
     </ul>
+    {#if !isOnTabRoute}
+      <p class="pb-0.5 text-center text-[10px] text-slate-600">Use ☰ for more pages</p>
+    {/if}
   </nav>
 {/if}
