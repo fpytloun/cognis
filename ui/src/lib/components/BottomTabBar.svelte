@@ -132,8 +132,5 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
         </li>
       {/each}
     </ul>
-    {#if !isOnTabRoute}
-      <p class="pb-0.5 text-center text-[10px] text-slate-600">Use ☰ for more pages</p>
-    {/if}
   </nav>
 {/if}
