@@ -14,3 +14,4 @@ ui/build/
 ui/coverage/
 cognis/ui_dist/
 .playwright-mcp/
+.worktrees
