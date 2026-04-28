@@ -269,6 +269,57 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
 
 
 @pytest.mark.asyncio
+async def test_session_cache_tracks_discovered_tool_handles_from_events() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-discovery")
+    handle = {
+        "tool_id": "mcp:googleworkspace:get_events",
+        "name": "mcp_googleworkspace__get_events",
+        "callable_name": "mcp_googleworkspace__get_events",
+        "scope": "session",
+        "category": "mcp",
+        "profile_group": "office",
+        "source": {
+            "type": "intaris_mcp",
+            "server_name": "googleworkspace",
+            "raw_tool_name": "get_events",
+        },
+        "capabilities": ["read"],
+        "read_only": True,
+        "permission_scope": "current_session_effective_inventory",
+        "confidence": 12.5,
+        "discovered_at": "2026-04-28T10:00:00+00:00",
+    }
+
+    await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="tool_discovery", data={"handles": [handle]})],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+
+    assert cache.get_discovered_tool_ids(session.session_id) == {"mcp:googleworkspace:get_events"}
+    cached = cache.get_discovered_tool_handles(session.session_id)
+    assert cached["mcp:googleworkspace:get_events"]["source"]["server_name"] == "googleworkspace"
+
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="tool_result",
+                data={
+                    "tool_id": "mcp:googleworkspace:get_events",
+                    "name": "mcp_googleworkspace__get_events",
+                    "is_error": False,
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=2, last_seq=2),
+    )
+
+    assert "mcp:googleworkspace:get_events" in cache.get_discovered_tool_ids(session.session_id)
+
+
+@pytest.mark.asyncio
 async def test_store_prefix_snapshot_replaces_active_prefix() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session()

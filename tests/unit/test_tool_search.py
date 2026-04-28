@@ -29,6 +29,10 @@ def test_search_inventory_returns_ranked_permission_filtered_matches() -> None:
     assert [match["name"] for match in matches] == ["read", "glob"]
     assert all(match["category"] == "filesystem" for match in matches)
     assert all(match["name"] != SEARCH_TOOLS_TOOL.name for match in matches)
+    assert matches[0]["handle"]["tool_id"] == "builtin:read"
+    assert matches[0]["handle"]["callable_name"] == "read"
+    assert matches[0]["handle"]["scope"] == "session"
+    assert matches[0]["handle"]["permission_scope"] == "current_session_effective_inventory"
 
 
 def test_search_inventory_limits_results() -> None:

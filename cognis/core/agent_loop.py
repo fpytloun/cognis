@@ -4818,6 +4818,36 @@ class AgentLoop:
                         for match in matches
                         if isinstance(match.get("tool_id"), str)
                     }
+                    discovered_at = datetime.now(UTC).isoformat()
+                    discovered_handles: list[dict[str, Any]] = []
+                    for match in matches:
+                        handle = match.get("handle")
+                        if not isinstance(handle, dict):
+                            continue
+                        handle["discovered_at"] = discovered_at
+                        discovered_handles.append(dict(handle))
+                    store_discovered = getattr(
+                        self.session_cache,
+                        "store_discovered_tool_handles",
+                        None,
+                    )
+                    if callable(store_discovered):
+                        store_discovered(
+                            ctx.session.session_id,
+                            discovered_handles,
+                            discovered_at=discovered_at,
+                        )
+                    if discovered_handles:
+                        events_to_record.append(
+                            SessionEvent(
+                                type="tool_discovery",
+                                data={
+                                    "source_tool": SEARCH_TOOLS_TOOL.name,
+                                    "query_length": len(str(tc.arguments.get("query", ""))),
+                                    "handles": discovered_handles,
+                                },
+                            )
+                        )
                     promoted_tool_ids.update(new_promoted)
                     logger.info(
                         "tool discovery updated",
@@ -7949,6 +7979,14 @@ class AgentLoop:
     ) -> None:
         self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
         result = await self._handle_escalation(result, tc, ctx, events_to_record, on_tool_result)
+        if not result.is_error:
+            note_discovered_used = getattr(self.session_cache, "note_discovered_tool_used", None)
+            if callable(note_discovered_used):
+                note_discovered_used(
+                    ctx.session.session_id,
+                    tool_id,
+                    used_at=datetime.now(UTC).isoformat(),
+                )
 
         raw_output = result.metadata.get("_raw_output") if result.metadata else None
         stored_output = result.metadata.get("stored_output") if result.metadata else None
@@ -9562,15 +9600,28 @@ class AgentLoop:
 
         Skill-attached tool ids are pre-promoted so they survive from the
         previous session into the current step without requiring a fresh
-        ``search_tools`` call.
+        ``search_tools`` call.  Session-discovered tool ids are also restored
+        here; later inventory/profile/permission filtering decides whether they
+        are still valid for this turn.
         """
 
+        promoted: set[str] = set()
         if not isinstance(ctx.agent.skills, dict):
-            return set()
-        raw_ids = ctx.agent.skills.get("_attached_skill_tool_ids")
-        if not isinstance(raw_ids, list):
-            return set()
-        return {str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()}
+            raw_ids = []
+        else:
+            raw_ids = ctx.agent.skills.get("_attached_skill_tool_ids")
+        if isinstance(raw_ids, list):
+            promoted.update(
+                str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()
+            )
+        get_discovered = getattr(self.session_cache, "get_discovered_tool_ids", None)
+        if callable(get_discovered):
+            promoted.update(
+                str(tool_id)
+                for tool_id in get_discovered(ctx.session.session_id)
+                if isinstance(tool_id, str) and tool_id.strip()
+            )
+        return promoted
 
     def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
         getter = getattr(self.session_cache, "get_activated_skill_tool_ids", None)

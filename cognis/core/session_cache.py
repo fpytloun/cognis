@@ -59,6 +59,25 @@ class CachedEvent:
 
 
 @dataclass(slots=True)
+class DiscoveredToolHandle:
+    """Session-scoped handle for a tool returned by ``search_tools``."""
+
+    tool_id: str
+    name: str
+    callable_name: str
+    scope: str = "session"
+    category: str | None = None
+    profile_group: str | None = None
+    source: dict[str, Any] = field(default_factory=dict)
+    capabilities: list[str] = field(default_factory=list)
+    read_only: bool | None = None
+    permission_scope: str | None = None
+    confidence: float | None = None
+    discovered_at: str | None = None
+    last_used_at: str | None = None
+
+
+@dataclass(slots=True)
 class CachedSessionState:
     """Cache entry for a single Cognis session."""
 
@@ -93,6 +112,7 @@ class CachedSessionState:
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
     activated_skill_tool_ids: set[str] = field(default_factory=set)
     skill_tool_classifications: dict[str, list[str]] = field(default_factory=dict)
+    discovered_tool_handles: dict[str, DiscoveredToolHandle] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
 
@@ -149,6 +169,10 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "reasoning_effort_override": entry.reasoning_effort_override,
+            "discovered_tool_handles": [
+                _serialize_discovered_tool_handle(item)
+                for item in sorted(entry.discovered_tool_handles.values(), key=lambda item: item.tool_id)
+            ],
             "project_contexts": [
                 {
                     "project_root": item.project_root,
@@ -208,6 +232,15 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
+        discovered_tool_handles={
+            handle.tool_id: handle
+            for handle in (
+                _discovered_tool_handle_from_raw(item)
+                for item in data.get("discovered_tool_handles", [])
+                if isinstance(item, dict)
+            )
+            if handle is not None
+        },
         project_contexts={
             entry.project_root: entry
             for entry in (
@@ -243,6 +276,64 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             )
         )
     return entry
+
+
+def _serialize_discovered_tool_handle(handle: DiscoveredToolHandle) -> dict[str, Any]:
+    """Return the Redis/event JSON shape for a discovered tool handle."""
+
+    return {
+        "tool_id": handle.tool_id,
+        "name": handle.name,
+        "callable_name": handle.callable_name,
+        "scope": handle.scope,
+        "category": handle.category,
+        "profile_group": handle.profile_group,
+        "source": dict(handle.source),
+        "capabilities": list(handle.capabilities),
+        "read_only": handle.read_only,
+        "permission_scope": handle.permission_scope,
+        "confidence": handle.confidence,
+        "discovered_at": handle.discovered_at,
+        "last_used_at": handle.last_used_at,
+    }
+
+
+def _discovered_tool_handle_from_raw(raw: dict[str, Any]) -> DiscoveredToolHandle | None:
+    """Normalize a persisted ``search_tools`` handle payload."""
+
+    tool_id = raw.get("tool_id")
+    name = raw.get("name")
+    callable_name = raw.get("callable_name") or name
+    if not isinstance(tool_id, str) or not tool_id.strip():
+        return None
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(callable_name, str) or not callable_name.strip():
+        return None
+    source = raw.get("source")
+    capabilities = raw.get("capabilities")
+    confidence = raw.get("confidence")
+    return DiscoveredToolHandle(
+        tool_id=tool_id.strip(),
+        name=name.strip(),
+        callable_name=callable_name.strip(),
+        scope=str(raw.get("scope") or "session"),
+        category=raw.get("category") if isinstance(raw.get("category"), str) else None,
+        profile_group=(
+            raw.get("profile_group") if isinstance(raw.get("profile_group"), str) else None
+        ),
+        source=dict(source) if isinstance(source, dict) else {},
+        capabilities=[str(item) for item in capabilities if isinstance(item, str)]
+        if isinstance(capabilities, list)
+        else [],
+        read_only=raw.get("read_only") if isinstance(raw.get("read_only"), bool) else None,
+        permission_scope=(
+            raw.get("permission_scope") if isinstance(raw.get("permission_scope"), str) else None
+        ),
+        confidence=float(confidence) if isinstance(confidence, int | float) else None,
+        discovered_at=raw.get("discovered_at") if isinstance(raw.get("discovered_at"), str) else None,
+        last_used_at=raw.get("last_used_at") if isinstance(raw.get("last_used_at"), str) else None,
+    )
 
 
 class SessionCache:
@@ -649,6 +740,72 @@ class SessionCache:
             return set()
         return set(entry.activated_skill_tool_ids)
 
+    def get_discovered_tool_ids(self, session_id: str) -> set[str]:
+        """Return stable tool ids discovered by ``search_tools`` in this session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return set()
+        return set(entry.discovered_tool_handles)
+
+    def get_discovered_tool_handles(self, session_id: str) -> dict[str, dict[str, Any]]:
+        """Return serialized discovered tool handles for this session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return {}
+        return {
+            tool_id: _serialize_discovered_tool_handle(handle)
+            for tool_id, handle in entry.discovered_tool_handles.items()
+        }
+
+    def store_discovered_tool_handles(
+        self,
+        session_id: str,
+        handles: list[dict[str, Any]],
+        *,
+        discovered_at: str | None = None,
+    ) -> set[str]:
+        """Store real handles returned by ``search_tools`` in L1 session state."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return set()
+        stored: set[str] = set()
+        for raw_handle in handles:
+            handle = _discovered_tool_handle_from_raw(raw_handle)
+            if handle is None:
+                continue
+            existing = entry.discovered_tool_handles.get(handle.tool_id)
+            if handle.discovered_at is None:
+                handle.discovered_at = existing.discovered_at if existing else discovered_at
+            if handle.last_used_at is None and existing is not None:
+                handle.last_used_at = existing.last_used_at
+            entry.discovered_tool_handles[handle.tool_id] = handle
+            stored.add(handle.tool_id)
+        if stored:
+            entry.touched_at = monotonic()
+        return stored
+
+    def note_discovered_tool_used(
+        self,
+        session_id: str,
+        tool_id: str,
+        *,
+        used_at: str | None = None,
+    ) -> bool:
+        """Update last-used metadata for a previously discovered tool handle."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return False
+        handle = entry.discovered_tool_handles.get(tool_id)
+        if handle is None:
+            return False
+        handle.last_used_at = used_at
+        entry.touched_at = monotonic()
+        return True
+
     def activate_skill_tools(self, session_id: str, skill_id: str, tool_ids: set[str]) -> None:
         entry = self.get_entry(session_id)
         if entry is None:
@@ -935,6 +1092,7 @@ class SessionCache:
         entry.context_snapshot_seq = 0
         entry.context_snapshot_source = None
         entry.prefix_repair_needed = False
+        entry.discovered_tool_handles = {}
         entry.project_contexts = {}
         self._apply_intaris_events(entry, raw_events)
         self._rebuild_prefix_from_raw_events(entry, raw_events)
@@ -1143,6 +1301,33 @@ class SessionCache:
             entry.last_compaction_summary = summary if isinstance(summary, str) else None
             entry.last_compaction_seq = event.seq
             entry.events = [existing for existing in entry.events if existing.seq > event.seq]
+        elif event.type == "tool_discovery":
+            raw_handles = event.data.get("handles")
+            if isinstance(raw_handles, list):
+                for raw_handle in raw_handles:
+                    if not isinstance(raw_handle, dict):
+                        continue
+                    handle = _discovered_tool_handle_from_raw(raw_handle)
+                    if handle is None:
+                        continue
+                    if handle.discovered_at is None:
+                        handle.discovered_at = event.ts
+                    existing = entry.discovered_tool_handles.get(handle.tool_id)
+                    if handle.last_used_at is None and existing is not None:
+                        handle.last_used_at = existing.last_used_at
+                    entry.discovered_tool_handles[handle.tool_id] = handle
+            if event.seq > entry.last_compaction_seq:
+                entry.events.append(event)
+        elif event.type == "tool_result":
+            tool_id = event.data.get("tool_id")
+            if (
+                isinstance(tool_id, str)
+                and not bool(event.data.get("is_error"))
+                and tool_id in entry.discovered_tool_handles
+            ):
+                entry.discovered_tool_handles[tool_id].last_used_at = event.ts
+            if event.seq > entry.last_compaction_seq:
+                entry.events.append(event)
         elif event.seq > entry.last_compaction_seq:
             entry.events.append(event)
         entry.last_event_seq = max(entry.last_event_seq, event.seq)

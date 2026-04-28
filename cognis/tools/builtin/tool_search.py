@@ -9,7 +9,13 @@ import re
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id, tool_profile_group
+from cognis.models.tool import (
+    ToolDefinition,
+    ToolSource,
+    stable_tool_id,
+    tool_capabilities,
+    tool_profile_group,
+)
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 
@@ -140,6 +146,19 @@ def search_inventory(
         )
         if score <= 0:
             continue
+        handle = {
+            "tool_id": stable_tool_id(tool),
+            "name": display_name,
+            "callable_name": tool.name,
+            "scope": "session",
+            "category": tool.category,
+            "profile_group": profile_group,
+            "source": tool.source.model_dump(mode="json"),
+            "capabilities": sorted(str(capability) for capability in tool_capabilities(tool)),
+            "read_only": tool.read_only,
+            "confidence": round(score, 3),
+            "permission_scope": "current_session_effective_inventory",
+        }
         matches.append(
             (
                 score,
@@ -150,6 +169,7 @@ def search_inventory(
                     "category": tool.category,
                     "profile_group": profile_group,
                     "source": tool.source.model_dump(mode="json"),
+                    "handle": handle,
                 },
             )
         )

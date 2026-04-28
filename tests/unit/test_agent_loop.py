@@ -29,6 +29,7 @@ from cognis.core.agent_loop import (
 )
 from cognis.core.project_context import ProjectContextEntry
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
+from cognis.core.session_cache import SessionCache
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
 from cognis.models.tool import (
@@ -2531,6 +2532,273 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
         "generic_search_tools",
         "openai_responses_controller_search_fallback",
     }
+
+
+@pytest.mark.asyncio
+async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
+    class _DiscoveryLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.tool_sets: list[list[str]] = []
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+            del messages
+            self.calls += 1
+            tool_names: list[str] = []
+            for schema in kwargs.get("tools", []):
+                if not isinstance(schema, dict):
+                    continue
+                function = schema.get("function")
+                if isinstance(function, dict) and isinstance(function.get("name"), str):
+                    tool_names.append(function["name"])
+            self.tool_sets.append(tool_names)
+            if self.calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_search",
+                                        "function": {
+                                            "name": "search_tools",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "query": "Google Calendar events",
+                                                    "category": "mcp",
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return
+            yield {"choices": [{"delta": {"content": f"done {self.calls}"}}]}
+
+    get_events = ToolDefinition(
+        name="mcp_googleworkspace__get_events",
+        description="Get Google Calendar events from Google Workspace.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="googleworkspace",
+            raw_tool_name="get_events",
+        ),
+        category="mcp",
+        profile_group="office",
+        read_only=True,
+    )
+    rohlik_orders = ToolDefinition(
+        name="mcp_rohlik__fetch_orders",
+        description="Retrieve Rohlik grocery shopping orders.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="rohlik", raw_tool_name="fetch_orders"),
+        category="mcp",
+        profile_group="web",
+        capabilities=["read"],
+        classification_source="declared",
+        classification_confidence=1.0,
+        read_only=True,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=get_events, handler=None))
+    registry.register(RegisteredTool(definition=rohlik_orders, handler=None))
+    fake_llm = _DiscoveryLLM()
+    session_cache = SessionCache(_NoopGuardrails(), max_entries=10)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    session = SimpleNamespace(
+        session_id="sess-discovery",
+        conversation_id="conv-discovery",
+        intaris_session_id="sess-discovery",
+        mnemory_session_id=None,
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    conversation = SimpleNamespace(conversation_id="conv-discovery", context=SimpleNamespace(platform_data={}))
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+
+    first_output = await agent_loop.run_step(
+        StepContext(
+            step_definition=StepDefinition(
+                name="direct",
+                type="run",
+                prompt="",
+                step_profile_id="system:direct-default",
+            ),
+            session=session,
+            conversation=conversation,
+            agent=agent,
+            policy=CHAT_POLICY,
+            user_message="Create a calendar event",
+            tool_registry=registry,
+            system_initiated=False,
+        )
+    )
+
+    assert first_output is not None
+    assert "mcp_rohlik__fetch_orders" in fake_llm.tool_sets[0]
+    assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[0]
+    assert session_cache.get_discovered_tool_ids(session.session_id) == {
+        stable_tool_id(get_events)
+    }
+
+    second_output = await agent_loop.run_step(
+        StepContext(
+            step_definition=StepDefinition(
+                name="direct",
+                type="run",
+                prompt="",
+                step_profile_id="system:direct-default",
+            ),
+            session=session,
+            conversation=conversation,
+            agent=agent,
+            policy=CHAT_POLICY,
+            user_message="Extend that event by 30 minutes",
+            tool_registry=registry,
+            system_initiated=False,
+        )
+    )
+
+    assert second_output is not None
+    assert "mcp_googleworkspace__get_events" in fake_llm.tool_sets[2]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovered_tool_is_revalidated_against_permissions() -> None:
+    class _CaptureLLM:
+        def __init__(self) -> None:
+            self.tool_sets: list[list[str]] = []
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+            del messages
+            self.tool_sets.append(
+                [
+                    function["name"]
+                    for schema in kwargs.get("tools", [])
+                    if isinstance(schema, dict)
+                    and isinstance((function := schema.get("function")), dict)
+                    and isinstance(function.get("name"), str)
+                ]
+            )
+            yield {"choices": [{"delta": {"content": "done"}}]}
+
+    get_events = ToolDefinition(
+        name="mcp_googleworkspace__get_events",
+        description="Get Google Calendar events from Google Workspace.",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="googleworkspace",
+            raw_tool_name="get_events",
+        ),
+        category="mcp",
+        profile_group="office",
+        read_only=True,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=get_events, handler=None))
+    session_cache = SessionCache(_NoopGuardrails(), max_entries=10)
+    session = SimpleNamespace(
+        session_id="sess-discovery-denied",
+        conversation_id="conv-discovery-denied",
+        intaris_session_id="sess-discovery-denied",
+        mnemory_session_id=None,
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    await session_cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="tool_discovery",
+                data={
+                    "handles": [
+                        {
+                            "tool_id": stable_tool_id(get_events),
+                            "name": get_events.name,
+                            "callable_name": get_events.name,
+                            "scope": "session",
+                        }
+                    ]
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+    fake_llm = _CaptureLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=session_cache,
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    output = await agent_loop.run_step(
+        StepContext(
+            step_definition=StepDefinition(
+                name="direct",
+                type="run",
+                prompt="",
+                step_profile_id="system:direct-default",
+            ),
+            session=session,
+            conversation=SimpleNamespace(conversation_id="conv-discovery-denied"),
+            agent=AgentDefinition(
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent",
+                permissions=AgentPermissions(
+                    tool_permissions={stable_tool_id(get_events): Permission.DENY}
+                ),
+            ),
+            policy=CHAT_POLICY,
+            user_message="Read my calendar",
+            tool_registry=registry,
+            system_initiated=False,
+        )
+    )
+
+    assert output is not None
+    assert stable_tool_id(get_events) in session_cache.get_discovered_tool_ids(session.session_id)
+    assert get_events.name not in fake_llm.tool_sets[0]
 
 
 @pytest.mark.asyncio
