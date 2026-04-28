@@ -37,6 +37,7 @@ from cognis.api.models import (
     ToolResponse,
     WorkflowResponse,
 )
+from cognis.api.routes.push import PushSubscriptionStatusResponse
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
 from cognis.core.management import _normalize_pause_context, _normalize_pause_options
 
@@ -154,6 +155,18 @@ def test_message_history_response_round_trips_active_streams() -> None:
 
     assert response.active_streams[0].content == "partial assistant text"
     assert response.active_streams[0].chunk_count == 3
+
+
+def test_push_subscription_status_response_round_trip() -> None:
+    response = PushSubscriptionStatusResponse(
+        configured=True,
+        enabled_subscriptions=1,
+        last_error="push endpoint rejected request",
+    )
+
+    assert response.configured is True
+    assert response.enabled_subscriptions == 1
+    assert response.last_error == "push endpoint rejected request"
 
 
 def test_agent_response_round_trips_sharing_fields() -> None:

@@ -67,7 +67,8 @@ import X from 'lucide-svelte/icons/x';
     isWebPushSupported,
     needsIosHomeScreenInstall,
     notifyIfHidden,
-    permissionState
+    permissionState,
+    reconcileWebPushSubscription
   } from '$lib/notifications';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
@@ -303,6 +304,11 @@ import X from 'lucide-svelte/icons/x';
     } finally {
       pushPromptBusy = false;
     }
+  }
+
+  async function reconcileChatNotifications(): Promise<void> {
+    if (!pushSubscriptionKnownEnabled) return;
+    pushSubscriptionKnownEnabled = await reconcileWebPushSubscription();
   }
 
   function isReadOnly(conversation: Conversation | null): boolean {
@@ -2155,6 +2161,12 @@ import X from 'lucide-svelte/icons/x';
       if (event.type === 'message_complete' && event.context_usage) {
         contextUsage = event.context_usage;
       }
+      if (currentConversation && event.type === 'message_complete') {
+        const agentObj = agents.find((a) => a.agent_id === currentConversation?.agent_id);
+        const agentLabel = agentObj?.display_name ?? agentObj?.name ?? 'Cognis';
+        const convTitle = currentConversation.title ?? 'Conversation';
+        notifyIfHidden(agentLabel, `New message in "${convTitle}"`, currentConversation.conversation_id, currentConversation.conversation_id);
+      }
       // Mark as read since the user is viewing this conversation
       if (currentConversation && !document.hidden) {
         api.conversations.markRead(currentConversation.conversation_id).catch(() => {});
@@ -2559,6 +2571,7 @@ import X from 'lucide-svelte/icons/x';
     window.addEventListener('pageshow', pageShowHandler);
     window.addEventListener('online', onlineHandler);
     startNotificationRefreshPolling();
+    void reconcileChatNotifications();
 
     void initialize();
 

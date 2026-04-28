@@ -65,6 +65,18 @@ export function hasEnabledWebPush(): boolean {
   return localStorage.getItem(WEB_PUSH_ENABLED_KEY) === 'true';
 }
 
+function setWebPushEnabled(enabled: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  if (enabled) localStorage.setItem(WEB_PUSH_ENABLED_KEY, 'true');
+  else localStorage.removeItem(WEB_PUSH_ENABLED_KEY);
+}
+
+/** Whether the user is not actively focused on this browser context. */
+export function shouldNotifyWhenUnfocused(): boolean {
+  if (typeof document === 'undefined') return false;
+  return document.visibilityState !== 'visible' || !document.hasFocus();
+}
+
 /**
  * Request notification permission from the user.
  * Returns the resulting permission state.
@@ -166,9 +178,7 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
       keys: { p256dh, auth },
       platform: isStandaloneDisplay() ? 'pwa' : 'browser'
     });
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(WEB_PUSH_ENABLED_KEY, 'true');
-    }
+    setWebPushEnabled(true);
     return { ok: true, status: 'enabled', message: 'Native notifications are enabled.' };
   } catch (error) {
     return {
@@ -176,6 +186,53 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
       status: 'error',
       message: error instanceof Error ? error.message : 'Unable to enable notifications.'
     };
+  }
+}
+
+/**
+ * Reconcile a previously enabled browser subscription with the backend.
+ *
+ * Browsers can drop PushManager subscriptions and development databases can be
+ * recreated. Keep the local enabled flag truthful so notification fallback and
+ * prompts do not assume Web Push is healthy when no usable subscription exists.
+ */
+export async function reconcileWebPushSubscription(): Promise<boolean> {
+  if (!hasEnabledWebPush()) return false;
+  if (!isWebPushSupported() || !isGranted()) {
+    setWebPushEnabled(false);
+    return false;
+  }
+
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      setWebPushEnabled(false);
+      return false;
+    }
+    const json = subscription.toJSON() as {
+      endpoint?: string;
+      expirationTime?: number | null;
+      keys?: { p256dh?: string; auth?: string };
+    };
+    const endpoint = json.endpoint ?? subscription.endpoint;
+    const p256dh = json.keys?.p256dh;
+    const auth = json.keys?.auth;
+    if (!endpoint || !p256dh || !auth) {
+      setWebPushEnabled(false);
+      return false;
+    }
+    await api.push.subscribe({
+      endpoint,
+      expirationTime: json.expirationTime ?? null,
+      keys: { p256dh, auth },
+      platform: isStandaloneDisplay() ? 'pwa' : 'browser'
+    });
+    setWebPushEnabled(true);
+    return true;
+  } catch {
+    setWebPushEnabled(false);
+    return false;
   }
 }
 
@@ -223,7 +280,7 @@ export function notifyIfHidden(
   conversationId: string,
   activeConversationId: string | null,
 ): void {
-  // Don't notify if the user is actively viewing this conversation
-  if (conversationId === activeConversationId && !document.hidden) return;
+  if (!shouldNotifyWhenUnfocused()) return;
+  if (hasEnabledWebPush()) return;
   showNotification(title, body, conversationId);
 }

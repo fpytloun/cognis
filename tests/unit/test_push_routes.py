@@ -5,8 +5,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.events import Event, EventBus, EventType
+from cognis.core.web_push import WebPushRuntimeConfig, WebPushService
 from cognis.store.models import PushSubscriptionRow
-from cognis.store.queries import create_user
+from cognis.store.queries import create_agent, create_conversation, create_user
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -85,6 +87,44 @@ def test_register_push_subscription_upserts_endpoint(monkeypatch: object, tmp_pa
         assert row.enabled is True
 
 
+def test_push_subscription_status_reports_delivery_error(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        asyncio.run(_seed_user(client))
+        headers = _auth_headers(client.app, email="user@example.com")
+        response = client.post(
+            "/api/v1/push/subscriptions",
+            headers=headers,
+            json={
+                "endpoint": "https://fcm.googleapis.com/fcm/send/sub-status",
+                "keys": {"p256dh": "p256dh-key", "auth": "auth-key"},
+            },
+        )
+        assert response.status_code == 200
+        subscription_id = response.json()["subscription_id"]
+
+        async def _set_error() -> None:
+            async with client.app.state.session_factory() as session:
+                row = await session.get(PushSubscriptionRow, subscription_id)
+                assert row is not None
+                row.last_error = "push endpoint rejected request"
+                await session.commit()
+
+        asyncio.run(_set_error())
+
+        response = client.get("/api/v1/push/subscriptions/status", headers=headers)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "configured": True,
+            "enabled_subscriptions": 1,
+            "last_error": "push endpoint rejected request",
+        }
+
+
 def test_unregister_push_subscription_disables_endpoint(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -120,6 +160,62 @@ def test_unregister_push_subscription_disables_endpoint(
         row = asyncio.run(_load())
         assert row is not None
         assert row.enabled is False
+
+
+def test_turn_completed_web_chat_creates_push_payload(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> dict[str, str] | None:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_1",
+                    owner_email="user@example.com",
+                    name="Agent",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_1",
+                    context_type="web",
+                    conversation_id="conv_1",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+            )
+            return await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={
+                        "conversation_id": "conv_1",
+                        "session_id": "session_1",
+                        "message_id": "message_1",
+                    },
+                )
+            )
+
+        payload = asyncio.run(_run())
+
+        assert payload == {
+            "user_email": "user@example.com",
+            "title": "Cognis",
+            "body": "New web chat message.",
+            "url": "/chat/conv_1",
+            "tag": "conv_1",
+            "kind": "message",
+        }
 
 
 def test_register_push_subscription_rejects_untrusted_endpoint(

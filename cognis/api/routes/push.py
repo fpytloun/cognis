@@ -6,9 +6,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 
 from cognis.api.common import require_current_user
 from cognis.core.web_push import WebPushService
+from cognis.store.models import PushSubscriptionRow
 
 router = APIRouter(prefix="/api/v1/push", tags=["push"])
 
@@ -50,6 +52,14 @@ class PushSubscriptionResponse(BaseModel):
 
     subscription_id: str
     enabled: bool
+
+
+class PushSubscriptionStatusResponse(BaseModel):
+    """Current user's browser push delivery status."""
+
+    configured: bool
+    enabled_subscriptions: int
+    last_error: str | None = None
 
 
 def _get_service(request: Request) -> WebPushService:
@@ -95,6 +105,35 @@ async def register_subscription(
     return PushSubscriptionResponse(
         subscription_id=subscription.subscription_id,
         enabled=subscription.enabled,
+    )
+
+
+@router.get("/subscriptions/status", response_model=PushSubscriptionStatusResponse)
+async def subscription_status(request: Request) -> PushSubscriptionStatusResponse:
+    """Return log-safe Web Push status for the current user."""
+
+    user = require_current_user(request)
+    service = _get_service(request)
+    async with request.app.state.session_factory() as session:
+        count_result = await session.execute(
+            select(func.count()).select_from(PushSubscriptionRow).where(
+                PushSubscriptionRow.user_email == user.email,
+                PushSubscriptionRow.enabled.is_(True),
+            )
+        )
+        error_result = await session.execute(
+            select(PushSubscriptionRow.last_error)
+            .where(
+                PushSubscriptionRow.user_email == user.email,
+                PushSubscriptionRow.last_error.is_not(None),
+            )
+            .order_by(PushSubscriptionRow.updated_at.desc())
+            .limit(1)
+        )
+    return PushSubscriptionStatusResponse(
+        configured=service.enabled,
+        enabled_subscriptions=int(count_result.scalar_one() or 0),
+        last_error=error_result.scalar_one_or_none(),
     )
 
 
