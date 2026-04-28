@@ -122,6 +122,28 @@ def test_headers_include_agent_owner_when_context_sets_it() -> None:
 
 
 @pytest.mark.asyncio
+async def test_remember_accepts_explicit_agent_owner() -> None:
+    auth = _AuthProvider()
+    provider = MnemoryProvider("https://mnemory.test", auth)
+    provider.client = _Client({"accepted": True})
+
+    await provider.remember(
+        session_id="mem-1",
+        messages=[{"role": "assistant", "content": "done"}],
+        user_email="guest@example.com",
+        agent_id="agent-1",
+        agent_owner_email="owner@example.com",
+    )
+
+    assert auth.calls[-1] == (
+        "guest@example.com",
+        "agent-1",
+        ["mnemory"],
+        "owner@example.com",
+    )
+
+
+@pytest.mark.asyncio
 async def test_recall_truncates_oversized_query_payload() -> None:
     provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
     client = _Client(

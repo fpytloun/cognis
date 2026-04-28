@@ -56,10 +56,7 @@
   function syncBottomOffset(): void {
     if (typeof window === 'undefined') return;
     const shouldReserve = visible && window.innerWidth < 1024;
-    const measuredHeight = navEl?.offsetHeight ?? 0;
-    const computedBottom = navEl ? Number.parseFloat(getComputedStyle(navEl).bottom) : 0;
-    const bottomBleed = Number.isFinite(computedBottom) && computedBottom < 0 ? Math.abs(computedBottom) : 0;
-    setBottomOffset(shouldReserve ? Math.max(0, measuredHeight - bottomBleed) : 0);
+    setBottomOffset(shouldReserve ? navEl?.offsetHeight ?? 0 : 0);
   }
 
   $effect(() => {
@@ -96,7 +93,7 @@
   <nav
     bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
-    style="--bottom-tab-bleed: min(env(safe-area-inset-bottom, 0px), 16px); bottom: calc(0px - var(--bottom-tab-bleed)); padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0); padding-bottom: var(--bottom-tab-bleed);"
+    style="padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
     aria-label="Primary"
   >
     <ul class="grid grid-cols-4">
@@ -105,7 +102,7 @@
         {@const Icon = tab.icon}
         <li class="contents">
           <a
-            class={`flex min-h-[44px] flex-col items-center justify-center gap-0.5 px-2 py-0.5 text-[10px] leading-none transition ${
+            class={`flex min-h-[48px] flex-col items-center justify-end gap-0.5 px-2 pb-1.5 pt-1 text-[10px] leading-none transition ${
               active
                 ? 'text-sky-300'
                 : isOnTabRoute
@@ -135,8 +132,5 @@
         </li>
       {/each}
     </ul>
-    {#if !isOnTabRoute}
-      <p class="pb-0.5 text-center text-[10px] text-slate-600">Use ☰ for more pages</p>
-    {/if}
   </nav>
 {/if}

@@ -86,6 +86,7 @@ class MnemoryProvider:
         agent_id: str | None = None,
         user_email: str | None = None,
         *,
+        agent_owner_email: str | None = None,
         allow_system_fallback: bool = False,
     ) -> dict[str, str]:
         subject = user_email or current_user_email.get()
@@ -96,7 +97,7 @@ class MnemoryProvider:
                 )
             subject = self.service_user_email
         resolved_agent_id = agent_id or current_agent_id.get()
-        resolved_agent_owner = current_agent_owner_email.get() or subject
+        resolved_agent_owner = agent_owner_email or current_agent_owner_email.get() or subject
         headers = {
             "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id or 'system', ['mnemory'], agent_owner_email=resolved_agent_owner)}",
         }
@@ -271,6 +272,7 @@ class MnemoryProvider:
         context: str | None = None,
         user_email: str | None = None,
         agent_id: str | None = None,
+        agent_owner_email: str | None = None,
     ) -> None:
         logger.info(
             "mnemory: remember",
@@ -289,7 +291,11 @@ class MnemoryProvider:
                 response = await self.client.post(
                     "/api/remember",
                     json=payload,
-                    headers=self._headers(agent_id=agent_id, user_email=user_email),
+                    headers=self._headers(
+                        agent_id=agent_id,
+                        user_email=user_email,
+                        agent_owner_email=agent_owner_email,
+                    ),
                 )
                 response.raise_for_status()
 

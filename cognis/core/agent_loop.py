@@ -8471,6 +8471,7 @@ class AgentLoop:
                     "assistant_event_seq": ctx.remember_assistant_event_seq,
                     "user_email": ctx.session.user_email,
                     "agent_id": ctx.session.agent_id,
+                    "agent_owner_email": ctx.agent.owner_email,
                 }
             )
         except Exception:

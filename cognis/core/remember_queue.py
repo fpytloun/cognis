@@ -407,6 +407,7 @@ class RememberRetryQueue:
 
         user_email = payload.get("user_email")
         agent_id = payload.get("agent_id")
+        agent_owner_email = payload.get("agent_owner_email")
         include_user_message = bool(payload.get("include_user_message", True))
         user_event_seq = payload.get("user_event_seq")
         assistant_event_seq = payload.get("assistant_event_seq")
@@ -417,7 +418,11 @@ class RememberRetryQueue:
         ]
         after_seq = max(0, min(requested_seqs) - 1) if requested_seqs else 0
 
-        with scoped_runtime_context(user_email=user_email, agent_id=agent_id):
+        with scoped_runtime_context(
+            user_email=user_email,
+            agent_id=agent_id,
+            agent_owner_email=str(agent_owner_email) if agent_owner_email else None,
+        ):
             event_read = await self._event_reader.read_events(
                 session_id=intaris_session_id,
                 after_seq=after_seq,
@@ -464,6 +469,7 @@ class RememberRetryQueue:
             "messages": messages,
             "user_email": user_email,
             "agent_id": agent_id,
+            "agent_owner_email": agent_owner_email,
         }
 
     @staticmethod

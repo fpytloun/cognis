@@ -110,6 +110,7 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
             "intaris_session_id": "intaris-s1",
             "user_email": "user@example.com",
             "agent_id": "agent-1",
+            "agent_owner_email": "owner@example.com",
             "user_event_seq": 1,
             "assistant_event_seq": 2,
         }
@@ -136,6 +137,7 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "done"},
     ]
+    assert worker.last_kwargs["agent_owner_email"] == "owner@example.com"
     async with session_factory() as session:
         count = await session.scalar(sa.select(sa.func.count()).select_from(RememberQueueRow))
         assert count == 0

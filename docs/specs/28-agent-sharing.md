@@ -239,10 +239,10 @@ a backfill that stamps `owner = user` on every pre-existing memory.
 Recall for a turn with `(user=U, owner=O, agent_id=A)` returns the
 union of:
 
-- records with `(user=O, owner=O, agent_id=A)` — the agent's identity
-  and the owner's episodic (shared personality);
+- assistant-role records with `(user=O, owner=O, agent_id=A)` — the
+  owner-authored agent identity/personality only;
 - records with `(user=U, owner=O, agent_id=A)` — the caller's episodic
-  on this particular agent.
+  and assistant observations on this particular shared agent.
 
 Recall outside an agent context (personal memory) queries records with
 `user=U` and the default owner=`U`; it never returns `owner≠U` records.
