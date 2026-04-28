@@ -1180,12 +1180,16 @@ import X from 'lucide-svelte/icons/x';
       reloadHistory?: boolean;
       resubscribe?: boolean;
       preserveTimelineOnHistoryFailure?: boolean;
+      preserveScroll?: boolean;
     } = {},
   ): Promise<void> {
     const reloadSessions = options.reloadSessions ?? true;
     const reloadHistory = options.reloadHistory ?? true;
     const shouldResubscribe = options.resubscribe ?? false;
     const preserveTimelineOnHistoryFailure = options.preserveTimelineOnHistoryFailure ?? false;
+    const shouldPreserveScroll = options.preserveScroll === true && userScrolledUp && timelineEl !== null;
+    const preservedScrollTop = shouldPreserveScroll ? timelineEl?.scrollTop ?? 0 : 0;
+    const preservedVisibleStartIndex = visibleStartIndex;
 
     const [sessionResult, historyResult] = await Promise.allSettled([
       reloadSessions ? api.conversations.sessions(conversationId) : Promise.resolve(sessions),
@@ -1239,8 +1243,12 @@ import X from 'lucide-svelte/icons/x';
         awaitingAssistantStart = false;
       }
       syncConversationActiveSession(nextActiveSessionId);
-      syncVisibleWindow();
-      userScrolledUp = false;
+      if (shouldPreserveScroll) {
+        visibleStartIndex = Math.min(preservedVisibleStartIndex, Math.max(0, timeline.length - 100));
+      } else {
+        syncVisibleWindow();
+        userScrolledUp = false;
+      }
     } else if (reloadHistory && historyResult.status === 'rejected') {
       if (!preserveTimelineOnHistoryFailure) {
         timeline = [];
@@ -1286,6 +1294,14 @@ import X from 'lucide-svelte/icons/x';
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        if (shouldPreserveScroll && timelineEl) {
+          programmaticScroll = true;
+          timelineEl.scrollTop = preservedScrollTop;
+          lastTimelineScrollTop = timelineEl.scrollTop;
+          userScrolledUp = true;
+          programmaticScroll = false;
+          return;
+        }
         scrollToBottom(true);
       });
     });
@@ -1354,6 +1370,7 @@ import X from 'lucide-svelte/icons/x';
         reloadHistory: true,
         resubscribe: true,
         preserveTimelineOnHistoryFailure: true,
+        preserveScroll: true,
       });
 
       if (!isStaleConversationLoad(requestId) && (historyError || sessionsError)) {
