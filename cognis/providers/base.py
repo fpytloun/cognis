@@ -86,6 +86,22 @@ class MemoryProvider(Protocol):
         user_email: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
+    async def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> None: ...
+
+    async def delete_memory_tool(
+        self,
+        memory_id: str,
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> None: ...
+
     async def bootstrap_agent(self, agent: AgentDefinition) -> None: ...
     async def health(self) -> ProviderHealth: ...
 

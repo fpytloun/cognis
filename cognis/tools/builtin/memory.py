@@ -14,7 +14,7 @@ import json
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import ToolCapability, ToolDefinition, ToolResult, ToolSource
 
 logger = get_logger(__name__)
 
@@ -256,7 +256,10 @@ MEMORY_UPDATE_TOOL = ToolDefinition(
 
 MEMORY_DELETE_TOOL = ToolDefinition(
     name="memory_delete",
-    description="Delete a specific memory and all its artifacts.",
+    description=(
+        "Delete, remove, or forget a specific memory and all its artifacts. "
+        "Use only when the user explicitly asks to remove stored memory."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -267,6 +270,8 @@ MEMORY_DELETE_TOOL = ToolDefinition(
     source=_SOURCE,
     category="memory",
     read_only=False,
+    capabilities=[ToolCapability.WRITE, ToolCapability.DESTRUCTIVE],
+    non_bypassable=True,
     timeout_seconds=15,
 )
 
@@ -567,6 +572,8 @@ async def _dispatch(
 
     if tool_name == "memory_delete":
         memory_id = str(args.get("memory_id", "")).strip()
+        if not memory_id:
+            return ToolResult(output="memory_id is required to delete a memory.", is_error=True)
         await mem.delete_memory_tool(memory_id, agent_id=agent_id, user_email=user_email)
         return ToolResult(output=f"Memory {memory_id} deleted.")
 

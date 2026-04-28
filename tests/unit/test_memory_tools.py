@@ -7,12 +7,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cognis.models.tool import ToolCapability, stable_tool_id
 from cognis.tools.builtin.memory import (
     ALL_MEMORY_TOOLS,
+    MEMORY_DELETE_TOOL,
     handle_memory_tool,
     is_memory_tool,
     memory_tools,
 )
+from cognis.tools.builtin.tool_search import search_inventory
 
 
 class TestMemoryToolDefinitions:
@@ -81,6 +84,27 @@ class TestMemoryToolDefinitions:
             "memory_delete_artifact",
         }
 
+    def test_memory_delete_is_destructive_and_non_bypassable(self) -> None:
+        assert MEMORY_DELETE_TOOL.capabilities == [
+            ToolCapability.WRITE,
+            ToolCapability.DESTRUCTIVE,
+        ]
+        assert MEMORY_DELETE_TOOL.non_bypassable is True
+
+    def test_memory_delete_is_discoverable_by_forget_synonyms(self) -> None:
+        matches = search_inventory(
+            ALL_MEMORY_TOOLS,
+            "forget remove stored memory",
+            category="memory",
+            already_visible_tool_ids={
+                stable_tool_id(tool)
+                for tool in ALL_MEMORY_TOOLS
+                if tool.name != "memory_delete"
+            },
+        )
+
+        assert [match["name"] for match in matches] == ["memory_delete"]
+
 
 class TestMemoryToolHandlers:
     """Test memory tool handler dispatch."""
@@ -140,6 +164,16 @@ class TestMemoryToolHandlers:
         provider.delete_memory_tool.assert_awaited_once_with(
             "mem_123", agent_id="agent1", user_email="user@test.com"
         )
+
+    @pytest.mark.asyncio()
+    async def test_memory_delete_requires_memory_id(self) -> None:
+        provider = self._mock_provider()
+        result = await handle_memory_tool(
+            "memory_delete", {"memory_id": "  "}, provider, "agent1", "user@test.com"
+        )
+        assert result.is_error
+        assert "memory_id is required" in result.output
+        provider.delete_memory_tool.assert_not_awaited()
 
     @pytest.mark.asyncio()
     async def test_memory_list(self) -> None:
@@ -277,7 +311,7 @@ class TestWorkflowToolDefinitions:
         from cognis.tools.builtin.workflow import workflow_tools
 
         defs = workflow_tools()
-        assert len(defs) == 7
+        assert len(defs) == 8
 
     def test_workflow_tool_names(self) -> None:
         from cognis.tools.builtin.workflow import workflow_tools
@@ -294,7 +328,7 @@ class TestWorkflowToolDefinitions:
         from cognis.tools.builtin.workflow import workflow_tools
 
         for tool in workflow_tools():
-            assert tool.category == "workflow"
+            assert tool.category in {"deliverable", "workflow"}
             assert tool.source.type == "builtin"
 
     def test_step_todo_write_uses_completed_status(self) -> None:

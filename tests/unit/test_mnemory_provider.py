@@ -37,10 +37,24 @@ class _Client:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
         self.last_json: dict[str, object] | None = None
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
 
     async def post(self, path: str, json: dict[str, object], headers: dict[str, str]) -> _Response:
         del path, headers
         self.last_json = json
+        return _Response(self.payload)
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str],
+    ) -> _Response:
+        del json, params
+        self.requests.append((method, path, headers))
         return _Response(self.payload)
 
 
@@ -129,3 +143,30 @@ async def test_recall_truncates_oversized_query_payload() -> None:
     assert len(bounded_query) < len(long_query)
     assert "middle truncated" in bounded_query
     assert client.last_json["messages"] == [{"role": "user", "content": bounded_query}]
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_tool_calls_mnemory_delete_endpoint() -> None:
+    auth = _AuthProvider()
+    provider = MnemoryProvider("https://mnemory.test", auth)
+    client = _Client({})
+    provider.client = client
+
+    await provider.delete_memory_tool(
+        "mem_123",
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    assert client.requests == [
+        (
+            "DELETE",
+            "/api/memories/mem_123",
+            {
+                "Authorization": "Bearer token",
+                "X-Agent-Id": "agent-1",
+                "X-Agent-Owner": "user@example.com",
+            },
+        )
+    ]
+    assert auth.calls == [("user@example.com", "agent-1", ["mnemory"], "user@example.com")]
