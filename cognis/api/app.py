@@ -376,6 +376,8 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             providers=providers,
         )
+        tool_router.notification_service = notification_service
+        tool_router.pause_waiter = pause_waiter
         agent_loop.notification_service = notification_service
         workflow_engine._notification_service = notification_service  # noqa: SLF001
 
@@ -555,6 +557,7 @@ def create_app() -> FastAPI:
             channel_manager_ref=_get_channel_manager,
             command_dispatcher=command_dispatcher,
             notification_service=notification_service,
+            credentials_provider=providers.credentials,
         )
         channel_manager = ChannelManager(
             session_factory=session_factory,

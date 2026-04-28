@@ -606,6 +606,17 @@ class TurnScheduler:
                     message="Answer the pending question before sending a new message.",
                     recoverable=True,
                 )
+            for pause_type in ("auth_challenge", "credential_request"):
+                pending_inputs = self._pause_waiter.list_pending(
+                    conversation_id=conversation_id,
+                    pause_type=pause_type,
+                )
+                if any(pause.task_id is None for pause in pending_inputs):
+                    return TurnError(
+                        code="pending_input_request",
+                        message="Answer the pending input request before sending a new message.",
+                        recoverable=True,
+                    )
 
         # Per-user concurrent turn limit
         if not system_initiated:

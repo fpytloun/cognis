@@ -489,13 +489,15 @@ class ChannelDeliveryService:
 
         # Flush any buffered observer text before sending the notification
         # so the assistant's preceding message arrives before the question.
-        if notification_type == "step_question" and self._turn_scheduler is not None:
+        if notification_type in {"step_question", "auth_challenge"} and self._turn_scheduler is not None:
             await self._flush_observer_buffers(conversation_id)
 
         if notification_type == "escalation" and isinstance(payload, dict):
             content = self._render_escalation_notification(payload)
         elif notification_type == "step_question" and isinstance(payload, dict):
             content = self._render_step_question_notification(payload)
+        elif notification_type == "auth_challenge" and isinstance(payload, dict):
+            content = self._render_auth_challenge_notification(payload)
         elif notification_type == "gate" and isinstance(payload, dict):
             content = self._render_gate_notification(payload)
         else:
@@ -530,6 +532,18 @@ class ChannelDeliveryService:
                     idx += 1
             if option_lines:
                 lines.append("\n".join(option_lines))
+        return "\n\n".join(lines)
+
+    def _render_auth_challenge_notification(self, payload: dict[str, Any]) -> str:
+        """Render an auth challenge prompt for channel integrations."""
+        label = str(payload.get("label") or "Authentication required")
+        message = str(payload.get("message") or "Reply with the requested authentication code.")
+        lines = [f"*[auth]* {label}", message]
+        required = payload.get("required_fields")
+        if isinstance(required, list) and "code" in required:
+            lines.append("_Reply with the code only._")
+        else:
+            lines.append("_Reply with the requested response when complete._")
         return "\n\n".join(lines)
 
     def _render_gate_notification(self, payload: dict[str, Any]) -> str:

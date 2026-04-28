@@ -35,6 +35,7 @@ from cognis.api.models import (
 )
 from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.events import Event, EventType
+from cognis.core.notification_resolution import build_auth_challenge_resolution_data
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError as SessionCreationFailedError,  # noqa: F401 — re-export
 )
@@ -1399,13 +1400,13 @@ async def _handle_step_response(
         notification = await svc.get(notification_id)
         if (
             notification is None
-            or notification.notification_type != "step_question"
-            or not _can_access_owner(connection, notification.user_email)
+            or notification.notification_type not in {"step_question", "auth_challenge"}
+            or notification.user_email != connection.user_email
         ):
             await manager.send_error(
                 connection,
                 code="not_found",
-                message="Step question not found",
+                message="Pending input request not found",
                 recoverable=True,
             )
             return
@@ -1413,7 +1414,7 @@ async def _handle_step_response(
             await manager.send_error(
                 connection,
                 code="conflict",
-                message="task_id does not match the referenced step question",
+                message="task_id does not match the referenced input request",
                 recoverable=True,
             )
             return
@@ -1430,9 +1431,10 @@ async def _handle_step_response(
 
     if notification is not None and notification.task_id is None:
         pause = app.state.pause_waiter.get(notification.notification_id)
+        expected_pause_type = notification.notification_type
         if (
             pause is None
-            or pause.pause_type != "step_question"
+            or pause.pause_type != expected_pause_type
             or pause.task_id is not None
             or pause.conversation_id != notification.conversation_id
             or pause.session_id != notification.session_id
@@ -1440,20 +1442,52 @@ async def _handle_step_response(
             await manager.send_error(
                 connection,
                 code="conflict",
-                message="Step question can no longer be resumed",
+                message="Input request can no longer be resumed",
                 recoverable=True,
             )
+            return
+        if notification.notification_type == "auth_challenge":
+            try:
+                data = await build_auth_challenge_resolution_data(
+                    notification=notification,
+                    decision="continue",
+                    user_email=notification.user_email,
+                    credentials_provider=app.state.providers.credentials,
+                    response=str(response),
+                )
+            except ValueError as exc:
+                await manager.send_error(
+                    connection,
+                    code="validation_error",
+                    message=str(exc),
+                    recoverable=True,
+                )
+                return
+            resolved = await svc.resolve(
+                notification.notification_id,
+                "continue",
+                data,
+                user_email=notification.user_email,
+            )
+            if not resolved:
+                await manager.send_error(
+                    connection,
+                    code="conflict",
+                    message="Input request already resolved",
+                    recoverable=True,
+                )
             return
         resolved = await svc.resolve(
             notification.notification_id,
             "continue",
             {"response": str(response)},
+            user_email=notification.user_email,
         )
         if not resolved:
             await manager.send_error(
                 connection,
                 code="conflict",
-                message="Step question already resolved",
+                message="Input request already resolved",
                 recoverable=True,
             )
         return
@@ -1816,6 +1850,34 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "options": payload.get("options"),
                 "context": payload.get("context"),
             }
+        if ntype == "auth_challenge":
+            return {
+                "type": "auth_challenge",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "task_id": event.data.get("task_id"),
+                "step_name": event.data.get("step_name"),
+                "label": payload.get("label", "Authentication required"),
+                "message": payload.get("message", ""),
+                "kind": payload.get("kind"),
+                "metadata": payload.get("metadata"),
+                "required_fields": payload.get("required_fields"),
+                "expires_at": payload.get("expires_at"),
+            }
+        if ntype == "credential_request":
+            return {
+                "type": "credential_request",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "task_id": event.data.get("task_id"),
+                "step_name": event.data.get("step_name"),
+                "label": payload.get("label", "Credential required"),
+                "message": payload.get("message") or payload.get("description", ""),
+                "credential_id": payload.get("credential_id"),
+                "kind": payload.get("kind"),
+                "metadata": payload.get("metadata"),
+                "required_fields": payload.get("required_fields"),
+            }
     if event.type == EventType.NOTIFICATION_RESOLVED:
         ntype = event.data.get("notification_type")
         if ntype == "escalation":
@@ -1835,6 +1897,20 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
         if ntype == "step_question":
             return {
                 "type": "workflow_step_question_resolved",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "decision": event.data.get("decision"),
+            }
+        if ntype == "auth_challenge":
+            return {
+                "type": "auth_challenge_resolved",
+                "conversation_id": conversation_id,
+                "notification_id": event.data.get("notification_id"),
+                "decision": event.data.get("decision"),
+            }
+        if ntype == "credential_request":
+            return {
+                "type": "credential_request_resolved",
                 "conversation_id": conversation_id,
                 "notification_id": event.data.get("notification_id"),
                 "decision": event.data.get("decision"),

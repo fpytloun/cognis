@@ -8944,6 +8944,12 @@ class AgentLoop:
             metadata["resolved_model"] = ctx.current_model
         if ctx.current_provider_id:
             metadata["resolved_provider_id"] = ctx.current_provider_id
+        if ctx.task_id:
+            metadata["task_id"] = ctx.task_id
+        if ctx.step_definition.name:
+            metadata["step_name"] = ctx.step_definition.name
+        if ctx.step_run_id:
+            metadata["step_run_id"] = ctx.step_run_id
         return metadata
 
     def _record_execution_evidence(

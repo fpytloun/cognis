@@ -106,7 +106,12 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_eval",
-            description="Evaluate arbitrary JSON-returning JavaScript in the current page context. This is a powerful debug/control tool and can mutate page state.",
+            description=(
+                "Evaluate arbitrary JSON-returning JavaScript in the current page context. "
+                "This is a powerful debug/control tool and can mutate page state. "
+                "Arguments may include {value_ref: '$credential:id.field'} or deferred "
+                "{value_ref: '$auth_challenge:id.code', auth_challenge: {...}} markers."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -115,7 +120,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "args": {
                         "type": "array",
                         "items": {},
-                        "description": "Optional JSON-serializable arguments passed to the evaluated function.",
+                        "description": "Optional JSON-serializable arguments passed to the evaluated function. Use value_ref marker objects for credentials or deferred auth challenge values.",
                     },
                 },
                 "required": ["session_id", "script"],
@@ -204,7 +209,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             name="browser_fill",
             description=(
                 "Fill an input by exact ref or by selector using literal value or value_ref. "
-                "Selector mode fails if multiple viable candidates match. Example value_ref refs: $credential:rohlik.username or $credential:rohlik.password."
+                "Selector mode fails if multiple viable candidates match. Example value_ref refs: $credential:rohlik.username, $credential:rohlik.password, or deferred $auth_challenge:reddit.code with auth_challenge metadata."
             ),
             parameters={
                 "type": "object",
@@ -214,6 +219,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "selector": {"type": "string"},
                     "value": {"type": "string"},
                     "value_ref": {"type": "string"},
+                    "auth_challenge": {
+                        "type": "object",
+                        "description": "Optional deferred auth challenge metadata used when value_ref starts with $auth_challenge:.",
+                    },
                     "intensity": {
                         "type": "string",
                         "enum": ["off", "low", "medium", "high"],

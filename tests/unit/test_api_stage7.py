@@ -737,6 +737,94 @@ def test_websocket_direct_chat_step_response_resolves_notification(
         assert resolved.resolution == {"decision": "continue", "response": "A", "state": "resolved"}
 
 
+def test_websocket_direct_chat_step_response_resolves_auth_challenge(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+        notification = asyncio.run(
+            app.state.notification_service.create(
+                notification_type="auth_challenge",
+                user_email="user@example.com",
+                conversation_id=conversation_id,
+                session_id=session_id,
+                notification_id="auth_direct_ok",
+                payload={"kind": "otp_code", "required_fields": ["code"], "message": "OTP"},
+            )
+        )
+
+        class _Manager:
+            def __init__(self) -> None:
+                self.errors: list[dict[str, object]] = []
+
+            async def send_error(self, _: object, **kwargs: object) -> None:
+                self.errors.append(kwargs)
+
+        manager = _Manager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-1",
+            websocket=object(),
+            user_email="user@example.com",
+            role="user",
+        )
+
+        asyncio.run(
+            _handle_step_response(
+                app,
+                manager,
+                connection,
+                {
+                    "type": "step_response",
+                    "notification_id": notification.notification_id,
+                    "response": "123456",
+                },
+            )
+        )
+
+        assert manager.errors == []
+        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        assert resolved is not None
+        assert resolved.status == "resolved"
+        assert resolved.resolution is not None
+        assert resolved.resolution["decision"] == "continue"
+        assert resolved.resolution["challenge_completed"] is True
+        assert str(resolved.resolution["response_ref"]).startswith("$credential:challenge_auth_direct_ok")
+
+
 def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
     monkeypatch: object, tmp_path: Path
 ) -> None:

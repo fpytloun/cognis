@@ -234,6 +234,7 @@ import X from 'lucide-svelte/icons/x';
     question: string;
     options: string[];
     context: string;
+    kind?: 'question' | 'auth_challenge';
   }
 
   type ChatTodo = TodoSnapshotItem;
@@ -354,21 +355,35 @@ import X from 'lucide-svelte/icons/x';
     question: unknown,
     options: unknown,
     context: unknown,
+    kind: PendingDirectQuestion['kind'] = 'question',
   ): PendingDirectQuestion {
     return {
       notificationId,
       stepName,
       question: typeof question === 'string' && question.trim().length > 0
         ? question.trim()
-        : 'The assistant needs more input to continue.',
+        : kind === 'auth_challenge'
+          ? 'Authentication is required to continue.'
+          : 'The assistant needs more input to continue.',
       options: directQuestionOptions(options),
-      context: directQuestionContext(context)
+      context: directQuestionContext(context),
+      kind
     };
   }
 
   function pendingDirectQuestionFromNotification(notification: Notification): PendingDirectQuestion | null {
-    if (notification.notification_type !== 'step_question' || notification.task_id || notification.status !== 'pending') {
+    if (!['step_question', 'auth_challenge'].includes(notification.notification_type) || notification.task_id || notification.status !== 'pending') {
       return null;
+    }
+    if (notification.notification_type === 'auth_challenge') {
+      return pendingDirectQuestionFromParts(
+        notification.notification_id,
+        notification.step_name ?? undefined,
+        notification.payload.message ?? notification.payload.label,
+        [],
+        notification.payload.metadata,
+        'auth_challenge',
+      );
     }
     return pendingDirectQuestionFromParts(
       notification.notification_id,
@@ -376,6 +391,7 @@ import X from 'lucide-svelte/icons/x';
       notification.payload.question,
       notification.payload.options,
       notification.payload.context,
+      'question',
     );
   }
 
@@ -838,9 +854,9 @@ import X from 'lucide-svelte/icons/x';
     try {
       const notifications = await api.notifications.list(currentConversation.conversation_id);
       const pendingStepNotifications = notifications.filter(
-        (item) => item.notification_type === 'step_question' && item.status === 'pending',
+        (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
       );
-      // Annotate any pending step_request_input tool call with a
+      // Annotate any pending input/challenge tool call with a
       // notification id so the send routing can resolve it without
       // needing another round-trip. Task-scoped notifications count
       // too — the UI uses the annotation purely for resolution, and
@@ -1795,13 +1811,13 @@ import X from 'lucide-svelte/icons/x';
       // Resolve the notification ID. Order of preference:
       //   1. The tool call's own annotation (authoritative if present).
       //   2. `pendingDirectQuestion.notificationId` from the WS event.
-      //   3. A fresh fetch of pending step_question notifications.
+      //   3. A fresh fetch of pending input/challenge notifications.
       let notificationId = pendingStepTool?.notificationId ?? pendingDirectQuestion?.notificationId ?? '';
       if (!notificationId && currentConversation) {
         try {
           const list = await api.notifications.list(currentConversation.conversation_id);
           const match = list.find(
-            (item) => item.notification_type === 'step_question' && item.status === 'pending',
+            (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
           );
           if (match) notificationId = match.notification_id;
         } catch {
@@ -2260,7 +2276,24 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
-    if (event.type === 'workflow_step_question_resolved') {
+    if (event.type === 'auth_challenge' && event.notification_id) {
+      timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
+      if (!event.task_id) {
+        pendingDirectQuestion = pendingDirectQuestionFromParts(
+          event.notification_id,
+          event.step_name,
+          event.message ?? event.label,
+          [],
+          event.metadata,
+          event.type,
+        );
+        directQuestionSubmitting = false;
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+      }
+    }
+
+    if (event.type === 'workflow_step_question_resolved' || event.type === 'auth_challenge_resolved') {
       if (pendingDirectQuestion && event.notification_id === pendingDirectQuestion.notificationId) {
         pendingDirectQuestion = null;
       }

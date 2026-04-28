@@ -21,7 +21,7 @@
   const nowDate = new Date();
 
   const LINES_PER_PAGE = 50;
-  const startsExpanded = $derived(item.toolName.toLowerCase().replace(/_/g, '') === 'steprequestinput');
+  const startsExpanded = $derived(['steprequestinput', 'requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, '')));
 
   $effect(() => {
     if (startsExpanded && !autoExpanded) {

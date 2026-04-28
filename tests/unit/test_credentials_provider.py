@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import cognis.providers.credentials.encrypted_db as encrypted_db_module
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
 from cognis.models.agent import AgentDefinition, AgentPermissions
@@ -103,3 +104,52 @@ async def test_credentials_provider_roundtrip_and_resolution(
     assert second.user_email == "other@example.com"
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_credentials_provider_generates_totp_from_seed(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setattr(encrypted_db_module.time, "time", lambda: 59)  # type: ignore[attr-defined]
+    config = load_config()
+    password_hasher = create_password_hasher()
+    _, engine, session_factory, _ = await bootstrap_runtime(config, password_hasher)
+    provider = EncryptedDBCredentialsProvider(session_factory, str(config.secrets_key_path))
+    try:
+        async with session_factory() as session:
+            await create_user(
+                session,
+                email="user@example.com",
+                name="User",
+                password_hash=password_hasher.hash("password123"),
+                role="user",
+            )
+            await session.commit()
+
+        await provider.upsert_credential(
+            credential_id="reddit_mfa",
+            user_email="user@example.com",
+            kind="totp_seed",
+            label="Reddit MFA",
+            payload={
+                "secret": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+                "digits": 6,
+                "period": 30,
+                "algorithm": "sha1",
+            },
+        )
+        resolved = await provider.resolve_ref(
+            "$credential:reddit_mfa.otp",
+            agent=AgentDefinition(
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent",
+                permissions=AgentPermissions(allowed_credentials=["reddit_mfa"]),
+            ),
+            user_email="user@example.com",
+        )
+
+        assert resolved.value == "287082"
+    finally:
+        await engine.dispose()

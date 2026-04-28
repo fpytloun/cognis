@@ -7,7 +7,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from fnmatch import fnmatchcase
 from time import monotonic, perf_counter
@@ -113,6 +115,8 @@ class ToolRouter:
         image_generation_provider: Any | None = None,
         artifact_store: Any | None = None,
         session_factory: Any | None = None,
+        notification_service: Any | None = None,
+        pause_waiter: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.llm = llm
@@ -122,6 +126,8 @@ class ToolRouter:
         self.image_generation_provider = image_generation_provider
         self.artifact_store = artifact_store
         self._session_factory = session_factory
+        self.notification_service = notification_service
+        self.pause_waiter = pause_waiter
         self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
         self._decision_cache_ttl_seconds = 15.0
@@ -138,6 +144,8 @@ class ToolRouter:
         tool_output_store: Any | None = None,
         image_generation_provider: Any | None = None,
         artifact_store: Any | None = None,
+        notification_service: Any | None = None,
+        pause_waiter: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -153,6 +161,8 @@ class ToolRouter:
             image_generation_provider=image_generation_provider,
             artifact_store=artifact_store,
             session_factory=session_factory,
+            notification_service=notification_service,
+            pause_waiter=pause_waiter,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -911,8 +921,7 @@ class ToolRouter:
                     item.setdefault("size_bytes", row.size_bytes)
                 sanitized_assets.append(item)
             arguments["assets"] = sanitized_assets
-        if self.credentials_provider is not None:
-            arguments = await self._resolve_credential_refs(arguments, session, agent)
+        arguments = self._sanitize_sensitive_refs_for_guardrails(arguments, root=True)
         return tool_call.model_copy(update={"arguments": arguments})
 
     async def _prepare_local_tool_call(
@@ -948,20 +957,69 @@ class ToolRouter:
                     item.setdefault("filename", filename)
                 resolved_assets.append(item)
             arguments["assets"] = resolved_assets
-        if self.credentials_provider is not None:
-            arguments = await self._resolve_credential_refs(arguments, session, agent)
+        arguments = await self._resolve_sensitive_refs(arguments, session, agent, tool_call)
         return tool_call.model_copy(update={"arguments": arguments})
 
-    async def _resolve_credential_refs(
-        self, arguments: dict[str, Any], session: SessionModel, agent: AgentDefinition
+    def _sanitize_sensitive_refs_for_guardrails(self, value: Any, *, root: bool = False) -> Any:
+        if isinstance(value, dict):
+            if not root and isinstance(value.get("value_ref"), str) and value["value_ref"].strip():
+                return "<resolved-at-execution>"
+            sanitized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key in {"auth_state", "value"} and (
+                    isinstance(value.get("value_ref"), str)
+                    or isinstance(value.get("auth_state_ref"), str)
+                ):
+                    sanitized[key] = "<resolved-at-execution>"
+                elif key == "env" and isinstance(item, dict):
+                    sanitized[key] = {
+                        str(env_key): "<resolved-at-execution>"
+                        if isinstance(env_value, str)
+                        and (env_value.startswith("$credential:") or env_value.startswith("$auth_challenge:"))
+                        else self._sanitize_sensitive_refs_for_guardrails(env_value)
+                        for env_key, env_value in item.items()
+                    }
+                else:
+                    sanitized[key] = self._sanitize_sensitive_refs_for_guardrails(item)
+            return sanitized
+        if isinstance(value, list):
+            return [self._sanitize_sensitive_refs_for_guardrails(item) for item in value]
+        if isinstance(value, str) and (
+            value.startswith("$credential:") or value.startswith("$auth_challenge:")
+        ):
+            return "<resolved-at-execution>"
+        return value
+
+    async def _resolve_sensitive_refs(
+        self,
+        arguments: dict[str, Any],
+        session: SessionModel,
+        agent: AgentDefinition,
+        tool_call: ToolCall,
     ) -> dict[str, Any]:
         resolved = dict(arguments)
         value_ref = resolved.get("value_ref")
         if isinstance(value_ref, str) and value_ref.strip():
-            cred = await self._resolve_credential_value(value_ref.strip(), session, agent)
-            resolved["value"] = str(cred.value)
+            value = await self._resolve_value_ref(
+                value_ref.strip(),
+                session=session,
+                agent=agent,
+                tool_call=tool_call,
+                challenge_payload=resolved.get("auth_challenge")
+                if isinstance(resolved.get("auth_challenge"), dict)
+                else None,
+            )
+            resolved["value"] = str(value)
         elif isinstance(value_ref, str):
             resolved.pop("value_ref", None)
+        args = resolved.get("args")
+        if tool_call.name == "browser_eval" and isinstance(args, list):
+            resolved["args"] = [
+                await self._resolve_nested_sensitive_refs(
+                    item, session=session, agent=agent, tool_call=tool_call
+                )
+                for item in args
+            ]
         auth_state_ref_raw = resolved.get("auth_state_ref")
         if isinstance(auth_state_ref_raw, str) and auth_state_ref_raw.strip():
             auth_state_ref = auth_state_ref_raw.strip()
@@ -1013,10 +1071,154 @@ class ToolRouter:
                 if isinstance(value, str) and value.startswith("$credential:"):
                     cred = await self._resolve_credential_value(value, session, agent)
                     new_env[str(key)] = str(cred.value)
+                elif isinstance(value, str) and value.startswith("$auth_challenge:"):
+                    new_env[str(key)] = str(
+                        await self._resolve_auth_challenge_value_ref(
+                            value,
+                            session=session,
+                            agent=agent,
+                            tool_call=tool_call,
+                            challenge_payload=None,
+                        )
+                    )
                 else:
                     new_env[str(key)] = value
             resolved["env"] = new_env
         return resolved
+
+    async def _resolve_nested_sensitive_refs(
+        self,
+        value: Any,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        tool_call: ToolCall,
+    ) -> Any:
+        if isinstance(value, dict):
+            value_ref = value.get("value_ref")
+            if isinstance(value_ref, str) and value_ref.strip():
+                return await self._resolve_value_ref(
+                    value_ref.strip(),
+                    session=session,
+                    agent=agent,
+                    tool_call=tool_call,
+                    challenge_payload=value.get("auth_challenge")
+                    if isinstance(value.get("auth_challenge"), dict)
+                    else None,
+                )
+            return {
+                str(key): await self._resolve_nested_sensitive_refs(
+                    item, session=session, agent=agent, tool_call=tool_call
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                await self._resolve_nested_sensitive_refs(
+                    item, session=session, agent=agent, tool_call=tool_call
+                )
+                for item in value
+            ]
+        return value
+
+    async def _resolve_value_ref(
+        self,
+        ref: str,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        tool_call: ToolCall,
+        challenge_payload: dict[str, Any] | None = None,
+    ) -> Any:
+        if ref.startswith("$auth_challenge:"):
+            return await self._resolve_auth_challenge_value_ref(
+                ref,
+                session=session,
+                agent=agent,
+                tool_call=tool_call,
+                challenge_payload=challenge_payload,
+            )
+        cred = await self._resolve_credential_value(ref, session, agent)
+        return cred.value
+
+    async def _resolve_auth_challenge_value_ref(
+        self,
+        ref: str,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,  # noqa: ARG002
+        tool_call: ToolCall,
+        challenge_payload: dict[str, Any] | None,
+    ) -> Any:
+        if self.notification_service is None or self.pause_waiter is None:
+            raise CredentialAccessError(
+                "auth_challenge_unavailable",
+                "Auth challenge resolution is not available for this tool call.",
+            )
+        raw = ref[len("$auth_challenge:") :]
+        challenge_id, field = raw, "response"
+        if "." in raw:
+            challenge_id, field = raw.split(".", 1)
+        challenge_id = challenge_id.strip() or "auth_challenge"
+        field = field.strip() or "response"
+        payload = dict(challenge_payload or {})
+        try:
+            timeout_seconds = int(payload.get("timeout_seconds") or 180)
+        except (TypeError, ValueError) as exc:
+            raise CredentialAccessError(
+                "auth_challenge_invalid",
+                "Auth challenge timeout_seconds must be an integer.",
+            ) from exc
+        timeout_seconds = max(1, min(timeout_seconds, 600))
+        payload.setdefault("kind", "otp_code" if field == "code" else "manual_continue")
+        payload.setdefault("label", challenge_id.replace("_", " ").strip().title())
+        payload.setdefault("message", "Authentication is required to continue.")
+        payload.setdefault("required_fields", [field] if field not in {"response", "completed"} else [])
+        payload["expires_at"] = (datetime.now(UTC) + timedelta(seconds=timeout_seconds)).isoformat()
+        pause_id = f"auth_{uuid.uuid4().hex[:12]}"
+        metadata = dict(tool_call.runtime_metadata or {})
+        await self.notification_service.create(
+            notification_type="auth_challenge",
+            user_email=session.user_email,
+            conversation_id=session.conversation_id,
+            task_id=metadata.get("task_id") if isinstance(metadata.get("task_id"), str) else None,
+            step_name=metadata.get("step_name") if isinstance(metadata.get("step_name"), str) else None,
+            step_run_id=metadata.get("step_run_id") if isinstance(metadata.get("step_run_id"), str) else None,
+            session_id=session.session_id,
+            notification_id=pause_id,
+            payload=payload,
+        )
+        try:
+            resolution = await self.pause_waiter.wait(pause_id, timeout=float(timeout_seconds))
+        except TimeoutError as exc:
+            if self.notification_service is not None:
+                await self.notification_service.mark_orphaned(pause_id, reason="timeout")
+            raise CredentialAccessError(
+                "auth_challenge_timeout",
+                "Authentication challenge timed out.",
+            ) from exc
+        if resolution.decision in {"cancel", "deny"}:
+            raise CredentialAccessError(
+                "auth_challenge_cancelled",
+                "Authentication challenge was cancelled.",
+            )
+        response_payload = resolution.data.get("response_payload")
+        if isinstance(response_payload, dict) and response_payload.get(field) is not None:
+            return response_payload[field]
+        if resolution.data.get(field) is not None:
+            return resolution.data[field]
+        if resolution.data.get("response") is not None:
+            return resolution.data["response"]
+        response_ref = resolution.data.get("response_ref")
+        if isinstance(response_ref, str) and response_ref.startswith("$credential:"):
+            cred = await self._resolve_credential_value(response_ref, session, agent)
+            return cred.value
+        if resolution.data.get("challenge_completed") is True:
+            return ""
+        raise CredentialAccessError(
+            "auth_challenge_missing_response",
+            "Authentication challenge did not provide the requested response.",
+        )
 
     async def _resolve_credential_value(
         self, ref: str, session: SessionModel, agent: AgentDefinition

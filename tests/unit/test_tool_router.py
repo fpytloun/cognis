@@ -85,6 +85,20 @@ class _SlowExecutor(_Executor):
         return ToolResult(output="too slow")
 
 
+class _CapturingExecutor(_Executor):
+    def __init__(self) -> None:
+        super().__init__(result=ToolResult(output="captured"))
+        self.tool_calls: list[ToolCall] = []
+
+    async def tool_execute(
+        self, tool_call: ToolCall, timeout_seconds: int | None = None
+    ) -> ToolResult:
+        del timeout_seconds
+        self.calls += 1
+        self.tool_calls.append(tool_call)
+        return self.result
+
+
 class _RemoteExecutor(_Executor):
     def __init__(self, result: ToolResult | None = None) -> None:
         super().__init__(result=result)
@@ -133,6 +147,14 @@ class _CredentialFailingProvider:
             "Credential not allowed for agent: rohlik",
             credential_id="rohlik",
         )
+
+
+class _CredentialProvider:
+    async def resolve_ref(self, ref: str, *, agent: AgentDefinition, user_email: str) -> object:
+        del agent, user_email
+        if ref == "$credential:reddit_mfa.otp":
+            return SimpleNamespace(value="123456")
+        raise AssertionError(f"unexpected ref: {ref}")
 
 
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
@@ -509,6 +531,51 @@ async def test_tool_router_returns_recoverable_result_for_credential_resolution_
     assert result.metadata["recoverable"] is True
     assert result.metadata["credential_id"] == "rohlik"
     assert "Credential not allowed for agent" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        non_bypassable_patterns=[],
+        credentials_provider=_CredentialProvider(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="browser_eval",
+                description="eval",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="local_mcp", server_name="browser", raw_tool_name="eval"),
+                non_bypassable=True,
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingExecutor()
+
+    result = await router.execute(
+        ToolCall(
+            call_id="browser-eval-1",
+            name="browser_eval",
+            arguments={
+                "session_id": "browser-1",
+                "script": "(code) => code",
+                "args": [{"value_ref": "$credential:reddit_mfa.otp"}],
+            },
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    assert guardrails.last_evaluate_call[2]["args"] == ["<resolved-at-execution>"]
+    assert executor.tool_calls[0].arguments["args"] == ["123456"]
 
 
 @pytest.mark.asyncio

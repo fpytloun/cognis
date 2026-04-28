@@ -198,6 +198,7 @@ class InboundPipeline:
         channel_manager_ref: Any,  # Callable[[], ChannelManager] — lazy ref
         command_dispatcher: Any = None,
         notification_service: Any = None,
+        credentials_provider: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
@@ -207,6 +208,7 @@ class InboundPipeline:
         self._channel_manager_ref = channel_manager_ref
         self._command_dispatcher = command_dispatcher
         self._notification_service = notification_service
+        self._credentials_provider = credentials_provider
 
     async def process(
         self,
@@ -673,18 +675,39 @@ class InboundPipeline:
         direct_questions = [
             notif
             for notif in pending
-            if notif.notification_type == "step_question" and notif.task_id is None
+            if notif.notification_type in {"step_question", "auth_challenge"} and notif.task_id is None
         ]
         if not direct_questions:
             return None
 
         # Resolve the most recent pending direct-chat question
         target = direct_questions[0]
-        resolved = await self._notification_service.resolve(
-            target.notification_id,
-            "continue",
-            {"response": content},
-        )
+        if target.notification_type == "auth_challenge":
+            from cognis.core.notification_resolution import build_auth_challenge_resolution_data
+
+            try:
+                data = await build_auth_challenge_resolution_data(
+                    notification=target,
+                    decision="continue",
+                    user_email=user_email,
+                    credentials_provider=self._credentials_provider,
+                    response=content,
+                )
+            except ValueError:
+                return False
+            resolved = await self._notification_service.resolve(
+                target.notification_id,
+                "continue",
+                data,
+                user_email=user_email,
+            )
+        else:
+            resolved = await self._notification_service.resolve(
+                target.notification_id,
+                "continue",
+                {"response": content},
+                user_email=user_email,
+            )
         return resolved
 
     async def _normalize_media_attachments(

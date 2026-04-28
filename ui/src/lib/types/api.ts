@@ -1398,6 +1398,48 @@ export interface WebSocketWorkflowQuestionResolvedEvent {
   decision?: string;
 }
 
+export interface WebSocketAuthChallengeEvent {
+  type: 'auth_challenge';
+  conversation_id?: string;
+  notification_id: string;
+  task_id?: string | null;
+  step_name?: string;
+  label?: string;
+  message?: string;
+  kind?: string;
+  metadata?: Record<string, unknown>;
+  required_fields?: unknown[];
+  expires_at?: string;
+}
+
+export interface WebSocketAuthChallengeResolvedEvent {
+  type: 'auth_challenge_resolved';
+  conversation_id?: string;
+  notification_id?: string;
+  decision?: string;
+}
+
+export interface WebSocketCredentialRequestEvent {
+  type: 'credential_request';
+  conversation_id?: string;
+  notification_id: string;
+  task_id?: string | null;
+  step_name?: string;
+  label?: string;
+  message?: string;
+  credential_id?: string;
+  kind?: string;
+  metadata?: Record<string, unknown>;
+  required_fields?: unknown[];
+}
+
+export interface WebSocketCredentialRequestResolvedEvent {
+  type: 'credential_request_resolved';
+  conversation_id?: string;
+  notification_id?: string;
+  decision?: string;
+}
+
 export interface WebSocketWorkflowCompletedEvent {
   type: 'workflow_completed';
   conversation_id?: string;
@@ -1607,6 +1649,10 @@ export type CognisWebSocketEvent =
   | WebSocketWorkflowQuestionEvent
   | WebSocketWorkflowGateResolvedEvent
   | WebSocketWorkflowQuestionResolvedEvent
+  | WebSocketAuthChallengeEvent
+  | WebSocketAuthChallengeResolvedEvent
+  | WebSocketCredentialRequestEvent
+  | WebSocketCredentialRequestResolvedEvent
   | WebSocketWorkflowCompletedEvent
   | WebSocketWorkflowFailedEvent
   | WebSocketWorkflowCancelledEvent

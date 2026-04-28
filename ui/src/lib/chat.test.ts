@@ -1474,6 +1474,42 @@ describe('chat timeline helpers', () => {
       expect(tool.notificationId).toBe('input_abc123');
     });
 
+    it('finds deferred auth challenge browser_eval calls', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_eval_otp',
+        tool_name: 'browser_eval',
+        status: 'started',
+        arguments: {
+          session_id: 'browser_1',
+          script: '(code) => code',
+          args: [{ value_ref: '$auth_challenge:reddit.code', auth_challenge: { label: 'Reddit MFA' } }]
+        }
+      });
+
+      const pending = findPendingStepRequestInputCall(timeline);
+      expect(pending).not.toBeNull();
+      expect(pending?.toolName).toBe('browser_eval');
+    });
+
+    it('redacts optimistic auth challenge answers', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_auth',
+        tool_name: 'request_auth_challenge',
+        status: 'started',
+        arguments: { label: 'Reddit MFA', required_fields: ['code'] }
+      });
+      const tool = timeline.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      const resolved = optimisticallyResolveStepRequestInput(timeline, tool.id, '123456');
+      const updated = resolved.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      expect(updated.result).toBe(JSON.stringify({ response: '<redacted>' }));
+    });
+
     it('optimistically resolves a step_request_input tool call with the user answer', () => {
       const timeline = applyWebSocketEvent([], {
         type: 'tool_call',

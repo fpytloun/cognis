@@ -1136,8 +1136,27 @@ const PENDING_TOOL_STATUSES = new Set(['started', 'running', 'paused']);
  * uses snake_case; this normalizer keeps the comparison resilient against
  * casing/underscore noise from older history rows.
  */
-function isStepRequestInputToolName(name: string): boolean {
-  return name.toLowerCase().replace(/_/g, '') === 'steprequestinput';
+function normalizedToolName(name: string): string {
+  return name.toLowerCase().replace(/_/g, '');
+}
+
+function hasDeferredAuthChallenge(value: unknown): boolean {
+  if (typeof value === 'string') return value.startsWith('$auth_challenge:');
+  if (Array.isArray(value)) return value.some(hasDeferredAuthChallenge);
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (typeof record.value_ref === 'string' && record.value_ref.startsWith('$auth_challenge:')) return true;
+    if (record.auth_challenge && typeof record.auth_challenge === 'object') return true;
+    return Object.values(record).some(hasDeferredAuthChallenge);
+  }
+  return false;
+}
+
+function isPendingInputToolCall(tool: ToolCallTimelineItem): boolean {
+  const name = normalizedToolName(tool.toolName);
+  if (name === 'steprequestinput' || name === 'requestauthchallenge') return true;
+  if ((name === 'browserfill' || name === 'browsereval') && hasDeferredAuthChallenge(tool.arguments)) return true;
+  return false;
 }
 
 /**
@@ -1151,7 +1170,7 @@ export function findPendingStepRequestInputCall(items: TimelineItem[]): ToolCall
     const item = items[i];
     if (item.kind !== 'tool_call') continue;
     const toolItem = item as ToolCallTimelineItem;
-    if (!isStepRequestInputToolName(toolItem.toolName)) continue;
+    if (!isPendingInputToolCall(toolItem)) continue;
     if (!PENDING_TOOL_STATUSES.has(toolItem.status)) continue;
     if (toolItem.result !== undefined) continue;
     return toolItem;
@@ -1192,12 +1211,12 @@ export function optimisticallyResolveStepRequestInput(
   return items.map((item) => {
     if (item.id !== toolId || item.kind !== 'tool_call') return item;
     const tool = item as ToolCallTimelineItem;
-    if (!isStepRequestInputToolName(tool.toolName)) return item;
+    if (!isPendingInputToolCall(tool)) return item;
     return {
       ...tool,
       status: 'completed',
       isError: false,
-      result: JSON.stringify({ response }),
+      result: JSON.stringify({ response: normalizedToolName(tool.toolName) === 'steprequestinput' ? response : '<redacted>' }),
     } satisfies ToolCallTimelineItem;
   });
 }
@@ -1836,9 +1855,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return removeWorkflowPromptNotices(next);
   }
 
-  if (event.type === 'workflow_gate' || event.type === 'workflow_step_question') {
+  if (event.type === 'workflow_gate' || event.type === 'workflow_step_question' || event.type === 'auth_challenge' || event.type === 'credential_request') {
     const isDirectQuestion = event.type === 'workflow_step_question' && !event.task_id;
-    if (isDirectQuestion) {
+    const isDirectAuth = event.type === 'auth_challenge' && !event.task_id;
+    if (isDirectQuestion || isDirectAuth) {
       return next;
     }
     const noticeId = event.notification_id
@@ -1846,14 +1866,22 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       : undefined;
     const title = event.type === 'workflow_gate'
       ? 'Task waiting for approval'
-      : isDirectQuestion
-        ? 'Assistant requested more input'
-        : 'Task requested more input';
+      : event.type === 'auth_challenge'
+        ? 'Task waiting for authentication'
+        : event.type === 'credential_request'
+          ? 'Task waiting for credentials'
+          : isDirectQuestion
+            ? 'Assistant requested more input'
+            : 'Task requested more input';
     const description = event.type === 'workflow_gate'
       ? `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`
-      : isDirectQuestion
-        ? event.question?.trim() || 'Conversation paused until you answer the clarification request.'
-        : `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`;
+      : event.type === 'auth_challenge'
+        ? event.message?.trim() || `Task ${event.task_id} paused for authentication.`
+        : event.type === 'credential_request'
+          ? event.message?.trim() || `Task ${event.task_id} paused for credentials.`
+          : isDirectQuestion
+            ? event.question?.trim() || 'Conversation paused until you answer the clarification request.'
+            : `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`;
     next.push(
       createNotice(
         title,
@@ -1865,9 +1893,15 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return next;
   }
 
-  if (event.type === 'workflow_gate_resolved' || event.type === 'workflow_step_question_resolved') {
+  if (event.type === 'workflow_gate_resolved' || event.type === 'workflow_step_question_resolved' || event.type === 'auth_challenge_resolved' || event.type === 'credential_request_resolved') {
     if (!event.notification_id) return next;
-    const sourceType = event.type === 'workflow_gate_resolved' ? 'workflow_gate' : 'workflow_step_question';
+    const sourceType = event.type === 'workflow_gate_resolved'
+      ? 'workflow_gate'
+      : event.type === 'auth_challenge_resolved'
+        ? 'auth_challenge'
+        : event.type === 'credential_request_resolved'
+          ? 'credential_request'
+          : 'workflow_step_question';
     return next.filter((item) => item.id !== `notice:${sourceType}:${event.notification_id}`);
   }
 

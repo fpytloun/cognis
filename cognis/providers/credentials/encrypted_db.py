@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
+import struct
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +24,12 @@ from cognis.models.credential import CredentialAccessError, CredentialRecord, Cr
 from cognis.store.models import CredentialRow
 
 logger = get_logger(__name__)
+
+_TOTP_ALGORITHMS = {
+    "sha1": hashlib.sha1,
+    "sha256": hashlib.sha256,
+    "sha512": hashlib.sha512,
+}
 
 
 class EncryptedDBCredentialsProvider:
@@ -228,9 +238,13 @@ class EncryptedDBCredentialsProvider:
                     f"Credential expired: {credential_id}",
                     credential_id=credential_id,
                 )
+            kind = row.kind
             payload = self._decrypt_payload(row.encrypted_payload)
-        value = payload if field is None else payload.get(field)
-        if field is not None and field not in payload:
+        if kind == "totp_seed" and field == "otp":
+            value = _generate_totp(payload)
+        else:
+            value = payload if field is None else payload.get(field)
+        if field is not None and field not in payload and not (kind == "totp_seed" and field == "otp"):
             raise CredentialAccessError(
                 "credential_field_not_found",
                 f"Credential field not found: {credential_id}.{field}",
@@ -263,3 +277,57 @@ class EncryptedDBCredentialsProvider:
             expires_at=row.expires_at,
             revoked_at=row.revoked_at,
         )
+
+
+def _generate_totp(payload: dict[str, Any]) -> str:
+    """Generate a TOTP code from an encrypted totp_seed credential payload."""
+
+    secret = str(payload.get("secret") or payload.get("seed") or "").strip().replace(" ", "")
+    if not secret:
+        raise CredentialAccessError(
+            "credential_field_not_found",
+            "TOTP seed credential is missing secret",
+            field="secret",
+        )
+    try:
+        digits = int(payload.get("digits") or 6)
+        period = int(payload.get("period") or 30)
+    except (TypeError, ValueError) as exc:
+        raise CredentialAccessError(
+            "credential_invalid",
+            "TOTP digits and period must be integers",
+        ) from exc
+    if digits < 6 or digits > 10:
+        raise CredentialAccessError(
+            "credential_invalid",
+            "TOTP digits must be between 6 and 10",
+            field="digits",
+        )
+    if period <= 0:
+        raise CredentialAccessError(
+            "credential_invalid",
+            "TOTP period must be positive",
+            field="period",
+        )
+    algorithm = str(payload.get("algorithm") or "sha1").lower().replace("-", "")
+    digest = _TOTP_ALGORITHMS.get(algorithm)
+    if digest is None:
+        raise CredentialAccessError(
+            "credential_invalid",
+            f"Unsupported TOTP algorithm: {algorithm}",
+            field="algorithm",
+        )
+    try:
+        padded_secret = secret.upper() + "=" * ((8 - len(secret) % 8) % 8)
+        key = base64.b32decode(padded_secret, casefold=True)
+    except Exception as exc:
+        raise CredentialAccessError(
+            "credential_invalid",
+            "TOTP seed is not valid base32",
+            field="secret",
+        ) from exc
+    counter = int(time.time() // period)
+    hmac_digest = hmac.new(key, struct.pack(">Q", counter), digest).digest()
+    offset = hmac_digest[-1] & 0x0F
+    code_int = struct.unpack(">I", hmac_digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(code_int % (10**digits)).zfill(digits)

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from cognis.api.common import require_current_user
 from cognis.api.models import CredentialUpsertRequest
+from cognis.core.notification_resolution import build_auth_challenge_resolution_data
 from cognis.core.notifications import Notification, NotificationService
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
@@ -244,40 +244,17 @@ async def resolve_notification(
             "credential_kind": created.kind,
         }
     elif notification.notification_type == "auth_challenge":
-        required_fields = (
-            notification.payload.get("required_fields")
-            if isinstance(notification.payload, dict)
-            else []
-        )
-        response_value: str | None = None
-        if payload.response is not None:
-            response_value = payload.response
-        elif (
-            payload.response_payload is not None
-            and payload.response_payload.get("code") is not None
-        ):
-            response_value = str(payload.response_payload["code"])
-        if payload.decision in {"deny", "cancel"}:
-            data = {"challenge_completed": False}
-        elif isinstance(required_fields, list) and "code" in required_fields and not response_value:
-            raise HTTPException(status_code=400, detail="Auth challenge requires a code response")
-        elif response_value:
-            created = await request.app.state.providers.credentials.upsert_credential(
-                credential_id=f"challenge_{notification_id}",
+        try:
+            data = await build_auth_challenge_resolution_data(
+                notification=notification,
+                decision=payload.decision,
                 user_email=user.email,
-                kind="text",
-                label=f"Challenge response {notification_id}",
-                payload={"value": response_value},
-                metadata={"notification_id": notification_id, "ephemeral": True},
-                description="Ephemeral auth challenge response",
-                expires_at=datetime.now(UTC) + timedelta(minutes=10),
+                credentials_provider=request.app.state.providers.credentials,
+                response=payload.response,
+                response_payload=payload.response_payload,
             )
-            data = {
-                "response_ref": f"$credential:{created.credential_id}.value",
-                "challenge_completed": True,
-            }
-        elif payload.decision in {"approve", "continue", "completed"}:
-            data = {"challenge_completed": True}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     ok = await svc.resolve(notification_id, payload.decision, data, user_email=user.email)
     if not ok:
