@@ -81,8 +81,39 @@ from cognis.store.queries import (
 )
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+_DELIVERY_MODES: frozenset[str] = frozenset(
+    {
+        "same_conversation",
+        "specific_conversation",
+        "latest_active_for_agent",
+        "preferred_channel",
+        "silent",
+    }
+)
 
 router = APIRouter(tags=["tasks"])
+
+
+def _validate_delivery_mode_applicability(
+    *,
+    delivery_mode: str,
+    source_type: str,
+    source_ref: str | None,
+) -> None:
+    if delivery_mode not in _DELIVERY_MODES:
+        raise api_exception(
+            400,
+            "validation_error",
+            f"Unsupported delivery mode: {delivery_mode}",
+        )
+    if delivery_mode == "same_conversation" and not (
+        source_type in {"chat", "agent"} and source_ref is not None
+    ):
+        raise api_exception(
+            400,
+            "validation_error",
+            "same_conversation delivery requires a chat source conversation",
+        )
 
 
 async def _resolve_completion_delivery(
@@ -176,14 +207,22 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             "validation_error",
             "chat-sourced tasks require source_ref conversation id",
         )
-    if payload.delivery_mode == "specific_conversation" and payload.delivery_target is None:
+    delivery_mode = payload.delivery_mode
+    if "delivery_mode" not in payload.model_fields_set and payload.source_type == "chat":
+        delivery_mode = "same_conversation"
+    if delivery_mode == "specific_conversation" and payload.delivery_target is None:
         raise api_exception(
             400,
             "validation_error",
             "specific_conversation delivery requires delivery_target",
         )
+    _validate_delivery_mode_applicability(
+        delivery_mode=delivery_mode,
+        source_type=payload.source_type,
+        source_ref=payload.source_ref,
+    )
     await _validate_agent_access(request, payload.agent_id)
-    if payload.source_type == "chat" and payload.source_ref is not None:
+    if payload.source_type in {"chat", "agent"} and payload.source_ref is not None:
         await _validate_conversation_access(request, payload.source_ref)
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
@@ -221,7 +260,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         resolved_workflow_id = created_workflow.workflow_id
         created_workflow_id = created_workflow.workflow_id
     queue = request.app.state.task_queue
-    delivery = TaskDelivery(mode=payload.delivery_mode, target=payload.delivery_target)
+    delivery = TaskDelivery(mode=delivery_mode, target=payload.delivery_target)
     completion_delivery = await _resolve_completion_delivery(
         request,
         workflow_id=resolved_workflow_id,
@@ -394,8 +433,19 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             "validation_error",
             "specific_conversation delivery requires delivery_target",
         )
+    _validate_delivery_mode_applicability(
+        delivery_mode=effective_delivery_mode,
+        source_type=existing_row.source_type,
+        source_ref=existing_row.source_ref,
+    )
     if payload.delivery_target is not None:
         await _validate_conversation_access(request, payload.delivery_target)
+    if (
+        effective_delivery_mode == "same_conversation"
+        and existing_row.source_type == "agent"
+        and existing_row.source_ref is not None
+    ):
+        await _validate_conversation_access(request, existing_row.source_ref)
     CompletionDeliveryPolicy(
         completion_mode_family=effective_completion_mode_family,
         allow_silent_completion=effective_allow_silent_completion,

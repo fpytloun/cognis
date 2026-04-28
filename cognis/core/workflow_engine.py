@@ -72,11 +72,15 @@ from cognis.runtime_context import (
 from cognis.store.queries import (
     create_step_run,
     fail_running_step_runs_for_task,
+    get_conversation,
+    get_conversation_channel_route,
     get_deliverable,
     get_latest_active_conversation_for_agent,
+    get_latest_active_conversation_for_channel_account,
     get_latest_approved_deliverable_for_step_run,
     get_latest_rejected_deliverable_for_step_run,
     get_latest_step_run_for_task_step,
+    get_preferred_channel_account_for_agent,
     get_project,
     list_project_sources,
     list_project_workflow_ids,
@@ -1909,22 +1913,8 @@ class WorkflowEngine:
             return
 
         if applied_mode == "direct":
-            target_conversation_id: str | None = None
             delivery_mode = task.delivery.mode
-            if delivery_mode == "same_conversation":
-                target_conversation_id = task.source_ref
-            elif delivery_mode == "specific_conversation":
-                target_conversation_id = task.delivery.target
-            elif delivery_mode in ("latest_active_for_agent", "preferred_channel"):
-                async with self._session_factory() as db_session:
-                    latest = await get_latest_active_conversation_for_agent(
-                        db_session, task.created_by, task.agent_id
-                    )
-                target_conversation_id = (
-                    latest.conversation_id if latest is not None else task.source_ref
-                )
-            elif delivery_mode == "silent":
-                target_conversation_id = task.source_ref
+            target_conversation_id = await self._resolve_task_delivery_conversation(task)
             if target_conversation_id is None:
                 logger.warning(
                     "task_delivery: explicit direct completion has no resolved target, skipping",
@@ -1935,26 +1925,14 @@ class WorkflowEngine:
             return
 
         delivery_mode = task.delivery.mode
-        target_conversation_id: str | None = None
-
-        if delivery_mode == "same_conversation":
-            target_conversation_id = task.source_ref
-        elif delivery_mode == "specific_conversation":
-            target_conversation_id = task.delivery.target
-        elif delivery_mode in ("latest_active_for_agent", "preferred_channel"):
-            async with self._session_factory() as db_session:
-                latest = await get_latest_active_conversation_for_agent(
-                    db_session, task.created_by, task.agent_id
-                )
-            target_conversation_id = (
-                latest.conversation_id if latest is not None else task.source_ref
-            )
-        elif delivery_mode == "silent":
+        if delivery_mode == "silent":
             logger.info(
                 "task_delivery: legacy silent delivery mode, skipping",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
             return
+
+        target_conversation_id = await self._resolve_task_delivery_conversation(task)
 
         if target_conversation_id is None:
             logger.warning(
@@ -1982,6 +1960,57 @@ class WorkflowEngine:
         )
 
         await self._deliver_task_result_default(task, target_conversation_id)
+
+    async def _resolve_task_delivery_conversation(self, task: TaskModel) -> str | None:
+        """Resolve the conversation that should receive a task result."""
+
+        delivery_mode = task.delivery.mode
+        if delivery_mode == "same_conversation":
+            return task.source_ref if task.source_type in {"chat", "agent"} else None
+        if delivery_mode == "specific_conversation":
+            return task.delivery.target
+        if delivery_mode == "latest_active_for_agent":
+            async with self._session_factory() as db_session:
+                latest = await get_latest_active_conversation_for_agent(
+                    db_session, task.created_by, task.agent_id
+                )
+            return latest.conversation_id if latest is not None else task.source_ref
+        if delivery_mode == "preferred_channel":
+            return await self._resolve_preferred_channel_conversation(task)
+        if delivery_mode == "silent":
+            return task.source_ref
+        return None
+
+    async def _resolve_preferred_channel_conversation(self, task: TaskModel) -> str | None:
+        async with self._session_factory() as db_session:
+            account = await get_preferred_channel_account_for_agent(
+                db_session,
+                user_email=task.created_by,
+                agent_id=task.agent_id,
+            )
+            if account is None:
+                return None
+            if account.default_conversation_id:
+                conversation = await get_conversation(db_session, account.default_conversation_id)
+                route = await get_conversation_channel_route(
+                    db_session, account.default_conversation_id
+                )
+                if (
+                    conversation is not None
+                    and conversation.status == "active"
+                    and conversation.user_email == task.created_by
+                    and conversation.agent_id == task.agent_id
+                    and route is not None
+                    and route[1] == account.account_id
+                ):
+                    return conversation.conversation_id
+            latest = await get_latest_active_conversation_for_channel_account(
+                db_session,
+                user_email=task.created_by,
+                agent_id=task.agent_id,
+                account_id=account.account_id,
+            )
+            return latest.conversation_id if latest is not None else None
 
     async def _deliver_task_result_direct(
         self, task: TaskModel, target_conversation_id: str

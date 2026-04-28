@@ -4078,6 +4078,7 @@ async def create_channel_account(
     credential_refs: dict[str, str] | None = None,
     default_conversation_id: str | None = None,
     allow_new_conversations: bool = True,
+    preferred_for_task_delivery: bool = False,
     adapter_location: str = "controller",
     executor_id: str | None = None,
     allowed_senders: list[str] | None = None,
@@ -4086,6 +4087,13 @@ async def create_channel_account(
     webhook_secret: str | None = None,
 ) -> ChannelAccountRow:
     """Create a new channel account."""
+    if preferred_for_task_delivery:
+        await session.execute(
+            update(ChannelAccountRow)
+            .where(ChannelAccountRow.user_email == user_email)
+            .where(ChannelAccountRow.agent_id == agent_id)
+            .values(preferred_for_task_delivery=False)
+        )
     row = ChannelAccountRow(
         account_id=account_id or f"ch_{uuid.uuid4().hex[:12]}",
         channel_type=channel_type,
@@ -4096,6 +4104,7 @@ async def create_channel_account(
         credential_refs=credential_refs or {},
         default_conversation_id=default_conversation_id,
         allow_new_conversations=allow_new_conversations,
+        preferred_for_task_delivery=preferred_for_task_delivery,
         adapter_location=adapter_location,
         executor_id=executor_id,
         allowed_senders=allowed_senders or [],
@@ -4117,11 +4126,74 @@ async def update_channel_account(
     row = await get_channel_account(session, account_id)
     if row is None:
         return None
+    next_user_email = str(kwargs.get("user_email") or row.user_email)
+    next_agent_id = str(kwargs.get("agent_id") or row.agent_id)
+    if kwargs.get("preferred_for_task_delivery") is True:
+        await session.execute(
+            update(ChannelAccountRow)
+            .where(ChannelAccountRow.user_email == next_user_email)
+            .where(ChannelAccountRow.agent_id == next_agent_id)
+            .where(ChannelAccountRow.account_id != account_id)
+            .values(preferred_for_task_delivery=False)
+        )
     for key, value in kwargs.items():
         if hasattr(row, key):
             setattr(row, key, value)
     await session.flush()
     return row
+
+
+async def get_preferred_channel_account_for_agent(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    agent_id: str,
+) -> ChannelAccountRow | None:
+    """Return the preferred enabled task-delivery channel account for an agent."""
+
+    result = await session.execute(
+        select(ChannelAccountRow)
+        .where(ChannelAccountRow.user_email == user_email)
+        .where(ChannelAccountRow.agent_id == agent_id)
+        .where(ChannelAccountRow.enabled.is_(True))
+        .where(ChannelAccountRow.preferred_for_task_delivery.is_(True))
+        .order_by(ChannelAccountRow.updated_at.desc(), ChannelAccountRow.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_latest_active_conversation_for_channel_account(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    agent_id: str,
+    account_id: str,
+) -> Conversation | None:
+    """Return the latest active conversation bound to a channel account."""
+
+    latest_activity = case(
+        (Conversation.last_message_at.is_(None), Conversation.updated_at),
+        (Conversation.updated_at > Conversation.last_message_at, Conversation.updated_at),
+        else_=Conversation.last_message_at,
+    )
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.user_email == user_email)
+        .where(Conversation.agent_id == agent_id)
+        .where(Conversation.status == "active")
+        .where(Conversation.context_type.notin_(["web", "api"]))
+        .order_by(latest_activity.desc(), Conversation.updated_at.desc())
+    )
+    for conversation in result.scalars().all():
+        platform_data = conversation.context_data or {}
+        if str(platform_data.get("account_id") or "") == account_id:
+            return conversation
+        context_ref = conversation.context_ref or ""
+        parts = context_ref.split(":", 3)
+        if len(parts) >= 3 and parts[1] == account_id:
+            return conversation
+    return None
 
 
 async def delete_channel_account(

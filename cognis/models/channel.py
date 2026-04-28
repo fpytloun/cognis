@@ -103,6 +103,7 @@ class ChannelAccountConfig(BaseModel):
     # Routing
     default_conversation_id: str | None = None
     allow_new_conversations: bool = True
+    preferred_for_task_delivery: bool = False
 
     # Adapter location
     adapter_location: Literal["controller", "executor"] = "controller"

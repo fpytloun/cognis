@@ -358,6 +358,81 @@ def test_task_create_allows_non_chat_source_refs(monkeypatch: object, tmp_path: 
         body = response.json()
         assert body["source_type"] == "scheduler"
         assert body["source_ref"] == "sched_daily_review"
+        assert body["delivery"]["mode"] == "preferred_channel"
+
+
+def test_task_create_rejects_same_conversation_outside_chat(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        response = client.post(
+            "/api/v1/tasks",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "agent_id": "agent-1",
+                "title": "Board task",
+                "delivery_mode": "same_conversation",
+            },
+        )
+        assert response.status_code == 400
+
+
+def test_task_create_rejects_unknown_delivery_mode(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        response = client.post(
+            "/api/v1/tasks",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "agent_id": "agent-1",
+                "title": "Board task",
+                "delivery_mode": "typo",
+            },
+        )
+        assert response.status_code == 400
 
 
 def test_task_create_rejects_chat_without_source_ref(monkeypatch: object, tmp_path: Path) -> None:

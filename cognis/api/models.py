@@ -623,7 +623,7 @@ class TaskCreateRequest(BaseModel):
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None
-    delivery_mode: str = "same_conversation"
+    delivery_mode: str = "preferred_channel"
     delivery_target: str | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None

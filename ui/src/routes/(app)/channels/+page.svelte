@@ -51,6 +51,7 @@
     dm_policy: 'pairing',
     group_policy: 'pairing',
     allow_new_conversations: true,
+    preferred_for_task_delivery: false,
     credentialValues: {},
     settingValues: {},
   });
@@ -78,6 +79,7 @@
     dm_policy: 'pairing',
     group_policy: 'pairing',
     allow_new_conversations: true,
+    preferred_for_task_delivery: false,
     credentialValues: {},
     settingValues: {},
   });
@@ -273,6 +275,7 @@
         dm_policy: draft.dm_policy,
         group_policy: draft.group_policy,
         allow_new_conversations: draft.allow_new_conversations,
+        preferred_for_task_delivery: draft.preferred_for_task_delivery,
       });
 
       webhookInfo = selectedGuide()?.publicUrlNeeded
@@ -321,6 +324,7 @@
         dm_policy: draft.dm_policy,
         group_policy: draft.group_policy,
         allow_new_conversations: draft.allow_new_conversations,
+        preferred_for_task_delivery: draft.preferred_for_task_delivery,
       };
 
       const config: Record<string, unknown> = {};

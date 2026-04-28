@@ -155,6 +155,46 @@ async def _pairing_response(
     )
 
 
+async def _validate_default_conversation(
+    request: Request,
+    *,
+    conversation_id: str | None,
+    user_email: str,
+    agent_id: str,
+    account_id: str | None = None,
+) -> Any | None:
+    if conversation_id is None:
+        return None
+
+    from cognis.store.queries import get_conversation, get_conversation_channel_route
+
+    async with request.app.state.session_factory() as session:
+        conversation = await get_conversation(session, conversation_id)
+        route = await get_conversation_channel_route(session, conversation_id)
+
+    if conversation is None:
+        return error_response(404, "not_found", "Default conversation not found")
+    if conversation.user_email != user_email or conversation.agent_id != agent_id:
+        return error_response(
+            400,
+            "validation_error",
+            "Default conversation must belong to the same user and agent",
+        )
+    if conversation.status != "active" or route is None:
+        return error_response(
+            400,
+            "validation_error",
+            "Default conversation must be an active channel conversation",
+        )
+    if account_id is not None and route[1] != account_id:
+        return error_response(
+            400,
+            "validation_error",
+            "Default conversation must belong to this channel account",
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Channel type metadata
 # ---------------------------------------------------------------------------
@@ -204,6 +244,9 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
             "credential_refs": row.credential_refs or {},
             "default_conversation_id": row.default_conversation_id,
             "allow_new_conversations": row.allow_new_conversations,
+            "preferred_for_task_delivery": getattr(
+                row, "preferred_for_task_delivery", False
+            ),
             "adapter_location": getattr(row, "adapter_location", "controller"),
             "executor_id": getattr(row, "executor_id", None),
             "allowed_senders": row.allowed_senders or [],
@@ -262,6 +305,21 @@ async def create_account(request: Request) -> Any:
         )
 
     display_name = body.get("display_name", f"{meta.label} Account")
+    default_conversation_id = body.get("default_conversation_id")
+    if default_conversation_id is not None:
+        return error_response(
+            400,
+            "validation_error",
+            "Default conversation can only be set after the channel account is created",
+        )
+    err = await _validate_default_conversation(
+        request,
+        conversation_id=default_conversation_id,
+        user_email=user_email,
+        agent_id=agent_id,
+    )
+    if err is not None:
+        return err
 
     # --- Channel-specific validation ---
     if channel_type == "signal":
@@ -294,8 +352,9 @@ async def create_account(request: Request) -> Any:
             user_email=user_email,
             config=body.get("settings", {}),
             credential_refs=body.get("credential_refs", {}),
-            default_conversation_id=body.get("default_conversation_id"),
+            default_conversation_id=default_conversation_id,
             allow_new_conversations=body.get("allow_new_conversations", True),
+            preferred_for_task_delivery=body.get("preferred_for_task_delivery", False),
             allowed_senders=body.get("allowed_senders", []),
             adapter_location=body.get("adapter_location", "controller"),
             executor_id=body.get("executor_id"),
@@ -337,6 +396,7 @@ async def get_account(request: Request, account_id: str) -> Any:
         "credential_refs": row.credential_refs or {},
         "default_conversation_id": row.default_conversation_id,
         "allow_new_conversations": row.allow_new_conversations,
+        "preferred_for_task_delivery": getattr(row, "preferred_for_task_delivery", False),
         "adapter_location": getattr(row, "adapter_location", "controller"),
         "executor_id": getattr(row, "executor_id", None),
         "allowed_senders": row.allowed_senders or [],
@@ -370,6 +430,7 @@ async def update_account(request: Request, account_id: str) -> Any:
         return error_response(404, "not_found", "Channel account not found")
 
     agent_id = body.get("agent_id")
+    effective_agent_id = agent_id or existing_row.agent_id
     if agent_id:
         from cognis.store.queries import get_agent
 
@@ -383,6 +444,22 @@ async def update_account(request: Request, account_id: str) -> Any:
                 "validation_error",
                 "Channel accounts support primary agents only",
             )
+
+    default_conversation_id = (
+        body.get("default_conversation_id")
+        if "default_conversation_id" in body
+        else existing_row.default_conversation_id
+    )
+    if "default_conversation_id" in body or agent_id:
+        err = await _validate_default_conversation(
+            request,
+            conversation_id=default_conversation_id,
+            user_email=existing_row.user_email,
+            agent_id=effective_agent_id,
+            account_id=account_id,
+        )
+        if err is not None:
+            return err
 
     if existing_row.channel_type == "signal":
         # Merge existing settings and credentials with incoming for validation
@@ -424,6 +501,7 @@ async def update_account(request: Request, account_id: str) -> Any:
         "credential_refs",
         "default_conversation_id",
         "allow_new_conversations",
+        "preferred_for_task_delivery",
         "adapter_location",
         "executor_id",
         "allowed_senders",

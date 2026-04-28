@@ -1202,6 +1202,9 @@ class ChannelAccountRow(Base):
     allow_new_conversations: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1"
     )
+    preferred_for_task_delivery: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
     # Adapter location
     adapter_location: Mapped[str] = mapped_column(
         String, nullable=False, default="controller", server_default="controller"

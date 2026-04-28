@@ -231,6 +231,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_tool_classification_override_table)
         await conn.run_sync(_ensure_browser_sessions_table)
         await conn.run_sync(_ensure_push_subscriptions_table)
+        await conn.run_sync(_ensure_channel_preferred_delivery_column)
         await conn.run_sync(_ensure_projects_tables)
         await conn.run_sync(_ensure_project_links_workflows_grants)
         await conn.run_sync(_ensure_step_history_columns)
@@ -312,6 +313,20 @@ def _ensure_push_subscriptions_table(sync_conn: object) -> None:
     from cognis.store.models import PushSubscriptionRow
 
     PushSubscriptionRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_channel_preferred_delivery_column(sync_conn: object) -> None:
+    """Add preferred task delivery marker to existing channel accounts."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    channel_columns = {column["name"] for column in inspector.get_columns("channel_accounts")}
+    if "preferred_for_task_delivery" not in channel_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(
+                "ALTER TABLE channel_accounts "
+                "ADD COLUMN preferred_for_task_delivery BOOLEAN NOT NULL DEFAULT 0"
+            )
+        )
 
 
 def _ensure_projects_tables(sync_conn: object) -> None:

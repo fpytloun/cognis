@@ -146,6 +146,14 @@
           Allow this adapter to create new conversations automatically when a new chat appears.
         </label>
 
+        <label class="flex items-start gap-3 rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+          <input bind:checked={draft.preferred_for_task_delivery} type="checkbox" class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-900" />
+          <span>
+            Use this account as the preferred task delivery channel.
+            <span class="mt-1 block text-xs text-sky-200/75">Only one channel account per agent is preferred; saving this will replace the previous preference.</span>
+          </span>
+        </label>
+
         <div class="flex items-center justify-between gap-3">
           <p class="text-xs text-slate-500">{isDirty ? 'You have unsaved changes.' : 'No pending changes.'}</p>
           <div class="flex justify-end gap-2">

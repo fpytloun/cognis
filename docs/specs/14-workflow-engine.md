@@ -159,12 +159,13 @@ Resolution rules:
 - `same_conversation` — use `source_ref` when `source_type=chat`
 - `specific_conversation` — use `delivery.target` as a conversation_id
 - `latest_active_for_agent` — resolve latest active conversation for user+agent
-- `preferred_channel` — use user/agent delivery preference
+- `preferred_channel` — use the preferred task-delivery channel account for the user+agent, then resolve its default conversation or latest active channel conversation
 - `silent` — do not auto-inject into a conversation; result stays on the task
 
 Default behavior:
-- chat-created tasks default to `same_conversation`
-- scheduler/webhook/API tasks should prefer explicit delivery settings
+- chat/LLM-created tasks default to `same_conversation` when they have a source conversation
+- UI/API tasks created outside a conversation default to `preferred_channel`
+- scheduler/webhook/API tasks should prefer explicit delivery settings when available
 
 ### Task queue
 
@@ -191,7 +192,7 @@ When a task completes, the result must reach the configured delivery target:
 | `same_conversation` | Inject synthetic event into source conversation |
 | `specific_conversation` | Inject into specified conversation |
 | `latest_active_for_agent` | Resolve latest active conversation for user+agent and inject there |
-| `preferred_channel` | Resolve preferred conversation/channel from user or agent settings |
+| `preferred_channel` | Resolve the user's preferred channel account for the agent, then its default or latest active channel conversation |
 | `silent` | Do not auto-inject; leave result on task/API only |
 
 For conversational delivery modes, the controller:

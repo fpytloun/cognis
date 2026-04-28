@@ -2012,10 +2012,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Delivery mode</span>
             <select bind:value={editForm.delivery_mode} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-              <option value="same_conversation">Same conversation</option>
+              {#if (task?.source_type === 'chat' || task?.source_type === 'agent') && task.source_ref}
+                <option value="same_conversation">Same conversation</option>
+              {/if}
+              <option value="preferred_channel">Preferred channel</option>
               <option value="specific_conversation">Specific conversation</option>
               <option value="latest_active_for_agent">Latest active</option>
-              <option value="preferred_channel">Preferred channel</option>
             </select>
           </label>
           {#if editForm.delivery_mode === 'specific_conversation'}

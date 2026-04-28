@@ -33,6 +33,9 @@
         {#if pendingCount > 0}
           <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-3 py-1 text-xs text-sky-300">{pendingCount} pending pairing</span>
         {/if}
+        {#if account.preferred_for_task_delivery}
+          <span class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-300">Preferred task delivery</span>
+        {/if}
         {#if meta?.connection_mode}
           <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">{meta.connection_mode}</span>
         {/if}

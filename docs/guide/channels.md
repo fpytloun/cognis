@@ -45,6 +45,8 @@ When you add or edit an account, Cognis shows:
 
 After the account is saved, Cognis uses the configured adapter to receive and send messages for that platform.
 
+You can also mark one channel account per agent as the preferred task delivery channel. Task-board and API-created tasks that are not tied to an existing chat use this preferred channel by default; Cognis delivers to the account's default conversation when set, otherwise to that account's latest active channel conversation.
+
 The platform-specific setup steps stay next to the editor so you can finish vendor-side configuration while filling in the Cognis settings.
 
 ## Controller vs executor placement

@@ -11,6 +11,7 @@ export interface ChannelEditorDraft {
   dm_policy: string;
   group_policy: string;
   allow_new_conversations: boolean;
+  preferred_for_task_delivery: boolean;
   credentialValues: Record<string, string>;
   settingValues: Record<string, string>;
 }
@@ -197,6 +198,7 @@ export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?:
     dm_policy: account?.dm_policy ?? 'pairing',
     group_policy: account?.group_policy ?? 'pairing',
     allow_new_conversations: account?.allow_new_conversations ?? true,
+    preferred_for_task_delivery: account?.preferred_for_task_delivery ?? false,
     credentialValues,
     settingValues: Object.fromEntries(
       meta.setting_fields.map((field) => [field.name, String(account?.config?.[field.name] ?? field.default ?? '')]),

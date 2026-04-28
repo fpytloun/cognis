@@ -735,7 +735,20 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
             "delivery": {
                 "type": "object",
                 "properties": {
-                    "mode": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": [
+                            "same_conversation",
+                            "preferred_channel",
+                            "latest_active_for_agent",
+                            "specific_conversation",
+                            "silent",
+                        ],
+                        "description": (
+                            "Use same_conversation for work tied to this chat, "
+                            "or preferred_channel for out-of-band task results."
+                        ),
+                    },
                     "target": {"type": "string"},
                     "completion_mode_family": {"type": "string", "enum": ["default", "direct"]},
                     "allow_silent_completion": {"type": "boolean"},

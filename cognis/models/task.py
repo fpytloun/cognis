@@ -49,7 +49,7 @@ class TaskDelivery(BaseModel):
 
     mode: str = "same_conversation"
     # same_conversation | specific_conversation | latest_active_for_agent
-    # | preferred_channel
+    # | preferred_channel | silent
     target: str | None = None
 
 

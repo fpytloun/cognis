@@ -655,6 +655,7 @@ def _row_to_config(row: Any) -> ChannelAccountConfig:
         settings=row.config or {},
         default_conversation_id=row.default_conversation_id,
         allow_new_conversations=row.allow_new_conversations,
+        preferred_for_task_delivery=getattr(row, "preferred_for_task_delivery", False),
         adapter_location=getattr(row, "adapter_location", None) or "controller",
         executor_id=getattr(row, "executor_id", None),
         allowed_senders=row.allowed_senders or [],

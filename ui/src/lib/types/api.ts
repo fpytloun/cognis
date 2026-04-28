@@ -513,6 +513,7 @@ export interface ChannelAccount {
   credential_refs: Record<string, string>;
   default_conversation_id?: string | null;
   allow_new_conversations?: boolean;
+  preferred_for_task_delivery?: boolean;
   adapter_location?: string;
   executor_id?: string | null;
   allowed_senders: string[];

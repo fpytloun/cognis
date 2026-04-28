@@ -13,6 +13,7 @@ from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base
 from cognis.store.queries import (
     create_agent,
+    create_channel_account,
     create_conversation,
     create_session,
     create_user,
@@ -557,6 +558,70 @@ async def test_deliver_task_result_uses_source_ref_for_specific_conversation(
 
 
 @pytest.mark.asyncio
+async def test_same_conversation_delivery_accepts_agent_source_conversation(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+            title="Source",
+        )
+        root_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await set_session_intaris_session_id(session, root_session.session_id, "intaris-agent")
+        await update_conversation_active_session(
+            session, conversation.conversation_id, root_session.session_id
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-agent-source",
+            title="Agent task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="agent",
+            source_ref=conversation.conversation_id,
+            delivery=TaskDelivery(mode="same_conversation"),
+            workflow_id=None,
+            result_summary="Done",
+        )
+    )
+
+    assert guardrails.recorded[0][0] == "intaris-agent"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: object) -> None:
     engine, session_factory = await _runtime(tmp_path)
     guardrails = _Guardrails()
@@ -643,6 +708,102 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
         assert row.channel_type == "signal"
         assert row.account_id == "acct-1"
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preferred_channel_delivery_uses_preferred_account_conversation(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        web_conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+            title="Web",
+        )
+        signal_conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="signal",
+            context_ref="signal:acct-preferred:chat-1",
+            context_data={
+                "channel_type": "signal",
+                "account_id": "acct-preferred",
+                "chat_id": "chat-1",
+            },
+            title="Signal",
+        )
+        await create_channel_account(
+            session,
+            account_id="acct-preferred",
+            channel_type="signal",
+            display_name="Signal",
+            agent_id="agent-1",
+            user_email="user@example.com",
+            preferred_for_task_delivery=True,
+        )
+        web_session = await create_session(
+            session,
+            conversation_id=web_conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        signal_session = await create_session(
+            session,
+            conversation_id=signal_conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await set_session_intaris_session_id(session, web_session.session_id, "intaris-web")
+        await set_session_intaris_session_id(session, signal_session.session_id, "intaris-signal")
+        await update_conversation_active_session(
+            session, web_conversation.conversation_id, web_session.session_id
+        )
+        await update_conversation_active_session(
+            session, signal_conversation.conversation_id, signal_session.session_id
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-preferred",
+            title="Background task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="api",
+            source_ref=None,
+            delivery=TaskDelivery(mode="preferred_channel"),
+            workflow_id=None,
+            result_summary="Done",
+        )
+    )
+
+    assert guardrails.recorded[0][0] == "intaris-signal"
     await engine.dispose()
 
 
