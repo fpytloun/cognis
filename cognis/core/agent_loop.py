@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -287,6 +287,8 @@ ToolResultCallback = Callable[
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
 DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
+DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
+DEFAULT_LLM_STREAM_MAX_RETRIES = 3
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
@@ -328,6 +330,98 @@ def _normalize_todos(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
         item["status"] = _normalize_todo_status(item.get("status"))
         normalized.append(item)
     return normalized
+
+
+def _positive_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _llm_stream_chunk_has_activity(chunk: dict[str, Any]) -> bool:
+    """Return whether a stream chunk should reset the LLM idle watchdog."""
+
+    if chunk.get("mid_stream_failure") or chunk.get("error") or chunk.get("done"):
+        return True
+    if chunk.get("usage"):
+        return True
+    choices = chunk.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                return True
+            for key in ("delta", "message"):
+                value = choice.get(key)
+                if _llm_stream_value_has_activity(value):
+                    return True
+    return any(
+        _llm_stream_value_has_activity(chunk.get(key))
+        for key in ("content", "reasoning_content", "tool_calls", "function_call")
+    )
+
+
+def _llm_stream_value_has_activity(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, list):
+        return bool(value) and any(_llm_stream_value_has_activity(item) for item in value)
+    if isinstance(value, dict):
+        if "tool_calls" in value or "function_call" in value:
+            return True
+        activity_keys = (
+            "content",
+            "reasoning_content",
+            "arguments",
+            "name",
+            "id",
+            "text",
+            "delta",
+            "refusal",
+        )
+        return any(_llm_stream_value_has_activity(value.get(key)) for key in activity_keys)
+    return False
+
+
+async def _iterate_llm_stream_with_idle_timeout(
+    stream: AsyncIterator[dict[str, Any]],
+    *,
+    idle_timeout_seconds: int,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield stream chunks while enforcing an activity-based idle timeout."""
+
+    timeout = max(1, int(idle_timeout_seconds))
+    deadline = monotonic() + timeout
+    iterator = aiter(stream)
+    try:
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise LLMStreamIdleTimeout(
+                    f"LLM stream produced no meaningful activity for {timeout}s"
+                )
+            try:
+                chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                raise LLMStreamIdleTimeout(
+                    f"LLM stream produced no meaningful activity for {timeout}s"
+                ) from exc
+            if _llm_stream_chunk_has_activity(chunk):
+                deadline = monotonic() + timeout
+            yield chunk
+    except LLMStreamIdleTimeout:
+        closer = getattr(iterator, "aclose", None)
+        if callable(closer):
+            with contextlib.suppress(Exception):
+                await closer()
+        raise
 
 
 _TODO_ECHO_CONTENT_MAX = 280
@@ -1445,6 +1539,10 @@ class StepInterrupted(Exception):
     """Raised when a step exits early because of pause/cancel control flow."""
 
 
+class LLMStreamIdleTimeout(TimeoutError):
+    """Raised when an LLM stream produces no meaningful activity in time."""
+
+
 # ---------------------------------------------------------------------------
 # Step context
 # ---------------------------------------------------------------------------
@@ -1560,6 +1658,8 @@ class AgentLoop:
         tool_classification_queue: Any = None,
         step_profile_registry: Any = None,
         default_step_timeout_seconds: int = DEFAULT_STEP_TIMEOUT_SECONDS,
+        default_llm_stream_idle_timeout_seconds: int = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS,
+        default_llm_stream_max_retries: int = DEFAULT_LLM_STREAM_MAX_RETRIES,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
         step_runtime_factory: Any = None,
@@ -1578,6 +1678,10 @@ class AgentLoop:
         self._tool_classification_queue = tool_classification_queue
         self._step_profile_registry = step_profile_registry
         self.default_step_timeout_seconds = max(1, int(default_step_timeout_seconds))
+        self.default_llm_stream_idle_timeout_seconds = max(
+            1, int(default_llm_stream_idle_timeout_seconds)
+        )
+        self.default_llm_stream_max_retries = max(0, int(default_llm_stream_max_retries))
         self.tool_output_store = tool_output_store
         self.notification_service: Any = None
         self._task_queue: Any = None
@@ -1599,6 +1703,43 @@ class AgentLoop:
         """Wire the step runtime factory after construction when needed."""
 
         self._step_runtime_factory = step_runtime_factory
+
+    async def _resolve_llm_stream_idle_config(
+        self,
+        *,
+        provider_id: str | None,
+        model_id: str,
+    ) -> tuple[int, int]:
+        """Resolve idle watchdog timeout and retry count for an LLM stream."""
+
+        idle_timeout = self.default_llm_stream_idle_timeout_seconds
+        max_retries = self.default_llm_stream_max_retries
+        resolver = getattr(self.providers.llm, "resolve_stream_idle_config", None)
+        if callable(resolver):
+            try:
+                resolved = await resolver(
+                    provider_id=provider_id,
+                    model_id=model_id,
+                    default_idle_timeout_seconds=idle_timeout,
+                    default_max_retries=max_retries,
+                )
+                if isinstance(resolved, dict):
+                    idle_timeout = _positive_int(
+                        resolved.get("idle_timeout_seconds"), idle_timeout
+                    )
+                    max_retries = max(0, _positive_int(resolved.get("max_retries"), max_retries))
+            except Exception:
+                logger.warning(
+                    "agent: failed to resolve LLM stream idle config; using defaults",
+                    extra={
+                        "extra_data": {
+                            "provider_id": provider_id,
+                            "model": model_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+        return max(1, idle_timeout), max(0, max_retries)
 
     async def run_step(
         self,
@@ -2747,6 +2888,13 @@ class AgentLoop:
                 provider_id=current_provider_id,
             )
             llm_kwargs.update(exposure.request_kwargs)
+            (
+                llm_stream_idle_timeout_seconds,
+                llm_stream_max_retries,
+            ) = await self._resolve_llm_stream_idle_config(
+                provider_id=current_provider_id,
+                model_id=current_model,
+            )
 
             # Stream LLM response
             accumulator = StreamAccumulator()
@@ -2763,8 +2911,22 @@ class AgentLoop:
                 pending_audit_messages,
                 on_token=on_token,
             )
+            stream_activity_seen = False
+            logger.debug(
+                "agent: LLM stream attempt started",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "provider_id": current_provider_id,
+                        "model": current_model,
+                        "attempt": mid_stream_retries + 1,
+                        "idle_timeout_seconds": llm_stream_idle_timeout_seconds,
+                        "max_retries": llm_stream_max_retries,
+                    }
+                },
+            )
             try:
-                async for chunk in self.providers.llm.stream_generate(
+                stream = self.providers.llm.stream_generate(
                     model_messages,
                     model=model_for_llm,
                     task_type="default",
@@ -2772,7 +2934,24 @@ class AgentLoop:
                     tools=exposure.tools,
                     cache_breakpoint_index=cache_breakpoint,
                     **llm_kwargs,
+                )
+                async for chunk in _iterate_llm_stream_with_idle_timeout(
+                    stream,
+                    idle_timeout_seconds=llm_stream_idle_timeout_seconds,
                 ):
+                    if not stream_activity_seen and _llm_stream_chunk_has_activity(chunk):
+                        stream_activity_seen = True
+                        logger.debug(
+                            "agent: LLM stream first activity received",
+                            extra={
+                                "extra_data": {
+                                    "session_id": ctx.session.session_id,
+                                    "provider_id": current_provider_id,
+                                    "model": current_model,
+                                    "attempt": mid_stream_retries + 1,
+                                }
+                            },
+                        )
                     if chunk.get("mid_stream_failure"):
                         mid_stream_error = chunk.get("error", "LLM stream failed mid-generation")
                         break
@@ -2808,19 +2987,36 @@ class AgentLoop:
                     },
                 )
                 continue
+            except LLMStreamIdleTimeout as exc:
+                mid_stream_error = str(exc)
+                logger.warning(
+                    "agent: LLM stream idle timeout",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "provider_id": current_provider_id,
+                            "model": current_model,
+                            "attempt": mid_stream_retries + 1,
+                            "idle_timeout_seconds": llm_stream_idle_timeout_seconds,
+                        }
+                    },
+                )
 
             if mid_stream_error:
-                if mid_stream_retries < _MAX_MID_STREAM_RETRIES:
+                if mid_stream_retries < llm_stream_max_retries:
                     saved_partial_tool_calls = accumulator.clone_tool_call_state()
                     mid_stream_retries += 1
                     logger.warning(
                         "agent: mid-stream failure, retrying LLM call (%d/%d)",
                         mid_stream_retries,
-                        _MAX_MID_STREAM_RETRIES,
+                        llm_stream_max_retries,
                         extra={
                             "extra_data": {
                                 "session_id": ctx.session.session_id,
+                                "provider_id": current_provider_id,
+                                "model": current_model,
                                 "error": mid_stream_error[:200],
+                                "idle_timeout_seconds": llm_stream_idle_timeout_seconds,
                             }
                         },
                     )
@@ -2847,14 +3043,26 @@ class AgentLoop:
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
+                            "provider_id": current_provider_id,
+                            "model": current_model,
                             "error": mid_stream_error[:200],
+                            "idle_timeout_seconds": llm_stream_idle_timeout_seconds,
+                            "max_retries": llm_stream_max_retries,
                         }
                     },
                 )
-                error_notice = (
-                    "A model error occurred while generating the response. "
-                    "Your tool results have been saved. Please try sending your message again."
-                )
+                if "no meaningful activity" in mid_stream_error:
+                    error_notice = (
+                        "Turn failed: the model did not produce output for "
+                        f"{llm_stream_idle_timeout_seconds} seconds after "
+                        f"{llm_stream_max_retries + 1} attempt(s). Your tool results have "
+                        "been saved. Please try sending your message again."
+                    )
+                else:
+                    error_notice = (
+                        "A model error occurred while generating the response. "
+                        "Your tool results have been saved. Please try sending your message again."
+                    )
                 events_to_record.append(
                     SessionEvent(
                         type="lifecycle",

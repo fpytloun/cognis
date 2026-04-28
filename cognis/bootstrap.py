@@ -39,6 +39,8 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
     "session.step_timeout_seconds": ("session", 3600),
+    "session.llm_stream_idle_timeout_seconds": ("session", 60),
+    "session.llm_stream_max_retries": ("session", 3),
     "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.max_session_age_seconds": ("session", 86400),

@@ -10,6 +10,8 @@ _POSITIVE_INT_KEYS = {
     "security.api_read_requests_per_minute",
     "security.api_write_requests_per_minute",
     "session.step_timeout_seconds",
+    "session.llm_stream_idle_timeout_seconds",
+    "session.llm_stream_max_retries",
     "evaluator.timeout_ms",
     "web.concurrency.global_cap",
     "web.concurrency.per_host_cap",

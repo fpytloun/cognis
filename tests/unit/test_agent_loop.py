@@ -24,6 +24,7 @@ from cognis.core.agent_loop import (
     StreamAccumulator,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
+    _iterate_llm_stream_with_idle_timeout,
     _validate_step_completion_notification,
 )
 from cognis.core.project_context import ProjectContextEntry
@@ -62,6 +63,23 @@ def test_stream_accumulator_collects_text() -> None:
 
     assert acc.get_content() == "Hello world"
     assert not acc.has_tool_calls()
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_idle_timeout_resets_on_meaningful_activity() -> None:
+    async def _stream():
+        for part in ("a", "b", "c", "d"):
+            await asyncio.sleep(0.35)
+            yield {"choices": [{"delta": {"content": part}}]}
+
+    chunks = [
+        chunk
+        async for chunk in _iterate_llm_stream_with_idle_timeout(
+            _stream(), idle_timeout_seconds=1
+        )
+    ]
+
+    assert len(chunks) == 4
 
 
 def test_stream_accumulator_collects_tool_calls() -> None:
@@ -3637,6 +3655,111 @@ async def test_step_complete_must_be_last_tool_call_in_response() -> None:
     second_prompt = "\n".join(str(message.get("content")) for message in fake_llm.calls[1])
     assert "step_complete_not_last_tool_call" in second_prompt
     assert "step_todo_write" in second_prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
+    class _HangingAfterTodoLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+            del messages
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_todos",
+                                        "function": {
+                                            "name": "step_todo_write",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "todos": [
+                                                        {
+                                                            "content": "Save each Reddit comment memory",
+                                                            "status": "completed",
+                                                        },
+                                                        {
+                                                            "content": "Attach source URL artifact",
+                                                            "status": "in_progress",
+                                                        },
+                                                    ]
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return
+
+            await asyncio.sleep(30)
+            if False:  # pragma: no cover - keep this an async generator
+                yield {}
+
+    fake_llm = _HangingAfterTodoLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-hung-llm",
+            intaris_session_id="sess-hung-llm",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-hung-llm",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="save reddit comments",
+        user_attachments=[],
+        system_initiated=False,
+    )
+    tokens: list[str] = []
+
+    async def _on_token(token: str) -> None:
+        tokens.append(token)
+
+    output = await agent_loop.run_step(ctx, on_token=_on_token)
+
+    assert output is None
+    assert fake_llm.calls == 3
+    assert "model did not produce output" in "".join(tokens)
+    assert "sess-hung-llm" in agent_loop.session_lock.stale_unlocked_session_ids(
+        max_idle_seconds=0
+    )
 
 
 def test_step_complete_rejects_silent_notification_when_not_allowed() -> None:

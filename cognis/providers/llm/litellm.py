@@ -240,6 +240,16 @@ def _metadata_floor_for_model(model_id: str) -> dict[str, int] | None:
     return None
 
 
+def _positive_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _apply_message_cache_hints(
     messages: list[dict[str, Any]],
     model: str,
@@ -2369,6 +2379,47 @@ class LiteLLMProvider:
         if api_key:
             request_kwargs["api_key"] = api_key
         return request_kwargs
+
+    async def resolve_stream_idle_config(
+        self,
+        *,
+        provider_id: str | None,
+        model_id: str,
+        default_idle_timeout_seconds: int,
+        default_max_retries: int,
+    ) -> dict[str, int]:
+        """Resolve LLM stream idle watchdog settings for a provider/model."""
+
+        idle_timeout = default_idle_timeout_seconds
+        max_retries = default_max_retries
+        provider: LLMProviderRow | None = None
+        if provider_id is not None:
+            async with self.session_factory() as session:
+                provider = await session.get(LLMProviderRow, provider_id)
+        if provider is not None:
+            config = dict(provider.config or {})
+            idle_timeout = _positive_int(
+                config.get("stream_idle_timeout_seconds"), idle_timeout
+            )
+            max_retries = _positive_int(config.get("stream_max_retries"), max_retries)
+            models = config.get("models")
+            if isinstance(models, list):
+                for raw_model in models:
+                    if not isinstance(raw_model, dict):
+                        continue
+                    if raw_model.get("model_id") != model_id:
+                        continue
+                    idle_timeout = _positive_int(
+                        raw_model.get("stream_idle_timeout_seconds"), idle_timeout
+                    )
+                    max_retries = _positive_int(
+                        raw_model.get("stream_max_retries"), max_retries
+                    )
+                    break
+        return {
+            "idle_timeout_seconds": max(1, idle_timeout),
+            "max_retries": max(0, max_retries),
+        }
 
     def _classify_provider_error(self, error: Exception) -> str:
         message = str(error).lower()

@@ -52,6 +52,52 @@ async def test_litellm_provider_uses_model_routing_entry(tmp_path: object) -> No
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_resolves_stream_idle_config_precedence(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-5.4",
+                    "stream_idle_timeout_seconds": 45,
+                    "stream_max_retries": 2,
+                    "models": [
+                        {
+                            "model_id": "gpt-5.4",
+                            "stream_idle_timeout_seconds": 15,
+                            "stream_max_retries": 5,
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    assert await provider.resolve_stream_idle_config(
+        provider_id="openai",
+        model_id="gpt-5.4",
+        default_idle_timeout_seconds=60,
+        default_max_retries=3,
+    ) == {"idle_timeout_seconds": 15, "max_retries": 5}
+    assert await provider.resolve_stream_idle_config(
+        provider_id="openai",
+        model_id="gpt-4o-mini",
+        default_idle_timeout_seconds=60,
+        default_max_retries=3,
+    ) == {"idle_timeout_seconds": 45, "max_retries": 2}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_applies_route_reasoning_effort_when_not_explicit(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:

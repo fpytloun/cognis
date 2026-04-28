@@ -322,6 +322,16 @@ def create_app() -> FastAPI:
                 "session.step_timeout_seconds",
                 3600,
             )
+            llm_stream_idle_timeout_seconds = await get_setting_value(
+                session,
+                "session.llm_stream_idle_timeout_seconds",
+                60,
+            )
+            llm_stream_max_retries = await get_setting_value(
+                session,
+                "session.llm_stream_max_retries",
+                3,
+            )
         agent_loop = AgentLoop(
             providers=providers,
             session_manager=session_manager,
@@ -338,6 +348,14 @@ def create_app() -> FastAPI:
             step_profile_registry=step_profile_registry,
             default_step_timeout_seconds=(
                 int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 3600
+            ),
+            default_llm_stream_idle_timeout_seconds=(
+                int(llm_stream_idle_timeout_seconds)
+                if isinstance(llm_stream_idle_timeout_seconds, int)
+                else 60
+            ),
+            default_llm_stream_max_retries=(
+                int(llm_stream_max_retries) if isinstance(llm_stream_max_retries, int) else 3
             ),
             tool_output_store=tool_output_store,
             step_runtime_factory=step_runtime_factory,
