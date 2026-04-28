@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
 import re
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from prometheus_client import Counter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.core.tool_exposure import LLMApiMode, ToolDiscoveryMode, ToolExposureContract
 from cognis.logging import get_logger
 from cognis.models.config import (
@@ -103,6 +105,16 @@ LLM_JSON_MODE_TRANSPORT_FLIP_TOTAL = Counter(
     "JSON-mode transport fallbacks (Responses API empty / BadRequest / cached-broken).",
     labelnames=("provider_id", "model", "reason"),
 )
+LLM_JSON_MODE_NORMALIZATION_TOTAL = Counter(
+    "cognis_llm_json_mode_normalization_total",
+    "JSON-mode response normalization and fallback outcomes.",
+    labelnames=("provider_id", "model", "reason"),
+)
+LLM_TEXT_TRANSPORT_FLIP_TOTAL = Counter(
+    "cognis_llm_text_transport_flip_total",
+    "Plain text transport fallbacks for empty Responses API outputs.",
+    labelnames=("provider_id", "model", "reason"),
+)
 LLM_OPENAI_TOOL_SEARCH_FALLBACK_TOTAL = Counter(
     "cognis_llm_openai_tool_search_fallback_total",
     "Cached downgrades from native OpenAI Responses tool search to controller fallback.",
@@ -151,6 +163,19 @@ class OpenAIToolSearchFallbackRequired(RuntimeError):
         self.reason = reason
         super().__init__(
             "native OpenAI Responses tool search is unsupported for "
+            f"provider={provider_id!r}, model={model_id!r}; reason={reason}"
+        )
+
+
+class JSONModeGenerationError(RuntimeError):
+    """Raised when a JSON-mode generation cannot produce valid JSON."""
+
+    def __init__(self, *, provider_id: str, model_id: str, reason: str) -> None:
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.reason = reason
+        super().__init__(
+            "LLM JSON-mode generation failed for "
             f"provider={provider_id!r}, model={model_id!r}; reason={reason}"
         )
 
@@ -224,6 +249,44 @@ def _is_empty_json_mode_response(response_dict: dict[str, Any]) -> bool:
     if isinstance(refusal, str) and refusal.strip():
         return False
     return not extract_text_from_response(response_dict).strip()
+
+
+def _normalized_json_mode_response(
+    response_dict: dict[str, Any], *, label: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Return a response with canonical JSON content, or a stable failure reason."""
+
+    choices = response_dict.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None, "empty_choices"
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None, "invalid_choice"
+    finish_reason = str(first.get("finish_reason") or "stop")
+    if finish_reason == "length":
+        return None, "length"
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return None, "invalid_message"
+    refusal = message.get("refusal")
+    if isinstance(refusal, str) and refusal.strip():
+        return None, "refusal"
+    content = extract_text_from_response(response_dict)
+    if not content.strip():
+        return None, "empty_response"
+    try:
+        payload = extract_json_object(content, label=label)
+    except ValueError:
+        return None, "invalid_json"
+    normalized = dict(response_dict)
+    normalized_choices = list(choices)
+    normalized_first = dict(first)
+    normalized_message = dict(message)
+    normalized_message["content"] = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    normalized_first["message"] = normalized_message
+    normalized_choices[0] = normalized_first
+    normalized["choices"] = normalized_choices
+    return normalized, "normalized"
 
 
 def _supports_image_response_format(model: str) -> bool:
@@ -524,6 +587,13 @@ class LiteLLMProvider:
         # the outgoing kwargs; non-JSON calls are unaffected. Cleared on
         # provider config update via invalidate_json_mode_cache_for_provider.
         self._json_mode_broken_keys: set[tuple[str, str]] = set()
+        # In-process cache of (provider_id, resolved_model) pairs where the
+        # provider rejects or cannot satisfy response_format itself. Future
+        # JSON calls still require JSON, but go straight to plain chat text.
+        self._json_response_format_broken_keys: set[tuple[str, str]] = set()
+        # In-process cache of (provider_id, resolved_model) pairs where plain
+        # text no-tool generations through Responses completed with no content.
+        self._plain_text_responses_broken_keys: set[tuple[str, str]] = set()
         # In-process cache of (provider_id, resolved_model) pairs for which
         # native OpenAI Responses tool_search/allowed_tools handling was
         # observed to fail. These calls should keep using Responses transport
@@ -1223,6 +1293,12 @@ class LiteLLMProvider:
         self._json_mode_broken_keys = {
             key for key in self._json_mode_broken_keys if key[0] != provider_id
         }
+        self._json_response_format_broken_keys = {
+            key for key in self._json_response_format_broken_keys if key[0] != provider_id
+        }
+        self._plain_text_responses_broken_keys = {
+            key for key in self._plain_text_responses_broken_keys if key[0] != provider_id
+        }
 
     def apply_tool_exposure_runtime_fallbacks(
         self,
@@ -1376,6 +1452,66 @@ class LiteLLMProvider:
             logger.warning(
                 "Marking model as broken for JSON mode (response_format); "
                 "future JSON-mode calls will bypass Responses API / response_format",
+                extra={
+                    "extra_data": {
+                        "provider_id": provider.provider_id,
+                        "model": resolved_model,
+                        "reason": reason,
+                    }
+                },
+            )
+
+    def _mark_json_response_format_broken(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        reason: str,
+    ) -> None:
+        if provider is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        newly_marked = key not in self._json_response_format_broken_keys
+        self._json_response_format_broken_keys.add(key)
+        LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+            provider_id=provider.provider_id,
+            model=resolved_model,
+            reason=reason,
+        ).inc()
+        if newly_marked:
+            logger.warning(
+                "Marking model as broken for response_format JSON mode; "
+                "future JSON-mode calls will use plain chat text",
+                extra={
+                    "extra_data": {
+                        "provider_id": provider.provider_id,
+                        "model": resolved_model,
+                        "reason": reason,
+                    }
+                },
+            )
+
+    def _mark_plain_text_responses_broken(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        reason: str,
+    ) -> None:
+        if provider is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        newly_marked = key not in self._plain_text_responses_broken_keys
+        self._plain_text_responses_broken_keys.add(key)
+        LLM_TEXT_TRANSPORT_FLIP_TOTAL.labels(
+            provider_id=provider.provider_id,
+            model=resolved_model,
+            reason=reason,
+        ).inc()
+        if newly_marked:
+            logger.warning(
+                "Marking model as broken for plain-text Responses generation; "
+                "future no-tool text calls will use chat completions",
                 extra={
                     "extra_data": {
                         "provider_id": provider.provider_id,
@@ -1575,25 +1711,44 @@ class LiteLLMProvider:
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, model_info, cache_breakpoint_index
         )
-        is_json_mode_request = "response_format" in request_kwargs
+        explicit_llm_api = str(request_kwargs.pop("cognis_llm_api", "") or "").strip().lower()
+        wants_json_response = "response_format" in request_kwargs
+        cache_key = (provider.provider_id, resolved_model)
+        response_format_cache_broken = cache_key in self._json_response_format_broken_keys
+        if wants_json_response and response_format_cache_broken:
+            request_kwargs = dict(request_kwargs)
+            request_kwargs.pop("response_format", None)
+            LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+                provider_id=provider.provider_id,
+                model=resolved_model,
+                reason="cached_response_format_broken",
+            ).inc()
+
         use_responses_api = self._should_use_responses_api(
             resolved_model,
             model_info,
             provider,
-            is_json_mode_request=is_json_mode_request,
+            is_json_mode_request=wants_json_response,
         )
+        if explicit_llm_api == "responses":
+            use_responses_api = True
+        elif explicit_llm_api in {"chat_completions", "completion", "completions"}:
+            use_responses_api = False
+        elif (
+            not wants_json_response
+            and not request_kwargs.get("tools")
+            and cache_key in self._plain_text_responses_broken_keys
+        ):
+            use_responses_api = False
+            LLM_TEXT_TRANSPORT_FLIP_TOTAL.labels(
+                provider_id=provider.provider_id,
+                model=resolved_model,
+                reason="cached_broken",
+            ).inc()
+
         if use_responses_api:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"
-        if self._should_route_to_executor(provider):
-            if isinstance(retry_count, int):
-                request_kwargs["max_retries"] = retry_count
-            return await self._executor_generate(
-                prefixed_model,
-                prepared_messages,
-                provider,
-                request_kwargs=request_kwargs,
-            )
         logger.debug(
             "LLM generate",
             extra={
@@ -1607,11 +1762,47 @@ class LiteLLMProvider:
             },
         )
         retry_count_int = int(retry_count) if isinstance(retry_count, int) else 3
-        if use_responses_api:
+
+        async def _generate_chat(chat_kwargs: dict[str, Any]) -> dict[str, Any]:
+            chat_kwargs = dict(chat_kwargs)
+            chat_kwargs.pop("cognis_llm_api", None)
+            if self._should_route_to_executor(provider):
+                if isinstance(retry_count, int):
+                    chat_kwargs["max_retries"] = retry_count
+                return await self._executor_generate(
+                    prefixed_model,
+                    prepared_messages,
+                    provider,
+                    request_kwargs=chat_kwargs,
+                )
+            response = await with_llm_retry(
+                litellm.acompletion,
+                model=prefixed_model,
+                messages=prepared_messages,
+                stream=False,
+                max_retries=retry_count_int,
+                operation=f"generate({prefixed_model})",
+                **chat_kwargs,
+            )
+            dumped = response.model_dump()
+            return cast(dict[str, Any], dumped)
+
+        async def _generate_responses(responses_source_kwargs: dict[str, Any]) -> dict[str, Any]:
+            responses_source_kwargs = dict(responses_source_kwargs)
+            responses_source_kwargs["cognis_llm_api"] = "responses"
+            if self._should_route_to_executor(provider):
+                if isinstance(retry_count, int):
+                    responses_source_kwargs["max_retries"] = retry_count
+                return await self._executor_generate(
+                    prefixed_model,
+                    prepared_messages,
+                    provider,
+                    request_kwargs=responses_source_kwargs,
+                )
             responses_instructions, responses_input_messages = split_messages_for_responses(
                 prepared_messages, cache_breakpoint_index
             )
-            responses_kwargs = responses_request_kwargs(request_kwargs)
+            responses_kwargs = responses_request_kwargs(responses_source_kwargs)
             if responses_instructions is not None:
                 responses_kwargs["instructions"] = responses_instructions
             responses_kwargs = _apply_responses_request_defaults(
@@ -1620,38 +1811,15 @@ class LiteLLMProvider:
                 resolved_model=resolved_model,
                 instructions=responses_instructions,
             )
-            try:
-                response = await with_llm_retry(
-                    litellm.aresponses,
-                    model=prefixed_model,
-                    input=messages_to_responses_input(responses_input_messages),
-                    stream=False,
-                    max_retries=retry_count_int,
-                    operation=f"generate.responses({prefixed_model})",
-                    **responses_kwargs,
-                )
-            except Exception as exc:
-                openai_tool_search_reason = _openai_tool_search_bad_request_reason(
-                    exc, request_kwargs
-                )
-                if openai_tool_search_reason is not None:
-                    self._mark_openai_tool_search_broken(
-                        provider,
-                        resolved_model,
-                        reason=openai_tool_search_reason,
-                    )
-                if is_json_mode_request and _is_json_validator_bad_request(exc):
-                    return await self._json_mode_fallback_chat_completions(
-                        prefixed_model=prefixed_model,
-                        prepared_messages=prepared_messages,
-                        request_kwargs=request_kwargs,
-                        retry_count=retry_count_int,
-                        provider=provider,
-                        resolved_model=resolved_model,
-                        reason="bad_request_json_validator",
-                        strip_response_format=True,
-                    )
-                raise
+            response = await with_llm_retry(
+                litellm.aresponses,
+                model=prefixed_model,
+                input=messages_to_responses_input(responses_input_messages),
+                stream=False,
+                max_retries=retry_count_int,
+                operation=f"generate.responses({prefixed_model})",
+                **responses_kwargs,
+            )
             raw_response_dict = _model_dump(response)
             self._maybe_note_hosted_instruction_drift(
                 provider,
@@ -1659,43 +1827,114 @@ class LiteLLMProvider:
                 sent_instructions=responses_instructions,
                 response_instructions=raw_response_dict.get("instructions"),
             )
-            response_dict = responses_to_chat_response(raw_response_dict)
-            if is_json_mode_request and _is_empty_json_mode_response(response_dict):
-                return await self._json_mode_fallback_chat_completions(
-                    prefixed_model=prefixed_model,
-                    prepared_messages=prepared_messages,
-                    request_kwargs=request_kwargs,
-                    retry_count=retry_count_int,
-                    provider=provider,
-                    resolved_model=resolved_model,
-                    reason="empty_responses_detected",
-                    strip_response_format=False,
-                )
-            return response_dict
-        try:
-            response = await with_llm_retry(
-                litellm.acompletion,
-                model=prefixed_model,
-                messages=prepared_messages,
-                stream=False,
-                max_retries=retry_count_int,
-                operation=f"generate({prefixed_model})",
-                **request_kwargs,
+            return responses_to_chat_response(raw_response_dict)
+
+        async def _generate_json() -> dict[str, Any]:
+            last_reason = "unknown"
+            if use_responses_api:
+                try:
+                    response_dict = await _generate_responses(request_kwargs)
+                    normalized, reason = _normalized_json_mode_response(
+                        response_dict, label=task_type
+                    )
+                    if normalized is not None:
+                        if reason == "normalized":
+                            LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+                                provider_id=provider.provider_id,
+                                model=resolved_model,
+                                reason="responses_normalized",
+                            ).inc()
+                        return normalized
+                    last_reason = reason
+                    self._mark_json_mode_broken(
+                        provider, resolved_model, reason=f"responses_{reason}"
+                    )
+                except Exception as exc:
+                    openai_tool_search_reason = _openai_tool_search_bad_request_reason(
+                        exc, request_kwargs
+                    )
+                    if openai_tool_search_reason is not None:
+                        self._mark_openai_tool_search_broken(
+                            provider,
+                            resolved_model,
+                            reason=openai_tool_search_reason,
+                        )
+                    if _is_json_validator_bad_request(exc):
+                        last_reason = "bad_request_json_validator"
+                        self._mark_json_mode_broken(provider, resolved_model, reason=last_reason)
+                        self._mark_json_response_format_broken(
+                            provider, resolved_model, reason=last_reason
+                        )
+                    else:
+                        raise
+
+            chat_kwargs = dict(request_kwargs)
+            chat_kwargs.pop("cognis_llm_api", None)
+            if response_format_cache_broken:
+                chat_kwargs.pop("response_format", None)
+            try:
+                response_dict = await _generate_chat(chat_kwargs)
+            except Exception as exc:
+                if "response_format" in chat_kwargs and _is_json_validator_bad_request(exc):
+                    last_reason = "bad_request_json_validator"
+                    self._mark_json_response_format_broken(
+                        provider, resolved_model, reason=last_reason
+                    )
+                else:
+                    raise
+            else:
+                normalized, reason = _normalized_json_mode_response(response_dict, label=task_type)
+                if normalized is not None:
+                    LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+                        provider_id=provider.provider_id,
+                        model=resolved_model,
+                        reason="chat_normalized",
+                    ).inc()
+                    return normalized
+                last_reason = reason
+                if "response_format" in chat_kwargs:
+                    self._mark_json_response_format_broken(
+                        provider, resolved_model, reason=f"chat_{reason}"
+                    )
+
+            plain_kwargs = dict(request_kwargs)
+            plain_kwargs.pop("cognis_llm_api", None)
+            plain_kwargs.pop("response_format", None)
+            response_dict = await _generate_chat(plain_kwargs)
+            normalized, reason = _normalized_json_mode_response(response_dict, label=task_type)
+            if normalized is not None:
+                LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+                    provider_id=provider.provider_id,
+                    model=resolved_model,
+                    reason="plain_chat_normalized",
+                ).inc()
+                return normalized
+            last_reason = reason or last_reason
+            LLM_JSON_MODE_NORMALIZATION_TOTAL.labels(
+                provider_id=provider.provider_id,
+                model=resolved_model,
+                reason=f"failed_{last_reason}",
+            ).inc()
+            raise JSONModeGenerationError(
+                provider_id=provider.provider_id,
+                model_id=resolved_model,
+                reason=last_reason,
             )
-        except Exception as exc:
-            if is_json_mode_request and _is_json_validator_bad_request(exc):
-                return await self._json_mode_fallback_chat_completions(
-                    prefixed_model=prefixed_model,
-                    prepared_messages=prepared_messages,
-                    request_kwargs=request_kwargs,
-                    retry_count=retry_count_int,
-                    provider=provider,
-                    resolved_model=resolved_model,
-                    reason="bad_request_json_validator",
-                    strip_response_format=True,
+
+        if wants_json_response:
+            return await _generate_json()
+
+        if use_responses_api:
+            response_dict = await _generate_responses(request_kwargs)
+            if _is_empty_json_mode_response(response_dict) and not request_kwargs.get("tools"):
+                self._mark_plain_text_responses_broken(
+                    provider, resolved_model, reason="empty_responses_detected"
                 )
-            raise
-        response_dict = response.model_dump()
+                chat_kwargs = dict(request_kwargs)
+                chat_kwargs.pop("cognis_llm_api", None)
+                response_dict = await _generate_chat(chat_kwargs)
+        else:
+            response_dict = await _generate_chat(request_kwargs)
 
         # Diagnostic: log response structure for debugging reasoning model issues
         choices = response_dict.get("choices")
@@ -1781,6 +2020,7 @@ class LiteLLMProvider:
         prepared_messages = _apply_message_cache_hints(
             messages, resolved_model, model_info, cache_breakpoint_index
         )
+        explicit_llm_api = str(request_kwargs.pop("cognis_llm_api", "") or "").strip().lower()
         is_json_mode_request = "response_format" in request_kwargs
         use_responses_api = self._should_use_responses_api(
             resolved_model,
@@ -1788,6 +2028,10 @@ class LiteLLMProvider:
             provider,
             is_json_mode_request=is_json_mode_request,
         )
+        if explicit_llm_api == "responses":
+            use_responses_api = True
+        elif explicit_llm_api in {"chat_completions", "completion", "completions"}:
+            use_responses_api = False
         if use_responses_api:
             request_kwargs = dict(request_kwargs)
             request_kwargs["cognis_llm_api"] = "responses"

@@ -293,17 +293,8 @@ async def test_evaluator_empty_response_fails_evaluation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_retries_empty_response_once() -> None:
-    llm = _SequenceLLM(
-        [
-            {"choices": [{"message": {"content": ""}}]},
-            {
-                "choices": [
-                    {"message": {"content": '{"decision": "approved", "reasoning": "Looks good"}'}}
-                ]
-            },
-        ]
-    )
+async def test_evaluator_leaves_transport_fallback_to_provider() -> None:
+    llm = _SequenceLLM([{"choices": [{"message": {"content": ""}}]}])
     evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
 
     result = await evaluator.evaluate(
@@ -312,38 +303,9 @@ async def test_evaluator_retries_empty_response_once() -> None:
         step_inputs={},
     )
 
-    assert llm.calls == 2
-    assert result.decision == "approved"
-
-
-@pytest.mark.asyncio
-async def test_evaluator_falls_back_to_plain_json_text_after_structured_retry() -> None:
-    llm = _SequenceLLM(
-        [
-            {"choices": [{"message": {"content": ""}}]},
-            {"choices": [{"message": {"content": ""}}]},
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"decision": "revise", "reasoning": "Tests missing", "feedback": "Add tests"}'
-                        }
-                    }
-                ]
-            },
-        ]
-    )
-    evaluator = StepEvaluator(llm=llm, evaluator_timeout_seconds=5.0)
-
-    result = await evaluator.evaluate(
-        step_definition=_step_def("Implement with tests"),
-        step_output=_step_output(claims=["Implemented feature"]),
-        step_inputs={},
-    )
-
-    assert llm.calls == 3
-    assert result.decision == "revise"
-    assert result.feedback == "Add tests"
+    assert llm.calls == 1
+    assert result.decision == "failed"
+    assert is_evaluator_malfunction(result) is True
 
 
 @pytest.mark.asyncio
@@ -415,7 +377,7 @@ async def test_evaluator_refusal_forces_revise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluator_retry_failure_after_empty_fails_evaluation() -> None:
+async def test_evaluator_empty_provider_response_fails_evaluation() -> None:
     llm = _SequenceLLM(
         [
             {"choices": [{"message": {"content": ""}}]},
@@ -431,7 +393,7 @@ async def test_evaluator_retry_failure_after_empty_fails_evaluation() -> None:
 
     assert result.decision == "failed"
     assert is_evaluator_malfunction(result) is True
-    assert "retry failed" in result.reasoning.lower()
+    assert "no usable output" in result.reasoning.lower()
 
 
 @pytest.mark.asyncio

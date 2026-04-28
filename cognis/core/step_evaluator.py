@@ -18,7 +18,6 @@ from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
     infer_evaluation_from_text,
-    maybe_fallback_to_plain_json_response,
 )
 from cognis.logging import get_logger
 from cognis.models.workflow import StepDefinition, StepEvaluation, StepOutput
@@ -192,61 +191,6 @@ class StepEvaluator:
                     "response_format": {"type": "json_object"},
                 }
                 response = await self._generate_evaluator_response(messages, generate_kwargs)
-                if self._should_retry_response(response):
-                    logger.warning(
-                        "Evaluator returned empty or incomplete response, retrying once",
-                        extra={"extra_data": {"step": step_definition.name}},
-                    )
-                    try:
-                        response = await self._generate_evaluator_response(
-                            messages, generate_kwargs
-                        )
-                    except TimeoutError:
-                        logger.warning(
-                            "Evaluator retry timed out after unusable response, failing evaluation",
-                            extra={"extra_data": {"step": step_definition.name}},
-                        )
-                        return self._forced_failed(
-                            reasoning="retry timed out after empty or incomplete output",
-                            feedback="Evaluator could not return a usable response after retry.",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Evaluator retry failed after unusable response, failing evaluation",
-                            extra={"extra_data": {"step": step_definition.name}},
-                        )
-                        return self._forced_failed(
-                            reasoning="retry failed after empty or incomplete output",
-                            feedback="Evaluator could not return a usable response after retry.",
-                        )
-                try:
-                    response = await maybe_fallback_to_plain_json_response(
-                        response,
-                        generate_response=lambda kwargs: self._generate_evaluator_response(
-                            messages, kwargs
-                        ),
-                        label="evaluator",
-                        logger_obj=logger,
-                        warning_context={"step": step_definition.name},
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        "Evaluator plain-text JSON fallback timed out",
-                        extra={"extra_data": {"step": step_definition.name}},
-                    )
-                    return self._forced_failed(
-                        reasoning="plain-text JSON fallback timed out after unusable output",
-                        feedback="Evaluator fallback could not return a usable response.",
-                    )
-                except Exception:
-                    logger.exception(
-                        "Evaluator plain-text JSON fallback failed",
-                        extra={"extra_data": {"step": step_definition.name}},
-                    )
-                    return self._forced_failed(
-                        reasoning="plain-text JSON fallback failed after unusable output",
-                        feedback="Evaluator fallback could not return a usable response.",
-                    )
                 evaluation = self._parse_response(response)
                 logger.info(
                     "Step evaluation complete",
@@ -390,14 +334,6 @@ class StepEvaluator:
 
         EVALUATIONS_TOTAL.labels(decision=evaluation.decision).inc()
         return evaluation
-
-    def _should_retry_response(self, response: dict[str, Any]) -> bool:
-        if self._extract_refusal_text(response):
-            return False
-        content = extract_text_from_response(response)
-        if not content.strip():
-            return True
-        return self._extract_finish_reason(response) == "length"
 
     def _extract_finish_reason(self, response: dict[str, Any]) -> str:
         choices = response.get("choices")

@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
-    maybe_fallback_to_plain_json_response,
 )
 from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.logging import get_logger
@@ -95,16 +94,7 @@ async def _generate_json_response(
         )
         return await _generate({}, call_timeout=plain_timeout)
 
-    return await maybe_fallback_to_plain_json_response(
-        response,
-        generate_response=lambda generate_kwargs: _generate(
-            generate_kwargs,
-            call_timeout=plain_timeout,
-        ),
-        label=label,
-        logger_obj=logger_obj,
-        warning_context=warning_context,
-    )
+    return response
 
 
 class SkillMaterial(BaseModel):

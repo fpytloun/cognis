@@ -831,6 +831,7 @@ async def test_litellm_provider_infers_openai_responses_capabilities_for_proxy_m
                 location="controller",
                 backend="litellm",
                 config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                is_default=True,
                 status="active",
             )
         )
@@ -3290,12 +3291,69 @@ async def test_json_mode_fallback_when_responses_api_returns_empty(
     )
 
     # Fallback kicked in and we got the chat-completions JSON payload.
-    assert result["choices"][0]["message"]["content"] == '{"decision":"approved"}'
+    assert result["choices"][0]["message"]["content"] == '{"decision": "approved"}'
     # response_format was preserved on the fallback call.
     assert acompletion_kwargs.get("response_format") == {"type": "json_object"}
     # The (provider, model) pair is now cached as broken for JSON mode.
     assert ("proxy", "gpt-5.4") in provider._json_mode_broken_keys
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_json_mode_fallback_when_responses_api_returns_invalid_json(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    class _InvalidJSONResponse:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output_text": "not json"}
+
+    acompletion_calls: list[dict[str, object]] = []
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _InvalidJSONResponse()
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        acompletion_calls.append(dict(kwargs))
+        return _CallCaptureResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "```json\n{\"ok\": true}\n```"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        response_format={"type": "json_object"},
+    )
+
+    assert result["choices"][0]["message"]["content"] == '{"ok": true}'
+    assert acompletion_calls[0].get("response_format") == {"type": "json_object"}
+    assert ("proxy", "gpt-5.4") in provider._json_mode_broken_keys
     await engine.dispose()
 
 
@@ -3350,7 +3408,42 @@ async def test_json_mode_cached_broken_routes_directly_to_chat_completions(
     )
 
     assert aresponses_calls == 0
-    assert result["choices"][0]["message"]["content"] == '{"ok":true}'
+    assert result["choices"][0]["message"]["content"] == '{"ok": true}'
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_json_mode_cached_response_format_broken_strips_response_format(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _groq_provider_session(tmp_path)
+    acompletion_kwargs: dict[str, object] = {}
+
+    async def _fake_acompletion(**kwargs: object) -> object:
+        acompletion_kwargs.update(kwargs)
+        return _CallCaptureResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "Result: {\"ok\": true}"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    provider._json_response_format_broken_keys.add(("groq", "llama-3.3-70b-versatile"))
+
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert "response_format" not in acompletion_kwargs
+    assert result["choices"][0]["message"]["content"] == '{"ok": true}'
     await engine.dispose()
 
 
@@ -3411,6 +3504,54 @@ async def test_non_json_call_still_uses_responses_api_on_cached_broken_model(
 
 
 @pytest.mark.asyncio
+async def test_plain_text_empty_responses_falls_back_to_chat_and_caches(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                is_default=True,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    class _EmptyResponse:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "completed", "output": []}
+
+    acompletion_calls = 0
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _EmptyResponse()
+
+    async def _fake_acompletion(**_: object) -> object:
+        nonlocal acompletion_calls
+        acompletion_calls += 1
+        return _CallCaptureResponse(
+            {"choices": [{"message": {"content": "Generated personality"}}]}
+        )
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_acompletion)
+
+    provider = LiteLLMProvider(session_factory)
+    result = await provider.generate(messages=[{"role": "user", "content": "agent field"}])
+
+    assert result["choices"][0]["message"]["content"] == "Generated personality"
+    assert acompletion_calls == 1
+    assert ("proxy", "gpt-5.4") in provider._plain_text_responses_broken_keys
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_json_mode_fallback_on_json_validator_bad_request(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3450,8 +3591,8 @@ async def test_json_mode_fallback_on_json_validator_bad_request(
     # First call carried response_format; second (fallback) dropped it.
     assert acompletion_kwargs_history[0].get("response_format") == {"type": "json_object"}
     assert "response_format" not in acompletion_kwargs_history[1]
-    assert result["choices"][0]["message"]["content"] == '{"rationale":"ok","steps":[]}'
-    assert ("groq", "llama-3.3-70b-versatile") in provider._json_mode_broken_keys
+    assert result["choices"][0]["message"]["content"] == '{"rationale": "ok", "steps": []}'
+    assert ("groq", "llama-3.3-70b-versatile") in provider._json_response_format_broken_keys
     await engine.dispose()
 
 

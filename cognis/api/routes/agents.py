@@ -35,6 +35,7 @@ from cognis.api.models import (
 )
 from cognis.api.serializers import agent_to_response
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
+from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.ownership import normalize_executor_scope
@@ -768,19 +769,14 @@ async def generate_agent_field(request: Request, payload: GenerateFieldRequest) 
         )
 
     try:
-        response = await llm.generate(
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            task_type="default",
-        )
-        choices = response.get("choices", [])
-        if choices:
-            content = choices[0].get("message", {}).get("content")
-            value = content.strip() if isinstance(content, str) else ""
-            if value:
-                return {"value": value}
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+        response = await llm.generate(messages=messages, task_type="default")
+        value = extract_text_from_response(response).strip()
+        if value:
+            return {"value": value}
     except Exception:
         logger.warning("Agent field generation failed", exc_info=True)
 

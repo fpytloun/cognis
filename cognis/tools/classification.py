@@ -12,7 +12,6 @@ from typing import Any
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
-    maybe_fallback_to_plain_json_response,
 )
 from cognis.logging import get_logger
 from cognis.models.tool import (
@@ -486,12 +485,6 @@ async def _classify_with_llm(
             )
 
         response = await _generate({"response_format": {"type": "json_object"}})
-        response = await maybe_fallback_to_plain_json_response(
-            response,
-            generate_response=_generate,
-            label="tool_classifier",
-            logger_obj=logger,
-        )
         payload = extract_json_object(extract_text_from_response(response), label="tool_classifier")
         tool_payloads = payload.get("tools") if isinstance(payload, dict) else None
         if not isinstance(tool_payloads, list):

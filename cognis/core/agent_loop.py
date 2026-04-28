@@ -55,7 +55,7 @@ from cognis.core.harness_guards import (
     loop_guard_rejection_payload,
     record_tool_call,
 )
-from cognis.core.json_utils import extract_json_object
+from cognis.core.json_utils import extract_json_object, extract_text_from_response
 from cognis.core.project_context import (
     PROJECT_CONTEXT_STATUS_LOADED,
     ProjectContextEntry,
@@ -9800,12 +9800,8 @@ class AgentLoop:
                 task_type="classifier",
                 response_format={"type": "json_object"},
             )
-            content = (
-                response.get("choices", [{}])[0].get("message", {}).get("content")
-                if isinstance(response, dict)
-                else None
-            )
-            payload = extract_json_object(str(content or "{}"), label="relevant_skill_classifier")
+            content = extract_text_from_response(response) if isinstance(response, dict) else ""
+            payload = extract_json_object(content or "{}", label="relevant_skill_classifier")
             raw_ids = payload.get("skill_ids") if isinstance(payload, dict) else []
             raw_confidence: dict[str, str] = {}
             if isinstance(payload, dict) and isinstance(payload.get("confidence"), dict):
@@ -10203,13 +10199,9 @@ class AgentLoop:
                     task_type="classifier",
                     response_format={"type": "json_object"},
                 )
-                content = (
-                    response.get("choices", [{}])[0].get("message", {}).get("content")
-                    if isinstance(response, dict)
-                    else None
-                )
+                content = extract_text_from_response(response) if isinstance(response, dict) else ""
                 payload = extract_json_object(
-                    str(content or "{}"),
+                    content or "{}",
                     label="skill_tool_classifier",
                 )
                 raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []

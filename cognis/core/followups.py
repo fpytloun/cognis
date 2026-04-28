@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field, model_validator
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
-    maybe_fallback_to_plain_json_response,
 )
 from cognis.logging import get_logger
 
@@ -446,13 +445,6 @@ class FollowUpPolicy:
                 )
 
             response = await _generate({"response_format": {"type": "json_object"}})
-            response = await maybe_fallback_to_plain_json_response(
-                response,
-                generate_response=_generate,
-                label="follow_up_classifier",
-                logger_obj=logger,
-                warning_context={"conversation_id": conversation_id},
-            )
             content = extract_text_from_response(response)
             if not content or not content.strip():
                 return self._classifier_fallback("empty")
