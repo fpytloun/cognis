@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import Bot from 'lucide-svelte/icons/bot';
+  import Clock from 'lucide-svelte/icons/clock';
 import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
@@ -27,7 +27,7 @@ import ListTodo from 'lucide-svelte/icons/list-todo';
   const tabs = [
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
-    { href: '/agents', label: 'Agents', icon: Bot },
+    { href: '/schedules', label: 'Schedules', icon: Clock },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 

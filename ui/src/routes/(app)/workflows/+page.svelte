@@ -522,7 +522,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 {:else}
   <!-- Extra bottom padding on mobile reserves room for the sticky action bar
        (Save + Actions) so the last step editor card isn't hidden behind it. -->
-  <section class="space-y-5 overflow-x-hidden pb-24 lg:pb-0">
+  <section class="min-h-0 min-w-0 w-full max-w-full space-y-5 overflow-x-hidden pb-24 lg:pb-0">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div class="min-w-0">
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow registry</p>
@@ -551,9 +551,9 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         - mobileShowEditor=true  → editor is visible, registry hidden.
       A "Back" breadcrumb appears in the editor on mobile.
     -->
-    <div class="grid gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
+    <div class="grid min-w-0 gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
       <!-- Registry column: hidden on mobile when editor is open -->
-      <aside class={`space-y-5 ${mobileShowEditor ? 'hidden lg:block' : 'block'}`}>
+      <aside class={`min-w-0 space-y-5 ${mobileShowEditor ? 'hidden lg:block' : 'block'}`}>
         <Card class="p-4">
           <label class="flex items-center justify-between gap-3 text-sm text-slate-200">
             <span>Show ephemeral workflows</span>
@@ -583,7 +583,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       </aside>
 
       <!-- Editor column: hidden on mobile when registry is the active screen -->
-      <div class={`space-y-5 ${mobileShowEditor ? 'block' : 'hidden lg:block'}`}>
+      <div class={`min-w-0 space-y-5 ${mobileShowEditor ? 'block' : 'hidden lg:block'}`}>
         <!-- Mobile back breadcrumb -->
         {#if mobileShowEditor}
           <button
@@ -627,7 +627,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         {/if}
 
         <!-- Pipeline diagram (first thing the user sees) -->
-        <Card class="p-5">
+        <Card class="overflow-hidden p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline diagram</p>
           <div class="mt-3">
             <WorkflowDiagram steps={form.steps} interactionMode={form.interactionMode} />
