@@ -757,8 +757,78 @@ async def test_headed_fallback_disabled_does_not_attempt_headed(
 
     assert result.is_error
     assert headed_called is False
+    assert "headed browser fallback is disabled" in result.output.lower()
     metadata = result.metadata or {}
     assert metadata.get("browser_fallback_modes_attempted") == ["headless"]
+    assert "headed_fallback_skipped_reason" in metadata
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_treats_headed_empty_extraction_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Direct HTTP fetch was blocked by Cloudflare",
+                is_error=True,
+                metadata={"cloudflare_blocked": True},
+            )
+
+    class _FakeHeadless:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(output="headless blocked", is_error=True)
+
+    class _FakeHeaded:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="",
+                metadata={
+                    "extracted_document": {
+                        "browser_block_signal": "empty_extraction",
+                        "extraction_status": "blocked_or_empty:empty_extraction",
+                    }
+                },
+            )
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeHeadless(),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "headed_fallback_enabled",
+        lambda metadata: True,
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_headed_browser_fetch_backend",
+        lambda metadata: _FakeHeaded(),
+    )
+
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+            "web_browser_fetch_headed_fallback_enabled": True,
+        }
+    )
+    result = await handlers.handle_web_fetch({"url": "https://example.com"}, ctx)
+
+    assert result.is_error
+    assert "headed browser fallback failed" in result.output.lower()
+    assert "empty_extraction" in result.output
+    metadata = result.metadata or {}
+    assert metadata.get("browser_fallback_modes_attempted") == ["headless", "headed"]
+    assert metadata.get("browser_fallback_success") is False
 
 
 @pytest.mark.asyncio
