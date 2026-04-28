@@ -353,8 +353,9 @@ The executor CLI reads connection parameters from environment variables so that 
 |---|---|
 | `COGNIS_CONTROLLER_URL` | WebSocket URL of the controller |
 | `COGNIS_EXECUTOR_TOKEN` | JWT authentication token |
+| `COGNIS_EXECUTOR_WORKDIR` | Default working directory for executor tool calls. Defaults to the executor user's home directory. |
 
-CLI flags (`--controller-url`, `--token`) still work and take precedence over environment variables.
+CLI flags (`--controller-url`, `--token`, `--workdir`) still work and take precedence over environment variables.
 
 When installed from PyPI, the recommended command is `uvx cognis-executor`.
 
@@ -371,6 +372,7 @@ sudo systemctl daemon-reload
 sudo tee /etc/cognis/executor-alice.env <<'EOF'
 COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
 COGNIS_EXECUTOR_TOKEN=eyJ...
+COGNIS_EXECUTOR_WORKDIR=/home/alice
 EOF
 sudo chmod 600 /etc/cognis/executor-alice.env
 sudo chown alice:alice /etc/cognis/executor-alice.env
@@ -395,6 +397,7 @@ systemctl --user daemon-reload
 cat > ~/.cognis/executor.env <<'EOF'
 COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
 COGNIS_EXECUTOR_TOKEN=eyJ...
+COGNIS_EXECUTOR_WORKDIR=/home/your-user
 EOF
 chmod 600 ~/.cognis/executor.env
 
@@ -411,7 +414,7 @@ A system-level controller unit (`cognis-controller.service`) is also provided. S
 
 ### Running from a git checkout
 
-The default `ExecStart` uses `uvx cognis-executor` (PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with a `WorkingDirectory`. Both variants are documented in the unit files as comments.
+The default `ExecStart` uses `uvx cognis-executor` (PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with a `WorkingDirectory` for uv project resolution. The executor process still switches to `COGNIS_EXECUTOR_WORKDIR` or the service user's home directory before it accepts tool calls.
 
 ## Running as a Docker container
 

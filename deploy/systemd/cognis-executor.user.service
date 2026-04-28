@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.cognis/executor.env
+# Set COGNIS_EXECUTOR_WORKDIR in the environment file to override the
+# runtime tool working directory. Defaults to the service user's home.
 # PyPI install (uvx):
 ExecStart=%h/.local/bin/uvx cognis-executor
 # Git checkout — uncomment and adjust path instead:

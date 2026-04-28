@@ -6,6 +6,7 @@ import contextlib
 import logging
 import os
 import sys
+from pathlib import Path
 
 import typer
 
@@ -51,6 +52,11 @@ def run_executor(
         "--log-level",
         help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info)",
     ),
+    workdir: str | None = typer.Option(
+        None,
+        "--workdir",
+        help="Executor working directory (or COGNIS_EXECUTOR_WORKDIR env var; default: user home)",
+    ),
 ) -> None:
     """Run a standalone executor process that connects to a Cognis controller.
 
@@ -62,6 +68,7 @@ def run_executor(
         COGNIS_CONTROLLER_URL   WebSocket URL of the controller
         COGNIS_EXECUTOR_TOKEN   JWT authentication token
         COGNIS_LOG_LEVEL        Log level (debug, info, warning, error)
+        COGNIS_EXECUTOR_WORKDIR Executor working directory
     """
     import asyncio
 
@@ -91,6 +98,15 @@ def run_executor(
         )
         raise typer.Exit(code=1)
 
+    try:
+        os.chdir(_resolve_workdir(workdir))
+    except ValueError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except OSError as exc:
+        typer.echo(f"ERROR: Failed to change executor working directory: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
     from cognis.executor.runner import ExecutorRunner
     from cognis.models.tool import ExecutorConfig
 
@@ -109,6 +125,14 @@ def _is_localhost(url: str) -> bool:
         if url.startswith(prefix):
             return True
     return False
+
+
+def _resolve_workdir(cli_workdir: str | None) -> str:
+    raw = cli_workdir or os.environ.get("COGNIS_EXECUTOR_WORKDIR") or str(Path.home())
+    path = Path(os.path.expandvars(os.path.expanduser(raw))).resolve(strict=False)
+    if not path.is_dir():
+        raise ValueError(f"Executor working directory does not exist or is not a directory: {raw}")
+    return str(path)
 
 
 @executor_app.command("browser-install")

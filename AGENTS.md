@@ -417,6 +417,7 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_INITIAL_ADMIN_PASSWORD` | — | Container/CI: admin password (cleared after use) |
 | `COGNIS_CONTROLLER_URL` | — | Executor: controller WebSocket URL (alternative to `--controller-url`) |
 | `COGNIS_EXECUTOR_TOKEN` | — | Executor: JWT auth token (alternative to `--token`) |
+| `COGNIS_EXECUTOR_WORKDIR` | `~` | Executor: default working directory for tool calls (alternative to `--workdir`) |
 
 ### Database
 

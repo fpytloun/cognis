@@ -8,6 +8,7 @@ import contextlib
 import logging
 import os
 import sys
+from pathlib import Path
 
 
 def _setup_logging(level_name: str) -> None:
@@ -125,6 +126,12 @@ def main() -> None:
         default="",
         help="Log level: debug, info, warning, error (or COGNIS_LOG_LEVEL env var, default: info)",
     )
+    parser.add_argument(
+        "--workdir",
+        required=False,
+        default="",
+        help="Executor working directory (or COGNIS_EXECUTOR_WORKDIR env var; default: user home)",
+    )
     args = parser.parse_args()
 
     if args.command == "browser-install":
@@ -158,6 +165,15 @@ def main() -> None:
         )
         raise SystemExit(1)
 
+    try:
+        os.chdir(_resolve_workdir(args.workdir))
+    except ValueError as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
+        raise SystemExit(1) from exc
+    except OSError as exc:
+        sys.stderr.write(f"ERROR: Failed to change executor working directory: {exc}\n")
+        raise SystemExit(1) from exc
+
     from cognis.executor.runner import ExecutorRunner
     from cognis.models.tool import ExecutorConfig
 
@@ -176,6 +192,14 @@ def _is_localhost(url: str) -> bool:
         if url.startswith(prefix):
             return True
     return False
+
+
+def _resolve_workdir(cli_workdir: str | None) -> str:
+    raw = cli_workdir or os.environ.get("COGNIS_EXECUTOR_WORKDIR") or str(Path.home())
+    path = Path(os.path.expandvars(os.path.expanduser(raw))).resolve(strict=False)
+    if not path.is_dir():
+        raise ValueError(f"Executor working directory does not exist or is not a directory: {raw}")
+    return str(path)
 
 
 if __name__ == "__main__":

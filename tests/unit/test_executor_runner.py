@@ -6,10 +6,12 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.cli import executor as cli_executor
 from cognis.executor import __main__ as executor_main
 from cognis.executor.runner import ExecutorRunner, _normalize_result
 from cognis.models.tool import (
@@ -521,7 +523,16 @@ async def test_handle_configure_degrades_when_lsp_manager_init_fails(
     assert ws.sent[-1]["result"]["state"] == "unavailable"
 
 
-def test_executor_main_suppresses_cancelled_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_executor_main_suppresses_cancelled_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workdir = tmp_path / "workdir"
+    launch = tmp_path / "launch"
+    workdir.mkdir()
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+
     class _Runner:
         def __init__(self, config: object) -> None:
             self.config = config
@@ -532,10 +543,132 @@ def test_executor_main_suppresses_cancelled_error(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr("cognis.executor.runner.ExecutorRunner", _Runner)
     monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
     monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setenv("COGNIS_EXECUTOR_WORKDIR", str(workdir))
     monkeypatch.setattr(sys, "argv", ["cognis-executor"])
     with open(os.devnull) as devnull:
         monkeypatch.setattr(sys, "stdin", devnull)
         executor_main.main()
+
+
+def test_executor_main_defaults_workdir_to_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    launch = tmp_path / "launch"
+    home.mkdir()
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    monkeypatch.delenv("COGNIS_EXECUTOR_WORKDIR", raising=False)
+    monkeypatch.setattr(executor_main.Path, "home", staticmethod(lambda: home))
+
+    class _Runner:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def run(self) -> None:
+            assert Path.cwd() == home
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("cognis.executor.runner.ExecutorRunner", _Runner)
+    monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
+    monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setattr(sys, "argv", ["cognis-executor"])
+    with open(os.devnull) as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
+        executor_main.main()
+
+
+def test_executor_main_uses_env_workdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env_workdir = tmp_path / "env-workdir"
+    launch = tmp_path / "launch"
+    env_workdir.mkdir()
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    monkeypatch.setenv("COGNIS_EXECUTOR_WORKDIR", str(env_workdir))
+
+    class _Runner:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def run(self) -> None:
+            assert Path.cwd() == env_workdir
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("cognis.executor.runner.ExecutorRunner", _Runner)
+    monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
+    monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setattr(sys, "argv", ["cognis-executor"])
+    with open(os.devnull) as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
+        executor_main.main()
+
+
+def test_executor_main_cli_workdir_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env_workdir = tmp_path / "env-workdir"
+    cli_workdir = tmp_path / "cli-workdir"
+    launch = tmp_path / "launch"
+    env_workdir.mkdir()
+    cli_workdir.mkdir()
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+    monkeypatch.setenv("COGNIS_EXECUTOR_WORKDIR", str(env_workdir))
+
+    class _Runner:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def run(self) -> None:
+            assert Path.cwd() == cli_workdir
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("cognis.executor.runner.ExecutorRunner", _Runner)
+    monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
+    monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cognis-executor", "--workdir", str(cli_workdir)],
+    )
+    with open(os.devnull) as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
+        executor_main.main()
+
+
+def test_executor_main_rejects_invalid_workdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    invalid = tmp_path / "missing"
+    monkeypatch.setenv("COGNIS_CONTROLLER_URL", "ws://localhost:8080/api/executor/ws")
+    monkeypatch.setenv("COGNIS_EXECUTOR_TOKEN", "token")
+    monkeypatch.setattr(sys, "argv", ["cognis-executor", "--workdir", str(invalid)])
+    with open(os.devnull) as devnull:
+        monkeypatch.setattr(sys, "stdin", devnull)
+        with pytest.raises(SystemExit) as exc_info:
+            executor_main.main()
+
+    assert exc_info.value.code == 1
+    assert "Executor working directory does not exist" in capsys.readouterr().err
+
+
+def test_cli_executor_workdir_defaults_to_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.delenv("COGNIS_EXECUTOR_WORKDIR", raising=False)
+    monkeypatch.setattr(cli_executor.Path, "home", staticmethod(lambda: home))
+
+    assert cli_executor._resolve_workdir(None) == str(home)
 
 
 # ---------------------------------------------------------------------------

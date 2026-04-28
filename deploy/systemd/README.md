@@ -81,6 +81,7 @@ Create `/etc/cognis/executor-alice.env`:
 ```bash
 COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
 COGNIS_EXECUTOR_TOKEN=eyJ...
+COGNIS_EXECUTOR_WORKDIR=/home/alice
 ```
 
 Generate the token in the Cognis UI under **Settings > Executors > Generate
@@ -127,6 +128,7 @@ Create `~/.cognis/executor.env`:
 ```bash
 COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
 COGNIS_EXECUTOR_TOKEN=eyJ...
+COGNIS_EXECUTOR_WORKDIR=/home/your-user
 ```
 
 Restrict permissions:
@@ -164,11 +166,14 @@ ExecStart=/usr/bin/uv run cognis-controller serve
 
 For executor units, use `uvx cognis-executor` for PyPI installs. From a local
 git checkout, replace it with `uv run cognis-executor` and set
-`WorkingDirectory`.
+`WorkingDirectory` for uv project resolution. The executor runtime itself
+switches to `COGNIS_EXECUTOR_WORKDIR` or the service user's home directory
+before running tools.
 
 ## Security notes
 
-- Connection parameters (`COGNIS_CONTROLLER_URL`, `COGNIS_EXECUTOR_TOKEN`)
+- Connection parameters (`COGNIS_CONTROLLER_URL`, `COGNIS_EXECUTOR_TOKEN`,
+  `COGNIS_EXECUTOR_WORKDIR`)
   are read from environment files, not CLI flags. This avoids exposing
   tokens in `/proc/<pid>/cmdline`.
 - Environment files should be `chmod 600` and owned by the service user.

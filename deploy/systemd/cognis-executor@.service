@@ -8,9 +8,11 @@ Type=simple
 User=%i
 Group=%i
 EnvironmentFile=/etc/cognis/executor-%i.env
+# Set COGNIS_EXECUTOR_WORKDIR in the environment file to override the
+# runtime tool working directory. Defaults to the service user's home.
 # PyPI install (uvx):
 ExecStart=/usr/bin/uvx cognis-executor
-# Git checkout — uncomment and set WorkingDirectory instead:
+# Git checkout — uncomment and set WorkingDirectory for uv project resolution:
 # WorkingDirectory=/opt/cognis
 # ExecStart=/usr/bin/uv run cognis-executor
 Restart=on-failure
