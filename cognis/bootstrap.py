@@ -321,10 +321,12 @@ def _ensure_channel_preferred_delivery_column(sync_conn: object) -> None:
     inspector = cast(Any, inspect(sync_conn))
     channel_columns = {column["name"] for column in inspector.get_columns("channel_accounts")}
     if "preferred_for_task_delivery" not in channel_columns:
+        dialect_name = cast(Any, sync_conn).dialect.name
+        default = "FALSE" if dialect_name == "postgresql" else "0"
         sync_conn.execute(  # type: ignore[attr-defined]
             text(
                 "ALTER TABLE channel_accounts "
-                "ADD COLUMN preferred_for_task_delivery BOOLEAN NOT NULL DEFAULT 0"
+                f"ADD COLUMN preferred_for_task_delivery BOOLEAN NOT NULL DEFAULT {default}"
             )
         )
 
