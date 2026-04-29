@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-04-29
+
+### Added
+
+- Browser stealth defaults, Patchright runtime support, autoconsent handling, input humanization, and fingerprint hardening.
+- Web push notifications, preferred channel delivery defaults, managed agent tooling, and task/schedule interaction mode overrides.
+- Project workflow and revision management, including project workflow bindings and the completed project management UI.
+- Expanded web tooling with SearXNG, browser fetch fallback, DIY crawl/map support, structured extraction metadata, media extraction, headed fallback, and binary fetch artifacts.
+
+### Changed
+
+- Improved browser session lifecycle, navigation waits, headed/headless runtime behavior, persistent manager handling, and browser auto-install safeguards.
+- Refined mobile and workflow UI navigation, task metadata panels, board filters, avatar/workflow presentation, bottom navigation spacing, and unfocused chat notifications.
+- Strengthened shared-agent runtime ownership, memory owner preservation, discovered tool exposure persistence, and lifecycle event recording.
+
+### Fixed
+
+- Stabilized in-flight assistant stream recovery, session history hydration after restart, markdown fence rendering, fetch fallback retry behavior, and chat scroll preservation.
+- Fixed executor reconfiguration teardown, default executor workdir selection, stalled LLM stream handling, JSON fallback handling, rejected todo write preservation, and inline browser OTP challenges.
+- Corrected PostgreSQL channel delivery defaults, schedule preferred channel delivery exposure, memory delete discoverability, and shared agent grantee runtime support.
+
+### Documentation
+
+- Added the Projects, step metadata gating, and human revision specification.
+- Polished public launch materials, refreshed launch diagrams and README screenshots, and removed OpenClaw references.
+
 ## [0.3.0] - 2026-04-26
 
 ### Added
