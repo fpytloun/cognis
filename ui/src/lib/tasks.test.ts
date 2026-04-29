@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { sortTasks } from '$lib/tasks';
+import { matchesTaskFilters, sortTasks, taskBoardProjectUrl, taskFiltersFromSearchParams, taskFiltersToSearchParams } from '$lib/tasks';
 import type { Task } from '$lib/types/api';
 
 function makeTask(overrides: Partial<Task>): Task {
@@ -55,5 +55,55 @@ describe('sortTasks', () => {
     ]);
 
     expect(tasks.map((task) => task.task_id)).toEqual(['task_old_high', 'task_new_low']);
+  });
+});
+
+describe('task filters', () => {
+  it('matches tasks against agent, workflow, project, status, and search filters', () => {
+    const task = makeTask({
+      title: 'Refresh docs',
+      description: 'Update task board guide',
+      status: 'running',
+      agent_id: 'agent-2',
+      workflow_id: 'workflow-1',
+      project_id: 'project-1'
+    });
+
+    expect(matchesTaskFilters(task, { search: 'board guide', agentId: 'agent-2', workflowId: 'workflow-1', projectId: 'project-1', status: 'running' })).toBe(true);
+    expect(matchesTaskFilters(task, { search: '', agentId: 'agent-1', workflowId: '', projectId: '', status: '' })).toBe(false);
+    expect(matchesTaskFilters(task, { search: '', agentId: '', workflowId: 'workflow-2', projectId: '', status: '' })).toBe(false);
+    expect(matchesTaskFilters(task, { search: '', agentId: '', workflowId: '', projectId: 'project-2', status: '' })).toBe(false);
+    expect(matchesTaskFilters(task, { search: '', agentId: '', workflowId: '', projectId: '', status: 'paused' })).toBe(false);
+    expect(matchesTaskFilters(task, { search: 'missing', agentId: '', workflowId: '', projectId: '', status: '' })).toBe(false);
+  });
+
+  it('normalizes legacy and canonical URL params', () => {
+    expect(taskFiltersFromSearchParams(new URLSearchParams('q=docs&agent=agent-1&workflow=workflow-1&project=project-1&status=running'))).toEqual({
+      search: 'docs',
+      agentId: 'agent-1',
+      workflowId: 'workflow-1',
+      projectId: 'project-1',
+      status: 'running'
+    });
+    expect(taskFiltersFromSearchParams(new URLSearchParams('search=docs&agent_id=agent-2&workflow_id=workflow-2&project_id=project-2&status=paused'))).toEqual({
+      search: 'docs',
+      agentId: 'agent-2',
+      workflowId: 'workflow-2',
+      projectId: 'project-2',
+      status: 'paused'
+    });
+  });
+
+  it('serializes task filters using canonical API-style query params', () => {
+    const params = taskFiltersToSearchParams({
+      search: 'docs',
+      agentId: 'agent-1',
+      workflowId: 'workflow-1',
+      projectId: 'project-1',
+      status: 'running'
+    });
+
+    expect(params.toString()).toBe('q=docs&agent_id=agent-1&workflow_id=workflow-1&project_id=project-1&status=running');
+    expect(taskBoardProjectUrl('project-1')).toBe('/tasks?project_id=project-1');
   });
 });

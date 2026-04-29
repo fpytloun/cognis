@@ -18,7 +18,7 @@
   import { addToast } from '$lib/stores/toasts';
   import { workspaceHealth } from '$lib/system';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
-  import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
+  import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, taskFiltersFromSearchParams, taskFiltersToSearchParams, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
   import type { Agent, Conversation, Project, Skill, Task, Workflow } from '$lib/types/api';
 
   // ---------------------------------------------------------------------------
@@ -81,13 +81,7 @@
 
   function hydrateFiltersFromUrl(): void {
     const sp = $page.url.searchParams;
-    const next: TaskFilterState = {
-      search: sp.get('q') ?? '',
-      agentId: sp.get('agent') ?? '',
-      workflowId: sp.get('workflow') ?? '',
-      projectId: sp.get('project') ?? '',
-      status: sp.get('status') ?? ''
-    };
+    const next = taskFiltersFromSearchParams(sp);
     if (
       next.search !== filters.search ||
       next.agentId !== filters.agentId ||
@@ -104,12 +98,7 @@
   }
 
   function buildFiltersUrl(): string {
-    const sp = new URLSearchParams();
-    if (filters.search) sp.set('q', filters.search);
-    if (filters.agentId) sp.set('agent', filters.agentId);
-    if (filters.workflowId) sp.set('workflow', filters.workflowId);
-    if (filters.projectId) sp.set('project', filters.projectId);
-    if (filters.status) sp.set('status', filters.status);
+    const sp = taskFiltersToSearchParams(filters);
     if (mobileActiveColumn !== 'running') sp.set('col', mobileActiveColumn);
     const query = sp.toString();
     return query ? `/tasks?${query}` : '/tasks';
@@ -156,7 +145,16 @@
   // ---------------------------------------------------------------------------
 
   let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.projectId || filters.status));
-  let filteredTasks = $derived(sortTasks(tasks.filter((task) => matchesTaskFilters(task, filters))));
+  let filteredTasks = $derived.by(() => {
+    const activeFilters = {
+      search: filters.search,
+      agentId: filters.agentId,
+      workflowId: filters.workflowId,
+      projectId: filters.projectId,
+      status: filters.status
+    };
+    return sortTasks(tasks.filter((task) => matchesTaskFilters(task, activeFilters)));
+  });
   let selectedCount = $derived(selectedIds.size);
 
   // Bulk action counts

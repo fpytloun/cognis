@@ -57,6 +57,37 @@ export interface TaskFilterState {
   status: string;
 }
 
+export function taskFiltersFromSearchParams(searchParams: URLSearchParams): TaskFilterState {
+  return {
+    search: searchParams.get('q') ?? searchParams.get('search') ?? '',
+    agentId: searchParams.get('agent_id') ?? searchParams.get('agent') ?? '',
+    workflowId: searchParams.get('workflow_id') ?? searchParams.get('workflow') ?? '',
+    projectId: searchParams.get('project_id') ?? searchParams.get('project') ?? '',
+    status: searchParams.get('status') ?? ''
+  };
+}
+
+export function taskFiltersToSearchParams(filters: TaskFilterState): URLSearchParams {
+  const searchParams = new URLSearchParams();
+  if (filters.search) searchParams.set('q', filters.search);
+  if (filters.agentId) searchParams.set('agent_id', filters.agentId);
+  if (filters.workflowId) searchParams.set('workflow_id', filters.workflowId);
+  if (filters.projectId) searchParams.set('project_id', filters.projectId);
+  if (filters.status) searchParams.set('status', filters.status);
+  return searchParams;
+}
+
+export function taskBoardProjectUrl(projectId: string): string {
+  const searchParams = taskFiltersToSearchParams({
+    search: '',
+    agentId: '',
+    workflowId: '',
+    projectId,
+    status: ''
+  });
+  return `/tasks?${searchParams.toString()}`;
+}
+
 export function matchesTaskFilters(task: Task, filters: TaskFilterState): boolean {
   if (filters.agentId && task.agent_id !== filters.agentId) {
     return false;

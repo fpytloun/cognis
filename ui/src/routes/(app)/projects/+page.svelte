@@ -1,12 +1,14 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
+  import ListTodo from 'lucide-svelte/icons/list-todo';
   import { api } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import { taskBoardProjectUrl } from '$lib/tasks';
   import type { Project } from '$lib/types/api';
 
   let projects = $state<Project[]>([]);
@@ -80,8 +82,18 @@
             <button type="button" class="shrink-0 cursor-pointer" onclick={() => { profileProject = project; }} aria-label={`Show ${project.name} profile`}>
               <AgentAvatar name={project.name} avatarUrl={project.avatar_url} class="h-12 w-12 rounded-xl" />
             </button>
-            <div class="min-w-0">
-              <a class="truncate text-lg font-semibold text-white hover:text-sky-200" href={`/projects/${project.project_id}`}>{project.name}</a>
+            <div class="min-w-0 flex-1">
+              <div class="flex min-w-0 items-start justify-between gap-2">
+                <a class="truncate text-lg font-semibold text-white hover:text-sky-200" href={`/projects/${project.project_id}`}>{project.name}</a>
+                <a
+                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-200"
+                  href={taskBoardProjectUrl(project.project_id)}
+                  aria-label={`Open task board filtered for ${project.name}`}
+                  title="Open filtered task board"
+                >
+                  <ListTodo class="h-4 w-4" aria-hidden="true" />
+                </a>
+              </div>
               <p class="mt-1 line-clamp-2 text-sm text-slate-400">{project.description || 'No description'}</p>
             </div>
           </div>
