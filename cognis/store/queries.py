@@ -138,6 +138,7 @@ async def update_user(
     *,
     name: str | None = None,
     role: str | None = None,
+    password_hash: str | None = None,
 ) -> User | None:
     """Update mutable user fields. Returns updated user or None if not found."""
     user = await get_user(session, email)
@@ -147,6 +148,8 @@ async def update_user(
         user.name = name
     if role is not None:
         user.role = role
+    if password_hash is not None:
+        user.password_hash = password_hash
     user.updated_at = _utcnow()
     await session.flush()
     return user

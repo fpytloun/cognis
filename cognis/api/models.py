@@ -121,6 +121,7 @@ class UserCreateRequest(BaseModel):
 class UserUpdateRequest(BaseModel):
     name: str | None = None
     role: str | None = None
+    password: str | None = Field(default=None, min_length=8)
 
 
 class ProfileUpdateRequest(BaseModel):

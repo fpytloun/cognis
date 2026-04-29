@@ -284,7 +284,7 @@ import { onMount, tick } from 'svelte';
   let showDisabledUsers = $state(false);
   let editingUser = $state<UserDetail | null>(null);
   let userCreateForm = $state({ email: '', name: '', password: '', confirm_password: '', role: 'user' as UserRole });
-  let userEditForm = $state({ name: '', role: 'user' as UserRole });
+  let userEditForm = $state({ name: '', role: 'user' as UserRole, password: '', confirm_password: '' });
   let accountNameForm = $state('');
   let accountNameDirty = $state(false);
   let executorPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -1611,7 +1611,7 @@ import { onMount, tick } from 'svelte';
 
   function openEditUserModal(user: UserDetail): void {
     editingUser = user;
-    userEditForm = { name: user.name ?? '', role: user.role };
+    userEditForm = { name: user.name ?? '', role: user.role, password: '', confirm_password: '' };
     showUserEditModal = true;
   }
 
@@ -1642,12 +1642,23 @@ import { onMount, tick } from 'svelte';
 
   async function updateUserSubmit(): Promise<void> {
     if (!editingUser) return;
+    if (userEditForm.password || userEditForm.confirm_password) {
+      if (userEditForm.password.length < 8) {
+        addToast('Password must be at least 8 characters.', 'error');
+        return;
+      }
+      if (userEditForm.password !== userEditForm.confirm_password) {
+        addToast('Passwords do not match.', 'error');
+        return;
+      }
+    }
     busy = true;
     error = '';
     try {
       await api.users.update(editingUser.email, {
         name: userEditForm.name || undefined,
-        role: userEditForm.role
+        role: userEditForm.role,
+        password: userEditForm.password || undefined
       });
       showUserEditModal = false;
       editingUser = null;
@@ -4208,6 +4219,16 @@ import { onMount, tick } from 'svelte';
             <option value="service">service</option>
           </select>
         </label>
+        <div class="grid gap-4 md:grid-cols-2">
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>New password</span>
+            <Input bind:value={userEditForm.password} type="password" autocomplete="new-password" placeholder="Leave blank to keep current" />
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Confirm new password</span>
+            <Input bind:value={userEditForm.confirm_password} type="password" autocomplete="new-password" placeholder="Repeat new password" />
+          </label>
+        </div>
       </div>
     {/snippet}
 

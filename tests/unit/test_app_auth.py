@@ -119,3 +119,46 @@ def test_exchange_token_rejects_unknown_target(monkeypatch: object, tmp_path: Pa
 
         response = client.post("/api/v1/auth/exchange-token?target=unknown")
         assert response.status_code == 422
+
+
+def test_admin_can_set_user_password(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        _seed_user(client)
+        _seed_user(client, email="user@example.com", role="user")
+        _login(client)
+
+        response = client.patch(
+            "/api/v1/admin/users/user@example.com",
+            json={"password": "newpassword123"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["email"] == "user@example.com"
+
+        old_login = client.post(
+            "/api/auth/login",
+            json={"email": "user@example.com", "password": "password123"},
+        )
+        assert old_login.status_code == 401
+
+        new_login = client.post(
+            "/api/auth/login",
+            json={"email": "user@example.com", "password": "newpassword123"},
+        )
+        assert new_login.status_code == 200
+
+
+def test_admin_user_password_update_requires_min_length(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        _seed_user(client)
+        _seed_user(client, email="user@example.com", role="user")
+        _login(client)
+
+        response = client.patch(
+            "/api/v1/admin/users/user@example.com",
+            json={"password": "short"},
+        )
+
+        assert response.status_code == 422

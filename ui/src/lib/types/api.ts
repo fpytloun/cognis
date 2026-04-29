@@ -27,6 +27,7 @@ export interface UserCreatePayload {
 export interface UserUpdatePayload {
   name?: string | null;
   role?: UserRole;
+  password?: string;
 }
 
 export interface TokenResponse {

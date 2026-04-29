@@ -95,6 +95,10 @@ async def admin_update_user(
     if payload.role is not None and payload.role not in VALID_ROLES:
         raise api_exception(400, "validation_error", f"Invalid role: {payload.role}")
 
+    password_hash = None
+    if payload.password is not None:
+        password_hash = request.app.state.password_hasher.hash(payload.password)
+
     async with request.app.state.session_factory() as session:
         # Guard: cannot demote the last admin
         if payload.role is not None and payload.role != "admin":
@@ -106,7 +110,13 @@ async def admin_update_user(
                         400, "validation_error", "Cannot demote the last admin user"
                     )
 
-        user = await update_user(session, email, name=payload.name, role=payload.role)
+        user = await update_user(
+            session,
+            email,
+            name=payload.name,
+            role=payload.role,
+            password_hash=password_hash,
+        )
         if user is None:
             raise api_exception(404, "not_found", f"User {email} not found")
         if user.role == _SYSTEM_ROLE:
