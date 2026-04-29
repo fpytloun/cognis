@@ -385,6 +385,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     ].filter((row) => row.value !== '');
   }
 
+  function runtimeCompactRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const info = runtimeInfo(stepRun);
+    if (Object.keys(info).length === 0) return [];
+    return [
+      { label: 'Executor', value: runtimeString(info.executor_id) || 'unresolved' },
+      { label: 'Model', value: runtimeString(info.resolved_model) || runtimeString(info.model) || 'default' },
+      { label: 'Reasoning', value: runtimeString(info.reasoning_effort) || 'default' }
+    ];
+  }
+
   function runtimeDebugRows(stepRun: StepRun): Array<{ label: string; value: string }> {
     const info = runtimeInfo(stepRun);
     if (Object.keys(info).length === 0) return [];
@@ -417,6 +427,28 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     return diagramSteps.find((step) => step.name === stepName) ?? null;
   }
 
+  function stepQuestionsAllowed(spec: WorkflowStepFormState | null): boolean {
+    if (!spec?.allowQuestions) return false;
+    const override = (task as { interaction_mode_override?: string | null } | null)?.interaction_mode_override ?? null;
+    if (override === 'none' || override === 'explicit_gates') return false;
+    if (override === 'step_requests') return true;
+    return workflowDef?.interaction?.mode?.toString() === 'step_requests';
+  }
+
+  function stepSpecSummaryRows(group: StepGroup | null): Array<{ label: string; value: string }> {
+    if (!group) return [];
+    const spec = workflowStepSpec(group.stepName);
+    const profile = spec
+      ? spec.stepProfileId
+        ? `${spec.stepProfileId} (${spec.stepProfileMode})`
+        : `default (${spec.stepProfileMode})`
+      : 'default';
+    return [
+      { label: 'Step type', value: group.stepType === 'gate' ? 'Gate' : 'Run' },
+      { label: 'Step profile', value: profile }
+    ];
+  }
+
   function stepSpecRows(group: StepGroup | null, stepRun: StepRun | null): Array<{ label: string; value: string }> {
     if (!group) return [];
     const spec = workflowStepSpec(group.stepName);
@@ -441,7 +473,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
       { label: 'Agent override', value: spec?.agentOverride ?? '' },
       { label: 'Step profile', value: profile },
       { label: 'Tool search', value: spec ? (spec.stepProfileAllowToolSearch ? 'enabled' : 'disabled') : '' },
-      { label: 'Questions', value: spec ? (spec.allowQuestions ? 'allowed' : 'not allowed') : '' }
+      { label: 'Questions', value: spec ? (stepQuestionsAllowed(spec) ? 'allowed' : 'not allowed') : '' }
     ].filter((row) => row.value !== '');
   }
 
@@ -1419,9 +1451,19 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                     {/if}
 
                     {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
-                      <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                        <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</p>
-                        <p class="mt-1 text-xs text-slate-500">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
+                      <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                        <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
+                          <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
+                          <span class="flex flex-wrap items-center gap-2">
+                            {#each stepSpecSummaryRows(selectedStepGroup) as row}
+                              <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
+                                {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                              </span>
+                            {/each}
+                            <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                          </span>
+                        </summary>
+                        <p class="mt-3 text-xs text-slate-500">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
                             <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
@@ -1430,11 +1472,21 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                             </div>
                           {/each}
                         </dl>
-                      </div>
+                      </details>
                     {/if}
 
-                    <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</p>
+                    <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                      <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
+                        <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
+                        <span class="flex flex-wrap items-center gap-2">
+                          {#each runtimeCompactRows(latestAttempt) as row}
+                            <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
+                              {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                            </span>
+                          {/each}
+                          <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                        </span>
+                      </summary>
                       {#if runtimeRows(latestAttempt).length > 0}
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
                           {#each runtimeRows(latestAttempt) as row}
@@ -1447,7 +1499,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       {:else}
                         <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
                       {/if}
-                    </div>
+                    </details>
 
                     {#if stepError}
                       <div class="mt-4 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
@@ -1884,9 +1936,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             {/if}
             {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
               <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-                <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs uppercase tracking-[0.25em] text-slate-500">
-                  Current workflow spec
-                  <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
+                  <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
+                  <span class="flex flex-wrap items-center gap-2">
+                    {#each stepSpecSummaryRows(selectedStepGroup) as row}
+                      <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
+                        {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                      </span>
+                    {/each}
+                    <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                  </span>
                 </summary>
                 <dl class="mt-3 grid gap-2 text-xs">
                   {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
@@ -1898,8 +1957,18 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                 </dl>
               </details>
             {/if}
-            <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime</p>
+            <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
+                <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
+                <span class="flex flex-wrap items-center gap-2">
+                  {#each runtimeCompactRows(latestAttempt) as row}
+                    <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
+                      {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
+                    </span>
+                  {/each}
+                  <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
+                </span>
+              </summary>
               {#if runtimeSummaryRows(latestAttempt).length > 0}
                 <dl class="mt-3 grid gap-2 text-xs">
                   {#each runtimeSummaryRows(latestAttempt) as row}
@@ -1928,7 +1997,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               {:else}
                 <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
               {/if}
-            </div>
+            </details>
             <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Completion metadata</p>
               {#if claims.length > 0}
