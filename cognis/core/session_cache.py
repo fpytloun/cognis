@@ -1301,7 +1301,9 @@ class SessionCache:
             entry.last_compaction_summary = summary if isinstance(summary, str) else None
             entry.last_compaction_seq = event.seq
             entry.events = [existing for existing in entry.events if existing.seq > event.seq]
-        elif event.type == "tool_discovery":
+        elif event.type == "tool_discovery" or (
+            event.type == "lifecycle" and event.data.get("event") == "tool_discovery"
+        ):
             raw_handles = event.data.get("handles")
             if isinstance(raw_handles, list):
                 for raw_handle in raw_handles:

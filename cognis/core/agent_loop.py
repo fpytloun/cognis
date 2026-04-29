@@ -4860,8 +4860,9 @@ class AgentLoop:
                     if discovered_handles:
                         events_to_record.append(
                             SessionEvent(
-                                type="tool_discovery",
+                                type="lifecycle",
                                 data={
+                                    "event": "tool_discovery",
                                     "source_tool": SEARCH_TOOLS_TOOL.name,
                                     "query_length": len(str(tc.arguments.get("query", ""))),
                                     "handles": discovered_handles,

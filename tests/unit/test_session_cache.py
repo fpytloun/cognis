@@ -269,7 +269,7 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
 
 
 @pytest.mark.asyncio
-async def test_session_cache_tracks_discovered_tool_handles_from_events() -> None:
+async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_events() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session("session-discovery")
     handle = {
@@ -293,7 +293,12 @@ async def test_session_cache_tracks_discovered_tool_handles_from_events() -> Non
 
     await cache.append_recorded_events(
         session,
-        [SessionEvent(type="tool_discovery", data={"handles": [handle]})],
+        [
+            SessionEvent(
+                type="lifecycle",
+                data={"event": "tool_discovery", "handles": [handle]},
+            )
+        ],
         EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
     )
 

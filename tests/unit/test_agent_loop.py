@@ -2742,8 +2742,9 @@ async def test_cached_discovered_tool_is_revalidated_against_permissions() -> No
         session,
         [
             SessionEvent(
-                type="tool_discovery",
+                type="lifecycle",
                 data={
+                    "event": "tool_discovery",
                     "handles": [
                         {
                             "tool_id": stable_tool_id(get_events),
