@@ -277,6 +277,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
   }
 
+  function isEscalationExpired(item: Escalation, now = tickNow): boolean {
+    const receivedAt = item.received_at ?? now;
+    const timeoutSeconds = item.timeout_seconds ?? 300;
+    return now - receivedAt >= timeoutSeconds * 1000;
+  }
+
   function taskEscalationFromNotification(notification: Notification): Escalation | null {
     if (notification.notification_type !== 'escalation' || notification.task_id !== task?.task_id) {
       return null;
@@ -847,6 +853,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
       notifications
         .map((notification) => taskEscalationFromNotification(notification))
         .filter((notification): notification is Escalation => notification !== null)
+        .filter((notification) => !isEscalationExpired(notification))
     );
   }
 

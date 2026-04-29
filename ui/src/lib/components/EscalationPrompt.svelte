@@ -10,6 +10,8 @@
     pending?: boolean;
     queuedCount?: number;
   }>();
+
+  const expired = $derived(secondsRemaining <= 0);
 </script>
 
 <article class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 shadow-card">
@@ -25,7 +27,7 @@
         </span>
       {/if}
       <span class="rounded-full border border-sky-300/40 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-sky-100">
-        {Math.max(secondsRemaining, 0)}s left
+        {expired ? 'Expired' : `${Math.max(secondsRemaining, 0)}s left`}
       </span>
     </div>
   </div>
@@ -48,7 +50,7 @@
   </p>
 
   <div class="mt-4 flex flex-wrap gap-2">
-    <Button disabled={pending} size="sm" onclick={onApprove}>Approve</Button>
-    <Button disabled={pending} size="sm" variant="danger" onclick={onDeny}>Deny</Button>
+    <Button disabled={pending || expired} size="sm" onclick={onApprove}>Approve</Button>
+    <Button disabled={pending || expired} size="sm" variant="danger" onclick={onDeny}>Deny</Button>
   </div>
 </article>

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -280,6 +280,31 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
     assert [notification.notification_id for notification in pending] == ["notif_active"]
     assert stale_row.status == "resolved"
     assert stale_row.resolution == {"decision": "cancel", "reason": "task_terminal"}
+
+
+@pytest.mark.asyncio
+async def test_list_pending_omits_and_orphans_expired_escalations() -> None:
+    active_row = _notification_row()
+    active_row.notification_id = "call-active"
+    active_row.payload = {"timeout_seconds": 300}
+
+    expired_row = _notification_row()
+    expired_row.notification_id = "call-expired"
+    expired_row.payload = {"timeout_seconds": 30}
+    expired_row.created_at = datetime.now(UTC) - timedelta(seconds=60)
+
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([active_row, expired_row], {}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    pending = await service.list_pending("user@example.com", conversation_id="conv-1")
+
+    assert [notification.notification_id for notification in pending] == ["call-active"]
+    assert expired_row.status == "resolved"
+    assert expired_row.resolution == {"decision": "cancel", "reason": "timeout"}
 
 
 @pytest.mark.asyncio

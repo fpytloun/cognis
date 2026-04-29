@@ -5257,6 +5257,7 @@ class AgentLoop:
             resolution = await self.pause_waiter.wait(pause_id, timeout=timeout_f)
         except TimeoutError:
             resolution = PauseResolution(decision="deny", data={"reason": "timeout"})
+            await self.notification_service.mark_orphaned(intaris_call_id, reason="timeout")
 
         # Publish resolution event to all channel subscribers
         await self.event_bus.publish(

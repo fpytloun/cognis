@@ -1428,6 +1428,16 @@ async def _handle_resolve_escalation(
         user_email=connection.user_email,
     )
     if not resolved:
+        notification = await svc.get(call_id)
+        resolution = notification.resolution if notification is not None else None
+        if isinstance(resolution, dict) and resolution.get("reason") == "timeout":
+            await manager.send_error(
+                connection,
+                code="expired",
+                message="Escalation expired before it could be resolved",
+                recoverable=True,
+            )
+            return
         await manager.send_error(
             connection,
             code="not_found",

@@ -15,7 +15,7 @@ queryable via a unified REST endpoint.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -443,7 +443,7 @@ class NotificationService:
         session_id: str | None = None,
     ) -> list[Notification]:
         """List pending notifications for a user, optionally filtered by conversation."""
-        stale_notification_ids: list[str] = []
+        stale_notifications: list[tuple[str, str]] = []
         resolved_submitted: set[str] = set()
         async with self._session_factory() as db:
             stmt = select(NotificationRow).where(
@@ -467,8 +467,12 @@ class NotificationService:
         async with self._session_factory() as db:
             visible_rows: list[Notification] = []
             task_status_cache: dict[str, str | None] = {}
+            now = datetime.now(UTC)
             for row in rows:
                 if row.notification_id in resolved_submitted:
+                    continue
+                if _is_expired_escalation(row, now=now):
+                    stale_notifications.append((row.notification_id, "timeout"))
                     continue
                 if row.task_id:
                     status = task_status_cache.get(row.task_id)
@@ -477,12 +481,12 @@ class NotificationService:
                         status = str(task_row.status) if task_row is not None else None
                         task_status_cache[row.task_id] = status
                     if status not in _ACTIVE_TASK_STATUSES:
-                        stale_notification_ids.append(row.notification_id)
+                        stale_notifications.append((row.notification_id, "task_terminal"))
                         continue
                 visible_rows.append(_row_to_notification(row))
 
-        for notification_id in stale_notification_ids:
-            await self.mark_orphaned(notification_id, reason="task_terminal")
+        for notification_id, reason in stale_notifications:
+            await self.mark_orphaned(notification_id, reason=reason)
 
         return visible_rows
 
@@ -695,6 +699,13 @@ class NotificationService:
                 )
                 orphaned_count += 1
                 continue
+            if _is_expired_escalation(row, now=datetime.now(UTC)):
+                await self.mark_orphaned(
+                    row.notification_id,
+                    reason="timeout",
+                )
+                orphaned_count += 1
+                continue
             if row.task_id:
                 status = task_status_cache.get(row.task_id)
                 if status not in _ACTIVE_TASK_STATUSES:
@@ -760,3 +771,22 @@ def _row_to_notification(row: NotificationRow) -> Notification:
         created_at=row.created_at,
         resolved_at=row.resolved_at,
     )
+
+
+def _is_expired_escalation(row: NotificationRow, *, now: datetime) -> bool:
+    """Return true when an escalation prompt has exceeded its approval window."""
+    if row.notification_type != NotificationType.ESCALATION or row.status != "pending":
+        return False
+    created_at = row.created_at
+    if created_at is None:
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    timeout_raw = (row.payload or {}).get("timeout_seconds") if isinstance(row.payload, dict) else None
+    try:
+        timeout_seconds = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout_seconds = 300.0
+    if timeout_seconds <= 0:
+        return True
+    return now >= created_at + timedelta(seconds=timeout_seconds)

@@ -503,6 +503,12 @@ import X from 'lucide-svelte/icons/x';
     return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
   }
 
+  function isEscalationExpired(item: Escalation, now = Date.now()): boolean {
+    const timeout = item.timeout_seconds ?? escalationTimeoutSeconds;
+    const receivedAt = item.received_at ?? now;
+    return now - receivedAt >= timeout * 1000;
+  }
+
   function persistLastOpenedConversation(conversation: Conversation): void {
     if (typeof window === 'undefined') return;
     if (conversation.status === 'active' && isWebConversation(conversation)) {
@@ -907,13 +913,14 @@ import X from 'lucide-svelte/icons/x';
               : escalationTimeoutSeconds,
           received_at: item.created_at ? Date.parse(item.created_at) : Date.now()
         }) satisfies Escalation);
-      for (const item of filtered) {
+      const pendingEscalations = filtered.filter((item) => !isEscalationExpired(item));
+      for (const item of pendingEscalations) {
         if (!escalations.some((e) => e.call_id === item.call_id)) {
           item.timeout_seconds = item.timeout_seconds ?? escalationTimeoutSeconds;
         }
       }
       const pendingStillExists = escalationResolutionPending
-        ? filtered.some((item) => item.call_id === escalationResolutionPending?.call_id)
+        ? pendingEscalations.some((item) => item.call_id === escalationResolutionPending?.call_id)
         : false;
       if (escalationResolutionPending && !pendingStillExists) {
         if (escalationBusyCallId === escalationResolutionPending.call_id) {
@@ -923,8 +930,8 @@ import X from 'lucide-svelte/icons/x';
       }
       escalations = sortEscalations(
         escalationResolutionPending
-          ? filtered.filter((item) => item.call_id !== escalationResolutionPending?.call_id)
-          : filtered
+          ? pendingEscalations.filter((item) => item.call_id !== escalationResolutionPending?.call_id)
+          : pendingEscalations
       );
       escalationError = '';
       startEscalationCountdown();
@@ -967,13 +974,7 @@ import X from 'lucide-svelte/icons/x';
     escalationCountdownTimer = window.setInterval(() => {
       // Force reactivity so countdown timers re-render
       escalations = [...escalations];
-      // Auto-remove expired escalations (server handles timeout, this is UI cleanup)
-      const now = Date.now();
-      escalations = escalations.filter((e) => {
-        const elapsed = (now - (e.received_at ?? now)) / 1000;
-        const timeout = e.timeout_seconds ?? escalationTimeoutSeconds;
-        return elapsed < timeout + 5; // 5s grace for network latency
-      });
+      escalations = escalations.filter((item) => !isEscalationExpired(item));
       if (escalations.length === 0) stopEscalationCountdown();
     }, 1000);
   }
