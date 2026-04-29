@@ -35,19 +35,23 @@ Cognis works with companion services for memory and guardrails:
 
 ## Screenshots
 
+Desktop workspace:
+
 <p align="center">
   <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
 </p>
 
 <p align="center">
   <img src="docs/assets/screenshots/executor-browser-tools.png" alt="Executor configuration with browser automation tools" width="49%" />
-  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis task workflow detail" width="31%" />
+  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="49%" />
 </p>
+
+iOS PWA:
 
 <p align="center">
   <img src="docs/assets/screenshots/pwa-conversations.png" alt="Cognis iOS PWA conversation drawer" width="31%" />
   <img src="docs/assets/screenshots/pwa-chat.png" alt="Cognis iOS PWA chat with tool activity" width="31%" />
-  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="31%" />
+  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis iOS PWA task workflow detail" width="31%" />
 </p>
 
 ## Features
