@@ -193,9 +193,9 @@ class WorkflowEngine:
             agent_id=agent.agent_id,
             agent_owner_email=agent.owner_email,
             agent_type=agent.agent_type,
-            session_id=session.session_id,
-            parent_session_id=session.parent_session_id,
-            delegation_mode=session.delegation_mode,
+            session_id=getattr(session, "session_id", None),
+            parent_session_id=getattr(session, "parent_session_id", None),
+            delegation_mode=getattr(session, "delegation_mode", None),
             workflow_step=False,
         )
         runtime = await self._resolve_step_runtime(
@@ -943,6 +943,8 @@ class WorkflowEngine:
 
         project_context = await self._build_project_context(task)
 
+        interaction_mode = task.interaction_mode_override or workflow.interaction.mode
+
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
@@ -965,7 +967,7 @@ class WorkflowEngine:
             is_retry=is_retry,
             user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
             prior_context=prior_context,
-            interaction_mode=workflow.interaction.mode,
+            interaction_mode=interaction_mode,
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
@@ -1096,7 +1098,7 @@ class WorkflowEngine:
         workflow: Workflow,
     ) -> str:
         """Handle a gate step — pause and wait for caller response."""
-        if workflow.interaction.mode == "none":
+        if (task.interaction_mode_override or workflow.interaction.mode) == "none":
             # Autonomous mode — gates become continue
             GATES_TOTAL.labels(action="auto_continue").inc()
             return "continue"
@@ -1520,7 +1522,7 @@ class WorkflowEngine:
         if action == "cancel":
             return "cancelled"
         if action == "gate":
-            if workflow.interaction.mode == "none":
+            if (task.interaction_mode_override or workflow.interaction.mode) == "none":
                 logger.warning(
                     "Outcome gate requested in autonomous mode, failing workflow",
                     extra={
@@ -1783,6 +1785,7 @@ class WorkflowEngine:
 
         Returns True if handled (workflow continues), False if workflow should fail.
         """
+        interaction_mode = task.interaction_mode_override or workflow.interaction.mode
         logger.info(
             "Handling exhausted step",
             extra={
@@ -1790,7 +1793,7 @@ class WorkflowEngine:
                     "task_id": task.task_id,
                     "step": step_def.name,
                     "action": action,
-                    "interaction_mode": workflow.interaction.mode,
+                    "interaction_mode": interaction_mode,
                 }
             },
         )
@@ -1851,7 +1854,7 @@ class WorkflowEngine:
             return True
 
         elif action == "gate":
-            if workflow.interaction.mode == "none":
+            if interaction_mode == "none":
                 # Autonomous mode — gate becomes fail
                 logger.warning(
                     "Gate action in autonomous mode, failing step",

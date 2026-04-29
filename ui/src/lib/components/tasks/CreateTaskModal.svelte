@@ -36,6 +36,7 @@
       delivery_target: string | null;
       completion_mode_family: 'default' | 'direct';
       allow_silent_completion: boolean;
+      interaction_mode_override: 'none' | 'explicit_gates' | 'step_requests' | null;
       status: string;
     }) => void;
   }>();
@@ -63,7 +64,8 @@
     delivery_mode: 'preferred_channel',
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
-    allow_silent_completion: false
+    allow_silent_completion: false,
+    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests'
   });
 
   function handleSubmit(): void {
@@ -82,6 +84,7 @@
       delivery_target: form.delivery_mode === 'specific_conversation' ? form.delivery_target : null,
       completion_mode_family: form.completion_mode_family,
       allow_silent_completion: form.allow_silent_completion,
+      interaction_mode_override: form.interaction_mode_override || null,
       status: 'draft'
     });
   }
@@ -231,6 +234,17 @@
           </label>
         </div>
         <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+      </div>
+
+      <div class="space-y-1">
+        <label for="task-interaction" class="text-xs font-medium uppercase tracking-widest text-slate-400">Interaction policy</label>
+        <select id="task-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <option value="">Workflow default</option>
+          <option value="step_requests">Allow planning questions</option>
+          <option value="explicit_gates">Gates only</option>
+          <option value="none">Fully autonomous</option>
+        </select>
+        <p class="text-xs text-slate-500">Workflow default allows clarification in selected planning steps. Fully autonomous disables dynamic questions.</p>
       </div>
     </div>
 

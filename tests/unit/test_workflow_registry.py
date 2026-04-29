@@ -45,6 +45,8 @@ def test_general_task_workflow_has_single_step_with_evaluation() -> None:
     w = GENERAL_TASK_WORKFLOW
     assert len(w.steps) == 1
     assert w.steps[0].name == "execute"
+    assert w.interaction.mode == "step_requests"
+    assert w.steps[0].allow_questions is True
     assert w.steps[0].reasoning_effort == "low"
     assert w.steps[0].completion is not None
     assert w.steps[0].completion.evaluate is True
@@ -131,6 +133,8 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
 def test_research_plan_step_uses_generic_evaluator_prompt() -> None:
     plan_step = next(step for step in RESEARCH_WORKFLOW.steps if step.name == "plan")
 
+    assert RESEARCH_WORKFLOW.interaction.mode == "step_requests"
+    assert plan_step.allow_questions is True
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
     assert "Expected deliverables and format" in plan_step.prompt
@@ -141,9 +145,22 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "plan"
     )
 
+    assert SOFTWARE_DEVELOPMENT_WORKFLOW.interaction.mode == "step_requests"
+    assert plan_step.allow_questions is True
+    for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps:
+        if step.name != "plan":
+            assert step.allow_questions is False
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
     assert "Files to create/modify (with rationale)" in plan_step.prompt
+
+
+def test_creative_workflow_can_ask_brief_clarifications() -> None:
+    step = CREATIVE_WORKFLOW.steps[0]
+
+    assert CREATIVE_WORKFLOW.interaction.mode == "step_requests"
+    assert step.allow_questions is True
+    assert "audience, tone, format" in step.prompt
 
 
 def test_validate_workflow_accepts_valid_definition() -> None:

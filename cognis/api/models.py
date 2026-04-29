@@ -12,6 +12,8 @@ from cognis.models.artifact import AttachmentRef
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import WorkflowState
 
+InteractionModeOverride = Literal["none", "explicit_gates", "step_requests"]
+
 
 class ErrorBody(BaseModel):
     code: str
@@ -628,6 +630,7 @@ class TaskCreateRequest(BaseModel):
     delivery_target: str | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    interaction_mode_override: InteractionModeOverride | None = None
     source_type: str = "api"
     source_ref: str | None = None
     status: str = "draft"
@@ -648,6 +651,7 @@ class TaskUpdateRequest(BaseModel):
     delivery_target: str | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    interaction_mode_override: InteractionModeOverride | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
 
@@ -740,6 +744,7 @@ class TaskResponse(BaseModel):
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
+    interaction_mode_override: InteractionModeOverride | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     attempt_number: int = 1
@@ -861,6 +866,7 @@ class CreateScheduleRequest(BaseModel):
     delete_after_run: bool = False
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
+    interaction_mode_override: InteractionModeOverride | None = "none"
 
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
@@ -897,6 +903,7 @@ class UpdateScheduleRequest(BaseModel):
     delete_after_run: bool | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    interaction_mode_override: InteractionModeOverride | None = None
 
 
 class ScheduleResponse(BaseModel):
@@ -918,6 +925,7 @@ class ScheduleResponse(BaseModel):
     delete_after_run: bool = False
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
+    interaction_mode_override: InteractionModeOverride | None = "none"
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: str | None = None

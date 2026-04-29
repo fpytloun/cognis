@@ -526,6 +526,7 @@ class Task(Base):
     allow_silent_completion: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
+    interaction_mode_override: Mapped[str | None] = mapped_column(String, nullable=True)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     attempt_number: Mapped[int] = mapped_column(
@@ -711,6 +712,9 @@ class Schedule(Base):
     )
     allow_silent_completion: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
+    )
+    interaction_mode_override: Mapped[str | None] = mapped_column(
+        String, nullable=True, default="none", server_default="none"
     )
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)

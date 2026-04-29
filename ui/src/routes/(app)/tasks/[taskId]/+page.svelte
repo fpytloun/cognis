@@ -82,7 +82,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     delivery_mode: 'same_conversation',
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
-    allow_silent_completion: false
+    allow_silent_completion: false,
+    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests'
   });
 
   const statusColors: Record<string, string> = {
@@ -874,7 +875,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         delivery_mode: task.delivery.mode,
         delivery_target: task.delivery.target ?? '',
         completion_mode_family: task.completion_mode_family,
-        allow_silent_completion: task.allow_silent_completion
+        allow_silent_completion: task.allow_silent_completion,
+        interaction_mode_override: task.interaction_mode_override ?? ''
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
       try {
@@ -942,7 +944,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         delivery_mode: editForm.delivery_mode,
         delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null,
         completion_mode_family: editForm.completion_mode_family,
-        allow_silent_completion: editForm.allow_silent_completion
+        allow_silent_completion: editForm.allow_silent_completion,
+        interaction_mode_override: editForm.interaction_mode_override || null
       });
       task = await api.tasks.detail(updatedTask.task_id);
       addToast('Task updated.', 'success');
@@ -2114,6 +2117,17 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <span>Allow silent completion</span>
             </label>
           </div>
+        </label>
+
+        <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+          <span>Interaction policy</span>
+          <select bind:value={editForm.interaction_mode_override} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+            <option value="">Workflow default</option>
+            <option value="step_requests">Allow planning questions</option>
+            <option value="explicit_gates">Gates only</option>
+            <option value="none">Fully autonomous</option>
+          </select>
+          <span class="block text-xs text-slate-500">Fully autonomous disables dynamic clarification questions for this task.</span>
         </label>
 
         <div class="mt-6 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">

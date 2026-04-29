@@ -69,6 +69,7 @@ import Zap from 'lucide-svelte/icons/zap';
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
+    interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
     max_concurrent_runs: 1
   });
 
@@ -147,6 +148,7 @@ import Zap from 'lucide-svelte/icons/zap';
       delivery_target: (delivery.target as string) ?? '',
       completion_mode_family: s.completion_mode_family,
       allow_silent_completion: s.allow_silent_completion,
+      interaction_mode_override: s.interaction_mode_override ?? 'none',
       max_concurrent_runs: s.max_concurrent_runs
     };
   }
@@ -185,6 +187,7 @@ import Zap from 'lucide-svelte/icons/zap';
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
+        interaction_mode_override: form.interaction_mode_override,
         max_concurrent_runs: form.max_concurrent_runs
       });
       await loadData();
@@ -487,6 +490,16 @@ import Zap from 'lucide-svelte/icons/zap';
             </label>
           </div>
           <p class="text-xs text-slate-500">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+        </div>
+
+        <div class="space-y-1">
+          <label for="edit-interaction" class="text-xs font-medium uppercase tracking-widest text-slate-400">Interaction policy</label>
+          <select id="edit-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+            <option value="none">Fully autonomous</option>
+            <option value="step_requests">Allow planning questions</option>
+            <option value="explicit_gates">Gates only</option>
+          </select>
+          <p class="text-xs text-slate-500">Scheduled tasks default to fully autonomous so unattended runs do not pause for clarification.</p>
         </div>
 
         <div class="flex justify-end">

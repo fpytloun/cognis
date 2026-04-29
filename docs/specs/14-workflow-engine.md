@@ -406,6 +406,11 @@ class InteractionMode:
 - `step_requests` — run steps with `allow_questions=true` may dynamically
   request caller input via `step_request_input`.
 
+Tasks may override the workflow's interaction mode for a single run. UI-created
+and agent-created tasks default to the workflow policy. Scheduled tasks default
+to `none` so unattended runs do not pause for clarification, but schedules can
+explicitly opt back into `explicit_gates` or `step_requests`.
+
 ### WorkflowDefaults
 
 Default values inherited by all steps unless overridden.
@@ -980,10 +985,13 @@ steps:
 **Research** — plan, research, synthesize, evaluate:
 ```yaml
 name: Research
+interaction:
+  mode: step_requests
 steps:
   - name: plan
     type: run
     prompt: "Create a research plan..."
+    allow_questions: true
     input: {type: "null"}
     completion: {evaluate: true}
   - name: research
@@ -1002,10 +1010,13 @@ steps:
 **Software Development** — full feature-oriented coding workflow:
 ```yaml
 name: Software Development
+interaction:
+  mode: step_requests
 steps:
   - name: plan
     type: run
     prompt: "Break down this task into implementation steps..."
+    allow_questions: true
     input: {type: "null"}
     completion: {evaluate: true, max_attempts: 2}
   - name: architect_review

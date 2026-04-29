@@ -299,7 +299,10 @@ current throughout the step.
   summaries, or digests when they should go straight to the resolved target \
   channel.
 - If you need clarification, use `step_request_input` (when available) \
-rather than guessing.
+rather than guessing. In planning or brief-shaping steps, ask a targeted \
+question when proceeding would require a large assumption; do not ask when \
+the user explicitly requested fully autonomous execution or a safe default \
+is sufficient.
 - Do not call `step_complete` until every remaining todo is `done` or \
 `cancelled`.
 - Stay within the step's scope. Do not create new tasks or make decisions \

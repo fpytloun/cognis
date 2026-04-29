@@ -91,6 +91,7 @@ async def create_user_schedule(
             delete_after_run=bool(request_model.delete_after_run),
             completion_mode_family=request_model.completion_mode_family,
             allow_silent_completion=bool(request_model.allow_silent_completion),
+            interaction_mode_override=request_model.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=owner_email,
         )

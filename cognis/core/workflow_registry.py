@@ -92,8 +92,12 @@ GENERAL_TASK_WORKFLOW = Workflow(
                 "completing the step. For coding work, prefer the smallest correct "
                 "change, preserve existing patterns, and update directly affected "
                 "docs only when needed. Write a deliverable that captures the final "
-                "result, not just the work you attempted."
+                "result, not just the work you attempted. If the task is ambiguous "
+                "enough that proceeding would require a large assumption, ask one "
+                "targeted clarification with step_request_input before doing the work, "
+                "unless the task explicitly requests fully autonomous execution."
             ),
+            allow_questions=True,
             reasoning_effort="low",
             step_profile_id="system:general-task",
             input=StepInputConfig(type="null"),
@@ -111,7 +115,7 @@ RESEARCH_WORKFLOW = Workflow(
     description="Plan, research, synthesize with evaluation.",
     criteria="Research tasks, information gathering, analysis requests.",
     tags=["research", "analysis"],
-    interaction=InteractionMode(mode="explicit_gates"),
+    interaction=InteractionMode(mode="step_requests"),
     allow_user_override=True,
     allow_user_disable=True,
     editable_fields=[
@@ -132,8 +136,14 @@ RESEARCH_WORKFLOW = Workflow(
                 "- Key questions to answer\n"
                 "- Sources and methodology (web search, codebase, documentation)\n"
                 "- Expected deliverables and format\n\n"
+                "If the task's intent, success criteria, scope, source preferences, or output format "
+                "are ambiguous enough that proceeding would require a large assumption, ask one "
+                "targeted clarification with step_request_input before finalizing the plan. Do not "
+                "ask when the task explicitly requests fully autonomous execution or the ambiguity "
+                "has a safe default.\n\n"
                 "Write the plan itself as the step deliverable."
             ),
+            allow_questions=True,
             metadata_contract=StepCompletionContract(
                 fields=[
                     StepCompletionMetadataField(name="confidence", type="number", required=True),
@@ -215,7 +225,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
     description="Full development pipeline: plan, architect review, implement, docs, code review, commit, remember, final summary.",
     criteria="Implementation tasks, feature development, bug fixes requiring structured quality pipeline.",
     tags=["code", "development"],
-    interaction=InteractionMode(mode="explicit_gates"),
+    interaction=InteractionMode(mode="step_requests"),
     allow_user_override=True,
     allow_user_disable=True,
     editable_fields=[
@@ -241,8 +251,14 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "- Edge cases and error handling\n"
                 "- Testing strategy\n"
                 "- Migration or compatibility concerns\n\n"
+                "If user intent, acceptance criteria, UX/API tradeoffs, migration policy, "
+                "compatibility expectations, or implementation scope are ambiguous enough that "
+                "proceeding would require a large assumption, ask one targeted clarification with "
+                "step_request_input before finalizing the plan. Do not ask when the task explicitly "
+                "requests fully autonomous execution or the ambiguity has a safe default.\n\n"
                 "Write the plan itself as the step deliverable."
             ),
+            allow_questions=True,
             metadata_contract=StepCompletionContract(
                 fields=[
                     StepCompletionMetadataField(name="confidence", type="number", required=True),
@@ -453,7 +469,7 @@ CREATIVE_WORKFLOW = Workflow(
     description="Generate content with evaluation loop.",
     criteria="Creative writing, content generation, copywriting.",
     tags=["creative", "writing"],
-    interaction=InteractionMode(mode="explicit_gates"),
+    interaction=InteractionMode(mode="step_requests"),
     allow_user_override=True,
     allow_user_disable=True,
     editable_fields=[
@@ -471,8 +487,10 @@ CREATIVE_WORKFLOW = Workflow(
             step_profile_id="system:general-task",
             prompt=(
                 "Create the requested content. Focus on quality, originality, and meeting the stated requirements. "
+                "If audience, tone, format, constraints, or direction are ambiguous enough that proceeding would require a large assumption, ask one targeted clarification with step_request_input first. "
                 "Write the content itself as the deliverable for this step."
             ),
+            allow_questions=True,
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(evaluate=True, max_attempts=5, on_exhausted="continue"),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],

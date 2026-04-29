@@ -280,6 +280,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 priority=payload.priority,
                 delivery=delivery,
                 completion_delivery=completion_delivery,
+                interaction_mode_override=payload.interaction_mode_override,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
                 workspace_root=payload.workspace_root,
@@ -299,6 +300,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 source_ref=payload.source_ref,
                 delivery=delivery,
                 completion_delivery=completion_delivery,
+                interaction_mode_override=payload.interaction_mode_override,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
                 workspace_root=payload.workspace_root,
@@ -473,6 +475,13 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 row.completion_mode_family = updates.pop("completion_mode_family")
             if "allow_silent_completion" in updates:
                 row.allow_silent_completion = updates.pop("allow_silent_completion")
+            if "interaction_mode_override" in updates:
+                row.interaction_mode_override = updates.pop("interaction_mode_override")
+            elif (
+                "interaction_mode_override" in payload.model_fields_set
+                and payload.interaction_mode_override is None
+            ):
+                row.interaction_mode_override = None
             if (
                 payload.working_directory is not None
                 and payload.workspace_root is None
@@ -1000,6 +1009,7 @@ def _row_to_task(row: Any) -> TaskModel:
             completion_mode_family=getattr(row, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
+        interaction_mode_override=getattr(row, "interaction_mode_override", None),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         attempt_number=getattr(row, "attempt_number", 1),

@@ -127,6 +127,7 @@ class ComposeAndRunWorkflowArgs(BaseModel):
     decompose_skills: Literal["auto", "always", "never"] = "auto"
     schedule: dict[str, Any] | None = None
     delivery: dict[str, Any] | None = None
+    interaction_mode_override: Literal["none", "explicit_gates", "step_requests"] | None = None
     persist: bool = False
     agent_id: str | None = None
     priority: int | None = None

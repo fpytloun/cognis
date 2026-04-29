@@ -500,6 +500,7 @@ def _task_row_to_model(task_row: Any) -> Any:
                     getattr(task_row, "allow_silent_completion", False)
                 ),
             },
+            "interaction_mode_override": getattr(task_row, "interaction_mode_override", None),
             "workflow_id": getattr(task_row, "workflow_id", None),
             "project_id": getattr(task_row, "project_id", None),
             "attempt_number": getattr(task_row, "attempt_number", 1),
@@ -5794,6 +5795,7 @@ class AgentLoop:
                     source_type="agent",
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
+                    interaction_mode_override=tc.arguments.get("interaction_mode_override"),
                     workflow_id=workflow_id,
                     project_id=str(project_id) if project_id else None,
                     workspace_root=ctx.workspace_root,
@@ -7394,6 +7396,9 @@ class AgentLoop:
                     },
                     "completion_mode_family": completion_delivery.completion_mode_family,
                     "allow_silent_completion": completion_delivery.allow_silent_completion,
+                    "interaction_mode_override": schedule_payload.get(
+                        "interaction_mode_override", args.interaction_mode_override or "none"
+                    ),
                 }
             )
             try:
@@ -7421,6 +7426,7 @@ class AgentLoop:
                     source_ref=ctx.conversation.conversation_id,
                     delivery=task_delivery,
                     completion_delivery=completion_delivery,
+                    interaction_mode_override=args.interaction_mode_override,
                     workflow_id=persisted_workflow_id,
                     workspace_root=ctx.workspace_root,
                     working_directory=ctx.working_directory,

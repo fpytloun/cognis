@@ -1846,6 +1846,7 @@ async def create_task(
     delivery_target: str | None = None,
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
+    interaction_mode_override: str | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
     workspace_root: str | None = None,
@@ -1876,6 +1877,7 @@ async def create_task(
         delivery_target=delivery_target,
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
+        interaction_mode_override=interaction_mode_override,
         workflow_id=workflow_id,
         project_id=project_id,
         workspace_root=workspace_root,
@@ -2985,6 +2987,7 @@ async def create_schedule(
     delete_after_run: bool = False,
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
+    interaction_mode_override: str | None = "none",
     next_fire_at: datetime | None = None,
     created_by: str,
 ) -> Schedule:
@@ -3008,6 +3011,7 @@ async def create_schedule(
         delete_after_run=delete_after_run,
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
+        interaction_mode_override=interaction_mode_override,
         next_fire_at=next_fire_at,
         created_by=created_by,
     )
@@ -3074,6 +3078,7 @@ async def update_schedule(
         "delete_after_run",
         "completion_mode_family",
         "allow_silent_completion",
+        "interaction_mode_override",
         "next_fire_at",
     }
     for key, value in fields.items():

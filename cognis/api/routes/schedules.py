@@ -106,6 +106,7 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
+        interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=_coerce_schedule_run_status(row.last_run_status),
@@ -134,6 +135,7 @@ def _row_to_response(
         delete_after_run=row.delete_after_run,
         completion_mode_family=getattr(row, "completion_mode_family", "default"),
         allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+        interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=_effective_last_run_status(row, latest_task_run),
@@ -337,6 +339,7 @@ async def create_schedule_route(
             delete_after_run=body.delete_after_run,
             completion_mode_family=body.completion_mode_family,
             allow_silent_completion=body.allow_silent_completion,
+            interaction_mode_override=body.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=user.email,
         )

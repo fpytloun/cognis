@@ -233,6 +233,14 @@ CREATE_TASK_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "What the final result should look like.",
             },
+            "interaction_mode_override": {
+                "type": "string",
+                "enum": ["none", "explicit_gates", "step_requests"],
+                "description": (
+                    "Optional task-level interaction policy. Use 'none' only when the user "
+                    "requested fully autonomous execution; otherwise omit to use the workflow default."
+                ),
+            },
         },
         "required": ["title", "description"],
     },
@@ -729,6 +737,11 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                     "enabled": {"type": "boolean"},
                     "max_concurrent_runs": {"type": "integer"},
                     "delete_after_run": {"type": "boolean"},
+                    "interaction_mode_override": {
+                        "type": "string",
+                        "enum": ["none", "explicit_gates", "step_requests"],
+                        "description": "Optional interaction policy for tasks created by this schedule. Defaults to none for scheduled tasks.",
+                    },
                 },
                 "required": ["schedule_type"],
             },
@@ -753,6 +766,11 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                     "completion_mode_family": {"type": "string", "enum": ["default", "direct"]},
                     "allow_silent_completion": {"type": "boolean"},
                 },
+            },
+            "interaction_mode_override": {
+                "type": "string",
+                "enum": ["none", "explicit_gates", "step_requests"],
+                "description": "Optional interaction policy for the created task. Omit to use the workflow default; use none only for fully autonomous work.",
             },
             "persist": {"type": "boolean", "default": False},
             "agent_id": {

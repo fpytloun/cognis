@@ -830,6 +830,8 @@ export interface CompletionDeliveryPolicy {
   allow_silent_completion: boolean;
 }
 
+export type InteractionModeOverride = 'none' | 'explicit_gates' | 'step_requests';
+
 export interface WorkflowState {
   current_step_index: number;
   step_outputs: Record<string, Record<string, unknown>>;
@@ -927,6 +929,7 @@ export interface Task {
   delivery: TaskDelivery;
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
+  interaction_mode_override: InteractionModeOverride | null;
   workflow_id: string | null;
   project_id: string | null;
   attempt_number: number;
@@ -1062,6 +1065,7 @@ export interface Schedule {
   delete_after_run: boolean;
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
+  interaction_mode_override: InteractionModeOverride | null;
   last_fired_at: string | null;
   next_fire_at: string | null;
   last_run_status: string | null;

@@ -273,6 +273,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         delivery=task.delivery,
         completion_mode_family=task.completion_delivery.completion_mode_family,
         allow_silent_completion=task.completion_delivery.allow_silent_completion,
+        interaction_mode_override=task.interaction_mode_override,
         workflow_id=task.workflow_id,
         project_id=task.project_id,
         attempt_number=task.attempt_number,

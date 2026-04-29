@@ -68,6 +68,7 @@ class TaskModel(BaseModel):
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
+    interaction_mode_override: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     attempt_number: int = 1

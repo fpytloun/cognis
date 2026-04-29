@@ -47,6 +47,7 @@ class ScheduleModel(BaseModel):
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
+    interaction_mode_override: str | None = "none"
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: ScheduleRunStatus | None = None

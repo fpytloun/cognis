@@ -284,6 +284,7 @@ class Scheduler:
                 source_ref=schedule_id,
                 delivery=delivery,
                 completion_delivery=completion_delivery,
+                interaction_mode_override=getattr(sched, "interaction_mode_override", None) or "none",
                 workflow_id=workflow_id,
                 project_id=getattr(sched, "project_id", None),
                 workspace_root=workspace_root,

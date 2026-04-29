@@ -218,6 +218,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_system_override_tables)
         await conn.run_sync(_ensure_task_execution_paths)
         await conn.run_sync(_ensure_task_completion_delivery_columns)
+        await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
@@ -709,6 +710,8 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
                 "ALTER TABLE schedules ADD COLUMN allow_silent_completion BOOLEAN NOT NULL DEFAULT false"
             )
         )
+    if "interaction_mode_override" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN interaction_mode_override VARCHAR DEFAULT 'none'"))
     if "suppress_empty" in columns:
         execute(
             text(
@@ -788,6 +791,20 @@ def _ensure_task_completion_delivery_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE tasks ADD COLUMN applied_completion_mode VARCHAR"))
     if "applied_completion_reason" not in columns:
         execute(text("ALTER TABLE tasks ADD COLUMN applied_completion_reason TEXT"))
+
+
+def _ensure_task_interaction_override_columns(sync_conn: object) -> None:
+    """Add per-task interaction override storage when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("tasks")}
+    except Exception:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "interaction_mode_override" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN interaction_mode_override VARCHAR"))
 
 
 def _ensure_step_run_execution_paths(sync_conn: object) -> None:

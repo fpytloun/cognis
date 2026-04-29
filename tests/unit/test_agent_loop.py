@@ -2063,6 +2063,39 @@ def test_delegation_schema_exposes_write_deliverable_for_workflow_backed_child()
     assert any(tool["function"]["name"] == "write_deliverable" for tool in tools)
 
 
+def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> None:
+    loop = object.__new__(AgentLoop)
+    base = dict(
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+    )
+    question_ctx = StepContext(
+        **base,
+        step_definition=StepDefinition(
+            name="plan", type="run", prompt="", allow_questions=True
+        ),
+        interaction_mode="step_requests",
+    )
+    autonomous_ctx = StepContext(
+        **base,
+        step_definition=StepDefinition(
+            name="plan", type="run", prompt="", allow_questions=True
+        ),
+        interaction_mode="none",
+    )
+
+    assert any(
+        tool["function"]["name"] == "step_request_input"
+        for tool in loop._build_controller_tool_schemas(question_ctx)
+    )
+    assert not any(
+        tool["function"]["name"] == "step_request_input"
+        for tool in loop._build_controller_tool_schemas(autonomous_ctx)
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_cache(
     monkeypatch: pytest.MonkeyPatch,
