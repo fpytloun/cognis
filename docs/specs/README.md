@@ -1,5 +1,9 @@
 # Specifications
 
+These documents are internal design references, architecture notes, and implementation history. User-facing documentation lives in [`docs/guide/`](../guide/) and the repository [README](../../README.md).
+
+Some specs describe future or partially shipped work. Treat current code and user guides as product truth when they differ from older planning documents.
+
 | File | Content |
 |---|---|
 | `00-vision.md` | Project vision, design principles, phased delivery |
@@ -31,4 +35,5 @@
 | `26-llm-exposure-audit.md` | LLM-exposure auditing in Intaris: new `system_message`/`developer_message`/`context_snapshot` event types, per-turn audit of every LLM-exposed message, Intaris-anchored immutable prefix, removal of `memory_stale` and per-field TTL, hard-fail on missing core memories |
 | `27-workflow-composer.md` | Workflow-first execution model: main-agent-owned workflow composition, ephemeral workflows, coding workflow family, skill step decomposition, and `compose_and_run_workflow` |
 | `28-agent-sharing.md` | User-to-user agent sharing, polymorphic `agent_grants` table (user wired, group reserved), two-headed runtime identity, Mnemory `(user, owner)` memory keying, owner-configurable executor scope per share, and explicit "no admin bypass for user-owned resources" rule |
+| `29-harness-benchmarks.md` | Harness benchmark scenarios and evaluation approach |
 | `30-projects-and-revisions.md` | First-class Projects (multi-source repos with hint-only paths and credential clues), Project ↔ Workflow bindings, project-aware task/schedule/conversation context, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with explicit intent, and human-as-evaluator revision flow with classifier-selected re-entry steps |

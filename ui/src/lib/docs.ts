@@ -40,8 +40,8 @@ const overviewModules = import.meta.glob('../../../docs/README.md', {
   eager: true
 }) as Record<string, string>;
 
-// SVG asset urls (diagrams referenced from guides).
-const assetUrlModules = import.meta.glob('../../../docs/assets/images/*.svg', {
+// Asset urls (diagrams and screenshots referenced from guides).
+const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg}', {
   query: '?url',
   import: 'default',
   eager: true
@@ -68,7 +68,7 @@ export interface DocsOverview {
 }
 
 const DOC_ROUTE_RE = /^\/docs\/([a-z0-9-]+)$/;
-const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.*)?|chat(\/.*)?|tasks(\/.*)?|workflows(\/.*)?|tools(\/.*)?|channels(\/.*)?)$/;
+const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.*)?|chat(\/.*)?|projects(\/.*)?|tasks(\/.*)?|schedules(\/.*)?|workflows(\/.*)?|tools(\/.*)?|channels(\/.*)?)$/;
 const MARKDOWN_LINK_RE = /!??\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
 const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
@@ -77,13 +77,17 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/architecture.md': '/docs/architecture',
   'docs/guide/configuring-providers.md': '/docs/configuring-providers',
   'docs/guide/creating-agents.md': '/docs/creating-agents',
+  'docs/guide/security-and-privacy.md': '/docs/security-and-privacy',
   'docs/guide/settings.md': '/docs/settings',
   'docs/guide/using-chat.md': '/docs/using-chat',
+  'docs/guide/projects.md': '/docs/projects',
   'docs/guide/managing-tasks.md': '/docs/managing-tasks',
+  'docs/guide/schedules.md': '/docs/schedules',
   'docs/guide/workflows.md': '/docs/workflows',
   'docs/guide/tools-and-skills.md': '/docs/tools-and-skills',
   'docs/guide/channels.md': '/docs/channels',
   'docs/guide/executors.md': '/docs/executors',
+  'docs/guide/deployment.md': '/docs/deployment',
   'docs/guide/troubleshooting.md': '/docs/troubleshooting'
 };
 

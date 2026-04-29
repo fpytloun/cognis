@@ -1,36 +1,39 @@
 # Documentation
 
-Cognis ships with embedded in-app docs under `/docs` and keeps the same guides in this repository for local reading and review.
+Cognis ships these guides in the repository and embeds the same user-facing docs in the web app under `/docs`.
 
-Architecture and implementation specs live in [`docs/specs/`](specs/README.md).
+The public guides explain how to run and use Cognis. The [specifications](specs/README.md) are internal design references and implementation history.
 
-## Getting Started
-
-| Document | Description |
-|---|---|
-| Getting Started | First-run setup for Mnemory, Intaris, Cognis, your first provider, and your first agent |
-| Architecture | Understand how Cognis fits with Mnemory, Intaris, and executors |
-| Configuring Providers | Add LLM providers, test them, and set model routing |
-| Creating Agents | Define identity, tools, executor placement, and workflow behavior |
-| Settings | Configure providers, routing, secrets, executors, diagnostics, and users |
-
-## Core Workflows
+## Start Here
 
 | Document | Description |
 |---|---|
-| Using Chat | Streaming chat, tool calls, escalations, delegation, and recovery |
-| Managing Tasks | Task board, workflow runs, approvals, and results delivery |
-| Schedules | Recurring task creation and scheduled workflow execution |
-| Workflows | Build reusable workflows and understand step behavior |
-| Channels | Connect external messaging platforms and understand pairing |
-| Executors | Choose between local and remote executors and route tools safely |
-| Tools and Skills | Inspect the tool registry, skills, and MCP-backed capabilities |
+| [Getting Started](guide/getting-started.md) | First-run setup for Mnemory, Intaris, Cognis, a provider, an executor, and your first agent |
+| [Architecture](guide/architecture.md) | Understand the cloud-native controller/executor split and Openclaw services |
+| [Configuring Providers](guide/configuring-providers.md) | Add LLM providers, test them, and set model routing |
+| [Creating Agents](guide/creating-agents.md) | Define identity, tools, skills, executor placement, and workflow behavior |
+| [Security and Privacy](guide/security-and-privacy.md) | Understand secrets, value refs, inference-provider privacy, guardrails, and executor boundaries |
+
+## Workspace
+
+| Document | Description |
+|---|---|
+| [Using Chat](guide/using-chat.md) | Streaming chat, tool calls, escalations, delegation, todos, and recovery |
+| [Projects](guide/projects.md) | Project sources, workflow bindings, grants, project-aware tasks, and revision flows |
+| [Managing Tasks](guide/managing-tasks.md) | Task board, workflow runs, approvals, deliverables, revisions, and results delivery |
+| [Schedules](guide/schedules.md) | Recurring task creation and scheduled workflow execution |
+| [Workflows](guide/workflows.md) | Build reusable workflows and understand step behavior |
+| [Tools and Skills](guide/tools-and-skills.md) | Inspect tools, MCP-backed capabilities, reusable skills, and skill-loaded tools |
 
 ## Operations
 
 | Document | Description |
 |---|---|
-| Troubleshooting | Common setup, provider, executor, and UI problems |
+| [Settings](guide/settings.md) | Configure providers, routing, secrets, executors, diagnostics, and users |
+| [Executors](guide/executors.md) | Choose where tools run, configure browser automation, and route tools safely |
+| [Channels](guide/channels.md) | Connect external messaging platforms and understand pairing |
+| [Deployment](guide/deployment.md) | Docker, systemd, remote executors, TLS, backups, and production hardening |
+| [Troubleshooting](guide/troubleshooting.md) | Common setup, provider, executor, browser, channel, and UI problems |
 
 ## In-App Docs
 
@@ -41,12 +44,15 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 - `/docs/architecture`
 - `/docs/configuring-providers`
 - `/docs/creating-agents`
-- `/docs/settings`
+- `/docs/security-and-privacy`
 - `/docs/using-chat`
+- `/docs/projects`
 - `/docs/managing-tasks`
 - `/docs/schedules`
 - `/docs/workflows`
-- `/docs/channels`
-- `/docs/executors`
 - `/docs/tools-and-skills`
+- `/docs/settings`
+- `/docs/executors`
+- `/docs/channels`
+- `/docs/deployment`
 - `/docs/troubleshooting`

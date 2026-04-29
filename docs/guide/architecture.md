@@ -2,6 +2,8 @@
 
 Cognis is the controller and orchestration layer of the Openclaw ecosystem. It works with Mnemory for persistent memory, Intaris for guardrails and session content, and executors for tool execution.
 
+![Cognis cloud-native Agent OS](../assets/images/cognis-cloud-native-agent-os.svg)
+
 ![Cognis ecosystem overview](../assets/images/cognis-ecosystem-overview.svg)
 
 ## The ecosystem at a glance
@@ -12,6 +14,17 @@ Cognis is the controller and orchestration layer of the Openclaw ecosystem. It w
 - **Executors** run tools and can optionally proxy local model inference.
 
 This split keeps Cognis focused on coordination instead of embedding memory, safety, and tool runtimes in one process.
+
+## Cloud-native Agent OS
+
+Cognis is built so the controller can run as stable infrastructure while executors come and go. A stateless cloud executor can handle ephemeral shell, search, LSP, MCP, or browser work. A stateful executor can keep browser profiles, local workspaces, caches, and private-network identity on a persistent host.
+
+This gives you a deployment shape that matches the work:
+
+- put the controller where the UI, routing, and orchestration should live
+- put executors near private files, internal networks, browser identities, or local model access
+- scale disposable executors for short-lived tasks
+- use persistent executor homes only when runtime state should survive
 
 ## Controller versus executor
 

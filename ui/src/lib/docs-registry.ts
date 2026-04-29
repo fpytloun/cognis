@@ -4,7 +4,7 @@
  * This module intentionally does NOT import any markdown `?raw` content.
  * Content is loaded lazily via `loadDocContent()` / `loadDocsOverviewContent()`.
  *
- * Previously, `src/lib/docs.ts` eagerly imported 13 `.md?raw` files at module
+ * Previously, `src/lib/docs.ts` eagerly imported all guide `.md?raw` files at module
  * load time, resulting in a ~71 KB docs chunk being shipped to every page
  * that imported `$lib/docs` — including `/getting-started`, which needed
  * only titles and hrefs.
@@ -43,7 +43,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'See how Cognis works with Mnemory, Intaris, and executors.',
     category: 'getting-started',
     sourcePath: 'docs/guide/architecture.md',
-    relatedSlugs: ['executors', 'channels', 'workflows']
+    relatedSlugs: ['executors', 'deployment', 'security-and-privacy']
   },
   {
     slug: 'configuring-providers',
@@ -60,6 +60,14 @@ export const embeddedDocsMeta: DocMeta[] = [
     category: 'workspace',
     sourcePath: 'docs/guide/creating-agents.md',
     relatedSlugs: ['configuring-providers', 'using-chat', 'executors', 'tools-and-skills']
+  },
+  {
+    slug: 'security-and-privacy',
+    title: 'Security and Privacy',
+    description: 'Understand secrets, value refs, guardrails, executor boundaries, and inference privacy.',
+    category: 'getting-started',
+    sourcePath: 'docs/guide/security-and-privacy.md',
+    relatedSlugs: ['architecture', 'executors', 'deployment']
   },
   {
     slug: 'settings',
@@ -83,7 +91,23 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Track queued or running work, workflow progress, and delivery back to chat.',
     category: 'workspace',
     sourcePath: 'docs/guide/managing-tasks.md',
-    relatedSlugs: ['workflows', 'using-chat']
+    relatedSlugs: ['workflows', 'projects', 'using-chat']
+  },
+  {
+    slug: 'projects',
+    title: 'Projects',
+    description: 'Group sources, workflow bindings, grants, tasks, schedules, and conversations.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/projects.md',
+    relatedSlugs: ['managing-tasks', 'workflows', 'creating-agents']
+  },
+  {
+    slug: 'schedules',
+    title: 'Schedules',
+    description: 'Create recurring task factories that run workflows on a schedule.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/schedules.md',
+    relatedSlugs: ['projects', 'workflows', 'managing-tasks']
   },
   {
     slug: 'workflows',
@@ -91,7 +115,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Create reusable execution templates with steps, gates, and revision loops.',
     category: 'workspace',
     sourcePath: 'docs/guide/workflows.md',
-    relatedSlugs: ['managing-tasks', 'creating-agents']
+    relatedSlugs: ['managing-tasks', 'projects', 'creating-agents']
   },
   {
     slug: 'tools-and-skills',
@@ -107,7 +131,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Connect agents to external platforms and understand pairing and trust.',
     category: 'operations',
     sourcePath: 'docs/guide/channels.md',
-    relatedSlugs: ['executors', 'troubleshooting']
+    relatedSlugs: ['executors', 'security-and-privacy', 'troubleshooting']
   },
   {
     slug: 'executors',
@@ -115,7 +139,15 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Choose where tools run and how remote executor placement affects agents.',
     category: 'operations',
     sourcePath: 'docs/guide/executors.md',
-    relatedSlugs: ['channels', 'configuring-providers', 'creating-agents']
+    relatedSlugs: ['deployment', 'channels', 'configuring-providers', 'creating-agents']
+  },
+  {
+    slug: 'deployment',
+    title: 'Deployment',
+    description: 'Run Cognis with Docker or systemd, remote executors, TLS, backups, and hardening.',
+    category: 'operations',
+    sourcePath: 'docs/guide/deployment.md',
+    relatedSlugs: ['executors', 'security-and-privacy', 'troubleshooting']
   },
   {
     slug: 'troubleshooting',
@@ -132,12 +164,16 @@ export const ONBOARDING_DOC_SLUGS = [
   'architecture',
   'configuring-providers',
   'creating-agents',
+  'security-and-privacy',
   'settings',
   'using-chat',
+  'projects',
   'managing-tasks',
+  'schedules',
   'workflows',
   'channels',
   'executors',
+  'deployment',
   'tools-and-skills',
   'troubleshooting'
 ] as const;

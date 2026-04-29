@@ -17,3 +17,5 @@ docker run --rm --platform linux/amd64 \
 ```
 
 Repeat the same command pattern for the other `.excalidraw` files whenever a diagram changes.
+
+Public launch screenshots live in `docs/assets/screenshots/`. They are curated copies of current app screenshots and should be referenced from README/guides instead of root-level working captures.

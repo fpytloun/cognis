@@ -2,6 +2,8 @@
 
 Tasks are how Cognis tracks durable work that should run through a workflow instead of a single immediate chat turn.
 
+![Cognis task workflow view on iOS PWA](../assets/screenshots/pwa-task.png)
+
 ## What tasks are for
 
 Use `Tasks` when work should be:

@@ -2,6 +2,8 @@
 
 The chat workspace is where you talk to an agent, watch responses stream in real time, and follow tool usage or delegated work without leaving the conversation.
 
+![Cognis chat workspace with web research tools](../assets/screenshots/chat-desktop.png)
+
 ## Starting a conversation
 
 Open `Chat`, create a new conversation, and select an agent.
@@ -83,6 +85,8 @@ When installed:
 - Updates are applied automatically. When a new version is available, a small banner appears at the top of the screen with a "Reload" action.
 
 ## Mobile-specific behavior
+
+![Cognis iOS PWA chat with tool activity](../assets/screenshots/pwa-chat.png)
 
 - Primary navigation on mobile is a bottom tab bar (Chat / Tasks / Agents / Settings). Inside a chat conversation the bar hides so the composer owns the bottom safe-area.
 - Tapping the hamburger button in the header opens a right-side sheet drawer with the full navigation. The sheet supports swipe-down-to-dismiss.

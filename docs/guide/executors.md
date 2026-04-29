@@ -4,6 +4,8 @@ Executors are the part of Cognis that perform tool execution. The controller dec
 
 ![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)
 
+![Executor browser automation and tool configuration](../assets/screenshots/executor-browser-tools.png)
+
 ## Why executors exist
 
 This separation lets Cognis:

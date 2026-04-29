@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="660" viewBox="0 0 1200 660" role="img" aria-labelledby="title desc">
+  <title id="title">Cognis cloud-native Agent OS architecture</title>
+  <desc id="desc">Cognis controller orchestrates memory, guardrails, and executors. Stateless cloud executors and stateful local executors run tools, browsers, MCP, shells, and optional inference.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#38bdf8" />
+    </marker>
+    <style>
+      .bg{fill:#020617}.panel{fill:#0f172a;stroke:#334155;stroke-width:2}.box{fill:#111827;stroke:#475569;stroke-width:1.5}.blue{fill:#082f49;stroke:#0ea5e9}.green{fill:#052e2b;stroke:#10b981}.purple{fill:#22134d;stroke:#8b5cf6}.amber{fill:#3b2603;stroke:#f59e0b}.text{fill:#f8fafc;font-family:Helvetica,Arial,sans-serif}.muted{fill:#94a3b8;font-family:Helvetica,Arial,sans-serif}.mono{fill:#bae6fd;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.arrow{stroke:#38bdf8;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.thin{stroke:#64748b;stroke-width:1.5;fill:none;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect class="bg" width="1200" height="660" rx="24" />
+  <text x="600" y="54" text-anchor="middle" class="text" font-size="28" font-weight="700">Cognis: Cloud-native Agent OS</text>
+  <text x="600" y="84" text-anchor="middle" class="muted" font-size="15">The controller decides. Executors do. Memory, guardrails, and tool runtime stay decoupled.</text>
+
+  <rect x="405" y="135" width="390" height="245" rx="22" class="panel" />
+  <text x="600" y="172" text-anchor="middle" class="text" font-size="22" font-weight="700">Cognis Controller</text>
+  <text x="600" y="200" text-anchor="middle" class="muted" font-size="14">identity, orchestration, routing, UI</text>
+  <rect x="435" y="225" width="150" height="52" rx="12" class="blue" />
+  <text x="510" y="257" text-anchor="middle" class="text" font-size="14">Agents + Chat</text>
+  <rect x="615" y="225" width="150" height="52" rx="12" class="blue" />
+  <text x="690" y="257" text-anchor="middle" class="text" font-size="14">Tasks + Workflows</text>
+  <rect x="435" y="300" width="150" height="52" rx="12" class="blue" />
+  <text x="510" y="332" text-anchor="middle" class="text" font-size="14">Projects + Schedules</text>
+  <rect x="615" y="300" width="150" height="52" rx="12" class="blue" />
+  <text x="690" y="332" text-anchor="middle" class="text" font-size="14">Provider Routing</text>
+
+  <rect x="70" y="145" width="245" height="100" rx="18" class="green" />
+  <text x="192" y="184" text-anchor="middle" class="text" font-size="20" font-weight="700">Mnemory</text>
+  <text x="192" y="212" text-anchor="middle" class="muted" font-size="14">long-term memory + recall</text>
+
+  <rect x="70" y="295" width="245" height="100" rx="18" class="purple" />
+  <text x="192" y="334" text-anchor="middle" class="text" font-size="20" font-weight="700">Intaris</text>
+  <text x="192" y="362" text-anchor="middle" class="muted" font-size="14">guardrails, approvals, audit</text>
+
+  <rect x="885" y="115" width="245" height="130" rx="18" class="amber" />
+  <text x="1008" y="153" text-anchor="middle" class="text" font-size="19" font-weight="700">Stateless Executors</text>
+  <text x="1008" y="181" text-anchor="middle" class="muted" font-size="14">ephemeral cloud workers</text>
+  <text x="1008" y="210" text-anchor="middle" class="mono" font-size="13">shell · search · LSP · MCP</text>
+
+  <rect x="885" y="300" width="245" height="150" rx="18" class="amber" />
+  <text x="1008" y="338" text-anchor="middle" class="text" font-size="19" font-weight="700">Stateful Executors</text>
+  <text x="1008" y="366" text-anchor="middle" class="muted" font-size="14">local or private-network runtime</text>
+  <text x="1008" y="395" text-anchor="middle" class="mono" font-size="13">browser profiles · files · channels</text>
+  <text x="1008" y="421" text-anchor="middle" class="mono" font-size="13">optional local inference</text>
+
+  <rect x="405" y="480" width="390" height="90" rx="18" class="box" />
+  <text x="600" y="517" text-anchor="middle" class="text" font-size="19" font-weight="700">Users and Channels</text>
+  <text x="600" y="545" text-anchor="middle" class="muted" font-size="14">Web UI, PWA, Signal, Slack, iMessage, webhooks</text>
+
+  <path class="arrow" d="M405 210 C350 190 325 188 315 188" />
+  <path class="arrow" d="M405 325 C350 340 325 343 315 343" />
+  <path class="arrow" d="M795 205 C835 180 855 176 885 176" />
+  <path class="arrow" d="M795 325 C835 355 855 370 885 374" />
+  <path class="thin" d="M600 480 L600 380" />
+  <path class="thin" d="M1008 450 C980 520 870 540 795 535" />
+  <path class="thin" d="M405 535 C315 525 245 470 205 395" />
+
+  <text x="345" y="171" class="muted" font-size="12">recall / remember</text>
+  <text x="330" y="325" class="muted" font-size="12">evaluate / record</text>
+  <text x="812" y="158" class="muted" font-size="12">tool.execute</text>
+  <text x="812" y="352" class="muted" font-size="12">browser + local state</text>
+  <text x="616" y="432" class="muted" font-size="12">chat, tasks, approvals</text>
+</svg>

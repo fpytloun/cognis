@@ -4,268 +4,263 @@
 
 # cognis
 
-Decoupled control plane for AI agents. Cognis is the controller and orchestration layer of the Openclaw ecosystem -- it manages agent definitions, interactive chat, delegated sub-sessions, tool execution routing, and integrates with external memory and guardrails services.
+**Cloud-native Agent OS for self-hosted AI agents.** Cognis is the controller and orchestration layer of the Openclaw ecosystem: it gives agents identity, memory, workflows, tools, browser use, channels, and safety guardrails without turning everything into one fragile monolith.
 
-**Non-blocking.** The main chat is always responsive. Heavy work -- research, coding, multi-step tool calls -- is delegated to background sub-sessions. The user sees real-time progress and can continue chatting.
+Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
-**Decoupled.** Cognis does not embed memory, guardrails, or session recording. It orchestrates them through pluggable provider interfaces. Swap any component without changing the controller.
+<p align="center">
+  <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
+</p>
 
-**Safe by default.** Every tool call flows through guardrails evaluation. Non-bypassable tools always require safety checks. All actions are audited with full lineage.
+Part of the Openclaw ecosystem:
 
-**Self-hosted.** Python async controller, SQLite or PostgreSQL, no external dependencies beyond an LLM API key and the companion services. Your agents, conversations, and data stay under your control.
+- [Cognis](https://github.com/fpytloun/cognis) controller and agent OS
+- [Intaris](https://github.com/fpytloun/intaris) guardrails, audit, and session content
+- [Mnemory](https://github.com/fpytloun/mnemory) persistent memory and recall
 
-Part of the Openclaw ecosystem: Cognis controller, [Intaris](https://github.com/fpytloun/intaris) guardrails, [Mnemory](https://github.com/fpytloun/mnemory) memory.
+## Why Cognis
+
+- **Agent work should not block chat.** Research, coding, browser sessions, and multi-step tasks can run in background workflows while the main conversation stays responsive.
+- **Tools should run near the thing they touch.** A cloud controller can orchestrate an executor in your home lab, a customer VPC, a CI runner, or a disposable container.
+- **Browser use should be real.** Executors can drive Playwright/Patchright browsers, keep persistent local profiles, inspect pages, click, type, submit forms, save screenshots, and behave closer to a human using a site than a simple HTTP scraper.
+- **Memory and safety should be first-class.** Cognis integrates Mnemory for long-term recall and Intaris for guardrails, approvals, audit, and session history.
+- **Work should be structured.** Tasks, workflows, gates, deliverables, revisions, schedules, and project context make agents useful for repeatable operations instead of one-off prompts.
+
+## What You Can Build
+
+- A personal agent workspace with chat, web research, browser automation, task queues, and scheduled workflows.
+- A team controller with remote executors in different networks, each exposing only the tools it should run.
+- Agents that monitor channels, ask for approval, perform browser tasks, and deliver results back to conversations.
+- Project-aware coding or research workflows that know which repository, source, task, or workflow they belong to.
+- Skill-backed agents that can load reusable operating procedures and tool bundles only when needed.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/screenshots/executor-browser-tools.png" alt="Executor configuration with browser automation tools" width="49%" />
+  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="49%" />
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshots/pwa-conversations.png" alt="Cognis iOS PWA conversation drawer" width="31%" />
+  <img src="docs/assets/screenshots/pwa-chat.png" alt="Cognis iOS PWA chat with tool activity" width="31%" />
+  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis iOS PWA task workflow view" width="31%" />
+</p>
 
 ## Features
 
-- **Interactive chat with streaming** -- WebSocket-based chat with real-time token streaming, tool call indicators, and delegation status cards.
-- **Agent identity** -- Create agents with name, personality, behavioral rules, and skills. Personality bootstrapped to Mnemory and evolves through interactions.
-- **Sub-session delegation** -- Three modes: Agent (delegate to different agent), Worker (same agent, focused task), Fork (parallel exploration). Main chat stays responsive.
-- **Task queue + workflows** -- Durable kanban-style tasks with priorities, dependencies, portable workflow templates, per-step tool profiles, step evaluation, and human-in-the-loop gates.
-- **Controller-executor separation** -- The controller decides; executors do. Ships with in-process, subprocess, and remote WebSocket executors using JSON-RPC 2.0 over WebSocket. Remote executors can provide local LLM inference alongside tool execution, and executor-hosted channel adapters are already supported for integrations that need user-local services such as Signal via `signal-cli`.
-- **Memory integration** -- Persistent recall and remember through [Mnemory](https://github.com/fpytloun/mnemory). Agent identity, user facts, episodic memory, and artifacts.
-- **Guardrails integration** -- Every tool call evaluated by [Intaris](https://github.com/fpytloun/intaris). Escalation prompts with approve/deny. Session recording and behavioral analysis.
-- **LLM provider abstraction** -- Multi-provider support via LiteLLM. Configure providers and model routing through the UI, with model metadata, capability flags, and pricing fields.
-- **MCP tool support** -- Connect MCP servers over supported transports such as stdio, SSE, and streamable HTTP. Tools are discovered automatically, evaluated through guardrails, and executed on the executor.
-- **Decision Engine** -- Deterministic rules + lightweight LLM classifier decide whether a request runs inline or gets delegated to a background sub-session.
-- **Context management** -- Parallel context assembly (Mnemory recall + Intaris events + intention read via `asyncio.gather`). LLM-based compaction with mechanical fallback for long conversations.
-- **Web UI** -- SvelteKit application served by Cognis on `:8080` by default, with setup flow, diagnostics, provider presets, and account management.
-- **Installable PWA** -- Cognis ships as a Progressive Web App. Install on desktop, iPhone, or Android for a dedicated window, offline app shell, safe-area-aware layout, and native-feel mobile navigation with a bottom tab bar and bottom-sheet drawers.
-- **Channel adapters** -- Connect agents to Signal, WhatsApp, Telegram, Discord, Slack, Matrix, IRC, Google Chat, and iMessage (via BlueBubbles) with DB-managed channel accounts and webhook/gateway integrations. Signal and BlueBubbles currently have the most complete setup documentation.
-- **Secure pairing flow** -- External senders can be required to redeem a short-lived verification code in the Cognis UI before the agent accepts their messages.
-- **Polished workspace UX** -- Global toasts, confirmation dialogs, keyboard shortcuts, mobile navigation, chat timestamps, and unsaved-change protection.
-- **Degraded-mode guidance** -- Provider outage banners, setup-incomplete states, retry affordances, and contextual chat/task failure messaging.
-- **CLI** -- Typer-based CLI for server management and administration.
-- **Quick local bootstrap** -- `uvx cognis-controller` creates local keys and a SQLite database, then serves the web UI on `:8080`.
-- **JWT service auth** -- Cognis issues ES256 JWTs. Mnemory and Intaris validate them. No API keys between services.
-- **Encrypted secrets** -- AES-256-GCM encrypted secret store for API keys and credentials. Injected into executors at runtime.
+- **Streaming chat workspace**: WebSocket chat with token streaming, tool activity, todos, approvals, delegation cards, reconnect handling, search, timestamps, and mobile-friendly navigation.
+- **Agent identity**: Agents have names, descriptions, personality, behavioral guidance, model/provider overrides, skills, avatars, sharing rules, and executor/tool boundaries.
+- **Projects**: Group work around projects with source hints, workflow bindings, grants, project-aware tasks, schedules, conversations, and context injection for relevant paths.
+- **Tasks and workflows**: Durable task board, dependencies, priorities, step runs, gates, deliverables, comments, reruns, revisions, schedules, and reusable workflow templates.
+- **Remote executors**: In-process, subprocess, and WebSocket executors. Use stateless cloud executors for ephemeral work or persistent executor homes for browser profiles, workspaces, caches, and local identity.
+- **Browser and web tools**: Web search/fetch/crawl/map/research plus executor-native browser sessions, snapshots, queries, clicks, typing, forms, console/network inspection, screenshots, and saved auth state.
+- **MCP and native tools**: Built-in filesystem, shell, search, LSP, artifact, image, date/time, memory, browser, web, workflow, and system tools, plus MCP tools from controller-managed or executor-attached servers.
+- **Skills**: Versioned instruction, asset, and tool bundles. Agents discover compact skill metadata, load full instructions on demand, and can expose linked or bundled tools through the executor boundary.
+- **Memory**: Mnemory-backed recall and remember for user facts, agent personality, episodic memory, and artifacts.
+- **Guardrails and approvals**: Intaris evaluates tool calls, escalates sensitive actions, records session content, and keeps an audit trail.
+- **Credentials without prompt leakage**: Secrets are encrypted at rest and referenced through value refs. Agents and LLMs receive references, not raw secret values; executors resolve values only at execution time.
+- **Channels**: Connect agents to external platforms through channel accounts, verified contacts, webhook/gateway adapters, and pairing flows. Signal and iMessage via BlueBubbles have the most complete setup paths today.
+- **PWA and mobile UX**: Installable web app with offline shell, iOS/Android safe-area layout, bottom tabs, drawers, and task/workflow views tuned for small screens.
+- **Admin and operations**: Setup flow, diagnostics, provider presets, model routing, secrets, executor tokens, system health, metrics, reconciliation, CLI admin commands, Docker images, and systemd templates.
+
+## Architecture
+
+![Cognis cloud-native Agent OS](docs/assets/images/cognis-cloud-native-agent-os.svg)
+
+![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
+
+| Data | Owner | Storage |
+|------|-------|---------|
+| Users, agents, projects, tasks, workflows, secrets, settings | **Cognis** | Cognis DB |
+| Conversation and session metadata | **Cognis** | Cognis DB |
+| Session content, tool-call audit, guardrails decisions | **Intaris** | Intaris DB + event store |
+| Long-term memories and recall artifacts | **Mnemory** | Mnemory stores |
+| Tool execution state, browser profiles, local workspaces | **Executor** | Executor host, optional persistent volume |
+
+The important rule is simple: **the controller decides, executors do**. Even local development uses the same conceptual boundary. This is what lets Cognis run as a cloud-native controller while moving risky, stateful, or network-local work to executors.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.12+
-- One LLM option: OpenAI, Anthropic, or a local Ollama instance
+- One LLM option: OpenAI, Anthropic, OpenAI-compatible API, LiteLLM proxy, or local Ollama
+- Mnemory and Intaris for memory and guardrails
 
-Cognis needs [Mnemory](https://github.com/fpytloun/mnemory) and [Intaris](https://github.com/fpytloun/intaris) running. Start Cognis once first so it can generate its JWT keypair and setup URL:
+Start Cognis once so it creates local state and a setup URL:
 
 ```bash
-uvx cognis-controller           # Controller on :8080
+uvx cognis-controller
 ```
 
-Then start Mnemory and Intaris with Cognis's public key for JWT validation:
+On first start Cognis creates `~/.cognis/` with ES256 JWT keys, a secrets encryption key, and a SQLite database. It serves the bundled UI on `http://localhost:8080` when assets are available.
+
+Start the companion services with Cognis's public key:
 
 ```bash
-# Mnemory
 MNEMORY_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx mnemory
-
-# Intaris
 INTARIS_JWT_PUBLIC_KEY=~/.cognis/keys/public.pem uvx intaris
 ```
 
-If you started Cognis before setting provider credentials, restart it with an LLM credential available to LiteLLM:
+Restart Cognis with an LLM credential if needed:
 
 ```bash
 OPENAI_API_KEY=sk-... uvx cognis-controller
 ```
 
-On first start, Cognis creates `~/.cognis/` with auto-generated JWT keys, a secrets encryption key, and a SQLite database. When bundled UI assets are present, it serves the web UI on `:8080` and prints a one-time setup URL for the first admin account:
+Then open the printed setup URL, create the first admin user, and use the in-app **Getting started** checklist to configure:
 
-```
-Cognis started on http://localhost:8080
+1. Provider and model routing
+2. Executor/tool access
+3. First agent
+4. First chat or task
 
-No users found. Complete setup at:
-  http://localhost:8080/setup?token=<random_token>
-This link expires in 15 minutes.
-```
-
-After creating the admin:
-
-1. Open the printed setup URL
-2. Create the first admin account in the web form
-3. Log in
-4. Open **Settings → Providers** and configure a provider preset
-5. Open **Settings → Executors** and enable the tool groups you want available
-6. Open **Agents → New** and create the first agent
-7. Start a conversation from **Chat**
-8. Optional: configure **Channels** and redeem pairing codes to link remote sender identities securely
-
-Use **Settings → System** or **Getting started** for readiness checks and diagnostics.
-
-The bundled UI also includes embedded user-facing documentation under `Docs`.
-
-For headless setup, use the CLI:
+For headless setup:
 
 ```bash
 cognis-controller admin create-user admin@example.com --name "Admin"
 ```
 
-## Architecture
+## Docker
 
-Cognis is a decoupled control plane. It orchestrates, but does not own, memory or guardrails:
+Cognis publishes two images:
 
-![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
+- `ghcr.io/fpytloun/cognis` for the controller and bundled UI
+- `ghcr.io/fpytloun/cognis-executor` for WebSocket executors with browser, shell, coding, search, and LSP tooling
 
-| Data | Owner | Storage |
-|------|-------|---------|
-| Users, agents, secrets, settings | **Cognis** | Cognis DB (SQLite / PostgreSQL) |
-| Conversation & session metadata | **Cognis** | Cognis DB |
-| Session content (messages, tool calls) | **Intaris** | Intaris event store |
-| Safety decisions, behavioral analysis | **Intaris** | Intaris DB |
-| Persistent memory (facts, personality) | **Mnemory** | Mnemory (Qdrant) |
+Run the controller with persistent state:
 
-Every major capability is a pluggable provider behind a Python `Protocol` interface:
+```bash
+docker run -d \
+  --name cognis \
+  --add-host=host.docker.internal:host-gateway \
+  -p 8080:8080 \
+  -v cognis-data:/data \
+  -e COGNIS_DATA_DIR=/data \
+  -e COGNIS_MNEMORY_URL=http://host.docker.internal:8050 \
+  -e COGNIS_INTARIS_URL=http://host.docker.internal:8060 \
+  -e OPENAI_API_KEY=sk-... \
+  ghcr.io/fpytloun/cognis:latest
+```
 
-- `MemoryProvider` -- default: Mnemory
-- `GuardrailsProvider` -- default: Intaris
-- `ExecutorProvider` -- ships with in-process, subprocess, and remote WebSocket modes
-- `LLMProvider` -- default: LiteLLM
-- `SecretsProvider` -- default: encrypted DB
-- `AuthProvider` -- default: ES256 JWT
+Create a WebSocket executor in **Settings -> Executors**, generate a token, then run an executor:
+
+```bash
+docker run -d \
+  --name cognis-executor \
+  -v cognis-executor-home:/home/cognis \
+  -e COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws \
+  -e COGNIS_EXECUTOR_TOKEN=eyJ... \
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+For a local non-TLS controller, use `ws://localhost:8080/api/executor/ws` only with local networking. Remote executors should use `wss://`.
+
+See [Deployment](docs/guide/deployment.md) for production notes, systemd, backups, TLS, and multi-user hardening.
 
 ## Configuration
 
-There is **no configuration file**. Infrastructure config uses environment variables. Application config (LLM providers, model routing, session settings) is stored in the database and managed through the UI or API.
+Cognis has **no config file**. Infrastructure settings use environment variables; application settings live in the database and are managed through the UI/API.
 
-### Environment Variables
+Common variables:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `COGNIS_DATA_DIR` | `~/.cognis` | Data directory (keys, DB, secrets) |
+|---|---|---|
+| `COGNIS_DATA_DIR` | `~/.cognis` | Data directory for keys, DB, secrets, artifacts |
 | `COGNIS_HOST` | `0.0.0.0` | Bind address |
-| `COGNIS_PORT` | `8080` | Port |
-| `COGNIS_MNEMORY_URL` | `http://localhost:8050` | Mnemory service URL |
-| `COGNIS_INTARIS_URL` | `http://localhost:8060` | Intaris service URL |
-| `DATABASE_URL` | `sqlite+aiosqlite:///~/.cognis/cognis.db` | Database URL |
-| `COGNIS_LOG_LEVEL` | `info` | Log level |
+| `COGNIS_PORT` | `8080` | HTTP port |
+| `COGNIS_MNEMORY_URL` | `http://localhost:8050` | Mnemory URL |
+| `COGNIS_INTARIS_URL` | `http://localhost:8060` | Intaris URL |
+| `DATABASE_URL` | SQLite under `COGNIS_DATA_DIR` | SQLAlchemy database URL |
+| `COGNIS_LOG_LEVEL` | `info` | Logging level |
 
-Auto-generated on first start (override with env vars for production):
-- `COGNIS_JWT_PRIVATE_KEY_PATH` -- ES256 private key
-- `COGNIS_JWT_PUBLIC_KEY_PATH` -- ES256 public key (share with Mnemory/Intaris)
-- `COGNIS_SECRETS_KEY_PATH` -- AES-256-GCM encryption key
+Auto-generated unless overridden:
+
+- `COGNIS_JWT_PRIVATE_KEY_PATH`
+- `COGNIS_JWT_PUBLIC_KEY_PATH`
+- `COGNIS_SECRETS_KEY_PATH`
+
+## CLI
+
+```bash
+cognis-controller serve
+cognis-controller admin create-user <email>
+cognis-controller admin reset-password <email>
+cognis-controller admin api-key create <email>
+cognis-controller status
+cognis-controller config init
+```
+
+Remote executor:
+
+```bash
+cognis-executor \
+  --controller-url wss://cognis.example.com/api/executor/ws \
+  --token <jwt-token>
+```
+
+Environment variables are preferred for long-running executors so tokens do not appear in command history:
+
+```bash
+export COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
+export COGNIS_EXECUTOR_TOKEN=<jwt-token>
+export COGNIS_EXECUTOR_WORKDIR=~
+cognis-executor
+```
 
 ## Development
 
 ```bash
-# Install with dev dependencies
 uv pip install -e ".[dev]"
-
-# Run server
 uv run cognis-controller serve
 
-# Run the SvelteKit UI in dev mode (not required for normal users)
-cd ui && npm install && npm run dev
+uv run pytest tests/unit/ -v
+uv run pytest tests/contract/ -v
+uv run pytest tests/integration/ -v
 
-# Run tests
-uv run pytest tests/unit/ -v          # Unit tests (fast, no services needed)
-uv run pytest tests/contract/ -v      # Contract tests (need Mnemory + Intaris)
-uv run pytest tests/integration/ -v   # Integration tests (need full stack)
+cd ui && npm install && npm run check && npm run test && npm run build
 
-# UI checks and build
-cd ui && npm run check
-cd ui && npm run test
-cd ui && npm run build
-
-# Lint and type check
 ruff check cognis/ tests/
 ruff format cognis/ tests/
 mypy cognis/
 ```
 
-## CLI
-
-```bash
-cognis-controller serve                 # Start the controller
-cognis-controller admin create-user <email>
-                                         # Create user (direct DB access)
-cognis-controller admin reset-password <email>
-                                         # Reset password
-cognis-controller admin api-key create <email>
-                                         # Create API key
-cognis-controller status                # Health + provider status
-cognis-controller config init           # Print env var template
-```
-
-### Remote Executor
-
-Run a standalone executor process that connects to a Cognis controller via WebSocket. The executor is a remote hand: the controller assigns tools, MCP setup, and decides whether LLM inference runs locally on the controller or is proxied through the executor.
-
-```bash
-# On the remote machine (via CLI flags)
-cognis-executor \
-    --controller-url wss://cognis.example.com/api/executor/ws \
-    --token <jwt-token>
-
-# Or via environment variables (preferred — avoids token in /proc/cmdline)
-export COGNIS_CONTROLLER_URL=wss://cognis.example.com/api/executor/ws
-export COGNIS_EXECUTOR_TOKEN=<jwt-token>
-# Optional. Defaults to the executor user's home directory.
-export COGNIS_EXECUTOR_WORKDIR=~
-cognis-executor
-```
-
-For local development from a checkout, `uv run cognis-executor` and `python -m cognis.executor` are also available.
-
-Or run as a Python module:
-```bash
-python -m cognis.executor \
-    --controller-url wss://cognis.example.com/api/executor/ws \
-    --token <jwt-token>
-```
-
-The executor authenticates with a JWT token generated by Cognis, communicates over encrypted WebSocket with per-message compression, and sends heartbeats every 15 seconds. TLS (`wss://`) is enforced for non-localhost connections. LLM providers remain configured normally in Cognis; setting a provider location to `executor` routes the same provider call through a matching executor instead of running it on the controller.
-
-Executor tools run from the explicit `--workdir` / `COGNIS_EXECUTOR_WORKDIR` directory, or from the executor user's home directory when unset. This prevents `uv run cognis-executor` from leaking the checkout directory into tool calls.
-
-Executors are user-scoped. MCP servers are also user-scoped and are assigned to executors, not shared globally across users. Agents bind to one executor (explicitly or by labels) and inherit the effective tool set from that executor.
-
-For multi-user production deployments, disable local executor modes with the DB-backed settings `executors.allow_in_process=false` and `executors.allow_subprocess=false`, then use only WebSocket executors.
-
-**Generating a token:** Create the executor in **Settings > Executors**, then click **Generate token**. The token is displayed once — copy it or the ready-made CLI command. Alternatively, use the API: `POST /api/v1/executors/{id}/token` (admin only).
-
-**Subprocess mode:** When using `python -m cognis.executor`, the token can also be piped via stdin (used internally by the subprocess executor to avoid exposing the token in process listings).
-
-**Systemd service templates** for both the controller and executor are available in [`deploy/systemd/`](deploy/systemd/). See [`deploy/systemd/README.md`](deploy/systemd/README.md) for installation instructions covering system-level units (per-user executor template) and user-level units (no root required).
-
-The same split is the deployment model for stateful channel adapters.
-For example, a user can either run Signal's `signal-cli` REST API next to a
-Cognis executor they control or let the executor run `signal-cli` directly via
-JSON-RPC, while the cloud controller continues to orchestrate pairing, turns,
-and outbound delivery without owning the Signal session state itself.
-
 ## Status
 
 Available today:
 
-- Interactive chat, agents, tasks, workflows, schedules, channels, and the bundled web UI
+- Chat, agents, projects, tasks, workflows, schedules, channels, tools, skills, and bundled web UI
 - In-process, subprocess, and remote WebSocket executors
-- Executor-routed inference and executor-hosted Signal direct mode
-- Mnemory and Intaris integrations, MCP tools, encrypted secrets, setup diagnostics, and admin CLI flows
+- Executor-routed inference and executor-native browser automation
+- Mnemory and Intaris integrations
+- MCP tools, encrypted secrets, credential references, setup diagnostics, admin CLI, Docker images, and systemd templates
 
 Still ahead:
 
-- Docker and Kubernetes executor backends
-- federation and cryptographic agent identity
-- broader production hardening for multi-user and multi-replica deployments
-
-See [docs/specs/](docs/specs/) for the full specification set and [docs/specs/implementation/](docs/specs/implementation/) for the implementation stage tracker.
+- Docker and Kubernetes executor backends managed directly by the controller
+- Federation and cryptographic agent identity
+- Broader multi-replica and multi-user production hardening
 
 ## Documentation
 
 - [Documentation Index](docs/README.md)
 - [Getting Started](docs/guide/getting-started.md)
 - [Architecture](docs/guide/architecture.md)
+- [Projects](docs/guide/projects.md)
 - [Configuring Providers](docs/guide/configuring-providers.md)
 - [Creating Agents](docs/guide/creating-agents.md)
-- [Settings](docs/guide/settings.md)
 - [Using Chat](docs/guide/using-chat.md)
 - [Managing Tasks](docs/guide/managing-tasks.md)
 - [Schedules](docs/guide/schedules.md)
 - [Workflows](docs/guide/workflows.md)
+- [Tools and Skills](docs/guide/tools-and-skills.md)
 - [Channels](docs/guide/channels.md)
 - [Executors](docs/guide/executors.md)
-- [Tools and Skills](docs/guide/tools-and-skills.md)
+- [Deployment](docs/guide/deployment.md)
+- [Security and Privacy](docs/guide/security-and-privacy.md)
 - [Troubleshooting](docs/guide/troubleshooting.md)
+- [Internal Design Specs](docs/specs/README.md)
 
 ## License
 
