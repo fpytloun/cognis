@@ -65,7 +65,7 @@ import Zap from 'lucide-svelte/icons/zap';
     task_description: '',
     priority: 0,
     expected_output: '',
-    delivery_mode: 'latest_active_for_agent',
+    delivery_mode: 'preferred_channel',
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
@@ -143,7 +143,7 @@ import Zap from 'lucide-svelte/icons/zap';
       task_description: (tmpl.description as string) ?? '',
       priority: (tmpl.priority as number) ?? 0,
       expected_output: (tmpl.expected_output as string) ?? '',
-      delivery_mode: (delivery.mode as string) ?? 'latest_active_for_agent',
+      delivery_mode: (delivery.mode as string) ?? 'preferred_channel',
       delivery_target: (delivery.target as string) ?? '',
       completion_mode_family: s.completion_mode_family,
       allow_silent_completion: s.allow_silent_completion,
@@ -445,6 +445,7 @@ import Zap from 'lucide-svelte/icons/zap';
           <div class="space-y-1">
             <label for="edit-delivery" class="text-xs font-medium uppercase tracking-widest text-slate-400">Delivery</label>
             <select id="edit-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="preferred_channel">Preferred channel</option>
               <option value="latest_active_for_agent">Latest active conversation</option>
               <option value="specific_conversation">Specific conversation</option>
             </select>

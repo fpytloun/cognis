@@ -108,10 +108,15 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
             },
             "delivery_mode": {
                 "type": "string",
-                "enum": ["latest_active_for_agent"],
+                "enum": [
+                    "preferred_channel",
+                    "latest_active_for_agent",
+                    "specific_conversation",
+                ],
                 "description": (
                     "How task results are delivered. "
-                    "'latest_active_for_agent' delivers to the most recent active conversation (default)."
+                    "'preferred_channel' uses the configured preferred channel (default); "
+                    "'latest_active_for_agent' delivers to the most recent active conversation."
                 ),
             },
             "expected_output": {
@@ -281,7 +286,7 @@ async def _handle_create(
         task_template["priority"] = arguments["task_priority"]
     if arguments.get("expected_output"):
         task_template["expected_output"] = arguments["expected_output"]
-    delivery_mode = arguments.get("delivery_mode", "latest_active_for_agent")
+    delivery_mode = arguments.get("delivery_mode", "preferred_channel")
     task_template["delivery"] = {"mode": delivery_mode, "target": None}
 
     target_agent = arguments.get("agent_id") or agent_id
