@@ -9,7 +9,7 @@
 Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
 <p align="center">
-  <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
+  <img src="docs/assets/images/cognis-cloud-native-agent-os.svg" alt="Cognis cloud-native Agent OS architecture" />
 </p>
 
 Cognis works with companion services for memory and guardrails:
@@ -36,14 +36,18 @@ Cognis works with companion services for memory and guardrails:
 ## Screenshots
 
 <p align="center">
+  <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
+</p>
+
+<p align="center">
   <img src="docs/assets/screenshots/executor-browser-tools.png" alt="Executor configuration with browser automation tools" width="49%" />
-  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="49%" />
+  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis task workflow detail" width="31%" />
 </p>
 
 <p align="center">
   <img src="docs/assets/screenshots/pwa-conversations.png" alt="Cognis iOS PWA conversation drawer" width="31%" />
   <img src="docs/assets/screenshots/pwa-chat.png" alt="Cognis iOS PWA chat with tool activity" width="31%" />
-  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis iOS PWA task workflow view" width="31%" />
+  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="31%" />
 </p>
 
 ## Features
@@ -64,8 +68,6 @@ Cognis works with companion services for memory and guardrails:
 - **Admin and operations**: Setup flow, diagnostics, provider presets, model routing, secrets, executor tokens, system health, metrics, reconciliation, CLI admin commands, Docker images, and systemd templates.
 
 ## Architecture
-
-![Cognis cloud-native Agent OS](docs/assets/images/cognis-cloud-native-agent-os.svg)
 
 ![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
 

@@ -582,6 +582,24 @@ Full architecture and design specifications are in `docs/specs/`:
 | `28-agent-sharing.md` | User-to-user agent sharing, `agent_grants`, two-headed runtime identity, Mnemory `(user, owner)` keying, no admin bypass for user-owned resources |
 | `30-projects-and-revisions.md` | Projects with multi-source repos and `project_grants`, project-aware tasks/schedules/conversations, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, and human-as-evaluator revision flow |
 
+## Diagram Style
+
+Public architecture diagrams in `docs/assets/images/` use the Cognis launch dark style. Keep matching editable sources in `docs/assets/diagrams/`.
+
+- Canvas: dark background `#020617`, rounded outer frame when useful.
+- Main panels: `#0f172a` or `#111827` with slate strokes `#334155` / `#475569`.
+- Primary/controller elements: cyan stroke `#38bdf8`, background `#082f49`.
+- Memory elements: green stroke `#10b981`, background `#052e2b`.
+- Guardrails/audit elements: purple stroke `#8b5cf6`, background `#22134d`.
+- Executor/runtime elements: amber stroke `#f59e0b`, background `#3b2603`.
+- Risk/denied/error elements: rose stroke `#fb7185`, background `#4c0519`.
+- User/channel/neutral elements: slate stroke `#64748b`, background `#111827`.
+- Text: primary `#f8fafc`, muted `#94a3b8`, monospace/details `#bae6fd`.
+- Typography: Helvetica for labels, monospace only for protocol/tool names. Use clear hierarchy: 28px title, 20px section heading, 14px labels, 12-13px details.
+- Shapes: rounded rectangles, clean SVG-like lines, `roughness: 0`; avoid hand-drawn styling.
+- Arrows: cyan for primary flow, slate dashed for retry/revision/secondary flows. Always label non-obvious edges.
+- Tone: diagrams should explain boundaries and ownership, not decorate. Prefer fewer boxes with stronger labels over dense exhaustive maps.
+
 **Read the relevant spec before making changes in that area.**
 
 ## Important Rules
