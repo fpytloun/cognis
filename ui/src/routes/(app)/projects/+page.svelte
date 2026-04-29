@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api } from '$lib/api/client';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
@@ -13,6 +15,8 @@
   let name = $state('');
   let description = $state('');
   let creating = $state(false);
+  let profileProject = $state<Project | null>(null);
+  let lightboxProject = $state<Project | null>(null);
 
   async function load(): Promise<void> {
     loading = true;
@@ -71,13 +75,13 @@
   {:else}
     <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {#each projects as project}
-        <a class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 transition hover:border-sky-500/60 hover:bg-slate-900" href={`/projects/${project.project_id}`}>
+        <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 transition hover:border-sky-500/60 hover:bg-slate-900">
           <div class="flex items-start gap-3">
-            <div class="flex h-12 w-12 items-center justify-center overflow-hidden rounded-xl bg-slate-800 text-lg font-semibold text-sky-200">
-              {#if project.avatar_url}<img class="h-full w-full object-cover" src={project.avatar_url} alt="" />{:else}{project.name.slice(0, 1).toUpperCase()}{/if}
-            </div>
+            <button type="button" class="shrink-0 cursor-pointer" onclick={() => { profileProject = project; }} aria-label={`Show ${project.name} profile`}>
+              <AgentAvatar name={project.name} avatarUrl={project.avatar_url} class="h-12 w-12 rounded-xl" />
+            </button>
             <div class="min-w-0">
-              <h2 class="truncate text-lg font-semibold text-white">{project.name}</h2>
+              <a class="truncate text-lg font-semibold text-white hover:text-sky-200" href={`/projects/${project.project_id}`}>{project.name}</a>
               <p class="mt-1 line-clamp-2 text-sm text-slate-400">{project.description || 'No description'}</p>
             </div>
           </div>
@@ -86,8 +90,32 @@
             <span>{project.workflow_ids.length} workflows</span>
             {#if project.is_shared_with_me}<span class="text-amber-300">shared</span>{/if}
           </div>
-        </a>
+        </div>
       {/each}
     </div>
   {/if}
 </section>
+
+{#if profileProject}
+  <button class="fixed inset-0 z-40 cursor-default bg-slate-950/30" type="button" onclick={() => { profileProject = null; }} aria-label="Close project profile"></button>
+  <div class="fixed left-1/2 top-1/2 z-50 w-[min(92vw,24rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-slate-700 bg-slate-900 p-5 shadow-2xl" role="dialog" aria-modal="true" aria-label={`${profileProject.name} profile`}>
+    <div class="flex items-start gap-4">
+      <button type="button" class="shrink-0 cursor-pointer disabled:cursor-default" onclick={() => { if (profileProject?.avatar_url) lightboxProject = profileProject; }} aria-label="View avatar full size" disabled={!profileProject.avatar_url}>
+        <AgentAvatar name={profileProject.name} avatarUrl={profileProject.avatar_url} class="h-20 w-20" />
+      </button>
+      <div class="min-w-0">
+        <p class="truncate text-lg font-semibold text-slate-100">{profileProject.name}</p>
+        <p class="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">Project</p>
+      </div>
+    </div>
+    <p class="mt-4 whitespace-pre-wrap text-sm leading-6 text-slate-300">{profileProject.description || 'No project description yet.'}</p>
+    <div class="mt-5 flex justify-end gap-2">
+      <Button variant="secondary" onclick={() => { profileProject = null; }}>Close</Button>
+      <Button onclick={() => goto(`/projects/${profileProject?.project_id}`)}>Open project</Button>
+    </div>
+  </div>
+{/if}
+
+{#if lightboxProject?.avatar_url}
+  <ImageLightbox src={lightboxProject.avatar_url} alt={`${lightboxProject.name} avatar`} onClose={() => { lightboxProject = null; }} />
+{/if}

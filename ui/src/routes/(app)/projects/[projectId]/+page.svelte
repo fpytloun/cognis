@@ -2,6 +2,9 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { api } from '$lib/api/client';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
+  import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { confirmAction } from '$lib/stores/confirm';
   import Button from '$lib/components/ui/Button.svelte';
@@ -17,7 +20,9 @@
   let savingSource = $state(false);
   let savingGrant = $state(false);
   let savingWorkflow = $state(false);
-  let generatingAvatar = $state(false);
+  let uploadingAvatar = $state(false);
+  let showAvatarModal = $state(false);
+  let showAvatarLightbox = $state(false);
   let editingSourceId = $state<string | null>(null);
 
   let projectForm = $state({ name: '', description: '', instructions: '', default_workflow_id: '' });
@@ -26,7 +31,7 @@
   let grantForm = $state({ grantee_user_email: '', note: '' });
 
   const workflowNameById = $derived(new Map(workflows.map((workflow) => [workflow.workflow_id, workflow.name])));
-  const attachableWorkflows = $derived(workflows.filter((workflow) => !project?.workflow_ids.includes(workflow.workflow_id)));
+  const attachableWorkflows = $derived(workflows.filter((workflow) => !workflow.is_system && !project?.workflow_ids.includes(workflow.workflow_id)));
   const readonly = $derived(Boolean(project?.is_readonly_for_caller));
 
   function resetProjectForm(next: Project): void {
@@ -94,18 +99,48 @@
     }
   }
 
-  async function generateAvatar(): Promise<void> {
+  async function updateAvatar(imageId: string | null, avatarUrl: string | null): Promise<void> {
     if (!project || readonly) return;
-    generatingAvatar = true;
     try {
-      await api.projects.generateAvatar(project.project_id);
-      await load();
-      addToast('Project avatar generated', 'success');
+      const previousGrants = project.grants;
+      project = await api.projects.update(project.project_id, {
+        avatar_image_id: imageId,
+        avatar_url: avatarUrl
+      });
+      project.grants = previousGrants;
+      resetProjectForm(project);
     } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Failed to generate avatar', 'error');
-    } finally {
-      generatingAvatar = false;
+      addToast(err instanceof Error ? err.message : 'Failed to update avatar', 'error');
+      throw err;
     }
+  }
+
+  async function handleAvatarUpload(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file || !project || readonly) return;
+    uploadingAvatar = true;
+    try {
+      const result = await api.images.upload(file);
+      await updateAvatar(result.image_id, result.url);
+      addToast('Project avatar uploaded', 'success');
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Failed to upload avatar', 'error');
+    } finally {
+      uploadingAvatar = false;
+      input.value = '';
+    }
+  }
+
+  async function handleGeneratedAvatar(imageId: string, avatarUrl: string): Promise<void> {
+    await updateAvatar(imageId, avatarUrl);
+    showAvatarModal = false;
+    addToast('Project avatar updated', 'success');
+  }
+
+  async function removeAvatar(): Promise<void> {
+    await updateAvatar(null, null);
+    addToast('Project avatar removed', 'success');
   }
 
   async function saveSource(): Promise<void> {
@@ -218,9 +253,9 @@
   {:else}
     <div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
       <div class="flex items-start gap-4">
-        <div class="flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-slate-800 text-2xl font-semibold text-sky-200">
-          {#if project.avatar_url}<img class="h-full w-full object-cover" src={project.avatar_url} alt="" />{:else}{project.name.slice(0, 1).toUpperCase()}{/if}
-        </div>
+        <button type="button" class="shrink-0 cursor-pointer" onclick={() => { if (project?.avatar_url) showAvatarLightbox = true; }} aria-label="View project avatar">
+          <AgentAvatar name={project.name} avatarUrl={project.avatar_url} class="h-16 w-16" />
+        </button>
         <div>
           <a class="text-sm text-sky-300 hover:text-sky-200" href="/projects">← Projects</a>
           <h1 class="mt-2 text-3xl font-semibold text-white">{project.name}</h1>
@@ -233,7 +268,16 @@
           </div>
         </div>
       </div>
-      {#if !readonly}<Button variant="secondary" onclick={generateAvatar} disabled={generatingAvatar}>{generatingAvatar ? 'Generating…' : 'Generate avatar'}</Button>{/if}
+      {#if !readonly}
+        <div class="flex flex-wrap gap-2">
+          <label class="inline-flex min-h-[40px] cursor-pointer items-center justify-center rounded-xl border border-slate-700 bg-slate-900 px-4 py-2 text-sm font-medium text-slate-100 transition hover:border-slate-500 hover:bg-slate-800 md:min-h-[36px] md:py-1.5">
+            <input class="hidden" type="file" accept="image/*" onchange={handleAvatarUpload} disabled={uploadingAvatar} />
+            {uploadingAvatar ? 'Uploading…' : 'Upload avatar'}
+          </label>
+          <Button variant="secondary" onclick={() => { showAvatarModal = true; }}>Generate avatar</Button>
+          {#if project.avatar_image_id || project.avatar_url}<Button variant="secondary" onclick={removeAvatar}>Remove avatar</Button>{/if}
+        </div>
+      {/if}
     </div>
 
     <div class="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(360px,1fr)]">
@@ -295,7 +339,7 @@
                 {#if !readonly}<Button size="sm" variant="secondary" onclick={() => detachWorkflow(workflowId)}>Unbind</Button>{/if}
               </div>
             {/each}
-            {#if project.workflow_ids.length === 0}<p class="text-sm text-slate-400">No project-bound workflows yet. Generic workflows remain available.</p>{/if}
+            {#if project.workflow_ids.length === 0}<p class="text-sm text-slate-400">No project-bound workflows yet. System workflows remain available.</p>{/if}
           </div>
           {#if !readonly}
             <div class="mt-4 flex gap-2">
@@ -305,6 +349,7 @@
               </select>
               <Button onclick={attachWorkflow} disabled={savingWorkflow || !selectedWorkflowId}>{savingWorkflow ? 'Binding…' : 'Bind'}</Button>
             </div>
+            <p class="mt-2 text-xs text-slate-500">System workflows are always available and do not need to be bound.</p>
           {/if}
         </Card>
 
@@ -333,3 +378,17 @@
     </div>
   {/if}
 </section>
+
+{#if showAvatarModal && project}
+  <AvatarGenerateModal
+    name={project.name}
+    description={project.description ?? ''}
+    personality={{ instructions: project.instructions ?? '' }}
+    onAccept={handleGeneratedAvatar}
+    onClose={() => { showAvatarModal = false; }}
+  />
+{/if}
+
+{#if showAvatarLightbox && project?.avatar_url}
+  <ImageLightbox src={project.avatar_url} alt={`${project.name} avatar`} onClose={() => { showAvatarLightbox = false; }} />
+{/if}
