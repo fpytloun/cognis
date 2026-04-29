@@ -4,7 +4,7 @@
 
 # cognis
 
-**Cloud-native Agent OS for self-hosted AI agents.** Cognis is the controller and orchestration layer of the Openclaw ecosystem: it gives agents identity, memory, workflows, tools, browser use, channels, and safety guardrails without turning everything into one fragile monolith.
+**Cloud-native Agent OS for self-hosted AI agents.** Cognis gives agents identity, memory, workflows, tools, browser use, channels, and safety guardrails without turning everything into one fragile monolith.
 
 Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
@@ -12,11 +12,10 @@ Cognis separates the **controller** from **executors**. The controller is the br
   <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
 </p>
 
-Part of the Openclaw ecosystem:
+Cognis works with companion services for memory and guardrails:
 
-- [Cognis](https://github.com/fpytloun/cognis) controller and agent OS
-- [Intaris](https://github.com/fpytloun/intaris) guardrails, audit, and session content
-- [Mnemory](https://github.com/fpytloun/mnemory) persistent memory and recall
+- [Intaris](https://github.com/fpytloun/intaris) for guardrails, audit, and session content
+- [Mnemory](https://github.com/fpytloun/mnemory) for persistent memory and recall
 
 ## Why Cognis
 

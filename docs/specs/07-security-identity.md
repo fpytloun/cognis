@@ -2,7 +2,7 @@
 
 ## Overview
 
-Cognis is the identity authority for the Openclaw ecosystem. It manages users,
+Cognis is the identity authority for its agent control plane. It manages users,
 agents, and service authentication. The controller is the sole gateway to
 Mnemory and Intaris — executors never communicate with external services
 directly.

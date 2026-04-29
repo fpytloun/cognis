@@ -1,6 +1,6 @@
 # Architecture
 
-Cognis is the controller and orchestration layer of the Openclaw ecosystem. It works with Mnemory for persistent memory, Intaris for guardrails and session content, and executors for tool execution.
+Cognis is the controller and orchestration layer for self-hosted AI agents. It works with Mnemory for persistent memory, Intaris for guardrails and session content, and executors for tool execution.
 
 ![Cognis cloud-native Agent OS](../assets/images/cognis-cloud-native-agent-os.svg)
 

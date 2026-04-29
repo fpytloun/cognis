@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Intaris is the session auditing service in the Openclaw ecosystem. Today it
+Intaris is the session auditing service used by Cognis. Today it
 audits user and assistant messages and tool calls, but it does not audit the
 system-role and developer-role content that actually drives the model.
 Memory instructions, core memories, routing reminders, system notices,

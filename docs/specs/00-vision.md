@@ -4,12 +4,12 @@
 
 ## Overview
 
-Cognis is the controller layer of the Openclaw ecosystem — a platform for
-building, orchestrating, and managing autonomous AI agents. It is designed as a
+Cognis is a controller layer for building, orchestrating, and managing
+autonomous AI agents. It is designed as a
 **decoupled control plane** where every major concern is handled by a pluggable
 provider behind a clear API contract.
 
-The Openclaw ecosystem consists of three core services:
+Cognis is designed to work with two companion services:
 
 | Service | Role | Owns |
 |---------|------|------|

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**cognis** is the controller and orchestration layer of the Openclaw ecosystem — a decoupled control plane for AI agents. It manages agent definitions, interactive chat, delegated sub-sessions, tool execution routing, and integrates with external memory (Mnemory) and guardrails/audit (Intaris) services.
+**cognis** is a controller and orchestration layer for self-hosted AI agents — a decoupled control plane that manages agent definitions, interactive chat, delegated sub-sessions, tool execution routing, and integrations with external memory (Mnemory) and guardrails/audit (Intaris) services.
 
 - **Language**: Python 3.12+, typed, async-first
 - **Framework**: FastAPI (Starlette) for HTTP/WebSocket, Typer for CLI
@@ -10,7 +10,7 @@
 - **Frontend**: SvelteKit (separate app in `ui/`)
 - **License**: TBD
 - **Repository**: https://github.com/fpytloun/cognis
-- **Part of**: Openclaw ecosystem (Cognis controller, Intaris guardrails, Mnemory memory)
+- **Companion services**: Intaris guardrails/audit and Mnemory memory
 
 ## Architecture
 

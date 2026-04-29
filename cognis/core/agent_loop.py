@@ -8568,8 +8568,7 @@ class AgentLoop:
         """Enqueue last turn (user + assistant) to Mnemory remember queue.
 
         Sends both the user message and assistant response so mnemory can
-        extract facts from the full exchange — matching the pattern used by
-        the OpenWebUI and OpenClaw mnemory integrations.
+        extract facts from the full exchange.
         """
         if not content_parts:
             return
