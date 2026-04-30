@@ -423,19 +423,17 @@ async def test_invalid_llm_group_is_rejected_back_to_heuristic() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_classification_retries_plain_json_on_invalid_payload_shape() -> None:
+async def test_tool_classification_does_not_retry_invalid_payload_shape() -> None:
     tool = _dynamic_tool_named("mcp_github__shape_retry", "shape/retry")
     llm = _FallbackClassifierLLM()
 
     classified = await classify_tool_definitions([tool], llm=llm)
 
-    assert classified[0].classification_source == "llm"
-    assert classified[0].profile_group == "web"
-    assert len(llm.calls) == 2
+    assert classified[0].classification_source == "heuristic"
+    assert classified[0].classification_status == "ready"
+    assert len(llm.calls) == 1
     assert "response_format" in llm.calls[0]
-    assert "response_format" not in llm.calls[1]
     assert "max_tokens" not in llm.calls[0]
-    assert "max_tokens" not in llm.calls[1]
     tool_payload = json.loads(llm.calls[0]["messages"][1]["content"])
     assert "parameters" not in tool_payload["tools"][0]
 

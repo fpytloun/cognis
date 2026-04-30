@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from cognis.core.workflow_composition import (
     SkillMaterial,
     compose_workflow_plan,
@@ -21,8 +23,6 @@ class _FallbackLLM:
         self, messages: list[dict[str, object]], **kwargs: object
     ) -> dict[str, object]:
         self.calls.append({"messages": messages, **kwargs})
-        if "response_format" in kwargs:
-            raise TimeoutError()
         return {
             "choices": [
                 {
@@ -32,6 +32,18 @@ class _FallbackLLM:
                 }
             ]
         }
+
+
+class _SlowLLM:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def generate(
+        self, messages: list[dict[str, object]], **kwargs: object
+    ) -> dict[str, object]:
+        self.calls.append({"messages": messages, **kwargs})
+        await asyncio.sleep(1)
+        return {"choices": [{"message": {"content": json.dumps({"rationale": "", "steps": []})}}]}
 
 
 def test_validate_composed_workflow_accepts_lifecycle_and_lineage() -> None:
@@ -86,7 +98,7 @@ def test_workflow_preview_payload_uses_step_names() -> None:
     assert preview["steps"] == ["collect", "brief"]
 
 
-def test_decompose_skill_material_retries_without_response_format_after_timeout() -> None:
+def test_decompose_skill_material_requests_provider_json_mode_once() -> None:
     llm = _FallbackLLM(
         {
             "rationale": "Split the skill into gather and summary.",
@@ -121,15 +133,34 @@ def test_decompose_skill_material_retries_without_response_format_after_timeout(
     )
 
     assert result.steps[0]["name"] == "gather"
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 1
     assert "response_format" in llm.calls[0]
-    assert "response_format" not in llm.calls[1]
     assert "max_tokens" not in llm.calls[0]
-    assert "max_tokens" not in llm.calls[1]
 
 
-def test_decompose_skill_material_gives_most_time_to_structured_attempt(
-    monkeypatch: object,
+def test_decompose_skill_material_enforces_outer_timeout() -> None:
+    llm = _SlowLLM()
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(
+            decompose_skill_material(
+                llm=llm,
+                skill_id="skill_daily_brief",
+                name="Daily Brief",
+                description="Prepare a daily brief.",
+                instructions="Gather updates and summarize them.",
+                tools=[],
+                prompt_templates={},
+                timeout_seconds=0.01,
+            )
+        )
+
+    assert len(llm.calls) == 1
+    assert "response_format" in llm.calls[0]
+
+
+def test_decompose_skill_material_uses_single_timeout(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recorded_timeouts: list[float] = []
     original_wait_for = asyncio.wait_for
@@ -170,7 +201,7 @@ def test_decompose_skill_material_gives_most_time_to_structured_attempt(
         )
     )
 
-    assert recorded_timeouts == [50.0, 10.0]
+    assert recorded_timeouts == [60.0]
 
 
 def test_decompose_skill_material_assigns_step_profiles_for_skill_tools() -> None:
@@ -300,7 +331,7 @@ def test_decompose_skill_material_includes_refresh_guidance_for_existing_steps()
     assert "immediately preceding run step" in prompt
 
 
-def test_compose_workflow_plan_retries_without_response_format_after_timeout() -> None:
+def test_compose_workflow_plan_requests_provider_json_mode_once() -> None:
     llm = _FallbackLLM(
         {
             "action": "reuse_existing",
@@ -328,9 +359,9 @@ def test_compose_workflow_plan_retries_without_response_format_after_timeout() -
 
     assert result.action == "reuse_existing"
     assert result.workflow_id == "system:software-development"
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 1
     assert "max_tokens" not in llm.calls[0]
-    assert "max_tokens" not in llm.calls[1]
+    assert "response_format" in llm.calls[0]
 
 
 def test_validate_composed_workflow_normalizes_missing_step_profiles_from_skill_materials() -> None:

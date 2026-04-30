@@ -39,20 +39,6 @@ _STEP_PROFILE_PROMPT_HINTS: dict[str, str] = {
 }
 
 
-def _split_json_generation_timeout(total_timeout: float) -> tuple[float, float]:
-    """Split a JSON task timeout between structured and plain fallbacks."""
-
-    if total_timeout <= 6.0:
-        structured_timeout = max(1.5, total_timeout * 0.5)
-        return structured_timeout, max(1.5, total_timeout - structured_timeout)
-
-    # Keep a small reserve for a plain-text retry, but avoid forcing larger
-    # classifier models through an artificial early timeout.
-    plain_timeout = max(2.0, min(10.0, total_timeout * 0.2))
-    structured_timeout = max(4.0, total_timeout - plain_timeout)
-    return structured_timeout, plain_timeout
-
-
 async def _generate_json_response(
     *,
     llm: Any,
@@ -63,38 +49,19 @@ async def _generate_json_response(
     logger_obj: Any,
     warning_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Generate JSON with a structured-first attempt and plain fallback."""
+    """Generate JSON using provider-owned JSON-mode fallback behavior."""
 
-    structured_timeout, plain_timeout = _split_json_generation_timeout(timeout_seconds)
-
-    async def _generate(generate_kwargs: dict[str, Any], *, call_timeout: float) -> dict[str, Any]:
-        return await asyncio.wait_for(
-            llm.generate(
-                messages,
-                task_type=task_type,
-                temperature=0,
-                max_retries=1,
-                **generate_kwargs,
-            ),
-            timeout=call_timeout,
-        )
-
-    try:
-        response = await _generate(
-            {"response_format": {"type": "json_object"}},
-            call_timeout=structured_timeout,
-        )
-    except TimeoutError:
-        extra_data = {"label": label, "reason": "structured_timeout"}
-        if warning_context:
-            extra_data.update(warning_context)
-        logger_obj.warning(
-            "Structured JSON generation timed out, retrying plain-text JSON fallback",
-            extra={"extra_data": extra_data},
-        )
-        return await _generate({}, call_timeout=plain_timeout)
-
-    return response
+    del label, logger_obj, warning_context
+    return await asyncio.wait_for(
+        llm.generate(
+            messages,
+            task_type=task_type,
+            temperature=0,
+            max_retries=1,
+            response_format={"type": "json_object"},
+        ),
+        timeout=timeout_seconds,
+    )
 
 
 class SkillMaterial(BaseModel):

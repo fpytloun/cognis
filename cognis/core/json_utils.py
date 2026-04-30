@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from prometheus_client import Counter
@@ -71,65 +70,6 @@ def extract_text_from_response(response: dict[str, Any]) -> str:
             return fallback
 
     return content
-
-
-async def maybe_fallback_to_plain_json_response(
-    response: dict[str, Any],
-    *,
-    generate_response: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
-    label: str,
-    logger_obj: Any,
-    warning_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Retry without structured output when JSON-mode response is unusable.
-
-    The fallback is intended for small JSON-only tasks where prompt-level
-    constraints are usually enough and transport-level structured output may
-    fail on some provider/model paths.
-    """
-
-    should_fallback, reason = should_fallback_to_plain_json_response(response, label=label)
-    if not should_fallback:
-        return response
-
-    extra_data = {"label": label, "reason": reason}
-    if warning_context:
-        extra_data.update(warning_context)
-    logger_obj.warning(
-        "Structured JSON response unusable, retrying with plain-text JSON fallback",
-        extra={"extra_data": extra_data},
-    )
-    return await generate_response({})
-
-
-def should_fallback_to_plain_json_response(
-    response: dict[str, Any], *, label: str
-) -> tuple[bool, str]:
-    """Return whether a structured JSON call should retry without response_format."""
-
-    if _extract_refusal_text(response):
-        return False, "refusal"
-
-    content = extract_text_from_response(response)
-    if not content.strip():
-        return True, "empty_response"
-
-    try:
-        extract_json_object(content, label=label)
-    except ValueError:
-        return True, "json_parse_failed"
-    return False, ""
-
-
-def _extract_refusal_text(response: dict[str, Any]) -> str:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return ""
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        return ""
-    refusal = message.get("refusal")
-    return refusal.strip() if isinstance(refusal, str) else ""
 
 
 def _extract_text_payload(value: Any, *, serialize_objects: bool) -> str:

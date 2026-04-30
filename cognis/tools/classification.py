@@ -475,28 +475,14 @@ async def _classify_with_llm(
     ]
     try:
 
-        async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
-            return await llm.generate(
-                messages,
-                task_type="classifier",
-                temperature=0,
-                max_retries=1,
-                **generate_kwargs,
-            )
-
-        response = await _generate({"response_format": {"type": "json_object"}})
+        response = await llm.generate(
+            messages,
+            task_type="classifier",
+            temperature=0,
+            max_retries=1,
+            response_format={"type": "json_object"},
+        )
         payload = extract_json_object(extract_text_from_response(response), label="tool_classifier")
-        tool_payloads = payload.get("tools") if isinstance(payload, dict) else None
-        if not isinstance(tool_payloads, list):
-            logger.warning(
-                "Tool classifier returned invalid payload shape, retrying plain-text JSON fallback",
-                extra={"extra_data": {"tool_count": len(uncached)}},
-            )
-            response = await _generate({})
-            payload = extract_json_object(
-                extract_text_from_response(response),
-                label="tool_classifier",
-            )
     except Exception:
         logger.warning("Tool LLM classification failed", exc_info=True)
         return cached_results, {
