@@ -598,6 +598,9 @@ import X from 'lucide-svelte/icons/x';
     if (event.code === 'pending_question') {
       return 'Answer the pending clarification request to continue.';
     }
+    if (event.code === 'pending_input_request') {
+      return 'Resolve or cancel the pending credential/auth request to continue.';
+    }
     return event.message;
   }
 
@@ -2217,6 +2220,9 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       error = nextError;
+      if (event.code === 'pending_input_request') {
+        void refreshPendingDirectQuestion();
+      }
       awaitingAssistantStart = false;
       turnInProgress = false;
       directQuestionSubmitting = false;

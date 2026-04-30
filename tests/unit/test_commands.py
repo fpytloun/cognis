@@ -252,14 +252,41 @@ async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
     session_factory = _DBSessionFactory()
     update_context_data = AsyncMock(return_value=True)
     monkeypatch.setattr(store_queries, "update_conversation_context_data", update_context_data)
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="cred-direct",
+            pause_type="credential_request",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="auth-direct",
+            pause_type="auth_challenge",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="cred-task",
+            pause_type="credential_request",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            task_id="task-1",
+        )
+    )
+    notifications = _NotificationService()
     dispatcher = CommandDispatcher(
         session_factory=session_factory,
         session_manager=manager,
         session_cache=None,
         compaction_strategy=None,
         providers=None,
-        pause_waiter=PauseWaiter(),
-        notification_service=_NotificationService(),
+        pause_waiter=pause_waiter,
+        notification_service=notifications,
     )
 
     conversation = ConversationModel(
@@ -309,6 +336,20 @@ async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
     }
     assert session_factory.session.commits == 1
     assert session_factory.session.rollbacks == 0
+    assert notifications.calls == [
+        ("cred-direct", "cancel", {}),
+        ("auth-direct", "cancel", {}),
+    ]
+    remaining_direct_credentials = [
+        pause
+        for pause in pause_waiter.list_pending(
+            conversation_id="conv-1", pause_type="credential_request"
+        )
+        if pause.task_id is None
+    ]
+    assert remaining_direct_credentials == []
+    assert pause_waiter.find_pending(task_id="task-1", pause_type="credential_request") is not None
+    assert pause_waiter.find_pending(conversation_id="conv-1", pause_type="auth_challenge") is None
 
 
 @pytest.mark.asyncio
@@ -328,6 +369,31 @@ async def test_stop_cancels_turn_and_resolves_pending_pauses() -> None:
             pause_type="escalation",
             conversation_id="conv-1",
             session_id="sess-1",
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="cred-direct",
+            pause_type="credential_request",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="auth-direct",
+            pause_type="auth_challenge",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        )
+    )
+    pause_waiter.register(
+        PendingPause(
+            pause_id="cred-task",
+            pause_type="credential_request",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            task_id="task-1",
         )
     )
     notifications = _NotificationService()
@@ -357,8 +423,13 @@ async def test_stop_cancels_turn_and_resolves_pending_pauses() -> None:
     assert scheduler.calls == ["conv-1"]
     assert notifications.calls == [
         ("notif-direct", "cancel", {"reason": "user_stop"}),
+        ("cred-direct", "cancel", {}),
+        ("auth-direct", "cancel", {}),
         ("esc-1", "deny", {"note": "Stopped by user"}),
     ]
+    assert pause_waiter.find_pending(conversation_id="conv-1", pause_type="step_question") is None
+    assert pause_waiter.find_pending(conversation_id="conv-1", pause_type="auth_challenge") is None
+    assert pause_waiter.find_pending(task_id="task-1", pause_type="credential_request") is not None
 
 
 @pytest.mark.asyncio

@@ -210,7 +210,7 @@ class CommandDispatcher:
 
         # /stop or /cancel [note]
         if stripped == "/stop" or stripped.startswith("/stop "):
-            return await self._handle_stop(conversation)
+            return await self._handle_stop(conversation, user_email=user_email)
         if stripped == "/cancel" or stripped.startswith("/cancel "):
             note = stripped[len("/cancel") :].strip() or None
             gate_result = await self._handle_gate_resolution(
@@ -218,7 +218,7 @@ class CommandDispatcher:
             )
             if gate_result is not None:
                 return gate_result
-            return await self._handle_stop(conversation)
+            return await self._handle_stop(conversation, user_email=user_email)
 
         # Not a recognized command
         return None
@@ -325,6 +325,11 @@ class CommandDispatcher:
                 },
             )
         else:
+            await self._cancel_direct_input_pauses(
+                conversation_id,
+                user_email=user_email,
+                reason="user_reset",
+            )
             # Channel-bound: create new root session within same conversation
             try:
                 new_session = await self._session_manager.rotate_session(
@@ -1068,7 +1073,52 @@ class CommandDispatcher:
             return None
         return pending_gates[-1]
 
-    async def _handle_stop(self, conversation: ConversationModel) -> CommandResult:
+    async def _cancel_direct_input_pauses(
+        self,
+        conversation_id: str,
+        *,
+        user_email: str | None,
+        reason: str,
+    ) -> int:
+        """Cancel direct, non-task input waits for a conversation."""
+
+        cancelled = 0
+        for pause in self._pause_waiter.list_pending(conversation_id=conversation_id):
+            if pause.task_id is not None or pause.pause_type not in {
+                "step_question",
+                "auth_challenge",
+                "credential_request",
+            }:
+                continue
+            resolution_data = {"reason": reason} if pause.pause_type == "step_question" else {}
+            resolved = False
+            if self._notification_service is not None:
+                resolved = await self._notification_service.resolve(
+                    pause.pause_id,
+                    "cancel",
+                    resolution_data,
+                    user_email=user_email,
+                )
+            if not resolved and self._notification_service is not None:
+                with contextlib.suppress(Exception):
+                    await self._notification_service.mark_orphaned(
+                        pause.pause_id,
+                        reason=f"{reason}_recovery",
+                    )
+            local_resolved = self._pause_waiter.resolve(
+                pause.pause_id,
+                PauseResolution(decision="cancel", data=resolution_data),
+            )
+            if resolved or local_resolved:
+                cancelled += 1
+        return cancelled
+
+    async def _handle_stop(
+        self,
+        conversation: ConversationModel,
+        *,
+        user_email: str,
+    ) -> CommandResult:
         """Handle /stop or /cancel by aborting active work immediately."""
         conversation_id = conversation.conversation_id
         stopped_anything = False
@@ -1076,34 +1126,23 @@ class CommandDispatcher:
         if self._turn_scheduler is not None:
             stopped_anything = await self._turn_scheduler.cancel_turn(conversation_id)
 
+        if await self._cancel_direct_input_pauses(
+            conversation_id,
+            user_email=user_email,
+            reason="user_stop",
+        ):
+            stopped_anything = True
+
         pending_pauses = self._pause_waiter.list_pending(conversation_id=conversation_id)
         for pause in pending_pauses:
-            if pause.pause_type == "step_question" and pause.task_id is None:
-                resolved = False
-                if self._notification_service is not None:
-                    resolved = await self._notification_service.resolve(
-                        pause.pause_id,
-                        "cancel",
-                        {"reason": "user_stop"},
-                    )
-                if not resolved and self._notification_service is not None:
-                    with contextlib.suppress(Exception):
-                        await self._notification_service.mark_orphaned(
-                            pause.pause_id,
-                            reason="user_stop_recovery",
-                        )
-                if resolved or self._pause_waiter.resolve(
-                    pause.pause_id,
-                    PauseResolution(decision="cancel", data={"reason": "user_stop"}),
-                ):
-                    stopped_anything = True
-            elif pause.pause_type == "escalation":
+            if pause.pause_type == "escalation":
                 resolved = False
                 if self._notification_service is not None:
                     resolved = await self._notification_service.resolve(
                         pause.pause_id,
                         "deny",
                         {"note": "Stopped by user"},
+                        user_email=user_email,
                     )
                 if not resolved and self._notification_service is not None:
                     with contextlib.suppress(Exception):
