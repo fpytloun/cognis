@@ -179,6 +179,19 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=60,
         ),
         ToolDefinition(
+            name="browser_get_focus",
+            description="Return the currently focused frame and focused element metadata without exposing field values.",
+            parameters={
+                "type": "object",
+                "properties": {"session_id": {"type": "string"}},
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
             name="browser_click",
             description="Click an element by exact ref or by selector. Selector mode fails if multiple viable candidates match.",
             parameters={
@@ -195,6 +208,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                             "Defaults to the executor's configured value. Set to 'off' "
                             "for the fastest possible click."
                         ),
+                    },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after the click, in milliseconds.",
                     },
                 },
                 "required": ["session_id"],
@@ -231,6 +248,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                             "Defaults to the executor's configured value."
                         ),
                     },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after filling, in milliseconds.",
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -249,6 +270,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "session_id": {"type": "string"},
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after focusing, in milliseconds.",
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -268,6 +293,11 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
                     "text": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "auth_challenge": {
+                        "type": "object",
+                        "description": "Optional deferred auth challenge metadata used when value_ref starts with $auth_challenge:.",
+                    },
                     "delay_ms": {
                         "type": "integer",
                         "description": (
@@ -283,8 +313,12 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                             "executor's configured value."
                         ),
                     },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after typing, in milliseconds.",
+                    },
                 },
-                "required": ["session_id", "text"],
+                "required": ["session_id"],
             },
             source=_SOURCE,
             category="browser",
@@ -302,6 +336,10 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "ref": {"type": "string"},
                     "selector": {"type": "string"},
                     "mode": {"type": "string", "enum": ["native", "event"]},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after submitting, in milliseconds.",
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -313,11 +351,33 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_press",
-            description="Press a keyboard key in the current page.",
+            description="Press a keyboard key or type text/value_ref into the currently focused element or frame.",
             parameters={
                 "type": "object",
-                "properties": {"session_id": {"type": "string"}, "key": {"type": "string"}},
-                "required": ["session_id", "key"],
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "key": {"type": "string"},
+                    "text": {"type": "string"},
+                    "value_ref": {"type": "string"},
+                    "auth_challenge": {
+                        "type": "object",
+                        "description": "Optional deferred auth challenge metadata used when value_ref starts with $auth_challenge:.",
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "Per-key delay in milliseconds when typing text.",
+                    },
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["off", "low", "medium", "high"],
+                        "description": "Keystroke-cadence humanization intensity for text typing.",
+                    },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after pressing or typing, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
             },
             source=_SOURCE,
             category="browser",
@@ -334,6 +394,11 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "session_id": {"type": "string"},
                     "selector": {"type": "string"},
                     "timeout_ms": {"type": "integer"},
+                    "state": {
+                        "type": "string",
+                        "enum": ["attached", "visible", "hidden", "detached"],
+                        "description": "Selector state to wait for. Defaults to visible.",
+                    },
                 },
                 "required": ["session_id"],
             },

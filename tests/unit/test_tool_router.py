@@ -579,6 +579,50 @@ async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["browser_type", "browser_press"])
+async def test_tool_router_resolves_browser_typing_value_ref_after_guardrails(
+    tool_name: str,
+) -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        non_bypassable_patterns=[],
+        credentials_provider=_CredentialProvider(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name=tool_name,
+                description="type",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="local_mcp", server_name="browser", raw_tool_name=tool_name),
+                non_bypassable=True,
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingExecutor()
+
+    result = await router.execute(
+        ToolCall(
+            call_id=f"{tool_name}-1",
+            name=tool_name,
+            arguments={"session_id": "browser-1", "value_ref": "$credential:reddit_mfa.otp"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    assert guardrails.last_evaluate_call[2]["value_ref"] == "<resolved-at-execution>"
+    assert executor.tool_calls[0].arguments["value"] == "123456"
+
+
+@pytest.mark.asyncio
 async def test_tool_router_times_out_and_cancels() -> None:
     router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
     executor = _SlowExecutor()

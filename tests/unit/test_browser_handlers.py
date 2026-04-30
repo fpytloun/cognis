@@ -8,7 +8,7 @@ import pytest
 from cognis.core.tool_router import ToolRouter
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord, CredentialResolution
-from cognis.models.tool import ExecutorHandle
+from cognis.models.tool import ExecutorHandle, ToolCall
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_click,
@@ -16,10 +16,12 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_fill,
     handle_browser_focus,
     handle_browser_get_console,
+    handle_browser_get_focus,
     handle_browser_get_network,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
+    handle_browser_press,
     handle_browser_query,
     handle_browser_save_auth_state,
     handle_browser_snapshot,
@@ -91,6 +93,18 @@ class _FakeLocator:
         self.evaluated = script
 
 
+class _FakeKeyboard:
+    def __init__(self) -> None:
+        self.pressed: list[str] = []
+        self.typed: list[tuple[str, int | None]] = []
+
+    async def press(self, key: str) -> None:
+        self.pressed.append(key)
+
+    async def type(self, text: str, delay: int | None = None) -> None:
+        self.typed.append((text, delay))
+
+
 class _FakePage:
     def __init__(self) -> None:
         self.locator_calls: list[str] = []
@@ -99,6 +113,9 @@ class _FakePage:
         self.url = "https://github.com/settings"
         self.last_evaluate_args: tuple[object, ...] = ()
         self.evaluate_scripts: list[str] = []
+        self.keyboard = _FakeKeyboard()
+        self.frames = [self]
+        self.active_element: dict[str, Any] | None = None
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
@@ -112,6 +129,8 @@ class _FakePage:
             if isinstance(payload, dict) and payload.get("script") == "() => ({ ok: true })":
                 return {"ok": True}
             raise RuntimeError("browser_eval script must evaluate to a function")
+        if "document.activeElement" in script:
+            return self.active_element
         if "querySelectorAll" in script:
             payload = args[0] if args else 40
             max_elements = (
@@ -262,8 +281,10 @@ class _FakePage:
     async def title(self) -> str:
         return "Settings"
 
-    async def wait_for_selector(self, selector: str, timeout: int) -> None:
-        self.last_wait_for_selector = (selector, timeout)
+    async def wait_for_selector(
+        self, selector: str, timeout: int, state: str | None = None
+    ) -> None:
+        self.last_wait_for_selector = (selector, timeout, state)
 
     async def wait_for_timeout(self, timeout: int) -> None:
         self.last_wait_for_timeout = timeout
@@ -490,7 +511,8 @@ async def test_browser_snapshot_uses_smaller_default_limit(
     assert len(manager.session.page.evaluate_scripts) == 1
     assert '"elements"' in result.output
     assert '"exact_selector"' in result.output
-    assert manager.session.ref_map["e1"] == '[data-cognis-ref="e1"]'
+    assert manager.session.ref_map["e1"]["selector"] == '[data-cognis-ref="e1"]'
+    assert manager.session.ref_map["e1"]["frame_index"] == 0
     assert '"visible": true' in result.output
     assert '"editable": false' in result.output
 
@@ -547,7 +569,7 @@ async def test_browser_query_returns_candidate_metadata(monkeypatch: pytest.Monk
     )
     assert '"name": "username"' in result.output
     assert '"label_text": "Username or email"' in result.output
-    assert manager.session.ref_map["e1"] == '[data-cognis-query-ref="e1"]'
+    assert manager.session.ref_map["e1"]["selector"] == '[data-cognis-query-ref="e1"]'
 
 
 @pytest.mark.asyncio
@@ -586,7 +608,7 @@ async def test_selector_actions_do_not_overwrite_query_refs(
         {"session_id": "sess-1", "selector": "input", "value": "abc"},
         _context(),
     )
-    assert manager.session.ref_map["e1"] == '[data-cognis-query-ref="e1"]'
+    assert manager.session.ref_map["e1"]["selector"] == '[data-cognis-query-ref="e1"]'
 
 
 @pytest.mark.asyncio
@@ -654,6 +676,93 @@ async def test_browser_type_uses_key_events(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_browser_type_accepts_resolved_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    visible = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = visible
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_type(
+        {"session_id": "sess-1", "ref": "e1", "value": "123456"},
+        _context(),
+    )
+    assert visible.typed == ("123456", None)
+    assert "123456" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_press_types_into_focused_element(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_press(
+        {"session_id": "sess-1", "value": "secret", "delay_ms": 25},
+        _context(),
+    )
+    assert manager.session.page.keyboard.typed == [("secret", 25)]
+    assert "secret" not in result.output
+    assert '"source": "focused"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_query_refs_track_iframe_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    child_frame = _FakePage()
+    child_frame.url = "https://payments.example/frame"
+    target = _FakeLocator(visible=True, enabled=True, editable=True)
+    child_frame.locator_map['[data-cognis-query-ref="e1"]'] = target
+    manager.session.page.frames = [manager.session.page, child_frame]
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    await handle_browser_query(
+        {"session_id": "sess-1", "selector": "input", "mode": "fillable"},
+        _context(),
+    )
+
+    assert manager.session.ref_map["e2"]["frame_index"] == 1
+    result = await handle_browser_fill(
+        {"session_id": "sess-1", "ref": "e2", "value": "4242424242424242"},
+        _context(),
+    )
+    assert target.filled == "4242424242424242"
+    assert "payments.example" in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_get_focus_reports_active_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    child_frame = _FakePage()
+    child_frame.url = "https://issuer.example/challenge"
+    child_frame.active_element = {
+        "tag": "input",
+        "type": "text",
+        "name": "otp",
+        "editable": True,
+        "value_state": "redacted",
+    }
+    manager.session.page.frames = [manager.session.page, child_frame]
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_get_focus({"session_id": "sess-1"}, _context())
+    assert '"frame_index": 1' in result.output
+    assert "issuer.example" in result.output
+    assert '"value_state": "redacted"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_wait_for_passes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_wait_for(
+        {
+            "session_id": "sess-1",
+            "selector": "iframe",
+            "timeout_ms": 500,
+            "state": "attached",
+        },
+        _context(),
+    )
+    assert result.output == "Wait completed."
+    assert manager.session.page.last_wait_for_selector == ("iframe", 500, "attached")
+
+
+@pytest.mark.asyncio
 async def test_browser_submit_form_supports_native(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = _FakeManager()
     visible = _FakeLocator(visible=True, enabled=True, editable=False)
@@ -710,7 +819,7 @@ async def test_tool_router_unwraps_storage_state_for_auth_state_ref() -> None:
         guardrails=SimpleNamespace(),
         credentials_provider=_FakeCredentialsProvider("https://github.com"),
     )
-    resolved = await router._resolve_credential_refs(  # noqa: SLF001
+    resolved = await router._resolve_sensitive_refs(  # noqa: SLF001
         {"url": "https://github.com/settings", "auth_state_ref": "$credential:github_state"},
         SimpleNamespace(user_email="user@example.com"),
         AgentDefinition(
@@ -719,6 +828,7 @@ async def test_tool_router_unwraps_storage_state_for_auth_state_ref() -> None:
             name="Agent",
             permissions=AgentPermissions(allowed_credentials=["github_state"]),
         ),
+        ToolCall(call_id="auth-state", name="browser_open", arguments={}),
     )
     assert resolved["auth_state"] == {"cookies": [], "origins": []}
 
@@ -730,7 +840,7 @@ async def test_tool_router_rejects_cross_origin_auth_state_ref() -> None:
         credentials_provider=_FakeCredentialsProvider("https://github.com"),
     )
     with pytest.raises(CredentialAccessError, match="origin does not match"):
-        await router._resolve_credential_refs(  # noqa: SLF001
+        await router._resolve_sensitive_refs(  # noqa: SLF001
             {"url": "https://evil.example", "auth_state_ref": "$credential:github_state"},
             SimpleNamespace(user_email="user@example.com"),
             AgentDefinition(
@@ -739,6 +849,7 @@ async def test_tool_router_rejects_cross_origin_auth_state_ref() -> None:
                 name="Agent",
                 permissions=AgentPermissions(allowed_credentials=["github_state"]),
             ),
+            ToolCall(call_id="auth-state", name="browser_open", arguments={}),
         )
 
 
@@ -748,7 +859,7 @@ async def test_tool_router_ignores_blank_auth_state_ref() -> None:
         guardrails=SimpleNamespace(),
         credentials_provider=_FakeCredentialsProvider("https://github.com"),
     )
-    resolved = await router._resolve_credential_refs(  # noqa: SLF001
+    resolved = await router._resolve_sensitive_refs(  # noqa: SLF001
         {"url": "https://github.com/settings", "auth_state_ref": "   "},
         SimpleNamespace(user_email="user@example.com"),
         AgentDefinition(
@@ -757,6 +868,7 @@ async def test_tool_router_ignores_blank_auth_state_ref() -> None:
             name="Agent",
             permissions=AgentPermissions(allowed_credentials=["github_state"]),
         ),
+        ToolCall(call_id="auth-state", name="browser_open", arguments={}),
     )
     assert "auth_state" not in resolved
     assert "auth_state_ref" not in resolved
@@ -768,7 +880,7 @@ async def test_tool_router_ignores_blank_value_ref() -> None:
         guardrails=SimpleNamespace(),
         credentials_provider=_FakeCredentialsProvider("https://github.com"),
     )
-    resolved = await router._resolve_credential_refs(  # noqa: SLF001
+    resolved = await router._resolve_sensitive_refs(  # noqa: SLF001
         {"value_ref": ""},
         SimpleNamespace(user_email="user@example.com"),
         AgentDefinition(
@@ -777,6 +889,7 @@ async def test_tool_router_ignores_blank_value_ref() -> None:
             name="Agent",
             permissions=AgentPermissions(allowed_credentials=["github_state"]),
         ),
+        ToolCall(call_id="value-ref", name="browser_fill", arguments={}),
     )
     assert "value" not in resolved
     assert "value_ref" not in resolved
@@ -802,7 +915,7 @@ async def test_tool_router_auth_state_wrong_kind_includes_hint() -> None:
     )
 
     with pytest.raises(CredentialAccessError, match="browser_storage_state") as excinfo:
-        await router._resolve_credential_refs(  # noqa: SLF001
+        await router._resolve_sensitive_refs(  # noqa: SLF001
             {"url": "https://github.com/settings", "auth_state_ref": "$credential:github_state"},
             SimpleNamespace(user_email="user@example.com"),
             AgentDefinition(
@@ -811,6 +924,7 @@ async def test_tool_router_auth_state_wrong_kind_includes_hint() -> None:
                 name="Agent",
                 permissions=AgentPermissions(allowed_credentials=["github_state"]),
             ),
+            ToolCall(call_id="auth-state", name="browser_open", arguments={}),
         )
 
     assert excinfo.value.code == "credential_wrong_kind"

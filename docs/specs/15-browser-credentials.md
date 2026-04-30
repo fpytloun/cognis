@@ -533,8 +533,10 @@ Initial executor-native browser tools:
 - `browser_open`
 - `browser_snapshot`
 - `browser_get_text`
+- `browser_get_focus`
 - `browser_click`
 - `browser_fill`
+- `browser_type`
 - `browser_press`
 - `browser_wait_for`
 - `browser_screenshot`
@@ -563,10 +565,46 @@ Likely follow-ups:
 - supports `value_ref` / credential refs
 - must never return the resolved plaintext
 
+### `browser_type`
+
+- types into an input field or contenteditable target using key events
+- supports literal `text` and secure `value_ref` / credential refs
+- must never return the resolved plaintext
+- supports per-key delay and executor-configured humanized key cadence
+
+### `browser_press`
+
+- presses a keyboard key in the current page, or types `text` / `value_ref`
+  into the currently focused element
+- useful after `browser_click` focuses a hosted payment iframe field where the
+  exact editable element is not directly visible to the top-level page
+- must never return typed text or resolved plaintext
+
+### Frame-aware targeting
+
+- `browser_snapshot` and `browser_query` discover actionable elements across
+  the main document and reachable iframes using Playwright frame contexts
+- returned refs include `frame_index`, `frame_url`, and `frame_name`
+- action tools (`browser_click`, `browser_fill`, `browser_focus`,
+  `browser_type`, and `browser_submit_form`) resolve refs back into the
+  originating frame before creating a locator
+- selector-mode actions search all frames and fail with frame metadata when
+  multiple viable candidates match
+- stale refs fail closed and require a fresh snapshot/query
+
+### `browser_get_focus`
+
+- returns the currently focused frame and active element metadata
+- includes frame URL/name/index and non-secret element properties such as tag,
+  type, name, placeholder, autocomplete, visibility, editability, and redacted
+  value state
+- must never return the active element's plaintext value
+
 ### `browser_snapshot`
 
 - returns a size-bounded representation of the current page
 - may include URL, title, visible text summary, and selector/locator hints
+- includes frame metadata for every returned interactive element
 - must avoid dumping raw page content without bounds
 
 ### `browser_screenshot`
@@ -597,9 +635,9 @@ Guidance:
 Suggested categories:
 
 - read/navigation-sensitive: `browser_open`, `browser_snapshot`,
-  `browser_get_text`, `browser_screenshot`
+  `browser_get_text`, `browser_get_focus`, `browser_screenshot`
 - write/non-bypassable: `browser_click`, `browser_fill`, `browser_press`,
-  `browser_upload`, `browser_submit`-like actions
+  `browser_type`, `browser_upload`, `browser_submit`-like actions
 
 The controller must not assume that screenshots or text extraction from a
 logged-in page are low-risk.

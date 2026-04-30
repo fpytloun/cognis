@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
@@ -31,6 +32,42 @@ def _resolve_intensity(arguments: dict[str, Any], manager: BrowserManager) -> st
     if isinstance(raw, str) and raw.strip():
         return humanizer.normalize_intensity(raw)
     return manager.humanize_intensity
+
+
+_FOCUS_DISCOVERY_SCRIPT = r"""
+() => {
+  const el = document.activeElement;
+  if (!el || !(el instanceof HTMLElement) || el === document.body) {
+    return null;
+  }
+  const style = window.getComputedStyle(el);
+  const rect = el.getBoundingClientRect();
+  const tag = el.tagName.toLowerCase();
+  const type = el.getAttribute('type') || '';
+  const role = el.getAttribute('role') || '';
+  const visible = style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  const enabled = !(el).disabled;
+  const isFillable = ['input', 'textarea', 'select'].includes(tag) || el.isContentEditable || ['textbox', 'searchbox', 'combobox', 'spinbutton'].includes(role);
+  const editable = isFillable && enabled && !(el).readOnly && type !== 'hidden';
+  return {
+    tag,
+    role,
+    type,
+    name: el.getAttribute('name') || '',
+    placeholder: el.getAttribute('placeholder') || '',
+    aria_label: el.getAttribute('aria-label') || '',
+    autocomplete: el.getAttribute('autocomplete') || '',
+    inputmode: el.getAttribute('inputmode') || '',
+    visible,
+    enabled,
+    editable,
+    disabled: !!(el).disabled,
+    read_only: !!(el).readOnly,
+    value_state: (type === 'password' || type === 'hidden' || (el.getAttribute('autocomplete') || '').includes('one-time-code')) ? 'redacted' : ((el.value || '') ? 'non_empty' : 'empty'),
+    bounding_box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+  };
+}
+"""
 
 
 _CANDIDATE_DISCOVERY_SCRIPT = r"""
@@ -395,17 +432,77 @@ async def _discover_candidates(
     assign_attr: str | None = None,
     include_computed: bool = False,
 ) -> list[dict[str, Any]]:
-    result = await session.page.evaluate(
-        _CANDIDATE_DISCOVERY_SCRIPT,
-        {
-            "mode": mode,
-            "selector": selector,
-            "maxResults": max_results,
-            "assignAttr": assign_attr,
-            "includeComputed": include_computed,
-        },
-    )
-    return result if isinstance(result, list) else []
+    payload = {
+        "mode": mode,
+        "selector": selector,
+        "maxResults": max_results,
+        "assignAttr": assign_attr,
+        "includeComputed": include_computed,
+    }
+    candidates: list[dict[str, Any]] = []
+    for frame_index, frame in enumerate(_session_frames(session)):
+        try:
+            result = await frame.evaluate(_CANDIDATE_DISCOVERY_SCRIPT, payload)
+        except Exception:
+            # Cross-origin frames are still scriptable through Playwright's
+            # frame context, but detached/security-restricted frames can race.
+            continue
+        if not isinstance(result, list):
+            continue
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            global_ref = f"e{len(candidates) + 1}"
+            frame_item = dict(item)
+            frame_item["ref"] = global_ref
+            frame_item["frame_index"] = frame_index
+            frame_item.setdefault("frame_url", _frame_url(frame))
+            frame_item.setdefault("frame_name", _frame_name(frame))
+            candidates.append(frame_item)
+            if len(candidates) >= max_results:
+                return candidates
+    return candidates
+
+
+def _session_frames(session: Any) -> list[Any]:
+    frames = getattr(session.page, "frames", None)
+    if callable(frames):
+        frames = frames()
+    if isinstance(frames, list) and frames:
+        return frames
+    return [session.page]
+
+
+def _frame_at(session: Any, frame_index: int | None) -> Any:
+    frames = _session_frames(session)
+    if frame_index is None:
+        return session.page
+    if frame_index < 0 or frame_index >= len(frames):
+        raise ValueError("Browser ref points to a frame that is no longer available; refresh browser_snapshot and retry")
+    return frames[frame_index]
+
+
+def _frame_url(frame: Any) -> str:
+    return str(getattr(frame, "url", "") or "")
+
+
+def _frame_name(frame: Any) -> str:
+    name = getattr(frame, "name", "")
+    if callable(name):
+        try:
+            name = name()
+        except Exception:
+            name = ""
+    return str(name or "")
+
+
+def _coerce_frame_index(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -422,7 +519,9 @@ def _candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
         "enabled": candidate.get("enabled"),
         "editable": candidate.get("editable"),
         "purpose_score": candidate.get("purpose_score"),
+        "frame_index": candidate.get("frame_index"),
         "frame_url": candidate.get("frame_url"),
+        "frame_name": candidate.get("frame_name"),
         "in_shadow_dom": candidate.get("in_shadow_dom"),
     }
 
@@ -433,10 +532,17 @@ async def _resolve_ref_target(
     ref: str,
     require_editable: bool,
 ) -> tuple[Any, dict[str, Any]]:
-    selector = session.ref_map.get(ref)
+    target = session.ref_map.get(ref)
+    if isinstance(target, dict):
+        selector = target.get("selector")
+        frame_index = _coerce_frame_index(target.get("frame_index"))
+    else:
+        selector = target
+        frame_index = None
     if not selector:
         raise ValueError(f"Unknown browser ref: {ref}")
-    locator = session.page.locator(selector)
+    frame = _frame_at(session, frame_index)
+    locator = frame.locator(selector)
     count = await locator.count()
     if count <= 0:
         raise ValueError(f"Browser ref {ref} is stale; refresh browser_snapshot and retry")
@@ -459,6 +565,9 @@ async def _resolve_ref_target(
             "visible": visible,
             "enabled": enabled,
             "editable": editable,
+            "frame_index": frame_index,
+            "frame_url": _frame_url(frame) or str(info.get("frame_url") or ""),
+            "frame_name": _frame_name(frame) or str(info.get("frame_name") or ""),
         }
     )
     return candidate, info
@@ -502,10 +611,54 @@ async def _resolve_selector_target(
     exact_selector = target.get("exact_selector")
     if not isinstance(exact_selector, str) or not exact_selector:
         raise ValueError("Resolved selector candidate does not have an exact selector")
-    locator = session.page.locator(exact_selector)
+    frame = _frame_at(session, _coerce_frame_index(target.get("frame_index")))
+    locator = frame.locator(exact_selector)
     if await locator.count() != 1:
         raise ValueError("Resolved selector candidate became stale; inspect the page again")
     return locator.nth(0), target
+
+
+def _store_ref_maps(session: Any, elements: list[dict[str, Any]]) -> None:
+    session.ref_map = {
+        str(item.get("ref")): {
+            "selector": str(item.get("exact_selector")),
+            "frame_index": item.get("frame_index"),
+        }
+        for item in elements
+        if isinstance(item, dict) and item.get("ref") and item.get("exact_selector")
+    }
+    session.ref_metadata = {
+        str(item.get("ref")): dict(item)
+        for item in elements
+        if isinstance(item, dict) and item.get("ref")
+    }
+
+
+async def _wait_after(page: Any, arguments: dict[str, Any]) -> None:
+    wait_after_ms = int(arguments.get("wait_after_ms", 0) or 0)
+    if wait_after_ms <= 0:
+        return
+    if hasattr(page, "wait_for_timeout"):
+        await page.wait_for_timeout(wait_after_ms)
+    else:
+        await asyncio.sleep(wait_after_ms / 1000.0)
+
+
+async def _type_focused_text(page: Any, text: str, *, delay_ms: int, intensity: str) -> None:
+    if intensity == "off":
+        if delay_ms > 0:
+            try:
+                await page.keyboard.type(text, delay=delay_ms)
+            except TypeError:
+                await page.keyboard.type(text)
+        else:
+            await page.keyboard.type(text)
+        return
+    profile = humanizer.PROFILES[humanizer.normalize_intensity(intensity)]
+    for char in text:
+        await page.keyboard.type(char)
+        if profile.inter_key_ms > 0:
+            await asyncio.sleep(profile.inter_key_ms / 1000.0)
 
 
 def _require_manager(context: ToolExecutionContext) -> BrowserManager | ToolResult:
@@ -582,16 +735,7 @@ async def handle_browser_query(
         assign_attr="data-cognis-query-ref",
         include_computed=bool(arguments.get("include_computed", False)),
     )
-    session.ref_map = {
-        str(item.get("ref")): str(item.get("exact_selector"))
-        for item in candidates
-        if isinstance(item, dict) and item.get("ref") and item.get("exact_selector")
-    }
-    session.ref_metadata = {
-        str(item.get("ref")): dict(item)
-        for item in candidates
-        if isinstance(item, dict) and item.get("ref")
-    }
+    _store_ref_maps(session, candidates)
     return ToolResult(output=json.dumps({"matches": candidates}, ensure_ascii=False))
 
 
@@ -657,16 +801,7 @@ async def handle_browser_snapshot(
         assign_attr="data-cognis-ref",
         include_computed=False,
     )
-    session.ref_map = {
-        str(item.get("ref")): str(item.get("exact_selector"))
-        for item in elements
-        if isinstance(item, dict) and item.get("ref") and item.get("exact_selector")
-    }
-    session.ref_metadata = {
-        str(item.get("ref")): dict(item)
-        for item in elements
-        if isinstance(item, dict) and item.get("ref")
-    }
+    _store_ref_maps(session, elements)
     title = await session.page.title()
     return ToolResult(
         output=json.dumps(
@@ -690,6 +825,39 @@ async def handle_browser_get_text(
     return ToolResult(output=str(text)[:max_chars])
 
 
+async def handle_browser_get_focus(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    active: dict[str, Any] | None = None
+    active_frame_index: int | None = None
+    active_frame: Any = session.page
+    for frame_index, frame in enumerate(_session_frames(session)):
+        try:
+            result = await frame.evaluate(_FOCUS_DISCOVERY_SCRIPT)
+        except Exception:
+            continue
+        if isinstance(result, dict):
+            active = result
+            active_frame_index = frame_index
+            active_frame = frame
+            break
+    return ToolResult(
+        output=json.dumps(
+            {
+                "frame": {
+                    "frame_index": active_frame_index,
+                    "frame_url": _frame_url(active_frame),
+                    "frame_name": _frame_name(active_frame),
+                },
+                "element": active,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 async def handle_browser_click(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
@@ -707,6 +875,7 @@ async def handle_browser_click(
         raise ValueError("Provide either ref or selector")
     intensity = _resolve_intensity(arguments, manager)
     await humanizer.humanize_click(session.page, chosen, intensity=intensity)
+    await _wait_after(session.page, arguments)
     return ToolResult(
         output=json.dumps(
             {
@@ -740,6 +909,7 @@ async def handle_browser_fill(
         raise ValueError("Provide either ref or selector")
     intensity = _resolve_intensity(arguments, manager)
     await humanizer.humanize_fill(session.page, chosen, value, intensity=intensity)
+    await _wait_after(session.page, arguments)
     return ToolResult(
         output=json.dumps(
             {
@@ -769,6 +939,7 @@ async def handle_browser_focus(
     else:
         raise ValueError("Provide either ref or selector")
     await chosen.focus()
+    await _wait_after(session.page, arguments)
     return ToolResult(
         output=json.dumps(
             {"action": "focus", "source": source, "target": _candidate_summary(info)},
@@ -783,6 +954,8 @@ async def handle_browser_type(
     manager = _get_manager(context)
     session = await manager.get_live_session(str(arguments.get("session_id", "")))
     text = arguments.get("text")
+    if not isinstance(text, str) and isinstance(arguments.get("value"), str):
+        text = arguments.get("value")
     if not isinstance(text, str):
         raise ValueError("browser_type requires text")
     ref = arguments.get("ref")
@@ -807,6 +980,7 @@ async def handle_browser_type(
             await chosen.press_sequentially(text)
     else:
         await humanizer.humanize_type(session.page, chosen, text, intensity=intensity)
+    await _wait_after(session.page, arguments)
     return ToolResult(
         output=json.dumps(
             {
@@ -864,6 +1038,7 @@ async def handle_browser_submit_form(
         )
     else:
         raise ValueError("browser_submit_form mode must be 'native' or 'event'")
+    await _wait_after(session.page, arguments)
     return ToolResult(
         output=json.dumps(
             {
@@ -882,8 +1057,23 @@ async def handle_browser_press(
 ) -> ToolResult:
     manager = _get_manager(context)
     session = await manager.get_live_session(str(arguments.get("session_id", "")))
-    await session.page.keyboard.press(str(arguments.get("key", "")))
-    return ToolResult(output="Pressed key.")
+    text = arguments.get("text")
+    if not isinstance(text, str) and isinstance(arguments.get("value"), str):
+        text = arguments.get("value")
+    key = arguments.get("key")
+    if isinstance(text, str):
+        intensity = _resolve_intensity(arguments, manager)
+        delay = int(arguments.get("delay_ms", 0) or 0)
+        await _type_focused_text(session.page, text, delay_ms=delay, intensity=intensity)
+        await _wait_after(session.page, arguments)
+        return ToolResult(
+            output=json.dumps({"action": "type", "source": "focused", "intensity": intensity})
+        )
+    if not isinstance(key, str) or not key:
+        raise ValueError("browser_press requires key or text")
+    await session.page.keyboard.press(key)
+    await _wait_after(session.page, arguments)
+    return ToolResult(output=json.dumps({"action": "press"}))
 
 
 async def handle_browser_wait_for(
@@ -893,12 +1083,39 @@ async def handle_browser_wait_for(
     session = await manager.get_live_session(str(arguments.get("session_id", "")))
     selector = arguments.get("selector")
     timeout_ms = int(arguments.get("timeout_ms", 10000) or 10000)
+    state = str(arguments.get("state") or "visible")
+    if state not in {"attached", "visible", "hidden", "detached"}:
+        raise ValueError("browser_wait_for state must be one of attached, visible, hidden, detached")
     if isinstance(selector, str) and selector:
         _validate_css_selector("browser_wait_for", selector)
-        await session.page.wait_for_selector(selector, timeout=timeout_ms)
+        last_error: Exception | None = None
+        tasks = [
+            asyncio.create_task(_frame_wait_for_selector(frame, selector, timeout_ms, state))
+            for frame in _session_frames(session)
+        ]
+        for task in asyncio.as_completed(tasks):
+            try:
+                await task
+                break
+            except Exception as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     else:
         await session.page.wait_for_timeout(timeout_ms)
     return ToolResult(output="Wait completed.")
+
+
+async def _frame_wait_for_selector(frame: Any, selector: str, timeout_ms: int, state: str) -> None:
+    try:
+        await frame.wait_for_selector(selector, timeout=timeout_ms, state=state)
+    except TypeError:
+        await frame.wait_for_selector(selector, timeout=timeout_ms)
 
 
 async def handle_browser_screenshot(

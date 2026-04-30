@@ -275,11 +275,21 @@ def test_browser_click_schema_advertises_intensity() -> None:
     from cognis.tools.executor.browser.definitions import browser_tool_definitions
 
     defs = {tool.name: tool for tool in browser_tool_definitions()}
-    for name in ("browser_click", "browser_fill", "browser_type"):
+    for name in ("browser_click", "browser_fill", "browser_type", "browser_press"):
         props = defs[name].parameters.get("properties", {})
         intensity = props.get("intensity")
         assert intensity is not None, f"{name} must expose intensity"
         assert intensity.get("enum") == ["off", "low", "medium", "high"]
+
+
+def test_browser_type_and_press_schema_advertise_value_ref() -> None:
+    from cognis.tools.executor.browser.definitions import browser_tool_definitions
+
+    defs = {tool.name: tool for tool in browser_tool_definitions()}
+    for name in ("browser_type", "browser_press"):
+        props = defs[name].parameters.get("properties", {})
+        assert props.get("value_ref") == {"type": "string"}
+        assert "auth_challenge" in props
 
 
 # ---------------------------------------------------------------------------
