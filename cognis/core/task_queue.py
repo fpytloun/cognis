@@ -41,6 +41,7 @@ from cognis.store.queries import (
     get_task,
     get_task_dependencies,
     get_unmet_dependencies,
+    list_project_workflow_ids,
     list_stale_running_tasks,
     list_tasks_by_status,
     pick_ready_task,
@@ -1048,11 +1049,20 @@ class TaskQueue:
                 owner_email=task.created_by,
                 project_id=task.project_id,
             )
+            project_workflow_ids: set[str] = set()
+            if task.project_id is not None:
+                async with self._session_factory() as db_session:
+                    project_workflow_ids = set(
+                        await list_project_workflow_ids(db_session, task.project_id)
+                    )
             workflow_candidates = [
                 {
                     "workflow_id": workflow.workflow_id,
                     "name": workflow.name,
+                    "description": workflow.description,
                     "criteria": workflow.criteria,
+                    "tags": list(workflow.tags),
+                    "project_bound": workflow.workflow_id in project_workflow_ids,
                 }
                 for workflow in available
             ]

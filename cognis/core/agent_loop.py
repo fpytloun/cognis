@@ -5801,7 +5801,11 @@ class AgentLoop:
                     )
 
                 workflow_id = tc.arguments.get("workflow_id")
+                if isinstance(workflow_id, str) and not workflow_id.strip():
+                    workflow_id = None
                 project_id = tc.arguments.get("project_id") or ctx.conversation.project_id
+                if isinstance(project_id, str) and not project_id.strip():
+                    project_id = None
                 if project_id:
                     async with self.session_manager.session_factory() as db:
                         project = await get_project(db, str(project_id))
@@ -9698,6 +9702,8 @@ class AgentLoop:
             field_schema: dict[str, Any] = {
                 "type": self._metadata_json_schema_type(metadata_field.type)
             }
+            if metadata_field.type == "array":
+                field_schema["items"] = {"type": "string"}
             if metadata_field.description:
                 field_schema["description"] = metadata_field.description
             if metadata_field.enum:

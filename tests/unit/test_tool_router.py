@@ -21,7 +21,7 @@ from cognis.models.tool import (
     ToolSource,
     sanitize_mcp_tool_name,
 )
-from cognis.tools.registry import RegisteredTool, ToolRegistry
+from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 
 class _Guardrails:
@@ -503,6 +503,61 @@ async def test_tool_router_executes_registered_builtin_handler_locally() -> None
 
     assert executor.calls == 0
     assert '"executor_type": "websocket"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_passes_merged_runtime_metadata_to_registered_handler() -> None:
+    captured: dict[str, object] = {}
+
+    async def builtin_handler(
+        arguments: dict[str, object], context: ToolExecutionContext
+    ) -> object:
+        del arguments
+        captured.update(context.runtime_metadata)
+        runtime_access = context.runtime_metadata.get("runtime_access", {})
+        user_email = runtime_access.get("user_email") if isinstance(runtime_access, dict) else None
+        return {"user_email": user_email}
+
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    executor = _RemoteExecutor()
+    executor.runtime_metadata = {"user_email": "user@example.com", "executor_key": "executor"}
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="local_context_probe",
+                description="context probe",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                category="system",
+                read_only=True,
+            ),
+            handler=builtin_handler,
+        )
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="local-context-1",
+            name="local_context_probe",
+            arguments={},
+            runtime_metadata={
+                "tool_key": "tool",
+                "runtime_access": {"user_email": "user@example.com"},
+            },
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert executor.calls == 0
+    assert result.is_error is False
+    assert captured["user_email"] == "user@example.com"
+    assert captured["executor_key"] == "executor"
+    assert captured["tool_key"] == "tool"
+    assert captured["runtime_access"] == {"user_email": "user@example.com"}
 
 
 @pytest.mark.asyncio

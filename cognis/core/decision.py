@@ -10,6 +10,7 @@ conversational messages) to short-circuit the turn lifecycle.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from prometheus_client import Counter
@@ -90,20 +91,31 @@ _ROUTING_REMINDER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
 )
 
-_WORKFLOW_HEURISTIC_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "system:research",
-        (
-            "research",
-            "best ",
-            "latest ",
-            "compare",
-            "look up",
-            "investigate",
-            "which mcp server",
-            "best mcp server",
-        ),
-    ),
+_WORKFLOW_SELECTION_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "be",
+        "by",
+        "do",
+        "for",
+        "from",
+        "in",
+        "into",
+        "it",
+        "of",
+        "on",
+        "or",
+        "should",
+        "that",
+        "the",
+        "this",
+        "to",
+        "with",
+    }
 )
 
 
@@ -350,11 +362,75 @@ class WorkflowSelectionResult(BaseModel):
     source: str  # "explicit" | "default" | "classifier"
 
 
+def _workflow_selection_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2 and token not in _WORKFLOW_SELECTION_STOPWORDS
+    }
+
+
+def _workflow_candidate_text(workflow: dict[str, Any]) -> str:
+    tags = workflow.get("tags")
+    tag_text = " ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags or "")
+    return "\n".join(
+        str(workflow.get(field, ""))
+        for field in ("name", "description", "criteria")
+        if workflow.get(field)
+    ) + (f"\n{tag_text}" if tag_text else "")
+
+
+def _score_workflow_candidate(task_description: str, workflow: dict[str, Any]) -> float:
+    task_tokens = _workflow_selection_tokens(task_description)
+    candidate_tokens = _workflow_selection_tokens(_workflow_candidate_text(workflow))
+    if not task_tokens or not candidate_tokens:
+        return 0.0
+    overlap = len(task_tokens & candidate_tokens)
+    if overlap == 0:
+        return 0.0
+    score = float(overlap)
+    if bool(workflow.get("project_bound")):
+        score += 1.5
+    return score
+
+
+def _select_by_candidate_metadata(
+    task_description: str,
+    available_workflows: list[dict[str, Any]],
+) -> WorkflowSelectionResult | None:
+    scored = [
+        (workflow, _score_workflow_candidate(task_description, workflow))
+        for workflow in available_workflows
+    ]
+    scored = [(workflow, score) for workflow, score in scored if score > 0]
+    if not scored:
+        return None
+    scored.sort(
+        key=lambda item: (
+            item[1],
+            1 if bool(item[0].get("project_bound")) else 0,
+            str(item[0].get("workflow_id", "")),
+        ),
+        reverse=True,
+    )
+    workflow, score = scored[0]
+    workflow_name_tokens = _workflow_selection_tokens(str(workflow.get("name", "")))
+    task_tokens = _workflow_selection_tokens(task_description)
+    if score < 2.0 and not (workflow_name_tokens and workflow_name_tokens & task_tokens):
+        return None
+    return WorkflowSelectionResult(
+        workflow_id=str(workflow["workflow_id"]),
+        confidence=min(0.9, 0.55 + (score * 0.08)),
+        reason="Workflow metadata match",
+        source="default",
+    )
+
+
 async def select_workflow(
     *,
     llm: Any,
     task_description: str,
-    available_workflows: list[dict[str, str]],
+    available_workflows: list[dict[str, Any]],
     default_workflow_id: str | None = None,
     selection_mode: str = "automatic",
     classifier_timeout_seconds: float = 10.0,
@@ -364,7 +440,7 @@ async def select_workflow(
     Args:
         llm: LLM provider for classifier calls.
         task_description: Description of the task.
-        available_workflows: List of {workflow_id, name, criteria} dicts.
+        available_workflows: List of workflow candidate metadata dicts.
         default_workflow_id: Agent's default workflow.
         selection_mode: "automatic" | "always_ask" | "use_default".
         classifier_timeout_seconds: Timeout for the LLM classifier.
@@ -385,18 +461,10 @@ async def select_workflow(
             source="default",
         )
 
-    lowered_description = task_description.strip().lower()
     valid_ids = {w["workflow_id"] for w in available_workflows}
-    for workflow_id, patterns in _WORKFLOW_HEURISTIC_PATTERNS:
-        if workflow_id not in valid_ids:
-            continue
-        if any(pattern in lowered_description for pattern in patterns):
-            return WorkflowSelectionResult(
-                workflow_id=workflow_id,
-                confidence=0.95,
-                reason="Deterministic workflow heuristic",
-                source="default",
-            )
+    metadata_selection = _select_by_candidate_metadata(task_description, available_workflows)
+    if metadata_selection is not None:
+        return metadata_selection
 
     # Build classifier prompt from system agent
     from cognis.core.agent_registry import SYSTEM_AGENTS
@@ -412,14 +480,26 @@ async def select_workflow(
     )
 
     workflow_options = "\n".join(
-        f"- {w['workflow_id']}: {w.get('name', '')} — {w.get('criteria', '')}"
+        (
+            f"- {w['workflow_id']}: {w.get('name', '')}\n"
+            f"  Description: {w.get('description', '')}\n"
+            f"  Criteria: {w.get('criteria', '')}\n"
+            f"  Tags: {', '.join(str(tag) for tag in w.get('tags', [])) if isinstance(w.get('tags'), list) else w.get('tags', '')}\n"
+            f"  Scope: {'project-bound' if w.get('project_bound') else 'global'}"
+        )
         for w in available_workflows
     )
     prompt = [
         {"role": "system", "content": classifier_prompt},
         {
             "role": "user",
-            "content": f"Task: {task_description}\n\nAvailable workflows:\n{workflow_options}",
+            "content": (
+                f"Task: {task_description}\n\n"
+                "Select the workflow whose description, criteria, and tags best match the task. "
+                "Prefer a project-bound workflow over a global/system workflow when both are suitable. "
+                "Return JSON with workflow_id, confidence, and reason.\n\n"
+                f"Available workflows:\n{workflow_options}"
+            ),
         },
     ]
 

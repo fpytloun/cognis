@@ -43,6 +43,8 @@ from cognis.models.tool import (
 )
 from cognis.models.workflow import (
     CompletionDeliveryPolicy,
+    StepCompletionContract,
+    StepCompletionMetadataField,
     StepDefinition,
     StepInputConfig,
     StepOutput,
@@ -2057,6 +2059,43 @@ def test_todo_schema_uses_completed_status() -> None:
     items = todo_tool["function"]["parameters"]["properties"]["todos"]["items"]
     assert items["required"] == ["content", "status"]
     assert "canonical workflow artifact" in write_deliverable_tool["function"]["description"]
+
+
+def test_step_complete_metadata_array_schema_includes_items() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="plan",
+            type="run",
+            prompt="",
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="source_strategy", type="array", required=False
+                    ),
+                    StepCompletionMetadataField(
+                        name="open_questions", type="array", required=True
+                    ),
+                ]
+            ),
+        ),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-1",
+    )
+
+    tools = loop._build_controller_tool_schemas(ctx)
+    step_complete_tool = next(
+        tool for tool in tools if tool["function"]["name"] == "step_complete"
+    )
+    metadata_properties = step_complete_tool["function"]["parameters"]["properties"][
+        "metadata"
+    ]["properties"]
+
+    assert metadata_properties["source_strategy"]["items"] == {"type": "string"}
+    assert metadata_properties["open_questions"]["items"] == {"type": "string"}
 
 
 def test_delegation_schema_exposes_write_deliverable_for_workflow_backed_child() -> None:

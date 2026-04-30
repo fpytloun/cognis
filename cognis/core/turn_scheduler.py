@@ -2163,7 +2163,9 @@ class TurnScheduler:
             {
                 "workflow_id": workflow.workflow_id,
                 "name": workflow.name,
+                "description": workflow.description,
                 "criteria": workflow.criteria,
+                "tags": list(workflow.tags),
             }
             for workflow in available_workflows
         ]

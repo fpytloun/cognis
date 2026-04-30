@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
 from cognis.models.artifact import AttachmentRef
@@ -652,6 +652,13 @@ class TaskCreateRequest(BaseModel):
     workspace_root: str | None = None
     working_directory: str | None = None
 
+    @field_validator("workflow_id", "project_id", "skill_id", mode="before")
+    @classmethod
+    def _empty_optional_ids_are_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
 
 class TaskUpdateRequest(BaseModel):
     title: str | None = None
@@ -669,6 +676,13 @@ class TaskUpdateRequest(BaseModel):
     interaction_mode_override: InteractionModeOverride | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
+
+    @field_validator("agent_id", "workflow_id", "project_id", "skill_id", mode="before")
+    @classmethod
+    def _empty_optional_ids_are_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 class TaskActionResponse(BaseModel):

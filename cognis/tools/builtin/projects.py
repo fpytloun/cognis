@@ -168,6 +168,14 @@ def build_project_tool_handlers(
     def _user(context: ToolExecutionContext) -> str:
         user_email = context.runtime_metadata.get("user_email")
         if not isinstance(user_email, str):
+            runtime_access = context.runtime_metadata.get("runtime_access")
+            if isinstance(runtime_access, dict):
+                user_email = runtime_access.get("user_email")
+        if not isinstance(user_email, str) and isinstance(
+            context.shared_runtime_metadata, dict
+        ):
+            user_email = context.shared_runtime_metadata.get("user_email")
+        if not isinstance(user_email, str):
             raise ValueError("User context is unavailable")
         return user_email
 

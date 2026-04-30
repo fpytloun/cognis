@@ -966,7 +966,11 @@ class ToolRouter:
             current_workspace_root,
         )
 
-        runtime_metadata: dict[str, Any] = {}
+        executor_metadata = getattr(executor, "runtime_metadata", None)
+        runtime_metadata: dict[str, Any] = (
+            dict(executor_metadata) if isinstance(executor_metadata, dict) else {}
+        )
+        runtime_metadata.update(tool_call.runtime_metadata)
         workspace_root = current_workspace_root.get()
         working_directory = current_effective_working_directory.get()
         if workspace_root:
@@ -976,7 +980,9 @@ class ToolRouter:
         context = ToolExecutionContext(
             executor_handle=executor_handle,
             runtime_metadata=runtime_metadata,
-            shared_runtime_metadata=getattr(executor, "runtime_metadata", None),
+            shared_runtime_metadata=(
+                executor_metadata if isinstance(executor_metadata, dict) else None
+            ),
             execution_scope_id=tool_call.execution_scope_id,
         )
         normalized_arguments = strip_empty_optional_values(

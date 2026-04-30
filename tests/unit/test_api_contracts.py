@@ -29,8 +29,10 @@ from cognis.api.models import (
     SkillVersionResponse,
     StepProfileResponse,
     StepRunResponse,
+    TaskCreateRequest,
     TaskRerunResponse,
     TaskResponse,
+    TaskUpdateRequest,
     ToolClassificationActionResponse,
     ToolClassificationOverrideRequest,
     ToolClassificationRequeueRequest,
@@ -40,6 +42,25 @@ from cognis.api.models import (
 from cognis.api.routes.push import PushSubscriptionStatusResponse
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
 from cognis.core.management import _normalize_pause_context, _normalize_pause_options
+
+
+def test_task_requests_normalize_empty_optional_ids() -> None:
+    create = TaskCreateRequest(
+        agent_id="agent-1",
+        title="Task",
+        workflow_id="",
+        project_id=" ",
+        skill_id="",
+    )
+    update = TaskUpdateRequest(agent_id="", workflow_id="", project_id="", skill_id="")
+
+    assert create.workflow_id is None
+    assert create.project_id is None
+    assert create.skill_id is None
+    assert update.agent_id is None
+    assert update.workflow_id is None
+    assert update.project_id is None
+    assert update.skill_id is None
 
 
 class _FakeRow(types.SimpleNamespace):

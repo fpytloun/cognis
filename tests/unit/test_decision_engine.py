@@ -57,6 +57,21 @@ class _SequenceWorkflowLLM:
         return self._responses.pop(0)
 
 
+class _CountingWorkflowLLM(_LLM):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.calls += 1
+        return await super().generate(messages, model=model, task_type=task_type, **kwargs)
+
+
 def _agent(can_delegate: bool = True, max_depth: int = 5) -> AgentDefinition:
     return AgentDefinition(
         agent_id="agent-1",
@@ -189,7 +204,7 @@ async def test_select_workflow_uses_general_task_when_no_workflows_available() -
 async def test_select_workflow_invalid_classifier_pick_falls_back_to_default() -> None:
     result = await select_workflow(
         llm=_InvalidWorkflowLLM(),
-        task_description="Implement slash command",
+        task_description="Coordinate slash command rollout",
         available_workflows=[
             {
                 "workflow_id": "system:general-task",
@@ -209,10 +224,9 @@ async def test_select_workflow_invalid_classifier_pick_falls_back_to_default() -
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_classifier_falls_back_to_plain_json_text() -> None:
+async def test_select_workflow_classifier_accepts_plain_json_text() -> None:
     llm = _SequenceWorkflowLLM(
         [
-            {"choices": [{"message": {"content": ""}}]},
             {
                 "choices": [
                     {
@@ -227,7 +241,7 @@ async def test_select_workflow_classifier_falls_back_to_plain_json_text() -> Non
 
     result = await select_workflow(
         llm=llm,
-        task_description="Implement slash command",
+        task_description="Coordinate slash command rollout",
         available_workflows=[
             {
                 "workflow_id": "system:general-task",
@@ -243,12 +257,12 @@ async def test_select_workflow_classifier_falls_back_to_plain_json_text() -> Non
         default_workflow_id="system:general-task",
     )
 
-    assert llm.calls == 2
+    assert llm.calls == 1
     assert result.workflow_id == "system:software-development"
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_uses_research_heuristic_before_classifier() -> None:
+async def test_select_workflow_uses_research_metadata_before_classifier() -> None:
     llm = _LLM()
 
     result = await select_workflow(
@@ -270,3 +284,137 @@ async def test_select_workflow_uses_research_heuristic_before_classifier() -> No
     )
 
     assert result.workflow_id == "system:research"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_uses_candidate_metadata_before_classifier() -> None:
+    llm = _CountingWorkflowLLM()
+
+    result = await select_workflow(
+        llm=llm,
+        task_description="Add expired scheduled tasks filter to the task UI and tests",
+        available_workflows=[
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Plan, research, and synthesize findings.",
+                "criteria": "Information gathering and analysis requests.",
+                "tags": ["research", "analysis"],
+            },
+            {
+                "workflow_id": "system:software-development",
+                "name": "Software Development",
+                "description": "Full development pipeline for code and UI changes.",
+                "criteria": "Implementation tasks, feature development, bug fixes, and tests.",
+                "tags": ["code", "development", "ui"],
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:software-development"
+    assert result.reason == "Workflow metadata match"
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_prefers_matching_project_bound_workflow() -> None:
+    result = await select_workflow(
+        llm=_CountingWorkflowLLM(),
+        task_description="Create the customer onboarding report from usage metrics",
+        available_workflows=[
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Research and report generation.",
+                "criteria": "Gather information and write reports.",
+                "tags": ["research", "report"],
+            },
+            {
+                "workflow_id": "project:onboarding-report",
+                "name": "Onboarding Report",
+                "description": "Create customer onboarding reports from usage metrics.",
+                "criteria": "Project-specific reporting workflow for onboarding analysis.",
+                "tags": ["report", "onboarding", "metrics"],
+                "project_bound": True,
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "project:onboarding-report"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_ignores_nonmatching_project_bound_workflow() -> None:
+    result = await select_workflow(
+        llm=_CountingWorkflowLLM(),
+        task_description="Research storage engine tradeoffs for vector search",
+        available_workflows=[
+            {
+                "workflow_id": "project:onboarding-report",
+                "name": "Onboarding Report",
+                "description": "Create customer onboarding reports from usage metrics.",
+                "criteria": "Project-specific reporting workflow for onboarding analysis.",
+                "tags": ["report", "onboarding", "metrics"],
+                "project_bound": True,
+            },
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Research information and compare tradeoffs.",
+                "criteria": "Research tasks, information gathering, and analysis requests.",
+                "tags": ["research", "analysis"],
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:research"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_uses_software_development_metadata_before_research() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:research", "confidence": 0.8, "reason": "research"}'
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = await select_workflow(
+        llm=llm,
+        task_description="Implement a frontend feature and add tests for the bug fix",
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic execution",
+            },
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Plan, research, and synthesize findings.",
+                "criteria": "Research and investigation",
+                "tags": ["research", "analysis"],
+            },
+            {
+                "workflow_id": "system:software-development",
+                "name": "Software Development",
+                "description": "Full development pipeline for frontend, backend, and UI changes.",
+                "criteria": "Implementation work, feature development, bug fixes, and tests.",
+                "tags": ["code", "development", "tests"],
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert llm.calls == 0
+    assert result.workflow_id == "system:software-development"
