@@ -333,11 +333,8 @@ class S3ArtifactBackend:
             objects = page.get("Contents", [])
             if not objects:
                 continue
-            delete_keys = [{"Key": obj["Key"]} for obj in objects]
-            self._client.delete_objects(
-                Bucket=self._bucket,
-                Delete={"Objects": delete_keys[:1000]},
-            )
+            for obj in objects:
+                self._client.delete_object(Bucket=self._bucket, Key=obj["Key"])
 
     def exists(self, namespace: str, object_id: str, filename: str) -> bool:
         key = self._key(namespace, object_id, filename)
