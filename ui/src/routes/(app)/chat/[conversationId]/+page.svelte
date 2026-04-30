@@ -16,6 +16,7 @@ import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Copy from 'lucide-svelte/icons/copy';
 import Info from 'lucide-svelte/icons/info';
+import ListPlus from 'lucide-svelte/icons/list-plus';
 import Menu from 'lucide-svelte/icons/menu';
 import Search from 'lucide-svelte/icons/search';
 import X from 'lucide-svelte/icons/x';
@@ -3593,10 +3594,10 @@ import X from 'lucide-svelte/icons/x';
                 `items-center` on the pill keeps the paperclip, the
                 text baseline, and the trailing button visually on one
                 line when the composer is a single row.
-              * The trailing icon is context-sensitive: a stop square
-                while a turn is streaming, a send arrow when there is
-                content to submit, and nothing when the field is
-                empty.
+              * The trailing icon is context-sensitive: a send arrow when
+                there is content to submit, a queued-send variant when a
+                turn is already running, a stop square only when running
+                with no draft, and nothing when idle + empty.
               * Enter defaults to newline; Cmd/Ctrl+Enter always
                 submits, and the stored Enter-to-send preference still
                 applies for users who opted in.
@@ -3634,7 +3635,22 @@ import X from 'lucide-svelte/icons/x';
                 onpaste={(event) => void handlePaste(event)}
                 placeholder={isLlmUnavailableForSetup() ? 'Configure an LLM provider to start chatting.' : pendingDirectQuestion ? 'Answer the pending clarification request...' : `Message ${currentAgentDisplayName}`}
               ></textarea>
-              {#if turnInProgress}
+              {#if canSendNow}
+                <button
+                  type="submit"
+                  aria-label={turnInProgress ? 'Queue message' : pendingDirectQuestion ? 'Answer' : 'Send'}
+                  title={turnInProgress ? 'Queue message after current turn' : pendingDirectQuestion ? 'Answer' : 'Send'}
+                  class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
+                  disabled={directQuestionSubmitting}
+                >
+                  <ArrowUp class="h-4 w-4" stroke-width="2.5" />
+                  {#if turnInProgress}
+                    <span class="absolute -bottom-0.5 -right-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-950 bg-slate-950 text-sky-300">
+                      <ListPlus class="h-2.5 w-2.5" stroke-width="2.5" />
+                    </span>
+                  {/if}
+                </button>
+              {:else if turnInProgress}
                 <button
                   type="button"
                   aria-label="Cancel turn"
@@ -3643,16 +3659,6 @@ import X from 'lucide-svelte/icons/x';
                   onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}
                 >
                   <Square class="h-3 w-3 fill-current" />
-                </button>
-              {:else if canSendNow}
-                <button
-                  type="submit"
-                  aria-label={pendingDirectQuestion ? 'Answer' : 'Send'}
-                  title={pendingDirectQuestion ? 'Answer' : 'Send'}
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
-                  disabled={directQuestionSubmitting}
-                >
-                  <ArrowUp class="h-4 w-4" stroke-width="2.5" />
                 </button>
               {/if}
             </div>
