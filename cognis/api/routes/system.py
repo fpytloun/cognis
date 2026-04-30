@@ -115,6 +115,8 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
             "serve_ui": config.serve_ui,
             "mnemory_url": config.mnemory_url,
             "intaris_url": config.intaris_url,
+            "public_mnemory_ui_url": config.public_mnemory_ui_url,
+            "public_intaris_ui_url": config.public_intaris_ui_url,
             "log_level": config.log_level,
             "log_format": config.log_format,
             "cors_origins": config.cors_origins,

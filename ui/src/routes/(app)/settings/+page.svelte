@@ -1511,7 +1511,7 @@ import { onMount, tick } from 'svelte';
   async function openTargetUi(target: 'intaris' | 'mnemory'): Promise<void> {
     try {
       const exchange = await api.auth.exchangeToken(target);
-      openUrlInNewTab(buildLinkedServiceUrl(target, { token: exchange.token }));
+      openUrlInNewTab(buildLinkedServiceUrl(target, { token: exchange.token }, exchange.ui_url));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to open linked UI');

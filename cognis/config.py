@@ -28,6 +28,8 @@ class CognisConfig:
     # Service URLs
     mnemory_url: str
     intaris_url: str
+    public_mnemory_ui_url: str
+    public_intaris_ui_url: str
     public_base_url: str
 
     # Database
@@ -119,12 +121,19 @@ def load_config() -> CognisConfig:
     lsp_enabled_raw = os.environ.get("COGNIS_LSP_ENABLED", "true").strip().lower()
     lsp_auto_install_raw = os.environ.get("COGNIS_LSP_AUTO_INSTALL", "true").strip().lower()
 
+    mnemory_url = os.environ.get("COGNIS_MNEMORY_URL", "http://localhost:8050").rstrip("/")
+    intaris_url = os.environ.get("COGNIS_INTARIS_URL", "http://localhost:8060").rstrip("/")
+    public_mnemory_ui_url = os.environ.get("PUBLIC_MNEMORY_UI_URL", mnemory_url).rstrip("/")
+    public_intaris_ui_url = os.environ.get("PUBLIC_INTARIS_UI_URL", intaris_url).rstrip("/")
+
     return CognisConfig(
         data_dir=data_dir,
         host=os.environ.get("COGNIS_HOST", "0.0.0.0"),
         port=int(os.environ.get("COGNIS_PORT", "8080")),
-        mnemory_url=os.environ.get("COGNIS_MNEMORY_URL", "http://localhost:8050"),
-        intaris_url=os.environ.get("COGNIS_INTARIS_URL", "http://localhost:8060"),
+        mnemory_url=mnemory_url,
+        intaris_url=intaris_url,
+        public_mnemory_ui_url=public_mnemory_ui_url,
+        public_intaris_ui_url=public_intaris_ui_url,
         public_base_url=os.environ.get("COGNIS_PUBLIC_BASE_URL", "").rstrip("/"),
         database_url=os.environ.get("DATABASE_URL", default_db_url),
         jwt_private_key_path=_expand_path(

@@ -379,4 +379,6 @@ async def exchange_token(
 ) -> ExchangeTokenResponse:
     user = request.state.user
     token = request.app.state.auth_provider.sign_exchange_token(user.email, target)
-    return ExchangeTokenResponse(token=token, target=target, expires_in=60)
+    config = request.app.state.config
+    ui_url = config.public_intaris_ui_url if target == "intaris" else config.public_mnemory_ui_url
+    return ExchangeTokenResponse(token=token, target=target, expires_in=60, ui_url=ui_url)

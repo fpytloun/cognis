@@ -1,4 +1,4 @@
-const publicEnv = import.meta.env as Record<string, string | undefined>;
+import { env as publicEnv } from '$env/dynamic/public';
 
 export type LinkedServiceTarget = 'intaris' | 'mnemory';
 
@@ -68,9 +68,9 @@ export function getLinkedServiceUiUrl(target: LinkedServiceTarget): string {
   return target === 'intaris' ? getIntarisUiUrl() : getMnemoryUiUrl();
 }
 
-export function buildLinkedServiceUrl(target: LinkedServiceTarget, params: Record<string, string>): string {
-  const baseUrl = getLinkedServiceUiUrl(target);
-  const url = new URL(baseUrl, browserOrigin() ?? 'http://localhost:5173');
+export function buildLinkedServiceUrl(target: LinkedServiceTarget, params: Record<string, string>, baseUrl?: string | null): string {
+  const resolvedBaseUrl = baseUrl && baseUrl.trim() ? baseUrl : getLinkedServiceUiUrl(target);
+  const url = new URL(resolvedBaseUrl, browserOrigin() ?? 'http://localhost:5173');
   for (const [key, value] of Object.entries(params)) {
     if (value) {
       url.searchParams.set(key, value);

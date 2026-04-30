@@ -49,6 +49,7 @@ export interface ExchangeTokenResponse {
   token: string;
   target: string;
   expires_in: number;
+  ui_url: string;
 }
 
 export interface BootstrapStatusResponse {

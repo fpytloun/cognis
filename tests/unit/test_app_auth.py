@@ -9,9 +9,13 @@ from cognis.api.app import create_app
 from cognis.store.queries import create_user
 
 
-def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
+def _create_test_client(
+    monkeypatch: object, tmp_path: Path, env: dict[str, str] | None = None
+) -> TestClient:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)  # type: ignore[attr-defined]
     app = create_app()
     return TestClient(app)
 
@@ -110,6 +114,55 @@ def test_exchange_token_accepts_known_targets(monkeypatch: object, tmp_path: Pat
             assert payload["target"] == target
             assert payload["expires_in"] == 60
             assert payload["token"]
+            assert payload["ui_url"] == (
+                "http://localhost:8060" if target == "intaris" else "http://localhost:8050"
+            )
+
+
+def test_exchange_token_uses_public_ui_url_override(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        env={
+            "PUBLIC_INTARIS_UI_URL": "https://intaris.example.com/",
+            "PUBLIC_MNEMORY_UI_URL": "https://mnemory.example.com/",
+        },
+    ) as client:
+        _seed_user(client)
+        _login(client)
+
+        intaris = client.post("/api/v1/auth/exchange-token?target=intaris")
+        mnemory = client.post("/api/v1/auth/exchange-token?target=mnemory")
+
+        assert intaris.status_code == 200
+        assert mnemory.status_code == 200
+        assert intaris.json()["ui_url"] == "https://intaris.example.com"
+        assert mnemory.json()["ui_url"] == "https://mnemory.example.com"
+
+
+def test_exchange_token_falls_back_to_internal_service_url(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(
+        monkeypatch,
+        tmp_path,
+        env={
+            "COGNIS_INTARIS_URL": "http://intaris.internal:8060/",
+            "COGNIS_MNEMORY_URL": "http://mnemory.internal:8050/",
+        },
+    ) as client:
+        _seed_user(client)
+        _login(client)
+
+        intaris = client.post("/api/v1/auth/exchange-token?target=intaris")
+        mnemory = client.post("/api/v1/auth/exchange-token?target=mnemory")
+
+        assert intaris.status_code == 200
+        assert mnemory.status_code == 200
+        assert intaris.json()["ui_url"] == "http://intaris.internal:8060"
+        assert mnemory.json()["ui_url"] == "http://mnemory.internal:8050"
 
 
 def test_exchange_token_rejects_unknown_target(monkeypatch: object, tmp_path: Path) -> None:

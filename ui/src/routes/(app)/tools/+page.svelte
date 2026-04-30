@@ -147,7 +147,7 @@ import Server from 'lucide-svelte/icons/server';
 
       if (diagResult.status === 'fulfilled') {
         const config = (diagResult.value as SystemDiagnostics).config as Record<string, unknown>;
-        const url = config?.intaris_url;
+        const url = config?.public_intaris_ui_url ?? config?.intaris_url;
         intarisUrl = typeof url === 'string' && url ? url : null;
       }
 

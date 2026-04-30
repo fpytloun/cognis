@@ -1772,7 +1772,7 @@ import X from 'lucide-svelte/icons/x';
           token: exchange.token,
           tab: 'sessions',
           session_id: sessionId
-        })
+        }, exchange.ui_url)
       );
     } catch (caughtError) {
       addToast(asApiError(caughtError).message, 'error', 4_000, 'Unable to open Intaris');

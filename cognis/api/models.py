@@ -71,6 +71,7 @@ class ExchangeTokenResponse(BaseModel):
     token: str
     target: str
     expires_in: int
+    ui_url: str
 
 
 class BootstrapStatusResponse(BaseModel):
