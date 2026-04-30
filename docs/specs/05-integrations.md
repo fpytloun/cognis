@@ -1058,22 +1058,26 @@ llm_providers:
       - model_id: "qwen3"
         tier: mini
 
-  # ChatGPT subscription via OAuth
+  # ChatGPT subscription via LiteLLM OAuth device flow
   - provider_id: "chatgpt"
     display_name: "ChatGPT Subscription"
     location: controller
     backend: litellm
-    litellm_provider: openai
-    oauth:
-      flow: authorization_code
-      auth_url: "https://auth.openai.com/authorize"
-      token_url: "https://auth.openai.com/token"
-      client_id_secret: "CHATGPT_CLIENT_ID"
-      client_secret_secret: "CHATGPT_CLIENT_SECRET"
-      token_secret: "chatgpt_oauth_token"
+    config:
+      preset: chatgpt                  # LiteLLM provider route: chatgpt/
+      auth_config:
+        mode: oauth
+        provider: chatgpt
+      default_model: "gpt-5.3-codex"
     models:
-      - model_id: "chatgpt-4o"
+      - model_id: "gpt-5.3-codex"
         tier: standard
+
+  # ChatGPT OAuth token storage:
+  # - durable token JSON is stored encrypted in Cognis' secrets table
+  # - LiteLLM's auth.json file is hydrated only into a temporary per-call dir
+  # - PostgreSQL deployments use a transaction-scoped advisory lock around
+  #   token hydration/refresh/write-back for multi-replica safety
 
   # Claude Code is a first-class agent runtime, not only an LLM provider.
   # Native Claude subscription auth and config live on the selected executor.

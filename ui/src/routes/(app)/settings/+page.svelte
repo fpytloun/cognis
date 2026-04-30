@@ -43,6 +43,7 @@ import { onMount, tick } from 'svelte';
     ExecutorTokenResponse,
     HealthResponse,
     LLMProvider,
+    LLMProviderOAuthStatus,
     ModelRouting,
     ProviderTestResult,
     SecretMetadata,
@@ -261,6 +262,7 @@ import { onMount, tick } from 'svelte';
   let settingValueText = $state('');
   let providerForm = $state<ProviderFormState>(createProviderForm());
   let providerTestResult = $state<ProviderTestResult | null>(null);
+  let providerOAuthStatus = $state<LLMProviderOAuthStatus | null>(null);
   let showModelDiscovery = $state(false);
   let editingModel = $state<ModelEntry | null>(null);
   let addModelId = $state('');
@@ -550,6 +552,7 @@ import { onMount, tick } from 'svelte';
     selectedProviderId = provider.provider_id;
     providerForm = createProviderForm(provider);
     providerTestResult = provider.last_test;
+    providerOAuthStatus = null;
   }
 
   async function selectProvider(provider: LLMProvider): Promise<void> {
@@ -568,6 +571,18 @@ import { onMount, tick } from 'svelte';
     selectedProviderId = '';
     providerForm = createProviderForm();
     providerTestResult = null;
+    providerOAuthStatus = null;
+  }
+
+  function handleProviderPresetChange(): void {
+    if (providerForm.preset === 'chatgpt') {
+      providerForm.auth_mode = 'oauth';
+      providerForm.use_responses_api = true;
+      providerForm.base_url = '';
+      providerForm.location = 'controller';
+    } else if (providerForm.auth_mode === 'oauth') {
+      providerForm.auth_mode = providerForm.preset === 'ollama' ? 'none' : 'env';
+    }
   }
 
   async function resetProviderForm(): Promise<void> {
@@ -780,7 +795,7 @@ import { onMount, tick } from 'svelte';
     }
   }
 
-  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy'];
+  const presetOptions: ProviderPreset[] = ['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'chatgpt'];
 
   function toStepProfileForm(profile: StepProfileDefinition): StepProfileFormState {
     const matrix = Object.entries(profile.config.matrix || {})
@@ -1179,6 +1194,54 @@ import { onMount, tick } from 'svelte';
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to test provider');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function startChatgptOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      providerOAuthStatus = await api.llmProviders.startChatgptOAuth(selectedProviderId);
+      addToast('ChatGPT OAuth started. Enter the device code in your browser.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to start OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function checkChatgptOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      providerOAuthStatus = await api.llmProviders.chatgptOAuthStatus(selectedProviderId);
+      if (providerOAuthStatus.status === 'authorized') {
+        addToast('ChatGPT OAuth is authorized.', 'success');
+      }
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to check OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function clearChatgptOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      await api.llmProviders.clearChatgptOAuth(selectedProviderId);
+      providerOAuthStatus = null;
+      addToast('ChatGPT OAuth tokens removed.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to remove OAuth tokens');
     } finally {
       busy = false;
     }
@@ -1878,7 +1941,7 @@ import { onMount, tick } from 'svelte';
             {/if}
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Provider type</span>
-              <select bind:value={providerForm.preset} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <select bind:value={providerForm.preset} onchange={handleProviderPresetChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 {#each presetOptions as preset}
                   <option value={preset}>{PRESET_LABELS[preset]}</option>
                 {/each}
@@ -1888,8 +1951,13 @@ import { onMount, tick } from 'svelte';
               <span>Execution location</span>
               <select bind:value={providerForm.location} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="controller">Controller</option>
-                <option value="executor">Via executor</option>
+                {#if providerForm.preset !== 'chatgpt'}
+                  <option value="executor">Via executor</option>
+                {/if}
               </select>
+              {#if providerForm.preset === 'chatgpt'}
+                <span class="block text-xs text-slate-400">ChatGPT OAuth tokens are hydrated on the controller, so executor routing is disabled for this preset.</span>
+              {/if}
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Status</span>
@@ -1931,10 +1999,36 @@ import { onMount, tick } from 'svelte';
                   <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                     <option value="env">Environment variable</option>
                     <option value="secret">Credential store</option>
+                    {#if providerForm.preset === 'chatgpt'}
+                      <option value="oauth">OAuth device flow</option>
+                    {/if}
                   </select>
                 </label>
 
-                {#if providerForm.auth_mode === 'env'}
+                {#if providerForm.auth_mode === 'oauth'}
+                  <div class="space-y-2 text-sm text-slate-300">
+                    <p class="font-medium text-slate-200">Encrypted OAuth token storage</p>
+                    <p class="text-xs text-slate-400">Tokens are stored in the encrypted Cognis secrets table. LiteLLM token files are temporary per request.</p>
+                    {#if selectedProviderId}
+                      <div class="flex flex-wrap gap-2">
+                        <Button size="sm" variant="secondary" onclick={startChatgptOAuth} disabled={busy}>Start OAuth</Button>
+                        <Button size="sm" variant="secondary" onclick={checkChatgptOAuth} disabled={busy}>Check status</Button>
+                        <Button size="sm" variant="ghost" onclick={clearChatgptOAuth} disabled={busy}>Clear tokens</Button>
+                      </div>
+                      {#if providerOAuthStatus}
+                        <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
+                          <p>Status: <span class="font-mono text-slate-100">{providerOAuthStatus.status}</span></p>
+                          {#if providerOAuthStatus.verification_url && providerOAuthStatus.user_code}
+                            <p class="mt-2">Visit <a class="text-sky-300 underline" href={providerOAuthStatus.verification_url} target="_blank" rel="noreferrer">{providerOAuthStatus.verification_url}</a></p>
+                            <p class="mt-1">Code: <span class="font-mono text-sky-100">{providerOAuthStatus.user_code}</span></p>
+                          {/if}
+                        </div>
+                      {/if}
+                    {:else}
+                      <p class="text-xs text-sky-300">Create the provider first, then start the OAuth device flow.</p>
+                    {/if}
+                  </div>
+                {:else if providerForm.auth_mode === 'env'}
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Env variable name</span>
                     <Input bind:value={providerForm.auth_env_var} placeholder="OPENAI_API_KEY" />

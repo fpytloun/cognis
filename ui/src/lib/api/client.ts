@@ -30,6 +30,7 @@ import type {
   IntarisMCPServer,
   IntarisSessionDetail,
   LLMProvider,
+  LLMProviderOAuthStatus,
   ModelEntry,
   MCPServerConfigResponse,
   MCPServerCreateRequest,
@@ -1222,6 +1223,22 @@ export const api = {
       return request<{ models: ModelEntry[] }>('/api/v1/llm-providers/enrich-models-preview', {
         method: 'POST',
         body: JSON.stringify(payload)
+      });
+    },
+
+    startChatgptOAuth(providerId: string): Promise<LLMProviderOAuthStatus> {
+      return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt/start`, {
+        method: 'POST'
+      });
+    },
+
+    chatgptOAuthStatus(providerId: string): Promise<LLMProviderOAuthStatus> {
+      return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt/status`);
+    },
+
+    clearChatgptOAuth(providerId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt`, {
+        method: 'DELETE'
       });
     }
   },

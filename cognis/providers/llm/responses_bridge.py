@@ -57,7 +57,7 @@ def should_use_openai_responses(
 
 def normalize_openai_model_name(model_name: str) -> str:
     lowered = model_name.lower()
-    for prefix in ("litellm_proxy/", "openai/", "azure/", "openai_compatible/"):
+    for prefix in ("litellm_proxy/", "openai/", "azure/", "openai_compatible/", "chatgpt/"):
         if lowered.startswith(prefix):
             return lowered[len(prefix) :]
     return lowered

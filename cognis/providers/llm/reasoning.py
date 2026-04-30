@@ -8,7 +8,7 @@ from typing import Any
 
 from cognis.models.config import ModelInfo, normalize_reasoning_level
 
-_OPENAI_PRESETS = {"openai", "openai_compatible", "litellm_proxy", "azure"}
+_OPENAI_PRESETS = {"openai", "openai_compatible", "litellm_proxy", "azure", "chatgpt"}
 _GOOGLE_PRESETS = {"gemini", "google", "vertex_ai"}
 _ANTHROPIC_BUDGET_BUFFER = 1024
 _MIN_ANTHROPIC_MAX_TOKENS = 2048
@@ -366,7 +366,7 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
 
 def _normalize_model_name(model_name: str) -> str:
     lowered = model_name.strip().lower()
-    for prefix in ("litellm_proxy/", "openai/", "azure/", "openai_compatible/"):
+    for prefix in ("litellm_proxy/", "openai/", "azure/", "openai_compatible/", "chatgpt/"):
         if lowered.startswith(prefix):
             return lowered[len(prefix) :]
     return lowered

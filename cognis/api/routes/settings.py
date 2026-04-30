@@ -15,6 +15,7 @@ from cognis.api.models import (
     CursorPage,
     EnrichModelsPreviewRequest,
     EnrichModelsRequest,
+    LLMProviderOAuthStatusResponse,
     LLMProviderRequest,
     LLMProviderResponse,
     LLMProviderTestResponse,
@@ -168,6 +169,18 @@ def _apply_last_test_metadata(
     if last_test is None:
         return response
     return response.model_copy(update={"last_test": last_test})
+
+
+def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] | None) -> None:
+    if not isinstance(config, dict):
+        return
+    preset = str(config.get("preset") or "").strip().lower()
+    if preset == "chatgpt" and location == "executor":
+        raise api_exception(
+            400,
+            "validation_error",
+            "ChatGPT OAuth providers must use controller execution location",
+        )
 
 
 @router.get("/api/v1/settings", response_model=list[SettingsCategoryResponse])
@@ -522,6 +535,7 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
     require_admin(request)
     from cognis.api.common import slugify
 
+    _validate_llm_provider_payload(payload.location, payload.config)
     provider_id = payload.provider_id or slugify(payload.display_name)
     async with request.app.state.session_factory() as session:
         existing = await get_llm_provider(session, provider_id)
@@ -559,6 +573,13 @@ async def llm_provider_update(
 ) -> LLMProviderResponse:
     require_admin(request)
     async with request.app.state.session_factory() as session:
+        existing = await get_llm_provider(session, provider_id)
+        if existing is None:
+            raise api_exception(404, "not_found", "LLM provider not found")
+        _validate_llm_provider_payload(
+            payload.location if payload.location is not None else existing.location,
+            payload.config if payload.config is not None else dict(existing.config or {}),
+        )
         ok = await update_llm_provider(
             session,
             provider_id,
@@ -644,6 +665,54 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
     response = LLMProviderTestResponse(provider_id=provider_id, **result)
     request.app.state.provider_test_results[provider_id] = response.model_dump(mode="json")
     return response
+
+
+@router.post(
+    "/api/v1/llm-providers/{provider_id}/oauth/chatgpt/start",
+    response_model=LLMProviderOAuthStatusResponse,
+)
+async def llm_provider_chatgpt_oauth_start(
+    request: Request, provider_id: str
+) -> LLMProviderOAuthStatusResponse:
+    require_admin(request)
+    try:
+        status = await request.app.state.providers.llm.start_chatgpt_oauth(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(502, "provider_error", f"Failed to start OAuth: {exc!s}"[:300]) from exc
+    return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
+
+
+@router.get(
+    "/api/v1/llm-providers/{provider_id}/oauth/chatgpt/status",
+    response_model=LLMProviderOAuthStatusResponse,
+)
+async def llm_provider_chatgpt_oauth_status(
+    request: Request, provider_id: str
+) -> LLMProviderOAuthStatusResponse:
+    require_admin(request)
+    try:
+        status = await request.app.state.providers.llm.get_chatgpt_oauth_status(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(502, "provider_error", f"Failed to check OAuth: {exc!s}"[:300]) from exc
+    status.pop("provider_id", None)
+    return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
+
+
+@router.delete(
+    "/api/v1/llm-providers/{provider_id}/oauth/chatgpt",
+    response_model=dict,
+)
+async def llm_provider_chatgpt_oauth_clear(request: Request, provider_id: str) -> dict[str, bool]:
+    require_admin(request)
+    try:
+        ok = await request.app.state.providers.llm.clear_chatgpt_oauth(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    return {"ok": ok}
 
 
 @router.post("/api/v1/llm-providers/discover-models-preview")

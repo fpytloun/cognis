@@ -1181,6 +1181,15 @@ export interface LLMProvider {
   last_test: ProviderTestResult | null;
 }
 
+export interface LLMProviderOAuthStatus {
+  provider_id: string;
+  status: string;
+  verification_url: string | null;
+  user_code: string | null;
+  interval: number | null;
+  expires_at: number | null;
+}
+
 export interface ModelRoutingEntry {
   model: string | null;
   reasoning_effort: string | null;

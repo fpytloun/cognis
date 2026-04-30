@@ -569,6 +569,15 @@ class LLMProviderResponse(BaseModel):
     last_test: ProviderTestResultResponse | None = None
 
 
+class LLMProviderOAuthStatusResponse(BaseModel):
+    provider_id: str
+    status: str
+    verification_url: str | None = None
+    user_code: str | None = None
+    interval: int | None = None
+    expires_at: float | None = None
+
+
 class ModelRoutingEntry(BaseModel):
     model: str | None = None
     reasoning_effort: str | None = None

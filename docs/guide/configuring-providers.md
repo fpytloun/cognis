@@ -17,6 +17,7 @@ The UI includes guided forms for:
 - **Anthropic** for direct Anthropic API access
 - **Ollama** for local Ollama deployments
 - **LiteLLM Proxy** for a LiteLLM proxy that performs routing upstream
+- **ChatGPT Subscription (Codex)** for ChatGPT Pro/Max subscription access through LiteLLM's `chatgpt/` provider route
 
 For provider-specific settings not covered by the structured fields (e.g., Azure `api_version`), use the collapsible **Advanced settings** section to add key-value pairs.
 
@@ -41,6 +42,12 @@ Use this for local models exposed through Ollama. Make sure the selected model i
 ### LiteLLM Proxy
 
 Use this when a LiteLLM proxy is already aggregating your models. Cognis treats the proxy as the provider and lets the proxy perform the final upstream routing.
+
+### ChatGPT Subscription (Codex)
+
+Use this when Cognis should call LiteLLM's native ChatGPT subscription provider. This preset uses OAuth device-code authentication instead of an API key. Create the provider first, then start OAuth from the provider editor. The UI shows the verification URL and user code; after you approve in the browser, Cognis stores the resulting token cache in the encrypted secrets table.
+
+The controller remains stateless: LiteLLM's `CHATGPT_TOKEN_DIR` file is only hydrated into a temporary directory for each model call, and refreshed tokens are written back to encrypted database storage. On PostgreSQL, Cognis serializes OAuth token hydration and refresh with a transaction-scoped advisory lock so multiple controller replicas do not refresh the same token concurrently.
 
 ## Provider location and executor routing
 
@@ -186,3 +193,4 @@ backend. Knobs live under `web.concurrency.*` and `web.rate_limit.*` in
 - Confirm the default model name is valid for the selected provider.
 - If using Ollama or a local compatible API, verify the base URL from the Cognis host or executor.
 - If a provider is routed through an executor, confirm the executor is connected and healthy.
+- For ChatGPT subscription providers, complete OAuth before testing the provider and keep the Cognis secrets encryption key stable across controller replicas.

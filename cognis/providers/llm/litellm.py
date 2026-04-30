@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
 import os
 import re
+import tempfile
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from time import monotonic
 from typing import Any, cast
+from urllib.parse import urlencode
 
 import httpx
 import litellm
@@ -33,6 +38,7 @@ from cognis.models.config import (
     TokenUsage,
     normalize_reasoning_level,
 )
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
@@ -57,6 +63,9 @@ MODEL_CACHE_TTL_SECONDS = 60.0
 PROXY_MODEL_INFO_CACHE_TTL = 300.0  # 5 minutes for successful proxy /model/info fetches
 PROXY_MODEL_INFO_NEGATIVE_TTL = 30.0  # 30 seconds negative cache for failures
 SAFE_PROVIDER_KWARGS = {"api_base", "api_version", "base_url", "timeout"}
+OAUTH_PROVIDER_PRESETS = {"chatgpt"}
+CHATGPT_OAUTH_AUTH_FILE = "auth.json"
+CHATGPT_OAUTH_SECRET_PREFIX = "llm_oauth_chatgpt"
 _CACHE_MISS = object()
 # Preset-to-litellm model prefix mapping.  LiteLLM uses the prefix to
 # determine which provider API to use.  Standard presets (openai, anthropic)
@@ -64,6 +73,7 @@ _CACHE_MISS = object()
 PRESET_TO_MODEL_PREFIX: dict[str, str] = {
     "litellm_proxy": "litellm_proxy",
     "openai_compatible": "openai",
+    "chatgpt": "chatgpt",
 }
 
 # Preset-to-image-generation strategy mapping.
@@ -396,6 +406,55 @@ def _model_dump(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _provider_preset(provider: LLMProviderRow | None) -> str:
+    if provider is None:
+        return ""
+    return str(dict(provider.config or {}).get("preset", "") or "").strip().lower()
+
+
+def _oauth_token_secret_name(provider: LLMProviderRow) -> str:
+    config = dict(provider.config or {})
+    auth_config = config.get("auth_config")
+    if isinstance(auth_config, dict):
+        for key in ("token_secret_name", "secret_name"):
+            value = auth_config.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return f"{CHATGPT_OAUTH_SECRET_PREFIX}_{provider.provider_id}"
+
+
+def _oauth_pending_secret_name(provider: LLMProviderRow) -> str:
+    return f"{_oauth_token_secret_name(provider)}_pending"
+
+
+def _oauth_secret_description(provider: LLMProviderRow) -> str:
+    return f"OAuth token cache for LLM provider {provider.provider_id}"
+
+
+def _looks_like_chatgpt_oauth_provider(provider: LLMProviderRow | None) -> bool:
+    return _provider_preset(provider) in OAUTH_PROVIDER_PRESETS
+
+
+class _ScopedEnv:
+    """Temporarily set process env vars around a synchronous LiteLLM call."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        self._values = values
+        self._previous: dict[str, str | None] = {}
+
+    def __enter__(self) -> None:
+        for key, value in self._values.items():
+            self._previous[key] = os.environ.get(key)
+            os.environ[key] = value
+
+    def __exit__(self, *_exc: object) -> None:
+        for key, previous in self._previous.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
 def _responses_prompt_cache_key(
     *, provider: LLMProviderRow | None, resolved_model: str, instructions: str
 ) -> str:
@@ -420,6 +479,8 @@ def _apply_responses_request_defaults(
 
     result = dict(responses_kwargs)
     config = dict(provider.config) if provider is not None and isinstance(provider.config, dict) else {}
+    if _looks_like_chatgpt_oauth_provider(provider):
+        return result
 
     if "store" not in result:
         configured_store = config.get("responses_store")
@@ -575,6 +636,9 @@ class LiteLLMProvider:
         self._secrets = secrets_provider
         self._inference_router = inference_router
         self._cache_lock = asyncio.Lock()
+        self._oauth_env_lock = asyncio.Lock()
+        self._oauth_locks_lock = asyncio.Lock()
+        self._oauth_locks: dict[str, asyncio.Lock] = {}
         self._resolved_model_cache: dict[str, tuple[tuple[str, str | None], float]] = {}
         self._model_info_cache: dict[str, tuple[ModelInfo, float]] = {}
         self._model_provider_cache: dict[str, tuple[str | None, float]] = {}
@@ -649,6 +713,318 @@ class LiteLLMProvider:
             explicit_provider_id=explicit_provider_id,
         )
         return resolved_model, (provider.provider_id if provider is not None else None)
+
+    async def _oauth_lock_for_provider(self, provider_id: str) -> asyncio.Lock:
+        async with self._oauth_locks_lock:
+            lock = self._oauth_locks.get(provider_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._oauth_locks[provider_id] = lock
+            return lock
+
+    @asynccontextmanager
+    async def _provider_oauth_token_context(
+        self, provider: LLMProviderRow | None
+    ) -> AsyncIterator[None]:
+        """Hydrate LiteLLM file-backed OAuth state from encrypted DB storage.
+
+        LiteLLM's ChatGPT provider stores OAuth tokens in ``CHATGPT_TOKEN_DIR``.
+        Cognis keeps the durable source of truth in encrypted DB secrets so the
+        controller can remain stateless; token files are temporary shims only.
+        """
+
+        if provider is None or not _looks_like_chatgpt_oauth_provider(provider):
+            yield
+            return
+        self._ensure_controller_side_oauth_provider(provider)
+        if self._secrets is None:
+            raise RuntimeError("ChatGPT OAuth requires the encrypted secrets provider")
+
+        provider_id = provider.provider_id
+        token_secret_name = _oauth_token_secret_name(provider)
+        lock = await self._oauth_lock_for_provider(provider_id)
+        async with (
+            self._oauth_env_lock,
+            lock,
+            self._postgres_advisory_lock(f"llm-oauth:{provider_id}"),
+        ):
+            with tempfile.TemporaryDirectory(prefix=f"cognis-{provider_id}-oauth-") as tmpdir:
+                auth_path = Path(tmpdir) / CHATGPT_OAUTH_AUTH_FILE
+                with contextlib.suppress(KeyError):
+                    existing = await self._secrets.get_secret(
+                        token_secret_name, SYSTEM_USER_EMAIL, None
+                    )
+                    if existing.strip():
+                        self._validate_chatgpt_authorized_record(existing)
+                        await asyncio.to_thread(
+                            auth_path.write_text, existing, encoding="utf-8"
+                        )
+                with _ScopedEnv(
+                    {
+                        "CHATGPT_TOKEN_DIR": tmpdir,
+                        "CHATGPT_AUTH_FILE": CHATGPT_OAUTH_AUTH_FILE,
+                    }
+                ):
+                    try:
+                        yield
+                    finally:
+                        if await asyncio.to_thread(auth_path.exists):
+                            value = await asyncio.to_thread(auth_path.read_text, encoding="utf-8")
+                            if value.strip():
+                                self._validate_chatgpt_authorized_record(value)
+                                await self._secrets.set_secret(
+                                    token_secret_name,
+                                    value,
+                                    SYSTEM_USER_EMAIL,
+                                    scope="system",
+                                    description=_oauth_secret_description(provider),
+                                )
+
+    @asynccontextmanager
+    async def _postgres_advisory_lock(self, key: str) -> AsyncIterator[None]:
+        """Hold a PostgreSQL transaction-scoped advisory lock when available."""
+
+        async with self.session_factory() as session:
+            bind = session.get_bind()
+            dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+            if dialect_name != "postgresql":
+                yield
+                return
+            from sqlalchemy import text
+
+            await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+            try:
+                yield
+            finally:
+                await session.commit()
+
+    async def start_chatgpt_oauth(self, provider_id: str) -> dict[str, Any]:
+        """Start ChatGPT device-code OAuth and persist pending state encrypted."""
+
+        provider = await self._get_chatgpt_oauth_provider(provider_id)
+        lock = await self._oauth_lock_for_provider(provider_id)
+        async with lock, self._postgres_advisory_lock(f"llm-oauth:{provider_id}"):
+            device_code = await self._request_chatgpt_device_code()
+            now = datetime.now(UTC).timestamp()
+            interval = _positive_int(device_code.get("interval"), 5)
+            pending = {
+                "status": "pending",
+                "device_auth_id": device_code["device_auth_id"],
+                "user_code": device_code["user_code"],
+                "verification_url": self._chatgpt_device_verify_url(),
+                "interval": interval,
+                "expires_at": now + 15 * 60,
+                "created_at": now,
+            }
+            await self._secrets.set_secret(
+                _oauth_pending_secret_name(provider),
+                json.dumps(pending, ensure_ascii=True, sort_keys=True),
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                description=f"Pending {_oauth_secret_description(provider)}",
+            )
+            return self._chatgpt_oauth_public_status(pending)
+
+    async def get_chatgpt_oauth_status(self, provider_id: str) -> dict[str, Any]:
+        """Return OAuth status and complete pending device-code authorization if ready."""
+
+        provider = await self._get_chatgpt_oauth_provider(provider_id)
+        lock = await self._oauth_lock_for_provider(provider_id)
+        async with lock, self._postgres_advisory_lock(f"llm-oauth:{provider_id}"):
+            token_secret_name = _oauth_token_secret_name(provider)
+            pending_secret_name = _oauth_pending_secret_name(provider)
+            try:
+                raw = await self._secrets.get_secret(pending_secret_name, SYSTEM_USER_EMAIL, None)
+            except KeyError:
+                with contextlib.suppress(KeyError):
+                    token_raw = await self._secrets.get_secret(
+                        token_secret_name, SYSTEM_USER_EMAIL, None
+                    )
+                    self._validate_chatgpt_authorized_record(token_raw)
+                    return {"status": "authorized", "provider_id": provider_id}
+                return {"status": "not_started", "provider_id": provider_id}
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return {"status": "invalid", "provider_id": provider_id}
+            if not isinstance(payload, dict):
+                return {"status": "invalid", "provider_id": provider_id}
+            if payload.get("status") != "pending":
+                return self._chatgpt_oauth_public_status(payload)
+            if float(payload.get("expires_at") or 0) <= datetime.now(UTC).timestamp():
+                expired = {**payload, "status": "expired"}
+                await self._secrets.set_secret(
+                    pending_secret_name,
+                    json.dumps(expired, ensure_ascii=True, sort_keys=True),
+                    SYSTEM_USER_EMAIL,
+                    scope="system",
+                    description=_oauth_secret_description(provider),
+                )
+                return self._chatgpt_oauth_public_status(expired)
+            auth_code = await self._poll_chatgpt_device_code_once(payload)
+            if auth_code is None:
+                return self._chatgpt_oauth_public_status(payload)
+            tokens = await self._exchange_chatgpt_auth_code(auth_code)
+            auth_record = await asyncio.to_thread(self._build_chatgpt_auth_record, tokens)
+            await self._secrets.set_secret(
+                token_secret_name,
+                json.dumps(auth_record, ensure_ascii=True, sort_keys=True),
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                description=_oauth_secret_description(provider),
+            )
+            await self._secrets.delete_secret(
+                pending_secret_name,
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                agent_id=None,
+            )
+            return {"status": "authorized", "provider_id": provider_id}
+
+    async def clear_chatgpt_oauth(self, provider_id: str) -> bool:
+        provider = await self._get_chatgpt_oauth_provider(provider_id)
+        lock = await self._oauth_lock_for_provider(provider_id)
+        async with lock, self._postgres_advisory_lock(f"llm-oauth:{provider_id}"):
+            token_deleted = await self._secrets.delete_secret(
+                _oauth_token_secret_name(provider),
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                agent_id=None,
+            )
+            pending_deleted = await self._secrets.delete_secret(
+                _oauth_pending_secret_name(provider),
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                agent_id=None,
+            )
+            return token_deleted or pending_deleted
+
+    async def _get_chatgpt_oauth_provider(self, provider_id: str) -> LLMProviderRow:
+        if self._secrets is None:
+            raise RuntimeError("ChatGPT OAuth requires the encrypted secrets provider")
+        async with self.session_factory() as session:
+            provider = await session.get(LLMProviderRow, provider_id)
+        if provider is None:
+            raise ValueError("LLM provider not found")
+        if not _looks_like_chatgpt_oauth_provider(provider):
+            raise ValueError("LLM provider is not configured for ChatGPT OAuth")
+        self._ensure_controller_side_oauth_provider(provider)
+        return provider
+
+    @staticmethod
+    def _ensure_controller_side_oauth_provider(provider: LLMProviderRow) -> None:
+        if provider.location == "executor":
+            raise RuntimeError(
+                "ChatGPT OAuth providers must run on the controller; executor-side token "
+                "hydration is not implemented"
+            )
+
+    @staticmethod
+    def _validate_chatgpt_authorized_record(raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ChatGPT OAuth token cache is invalid; restart OAuth") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("ChatGPT OAuth token cache is invalid; restart OAuth")
+        if not payload.get("access_token") or not payload.get("refresh_token"):
+            raise RuntimeError("ChatGPT OAuth is not authorized; complete the device flow first")
+
+    @staticmethod
+    def _chatgpt_oauth_public_status(payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "status": str(payload.get("status") or "unknown"),
+            "verification_url": payload.get("verification_url"),
+            "user_code": payload.get("user_code"),
+            "interval": payload.get("interval"),
+            "expires_at": payload.get("expires_at"),
+        }
+
+    @staticmethod
+    def _chatgpt_device_verify_url() -> str:
+        from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_VERIFY_URL
+
+        return CHATGPT_DEVICE_VERIFY_URL
+
+    @staticmethod
+    async def _request_chatgpt_device_code() -> dict[str, Any]:
+        from litellm.llms.chatgpt.common_utils import CHATGPT_CLIENT_ID, CHATGPT_DEVICE_CODE_URL
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                CHATGPT_DEVICE_CODE_URL,
+                json={"client_id": CHATGPT_CLIENT_ID},
+            )
+            response.raise_for_status()
+        data = response.json()
+        device_auth_id = data.get("device_auth_id")
+        user_code = data.get("user_code") or data.get("usercode")
+        if not isinstance(device_auth_id, str) or not isinstance(user_code, str):
+            raise RuntimeError("ChatGPT device-code response missing required fields")
+        return {
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+            "interval": data.get("interval") or 5,
+        }
+
+    @staticmethod
+    async def _poll_chatgpt_device_code_once(payload: dict[str, Any]) -> dict[str, str] | None:
+        from litellm.llms.chatgpt.common_utils import CHATGPT_DEVICE_TOKEN_URL
+
+        device_auth_id = payload.get("device_auth_id")
+        user_code = payload.get("user_code")
+        if not isinstance(device_auth_id, str) or not isinstance(user_code, str):
+            raise RuntimeError("ChatGPT OAuth pending state is incomplete")
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                CHATGPT_DEVICE_TOKEN_URL,
+                json={"device_auth_id": device_auth_id, "user_code": user_code},
+            )
+        if response.status_code in {403, 404}:
+            return None
+        response.raise_for_status()
+        data = response.json()
+        required = ("authorization_code", "code_challenge", "code_verifier")
+        if not all(isinstance(data.get(key), str) and data.get(key) for key in required):
+            return None
+        return {key: str(data[key]) for key in required}
+
+    @staticmethod
+    async def _exchange_chatgpt_auth_code(code_data: dict[str, str]) -> dict[str, str]:
+        from litellm.llms.chatgpt.common_utils import (
+            CHATGPT_AUTH_BASE,
+            CHATGPT_CLIENT_ID,
+            CHATGPT_OAUTH_TOKEN_URL,
+        )
+
+        redirect_uri = f"{CHATGPT_AUTH_BASE}/deviceauth/callback"
+        body = urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": code_data["authorization_code"],
+                "redirect_uri": redirect_uri,
+                "client_id": CHATGPT_CLIENT_ID,
+                "code_verifier": code_data["code_verifier"],
+            }
+        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                CHATGPT_OAUTH_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                content=body,
+            )
+            response.raise_for_status()
+        data = response.json()
+        required = ("access_token", "refresh_token", "id_token")
+        if not all(isinstance(data.get(key), str) and data.get(key) for key in required):
+            raise RuntimeError("ChatGPT OAuth token response missing required fields")
+        return {key: str(data[key]) for key in required}
+
+    @staticmethod
+    def _build_chatgpt_auth_record(tokens: dict[str, str]) -> dict[str, Any]:
+        from litellm.llms.chatgpt.authenticator import Authenticator
+
+        return Authenticator()._build_auth_record(tokens)
 
     async def _resolve_model_target(
         self,
@@ -1126,7 +1502,7 @@ class LiteLLMProvider:
         is_openai_like = (
             model_name.startswith("gpt-")
             or model_name.startswith("openai/")
-            or preset in {"openai", "litellm_proxy", "openai_compatible"}
+            or preset in {"openai", "litellm_proxy", "openai_compatible", "chatgpt"}
         )
         supports_responses_api = bool(
             is_openai_like
@@ -1175,6 +1551,8 @@ class LiteLLMProvider:
         *,
         is_json_mode_request: bool = False,
     ) -> bool:
+        if _looks_like_chatgpt_oauth_provider(provider):
+            return True
         if provider is not None and dict(provider.config).get("use_responses_api") is False:
             return False
         if (
@@ -1550,6 +1928,8 @@ class LiteLLMProvider:
             or "max_output_tokens" in request_kwargs
         ):
             return
+        if _looks_like_chatgpt_oauth_provider(provider):
+            return
         learned_max = int(model_info.max_output_tokens or 0)
         if learned_max > DEFAULT_MODEL_INFO.max_output_tokens:
             auto_max = learned_max
@@ -1669,6 +2049,8 @@ class LiteLLMProvider:
         )
         if provider is None:
             raise ValueError(f"No LLM provider found for model {resolved_model!r}")
+        if _looks_like_chatgpt_oauth_provider(provider):
+            self._ensure_controller_side_oauth_provider(provider)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         model_info = await self.get_model_info(
@@ -1921,20 +2303,21 @@ class LiteLLMProvider:
                 reason=last_reason,
             )
 
-        if wants_json_response:
-            return await _generate_json()
+        async with self._provider_oauth_token_context(provider):
+            if wants_json_response:
+                return await _generate_json()
 
-        if use_responses_api:
-            response_dict = await _generate_responses(request_kwargs)
-            if _is_empty_json_mode_response(response_dict) and not request_kwargs.get("tools"):
-                self._mark_plain_text_responses_broken(
-                    provider, resolved_model, reason="empty_responses_detected"
-                )
-                chat_kwargs = dict(request_kwargs)
-                chat_kwargs.pop("cognis_llm_api", None)
-                response_dict = await _generate_chat(chat_kwargs)
-        else:
-            response_dict = await _generate_chat(request_kwargs)
+            if use_responses_api:
+                response_dict = await _generate_responses(request_kwargs)
+                if _is_empty_json_mode_response(response_dict) and not request_kwargs.get("tools"):
+                    self._mark_plain_text_responses_broken(
+                        provider, resolved_model, reason="empty_responses_detected"
+                    )
+                    chat_kwargs = dict(request_kwargs)
+                    chat_kwargs.pop("cognis_llm_api", None)
+                    response_dict = await _generate_chat(chat_kwargs)
+            else:
+                response_dict = await _generate_chat(request_kwargs)
 
         # Diagnostic: log response structure for debugging reasoning model issues
         choices = response_dict.get("choices")
@@ -1980,6 +2363,8 @@ class LiteLLMProvider:
         )
         if provider is None:
             raise ValueError(f"No LLM provider found for model {resolved_model!r}")
+        if _looks_like_chatgpt_oauth_provider(provider):
+            self._ensure_controller_side_oauth_provider(provider)
 
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
         model_info = await self.get_model_info(
@@ -2059,87 +2444,89 @@ class LiteLLMProvider:
             },
         )
         if use_responses_api:
-            responses_instructions, responses_input_messages = split_messages_for_responses(
-                prepared_messages, cache_breakpoint_index
-            )
-            responses_kwargs = responses_request_kwargs(request_kwargs)
-            if responses_instructions is not None:
-                responses_kwargs["instructions"] = responses_instructions
-            responses_kwargs = _apply_responses_request_defaults(
-                responses_kwargs,
-                provider=provider,
-                resolved_model=resolved_model,
-                instructions=responses_instructions,
-            )
-            try:
-                stream = await with_llm_retry(
-                    litellm.aresponses,
-                    model=prefixed_model,
-                    input=messages_to_responses_input(responses_input_messages),
-                    stream=True,
-                    max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
-                    operation=f"stream_generate.responses({prefixed_model})",
-                    **responses_kwargs,
+            async with self._provider_oauth_token_context(provider):
+                responses_instructions, responses_input_messages = split_messages_for_responses(
+                    prepared_messages, cache_breakpoint_index
                 )
-            except Exception as exc:
-                openai_tool_search_reason = _openai_tool_search_bad_request_reason(
-                    exc, request_kwargs
+                responses_kwargs = responses_request_kwargs(request_kwargs)
+                if responses_instructions is not None:
+                    responses_kwargs["instructions"] = responses_instructions
+                responses_kwargs = _apply_responses_request_defaults(
+                    responses_kwargs,
+                    provider=provider,
+                    resolved_model=resolved_model,
+                    instructions=responses_instructions,
                 )
-                if openai_tool_search_reason is not None:
-                    self._mark_openai_tool_search_broken(
-                        provider,
-                        resolved_model,
-                        reason=openai_tool_search_reason,
+                try:
+                    stream = await with_llm_retry(
+                        litellm.aresponses,
+                        model=prefixed_model,
+                        input=messages_to_responses_input(responses_input_messages),
+                        stream=True,
+                        max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
+                        operation=f"stream_generate.responses({prefixed_model})",
+                        **responses_kwargs,
                     )
-                    raise OpenAIToolSearchFallbackRequired(
-                        provider_id=provider.provider_id if provider is not None else "unknown",
-                        model_id=resolved_model,
-                        reason=openai_tool_search_reason,
-                    ) from exc
-                raise
-            try:
-                async for chunk in responses_stream_to_chat_chunks(stream):
-                    if "response_instructions" in chunk:
-                        self._maybe_note_hosted_instruction_drift(
+                except Exception as exc:
+                    openai_tool_search_reason = _openai_tool_search_bad_request_reason(
+                        exc, request_kwargs
+                    )
+                    if openai_tool_search_reason is not None:
+                        self._mark_openai_tool_search_broken(
                             provider,
                             resolved_model,
-                            sent_instructions=responses_instructions,
-                            response_instructions=chunk.pop("response_instructions", None),
+                            reason=openai_tool_search_reason,
                         )
-                    yield chunk
-            except Exception as exc:
-                logger.warning(
-                    "LLM Responses stream failed mid-generation",
-                    extra={"extra_data": {"model": prefixed_model}},
-                    exc_info=True,
-                )
-                yield {"error": str(exc), "mid_stream_failure": True}
+                        raise OpenAIToolSearchFallbackRequired(
+                            provider_id=provider.provider_id if provider is not None else "unknown",
+                            model_id=resolved_model,
+                            reason=openai_tool_search_reason,
+                        ) from exc
+                    raise
+                try:
+                    async for chunk in responses_stream_to_chat_chunks(stream):
+                        if "response_instructions" in chunk:
+                            self._maybe_note_hosted_instruction_drift(
+                                provider,
+                                resolved_model,
+                                sent_instructions=responses_instructions,
+                                response_instructions=chunk.pop("response_instructions", None),
+                            )
+                        yield chunk
+                except Exception as exc:
+                    logger.warning(
+                        "LLM Responses stream failed mid-generation",
+                        extra={"extra_data": {"model": prefixed_model}},
+                        exc_info=True,
+                    )
+                    yield {"error": str(exc), "mid_stream_failure": True}
             return
         # Retry pre-stream errors (connection refused, rate limit, etc.)
         # with exponential backoff.  Once the stream is established,
         # mid-stream failures are caught and yielded as error markers.
-        stream = await with_llm_retry(
-            litellm.acompletion,
-            model=prefixed_model,
-            messages=prepared_messages,
-            stream=True,
-            max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
-            operation=f"stream_generate({prefixed_model})",
-            **request_kwargs,
-        )
-        try:
-            async for chunk in stream:
-                yield dict(chunk)
-        except Exception as exc:
-            # Mid-stream failures (e.g. LiteLLM MidStreamFallbackError,
-            # Anthropic tool_use_failed) should not crash the caller.
-            # Yield an error marker so the agent loop can handle it.
-            logger.warning(
-                "LLM stream failed mid-generation",
-                extra={"extra_data": {"model": prefixed_model}},
-                exc_info=True,
+        async with self._provider_oauth_token_context(provider):
+            stream = await with_llm_retry(
+                litellm.acompletion,
+                model=prefixed_model,
+                messages=prepared_messages,
+                stream=True,
+                max_retries=int(retry_count) if isinstance(retry_count, int) else 3,
+                operation=f"stream_generate({prefixed_model})",
+                **request_kwargs,
             )
-            yield {"error": str(exc), "mid_stream_failure": True}
+            try:
+                async for chunk in stream:
+                    yield dict(chunk)
+            except Exception as exc:
+                # Mid-stream failures (e.g. LiteLLM MidStreamFallbackError,
+                # Anthropic tool_use_failed) should not crash the caller.
+                # Yield an error marker so the agent loop can handle it.
+                logger.warning(
+                    "LLM stream failed mid-generation",
+                    extra={"extra_data": {"model": prefixed_model}},
+                    exc_info=True,
+                )
+                yield {"error": str(exc), "mid_stream_failure": True}
 
     def count_tokens(self, text: str, model: str) -> int:
         family = self._tokenizer_family(model)
@@ -2206,6 +2593,8 @@ class LiteLLMProvider:
             provider = await session.get(LLMProviderRow, provider_id)
         if provider is None:
             raise ValueError("LLM provider not found")
+        if _looks_like_chatgpt_oauth_provider(provider):
+            self._ensure_controller_side_oauth_provider(provider)
 
         config = dict(provider.config)
         if provider.location == "executor":
@@ -2392,24 +2781,25 @@ class LiteLLMProvider:
         tested_at = datetime.now(UTC)
         try:
             test_messages = [{"role": "user", "content": "Say hello."}]
-            if self._should_route_to_executor(provider):
-                if self._inference_router is None:
-                    raise RuntimeError("Inference router is not configured")
-                await self._inference_router.route_generate(
-                    messages=test_messages,
-                    model=prefixed_model,
-                    executor_labels=config.get("executor_labels")
-                    if isinstance(config, dict)
-                    else None,
-                    request_kwargs=request_kwargs,
-                )
-            else:
-                await litellm.acompletion(
-                    model=prefixed_model,
-                    messages=test_messages,
-                    stream=False,
-                    **request_kwargs,
-                )
+            async with self._provider_oauth_token_context(provider):
+                if self._should_route_to_executor(provider):
+                    if self._inference_router is None:
+                        raise RuntimeError("Inference router is not configured")
+                    await self._inference_router.route_generate(
+                        messages=test_messages,
+                        model=prefixed_model,
+                        executor_labels=config.get("executor_labels")
+                        if isinstance(config, dict)
+                        else None,
+                        request_kwargs=request_kwargs,
+                    )
+                else:
+                    await litellm.acompletion(
+                        model=prefixed_model,
+                        messages=test_messages,
+                        stream=False,
+                        **request_kwargs,
+                    )
         except TimeoutError as exc:
             return {
                 "ok": False,

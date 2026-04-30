@@ -2,8 +2,8 @@ import { slugify } from '$lib/agents';
 import type { LLMProvider, ModelEntry } from '$lib/types/api';
 import { defaultModelEntry } from '$lib/types/api';
 
-export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy';
-export type AuthMode = 'env' | 'secret' | 'none';
+export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt';
+export type AuthMode = 'env' | 'secret' | 'oauth' | 'none';
 
 export interface AdvancedSetting {
   key: string;
@@ -50,7 +50,8 @@ export const PRESET_LABELS: Record<ProviderPreset, string> = {
   openai_compatible: 'OpenAI Compatible',
   anthropic: 'Anthropic',
   ollama: 'Ollama (local)',
-  litellm_proxy: 'LiteLLM Proxy'
+  litellm_proxy: 'LiteLLM Proxy',
+  chatgpt: 'ChatGPT Subscription (Codex)'
 };
 
 /** Config keys that are handled by structured form fields. */
@@ -111,7 +112,7 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
     if (raw === 'custom') {
       return 'openai_compatible';
     }
-    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy'].includes(raw)) {
+    if (['openai', 'openai_compatible', 'anthropic', 'ollama', 'litellm_proxy', 'chatgpt'].includes(raw)) {
       return raw as ProviderPreset;
     }
   }
@@ -122,6 +123,9 @@ export function detectProviderPreset(provider: LLMProvider | null): ProviderPres
   }
   if (defaultModel.startsWith('litellm_proxy/')) {
     return 'litellm_proxy';
+  }
+  if (defaultModel.startsWith('chatgpt/')) {
+    return 'chatgpt';
   }
   if (defaultModel.startsWith('claude') || defaultModel.startsWith('anthropic/')) {
     return 'anthropic';
@@ -146,7 +150,7 @@ function readAuthConfig(config: Record<string, unknown>): {
     return { auth_mode: 'env', auth_env_var: '', auth_secret_name: '' };
   }
   const authConfig = auth as Record<string, unknown>;
-  const mode = authConfig.mode === 'secret' ? 'secret' : authConfig.mode === 'none' ? 'none' : 'env';
+  const mode = authConfig.mode === 'secret' ? 'secret' : authConfig.mode === 'oauth' ? 'oauth' : authConfig.mode === 'none' ? 'none' : 'env';
   return {
     auth_mode: mode,
     auth_env_var: typeof authConfig.env_var === 'string' ? authConfig.env_var : '',
@@ -184,7 +188,7 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
   return {
     provider_id: provider?.provider_id ?? '',
     display_name: provider?.display_name ?? '',
-    location: provider?.location ?? 'controller',
+    location: preset === 'chatgpt' ? 'controller' : (provider?.location ?? 'controller'),
     executor_selector:
       typeof config.executor_labels === 'object' && config.executor_labels !== null && !Array.isArray(config.executor_labels)
         ? Object.entries(config.executor_labels as Record<string, unknown>)
@@ -206,7 +210,7 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
               : '',
     default_model: typeof config.default_model === 'string' ? config.default_model : '',
     models,
-    auth_mode: preset === 'ollama' ? 'none' : authInfo.auth_mode,
+    auth_mode: preset === 'ollama' ? 'none' : preset === 'chatgpt' ? 'oauth' : authInfo.auth_mode,
     auth_env_var: authInfo.auth_env_var || defaultEnvVar,
     auth_secret_name: authInfo.auth_secret_name || `${preset}_api_key`,
     auth_secret_value: '',
@@ -239,6 +243,8 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
   const authConfig: Record<string, unknown> =
     form.auth_mode === 'secret'
       ? { mode: 'secret', secret_name: form.auth_secret_name }
+      : form.auth_mode === 'oauth'
+        ? { mode: 'oauth', provider: form.preset }
       : form.auth_mode === 'env'
         ? { mode: 'env', env_var: form.auth_env_var }
         : { mode: 'none' };

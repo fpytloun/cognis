@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cognis.models.config import DEFAULT_MODEL_INFO, ModelInfo
+from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.litellm import (
     LiteLLMProvider,
     OpenAIToolSearchFallbackRequired,
     _normalize_proxy_model_info,
+    _oauth_token_secret_name,
 )
 from cognis.providers.llm.reasoning import (
     apply_reasoning_config,
@@ -27,6 +32,36 @@ async def _session_factory(tmp_path: object):
     return engine, create_session_factory(engine)
 
 
+class _MemorySecrets:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str, str], str] = {}
+
+    async def get_secret(self, name: str, user_id: str, agent_id: str | None = None) -> str:
+        del agent_id
+        key = (user_id, "system", name)
+        if key not in self.values:
+            raise KeyError(name)
+        return self.values[key]
+
+    async def set_secret(
+        self,
+        name: str,
+        value: str,
+        user_id: str,
+        scope: str = "user",
+        agent_id: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        del agent_id, description
+        self.values[(user_id, scope, name)] = value
+
+    async def delete_secret(
+        self, name: str, user_id: str, scope: str = "user", agent_id: str | None = None
+    ) -> bool:
+        del agent_id
+        return self.values.pop((user_id, scope, name), None) is not None
+
+
 @pytest.mark.asyncio
 async def test_litellm_provider_resolves_explicit_model(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
@@ -35,6 +70,177 @@ async def test_litellm_provider_resolves_explicit_model(tmp_path: object) -> Non
     resolved = await provider.resolve_model(explicit_model="gpt-5.4-mini")
 
     assert resolved == "gpt-5.4-mini"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_preset_prefixes_model_and_uses_responses(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="controller",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.3-codex"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "chatgpt")
+    assert row is not None
+
+    model_info = ModelInfo(model_id="gpt-5.3-codex")
+    assert provider._apply_model_prefix("gpt-5.3-codex", row) == "chatgpt/gpt-5.3-codex"
+    assert provider._should_use_responses_api("gpt-5.3-codex", model_info, row) is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_context_hydrates_and_persists_encrypted_secret(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="controller",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.3-codex"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    secrets = _MemorySecrets()
+    provider = LiteLLMProvider(session_factory, secrets_provider=secrets)
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "chatgpt")
+    assert row is not None
+    secret_name = _oauth_token_secret_name(row)
+    await secrets.set_secret(
+        secret_name,
+        json.dumps({"access_token": "old", "refresh_token": "refresh"}),
+        SYSTEM_USER_EMAIL,
+        scope="system",
+    )
+
+    async with provider._provider_oauth_token_context(row):
+        token_dir = os.environ["CHATGPT_TOKEN_DIR"]
+        auth_file = os.environ["CHATGPT_AUTH_FILE"]
+        auth_path = Path(token_dir) / auth_file
+        assert json.loads(auth_path.read_text())["access_token"] == "old"
+        auth_path.write_text(json.dumps({"access_token": "new", "refresh_token": "refresh"}))
+
+    assert json.loads(secrets.values[(SYSTEM_USER_EMAIL, "system", secret_name)])["access_token"] == "new"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_context_rejects_pending_state(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="controller",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.3-codex"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    secrets = _MemorySecrets()
+    provider = LiteLLMProvider(session_factory, secrets_provider=secrets)
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "chatgpt")
+    assert row is not None
+    await secrets.set_secret(
+        _oauth_token_secret_name(row),
+        json.dumps({"status": "pending", "user_code": "ABCD-EFGH"}),
+        SYSTEM_USER_EMAIL,
+        scope="system",
+    )
+
+    with pytest.raises(RuntimeError, match="not authorized"):
+        async with provider._provider_oauth_token_context(row):
+            pass
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_start_preserves_existing_authorized_token(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="controller",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.3-codex"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    secrets = _MemorySecrets()
+    provider = LiteLLMProvider(session_factory, secrets_provider=secrets)
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "chatgpt")
+    assert row is not None
+    token_secret_name = _oauth_token_secret_name(row)
+    await secrets.set_secret(
+        token_secret_name,
+        json.dumps({"access_token": "working", "refresh_token": "refresh"}),
+        SYSTEM_USER_EMAIL,
+        scope="system",
+    )
+
+    async def _fake_device_code() -> dict[str, object]:
+        return {"device_auth_id": "device", "user_code": "ABCD-EFGH", "interval": 5}
+
+    monkeypatch.setattr(provider, "_request_chatgpt_device_code", _fake_device_code)
+
+    status = await provider.start_chatgpt_oauth("chatgpt")
+
+    assert status["status"] == "pending"
+    assert json.loads(secrets.values[(SYSTEM_USER_EMAIL, "system", token_secret_name)])[
+        "access_token"
+    ] == "working"
+    assert (SYSTEM_USER_EMAIL, "system", f"{token_secret_name}_pending") in secrets.values
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_oauth_rejects_executor_location(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="executor",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.3-codex"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory, secrets_provider=_MemorySecrets())
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "chatgpt")
+    assert row is not None
+
+    with pytest.raises(RuntimeError, match="must run on the controller"):
+        async with provider._provider_oauth_token_context(row):
+            pass
     await engine.dispose()
 
 

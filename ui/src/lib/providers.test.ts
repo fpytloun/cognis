@@ -98,6 +98,33 @@ describe('provider presets', () => {
     expect(form.auth_env_var).toBe('LITELLM_PROXY_API_KEY');
   });
 
+  it('handles chatgpt subscription preset with oauth auth', () => {
+    const chatgptProvider: LLMProvider = {
+      provider_id: 'chatgpt',
+      display_name: 'ChatGPT Subscription',
+      location: 'controller',
+      backend: 'litellm',
+      config: {
+        preset: 'chatgpt',
+        default_model: 'gpt-5.3-codex',
+        models: [{ model_id: 'gpt-5.3-codex' }],
+        auth_config: { mode: 'oauth', provider: 'chatgpt' }
+      },
+      is_default: false,
+      status: 'active',
+      created_at: null,
+      updated_at: null,
+      models: [defaultModelEntry('gpt-5.3-codex')],
+      last_test: null
+    };
+    expect(detectProviderPreset(chatgptProvider)).toBe('chatgpt');
+    const form = createProviderForm(chatgptProvider);
+    expect(form.auth_mode).toBe('oauth');
+    const payload = providerFormToPayload(form);
+    const config = payload.config as Record<string, unknown>;
+    expect(config.auth_config).toEqual({ mode: 'oauth', provider: 'chatgpt' });
+  });
+
   it('defaults base_url for new litellm_proxy preset', () => {
     const newProxy: LLMProvider = {
       provider_id: 'proxy-new',
