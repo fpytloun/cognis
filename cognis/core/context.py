@@ -1678,10 +1678,11 @@ class ContextAssembler:
             sections.append(skill_metadata)
             skill_guidance = (
                 "You have skills that extend your capabilities. Review the "
-                "list above and use skill_load to load any skills relevant "
-                "to the current task. Skills marked as attached are preferred "
-                "defaults for this agent. Follow loaded skill instructions "
-                "carefully."
+                "list above and use skill_load only when a skill adds procedure "
+                "needed for the current task or workflow step. Skills marked as "
+                "attached are preferred defaults for this agent, but loaded skill "
+                "instructions are subordinate to workflow step contracts and "
+                "controller completion requirements."
             )
             if visible_tool_names is not None and "skill_write" in visible_tool_names:
                 skill_guidance += (

@@ -77,6 +77,8 @@ linked_tool_ids:
 
 Use this skill when the agent is doing software engineering work and should follow a careful, execution-first coding workflow.
 
+Workflow step objectives and controller completion contracts override this skill. If a workflow step asks for a plan, review, summary, or decision, produce that step artifact only and do not jump ahead to implementation.
+
 # Working Style
 
 - Inspect first. Read only the files, code paths, and repo guidance needed to act correctly.
@@ -105,6 +107,9 @@ Use this skill when the agent is doing software engineering work and should foll
 
 # Routing
 
+- In direct chat, implement when the user asks for implementation and the next action is clear.
+- In general tasks, follow the requested task scope and stop at the requested artifact.
+- In coding workflows, complete only the current workflow step artifact; later workflow steps handle later lifecycle actions such as implementation, verification, commit, pull request, and final summary.
 - Keep small, clear edits inline when you can finish them immediately.
 - When the code path is unclear, use `system:explore` first to trace the implementation before editing.
 - For larger implementation, refactor, or multi-step debugging work, prefer delegation or a task with the software-development workflow instead of forcing everything inline.
@@ -134,7 +139,7 @@ Use this skill when the agent is doing software engineering work and should foll
 
 # Do Not Do
 
-- Do not stop at a plan when the next concrete action is clear.
+- Do not stop at a plan unless the user request or current workflow step explicitly asks for a plan, review, explanation, or decision.
 - Do not perform large opportunistic refactors without a concrete need.
 - Do not overengineer, add speculative abstractions, or widen scope just because you see a cleaner architecture.
 - Do not claim verification you did not run.

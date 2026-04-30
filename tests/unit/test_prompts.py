@@ -129,12 +129,9 @@ def test_critical_rules_cover_truncated_output_recovery_and_placeholder_bleed() 
     # right after <identity>.
     rules = build_critical_rules()
     assert rules is not None
-    assert "cleared from context" in rules
-    assert "compacted" in rules
-    assert "read_tool_output" in rules
-    assert "list_tool_output_anchors" in rules
-    assert "read_tool_output_anchor" in rules
-    assert "search_tool_output" in rules
+    assert "Tool outputs may be omitted from the prompt for space" in rules
+    assert "Recover a saved output only when a specific missing detail" in rules
+    assert "Do not recover old outputs just to reconfirm context" in rules
     # Placeholder guardrail.
     assert '"dummy"' in rules
     assert '"noop"' in rules
@@ -204,3 +201,12 @@ def test_coding_skill_prefers_structured_tools_for_file_inspection() -> None:
     assert "Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`" in content
     assert "structured tools such as `read`, `grep`, `glob`, or `list_directory`" in content
     assert "Do not chain file inspection commands with `&&`, `;`, or separator output" in content
+
+
+def test_coding_skill_allows_explicit_plan_steps() -> None:
+    skill = get_system_skill_default("cognis-coding")
+    assert skill is not None
+    content = str(skill["instructions"])
+    assert "Workflow step objectives and controller completion contracts override this skill" in content
+    assert "unless the user request or current workflow step explicitly asks for a plan" in content
+    assert "complete only the current workflow step artifact" in content

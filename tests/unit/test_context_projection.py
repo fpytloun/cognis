@@ -50,8 +50,10 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
     result = project_messages(messages, preserve_recent_completed_tool_groups=2)
 
     assert result.mutable_start_index == 3
-    assert "Older tool result compacted from prompt." in str(result.messages[2]["content"])
+    assert "Tool output omitted from prompt." in str(result.messages[2]["content"])
     assert "call_id 'call-1'" in str(result.messages[2]["content"])
+    assert "Recover with" in str(result.messages[2]["content"])
+    assert "list_tool_output_anchors" not in str(result.messages[2]["content"])
     assistant_args = result.messages[1]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(assistant_args, str)
     assert "Arguments cleared -" in assistant_args
@@ -79,6 +81,7 @@ def test_project_messages_uses_helper_recovery_call_id_for_helper_results() -> N
     assert "call_id 'helper-call'" in placeholder
     assert "source call_id 'source-call'" in placeholder
     assert "anchor='result:1'" not in placeholder
+    assert "list_tool_output_anchors" not in placeholder
 
 
 def test_project_messages_preserves_recent_groups_until_byte_budget_is_hit() -> None:
@@ -100,8 +103,8 @@ def test_project_messages_preserves_recent_groups_until_byte_budget_is_hit() -> 
 
     # The oldest preserved groups are dropped until the preserved tail fits the
     # byte budget, but the newest group is always retained in full.
-    assert "Older tool result compacted from prompt." in str(result.messages[2]["content"])
-    assert "Older tool result compacted from prompt." in str(result.messages[4]["content"])
+    assert "Tool output omitted from prompt." in str(result.messages[2]["content"])
+    assert "Tool output omitted from prompt." in str(result.messages[4]["content"])
     assert result.messages[6]["content"] == "C" * 200
 
 
@@ -132,5 +135,28 @@ def test_prune_tool_outputs_only_modifies_mutable_tail() -> None:
     )
 
     assert result[1]["content"] == messages[1]["content"]
-    assert "Older tool result compacted from prompt." in str(result[3]["content"])
+    assert "Tool output omitted from prompt." in str(result[3]["content"])
     assert "call_id 'source-call'" in str(result[3]["content"])
+
+
+def test_controller_critical_tool_results_are_preserved() -> None:
+    messages = [
+        {"role": "user", "content": "start"},
+        _assistant_tool_call("call-1", "step_todo_write", {"todos": []}),
+        {
+            **_tool_result(
+                "call-1",
+                "terminal todos",
+                tool_name="step_todo_write",
+                recovery_call_id="call-1",
+            ),
+            "_protected_tool_output": True,
+        },
+        _assistant_tool_call("call-2", "read", {"path": "a.py"}),
+        _tool_result("call-2", "large" * 2000, tool_name="read", recovery_call_id="call-2"),
+    ]
+
+    result = project_messages(messages, preserve_recent_completed_tool_groups=0)
+
+    assert result.messages[2]["content"] == "terminal todos"
+    assert "Tool output omitted from prompt." in str(result.messages[4]["content"])

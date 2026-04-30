@@ -244,7 +244,11 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Explore the codebase only as needed to understand the relevant "
                 "areas. Use focused exploration first, and parallelize only when "
-                "the task is broad enough to justify it.\n\n"
+                "the task is broad enough to justify it. This is a read-only "
+                "planning step: do not edit files, create worktrees, run tests or "
+                "builds, commit, open pull requests, or implement changes. Later "
+                "workflow steps handle implementation, verification, commit, and PR "
+                "work.\n\n"
                 "Then produce a detailed implementation plan covering:\n"
                 "- Files to create/modify (with rationale)\n"
                 "- Specific changes per file\n"

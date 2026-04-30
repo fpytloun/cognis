@@ -153,6 +153,9 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
     assert "Files to create/modify (with rationale)" in plan_step.prompt
+    assert "read-only planning step" in plan_step.prompt
+    assert "do not edit files" in plan_step.prompt
+    assert "Later workflow steps handle implementation" in plan_step.prompt
 
 
 def test_creative_workflow_can_ask_brief_clarifications() -> None:

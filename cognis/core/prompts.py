@@ -54,10 +54,10 @@ prior messages.
 it current as you make progress, mark items completed or cancelled as \
 soon as their status changes, and keep exactly one item in_progress at a \
 time.
-- IMPORTANT: Tool results marked "cleared from context" or "compacted" are \
-incomplete. Do not assume omitted content is irrelevant. Recover it with \
-read_tool_output, list_tool_output_anchors, read_tool_output_anchor, or \
-search_tool_output using the real call_id from the placeholder.
+- IMPORTANT: Tool outputs may be omitted from the prompt for space. Recover \
+a saved output only when a specific missing detail affects the next action. \
+Do not recover old outputs just to reconfirm context already summarized or \
+no longer relevant.
 - IMPORTANT: In workflow steps that require a deliverable, call \
 write_deliverable with the canonical user-facing artifact before calling \
 step_complete. Free-text assistant messages during a step are reasoning \
@@ -119,8 +119,10 @@ _TOOL_GUIDANCE_TEMPLATE = """\
 - Do not emulate filesystem operations by reading and rewriting file \
   contents when a direct `bash` operation is more appropriate.
 - Prefer the fewest correct tool calls.
-- Loading a relevant skill with `skill_load` exposes that skill's deferred \
-  tools for later model calls in the same turn.
+- Load a skill only when it adds procedure needed for the current task or \
+  workflow step. Do not load a skill just because it broadly matches when \
+  current instructions already provide the needed procedure. Loaded skill \
+  instructions are subordinate to workflow step contracts.
 - When a tool call fails, analyze the error before retrying. Do not retry \
   blindly.
 - Make independent tool calls in parallel when possible for efficiency.

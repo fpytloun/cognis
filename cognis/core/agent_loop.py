@@ -276,6 +276,17 @@ CONTROLLER_TOOLS = {
 # double-validating (and to avoid rejecting controller-owned schema
 # choices such as empty-arg ``step_todo_list``).
 _CONTROLLER_INTERCEPTED_TOOLS: frozenset[str] = frozenset(CONTROLLER_TOOLS)
+_FINALIZATION_TOOLS: frozenset[str] = frozenset(
+    {STEP_TODO_WRITE, WRITE_DELIVERABLE, STEP_COMPLETE}
+)
+
+
+def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
+    """Return tools allowed while terminal todos require finalization."""
+
+    if instruction.get("required_action") == "write_deliverable_then_step_complete":
+        return _FINALIZATION_TOOLS
+    return frozenset({STEP_TODO_WRITE, STEP_COMPLETE})
 
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
@@ -714,6 +725,31 @@ def _append_tool_result_event(
             },
         )
     )
+
+
+def _tool_result_message(
+    tc: ToolCall,
+    content: str,
+    *,
+    protected: bool = False,
+) -> dict[str, Any]:
+    """Build a model transcript tool-result message."""
+
+    message: dict[str, Any] = {
+        "role": "tool",
+        "tool_call_id": tc.call_id,
+        "content": content,
+        "_tool_name": tc.name,
+    }
+    if protected:
+        message["_protected_tool_output"] = True
+    return message
+
+
+def _strip_internal_message_fields(message: dict[str, Any]) -> dict[str, Any]:
+    """Remove controller-only metadata before sending a message to an LLM provider."""
+
+    return {key: value for key, value in message.items() if not str(key).startswith("_")}
 
 
 @dataclass
@@ -1954,12 +1990,21 @@ class AgentLoop:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
         if callable(self._step_runtime_factory):
-            return await self._step_runtime_factory(
-                agent=agent,
-                user_email=user_email,
-                executor_agent=executor_agent,
-                access_context=access_context,
-            )
+            try:
+                return await self._step_runtime_factory(
+                    agent=agent,
+                    user_email=user_email,
+                    executor_agent=executor_agent,
+                    access_context=access_context,
+                )
+            except TypeError as exc:
+                if "access_context" not in str(exc):
+                    raise
+                return await self._step_runtime_factory(
+                    agent=agent,
+                    user_email=user_email,
+                    executor_agent=executor_agent,
+                )
 
         raise RuntimeError("Step runtime factory unavailable; refusing delegation fallback")
 
@@ -2044,8 +2089,8 @@ class AgentLoop:
                 agent_owner_email=resolved_agent.owner_email,
                 agent_type=resolved_agent.agent_type,
                 session_id=child_session.session_id,
-                parent_session_id=child_session.parent_session_id,
-                delegation_mode=child_session.delegation_mode,
+                parent_session_id=getattr(child_session, "parent_session_id", None),
+                delegation_mode=getattr(child_session, "delegation_mode", None),
                 workflow_step=False,
             )
             child_runtime = await self._resolve_child_runtime(
@@ -2627,6 +2672,7 @@ class AgentLoop:
         continuation_message_index: int | None = None
         continuation_reminder_index: int | None = None
         relevant_skills_message_added = False
+        workflow_step_reminder_added = False
         queued_edit_guidance: str | None = None
         edit_guidance_message_index: int | None = None
         while True:
@@ -2640,6 +2686,12 @@ class AgentLoop:
                 if relevant_skills_message is not None:
                     messages.append(relevant_skills_message)
                 relevant_skills_message_added = True
+
+            if not workflow_step_reminder_added:
+                workflow_step_reminder = self._build_workflow_step_reminder(ctx)
+                if workflow_step_reminder is not None:
+                    messages.append(workflow_step_reminder)
+                workflow_step_reminder_added = True
 
             # Resolve model and reasoning effort for this turn.
             # Chain: session override → workflow step default → agent config → provider default.
@@ -3503,6 +3555,7 @@ class AgentLoop:
             delegation_spawned = False
             restart_llm_cycle = False
             prepared_regular_batch: list[_PreparedRegularToolCall] = []
+            post_tool_system_messages: list[dict[str, Any]] = []
             for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
                 tool_id = _tool_id_for_call(tc.name, registry)
@@ -3510,6 +3563,88 @@ class AgentLoop:
 
                 if on_tool_call:
                     await on_tool_call(tc.name, tc.call_id, tc.arguments)
+
+                finalization_instruction = await self._finalization_instruction(ctx)
+                allowed_finalization_tools = (
+                    _allowed_finalization_tools(finalization_instruction)
+                    if finalization_instruction is not None
+                    else _FINALIZATION_TOOLS
+                )
+                if (
+                    finalization_instruction is not None
+                    and tc.name not in allowed_finalization_tools
+                ):
+                    tool_call_count += 1
+                    if prepared_regular_batch:
+                        await self._execute_regular_tool_batch(
+                            ctx,
+                            prepared_regular_batch,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            collected_attachments=collected_attachments,
+                            pending_assistant_attachments=pending_assistant_attachments,
+                            promoted_tool_ids=promoted_tool_ids,
+                            activated_tool_ids=activated_tool_ids,
+                            on_token=on_token,
+                            on_tool_result=on_tool_result,
+                        )
+                        prepared_regular_batch.clear()
+                    HARNESS_GUARD_TRIPS.labels(guard="finalization", tool_name=tool_id).inc()
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    payload = json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason": "finalization_required",
+                            "message": (
+                                "All step todos are terminal, so further non-finalization "
+                                "tool use is blocked. "
+                                f"{finalization_instruction['message']}"
+                            ),
+                            "required_action": finalization_instruction["required_action"],
+                            "allowed_tools": sorted(allowed_finalization_tools),
+                        }
+                    )
+                    messages.append(_tool_result_message(tc, payload, protected=True))
+                    _append_tool_result_event(
+                        events_to_record,
+                        tc,
+                        payload,
+                        True,
+                        tool_id=tool_id,
+                        protect_from_pruning=True,
+                    )
+                    post_tool_system_messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Internal controller reminder — this is not a new user "
+                                "message. All step todos are terminal. "
+                                f"{finalization_instruction['reminder']} Use step_todo_write "
+                                "only if the todo state is wrong."
+                            ),
+                            "_workflow_step_reminder": True,
+                        }
+                    )
+                    _queue_audit_message(
+                        role="developer",
+                        source="tool_reminder",
+                        content=str(post_tool_system_messages[-1]["content"]),
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_result:finalization:{tc.name}",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, payload, True, None, None)
+                    record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                    continue
+                if finalization_instruction is not None and tc.name in {
+                    WRITE_DELIVERABLE,
+                    STEP_COMPLETE,
+                }:
+                    tool_call_count += 1
 
                 # ---- Harness guards (pre-dispatch) ----------------------
                 #
@@ -3788,7 +3923,12 @@ class AgentLoop:
                             {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
                         )
                         _append_tool_result_event(
-                            events_to_record, tc, err_content, True, tool_id=tool_id
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
                         )
                         await self._flush_events_incremental(
                             ctx,
@@ -3808,11 +3948,14 @@ class AgentLoop:
                                 "message": "write_deliverable requires non-empty content.",
                             }
                         )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
-                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
                         _append_tool_result_event(
-                            events_to_record, tc, err_content, True, tool_id=tool_id
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
                         )
                         await self._flush_events_incremental(
                             ctx,
@@ -3832,11 +3975,14 @@ class AgentLoop:
                                 "message": "write_deliverable format must be one of: markdown, plain, html.",
                             }
                         )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
-                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
                         _append_tool_result_event(
-                            events_to_record, tc, err_content, True, tool_id=tool_id
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
                         )
                         await self._flush_events_incremental(
                             ctx,
@@ -3873,11 +4019,13 @@ class AgentLoop:
                             "preview": preview,
                         }
                     )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
-                    )
+                    messages.append(_tool_result_message(tc, result_content))
                     _append_tool_result_event(
-                        events_to_record, tc, result_content, False, tool_id=tool_id
+                        events_to_record,
+                        tc,
+                        result_content,
+                        False,
+                        tool_id=tool_id,
                     )
                     await self._flush_events_incremental(
                         ctx,
@@ -3923,9 +4071,7 @@ class AgentLoop:
                                 ),
                             }
                         )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
-                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
                         )
@@ -3991,9 +4137,7 @@ class AgentLoop:
                                 "required_action": "update_todos_then_retry_step_complete",
                             }
                         )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
-                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
                         _append_tool_result_event(
                             events_to_record, tc, err_content, True, tool_id=tool_id
                         )
@@ -4004,7 +4148,7 @@ class AgentLoop:
                         # system message keeps the instructions prominent
                         # and lets the controller emit a single, consistent
                         # prescription.
-                        messages.append(
+                        post_tool_system_messages.append(
                             {
                                 "role": "system",
                                 "content": (
@@ -4023,7 +4167,7 @@ class AgentLoop:
                         _queue_audit_message(
                             role="developer",
                             source="tool_reminder",
-                            content=str(messages[-1]["content"]),
+                            content=str(post_tool_system_messages[-1]["content"]),
                         )
 
                         await self._flush_events_incremental(
@@ -4052,13 +4196,16 @@ class AgentLoop:
                                 "required_action": "write_deliverable_then_retry_step_complete",
                             }
                         )
-                        messages.append(
-                            {"role": "tool", "tool_call_id": tc.call_id, "content": err_content}
-                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
                         _append_tool_result_event(
-                            events_to_record, tc, err_content, True, tool_id=tool_id
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
                         )
-                        messages.append(
+                        post_tool_system_messages.append(
                             {
                                 "role": "system",
                                 "content": (
@@ -4073,7 +4220,7 @@ class AgentLoop:
                         _queue_audit_message(
                             role="developer",
                             source="tool_reminder",
-                            content=str(messages[-1]["content"]),
+                            content=str(post_tool_system_messages[-1]["content"]),
                         )
                         await self._flush_events_incremental(
                             ctx,
@@ -4250,11 +4397,13 @@ class AgentLoop:
                         )
                     )
                     result_content = json.dumps({"status": "completed"})
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
-                    )
+                    messages.append(_tool_result_message(tc, result_content))
                     _append_tool_result_event(
-                        events_to_record, tc, result_content, False, tool_id=tool_id
+                        events_to_record,
+                        tc,
+                        result_content,
+                        False,
+                        tool_id=tool_id,
                     )
                     await self._flush_events_incremental(
                         ctx,
@@ -4312,15 +4461,16 @@ class AgentLoop:
                             "remaining todo as either completed or cancelled."
                         )
                     else:
-                        if self._deliverable_owner_step_run_id(ctx) is not None:
+                        finalization_instruction = await self._finalization_instruction(ctx)
+                        if finalization_instruction is not None:
                             guidance = (
                                 "All todos are terminal (completed or cancelled). "
-                                "You may call step_complete when the deliverable is ready."
+                                f"{finalization_instruction['message']}"
                             )
                         else:
                             guidance = (
                                 "All todos are terminal (completed or cancelled). "
-                                "You may call step_complete when the final result message is ready."
+                                "Finish with the appropriate user-facing result for this turn."
                             )
                     # Canonical echo gives the model a verifiable view of
                     # what it actually wrote (the previous write-only
@@ -4340,11 +4490,13 @@ class AgentLoop:
                             "guidance": guidance,
                         }
                     )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
-                    )
+                    messages.append(_tool_result_message(tc, result_content))
                     _append_tool_result_event(
-                        events_to_record, tc, result_content, False, tool_id=tool_id
+                        events_to_record,
+                        tc,
+                        result_content,
+                        False,
+                        tool_id=tool_id,
                     )
                     await self._flush_events_incremental(
                         ctx,
@@ -5054,6 +5206,9 @@ class AgentLoop:
                     on_tool_result=on_tool_result,
                 )
                 prepared_regular_batch.clear()
+
+            if post_tool_system_messages:
+                messages.extend(post_tool_system_messages)
 
             if restart_llm_cycle:
                 continue
@@ -8056,6 +8211,52 @@ class AgentLoop:
         ]
 
     @staticmethod
+    def _workflow_todos_are_terminal(ctx: StepContext) -> bool:
+        """Return whether a workflow step has a non-empty, fully terminal todo list."""
+
+        normalized = _normalize_todos(ctx.todos)
+        return bool(normalized) and all(
+            todo.get("status") in ("completed", "cancelled") for todo in normalized
+        )
+
+    async def _finalization_instruction(self, ctx: StepContext) -> dict[str, str] | None:
+        """Return controller-specific finalization guidance once todos are terminal."""
+
+        if (
+            not ctx.policy.require_step_complete
+            or not (ctx.task_id or ctx.step_run_id)
+            or not self._workflow_todos_are_terminal(ctx)
+        ):
+            return None
+        if ctx.step_definition.require_deliverable and self._deliverable_owner_step_run_id(ctx):
+            current_deliverable = await self._get_current_deliverable(ctx)
+            if current_deliverable is None:
+                return {
+                    "required_action": "write_deliverable_then_step_complete",
+                    "message": (
+                        "This step requires a deliverable. Next call write_deliverable "
+                        "with the final step artifact, then call step_complete."
+                    ),
+                    "reminder": (
+                        "Your next action must be write_deliverable with the final step "
+                        "artifact, followed by step_complete."
+                    ),
+                }
+            return {
+                "required_action": "step_complete",
+                "message": (
+                    "A deliverable is already written. Next call step_complete to finish "
+                    "the workflow step."
+                ),
+                "reminder": "Your next action must be step_complete.",
+            }
+        return {
+            "required_action": "step_complete",
+            "message": "Next call step_complete to finish the workflow step.",
+            "reminder": "Your next action must be step_complete.",
+        }
+
+    @staticmethod
     def _should_count_tool_call(tool_name: str) -> bool:
         return tool_name not in CONTROLLER_TOOLS
 
@@ -8362,13 +8563,14 @@ class AgentLoop:
             def token_counter(text: str, _m: str = resolved_model) -> int:
                 return self.providers.llm.count_tokens(text, _m)
 
-        return prune_tool_outputs(
+        pruned = prune_tool_outputs(
             projection.messages,
             protect_tokens=min(40_000, max(4_000, max_context_tokens // 4)),
             minimum_savings=min(20_000, max(2_000, max_context_tokens // 8)),
             min_index_to_modify=projection.mutable_start_index,
             token_counter=token_counter,
         )
+        return [_strip_internal_message_fields(message) for message in pruned]
 
     def _context_pressure_exceeded(
         self,
@@ -9339,8 +9541,8 @@ class AgentLoop:
             "agent_owner_email": ctx.agent.owner_email,
             "agent_type": ctx.agent.agent_type,
             "session_id": ctx.session.session_id,
-            "parent_session_id": ctx.session.parent_session_id,
-            "delegation_mode": ctx.session.delegation_mode,
+            "parent_session_id": getattr(ctx.session, "parent_session_id", None),
+            "delegation_mode": getattr(ctx.session, "delegation_mode", None),
             "workflow_step": bool(ctx.task_id or ctx.step_run_id),
         }
         if ctx.workspace_root:
@@ -9399,6 +9601,69 @@ class AgentLoop:
             return ctx.deliverable_step_run_id
         return None
 
+    def _workflow_step_boundaries(self, ctx: StepContext) -> str:
+        """Return concise boundaries for the current workflow step."""
+
+        lines = [
+            "Complete only this current step, not the full workflow.",
+            "The current step objective is authoritative for what to do now.",
+            (
+                "Task-level instructions about implementation, verification, commits, pull "
+                "requests, deployment, or final summaries apply only when they are relevant "
+                "to this current step."
+            ),
+        ]
+        step_name = ctx.step_definition.name.lower()
+        if any(token in step_name for token in ("plan", "design", "architect")):
+            lines.append(
+                "This is a read-only planning/review step: do not edit files, create or "
+                "modify worktrees, run tests or builds, commit, open pull requests, or "
+                "implement changes unless this current step explicitly says to do so."
+            )
+        elif any(token in step_name for token in ("implement", "code", "fix")):
+            lines.append(
+                "Implementation edits are allowed when needed, but do not commit or open "
+                "pull requests unless this current step explicitly says to do so."
+            )
+        elif "commit" in step_name:
+            lines.append("Commit-related actions are allowed; avoid unrelated implementation edits.")
+        elif "review" in step_name:
+            lines.append("Focus on review findings unless this current step explicitly asks for fixes.")
+        elif any(token in step_name for token in ("summary", "final", "report")):
+            lines.append("Summarize and deliver only; do not start new implementation work.")
+        return "\n".join(f"- {line}" for line in lines)
+
+    def _build_workflow_step_reminder(self, ctx: StepContext) -> dict[str, Any] | None:
+        """Build a hidden phase reminder for workflow-step LLM calls."""
+
+        if not ctx.policy.require_step_complete or not (ctx.task_id or ctx.step_run_id):
+            return None
+        completion_lines = []
+        if self._deliverable_owner_step_run_id(ctx) is not None and ctx.step_definition.require_deliverable:
+            completion_lines.append(
+                "- This step requires a deliverable: call write_deliverable with the step "
+                "artifact before step_complete."
+            )
+        completion_lines.append("- Then call step_complete.")
+        completion_lines.append("- Use step_todo_write only to keep todo state accurate.")
+        content = (
+            "<workflow_step_reminder>\n"
+            f"Current workflow step: {ctx.step_definition.name}\n"
+            "\nBoundaries:\n"
+            f"{self._workflow_step_boundaries(ctx)}\n"
+            "\nInstruction precedence:\n"
+            "- This workflow step reminder overrides task-level finishing instructions "
+            "and loaded skill instructions.\n"
+            "- The current step objective and controller completion contract define what "
+            "done means for this turn.\n"
+            "- Later workflow steps handle their own implementation, verification, commit, "
+            "pull request, or final-summary work.\n"
+            "\nRequired completion:\n"
+            + "\n".join(completion_lines)
+            + "\n</workflow_step_reminder>"
+        )
+        return {"role": "system", "content": content, "_workflow_step_reminder": True}
+
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt.
 
@@ -9409,21 +9674,27 @@ class AgentLoop:
         """
         parts: list[str] = []
 
-        # Inject task context so the LLM knows what the workflow is about
         if ctx.task_title or ctx.task_description:
-            parts.append("## Task\n\n")
+            parts.append("## Workflow Task\n\n")
             if ctx.task_title:
                 parts.append(f"**{ctx.task_title}**\n\n")
             if ctx.task_description:
                 parts.append(f"{ctx.task_description}\n\n")
             if ctx.task_expected_output:
-                parts.append(f"**Expected output:** {ctx.task_expected_output}\n\n")
+                parts.append("## Workflow-Level Expected Output\n\n")
+                parts.append(
+                    f"{ctx.task_expected_output}\n\n"
+                    "This describes the final task result. Use it to shape the current "
+                    "step artifact, but do not perform later workflow steps unless the "
+                    "current step explicitly asks for them.\n\n"
+                )
+            parts.append("## Workflow Delivery Policy\n\n")
             parts.append(
-                "**Notification delivery family:** "
+                "Notification delivery family: "
                 f"{ctx.completion_delivery.completion_mode_family}\n\n"
             )
             parts.append(
-                "**Silent completion allowed:** "
+                "Silent completion allowed: "
                 f"{str(ctx.completion_delivery.allow_silent_completion).lower()}\n\n"
             )
 
@@ -9438,10 +9709,13 @@ class AgentLoop:
             parts.append(f"## Prior Step Output\n\n{prior_output_text}\n\n")
 
         prompt_text = ctx.user_message or ctx.step_definition.prompt
-        parts.append(f"## Step: {ctx.step_definition.name}\n\n{prompt_text}")
+        parts.append(f"## Current Step\n\nName: {ctx.step_definition.name}\n\n{prompt_text}")
+        boundaries = self._workflow_step_boundaries(ctx)
+        if boundaries:
+            parts.append(f"\n\n## Current Step Boundaries\n\n{boundaries}")
 
         if ctx.todos:
-            parts.append("\n\n## Your step todos:\n")
+            parts.append("\n\n## Current Step Todos\n")
             for todo in ctx.todos:
                 status = todo.get("status", "pending")
                 content = todo.get("content", "")
@@ -9466,8 +9740,8 @@ class AgentLoop:
 
         if self._deliverable_owner_step_run_id(ctx) is not None:
             parts.append(
-                "\n\n---\n"
-                "When you have completed the objective, call write_deliverable with the "
+                "\n\n## Required Completion Actions\n\n"
+                "When you have completed the current step objective, call write_deliverable with the "
                 "canonical user-facing artifact for this step. Respect Expected output "
                 "closely for structure, tone, format, and level of detail. If "
                 "Expected output conflicts with the step completion contract, still "
@@ -9486,8 +9760,8 @@ class AgentLoop:
             )
         else:
             parts.append(
-                "\n\n---\n"
-                "When you have completed the objective, write the final result as a normal "
+                "\n\n## Required Completion Actions\n\n"
+                "When you have completed the current step objective, write the final result as a normal "
                 "assistant message. Respect Expected output closely for structure, tone, "
                 "format, and level of detail. Then call step_complete with a summary, structured "
                 "outputs, verifiable claims, and an outcome when the completed step should "
@@ -10166,7 +10440,9 @@ class AgentLoop:
         )
         lines = [
             "<relevant_skills>",
-            "These skills look relevant to the current task. Load one if it matches the user's intent.",
+            "These skills may be relevant. Load one only if it adds procedure needed "
+            "for the current task or workflow step and does not conflict with current "
+            "workflow instructions.",
         ]
         for item in relevant:
             lines.append(

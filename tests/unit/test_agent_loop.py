@@ -1184,6 +1184,148 @@ class _StepCompleteOrderingLLM:
         }
 
 
+class _TerminalTodosThenExtraToolLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_todos_done",
+                                    "function": {
+                                        "name": "step_todo_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "todos": [
+                                                    {"content": "Inspect scope", "status": "completed"}
+                                                ]
+                                            }
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        if len(self.calls) == 2:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_todo_list_after_done",
+                                    "function": {"name": "step_todo_list", "arguments": "{}"},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_status_after_done",
+                                    "function": {"name": "get_status", "arguments": "{}"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_step_complete_after_guard",
+                                "function": {
+                                    "name": "step_complete",
+                                    "arguments": '{"summary":"done","claims":["Finalized"]}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+
+class _TerminalTodosThenTodoCorrectionLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) <= 2:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_todo_write_{len(self.calls)}",
+                                    "function": {
+                                        "name": "step_todo_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "todos": [
+                                                    {"content": "Inspect scope", "status": "completed"}
+                                                ]
+                                            }
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_done_after_todo_correction",
+                                "function": {
+                                    "name": "step_complete",
+                                    "arguments": '{"summary":"done","claims":["Finalized"]}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+
 class _FinalAssistantContentLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -4011,6 +4153,107 @@ async def test_step_complete_must_be_last_tool_call_in_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_todos_block_non_finalization_tool() -> None:
+    fake_llm = _TerminalTodosThenExtraToolLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="plan", type="run", prompt="Plan the change.", require_deliverable=False
+        ),
+        session=SimpleNamespace(
+            session_id="sess-finalization",
+            intaris_session_id="sess-finalization",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-finalization", title=None),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Plan the change.",
+        user_attachments=[],
+        system_initiated=False,
+        task_id="task-finalization",
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.summary == "done"
+    assert len(fake_llm.calls) == 3
+    final_prompt = "\n".join(str(message.get("content")) for message in fake_llm.calls[2])
+    assert "finalization_required" in final_prompt
+    assert "All step todos are terminal" in final_prompt
+    assert "Your next action must be step_complete" in final_prompt
+    assistant_index = next(
+        index
+        for index, message in enumerate(fake_llm.calls[2])
+        if "call_todo_list_after_done" in str(message.get("tool_calls"))
+    )
+    assert fake_llm.calls[2][assistant_index + 1]["role"] == "tool"
+    assert fake_llm.calls[2][assistant_index + 2]["role"] == "tool"
+    assert fake_llm.calls[2][assistant_index + 3]["role"] == "system"
+    first_rejection = json.loads(str(fake_llm.calls[2][assistant_index + 1]["content"]))
+    assert first_rejection["allowed_tools"] == ["step_complete", "step_todo_write"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_todos_still_allow_todo_write() -> None:
+    fake_llm = _TerminalTodosThenTodoCorrectionLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="plan", type="run", prompt="Plan the change.", require_deliverable=False
+        ),
+        session=SimpleNamespace(
+            session_id="sess-todo-correction",
+            intaris_session_id="sess-todo-correction",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-todo-correction", title=None),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Plan the change.",
+        user_attachments=[],
+        system_initiated=False,
+        task_id="task-todo-correction",
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.summary == "done"
+    assert len(fake_llm.calls) == 3
+    final_prompt = "\n".join(str(message.get("content")) for message in fake_llm.calls[2])
+    assert "finalization_required" not in final_prompt
+    assert "Next call step_complete" in final_prompt
+
+
+@pytest.mark.asyncio
 async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
     class _HangingAfterTodoLLM:
         def __init__(self) -> None:
@@ -5925,5 +6168,70 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "Respect Expected output closely" in prompt
+    assert "## Workflow-Level Expected Output" in prompt
+    assert "This describes the final task result" in prompt
+    assert "## Current Step" in prompt
+    assert "## Current Step Boundaries" in prompt
     assert "write_deliverable with the canonical user-facing artifact" in prompt
+
+
+def test_plan_step_prompt_has_read_only_boundaries() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt="Create a plan."),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-1",
+        task_title="Feature",
+        task_description="Implement the feature and open a PR.",
+    )
+
+    prompt = agent_loop._build_step_prompt(ctx)
+
+    assert "This is a read-only planning/review step" in prompt
+    assert "do not edit files" in prompt
+    assert "Complete only this current step" in prompt
+
+
+def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt="Create a plan."),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-1",
+    )
+
+    reminder = agent_loop._build_workflow_step_reminder(ctx)
+
+    assert reminder is not None
+    assert reminder["_workflow_step_reminder"] is True
+    content = str(reminder["content"])
+    assert "overrides task-level finishing instructions and loaded skill instructions" in content
+    assert "call write_deliverable" in content

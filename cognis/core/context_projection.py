@@ -47,18 +47,14 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
         source_note = f" This helper output was derived from source call_id '{source_call_id}'."
     if recovery_call_id is None:
         return (
-            "[Tool result cleared from context. Older tool result compacted from prompt. "
+            "[Tool output omitted from prompt. "
             f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
-            "No saved output handle is available for re-query from this placeholder.]"
+            "No saved output handle is available.]"
         )
     return (
-        "[Tool result cleared from context. Older tool result compacted from prompt. "
+        "[Tool output omitted from prompt. "
         f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
-        f"Full saved output remains queryable via call_id '{recovery_call_id}'. "
-        f"Use list_tool_output_anchors(call_id='{recovery_call_id}') to inspect available structured sections, "
-        f"read_tool_output_anchor(call_id='{recovery_call_id}', anchor='<anchor>') after listing anchors to read one structured section, "
-        f"search_tool_output(call_id='{recovery_call_id}', pattern='error|timeout|keyword') for targeted lookup, "
-        f"or read_tool_output(call_id='{recovery_call_id}') for sequential inspection.]"
+        f"Recover with call_id '{recovery_call_id}' only if a specific missing detail is needed.]"
     )
 
 
