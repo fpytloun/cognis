@@ -977,8 +977,28 @@ class WorkflowEngine:
             step_index=step_index,
             cancel_event=cancel_event,
             orchestration_mode=step_orchestration,
+            turn_id=step_run_id,
             todos=persisted_todos,
         )
+
+        async def on_thinking(
+            block_id: str,
+            delta: str,
+            title: str | None,
+            complete: bool,
+            content: str | None = None,
+        ) -> None:
+            if hasattr(self._session_cache, "update_active_thinking"):
+                self._session_cache.update_active_thinking(
+                    session.session_id,
+                    message_id=step_run_id,
+                    turn_id=step_run_id,
+                    block_id=block_id,
+                    delta=delta,
+                    title=title,
+                    complete=complete,
+                    content=content,
+                )
 
         # Run agent loop
         try:
@@ -990,7 +1010,11 @@ class WorkflowEngine:
                 effective_working_directory=ctx.working_directory,
                 access_context=access_context,
             ):
-                output = await self._agent_loop.run_step(ctx, on_token=on_progress)
+                output = await self._agent_loop.run_step(
+                    ctx,
+                    on_token=on_progress,
+                    on_thinking=on_thinking,
+                )
         except StepInterrupted:
             current_status = await self._read_task_status(task.task_id)
             async with self._session_factory() as db_session:

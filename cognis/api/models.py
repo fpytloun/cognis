@@ -246,6 +246,22 @@ class ActiveStreamSnapshotResponse(BaseModel):
     updated_at: str | None = None
 
 
+class ActiveThinkingBlockResponse(BaseModel):
+    block_id: str
+    title: str
+    content: str
+    source: str = "summary"
+    complete: bool = False
+
+
+class ActiveThinkingSnapshotResponse(BaseModel):
+    session_id: str
+    message_id: str
+    turn_id: str | None = None
+    blocks: list[ActiveThinkingBlockResponse] = Field(default_factory=list)
+    updated_at: str | None = None
+
+
 class MessageHistoryResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
@@ -401,6 +417,7 @@ class SessionEventsResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
     has_more: bool = False
+    active_thinking: list[ActiveThinkingSnapshotResponse] = Field(default_factory=list)
 
 
 class SessionCancelResponse(BaseModel):

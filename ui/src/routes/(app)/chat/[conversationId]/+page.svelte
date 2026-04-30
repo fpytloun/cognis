@@ -77,6 +77,7 @@ import X from 'lucide-svelte/icons/x';
   import {
     annotateStepRequestInputWithNotification,
     applyActiveStreamSnapshots,
+    applyActiveThinkingSnapshots,
     applyWebSocketEvent,
     appendOptimisticUserMessage,
     findPendingStepRequestInputCall,
@@ -88,7 +89,7 @@ import X from 'lucide-svelte/icons/x';
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
-  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -558,6 +559,7 @@ import X from 'lucide-svelte/icons/x';
   let showTurnProgress = $derived.by(() =>
     turnInProgress
       && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
+      && !timeline.some((item) => item.kind === 'thinking' && item.streaming)
   );
   let isPreSessionConversation = $derived.by(() =>
     isPreSessionChatConversation(currentConversation, sessions.length)
@@ -841,7 +843,7 @@ import X from 'lucide-svelte/icons/x';
   async function loadSessionHistory(
     conversationId: string,
     sessionId: string,
-  ): Promise<{ events: MessageEvent[]; lastSeq: number; truncated: boolean }> {
+  ): Promise<{ events: MessageEvent[]; lastSeq: number; truncated: boolean; activeThinking: ActiveThinkingSnapshot[] }> {
     const events: MessageEvent[] = [];
     let afterSeq = 0;
     let pageCount = 0;
@@ -853,11 +855,11 @@ import X from 'lucide-svelte/icons/x';
       lastSeq = response.last_seq;
       pageCount += 1;
       if (!response.has_more || response.items.length === 0) {
-        return { events, lastSeq, truncated: false };
+        return { events, lastSeq, truncated: false, activeThinking: response.active_thinking ?? [] };
       }
       afterSeq = getNextHistoryAfterSeq(response);
       if (afterSeq === 0) {
-        return { events, lastSeq, truncated: false };
+        return { events, lastSeq, truncated: false, activeThinking: response.active_thinking ?? [] };
       }
     }
 
@@ -867,7 +869,7 @@ import X from 'lucide-svelte/icons/x';
       data: { reason: 'bootstrap_cap_reached', session_id: sessionId },
       timestamp: new Date().toISOString()
     });
-    return { events, lastSeq, truncated: true };
+    return { events, lastSeq, truncated: true, activeThinking: [] };
   }
 
   async function refreshSidebarData(): Promise<void> {
@@ -2124,7 +2126,7 @@ import X from 'lucide-svelte/icons/x';
       // Event for a different conversation — mark it as unread locally
       // and show a browser notification if appropriate.
       const otherConvId = event.conversation_id;
-      if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'tool_call' || event.type === 'delegation_started') {
+      if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'delegation_started') {
         setConversationTurnIndicator(otherConvId, true);
       } else if (event.type === 'turn_settled' || event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
         setConversationTurnIndicator(otherConvId, false);
@@ -2257,7 +2259,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'tool_call' || event.type === 'delegation_started') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
       setConversationTurnIndicator(currentConversation?.conversation_id, true);
@@ -2467,7 +2469,7 @@ import X from 'lucide-svelte/icons/x';
     }
 
     // Auto-scroll on new content
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
       scrollToBottom();
     }
 
@@ -2500,7 +2502,7 @@ import X from 'lucide-svelte/icons/x';
     try {
       const result = await loadSessionHistory(currentConversation.conversation_id, sessionId);
       subSessionEvents = result.events;
-      subSessionTimeline = normalizeHistory(result.events);
+      subSessionTimeline = applyActiveThinkingSnapshots(normalizeHistory(result.events), result.activeThinking);
       subSessionLastSeq = result.lastSeq;
     } catch (err) {
       subSessionError = asApiError(err)?.message ?? 'Failed to load session events';
@@ -2525,8 +2527,8 @@ import X from 'lucide-svelte/icons/x';
         );
         if ((result.items ?? []).length > 0) {
           subSessionEvents = [...subSessionEvents, ...(result.items ?? [])];
-          subSessionTimeline = normalizeHistory(subSessionEvents);
         }
+        subSessionTimeline = applyActiveThinkingSnapshots(normalizeHistory(subSessionEvents), result.active_thinking ?? []);
         subSessionLastSeq = result.last_seq;
         subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
       } catch {

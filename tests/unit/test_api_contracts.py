@@ -17,6 +17,8 @@ from pydantic import ValidationError
 
 from cognis.api.models import (
     ActiveStreamSnapshotResponse,
+    ActiveThinkingBlockResponse,
+    ActiveThinkingSnapshotResponse,
     AgentGrantResponse,
     AgentResponse,
     DeliverableResponse,
@@ -25,6 +27,7 @@ from cognis.api.models import (
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
+    SessionEventsResponse,
     SkillResponse,
     SkillVersionResponse,
     StepProfileResponse,
@@ -178,6 +181,31 @@ def test_message_history_response_round_trips_active_streams() -> None:
     assert response.has_active_turn is True
     assert response.active_streams[0].content == "partial assistant text"
     assert response.active_streams[0].chunk_count == 3
+
+
+def test_session_events_response_round_trips_active_thinking() -> None:
+    response = SessionEventsResponse(
+        session_id="sess-1",
+        items=[],
+        active_thinking=[
+            ActiveThinkingSnapshotResponse(
+                session_id="sess-1",
+                message_id="sr-1",
+                turn_id="sr-1",
+                blocks=[
+                    ActiveThinkingBlockResponse(
+                        block_id="thk-1",
+                        title="Considering options",
+                        content="Considering options for the task",
+                    )
+                ],
+                updated_at="2026-04-20T00:00:00Z",
+            )
+        ],
+    )
+
+    assert response.active_thinking[0].message_id == "sr-1"
+    assert response.active_thinking[0].blocks[0].content == "Considering options for the task"
 
 
 def test_push_subscription_status_response_round_trip() -> None:

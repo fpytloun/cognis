@@ -5,17 +5,9 @@
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
   import Brain from 'lucide-svelte/icons/brain';
 
-  let { item, compact = false } = $props<{ item: ThinkingTimelineItem; compact?: boolean }>();
+  let { item } = $props<{ item: ThinkingTimelineItem; compact?: boolean }>();
 
   let expanded = $state(false);
-  let initializedFromCompact = $state(false);
-
-  $effect(() => {
-    if (initializedFromCompact) return;
-    // Log views start expanded for scanability, but still remain collapsible.
-    expanded = compact;
-    initializedFromCompact = true;
-  });
 
   function toggle(): void {
     expanded = !expanded;

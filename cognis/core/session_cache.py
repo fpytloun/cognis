@@ -17,6 +17,7 @@ import collections
 import contextlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 
@@ -75,6 +76,28 @@ class DiscoveredToolHandle:
     confidence: float | None = None
     discovered_at: str | None = None
     last_used_at: str | None = None
+
+
+@dataclass(slots=True)
+class ActiveThinkingBlock:
+    """Volatile in-flight reasoning block for live session logs."""
+
+    block_id: str
+    title: str
+    content: str = ""
+    source: str = "summary"
+    complete: bool = False
+
+
+@dataclass(slots=True)
+class ActiveThinkingState:
+    """Volatile thinking snapshot for a running session."""
+
+    session_id: str
+    message_id: str
+    turn_id: str | None
+    blocks: dict[str, ActiveThinkingBlock] = field(default_factory=dict)
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
 @dataclass(slots=True)
@@ -353,6 +376,7 @@ class SessionCache:
         self.max_entries = max_entries
         self._entries: dict[str, CachedSessionState] = {}
         self._entries_lock = asyncio.Lock()
+        self._active_thinking: dict[str, ActiveThinkingState] = {}
         self._redis: Any | None = None
         self._redis_ttl = redis_ttl_seconds
         if redis_url:
@@ -379,6 +403,75 @@ class SessionCache:
             with contextlib.suppress(Exception):
                 await self._redis.aclose()
             self._redis = None
+
+    def update_active_thinking(
+        self,
+        session_id: str,
+        *,
+        message_id: str,
+        turn_id: str | None,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+        content: str | None = None,
+    ) -> None:
+        """Store an in-memory thinking delta for live, unpersisted session logs."""
+
+        state = self._active_thinking.get(session_id)
+        if state is None or state.message_id != message_id or state.turn_id != turn_id:
+            state = ActiveThinkingState(
+                session_id=session_id,
+                message_id=message_id,
+                turn_id=turn_id,
+            )
+            self._active_thinking[session_id] = state
+        block = state.blocks.get(block_id)
+        if block is None:
+            block = ActiveThinkingBlock(block_id=block_id, title=title or "Thinking")
+            state.blocks[block_id] = block
+        if content is not None:
+            block.content = content
+        elif delta:
+            block.content += delta
+        if title:
+            block.title = title
+        block.complete = complete
+        state.updated_at = datetime.now(UTC).isoformat()
+        if complete:
+            # Completed blocks are persisted by the agent loop; keep only live blocks here.
+            state.blocks.pop(block_id, None)
+            if not state.blocks:
+                self._active_thinking.pop(session_id, None)
+
+    def active_thinking_snapshots(self, session_id: str) -> list[dict[str, Any]]:
+        """Return live thinking snapshots for a session's currently running turn."""
+
+        state = self._active_thinking.get(session_id)
+        if state is None or not state.blocks:
+            return []
+        blocks = [
+            {
+                "block_id": block.block_id,
+                "title": block.title,
+                "content": block.content,
+                "source": block.source,
+                "complete": block.complete,
+            }
+            for block in state.blocks.values()
+            if block.content
+        ]
+        if not blocks:
+            return []
+        return [
+            {
+                "session_id": state.session_id,
+                "message_id": state.message_id,
+                "turn_id": state.turn_id,
+                "blocks": blocks,
+                "updated_at": state.updated_at,
+            }
+        ]
 
     # ------------------------------------------------------------------
     # Redis L2 helpers (best-effort, never raise)

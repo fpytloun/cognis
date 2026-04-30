@@ -1,6 +1,6 @@
 import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
 import { normalizeFileDiffs, type FileDiff } from '$lib/diff';
-import type { ActiveStreamSnapshot, AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
+import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
 
 /**
  * Per-message markdown streamers. Streaming assistant replies accumulate
@@ -742,6 +742,50 @@ export function applyActiveStreamSnapshots(
 ): TimelineItem[] {
   if (!snapshots?.length) return items;
   return snapshots.reduce((next, snapshot) => applyActiveStreamSnapshot(next, snapshot), items);
+}
+
+export function applyActiveThinkingSnapshots(
+  items: TimelineItem[],
+  snapshots: ActiveThinkingSnapshot[] | undefined | null,
+): TimelineItem[] {
+  if (!snapshots?.length) return items;
+  let next = [...items];
+  for (const snapshot of snapshots) {
+    const turnId = normalizeEventTurnId(snapshot.turn_id) ?? snapshot.message_id;
+    const blocks = (snapshot.blocks ?? [])
+      .filter((block) => typeof block.content === 'string' && block.content.length > 0)
+      .map((block) => ({
+        block_id: block.block_id,
+        title: block.title || 'Thinking',
+        content: block.content,
+        html: renderMarkdown(block.content),
+        source: block.source || 'summary',
+        complete: block.complete,
+      }) satisfies ThinkingBlock);
+    if (blocks.length === 0) continue;
+
+    const existingIndex = next.findIndex(
+      (item) => item.kind === 'thinking'
+        && item.turnId === turnId
+        && (item as ThinkingTimelineItem).messageId === snapshot.message_id,
+    );
+    const item: ThinkingTimelineItem = {
+      id: `thinking:${turnId}:active`,
+      kind: 'thinking',
+      messageId: snapshot.message_id,
+      turnId,
+      blocks,
+      streaming: blocks.some((block) => !block.complete),
+      activeTitle: [...blocks].reverse().find((block) => !block.complete)?.title ?? null,
+      timestamp: snapshot.updated_at ?? new Date().toISOString(),
+    };
+    if (existingIndex >= 0) {
+      next[existingIndex] = item;
+    } else {
+      insertBeforeOpenPhaseAssistant(next, item, turnId);
+    }
+  }
+  return next;
 }
 
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {

@@ -92,6 +92,11 @@ async def session_events(
         ),
         last_seq=result.last_seq,
         has_more=result.has_more,
+        active_thinking=(
+            request.app.state.session_cache.active_thinking_snapshots(row.session_id)
+            if getattr(request.app.state, "session_cache", None) is not None
+            else []
+        ),
     )
 
 

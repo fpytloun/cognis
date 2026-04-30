@@ -204,6 +204,22 @@ export interface ActiveStreamSnapshot {
   updated_at?: string | null;
 }
 
+export interface ActiveThinkingBlockSnapshot {
+  block_id: string;
+  title: string;
+  content: string;
+  source: string;
+  complete: boolean;
+}
+
+export interface ActiveThinkingSnapshot {
+  session_id: string;
+  message_id: string;
+  turn_id?: string | null;
+  blocks: ActiveThinkingBlockSnapshot[];
+  updated_at?: string | null;
+}
+
 export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;
@@ -241,6 +257,7 @@ export interface SessionEventsResponse {
   items: MessageEvent[];
   last_seq: number;
   has_more: boolean;
+  active_thinking?: ActiveThinkingSnapshot[];
 }
 
 export interface IntarisSessionDetail {

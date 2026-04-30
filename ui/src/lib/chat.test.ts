@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   annotateStepRequestInputWithNotification,
   applyActiveStreamSnapshots,
+  applyActiveThinkingSnapshots,
   appendOptimisticUserMessage,
   applyWebSocketEvent,
   findPendingStepRequestInputCall,
@@ -1162,6 +1163,32 @@ describe('chat timeline helpers', () => {
 
     const thinking2 = after2[0] as ThinkingTimelineItem;
     expect(thinking2.blocks[0].content).toBe('Considering further options');
+  });
+
+  it('applies active thinking snapshots to polled session timelines', () => {
+    const items = applyActiveThinkingSnapshots([], [
+      {
+        session_id: 'sess_1',
+        message_id: 'sr_1',
+        turn_id: 'sr_1',
+        updated_at: '2026-04-20T00:00:00Z',
+        blocks: [
+          {
+            block_id: 'thk_1',
+            title: 'Considering options',
+            content: 'Considering options for the task',
+            source: 'summary',
+            complete: false,
+          },
+        ],
+      },
+    ]);
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'thinking', streaming: true });
+    const thinking = items[0] as ThinkingTimelineItem;
+    expect(thinking.activeTitle).toBe('Considering options');
+    expect(thinking.blocks[0].content).toBe('Considering options for the task');
   });
 
   it('finalizes a thinking block on assistant_thinking_block complete event', () => {

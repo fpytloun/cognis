@@ -11,7 +11,7 @@
     SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
-  import { latestTodoSnapshot, normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type TodoSnapshotItem } from '$lib/chat';
+  import { applyActiveThinkingSnapshots, latestTodoSnapshot, normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type TodoSnapshotItem } from '$lib/chat';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
@@ -20,7 +20,7 @@
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { Escalation, MessageEvent } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Escalation, MessageEvent } from '$lib/types/api';
 
   let {
     conversationId,
@@ -168,10 +168,12 @@
         let afterSeq = 0;
         let pageCount = 0;
         let finalLastSeq = 0;
+        let activeThinking: ActiveThinkingSnapshot[] = [];
         while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
           const result = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
           history.push(...(result.items ?? []));
           finalLastSeq = result.last_seq;
+          activeThinking = result.active_thinking ?? [];
           pageCount += 1;
           if (!result.has_more || result.items.length === 0) break;
           afterSeq = result.last_seq;
@@ -187,16 +189,18 @@
         }
         events = history;
         lastSeq = finalLastSeq;
-        timeline = normalizeHistory(history);
+        timeline = applyActiveThinkingSnapshots(normalizeHistory(history), activeThinking);
         await tick();
         userScrolledUp = false;
         scrollToBottom(true);
       } else {
         const result = await api.conversations.sessionEvents(conversationId, sessionId, lastSeq, SESSION_LOG_PAGE_SIZE);
+        const shouldFollow = !userScrolledUp;
         if ((result.items ?? []).length > 0) {
-          const shouldFollow = !userScrolledUp;
           events = [...events, ...(result.items ?? [])];
-          timeline = normalizeHistory(events);
+        }
+        timeline = applyActiveThinkingSnapshots(normalizeHistory(events), result.active_thinking ?? []);
+        if ((result.items ?? []).length > 0 || (result.active_thinking ?? []).length > 0 || timeline.some((item) => item.kind === 'thinking' && item.streaming)) {
           await tick();
           if (shouldFollow) scrollToBottom(true);
         }

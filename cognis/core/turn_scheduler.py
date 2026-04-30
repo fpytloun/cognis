@@ -1882,6 +1882,17 @@ class TurnScheduler:
             complete: bool,
             content: str | None = None,
         ) -> None:
+            if hasattr(self._session_cache, "update_active_thinking"):
+                self._session_cache.update_active_thinking(
+                    session_id,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                    block_id=block_id,
+                    delta=delta,
+                    title=title,
+                    complete=complete,
+                    content=content,
+                )
             await asyncio.gather(
                 *(
                     self._call_observer(
