@@ -250,6 +250,10 @@ class MessageHistoryResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
     has_more: bool = False
+    has_active_turn: bool = Field(
+        default=False,
+        description="Whether the controller currently has user-visible work running for this conversation.",
+    )
     active_streams: list[ActiveStreamSnapshotResponse] = Field(default_factory=list)
     active_session_id: str | None = Field(
         default=None,

@@ -794,6 +794,7 @@ import X from 'lucide-svelte/icons/x';
     let activeSessionId: string | null | undefined = null;
     let activeSessionLastSeq = 0;
     let activeStreams: import('$lib/types/api').ActiveStreamSnapshot[] = [];
+    let hasActiveTurn = false;
     let historyTruncated = false;
     let truncationReason: string | null | undefined = null;
 
@@ -803,6 +804,7 @@ import X from 'lucide-svelte/icons/x';
       activeSessionId = response.active_session_id;
       activeSessionLastSeq = response.active_session_last_seq ?? activeSessionLastSeq;
       activeStreams = response.active_streams ?? activeStreams;
+      hasActiveTurn = response.has_active_turn ?? hasActiveTurn;
       historyTruncated = response.history_truncated ?? historyTruncated;
       truncationReason = response.truncation_reason ?? truncationReason;
       if (!response.has_more || response.items.length === 0) {
@@ -810,6 +812,7 @@ import X from 'lucide-svelte/icons/x';
           items: events,
           last_seq: response.last_seq,
           has_more: response.has_more,
+          has_active_turn: hasActiveTurn,
           active_streams: activeStreams,
           active_session_id: activeSessionId,
           active_session_last_seq: activeSessionLastSeq,
@@ -824,6 +827,7 @@ import X from 'lucide-svelte/icons/x';
           items: events,
           last_seq: response.last_seq,
           has_more: response.has_more,
+          has_active_turn: hasActiveTurn,
           active_streams: activeStreams,
           active_session_id: activeSessionId,
           active_session_last_seq: activeSessionLastSeq,
@@ -1242,6 +1246,7 @@ import X from 'lucide-svelte/icons/x';
             items: [],
             last_seq: 0,
             has_more: false,
+            has_active_turn: false,
             active_streams: [],
             active_session_id: null,
             active_session_last_seq: 0,
@@ -1281,7 +1286,8 @@ import X from 'lucide-svelte/icons/x';
         normalizeHistory(historyResult.value.items),
         historyResult.value.active_streams,
       );
-      turnInProgress = hasActiveTurnTimelineItem();
+      turnInProgress = historyResult.value.has_active_turn ?? hasActiveTurnTimelineItem();
+      setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
       if (turnInProgress) {
         awaitingAssistantStart = false;
       }
@@ -2382,7 +2388,7 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'reconnected') {
       awaitingAssistantStart = false;
-      turnInProgress = hasActiveTurnTimelineItem();
+      turnInProgress = event.has_active_turn ?? hasActiveTurnTimelineItem();
       setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
     }
 

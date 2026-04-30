@@ -139,6 +139,7 @@ def test_deliverable_response_round_trip() -> None:
 def test_message_history_response_round_trips_active_streams() -> None:
     response = MessageHistoryResponse(
         items=[],
+        has_active_turn=True,
         active_streams=[
             ActiveStreamSnapshotResponse(
                 conversation_id="conv-1",
@@ -153,6 +154,7 @@ def test_message_history_response_round_trips_active_streams() -> None:
         ],
     )
 
+    assert response.has_active_turn is True
     assert response.active_streams[0].content == "partial assistant text"
     assert response.active_streams[0].chunk_count == 3
 

@@ -497,6 +497,9 @@ async def conversation_messages(
 
     await _hydrate_event_attachments(request, all_events, conversation_id=conversation_id)
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    has_active_turn = bool(
+        turn_scheduler and turn_scheduler.has_running_turn(conversation_id)
+    )
     active_streams = (
         await turn_scheduler.active_stream_snapshots(conversation_id)
         if turn_scheduler is not None
@@ -514,6 +517,7 @@ async def conversation_messages(
         ),
         last_seq=last_seq_value,
         has_more=has_more,
+        has_active_turn=has_active_turn,
         active_streams=active_streams,
         active_session_id=active_session_id,
         active_session_last_seq=active_session_last_seq,

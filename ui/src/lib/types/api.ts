@@ -208,6 +208,7 @@ export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;
   has_more: boolean;
+  has_active_turn: boolean;
   active_streams?: ActiveStreamSnapshot[];
   active_session_id?: string | null;
   active_session_last_seq?: number;
@@ -1606,6 +1607,7 @@ export interface WebSocketReconnectedEvent {
   session_id?: string;
   missed_events_count: number;
   last_seq?: number;
+  has_active_turn?: boolean;
 }
 
 export interface WebSocketSessionRecoveredEvent {

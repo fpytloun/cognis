@@ -862,6 +862,9 @@ class WebSocketConnectionManager:
             )
 
         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        has_active_turn = bool(
+            turn_scheduler and turn_scheduler.has_running_turn(conversation_id)
+        )
         if turn_scheduler is not None:
             for snapshot in await turn_scheduler.active_stream_snapshots(conversation_id):
                 await connection.send_json(
@@ -878,6 +881,7 @@ class WebSocketConnectionManager:
                 "session_id": session.session_id,
                 "missed_events_count": replayed,
                 "last_seq": result.last_seq,
+                "has_active_turn": has_active_turn,
             }
         )
 
