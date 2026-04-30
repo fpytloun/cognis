@@ -674,6 +674,11 @@ import X from 'lucide-svelte/icons/x';
     patchConversationInList(currentConversation.conversation_id, { active_session_id: activeSessionId }, { touchUpdatedAt: true });
   }
 
+  function setConversationTurnIndicator(conversationId: string | null | undefined, active: boolean): void {
+    if (!conversationId) return;
+    patchConversationInList(conversationId, { has_active_turn: active }, { touchUpdatedAt: active });
+  }
+
   async function loadConversationPage(reset = false): Promise<void> {
     const channelFilter = selectedChannel !== 'all' ? selectedChannel : null;
     const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
@@ -2113,6 +2118,11 @@ import X from 'lucide-svelte/icons/x';
       // Event for a different conversation — mark it as unread locally
       // and show a browser notification if appropriate.
       const otherConvId = event.conversation_id;
+      if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'tool_call' || event.type === 'delegation_started') {
+        setConversationTurnIndicator(otherConvId, true);
+      } else if (event.type === 'turn_settled' || event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
+        setConversationTurnIndicator(otherConvId, false);
+      }
       if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed') {
         const idx = conversations.findIndex((c) => c.conversation_id === otherConvId);
         const conversation = idx >= 0 ? conversations[idx] : null;
@@ -2186,6 +2196,7 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'turn_started' || event.type === 'queued') {
       turnInProgress = true;
+      setConversationTurnIndicator(currentConversation?.conversation_id, true);
     }
 
     if (event.type === 'error') {
@@ -2199,6 +2210,7 @@ import X from 'lucide-svelte/icons/x';
         error = '';
         awaitingAssistantStart = false;
         turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
         directQuestionSubmitting = false;
         return;
       }
@@ -2210,6 +2222,7 @@ import X from 'lucide-svelte/icons/x';
         error = '';
         awaitingAssistantStart = false;
         turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
         directQuestionSubmitting = false;
         pendingDirectQuestion = null;
         if (escalationBusyCallId) {
@@ -2225,6 +2238,7 @@ import X from 'lucide-svelte/icons/x';
       }
       awaitingAssistantStart = false;
       turnInProgress = false;
+      setConversationTurnIndicator(currentConversation?.conversation_id, false);
       directQuestionSubmitting = false;
       if (escalationBusyCallId) {
         escalationBusyCallId = null;
@@ -2240,6 +2254,7 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'tool_call' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
+      setConversationTurnIndicator(currentConversation?.conversation_id, true);
     }
 
     if (
@@ -2252,12 +2267,14 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'turn_settled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      setConversationTurnIndicator(currentConversation?.conversation_id, false);
       directQuestionSubmitting = false;
     }
 
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      setConversationTurnIndicator(currentConversation?.conversation_id, false);
       if (directQuestionSubmitting) {
         pendingDirectQuestion = null;
       }
@@ -2348,6 +2365,7 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'session_reset') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      setConversationTurnIndicator(currentConversation?.conversation_id, false);
       timeline = applyWebSocketEvent([], {
         type: 'system_message',
         conversation_id: event.conversation_id,
@@ -2365,6 +2383,7 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'reconnected') {
       awaitingAssistantStart = false;
       turnInProgress = hasActiveTurnTimelineItem();
+      setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
     }
 
     // Handle conversation_created: navigate to new conversation
@@ -2390,6 +2409,7 @@ import X from 'lucide-svelte/icons/x';
         directQuestionSubmitting = false;
         awaitingAssistantStart = false;
         turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
       }
     }
 
@@ -2407,6 +2427,7 @@ import X from 'lucide-svelte/icons/x';
         directQuestionSubmitting = false;
         awaitingAssistantStart = false;
         turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
       }
     }
 
@@ -2887,15 +2908,19 @@ import X from 'lucide-svelte/icons/x';
               {@const agent = conversationAgent(conversation)}
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
+              {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
               <a
                 class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={closeMobileList}
               >
-                <div class="relative shrink-0">
+                <div class="relative grid h-9 w-9 shrink-0 place-items-center">
+                  {#if inProgress}
+                    <span class="conversation-turn-orbit" aria-hidden="true"><span></span></span>
+                  {/if}
                   <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                  {#if unread}
-                    <span class="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-sky-400"></span>
+                  {#if unread && !inProgress}
+                    <span class="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-sky-400"></span>
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
@@ -3808,5 +3833,46 @@ import X from 'lucide-svelte/icons/x';
   }
   .animate-slide-out-right {
     animation: slide-out-right 0.25s ease-in forwards;
+  }
+
+  @keyframes conversation-turn-orbit {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  .conversation-turn-orbit {
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    pointer-events: none;
+    animation: conversation-turn-orbit 1.15s linear infinite;
+    background: conic-gradient(
+      from 0deg,
+      rgb(56 189 248 / 0) 0deg,
+      rgb(56 189 248 / 0.08) 210deg,
+      rgb(56 189 248 / 0.46) 315deg,
+      rgb(125 211 252 / 0.95) 360deg
+    );
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  }
+
+  .conversation-turn-orbit span {
+    position: absolute;
+    left: 50%;
+    top: -1px;
+    height: 0.5rem;
+    width: 0.5rem;
+    transform: translateX(-50%);
+    border-radius: 9999px;
+    background: rgb(56 189 248);
+    box-shadow: 0 0 10px rgb(56 189 248 / 0.9), 0 0 18px rgb(14 165 233 / 0.45);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .conversation-turn-orbit {
+      animation: none;
+      transform: rotate(45deg);
+    }
   }
 </style>

@@ -135,7 +135,16 @@ async def conversation_list(
             project_id=project_id,
             status=status,
         )
-    items = [conversation_to_response(row) for row in rows]
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    items = [
+        conversation_to_response(
+            row,
+            has_active_turn=bool(
+                turn_scheduler and turn_scheduler.has_running_turn(row.conversation_id)
+            ),
+        )
+        for row in rows
+    ]
     page_items, next_cursor, has_more = paginate_items(
         items,
         limit=limit,

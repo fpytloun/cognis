@@ -43,7 +43,7 @@ from cognis.providers.llm.reasoning import enrich_model_entry
 logger = get_logger(__name__)
 
 
-def conversation_to_response(row: Any) -> ConversationResponse:
+def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
     has_unread = last_message_at is not None and (
@@ -70,6 +70,7 @@ def conversation_to_response(row: Any) -> ConversationResponse:
         last_message_at=last_message_at,
         last_read_at=last_read_at,
         has_unread=has_unread,
+        has_active_turn=has_active_turn,
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
     )

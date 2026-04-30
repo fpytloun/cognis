@@ -223,6 +223,7 @@ class ConversationResponse(BaseModel):
     last_message_at: datetime | None = None
     last_read_at: datetime | None = None
     has_unread: bool = False
+    has_active_turn: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

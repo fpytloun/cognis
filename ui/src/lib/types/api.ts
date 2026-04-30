@@ -115,6 +115,7 @@ export interface Conversation {
     last_message_at: string | null;
     last_read_at: string | null;
     has_unread: boolean;
+    has_active_turn: boolean;
     created_at: string | null;
     updated_at: string | null;
 }
