@@ -21,6 +21,8 @@ RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
 
 logger = get_logger(__name__)
 
+_NATIVE_APPLY_PATCH_OPERATION_TYPES = {"create_file", "update_file", "delete_file"}
+
 
 @dataclass(slots=True)
 class NormalizedResponseEnvelope:
@@ -215,7 +217,28 @@ def _extract_native_apply_patch_operation(function_name: str, arguments: str) ->
     if not isinstance(parsed, dict):
         return None
     operation = parsed.get("operation")
-    return operation if isinstance(operation, dict) else None
+    return _normalize_native_apply_patch_operation(operation)
+
+
+def _normalize_native_apply_patch_operation(operation: Any) -> dict[str, Any] | None:
+    """Return a Responses-safe native apply_patch operation, or None.
+
+    The OpenAI Responses API validates prior native ``apply_patch_call`` items
+    before the model runs. Replaying incomplete operations such as
+    ``{"operation": {}}`` poisons the transcript with request-time 400s, so
+    only well-formed operations are projected back into native history.
+    """
+
+    if not isinstance(operation, dict):
+        return None
+    operation_type = str(operation.get("type") or "").strip()
+    path = str(operation.get("path") or "").strip()
+    if operation_type not in _NATIVE_APPLY_PATCH_OPERATION_TYPES or not path:
+        return None
+    normalized = dict(operation)
+    normalized["type"] = operation_type
+    normalized["path"] = path
+    return normalized
 
 
 def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -275,8 +298,8 @@ def _tool_call_item_name(item: dict[str, Any]) -> str:
 
 def _tool_call_item_arguments(item: dict[str, Any]) -> str:
     if str(item.get("type")) == "apply_patch_call":
-        operation = item.get("operation")
-        return json.dumps({"operation": operation if isinstance(operation, dict) else {}})
+        operation = _normalize_native_apply_patch_operation(item.get("operation"))
+        return json.dumps({"operation": operation}) if operation is not None else ""
     return str(item.get("arguments") or "")
 
 

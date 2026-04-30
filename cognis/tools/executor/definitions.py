@@ -166,30 +166,18 @@ APPLY_PATCH_TOOL = ToolDefinition(
     name="apply_patch",
     description=(
         "Apply a strict patch to one or more text files using the apply_patch "
-        "envelope, native operation object, or supported unified diff update subset."
+        "envelope or supported unified diff update subset."
     ),
     parameters={
         "type": "object",
-        "description": "Provide either patchText or operation.",
+        "description": "Provide patchText.",
         "properties": {
             "patchText": {
                 "type": "string",
                 "description": "Patch text in apply_patch envelope syntax or the supported unified diff update subset",
             },
-            "operation": {
-                "type": "object",
-                "description": "Native apply_patch operation with type, path, and optional diff. Used by OpenAI Responses native apply_patch calls.",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": ["create_file", "update_file", "delete_file"],
-                    },
-                    "path": {"type": "string"},
-                    "diff": {"type": "string"},
-                },
-                "required": ["type", "path"],
-            },
         },
+        "required": ["patchText"],
     },
     source=_EXECUTOR_SOURCE,
     category="filesystem",

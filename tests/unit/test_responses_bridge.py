@@ -279,6 +279,26 @@ def test_responses_to_chat_response_normalizes_apply_patch_call() -> None:
     )
 
 
+def test_responses_to_chat_response_drops_incomplete_apply_patch_arguments() -> None:
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "apply_patch_call",
+                "id": "apc_1",
+                "call_id": "call_patch",
+                "operation": {"type": "update_file", "path": "", "diff": "@@\n-x\n+y\n"},
+            }
+        ],
+    }
+
+    result = responses_to_chat_response(payload)
+
+    tool_call = result["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "apply_patch"
+    assert tool_call["function"]["arguments"] == "{}"
+
+
 def test_messages_to_responses_input_drops_tool_messages_without_tool_call_id() -> None:
     result = messages_to_responses_input(
         [
@@ -332,6 +352,45 @@ def test_messages_to_responses_input_maps_native_apply_patch_roundtrip() -> None
             "output": "Updated /tmp/a.txt",
         },
     ]
+
+
+def test_messages_to_responses_input_does_not_replay_invalid_native_apply_patch() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": '{"operation":{"type":"update_file","path":"","diff":"@@\\n-x\\n+y\\n"}}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "Native apply_patch operation requires a path.",
+            "_tool_name": "apply_patch",
+            "_tool_is_error": True,
+        },
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result[0] == {
+        "type": "function_call",
+        "call_id": "call_patch",
+        "name": "apply_patch",
+        "arguments": '{"operation":{"type":"update_file","path":"","diff":"@@\\n-x\\n+y\\n"}}',
+    }
+    assert result[1] == {
+        "type": "function_call_output",
+        "call_id": "call_patch",
+        "output": "Native apply_patch operation requires a path.",
+    }
 
 
 def test_messages_to_responses_input_marks_failed_native_apply_patch_output() -> None:

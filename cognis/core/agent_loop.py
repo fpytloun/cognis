@@ -457,6 +457,19 @@ def _truncate_tool_data(text: str) -> str:
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
 
 
+def _bounded_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return JSON-safe tool-call arguments for persisted history/events."""
+
+    serialized = json.dumps(arguments, default=str)
+    if len(serialized) <= _MAX_TOOL_DATA_BYTES:
+        return arguments
+    return {
+        "_truncated": True,
+        "_original_size": len(serialized),
+        "_preview": _truncate_tool_data(serialized),
+    }
+
+
 def _step_complete_example_payload() -> dict[str, Any]:
     """Return a minimal valid ``step_complete`` payload example."""
 
@@ -614,7 +627,7 @@ def _append_tool_call_event(
                 "name": tc.name,
                 "tool_id": tool_id,
                 "call_id": tc.call_id,
-                "arguments": _truncate_tool_data(json.dumps(tc.arguments, default=str)),
+                "arguments": _bounded_tool_arguments(tc.arguments),
             },
         )
     )

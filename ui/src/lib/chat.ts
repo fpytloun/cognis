@@ -832,7 +832,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       if (typeof event.data.arguments === 'object' && event.data.arguments !== null) {
         args = event.data.arguments as Record<string, unknown>;
       } else if (typeof event.data.arguments === 'string') {
-        try { args = JSON.parse(event.data.arguments as string); } catch { args = undefined; }
+        try { args = JSON.parse(event.data.arguments as string); } catch { args = { _raw: event.data.arguments }; }
       }
       const item: ToolCallTimelineItem = {
         id: `tool:${callId}`,

@@ -22,6 +22,7 @@ from cognis.core.agent_loop import (
     SessionLock,
     StepContext,
     StreamAccumulator,
+    _bounded_tool_arguments,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
     _iterate_llm_stream_with_idle_timeout,
@@ -234,6 +235,17 @@ def test_stream_accumulator_reset() -> None:
     acc.reset()
     assert acc.get_content() == ""
     assert not acc.has_tool_calls()
+
+
+def test_bounded_tool_arguments_remain_json_safe() -> None:
+    arguments = {"patchText": "x" * 20_000}
+
+    bounded = _bounded_tool_arguments(arguments)
+
+    assert bounded["_truncated"] is True
+    assert bounded["_original_size"] > 20_000
+    assert isinstance(json.dumps(bounded), str)
+    assert "... (truncated," in str(bounded["_preview"])
 
 
 def test_stream_accumulator_collects_usage() -> None:

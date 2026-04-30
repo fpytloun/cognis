@@ -102,7 +102,8 @@ class TestDefinitions:
         assert tool.parameters.get("type") == "object"
         assert not (forbidden_top_level & set(tool.parameters))
         assert "patchText" in tool.parameters.get("properties", {})
-        assert "operation" in tool.parameters.get("properties", {})
+        assert "operation" not in tool.parameters.get("properties", {})
+        assert tool.parameters.get("required") == ["patchText"]
 
 
 class TestReadTool:
