@@ -152,6 +152,94 @@ def test_credential_request_approve_requires_declared_fields(
         assert response.status_code == 400
 
 
+def test_credential_request_approve_rejects_empty_declared_fields(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "credential_id": "github_login",
+                    "kind": "username_password",
+                    "label": "GitHub Login",
+                    "required_fields": ["username", "password"],
+                },
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={
+                "decision": "approve",
+                "response_payload": {"username": "alice", "password": "   "},
+            },
+        )
+
+        assert response.status_code == 400
+        assert "password" in response.text
+
+
+def test_credential_request_deny_drops_supplied_secret_payload(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={"credential_id": "github_work", "kind": "token", "label": "GitHub"},
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={
+                "decision": "deny",
+                "response": "secret-token",
+                "response_payload": {"token": "secret-token"},
+            },
+        )
+
+        assert response.status_code == 200
+        detail = client.get(
+            f"/api/v1/notifications/{notification_id}",
+            headers=_auth_headers(client.app, email="user@example.com"),
+        )
+        assert detail.status_code == 200
+        resolution = detail.json()["resolution"]
+        assert resolution == {"decision": "deny", "state": "resolved"}
+
+
 def test_credential_request_parses_username_password_formats(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -229,5 +317,45 @@ def test_credential_request_parses_token_reply(monkeypatch: object, tmp_path: Pa
             f"/api/v1/notifications/{notification_id}/resolve",
             headers=_auth_headers(client.app, email="user@example.com"),
             json={"decision": "approve", "response": "token: abc123"},
+        )
+        assert response.status_code == 200
+
+
+def test_credential_request_accepts_response_payload(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "credential_id": "site_login",
+                    "kind": "username_password",
+                    "label": "Site login",
+                    "required_fields": ["username", "password"],
+                },
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={
+                "decision": "approve",
+                "response_payload": {"username": "alice", "password": "secret"},
+            },
         )
         assert response.status_code == 200

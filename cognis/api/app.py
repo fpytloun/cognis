@@ -597,6 +597,7 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             channel_manager_ref=_get_channel_manager,
             turn_scheduler=turn_scheduler,
+            public_base_url=config_runtime.public_base_url,
         )
         workflow_engine._channel_delivery = channel_delivery  # noqa: SLF001
 

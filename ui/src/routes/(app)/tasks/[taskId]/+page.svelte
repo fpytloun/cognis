@@ -19,6 +19,7 @@ import Target from 'lucide-svelte/icons/target';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -63,6 +64,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let taskActionsOpen = $state(false);
   let outputModalStepRun = $state<StepRun | null>(null);
   let taskEscalations = $state<Escalation[]>([]);
+  let taskCredentialRequest = $state<Notification | null>(null);
   let taskEscalationBusyCallId = $state<string | null>(null);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
@@ -811,6 +813,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     if (!task?.pending_pause || task.status !== 'paused') return null;
     const pause = task.pending_pause;
     if (pause.pause_type === 'escalation') return null;
+    if (pause.pause_type === 'credential_request') return null;
     const currentStepName = task.workflow_run?.current_step_name;
     if (pause.step_name && currentStepName && pause.step_name !== currentStepName) {
       return {
@@ -846,15 +849,19 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   async function refreshTaskEscalations(): Promise<void> {
     if (!task) {
       taskEscalations = [];
+      taskCredentialRequest = null;
       return;
     }
-    const notifications = await api.notifications.list();
+    const notifications = await api.notifications.list(null, { taskId: task.task_id });
     taskEscalations = sortEscalations(
       notifications
         .map((notification) => taskEscalationFromNotification(notification))
         .filter((notification): notification is Escalation => notification !== null)
         .filter((notification) => !isEscalationExpired(notification))
     );
+    taskCredentialRequest = notifications.find(
+      (notification) => notification.notification_type === 'credential_request' && notification.status === 'pending'
+    ) ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -890,10 +897,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         await refreshTaskEscalations();
       } catch {
         taskEscalations = [];
+        taskCredentialRequest = null;
       }
     } catch (caughtError) {
       task = null;
       taskEscalations = [];
+      taskCredentialRequest = null;
       error = asApiError(caughtError).message;
     } finally {
       loading = false;
@@ -912,11 +921,13 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         await refreshTaskEscalations();
       } catch {
         taskEscalations = [];
+        taskCredentialRequest = null;
       }
     } catch (caughtError) {
       if (shouldClearTaskFromError(caughtError)) {
         task = null;
         taskEscalations = [];
+        taskCredentialRequest = null;
       }
       error = asApiError(caughtError).message;
     }
@@ -1288,6 +1299,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             queuedCount={taskEscalations.length - 1}
             onApprove={() => respondToEscalation(activeEscalation.call_id, 'approve')}
             onDeny={() => respondToEscalation(activeEscalation.call_id, 'deny')}
+          />
+        {/if}
+
+        {#if taskCredentialRequest}
+          <CredentialRequestForm
+            notification={taskCredentialRequest}
+            onResolved={async () => {
+              taskCredentialRequest = null;
+              await refreshTaskOnly();
+            }}
           />
         {/if}
 

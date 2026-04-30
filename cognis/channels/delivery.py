@@ -164,11 +164,13 @@ class ChannelDeliveryService:
         event_bus: EventBus,
         channel_manager_ref: Any,  # Callable[[], ChannelManager]
         turn_scheduler: Any | None = None,  # TurnScheduler (for observer flush)
+        public_base_url: str = "",
     ) -> None:
         self._session_factory = session_factory
         self._event_bus = event_bus
         self._channel_manager_ref = channel_manager_ref
         self._turn_scheduler = turn_scheduler
+        self._public_base_url = public_base_url.rstrip("/")
         self._retry_task: asyncio.Task[None] | None = None
 
         # Subscribe to relevant events
@@ -489,7 +491,7 @@ class ChannelDeliveryService:
 
         # Flush any buffered observer text before sending the notification
         # so the assistant's preceding message arrives before the question.
-        if notification_type in {"step_question", "auth_challenge"} and self._turn_scheduler is not None:
+        if notification_type in {"step_question", "auth_challenge", "credential_request"} and self._turn_scheduler is not None:
             await self._flush_observer_buffers(conversation_id)
 
         if notification_type == "escalation" and isinstance(payload, dict):
@@ -498,6 +500,11 @@ class ChannelDeliveryService:
             content = self._render_step_question_notification(payload)
         elif notification_type == "auth_challenge" and isinstance(payload, dict):
             content = self._render_auth_challenge_notification(payload)
+        elif notification_type == "credential_request" and isinstance(payload, dict):
+            content = self._render_credential_request_notification(
+                payload,
+                notification_id=str(event.data.get("notification_id") or ""),
+            )
         elif notification_type == "gate" and isinstance(payload, dict):
             content = self._render_gate_notification(payload)
         else:
@@ -544,6 +551,32 @@ class ChannelDeliveryService:
             lines.append("_Reply with the code only._")
         else:
             lines.append("_Reply with the requested response when complete._")
+        return "\n\n".join(lines)
+
+    def _render_credential_request_notification(
+        self, payload: dict[str, Any], *, notification_id: str
+    ) -> str:
+        """Render a credential request with a Cognis form link for channels."""
+
+        label = str(payload.get("label") or "Credential required")
+        message = str(
+            payload.get("message")
+            or payload.get("description")
+            or "A task needs a credential before it can continue."
+        )
+        link = (
+            f"{self._public_base_url}/notifications/{notification_id}"
+            if self._public_base_url and notification_id
+            else "Open Cognis to provide the credential."
+        )
+        lines = [f"*[credential]* {label}", message]
+        required = payload.get("required_fields")
+        if isinstance(required, list) and required:
+            fields = ", ".join(str(field) for field in required if isinstance(field, str))
+            if fields:
+                lines.append(f"Required fields: {fields}")
+        lines.append(f"Provide or cancel it in Cognis: {link}")
+        lines.append("Do not send credential values in this chat.")
         return "\n\n".join(lines)
 
     def _render_gate_notification(self, payload: dict[str, Any]) -> str:

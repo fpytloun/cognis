@@ -1219,6 +1219,18 @@ export interface CredentialMetadata {
   updated_at: string | null;
 }
 
+export interface CredentialUpsertPayload {
+  credential_id: string;
+  kind: string;
+  label: string;
+  payload: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  scope?: string;
+  agent_id?: string | null;
+  description?: string | null;
+  expires_at?: string | null;
+}
+
 export interface WebConfigStatus {
   backend: string;
   search_backend: string;

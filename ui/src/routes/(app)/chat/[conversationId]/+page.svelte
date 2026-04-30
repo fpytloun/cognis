@@ -25,6 +25,7 @@ import X from 'lucide-svelte/icons/x';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
+  import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
@@ -319,6 +320,7 @@ import X from 'lucide-svelte/icons/x';
   type ChatTodo = TodoSnapshotItem;
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
+  let pendingCredentialRequest = $state<Notification | null>(null);
   let directQuestionSubmitting = $state(false);
   let chatTodoDrawerOpen = $state(true);
   let retainedChatTodos = $state<ChatTodo[]>([]);
@@ -947,6 +949,9 @@ import X from 'lucide-svelte/icons/x';
       const pendingStepNotifications = notifications.filter(
         (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
       );
+      pendingCredentialRequest = notifications.find(
+        (item) => item.notification_type === 'credential_request' && item.status === 'pending',
+      ) ?? null;
       // Annotate any pending input/challenge tool call with a
       // notification id so the send routing can resolve it without
       // needing another round-trip. Task-scoped notifications count
@@ -1318,6 +1323,7 @@ import X from 'lucide-svelte/icons/x';
       escalations = [];
       escalationError = '';
       pendingDirectQuestion = null;
+      pendingCredentialRequest = null;
       directQuestionSubmitting = false;
     }
 
@@ -1483,6 +1489,7 @@ import X from 'lucide-svelte/icons/x';
       turnInProgress = false;
       awaitingAssistantStart = false;
       pendingDirectQuestion = null;
+      pendingCredentialRequest = null;
       directQuestionSubmitting = false;
       lastRecoverableMessage = '';
       editingTitle = false;
@@ -1526,6 +1533,7 @@ import X from 'lucide-svelte/icons/x';
       escalations = [];
       escalationResolutionPending = null;
       pendingDirectQuestion = null;
+      pendingCredentialRequest = null;
       directQuestionSubmitting = false;
       sessionIds.clear();
       conversationSubloadsLoading = false;
@@ -2395,11 +2403,22 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
+    if (event.type === 'credential_request' && event.notification_id) {
+      void refreshPendingDirectQuestion();
+    }
+
     if (event.type === 'workflow_step_question_resolved' || event.type === 'auth_challenge_resolved') {
       if (pendingDirectQuestion && event.notification_id === pendingDirectQuestion.notificationId) {
         pendingDirectQuestion = null;
       }
       directQuestionSubmitting = false;
+    }
+
+    if (event.type === 'credential_request_resolved') {
+      if (pendingCredentialRequest && event.notification_id === pendingCredentialRequest.notification_id) {
+        pendingCredentialRequest = null;
+      }
+      void refreshPendingDirectQuestion();
     }
 
     timeline = applyWebSocketEvent(timeline, event);
@@ -3546,6 +3565,16 @@ import X from 'lucide-svelte/icons/x';
                   </div>
                 {/if}
               </div>
+            {/if}
+            {#if pendingCredentialRequest}
+              <CredentialRequestForm
+                compact={true}
+                notification={pendingCredentialRequest}
+                onResolved={async () => {
+                  pendingCredentialRequest = null;
+                  await refreshPendingDirectQuestion();
+                }}
+              />
             {/if}
             <ComposerAttachments
               attachments={composerAttachments}

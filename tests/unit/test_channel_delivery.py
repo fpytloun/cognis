@@ -15,6 +15,7 @@ def _make_service() -> ChannelDeliveryService:
         session_factory=AsyncMock(),
         event_bus=EventBus(),
         channel_manager_ref=lambda: None,
+        public_base_url="https://cognis.example.com",
     )
 
 
@@ -78,6 +79,25 @@ def test_render_gate_notification_lists_real_options_and_task_board_instruction(
     assert "/approve" in content
     assert "/deny" in content
     assert "tool escalations" in content
+
+
+def test_render_credential_request_notification_includes_form_link() -> None:
+    service = _make_service()
+
+    content = service._render_credential_request_notification(
+        {
+            "label": "Cocky Kontaktni Google login",
+            "message": "Need password for Google login.",
+            "required_fields": ["username", "password"],
+        },
+        notification_id="auth_123",
+    )
+
+    assert "*[credential]* Cocky Kontaktni Google login" in content
+    assert "Need password for Google login." in content
+    assert "Required fields: username, password" in content
+    assert "https://cognis.example.com/notifications/auth_123" in content
+    assert "Do not send credential values in this chat." in content
 
 
 @pytest.mark.asyncio

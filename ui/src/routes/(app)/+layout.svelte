@@ -353,7 +353,8 @@ import X from 'lucide-svelte/icons/x';
     }
 
     stopWorkspace();
-    void goto('/login', { replaceState: true });
+    const returnTo = `${$page.url.pathname}${$page.url.search}`;
+    void goto(`/login?returnTo=${encodeURIComponent(returnTo)}`, { replaceState: true });
   });
 
   async function handleLogout(): Promise<void> {

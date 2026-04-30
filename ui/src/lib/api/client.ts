@@ -10,6 +10,7 @@ import type {
   ChannelAccountStatus,
     ChannelContact,
     CredentialMetadata,
+    CredentialUpsertPayload,
     ChannelMeta,
   ApiErrorResponse,
   ApiKeyMetadata,
@@ -1333,7 +1334,11 @@ export const api = {
       );
     },
 
-    resolve(notificationId: string, payload: { decision: string; note?: string; response?: string; feedback?: string }): Promise<{ ok: boolean; notification_id: string; decision: string }> {
+    get(notificationId: string): Promise<Notification> {
+      return request<Notification>(`/api/v1/notifications/${encodeURIComponent(notificationId)}`);
+    },
+
+    resolve(notificationId: string, payload: { decision: string; note?: string; response?: string; feedback?: string; response_payload?: Record<string, unknown>; credential?: CredentialUpsertPayload }): Promise<{ ok: boolean; notification_id: string; decision: string }> {
       return request<{ ok: boolean; notification_id: string; decision: string }>(`/api/v1/notifications/${notificationId}/resolve`, {
         method: 'POST',
         body: JSON.stringify(payload)

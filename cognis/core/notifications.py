@@ -337,9 +337,14 @@ class NotificationService:
 
             notification_type = row.notification_type
             created_at = row.created_at
+            row_user_email = row.user_email
+            conversation_id = row.conversation_id
+            task_id = row.task_id
+            step_name = row.step_name
+            session_id = row.session_id
         if notification_type == NotificationType.ESCALATION:
             try:
-                with scoped_runtime_context(user_email=user_email or row.user_email):
+                with scoped_runtime_context(user_email=user_email or row_user_email):
                     await self._providers.guardrails.submit_decision(
                         notification_id, decision, resolution_data.get("note")
                     )
@@ -401,6 +406,10 @@ class NotificationService:
                 data={
                     "notification_id": notification_id,
                     "notification_type": notification_type,
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                    "step_name": step_name,
+                    "session_id": session_id,
                     "decision": decision,
                 },
             )

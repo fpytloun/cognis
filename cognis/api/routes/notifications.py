@@ -2,51 +2,18 @@
 
 from __future__ import annotations
 
-import re
-
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from cognis.api.common import require_current_user
 from cognis.api.models import CredentialUpsertRequest
-from cognis.core.notification_resolution import build_auth_challenge_resolution_data
+from cognis.core.notification_resolution import (
+    build_auth_challenge_resolution_data,
+    build_credential_request_resolution_data,
+)
 from cognis.core.notifications import Notification, NotificationService
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["notifications"])
-
-
-def _parse_credential_response(kind: str, response: str) -> dict[str, str]:
-    text = response.strip()
-    if not text:
-        raise ValueError("Credential response is empty")
-    normalized_kind = kind.strip().lower()
-    if normalized_kind == "token":
-        keyed = re.match(r"^token\s*:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
-        return {"token": keyed.group(1).strip()} if keyed else {"token": text}
-    if normalized_kind != "username_password":
-        raise ValueError(f"Natural response parsing not implemented for credential kind: {kind}")
-
-    keyed_values: dict[str, str] = {}
-    for line in text.splitlines():
-        match = re.match(r"^(username|email|password)\s*:\s*(.+)$", line.strip(), re.IGNORECASE)
-        if match:
-            field = "username" if match.group(1).lower() in {"username", "email"} else "password"
-            keyed_values[field] = match.group(2).strip()
-    if {"username", "password"}.issubset(keyed_values):
-        return {"username": keyed_values["username"], "password": keyed_values["password"]}
-
-    non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(non_empty_lines) == 2:
-        return {"username": non_empty_lines[0], "password": non_empty_lines[1]}
-
-    if ":" in text:
-        username, password = text.split(":", 1)
-        if username.strip() and password.strip():
-            return {"username": username.strip(), "password": password.strip()}
-
-    raise ValueError(
-        "Provide credentials as username:password, two lines, or username/password keyed lines"
-    )
 
 
 class NotificationResponse(BaseModel):
@@ -166,6 +133,7 @@ async def resolve_notification(
             payload.decision == "approve"
             and payload.credential is None
             and payload.response is None
+            and payload.response_payload is None
         ):
             raise HTTPException(
                 status_code=400,
@@ -191,58 +159,21 @@ async def resolve_notification(
     if payload.response_payload:
         data["response_payload"] = payload.response_payload
 
-    if notification.notification_type == "credential_request" and payload.decision == "approve":
-        requested = notification.payload if isinstance(notification.payload, dict) else {}
-        credential_payload = payload.credential.payload if payload.credential is not None else None
-        if credential_payload is None:
-            try:
-                credential_payload = _parse_credential_response(
-                    str(requested.get("kind") or ""),
-                    str(payload.response or ""),
-                )
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-        required_fields = requested.get("required_fields") if isinstance(requested, dict) else []
-        if isinstance(required_fields, list):
-            missing = [
-                str(field)
-                for field in required_fields
-                if isinstance(field, str) and field not in credential_payload
-            ]
-            if missing:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Credential approval is missing required fields: {', '.join(missing)}",
-                )
-        created = await request.app.state.providers.credentials.upsert_credential(
-            credential_id=str(
-                requested.get("credential_id")
-                or (payload.credential.credential_id if payload.credential is not None else "")
-            ),
-            user_email=user.email,
-            kind=str(
-                requested.get("kind") or (payload.credential.kind if payload.credential else "")
-            ),
-            label=str(
-                requested.get("label")
-                or (payload.credential.label if payload.credential is not None else "")
-            ),
-            payload=credential_payload,
-            metadata=(payload.credential.metadata if payload.credential is not None else {}),
-            scope=str(requested.get("scope") or "user"),
-            agent_id=(
-                str(requested.get("agent_id")) if requested.get("agent_id") is not None else None
-            ),
-            description=(
-                payload.credential.description if payload.credential is not None else None
-            ),
-            expires_at=(payload.credential.expires_at if payload.credential is not None else None),
-        )
-        data = {
-            "credential_id": created.credential_id,
-            "credential_label": created.label,
-            "credential_kind": created.kind,
-        }
+    if notification.notification_type == "credential_request" and payload.decision != "approve":
+        data = {}
+    elif notification.notification_type == "credential_request" and payload.decision == "approve":
+        try:
+            data = await build_credential_request_resolution_data(
+                notification=notification,
+                decision=payload.decision,
+                user_email=user.email,
+                credentials_provider=request.app.state.providers.credentials,
+                response=payload.response,
+                response_payload=payload.response_payload,
+                credential=payload.credential,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif notification.notification_type == "auth_challenge":
         try:
             data = await build_auth_challenge_resolution_data(

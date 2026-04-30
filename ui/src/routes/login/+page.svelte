@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
   import Button from '$lib/components/ui/Button.svelte';
@@ -12,10 +13,15 @@
   let error = '';
   let submitting = false;
 
+  function returnTarget(): string {
+    const target = $page.url.searchParams.get('returnTo');
+    return target && target.startsWith('/') ? target : '/chat';
+  }
+
   onMount(() => {
     void auth.bootstrap().then(async () => {
       if (auth.getSnapshot().status === 'authenticated') {
-        await goto('/chat', { replaceState: true });
+        await goto(returnTarget(), { replaceState: true });
       }
     });
   });
@@ -27,7 +33,7 @@
 
     try {
       await auth.login(email, password);
-      await goto('/chat', { replaceState: true });
+      await goto(returnTarget(), { replaceState: true });
     } catch (caughtError) {
       error = caughtError instanceof Error ? caughtError.message : 'Unable to log in.';
     } finally {
