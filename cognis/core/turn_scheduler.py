@@ -299,6 +299,7 @@ class TurnObserver(Protocol):
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
     ) -> None: ...
 
@@ -1936,6 +1937,7 @@ class TurnScheduler:
             duration_ms: int | None,
             evaluation: dict[str, Any] | None = None,
             attachments: list[dict[str, Any]] | None = None,
+            file_diffs: list[dict[str, Any]] | None = None,
         ) -> None:
             await asyncio.gather(
                 *(
@@ -1952,6 +1954,7 @@ class TurnScheduler:
                         duration_ms,
                         evaluation,
                         attachments,
+                        file_diffs,
                         turn_id,
                     )
                     for observer in self._iter_observers(

@@ -5385,6 +5385,74 @@ async def test_tool_output_helper_results_recover_via_helper_call_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finalize_regular_tool_result_records_file_diffs() -> None:
+    class _CapturingGuardrails(_NoopGuardrails):
+        def __init__(self) -> None:
+            self.events: list[SessionEvent] = []
+
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            self.events.extend(kwargs.get("events", []))  # type: ignore[arg-type]
+            return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
+
+    guardrails = _CapturingGuardrails()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=guardrails),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+    tc = ToolCall(call_id="edit-call", name="edit", arguments={"file_path": "example.py"})
+    file_diffs = [
+        {
+            "path": "example.py",
+            "diff": "--- example.py\n+++ example.py\n@@ -1 +1 @@\n-old\n+new\n",
+        }
+    ]
+    result = ToolResult(output="Replaced 1 occurrence", metadata={"file_diffs": file_diffs})
+    events: list[SessionEvent] = []
+    observed: list[object] = []
+
+    async def on_tool_result(*args: object) -> None:
+        observed.append(args)
+
+    await agent_loop._finalize_regular_tool_result(
+        ctx,
+        tc=tc,
+        tool_id="builtin:edit",
+        result=result,
+        events_to_record=events,
+        messages=[],
+        collected_attachments=[],
+        pending_assistant_attachments=[],
+        promoted_tool_ids=set(),
+        activated_tool_ids=set(),
+        on_token=None,
+        on_tool_result=on_tool_result,
+    )
+
+    assert guardrails.events[-1].data["file_diffs"] == file_diffs
+    assert observed[0][-1] == file_diffs
+
+
+@pytest.mark.asyncio
 async def test_get_task_step_output_returns_anchored_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

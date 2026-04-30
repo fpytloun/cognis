@@ -42,6 +42,29 @@ async def test_sse_turn_complete_includes_sanitized_attachments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sse_tool_result_includes_file_diffs() -> None:
+    observer = SSETurnObserver("conv-1")
+    file_diffs = [{"path": "example.py", "diff": "--- example.py\n+++ example.py\n"}]
+
+    await observer.on_tool_result(
+        "conv-1",
+        "sess-1",
+        "call-1",
+        "edit",
+        "done",
+        False,
+        20,
+        None,
+        None,
+        file_diffs,
+    )
+
+    event = await observer._queue.get()  # noqa: SLF001
+    assert event["event"] == "tool_result"
+    assert event["data"]["file_diffs"] == file_diffs
+
+
+@pytest.mark.asyncio
 async def test_sse_tool_result_includes_sanitized_attachments() -> None:
     observer = SSETurnObserver("conv-1")
 

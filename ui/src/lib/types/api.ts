@@ -184,6 +184,14 @@ export interface AttachmentRef {
   url?: string | null;
 }
 
+export interface FileDiff {
+  path: string;
+  diff: string;
+  truncated?: boolean;
+  original_size?: number;
+  omitted_count?: number;
+}
+
 export interface ActiveStreamSnapshot {
   conversation_id: string;
   session_id: string;
@@ -1613,6 +1621,7 @@ export interface WebSocketToolResultEvent {
   duration_ms: number | null;
   timestamp?: string | null;
   attachments?: AttachmentRef[];
+  file_diffs?: FileDiff[];
   evaluation?: {
     decision: string;
     reasoning?: string;

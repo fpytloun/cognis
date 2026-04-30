@@ -72,6 +72,7 @@ class _RecordingObserver:
         duration_ms: int | None,
         evaluation: dict[str, object] | None,
         attachments: list[dict[str, object]] | None = None,
+        file_diffs: list[dict[str, object]] | None = None,
         turn_id: str | None = None,
     ) -> None:
         return None

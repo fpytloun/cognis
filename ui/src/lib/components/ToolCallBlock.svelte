@@ -3,6 +3,7 @@
   import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import type { ToolCallTimelineItem } from '$lib/chat';
+  import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import { addToast } from '$lib/stores/toasts';
@@ -14,6 +15,7 @@
   let expanded = $state(false);
   let inputExpanded = $state(false);
   let outputExpanded = $state(false);
+  let rawExpanded = $state(false);
   let evalExpanded = $state(false);
   let autoExpanded = $state(false);
   let copiedBox = $state<'input' | 'output' | null>(null);
@@ -218,6 +220,10 @@
     return 'text-slate-400';
   }
 
+  function hasDiffs(): boolean {
+    return Boolean(item.fileDiffs && item.fileDiffs.length > 0);
+  }
+
   function stepRequestQuestion(): string {
     return typeof item.arguments?.question === 'string' ? item.arguments.question : '';
   }
@@ -345,70 +351,92 @@
         </div>
 
       {:else}
-        {#if item.arguments && Object.keys(item.arguments).length > 0}
-          {@const inputText = formatArguments()}
-          {@const inputData = formatMaybeJson(inputText, inputExpanded)}
+        {#if hasDiffs() && item.fileDiffs}
           <div>
-            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
-            <div class="relative">
-              <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 pr-10 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
-              <button
-                class="copy-icon-button absolute right-2 top-2"
-                onclick={() => void copyBox('input', inputText)}
-                type="button"
-                title="Copy input"
-                aria-label="Copy input"
-              >
-                {#if copiedBox === 'input'}
-                  <Check class="h-3.5 w-3.5" />
-                {:else}
-                  <Copy class="h-3.5 w-3.5" />
-                {/if}
-              </button>
-            </div>
-            {#if inputData.hiddenCount > 0}
-              <button
-                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
-                onclick={() => { inputExpanded = !inputExpanded; }}
-                type="button"
-              >
-                {inputExpanded ? 'Show less' : `Show all (${inputData.totalLines} lines)`}
-              </button>
-            {/if}
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Diff</p>
+            <FileDiffViewer diffs={item.fileDiffs} />
           </div>
         {/if}
 
-        {#if item.result != null}
-          {@const outputText = cleanResult(item.result)}
-          {@const outputData = formatMaybeJson(outputText, outputExpanded)}
+        {#if hasDiffs()}
           <div>
-            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-            <div class="relative">
-              <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
-              <button
-                class="copy-icon-button absolute right-2 top-2"
-                onclick={() => void copyBox('output', outputText)}
-                type="button"
-                title="Copy output"
-                aria-label="Copy output"
-              >
-                {#if copiedBox === 'output'}
-                  <Check class="h-3.5 w-3.5" />
-                {:else}
-                  <Copy class="h-3.5 w-3.5" />
-                {/if}
-              </button>
-            </div>
-            {#if outputData.hiddenCount > 0}
-              <button
-                class="mt-1 text-xs text-sky-400 hover:text-sky-300"
-                onclick={() => { outputExpanded = !outputExpanded; }}
-                type="button"
-              >
-                {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
-              </button>
-            {/if}
+            <button
+              class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+              onclick={() => { rawExpanded = !rawExpanded; }}
+              type="button"
+            >
+              <span>{rawExpanded ? '\u25BC' : '\u25B6'}</span>
+              <span>Raw</span>
+            </button>
           </div>
+        {/if}
+
+        {#if !hasDiffs() || rawExpanded}
+          {#if item.arguments && Object.keys(item.arguments).length > 0}
+            {@const inputText = formatArguments()}
+            {@const inputData = formatMaybeJson(inputText, inputExpanded)}
+            <div>
+              <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
+              <div class="relative">
+                <pre class="max-h-[40vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 pr-10 text-xs leading-5 text-slate-300">{#if inputData.html}{@html inputData.html}{:else}{inputData.text}{/if}</pre>
+                <button
+                  class="copy-icon-button absolute right-2 top-2"
+                  onclick={() => void copyBox('input', inputText)}
+                  type="button"
+                  title="Copy input"
+                  aria-label="Copy input"
+                >
+                  {#if copiedBox === 'input'}
+                    <Check class="h-3.5 w-3.5" />
+                  {:else}
+                    <Copy class="h-3.5 w-3.5" />
+                  {/if}
+                </button>
+              </div>
+              {#if inputData.hiddenCount > 0}
+                <button
+                  class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+                  onclick={() => { inputExpanded = !inputExpanded; }}
+                  type="button"
+                >
+                  {inputExpanded ? 'Show less' : `Show all (${inputData.totalLines} lines)`}
+                </button>
+              {/if}
+            </div>
+          {/if}
+
+          {#if item.result != null}
+            {@const outputText = cleanResult(item.result)}
+            {@const outputData = formatMaybeJson(outputText, outputExpanded)}
+            <div>
+              <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
+              <div class="relative">
+                <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
+                <button
+                  class="copy-icon-button absolute right-2 top-2"
+                  onclick={() => void copyBox('output', outputText)}
+                  type="button"
+                  title="Copy output"
+                  aria-label="Copy output"
+                >
+                  {#if copiedBox === 'output'}
+                    <Check class="h-3.5 w-3.5" />
+                  {:else}
+                    <Copy class="h-3.5 w-3.5" />
+                  {/if}
+                </button>
+              </div>
+              {#if outputData.hiddenCount > 0}
+                <button
+                  class="mt-1 text-xs text-sky-400 hover:text-sky-300"
+                  onclick={() => { outputExpanded = !outputExpanded; }}
+                  type="button"
+                >
+                  {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
+                </button>
+              {/if}
+            </div>
+          {/if}
         {/if}
 
         {#if item.attachments && item.attachments.length > 0}

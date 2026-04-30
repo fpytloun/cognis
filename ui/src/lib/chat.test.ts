@@ -908,6 +908,61 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('preserves file diffs from persisted tool results', () => {
+    const items = normalizeHistory([
+      {
+        seq: 1,
+        type: 'tool_call',
+        data: { call_id: 'call-edit', name: 'edit', arguments: { file_path: 'example.py' } },
+        timestamp: '2026-04-07T00:00:00Z'
+      },
+      {
+        seq: 2,
+        type: 'tool_result',
+        data: {
+          call_id: 'call-edit',
+          name: 'edit',
+          result: 'Replaced 1 occurrence',
+          is_error: false,
+          file_diffs: [{ path: 'example.py', diff: '--- example.py\n+++ example.py\n@@ -1 +1 @@\n-old\n+new\n' }]
+        },
+        timestamp: '2026-04-07T00:00:01Z'
+      }
+    ]);
+
+    expect(items[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call-edit',
+      fileDiffs: [{ path: 'example.py', diff: expect.stringContaining('+new') }]
+    });
+  });
+
+  it('preserves file diffs from live websocket tool results', () => {
+    const started = applyWebSocketEvent([], {
+      type: 'tool_call',
+      call_id: 'call-live-edit',
+      tool_name: 'write',
+      status: 'started',
+      arguments: { file_path: 'ui/src/lib/diff.ts' }
+    });
+
+    const completed = applyWebSocketEvent(started, {
+      type: 'tool_result',
+      call_id: 'call-live-edit',
+      tool_name: 'write',
+      result: 'Wrote file',
+      is_error: false,
+      duration_ms: 12,
+      file_diffs: [{ path: 'ui/src/lib/diff.ts', diff: '--- ui/src/lib/diff.ts\n+++ ui/src/lib/diff.ts\n@@ -1 +1 @@\n-old\n+new\n' }]
+    });
+
+    expect(completed[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call-live-edit',
+      fileDiffs: [{ path: 'ui/src/lib/diff.ts', diff: expect.stringContaining('+new') }]
+    });
+  });
+
   it('keeps the previous todo snapshot when a repeated todo write is rejected', () => {
     const items = normalizeHistory([
       {

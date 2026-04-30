@@ -280,10 +280,7 @@ _CONTROLLER_INTERCEPTED_TOOLS: frozenset[str] = frozenset(CONTROLLER_TOOLS)
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
 ToolCallCallback = Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
-ToolResultCallback = Callable[
-    [str, str, str, bool, int | None, dict[str, Any] | None],
-    Coroutine[Any, Any, None],
-]
+ToolResultCallback = Callable[..., Coroutine[Any, Any, None]]
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
@@ -292,6 +289,8 @@ DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_STREAM_MAX_RETRIES = 3
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_INTARIS_TOOL_RESULT = 50_000  # Intaris gets the middle-truncated preview
+_MAX_FILE_DIFF_BYTES = 120_000
+_MAX_FILE_DIFFS = 20
 _MAX_TODO_REPROMPTS = 3  # Max re-prompts for incomplete todos before force-completing
 _MAX_STEP_COMPLETE_REPROMPTS = 3
 _MAX_EMPTY_DIRECT_RESPONSE_REPROMPTS = 2
@@ -455,6 +454,50 @@ def _truncate_tool_data(text: str) -> str:
     if len(text) <= _MAX_TOOL_DATA_BYTES:
         return text
     return text[:_MAX_TOOL_DATA_BYTES] + f"\n... (truncated, {len(text)} bytes total)"
+
+
+def _truncate_file_diff(text: str) -> tuple[str, bool]:
+    if len(text) <= _MAX_FILE_DIFF_BYTES:
+        return text, False
+    return (
+        text[:_MAX_FILE_DIFF_BYTES]
+        + f"\n... (diff truncated, {len(text)} bytes total)",
+        True,
+    )
+
+
+def _file_diffs_from_metadata(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return sanitized file diff metadata safe for API/UI payloads."""
+
+    if not isinstance(metadata, dict):
+        return []
+    raw_diffs = metadata.get("file_diffs")
+    if not isinstance(raw_diffs, list):
+        return []
+    diffs: list[dict[str, Any]] = []
+    for item in raw_diffs[:_MAX_FILE_DIFFS]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        diff = item.get("diff")
+        if not path or not isinstance(diff, str) or not diff:
+            continue
+        truncated_diff, truncated = _truncate_file_diff(diff)
+        payload: dict[str, Any] = {"path": path, "diff": truncated_diff}
+        if truncated:
+            payload["truncated"] = True
+            payload["original_size"] = len(diff)
+        diffs.append(payload)
+    if len(raw_diffs) > _MAX_FILE_DIFFS:
+        diffs.append(
+            {
+                "path": "",
+                "diff": "",
+                "truncated": True,
+                "omitted_count": len(raw_diffs) - _MAX_FILE_DIFFS,
+            }
+        )
+    return diffs
 
 
 def _bounded_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -8107,6 +8150,7 @@ class AgentLoop:
         )
         original_size = result.metadata.get("original_size") if result.metadata else None
         eval_meta = result.metadata.get("evaluation") if result.metadata else None
+        file_diffs = _file_diffs_from_metadata(result.metadata)
         has_saved_output = bool(raw_output or stored_output)
         source_call_id = None
         recovery_call_id = None
@@ -8141,6 +8185,7 @@ class AgentLoop:
                     "recovery_call_id": recovery_call_id,
                     "source_call_id": source_call_id,
                     "evaluation": eval_meta,
+                    "file_diffs": file_diffs,
                     "attachments": safe_result_attachments,
                     "protect_from_pruning": bool(
                         result.metadata and result.metadata.get("protected_context")
@@ -8165,6 +8210,7 @@ class AgentLoop:
                 result.duration_ms,
                 eval_meta,
                 safe_result_attachments or None,
+                file_diffs or None,
             )
         if normalized_result_attachments:
             normalized_attachments = normalized_result_attachments
@@ -8236,6 +8282,7 @@ class AgentLoop:
                     "is_error": result.is_error,
                     "duration_ms": result.duration_ms,
                     "evaluation": eval_meta,
+                    "file_diffs": file_diffs,
                     "attachments": safe_result_attachments,
                 },
             )

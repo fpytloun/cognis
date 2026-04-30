@@ -900,6 +900,7 @@ class ChannelTurnObserver:
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
     ) -> None:
         """No-op for tool results."""

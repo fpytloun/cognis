@@ -1,4 +1,5 @@
 import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
+import { normalizeFileDiffs, type FileDiff } from '$lib/diff';
 import type { ActiveStreamSnapshot, AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
 
 /**
@@ -148,7 +149,8 @@ export interface ToolCallTimelineItem {
   isError?: boolean;
   durationMs?: number;
   evaluation?: ToolCallEvaluation;
-   attachments?: AttachmentRef[];
+  attachments?: AttachmentRef[];
+  fileDiffs?: FileDiff[];
   reconstructed?: boolean;
   /**
    * Notification ID backing a pending `step_request_input` tool call.
@@ -900,6 +902,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     if (event.type === 'tool_result') {
       const callId = String(event.data.call_id ?? '');
       const resultAttachments = normalizeEventAttachments(event.data.attachments);
+      const fileDiffs = normalizeFileDiffs(event.data.file_diffs);
       const evaluation =
         typeof event.data.evaluation === 'object' && event.data.evaluation !== null
           ? (event.data.evaluation as ToolCallEvaluation)
@@ -915,6 +918,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
           evaluation,
           attachments: resultAttachments.length > 0 ? resultAttachments : existing.attachments,
+          fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
           turnId: existing.turnId ?? turnId,
         };
       } else {
@@ -932,6 +936,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : undefined,
           evaluation,
           attachments: resultAttachments.length > 0 ? resultAttachments : undefined,
+          fileDiffs: fileDiffs.length > 0 ? fileDiffs : undefined,
           reconstructed: true
         });
       }
@@ -1629,6 +1634,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const itemId = `tool:${event.call_id}`;
     const evaluation = event.evaluation ?? undefined;
     const attachments = normalizeEventAttachments(event.attachments);
+    const fileDiffs = normalizeFileDiffs(event.file_diffs);
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
@@ -1641,6 +1647,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         durationMs: event.duration_ms ?? undefined,
         evaluation,
         attachments: attachments.length > 0 ? attachments : existing.attachments,
+        fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
         turnId: existing.turnId ?? turnId,
       };
       return next;
@@ -1659,6 +1666,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       durationMs: event.duration_ms ?? undefined,
       evaluation,
       attachments: attachments.length > 0 ? attachments : undefined,
+      fileDiffs: fileDiffs.length > 0 ? fileDiffs : undefined,
     });
     return next;
   }

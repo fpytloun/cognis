@@ -236,6 +236,7 @@ class WebSocketTurnObserver:
         duration_ms: int | None,
         evaluation: dict[str, Any] | None,
         attachments: list[dict[str, Any]] | None = None,
+        file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
@@ -254,6 +255,8 @@ class WebSocketTurnObserver:
             payload["evaluation"] = evaluation
         if attachments:
             payload["attachments"] = strip_attachment_payload_bytes(attachments)
+        if file_diffs:
+            payload["file_diffs"] = file_diffs
         await self._manager.send_to_conversation(conversation_id, payload)
 
     async def on_turn_complete(self, result: TurnResult) -> None:
@@ -709,6 +712,7 @@ class WebSocketConnectionManager:
                             "is_error": bool(data.get("is_error", False)),
                             "duration_ms": data.get("duration_ms"),
                             "evaluation": data.get("evaluation"),
+                            "file_diffs": data.get("file_diffs") or [],
                             "attachments": attachments,
                             "turn_id": data.get("turn_id"),
                         }
@@ -1854,6 +1858,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "is_error": bool(event.data.get("is_error", False)),
                 "duration_ms": event.data.get("duration_ms"),
                 "evaluation": event.data.get("evaluation"),
+                "file_diffs": event.data.get("file_diffs") or [],
                 "attachments": event.data.get("attachments") or [],
                 "timestamp": event.timestamp.isoformat() if event.timestamp else None,
                 "turn_id": event.data.get("turn_id"),

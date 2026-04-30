@@ -390,6 +390,29 @@ async def test_turn_observer_tool_result_strips_attachment_payload_bytes() -> No
     ]
 
 
+@pytest.mark.asyncio
+async def test_turn_observer_tool_result_includes_file_diffs() -> None:
+    manager = AsyncMock()
+    observer = WebSocketTurnObserver(manager)
+    file_diffs = [{"path": "example.py", "diff": "--- example.py\n+++ example.py\n"}]
+
+    await observer.on_tool_result(
+        "conv-1",
+        "sess-1",
+        "call-1",
+        "edit",
+        "done",
+        False,
+        42,
+        None,
+        None,
+        file_diffs,
+    )
+
+    payload = manager.send_to_conversation.await_args.args[1]
+    assert payload["file_diffs"] == file_diffs
+
+
 def test_workflow_composed_payload_supports_lifecycle_backed_replay() -> None:
     payload = _workflow_composed_payload(
         "conv-1",
