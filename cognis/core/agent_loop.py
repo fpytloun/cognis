@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -320,6 +321,7 @@ _PROJECT_TOUCH_TOOL_NAMES = frozenset(
         "bash",
     }
 )
+_READ_ONLY_PROJECT_TOUCH_TOOL_NAMES = frozenset({"read", "list_directory", "glob", "grep"})
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -3556,6 +3558,8 @@ class AgentLoop:
             restart_llm_cycle = False
             prepared_regular_batch: list[_PreparedRegularToolCall] = []
             post_tool_system_messages: list[dict[str, Any]] = []
+            loaded_project_contexts_this_cycle: dict[str, ProjectContextEntry] = {}
+            queued_project_context_hashes: set[str] = set()
             for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
                 tool_id = _tool_id_for_call(tc.name, registry)
@@ -3756,11 +3760,41 @@ class AgentLoop:
                             on_tool_result=on_tool_result,
                         )
                         prepared_regular_batch.clear()
+                    can_continue_after_context = self._can_continue_after_project_context_load(
+                        ctx,
+                        tc,
+                        registry,
+                    )
+                    loaded_project_context = None
+                    force_project_context_retry = False
                     loaded_project_context = await self._maybe_load_project_context_before_tool(
                         ctx,
                         tc=tc,
                     )
-                    if loaded_project_context is not None:
+                    if (
+                        loaded_project_context is None
+                        and not can_continue_after_context
+                    ):
+                        loaded_project_context = self._project_context_loaded_for_tool_target(
+                            ctx,
+                            tc,
+                            loaded_project_contexts_this_cycle,
+                        )
+                        force_project_context_retry = loaded_project_context is not None
+                    if loaded_project_context is not None and can_continue_after_context:
+                        loaded_project_contexts_this_cycle[
+                            loaded_project_context.project_root
+                        ] = loaded_project_context
+                        if loaded_project_context.content_hash not in queued_project_context_hashes:
+                            queued_project_context_hashes.add(loaded_project_context.content_hash)
+                            post_tool_system_messages.append(
+                                {
+                                    "role": "system",
+                                    "content": loaded_project_context.content,
+                                    "_project_context": True,
+                                }
+                            )
+                    elif loaded_project_context is not None:
                         HARNESS_GUARD_TRIPS.labels(guard="project_context", tool_name=tool_id).inc()
                         _append_tool_call_event(events_to_record, tc, tool_id)
                         rejection_payload = json.dumps(
@@ -3770,6 +3804,11 @@ class AgentLoop:
                                 "message": (
                                     "Project instructions were loaded before accessing the repository. "
                                     "Review them and re-issue the tool call if it is still needed."
+                                )
+                                if not force_project_context_retry
+                                else (
+                                    "Project instructions were loaded earlier in this tool batch. "
+                                    "Review them and re-issue this mutating tool call if it is still needed."
                                 ),
                                 "project_root": loaded_project_context.project_root,
                                 "source_path": loaded_project_context.source_path,
@@ -3783,13 +3822,15 @@ class AgentLoop:
                                 "content": rejection_payload,
                             }
                         )
-                        messages.append(
-                            {
-                                "role": "system",
-                                "content": loaded_project_context.content,
-                                "_project_context": True,
-                            }
-                        )
+                        if loaded_project_context.content_hash not in queued_project_context_hashes:
+                            queued_project_context_hashes.add(loaded_project_context.content_hash)
+                            post_tool_system_messages.append(
+                                {
+                                    "role": "system",
+                                    "content": loaded_project_context.content,
+                                    "_project_context": True,
+                                }
+                            )
                         _append_tool_result_event(
                             events_to_record, tc, rejection_payload, True, tool_id=tool_id
                         )
@@ -8277,7 +8318,12 @@ class AgentLoop:
         registered = registry.get(tc.name)
         if registered is None or not registered.definition.read_only:
             return False
-        if self.tool_router._is_non_bypassable(  # noqa: SLF001
+        is_non_bypassable = getattr(
+            self.tool_router,
+            "_is_non_bypassable",
+            lambda _name, non_bypassable: bool(non_bypassable),
+        )
+        if is_non_bypassable(
             registered.definition.name,
             registered.definition.non_bypassable,
         ):
@@ -8291,6 +8337,73 @@ class AgentLoop:
         # Safe read-only tools can batch even when they still go through
         # guardrails evaluation. Only explicit deny should force serialization.
         return permission is not Permission.DENY
+
+    def _can_continue_after_project_context_load(
+        self,
+        ctx: StepContext,
+        tc: ToolCall,
+        registry: Any | None,
+    ) -> bool:
+        """Allow safe read-only repo probes to continue after instructions load."""
+
+        if tc.name not in _READ_ONLY_PROJECT_TOUCH_TOOL_NAMES:
+            return False
+        if registry is None:
+            return False
+        registered = registry.get(tc.name)
+        if registered is None or not registered.definition.read_only:
+            return False
+        is_non_bypassable = getattr(
+            self.tool_router,
+            "_is_non_bypassable",
+            lambda _name, non_bypassable: bool(non_bypassable),
+        )
+        if is_non_bypassable(
+            registered.definition.name,
+            registered.definition.non_bypassable,
+        ):
+            return False
+        if ctx.agent.permissions is None:
+            return True
+        permission = ctx.agent.permissions.resolve_permission(
+            tc.name,
+            tool_id=stable_tool_id(registered.definition),
+        )
+        return permission is not Permission.DENY
+
+    def _project_context_loaded_for_tool_target(
+        self,
+        ctx: StepContext,
+        tc: ToolCall,
+        loaded_contexts: dict[str, ProjectContextEntry],
+    ) -> ProjectContextEntry | None:
+        probe_arguments = self._project_probe_arguments(ctx, tc)
+        if probe_arguments is None:
+            return None
+        target_path = self._normalize_project_probe_target(
+            ctx,
+            str(probe_arguments.get("path") or ""),
+        )
+        if target_path is None:
+            return None
+        for project_root, project_context in loaded_contexts.items():
+            normalized_root = normalize_project_path(project_root)
+            if normalized_root is None:
+                continue
+            if target_path == normalized_root or target_path.startswith(f"{normalized_root}/"):
+                return project_context
+        return None
+
+    @staticmethod
+    def _normalize_project_probe_target(ctx: StepContext, raw_path: str) -> str | None:
+        if not raw_path.strip():
+            return None
+        if os.path.isabs(raw_path):
+            return normalize_project_path(raw_path)
+        base_path = normalize_project_path(ctx.working_directory or ctx.workspace_root)
+        if base_path is None:
+            return normalize_project_path(raw_path)
+        return normalize_project_path(os.path.join(base_path, raw_path))
 
     async def _execute_regular_tool(
         self,
@@ -8340,18 +8453,10 @@ class AgentLoop:
         if stored_output or raw_output:
             await self._save_tool_output_if_available(tc.call_id, result)
 
-        token_counter = None
-        if ctx.current_model:
-
-            def token_counter(text: str, _m: str = ctx.current_model) -> int:
-                return self.providers.llm.count_tokens(text, _m)
-
         intaris_preview, _ = middle_truncate(
             result.output,
             _MAX_INTARIS_TOOL_RESULT,
             call_id=tc.call_id,
-            token_counter=token_counter,
-            max_tokens=max(256, _MAX_INTARIS_TOOL_RESULT // 4) if token_counter else None,
         )
         original_size = result.metadata.get("original_size") if result.metadata else None
         eval_meta = result.metadata.get("evaluation") if result.metadata else None

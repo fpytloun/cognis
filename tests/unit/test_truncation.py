@@ -19,6 +19,27 @@ def test_exact_limit_not_truncated() -> None:
     assert was_truncated is False
 
 
+def test_char_budget_fast_path_skips_token_counter() -> None:
+    calls = 0
+
+    def count_tokens(_: str) -> int:
+        nonlocal calls
+        calls += 1
+        return 1
+
+    text = "x" * 500
+    result, was_truncated = middle_truncate(
+        text,
+        1000,
+        token_counter=count_tokens,
+        max_tokens=10,
+    )
+
+    assert result == text
+    assert was_truncated is False
+    assert calls == 0
+
+
 def test_long_text_middle_truncated() -> None:
     text = "A" * 200 + "B" * 600 + "C" * 200
     result, was_truncated = middle_truncate(text, 500)

@@ -35,6 +35,9 @@ def middle_truncate(
     recover the full output via ``read_tool_output``.
     """
 
+    if len(text) <= max_chars or max_chars < _MIN_TRUNCATION_SIZE:
+        return text, False
+
     if token_counter is not None and max_tokens is not None and max_tokens > 0:
         try:
             total_tokens = token_counter(text)
@@ -49,9 +52,6 @@ def middle_truncate(
                 call_id=call_id,
                 head_ratio=head_ratio,
             )
-
-    if len(text) <= max_chars or max_chars < _MIN_TRUNCATION_SIZE:
-        return text, False
 
     return _middle_truncate_chars(text, max_chars, call_id=call_id, head_ratio=head_ratio)
 

@@ -1239,7 +1239,7 @@ class _TerminalTodosThenExtraToolLLM:
                                     "index": 1,
                                     "id": "call_status_after_done",
                                     "function": {"name": "get_status", "arguments": "{}"},
-                                }
+                                },
                             ]
                         }
                     }
@@ -1553,6 +1553,45 @@ class _CrossProjectProbeExecutor:
         )
 
 
+class _ReadOnlyProjectContextExecutor:
+    def __init__(self) -> None:
+        self.probes: list[dict[str, object]] = []
+        self.executed_tools: list[str] = []
+
+    async def tool_execute(
+        self, tool_call: ToolCall, timeout_seconds: int | None = None
+    ) -> ToolResult:
+        del timeout_seconds
+        if tool_call.name == "_project_context_probe":
+            self.probes.append(dict(tool_call.arguments))
+            path = str(tool_call.arguments.get("path") or "")
+            project_name = "other" if path.startswith("/workspace/other") else "cognis"
+            project_root = f"/workspace/{project_name}"
+            return ToolResult(
+                output="loaded",
+                metadata={
+                    "project_context": {
+                        "status": "loaded",
+                        "project_root": project_root,
+                        "working_directory": project_root,
+                        "source_path": f"{project_root}/AGENTS.md",
+                        "content": (
+                            f"Instructions for project at {project_root} loaded from "
+                            f"{project_root}/AGENTS.md.\nProject root: {project_root}\n"
+                            f"Effective working directory: {project_root}\n\n"
+                            f"<project_instructions>\nUse {project_name} instructions.\n"
+                            "</project_instructions>"
+                        ),
+                        "content_hash": f"{project_name}-hash",
+                    }
+                },
+            )
+        self.executed_tools.append(tool_call.name)
+        if tool_call.name == "list_directory":
+            return ToolResult(output="listed project files")
+        return ToolResult(output="unexpected tool", is_error=True)
+
+
 class _ProjectContextLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -1595,6 +1634,162 @@ class _ProjectContextLLM:
         )
         yield {"choices": [{"delta": {"content": "Done without implicit project context."}}]}
         return
+
+
+class _ReadOnlyProjectContextLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_list_project",
+                                    "function": {
+                                        "name": "list_directory",
+                                        "arguments": '{"path":"/workspace/cognis"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        assert any(
+            message.get("role") == "system"
+            and "/workspace/cognis/AGENTS.md" in str(message.get("content"))
+            for message in messages
+        )
+        assert any(
+            message.get("role") == "tool" and "listed project files" in str(message.get("content"))
+            for message in messages
+        )
+        assert not any(
+            message.get("role") == "tool"
+            and "project_instructions_loaded" in str(message.get("content"))
+            for message in messages
+        )
+        project_system_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "system"
+            and "/workspace/cognis/AGENTS.md" in str(message.get("content"))
+        ]
+        tool_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "tool"
+            and "listed project files" in str(message.get("content"))
+        ]
+        assert tool_indexes and project_system_indexes
+        assert max(tool_indexes) < min(project_system_indexes)
+        yield {"choices": [{"delta": {"content": "Read-only tool continued."}}]}
+
+
+class _MixedProjectContextLLM:
+    def __init__(
+        self,
+        *,
+        write_path: str = "/workspace/cognis/out.txt",
+        expected_source: str = "/workspace/cognis/AGENTS.md",
+        second_read_path: str | None = None,
+    ) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+        self.write_path = write_path
+        self.expected_source = expected_source
+        self.second_read_path = second_read_path
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            tool_calls = [
+                {
+                    "index": 0,
+                    "id": "call_list_project",
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": '{"path":"/workspace/cognis"}',
+                    },
+                }
+            ]
+            if self.second_read_path is not None:
+                tool_calls.append(
+                    {
+                        "index": 1,
+                        "id": "call_list_second_project",
+                        "function": {
+                            "name": "list_directory",
+                            "arguments": json.dumps({"path": self.second_read_path}),
+                        },
+                    }
+                )
+            tool_calls.append(
+                {
+                    "index": len(tool_calls),
+                    "id": "call_write_project",
+                    "function": {
+                        "name": "write",
+                        "arguments": json.dumps(
+                            {"file_path": self.write_path, "content": "x"}
+                        ),
+                    },
+                }
+            )
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": tool_calls
+                        }
+                    }
+                ]
+            }
+            return
+
+        assert any(
+            message.get("role") == "tool" and "listed project files" in str(message.get("content"))
+            for message in messages
+        )
+        assert any(
+            message.get("role") == "tool"
+            and "project_instructions_loaded" in str(message.get("content"))
+            and self.expected_source in str(message.get("content"))
+            for message in messages
+        )
+        project_system_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "system"
+            and "/workspace/cognis/AGENTS.md" in str(message.get("content"))
+        ]
+        tool_indexes = [index for index, message in enumerate(messages) if message.get("role") == "tool"]
+        assert tool_indexes and project_system_indexes
+        assert max(tool_indexes) < min(project_system_indexes)
+        yield {"choices": [{"delta": {"content": "Mutating tool was retried."}}]}
 
 
 class _CrossProjectLLM:
@@ -1853,6 +2048,392 @@ async def test_explicit_cross_project_path_still_triggers_project_probe() -> Non
     assert output.content == "Cross-project instructions loaded."
     assert len(probe_executor.probes) == 1
     assert probe_executor.probes[0]["path"] == "/workspace/obsidian"
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_continues_after_project_context_load() -> None:
+    fake_llm = _ReadOnlyProjectContextLLM()
+    probe_executor = _ReadOnlyProjectContextExecutor()
+
+    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+        return await probe_executor.tool_execute(tool_call)
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="list_directory",
+                description="List a directory",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(
+            execute=execute_tool,
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable,
+        ),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-read-only-project",
+            conversation_id="conv-read-only-project",
+            intaris_session_id="sess-read-only-project",
+            mnemory_session_id="mem-read-only-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-read-only-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect the cognis project",
+        tool_registry=registry,
+        executor_connection=probe_executor,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-read-only-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Read-only tool continued."
+    assert probe_executor.executed_tools == ["list_directory"]
+    assert len(probe_executor.probes) == 1
+    assert len(fake_llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_mutating_trailing_tool_retries_after_read_only_project_context_load() -> None:
+    fake_llm = _MixedProjectContextLLM()
+    probe_executor = _ReadOnlyProjectContextExecutor()
+
+    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+        return await probe_executor.tool_execute(tool_call)
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="list_directory",
+                description="List a directory",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="write",
+                description="Write a file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+                source=ToolSource(type="executor"),
+                read_only=False,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(
+            execute=execute_tool,
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable,
+        ),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-mixed-project",
+            conversation_id="conv-mixed-project",
+            intaris_session_id="sess-mixed-project",
+            mnemory_session_id="mem-mixed-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-mixed-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect then modify the cognis project",
+        tool_registry=registry,
+        executor_connection=probe_executor,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-mixed-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Mutating tool was retried."
+    assert probe_executor.executed_tools == ["list_directory"]
+    assert [probe["path"] for probe in probe_executor.probes] == [
+        "/workspace/cognis",
+        "/workspace/cognis/out.txt",
+    ]
+    assert len(fake_llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_project_mutating_trailing_tool_loads_own_project_context() -> None:
+    fake_llm = _MixedProjectContextLLM(
+        write_path="/workspace/other/out.txt",
+        expected_source="/workspace/other/AGENTS.md",
+    )
+    probe_executor = _ReadOnlyProjectContextExecutor()
+
+    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+        return await probe_executor.tool_execute(tool_call)
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="list_directory",
+                description="List a directory",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="write",
+                description="Write a file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                },
+                source=ToolSource(type="executor"),
+                read_only=False,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(
+            execute=execute_tool,
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable,
+        ),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-cross-mixed-project",
+            conversation_id="conv-cross-mixed-project",
+            intaris_session_id="sess-cross-mixed-project",
+            mnemory_session_id="mem-cross-mixed-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-cross-mixed-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect cognis then modify other project",
+        tool_registry=registry,
+        executor_connection=probe_executor,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-cross-mixed-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Mutating tool was retried."
+    assert probe_executor.executed_tools == ["list_directory"]
+    assert [probe["path"] for probe in probe_executor.probes] == [
+        "/workspace/cognis",
+        "/workspace/other/out.txt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mutating_tool_retries_with_matching_earlier_project_context() -> None:
+    fake_llm = _MixedProjectContextLLM(
+        write_path="/workspace/cognis/out.txt",
+        expected_source="/workspace/cognis/AGENTS.md",
+        second_read_path="/workspace/other",
+    )
+    probe_executor = _ReadOnlyProjectContextExecutor()
+
+    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+        return await probe_executor.tool_execute(tool_call)
+
+    registry = ToolRegistry()
+    for name, read_only in (("list_directory", True), ("write", False)):
+        registry.register(
+            RegisteredTool(
+                definition=ToolDefinition(
+                    name=name,
+                    description=name,
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(type="executor"),
+                    read_only=read_only,
+                ),
+                handler=None,
+            )
+        )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_ExistingProjectSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(
+            execute=execute_tool,
+            _is_non_bypassable=lambda _name, non_bypassable: non_bypassable,
+        ),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-multi-project",
+            conversation_id="conv-multi-project",
+            intaris_session_id="sess-multi-project",
+            mnemory_session_id="mem-multi-project",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-multi-project",
+            context=SimpleNamespace(platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Inspect two projects then modify cognis",
+        tool_registry=registry,
+        executor_connection=probe_executor,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-multi-project",
+            executor_type="in_process",
+            source="test",
+        ),
+        workspace_root="/workspace/current",
+        working_directory="/workspace/current",
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Mutating tool was retried."
+    assert probe_executor.executed_tools == ["list_directory", "list_directory"]
+    assert [probe["path"] for probe in probe_executor.probes] == [
+        "/workspace/cognis",
+        "/workspace/other",
+        "/workspace/cognis/out.txt",
+    ]
+
+
+def test_project_context_fallback_matches_relative_tool_path_to_workdir() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-relative", intaris_session_id="sess-relative"),
+        conversation=SimpleNamespace(conversation_id="conv-relative"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        working_directory="/workspace/cognis",
+    )
+    project_context = ProjectContextEntry(
+        project_root="/workspace/cognis",
+        source_path="/workspace/cognis/AGENTS.md",
+        content="Instructions",
+        content_hash="hash",
+        working_directory="/workspace/cognis",
+    )
+
+    matched = agent_loop._project_context_loaded_for_tool_target(
+        ctx,
+        ToolCall(name="write", call_id="call_write", arguments={"file_path": "out.txt"}),
+        {project_context.project_root: project_context},
+    )
+
+    assert matched is project_context
 
 
 @pytest.mark.asyncio
