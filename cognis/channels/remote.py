@@ -216,6 +216,35 @@ class RemoteChannelAdapterProxy:
         message: InboundMessage,
         attachment: MediaAttachment,
     ) -> tuple[bytes, str, str] | None:
+        return await self._download_attachment(
+            message,
+            attachment,
+            stt_supported_mime_types=None,
+            raise_errors=False,
+        )
+
+    async def download_attachment_for_stt(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+        *,
+        supported_mime_types: list[str] | None = None,
+    ) -> tuple[bytes, str, str] | None:
+        return await self._download_attachment(
+            message,
+            attachment,
+            stt_supported_mime_types=supported_mime_types,
+            raise_errors=True,
+        )
+
+    async def _download_attachment(
+        self,
+        message: InboundMessage,
+        attachment: MediaAttachment,
+        *,
+        stt_supported_mime_types: list[str] | None,
+        raise_errors: bool,
+    ) -> tuple[bytes, str, str] | None:
         try:
             result = await self._connection.rpc_call(
                 "channel.fetch_media",
@@ -223,9 +252,13 @@ class RemoteChannelAdapterProxy:
                     "account_id": self._account_id,
                     "message": message.model_dump(mode="json"),
                     "attachment": attachment.model_dump(mode="json"),
+                    "stt_supported_mime_types": stt_supported_mime_types,
                 },
                 timeout=60.0,
             )
+            error = result.get("error")
+            if isinstance(error, str) and error:
+                raise RuntimeError(error)
             payload = result.get("content_b64")
             if not isinstance(payload, str):
                 return None
@@ -242,6 +275,8 @@ class RemoteChannelAdapterProxy:
                 extra={"extra_data": {"account_id": self._account_id}},
                 exc_info=True,
             )
+            if raise_errors:
+                raise
             return None
 
     async def get_status(self) -> ChannelAccountStatus:

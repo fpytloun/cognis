@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import httpx
@@ -252,10 +252,19 @@ class InferenceHandler:
         filename: str,
         model: str,
         provider_preset: str | None = None,
+        supported_audio_mime_types: Sequence[str] | None = None,
         request_kwargs: dict[str, Any],
         prompt: str | None = None,
         language: str | None = None,
     ) -> dict[str, Any]:
+        from cognis.channels.inbound import _prepare_audio_for_stt
+
+        audio_bytes, mime_type, filename = await _prepare_audio_for_stt(
+            audio_bytes,
+            mime_type=mime_type,
+            filename=filename,
+            supported_mime_types=[str(item) for item in supported_audio_mime_types or []],
+        )
         api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
         if not isinstance(api_base, str) or not api_base:
             api_base = "https://api.openai.com"

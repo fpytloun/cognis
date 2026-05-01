@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,9 +14,12 @@ from cognis.channels.inbound import (
     _prepare_audio_for_stt,
     _signal_image_preview_payload,
     _stt_passthrough_target,
+    _stt_supported_audio_mime_types,
 )
+from cognis.channels.remote import RemoteChannelAdapterProxy
 from cognis.core.commands import CommandResult
 from cognis.core.turn_scheduler import TurnResult
+from cognis.executor.channel_handler import ChannelHandler
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import ChannelAccountConfig, InboundMessage, MediaAttachment
 
@@ -316,6 +320,23 @@ def test_stt_passthrough_target_normalizes_filename_extension() -> None:
     assert _stt_passthrough_target("audio/ogg", "voice.ogg") == ("audio/ogg", "voice.ogg")
 
 
+def test_stt_passthrough_target_uses_configured_model_formats() -> None:
+    assert _stt_passthrough_target(
+        "audio/aac",
+        "voice",
+        supported_mime_types=["audio/aac"],
+    ) == ("audio/aac", "voice.aac")
+
+
+def test_stt_supported_audio_mime_types_uses_model_metadata() -> None:
+    model_info = SimpleNamespace(supported_audio_mime_types=["audio/aac", " audio/flac "])
+
+    assert _stt_supported_audio_mime_types(model="custom-stt", model_info=model_info) == [
+        "audio/aac",
+        "audio/flac",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_prepare_audio_for_stt_requires_ffmpeg_for_aac(
     monkeypatch: pytest.MonkeyPatch,
@@ -331,6 +352,30 @@ async def test_prepare_audio_for_stt_requires_ffmpeg_for_aac(
 
 
 @pytest.mark.asyncio
+async def test_prepare_audio_for_stt_transcodes_when_policy_excludes_mime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_transcode(content: bytes, *, mime_type: str, filename: str):
+        assert content == b"audio-bytes"
+        assert mime_type == "audio/aac"
+        assert filename == "voice.aac"
+        return b"wav-bytes", "audio/wav", "voice-input.wav"
+
+    monkeypatch.setattr("cognis.channels.inbound._transcode_audio_for_stt", fake_transcode)
+
+    content, mime_type, filename = await _prepare_audio_for_stt(
+        b"audio-bytes",
+        mime_type="audio/aac",
+        filename="voice.aac",
+        supported_mime_types=["audio/wav"],
+    )
+
+    assert content == b"wav-bytes"
+    assert mime_type == "audio/wav"
+    assert filename == "voice-input.wav"
+
+
+@pytest.mark.asyncio
 async def test_prepare_audio_for_stt_passthroughs_supported_audio() -> None:
     content, mime_type, filename = await _prepare_audio_for_stt(
         b"audio-bytes",
@@ -341,6 +386,89 @@ async def test_prepare_audio_for_stt_passthroughs_supported_audio() -> None:
     assert content == b"audio-bytes"
     assert mime_type == "audio/ogg"
     assert filename == "voice.ogg"
+
+
+@pytest.mark.asyncio
+async def test_executor_channel_fetch_media_normalizes_voice_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Adapter:
+        async def download_attachment(self, _message: object, _attachment: object):
+            return b"aac-bytes", "audio/aac", "voice.aac"
+
+    async def fake_prepare(content: bytes, **kwargs: object):
+        assert content == b"aac-bytes"
+        assert kwargs["supported_mime_types"] == ["audio/wav"]
+        return b"wav-bytes", "audio/wav", "voice-input.wav"
+
+    monkeypatch.setattr("cognis.channels.inbound._prepare_audio_for_stt", fake_prepare)
+    handler = ChannelHandler()
+    handler._adapters["acct-1"] = _Adapter()  # noqa: SLF001
+
+    result = await handler.fetch_media(
+        "acct-1",
+        {
+            "channel_type": "signal",
+            "account_id": "acct-1",
+            "message_id": "msg-1",
+            "sender_id": "sender-1",
+            "chat_id": "chat-1",
+            "content": "",
+            "timestamp": __import__("datetime").datetime.now(__import__("datetime").UTC),
+        },
+        {"mime_type": "audio/aac", "filename": "voice.aac"},
+        stt_supported_mime_types=["audio/wav"],
+    )
+
+    assert result["content_b64"] == base64.b64encode(b"wav-bytes").decode("ascii")
+    assert result["content_type"] == "audio/wav"
+    assert result["filename"] == "voice-input.wav"
+
+
+@pytest.mark.asyncio
+async def test_remote_channel_download_attachment_for_stt_passes_policy() -> None:
+    class _Connection:
+        executor_id = "exec-1"
+
+        def __init__(self) -> None:
+            self.params: dict[str, object] | None = None
+
+        async def rpc_call(self, _method: str, params: dict[str, object], timeout: float):
+            self.params = params
+            assert timeout == 60.0
+            return {
+                "content_b64": base64.b64encode(b"wav-bytes").decode("ascii"),
+                "content_type": "audio/wav",
+                "filename": "voice-input.wav",
+            }
+
+    conn = _Connection()
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=MagicMock(),
+        account_id="acct-1",
+    )
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    attachment = MediaAttachment(mime_type="audio/aac", filename="voice.aac")
+
+    fetched = await proxy.download_attachment_for_stt(
+        message,
+        attachment,
+        supported_mime_types=["audio/wav"],
+    )
+
+    assert fetched == (b"wav-bytes", "audio/wav", "voice-input.wav")
+    assert conn.params is not None
+    assert conn.params["stt_supported_mime_types"] == ["audio/wav"]
 
 
 @pytest.mark.asyncio

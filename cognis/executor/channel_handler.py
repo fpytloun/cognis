@@ -122,6 +122,7 @@ class ChannelHandler:
         account_id: str,
         message: dict[str, Any],
         attachment: dict[str, Any],
+        stt_supported_mime_types: list[str] | None = None,
     ) -> dict[str, Any]:
         adapter = self._adapters.get(account_id)
         if adapter is None:
@@ -132,6 +133,18 @@ class ChannelHandler:
         if fetched is None:
             return {"status": "unavailable"}
         content, content_type, filename = fetched
+        if str(content_type or "").startswith("audio/") and stt_supported_mime_types:
+            try:
+                from cognis.channels.inbound import _prepare_audio_for_stt
+
+                content, content_type, filename = await _prepare_audio_for_stt(
+                    content,
+                    mime_type=content_type,
+                    filename=filename,
+                    supported_mime_types=stt_supported_mime_types,
+                )
+            except Exception as exc:
+                return {"error": str(exc)[:500]}
         return {
             "status": "ok",
             "content_b64": base64.b64encode(content).decode("ascii"),

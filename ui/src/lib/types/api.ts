@@ -1150,6 +1150,7 @@ export interface ModelEntry {
   supports_responses_api: boolean;
   supports_extended_thinking: boolean;
   supports_image_generation: boolean;
+  supported_audio_mime_types: string[];
   supported_openai_params: string[];
   max_tools?: number;
   input_cost_per_mtok?: number;
@@ -1179,6 +1180,7 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_responses_api: false,
     supports_extended_thinking: false,
     supports_image_generation: false,
+    supported_audio_mime_types: [],
     supported_openai_params: [],
     tier: 'standard'
   };

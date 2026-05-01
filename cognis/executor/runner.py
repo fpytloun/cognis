@@ -892,6 +892,7 @@ class ExecutorRunner:
                 filename=str(params.get("filename", "audio.bin")),
                 model=str(params.get("model", "")),
                 provider_preset=params.get("provider_preset"),
+                supported_audio_mime_types=params.get("supported_audio_mime_types"),
                 request_kwargs=request_kwargs,
                 prompt=params.get("prompt"),
                 language=params.get("language"),
@@ -955,6 +956,7 @@ class ExecutorRunner:
                 account_id=params.get("account_id", ""),
                 message=params.get("message", {}),
                 attachment=params.get("attachment", {}),
+                stt_supported_mime_types=params.get("stt_supported_mime_types"),
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:

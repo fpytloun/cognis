@@ -88,6 +88,7 @@ class ModelInfo(BaseModel):
     supports_openai_allowed_tools: bool = False
     supports_openai_apply_patch: bool = False
     supports_image_generation: bool = False
+    supported_audio_mime_types: list[str] = Field(default_factory=list)
     supported_openai_params: list[str] = Field(default_factory=list)
     max_tools: int | None = None
     input_cost_per_mtok: float | None = None

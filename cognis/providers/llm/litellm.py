@@ -569,6 +569,10 @@ def _normalize_proxy_model_info(info: dict[str, Any]) -> dict[str, Any]:
         normalized["supports_audio_input"] = bool(info["supports_audio_input"])
     if "supports_image_generation" in info:
         normalized["supports_image_generation"] = bool(info["supports_image_generation"])
+    if isinstance(info.get("supported_audio_mime_types"), list):
+        normalized["supported_audio_mime_types"] = [
+            str(item) for item in info["supported_audio_mime_types"] if str(item).strip()
+        ]
     if "supports_pdf_input" in info:
         normalized["supports_pdf_input"] = bool(info["supports_pdf_input"])
     if "supports_reasoning" in info:
@@ -1182,6 +1186,13 @@ class LiteLLMProvider:
             raise ValueError(f"No LLM provider found for transcription model {resolved_model!r}")
         provider_preset = str(dict(provider.config).get("preset", "")).lower()
         model_name = self._transcription_wire_model(resolved_model, provider_preset)
+        model_info = await self.get_model_info(resolved_model, provider.provider_id)
+        from cognis.channels.inbound import _prepare_audio_for_stt, _stt_supported_audio_mime_types
+
+        supported_audio_mime_types = _stt_supported_audio_mime_types(
+            model=resolved_model,
+            model_info=model_info,
+        )
         logger.debug(
             "llm: speech-to-text request prepared",
             extra={
@@ -1204,11 +1215,18 @@ class LiteLLMProvider:
                 model=model_name,
                 provider_preset=provider_preset,
                 executor_labels=dict(provider.config).get("executor_labels"),
+                supported_audio_mime_types=supported_audio_mime_types,
                 request_kwargs=request_kwargs,
                 prompt=prompt,
                 language=language,
             )
 
+        audio_bytes, mime_type, filename = await _prepare_audio_for_stt(
+            audio_bytes,
+            mime_type=mime_type,
+            filename=filename,
+            supported_mime_types=supported_audio_mime_types,
+        )
         request_kwargs = await self._resolve_provider_kwargs(provider)
         api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
         if not isinstance(api_base, str) or not api_base:
@@ -1383,6 +1401,11 @@ class LiteLLMProvider:
                             live,
                             merged,
                             "supports_image_generation",
+                        ),
+                        "supported_audio_mime_types": list(
+                            live.get("supported_audio_mime_types")
+                            or merged.get("supported_audio_mime_types")
+                            or []
                         ),
                         "supports_pdf_input": _merge_live_bool(live, merged, "supports_pdf_input"),
                         "supports_file_input": _merge_live_bool(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import os
 import shutil
 import tempfile
@@ -47,7 +48,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
 
-_STT_SUPPORTED_AUDIO_MIME_TYPES = {
+_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ("audio/mpeg", ".mp3"),
     "audio/mp3": ("audio/mpeg", ".mp3"),
     "audio/mp4": ("audio/mp4", ".m4a"),
@@ -56,6 +57,17 @@ _STT_SUPPORTED_AUDIO_MIME_TYPES = {
     "audio/x-wav": ("audio/wav", ".wav"),
     "audio/webm": ("audio/webm", ".webm"),
     "audio/ogg": ("audio/ogg", ".ogg"),
+    "audio/oga": ("audio/ogg", ".oga"),
+    "audio/flac": ("audio/flac", ".flac"),
+}
+
+_STT_AUDIO_EXTENSION_BY_MIME = {
+    **_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES,
+    "audio/aac": ("audio/aac", ".aac"),
+    "audio/x-aac": ("audio/aac", ".aac"),
+    "audio/opus": ("audio/opus", ".opus"),
+    "audio/x-opus": ("audio/opus", ".opus"),
+    "audio/amr": ("audio/amr", ".amr"),
 }
 
 _STT_TRANSCODE_TARGET_MIME = "audio/wav"
@@ -105,8 +117,33 @@ def _normalized_audio_filename(filename: str, default_stem: str = "attachment") 
     return default_stem
 
 
-def _stt_passthrough_target(mime_type: str, filename: str) -> tuple[str, str] | None:
-    normalized = _STT_SUPPORTED_AUDIO_MIME_TYPES.get(mime_type.lower())
+def _stt_supported_audio_mime_types(
+    *,
+    model: str | None = None,
+    model_info: Any | None = None,
+) -> list[str]:
+    configured = getattr(model_info, "supported_audio_mime_types", None)
+    if isinstance(configured, list) and configured:
+        return [str(item).strip().lower() for item in configured if str(item).strip()]
+    return sorted(_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES)
+
+
+def _stt_passthrough_target(
+    mime_type: str,
+    filename: str,
+    *,
+    supported_mime_types: list[str] | None = None,
+) -> tuple[str, str] | None:
+    supported = {item.strip().lower() for item in (supported_mime_types or []) if item.strip()}
+    supported_map = (
+        {
+            mime: _STT_AUDIO_EXTENSION_BY_MIME.get(mime, (mime, Path(filename).suffix or ".bin"))
+            for mime in supported
+        }
+        if supported
+        else _STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES
+    )
+    normalized = supported_map.get(mime_type.lower())
     if normalized is None:
         return None
     normalized_mime, extension = normalized
@@ -172,8 +209,13 @@ async def _prepare_audio_for_stt(
     *,
     mime_type: str,
     filename: str,
+    supported_mime_types: list[str] | None = None,
 ) -> tuple[bytes, str, str]:
-    passthrough = _stt_passthrough_target(mime_type, filename)
+    passthrough = _stt_passthrough_target(
+        mime_type,
+        filename,
+        supported_mime_types=supported_mime_types,
+    )
     if passthrough is not None:
         normalized_mime, normalized_filename = passthrough
         return content, normalized_mime, normalized_filename
@@ -304,11 +346,17 @@ class InboundPipeline:
                 )
             return
 
-        attachments = await self._normalize_media_attachments(
-            message=message,
-            conversation_id=conversation_id,
-            user_email=user_email,
-        )
+        try:
+            attachments = await self._normalize_media_attachments(
+                message=message,
+                conversation_id=conversation_id,
+                user_email=user_email,
+            )
+        except Exception as exc:
+            if self._is_voice_input(message):
+                await self._send_error(message, config, str(exc))
+                return
+            raise
         if _SIGNAL_DEBUG_ENABLED and message.channel_type == "signal":
             logger.info(
                 "channel inbound: attachment normalization result",
@@ -401,10 +449,12 @@ class InboundPipeline:
         content, _ = await manager._artifact_store.async_load(  # noqa: SLF001
             "attachments", audio_attachment.artifact_id, audio_attachment.filename
         )
+        supported_mime_types = await self._voice_stt_supported_mime_types()
         prepared_content, prepared_mime, prepared_filename = await _prepare_audio_for_stt(
             content,
             mime_type=audio_attachment.mime_type,
             filename=audio_attachment.filename,
+            supported_mime_types=supported_mime_types,
         )
         try:
             result = await self._llm_provider.transcribe(
@@ -415,6 +465,29 @@ class InboundPipeline:
         except Exception as exc:
             raise RuntimeError(f"I couldn't transcribe that voice message. {exc}") from exc
         return result.text
+
+    async def _voice_stt_supported_mime_types(self) -> list[str] | None:
+        if self._llm_provider is None:
+            return None
+        try:
+            resolver = getattr(self._llm_provider, "resolve_model_target", None)
+            if not callable(resolver):
+                return None
+            resolved = resolver(task_type="speech_to_text")
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            if not isinstance(resolved, tuple) or not resolved:
+                return None
+            model = str(resolved[0])
+            model_info = None
+            info_getter = getattr(self._llm_provider, "get_model_info", None)
+            if callable(info_getter):
+                info = info_getter(model)
+                model_info = await info if inspect.isawaitable(info) else info
+            return _stt_supported_audio_mime_types(model=model, model_info=model_info)
+        except Exception:
+            logger.debug("channel inbound: failed to resolve STT audio policy", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # Access control
@@ -730,9 +803,23 @@ class InboundPipeline:
         async with self._session_factory() as session:
             from cognis.store.queries import create_artifact_record
 
+            stt_supported_mime_types: list[str] | None = None
+            if self._is_voice_input(message):
+                stt_supported_mime_types = await self._voice_stt_supported_mime_types()
             for attachment in message.media:
                 try:
-                    fetched = await adapter.download_attachment(message, attachment)
+                    if (
+                        self._is_voice_input(message)
+                        and str(attachment.mime_type or "").startswith("audio/")
+                        and hasattr(adapter, "download_attachment_for_stt")
+                    ):
+                        fetched = await adapter.download_attachment_for_stt(  # type: ignore[attr-defined]
+                            message,
+                            attachment,
+                            supported_mime_types=stt_supported_mime_types,
+                        )
+                    else:
+                        fetched = await adapter.download_attachment(message, attachment)
                     if fetched is None:
                         continue
                     content, content_type, filename = fetched
@@ -784,6 +871,10 @@ class InboundPipeline:
                         },
                         exc_info=True,
                     )
+                    if self._is_voice_input(message) and str(
+                        attachment.mime_type or ""
+                    ).startswith("audio/"):
+                        raise
                     continue
             await session.commit()
         return refs
