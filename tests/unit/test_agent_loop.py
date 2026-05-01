@@ -26,6 +26,7 @@ from cognis.core.agent_loop import (
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
     _iterate_llm_stream_with_idle_timeout,
+    _PreparedRegularToolCall,
     _validate_step_completion_notification,
 )
 from cognis.core.project_context import ProjectContextEntry
@@ -393,6 +394,448 @@ def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
         )
         is True
     )
+
+
+def test_classified_dynamic_read_only_tool_parallelizes() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = SimpleNamespace(
+        _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+    )
+    raw_tool = ToolDefinition(
+        name="mcp_github__search_issues",
+        description="Search GitHub issues",
+        parameters={},
+        source=ToolSource(type="intaris_mcp", server_name="github", raw_tool_name="search/issues"),
+        category="mcp",
+        read_only=False,
+    )
+    classified_tool = raw_tool.model_copy(update={"read_only": True})
+    registry = {raw_tool.name: SimpleNamespace(definition=raw_tool)}
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        classified_tool_definitions={stable_tool_id(raw_tool): classified_tool},
+    )
+
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-1", name=raw_tool.name, arguments={}),
+            registry,
+        )
+        is True
+    )
+
+
+def test_safe_executor_mutations_parallelize_under_evaluate_permission() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = SimpleNamespace(
+        _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+    )
+    tool = ToolDefinition(
+        name="write",
+        description="Write a file",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=False,
+        non_bypassable=True,
+    )
+    registry = {"write": SimpleNamespace(definition=tool)}
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            permissions=AgentPermissions(
+                tool_permissions={stable_tool_id(tool): Permission.EVALUATE}
+            ),
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-1", name="write", arguments={"file_path": "a.txt"}),
+            registry,
+        )
+        is True
+    )
+
+
+def test_unsafe_executor_mutations_stay_serial() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = SimpleNamespace(
+        _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+    )
+    bash_tool = ToolDefinition(
+        name="bash",
+        description="Run shell",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="shell",
+        read_only=False,
+        non_bypassable=True,
+    )
+    browser_tool = ToolDefinition(
+        name="browser_click",
+        description="Click",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="browser",
+        read_only=False,
+        non_bypassable=True,
+    )
+    registry = {
+        "bash": SimpleNamespace(definition=bash_tool),
+        "browser_click": SimpleNamespace(definition=browser_tool),
+    }
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-bash", name="bash", arguments={}),
+            registry,
+        )
+        is False
+    )
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-click", name="browser_click", arguments={}),
+            registry,
+        )
+        is False
+    )
+
+
+def test_artifact_executor_tools_parallelize() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = SimpleNamespace(
+        _is_non_bypassable=lambda _name, non_bypassable: non_bypassable
+    )
+    artifact_save = ToolDefinition(
+        name="artifact_save",
+        description="Save artifact",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=False,
+        non_bypassable=True,
+    )
+    artifact_publish = ToolDefinition(
+        name="artifact_publish",
+        description="Publish artifact",
+        parameters={},
+        source=ToolSource(type="executor"),
+        category="document",
+        read_only=True,
+    )
+    registry = {
+        "artifact_save": SimpleNamespace(definition=artifact_save),
+        "artifact_publish": SimpleNamespace(definition=artifact_publish),
+    }
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-save", name="artifact_save", arguments={}),
+            registry,
+        )
+        is True
+    )
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-publish", name="artifact_publish", arguments={}),
+            registry,
+        )
+        is True
+    )
+
+
+def _parallel_group_ctx() -> StepContext:
+    return StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        working_directory="/tmp",
+    )
+
+
+def test_default_parallel_path_uses_home_without_working_directory() -> None:
+    ctx = _parallel_group_ctx()
+    ctx.working_directory = None
+    ctx.workspace_root = "/tmp"
+
+    assert AgentLoop._default_parallel_path(ctx) != "/tmp"
+
+
+def test_parallel_execution_groups_split_conflicting_mutation_paths() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    first = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/a.txt"},
+        ),
+        tool_id="builtin:write",
+    )
+    second = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-edit",
+            name="edit",
+            arguments={"file_path": "/tmp/a.txt"},
+        ),
+        tool_id="builtin:edit",
+    )
+    third = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-other-write",
+            name="write",
+            arguments={"file_path": "/tmp/b.txt"},
+        ),
+        tool_id="builtin:write",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [first, second, third])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-edit", "call-other-write"],
+    ]
+
+
+def test_parallel_execution_groups_keep_apply_patch_exclusive() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    patch = _PreparedRegularToolCall(
+        tool_call=ToolCall(call_id="call-patch", name="apply_patch", arguments={}),
+        tool_id="builtin:apply_patch",
+    )
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/a.txt"},
+        ),
+        tool_id="builtin:write",
+    )
+    read = _PreparedRegularToolCall(
+        tool_call=ToolCall(call_id="call-read", name="read", arguments={"file_path": "/tmp/a.txt"}),
+        tool_id="builtin:read",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [patch, read, write])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-patch"],
+        ["call-read"],
+        ["call-write"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_same_path_publish() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/report.pdf"},
+        ),
+        tool_id="builtin:write",
+    )
+    publish = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-publish",
+            name="artifact_publish",
+            arguments={"path": "/tmp/report.pdf"},
+        ),
+        tool_id="builtin:artifact_publish",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, publish])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-publish"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_same_path_read_alias() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/report.md"},
+        ),
+        tool_id="builtin:write",
+    )
+    read = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-read",
+            name="read",
+            arguments={"file_path": "./report.md"},
+        ),
+        tool_id="builtin:read",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, read])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-read"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_dynamic_path_read() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/report.md"},
+        ),
+        tool_id="builtin:write",
+    )
+    dynamic_read = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-dynamic-read",
+            name="mcp_files__read_file",
+            arguments={"path": "./report.md"},
+        ),
+        tool_id="mcp:files:read_file",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, dynamic_read])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-dynamic-read"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_directory_read() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/report.md"},
+        ),
+        tool_id="builtin:write",
+    )
+    list_directory = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-list",
+            name="list_directory",
+            arguments={"path": "/tmp"},
+        ),
+        tool_id="builtin:list_directory",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, list_directory])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-list"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_default_path_grep() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/report.md"},
+        ),
+        tool_id="builtin:write",
+    )
+    grep = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-grep",
+            name="grep",
+            arguments={"pattern": "report"},
+        ),
+        tool_id="builtin:grep",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, grep])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-grep"],
+    ]
+
+
+def test_parallel_execution_groups_split_write_before_document_asset_read() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    write = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-write",
+            name="write",
+            arguments={"file_path": "/tmp/chart.png"},
+        ),
+        tool_id="builtin:write",
+    )
+    document_generate = _PreparedRegularToolCall(
+        tool_call=ToolCall(
+            call_id="call-doc",
+            name="document_generate",
+            arguments={"content": "![chart](asset:chart)", "assets": [{"name": "chart", "path": "/tmp/chart.png"}]},
+        ),
+        tool_id="builtin:document_generate",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, document_generate])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-write"],
+        ["call-doc"],
+    ]
+
+
+def test_parallel_execution_groups_keep_apply_patch_exclusive_after_untracked_tool() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    web_fetch = _PreparedRegularToolCall(
+        tool_call=ToolCall(call_id="call-web", name="web_fetch", arguments={"url": "https://example.com"}),
+        tool_id="builtin:web_fetch",
+    )
+    patch = _PreparedRegularToolCall(
+        tool_call=ToolCall(call_id="call-patch", name="apply_patch", arguments={}),
+        tool_id="builtin:apply_patch",
+    )
+
+    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [web_fetch, patch])
+
+    assert [[item.tool_call.call_id for item in group] for group in groups] == [
+        ["call-web"],
+        ["call-patch"],
+    ]
 
 
 @pytest.mark.asyncio

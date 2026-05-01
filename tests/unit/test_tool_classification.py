@@ -6,6 +6,7 @@ import json
 import pytest
 import sqlalchemy as sa
 
+from cognis.api.serializers import tool_to_response
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.tool_classification_queue import ToolClassificationQueue
 from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource, stable_tool_id
@@ -189,6 +190,8 @@ async def test_resolve_tool_classifications_overlays_ready_persisted_state(tmp_p
     assert resolved[0].classification_status == "ready"
     assert resolved[0].profile_group == "web"
     assert resolved[0].classification_source == "llm"
+    assert resolved[0].read_only is True
+    assert tool_to_response(resolved[0]).read_only is True
 
     await engine.dispose()
 
@@ -234,6 +237,122 @@ async def test_resolve_tool_classifications_applies_manual_override_precedence(t
     assert resolved[0].classification_source == "override"
     assert resolved[0].profile_group == "development"
     assert resolved[0].capabilities == ["read", "privileged"]
+    assert resolved[0].read_only is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dynamic_write_classification_remains_not_read_only(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    tool = _dynamic_tool()
+    async with session_factory() as session:
+        await upsert_tool_classification(
+            session,
+            scope_key="__global__",
+            owner_email=None,
+            tool_id=stable_tool_id(tool),
+            source_type=tool.source.type,
+            fingerprint=tool_fingerprint(tool),
+            tool_payload=tool.model_dump(mode="json"),
+            status="ready",
+            category="development",
+            capabilities=["read", "write"],
+            classification_source="llm",
+            classification_confidence=0.93,
+        )
+        await session.commit()
+
+    resolved = await resolve_tool_classifications(
+        [tool],
+        session_factory=session_factory,
+        owner_email=None,
+        queue=None,
+    )
+
+    assert resolved[0].classification_status == "ready"
+    assert resolved[0].read_only is False
+    assert tool_to_response(resolved[0]).read_only is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_dynamic_classification_returns_pending_without_read_only(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    tool = _dynamic_tool().model_copy(update={"read_only": False})
+    async with session_factory() as session:
+        await upsert_tool_classification(
+            session,
+            scope_key="__global__",
+            owner_email=None,
+            tool_id=stable_tool_id(tool),
+            source_type=tool.source.type,
+            fingerprint="stale-fingerprint",
+            tool_payload=tool.model_dump(mode="json"),
+            status="ready",
+            category="web",
+            capabilities=["read"],
+            classification_source="llm",
+            classification_confidence=0.93,
+        )
+        await session.commit()
+
+    resolved = await resolve_tool_classifications(
+        [tool],
+        session_factory=session_factory,
+        owner_email=None,
+        queue=None,
+    )
+
+    assert resolved[0].classification_status == "pending"
+    assert resolved[0].read_only is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tool_classification_queue_reenqueues_stale_ready_row(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    tool = _dynamic_tool().model_copy(update={"read_only": False})
+    async with session_factory() as session:
+        await upsert_tool_classification(
+            session,
+            scope_key="__global__",
+            owner_email=None,
+            tool_id=stable_tool_id(tool),
+            source_type=tool.source.type,
+            fingerprint="stale-fingerprint",
+            tool_payload=tool.model_dump(mode="json"),
+            status="ready",
+            category="web",
+            capabilities=["read"],
+            classification_source="llm",
+            classification_confidence=0.93,
+        )
+        await session.commit()
+
+    queue = ToolClassificationQueue(session_factory=session_factory, llm_provider=_FakeLLM())
+    await queue.enqueue_tools([tool], owner_email=None)
+
+    async with session_factory() as session:
+        result = await session.execute(
+            sa.select(ToolClassificationRow).where(
+                ToolClassificationRow.scope_key == "__global__",
+                ToolClassificationRow.tool_id == stable_tool_id(tool),
+            )
+        )
+        row = result.scalar_one()
+
+    assert row.status == "pending"
+    assert row.fingerprint == tool_fingerprint(tool)
+    assert row.attempts == 0
 
     await engine.dispose()
 

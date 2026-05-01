@@ -115,6 +115,7 @@ class ToolClassificationQueue:
                 if (
                     row is not None
                     and row.status == "ready"
+                    and row.fingerprint == fingerprint
                     and row.category in AUTO_PROFILE_GROUPS
                     and row.capabilities
                     and _validate_profile_group(

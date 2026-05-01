@@ -21,6 +21,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from typing import Any
 
@@ -322,6 +323,17 @@ _PROJECT_TOUCH_TOOL_NAMES = frozenset(
     }
 )
 _READ_ONLY_PROJECT_TOUCH_TOOL_NAMES = frozenset({"read", "list_directory", "glob", "grep"})
+_PARALLEL_MUTATION_TOOL_NAMES = frozenset(
+    {
+        "write",
+        "edit",
+        "multiedit",
+        "apply_patch",
+        "artifact_save",
+        "document_generate",
+        "artifact_publish",
+    }
+)
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -1680,6 +1692,7 @@ class StepContext:
     prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
     interaction_mode: str = "explicit_gates"
     tool_registry: Any = None  # ToolRegistry instance for this step
+    classified_tool_definitions: dict[str, ToolDefinition] = field(default_factory=dict)
     executor_connection: Any = None  # ExecutorConnection for this step
     executor_environment: ExecutorEnvironmentSnapshot | None = None
     runtime_info: dict[str, Any] = field(default_factory=dict)
@@ -2812,6 +2825,9 @@ class AgentLoop:
                     )
                 else:
                     classified_inventory = classify_tool_definitions_sync(registry.list_tools())
+                ctx.classified_tool_definitions = {
+                    stable_tool_id(tool): tool for tool in classified_inventory
+                }
                 full_inventory_tools = _filter_model_inventory_tools(
                     ctx.agent,
                     classified_inventory,
@@ -8316,23 +8332,31 @@ class AgentLoop:
         if registry is None or tc.name in CONTROLLER_TOOLS or is_orchestration_tool(tc.name):
             return False
         registered = registry.get(tc.name)
-        if registered is None or not registered.definition.read_only:
+        if registered is None:
+            return False
+        definition = ctx.classified_tool_definitions.get(
+            stable_tool_id(registered.definition), registered.definition
+        )
+        allowlisted_parallel_mutation = (
+            definition.source.type == "executor" and definition.name in _PARALLEL_MUTATION_TOOL_NAMES
+        )
+        if not definition.read_only and not allowlisted_parallel_mutation:
             return False
         is_non_bypassable = getattr(
             self.tool_router,
             "_is_non_bypassable",
             lambda _name, non_bypassable: bool(non_bypassable),
         )
-        if is_non_bypassable(
-            registered.definition.name,
-            registered.definition.non_bypassable,
+        if not allowlisted_parallel_mutation and is_non_bypassable(
+            definition.name,
+            definition.non_bypassable,
         ):
             return False
         permission = Permission.EVALUATE
         if ctx.agent.permissions is not None:
             permission = ctx.agent.permissions.resolve_permission(
                 tc.name,
-                tool_id=stable_tool_id(registered.definition),
+                tool_id=stable_tool_id(definition),
             )
         # Safe read-only tools can batch even when they still go through
         # guardrails evaluation. Only explicit deny should force serialization.
@@ -8370,6 +8394,143 @@ class AgentLoop:
             tool_id=stable_tool_id(registered.definition),
         )
         return permission is not Permission.DENY
+
+    @staticmethod
+    def _normalized_parallel_path(ctx: StepContext, raw_path: object) -> str | None:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return None
+        return AgentLoop._normalize_project_probe_target(ctx, raw_path)
+
+    @staticmethod
+    def _default_parallel_path(ctx: StepContext) -> str | None:
+        return normalize_project_path(ctx.working_directory or str(Path.home()))
+
+    @staticmethod
+    def _parallel_resource_access(
+        ctx: StepContext,
+        tc: ToolCall,
+    ) -> tuple[set[str], set[str], bool]:
+        reads: set[str] = set()
+        writes: set[str] = set()
+        if tc.name in {"write", "edit", "multiedit", "artifact_save"}:
+            path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("file_path"))
+            if path is None:
+                return set(), set(), True
+            writes.add(path)
+        elif tc.name in {"read", "lsp", "list_directory", "glob", "grep"}:
+            path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("file_path"))
+            if path is None:
+                path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("path"))
+            if path is None and tc.name in {"list_directory", "glob", "grep"}:
+                path = AgentLoop._default_parallel_path(ctx)
+            if path is not None:
+                reads.add(path)
+        elif tc.name == "document_generate":
+            source_path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("source_path"))
+            output_path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("output_path"))
+            if source_path is not None:
+                reads.add(source_path)
+            if output_path is not None:
+                writes.add(output_path)
+            raw_assets = tc.arguments.get("assets")
+            if isinstance(raw_assets, list):
+                for raw_asset in raw_assets:
+                    if not isinstance(raw_asset, dict):
+                        continue
+                    asset_path = AgentLoop._normalized_parallel_path(ctx, raw_asset.get("path"))
+                    if asset_path is not None:
+                        reads.add(asset_path)
+        elif tc.name == "artifact_publish":
+            path = AgentLoop._normalized_parallel_path(ctx, tc.arguments.get("path"))
+            if path is None:
+                return set(), set(), True
+            reads.add(path)
+        elif tc.name == "apply_patch":
+            return set(), set(), True
+        else:
+            reads.update(AgentLoop._parallel_read_paths_from_arguments(ctx, tc.arguments))
+        return reads, writes, False
+
+    @staticmethod
+    def _parallel_read_paths_from_arguments(
+        ctx: StepContext,
+        arguments: dict[str, Any],
+    ) -> set[str]:
+        paths: set[str] = set()
+        for key in ("path", "file_path", "source_path"):
+            path = AgentLoop._normalized_parallel_path(ctx, arguments.get(key))
+            if path is not None:
+                paths.add(path)
+        for key in ("paths", "files"):
+            values = arguments.get(key)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                path = AgentLoop._normalized_parallel_path(ctx, value)
+                if path is not None:
+                    paths.add(path)
+        return paths
+
+    @staticmethod
+    def _parallel_access_conflicts(
+        current_reads: set[str],
+        current_writes: set[str],
+        current_exclusive: bool,
+        reads: set[str],
+        writes: set[str],
+        exclusive: bool,
+    ) -> bool:
+        if current_exclusive or exclusive:
+            return True
+        return any(
+            AgentLoop._parallel_paths_overlap(write_path, read_path)
+            for write_path in writes
+            for read_path in current_reads | current_writes
+        ) or any(
+            AgentLoop._parallel_paths_overlap(read_path, write_path)
+            for read_path in reads
+            for write_path in current_writes
+        )
+
+    @staticmethod
+    def _parallel_paths_overlap(left: str, right: str) -> bool:
+        left = left.rstrip("/")
+        right = right.rstrip("/")
+        return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+
+    def _parallel_execution_groups(
+        self,
+        ctx: StepContext,
+        batch: list[_PreparedRegularToolCall],
+    ) -> list[list[_PreparedRegularToolCall]]:
+        groups: list[list[_PreparedRegularToolCall]] = []
+        current_group: list[_PreparedRegularToolCall] = []
+        current_reads: set[str] = set()
+        current_writes: set[str] = set()
+        current_exclusive = False
+        for item in batch:
+            reads, writes, exclusive = self._parallel_resource_access(ctx, item.tool_call)
+            conflicts = bool(current_group) and self._parallel_access_conflicts(
+                current_reads,
+                current_writes,
+                current_exclusive,
+                reads,
+                writes,
+                exclusive,
+            )
+            if current_group and conflicts:
+                groups.append(current_group)
+                current_group = []
+                current_reads = set()
+                current_writes = set()
+                current_exclusive = False
+            current_group.append(item)
+            current_reads.update(reads)
+            current_writes.update(writes)
+            current_exclusive = current_exclusive or exclusive
+        if current_group:
+            groups.append(current_group)
+        return groups
 
     def _project_context_loaded_for_tool_target(
         self,
@@ -8812,70 +8973,72 @@ class AgentLoop:
         on_token: TokenCallback | None,
         on_tool_result: ToolResultCallback | None,
     ) -> None:
-        for item in batch:
-            await self.event_bus.publish(
-                Event(
-                    type=EventType.WORKFLOW_PROGRESS,
-                    data={
-                        "event": "tool_call_started",
-                        "task_id": ctx.task_id,
-                        "session_id": ctx.session.session_id,
-                        "turn_id": ctx.turn_id,
-                        "step_name": ctx.step_definition.name,
-                        "step_run_id": ctx.step_run_id,
-                        "call_id": item.tool_call.call_id,
-                        "tool_name": item.tool_call.name,
-                        "tool_id": item.tool_id,
-                        "arguments": item.tool_call.arguments,
-                    },
+        for group in self._parallel_execution_groups(ctx, batch):
+            for item in group:
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.WORKFLOW_PROGRESS,
+                        data={
+                            "event": "tool_call_started",
+                            "task_id": ctx.task_id,
+                            "session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
+                            "step_name": ctx.step_definition.name,
+                            "step_run_id": ctx.step_run_id,
+                            "call_id": item.tool_call.call_id,
+                            "tool_name": item.tool_call.name,
+                            "tool_id": item.tool_id,
+                            "arguments": item.tool_call.arguments,
+                        },
+                    )
                 )
-            )
-            events_to_record.append(
-                SessionEvent(
-                    type="tool_call",
-                    data={
-                        "name": item.tool_call.name,
-                        "tool_id": item.tool_id,
-                        "call_id": item.tool_call.call_id,
-                        "arguments": _truncate_tool_data(
-                            json.dumps(item.tool_call.arguments, default=str)
-                        ),
-                    },
+                events_to_record.append(
+                    SessionEvent(
+                        type="tool_call",
+                        data={
+                            "name": item.tool_call.name,
+                            "tool_id": item.tool_id,
+                            "call_id": item.tool_call.call_id,
+                            "arguments": _truncate_tool_data(
+                                json.dumps(item.tool_call.arguments, default=str)
+                            ),
+                        },
+                    )
                 )
-            )
-            _track_pending_tool_call(ctx, item.tool_call, tool_id=item.tool_id)
+                _track_pending_tool_call(ctx, item.tool_call, tool_id=item.tool_id)
 
-        await self._flush_events_incremental(
-            ctx,
-            events_to_record,
-            reason="tool_call:batch",
-            on_token=on_token,
-        )
-
-        if len(batch) == 1:
-            results: list[ToolResult] = [await self._execute_regular_tool(ctx, batch[0].tool_call)]
-        else:
-            results = list(
-                await asyncio.gather(
-                    *(self._execute_regular_tool(ctx, item.tool_call) for item in batch)
-                )
-            )
-
-        for item, result in zip(batch, results, strict=False):
-            await self._finalize_regular_tool_result(
+            await self._flush_events_incremental(
                 ctx,
-                tc=item.tool_call,
-                tool_id=item.tool_id,
-                result=result,
-                events_to_record=events_to_record,
-                messages=messages,
-                collected_attachments=collected_attachments,
-                pending_assistant_attachments=pending_assistant_attachments,
-                promoted_tool_ids=promoted_tool_ids,
-                activated_tool_ids=activated_tool_ids,
+                events_to_record,
+                reason="tool_call:batch",
                 on_token=on_token,
-                on_tool_result=on_tool_result,
             )
+
+            if len(group) == 1:
+                group_results: list[ToolResult] = [
+                    await self._execute_regular_tool(ctx, group[0].tool_call)
+                ]
+            else:
+                group_results = list(
+                    await asyncio.gather(
+                        *(self._execute_regular_tool(ctx, item.tool_call) for item in group)
+                    )
+                )
+            for item, result in zip(group, group_results, strict=False):
+                await self._finalize_regular_tool_result(
+                    ctx,
+                    tc=item.tool_call,
+                    tool_id=item.tool_id,
+                    result=result,
+                    events_to_record=events_to_record,
+                    messages=messages,
+                    collected_attachments=collected_attachments,
+                    pending_assistant_attachments=pending_assistant_attachments,
+                    promoted_tool_ids=promoted_tool_ids,
+                    activated_tool_ids=activated_tool_ids,
+                    on_token=on_token,
+                    on_tool_result=on_tool_result,
+                )
 
     async def _flush_events_incremental(
         self,

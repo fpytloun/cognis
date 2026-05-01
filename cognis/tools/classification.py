@@ -33,6 +33,7 @@ logger = get_logger(__name__)
 
 _CLASSIFICATION_CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = asyncio.Lock()
+_DYNAMIC_SOURCE_TYPES = {"local_mcp", "intaris_mcp", "skill"}
 
 _READ_PREFIXES = (
     "get_",
@@ -189,6 +190,20 @@ def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
     )
 
 
+def _read_only_from_capabilities(capabilities: list[ToolCapability]) -> bool:
+    capability_set = set(capabilities)
+    return ToolCapability.READ in capability_set and not (
+        capability_set
+        & {ToolCapability.WRITE, ToolCapability.DESTRUCTIVE, ToolCapability.PRIVILEGED}
+    )
+
+
+def _classified_read_only(tool: ToolDefinition, capabilities: list[ToolCapability]) -> bool:
+    if tool.source.type not in _DYNAMIC_SOURCE_TYPES:
+        return tool.read_only
+    return _read_only_from_capabilities(capabilities)
+
+
 def classify_tool_definitions_sync(tools: list[ToolDefinition]) -> list[ToolDefinition]:
     """Classify tools without calling the LLM."""
 
@@ -245,6 +260,7 @@ async def classify_tool_definitions(
             update={
                 "profile_group": profile_group,
                 "capabilities": capabilities,
+                "read_only": _classified_read_only(current, capabilities),
                 "classification_status": "ready",
                 "classification_source": "llm",
                 "classification_confidence": float(payload.get("confidence") or 0.75),
@@ -256,7 +272,7 @@ async def classify_tool_definitions(
 def requires_background_classification(tool: ToolDefinition) -> bool:
     """Return whether a tool benefits from background LLM refinement."""
 
-    return tool.source.type in {"local_mcp", "intaris_mcp", "skill"}
+    return tool.source.type in _DYNAMIC_SOURCE_TYPES
 
 
 def apply_persisted_classifications(
@@ -288,6 +304,7 @@ def apply_persisted_classifications(
                             getattr(override, "profile_group", None) or tool_profile_group(tool)
                         ),
                         "capabilities": capabilities,
+                        "read_only": _classified_read_only(tool, capabilities),
                         "classification_status": "ready",
                         "classification_source": "override",
                         "classification_confidence": 1.0,
@@ -301,6 +318,9 @@ def apply_persisted_classifications(
                 overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
             else:
                 overlaid.append(tool)
+            continue
+        if str(getattr(row, "fingerprint", "")) != tool_fingerprint(tool):
+            overlaid.append(tool.model_copy(update={"classification_status": "pending"}))
             continue
         stored_profile_group = str(getattr(row, "category", None) or "").strip()
         capabilities = (
@@ -319,6 +339,7 @@ def apply_persisted_classifications(
                 update={
                     "profile_group": stored_profile_group,
                     "capabilities": capabilities,
+                    "read_only": _classified_read_only(tool, capabilities),
                     "classification_status": "ready",
                     "classification_source": getattr(row, "classification_source", None)
                     or tool.classification_source,
@@ -474,7 +495,6 @@ async def _classify_with_llm(
         },
     ]
     try:
-
         response = await llm.generate(
             messages,
             task_type="classifier",
