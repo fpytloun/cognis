@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,6 +18,7 @@ from cognis.models.schedule import (
     describe_interval,
     describe_schedule,
 )
+from cognis.tools.builtin import schedule as schedule_mod
 
 # ---------------------------------------------------------------------------
 # Schedule model validation
@@ -338,8 +343,243 @@ class TestScheduleToolClassification:
 
 
 # ---------------------------------------------------------------------------
+# Schedule tool definition output and patch semantics
+# ---------------------------------------------------------------------------
+
+
+class TestScheduleToolDefinitionOutput:
+    """Test LLM-facing schedule tool output and safe patch behavior."""
+
+    def test_definition_payload_includes_full_editable_definition(self) -> None:
+        payload = schedule_mod._schedule_definition_payload(_schedule_row(), active_tasks=1)
+
+        assert payload["name"] == "Daily check"
+        assert payload["schedule_type"] == "cron"
+        assert payload["cron_expr"] == "0 8 * * *"
+        assert payload["timezone"] == "UTC"
+        assert payload["agent_id"] == "agent_1"
+        assert payload["workflow_id"] == "system:general-task"
+        assert payload["project_id"] == "proj_1"
+        assert payload["task_title"] == "Daily check task"
+        assert payload["task_description"] == "Check the account and preserve these instructions."
+        assert payload["expected_output"] == "A concise status update."
+        assert payload["delivery_mode"] == "specific_conversation"
+        assert payload["delivery_target"] == "conv_1"
+        assert payload["completion_mode_family"] == "direct"
+        assert payload["allow_silent_completion"] is True
+        assert payload["enabled"] is True
+        assert payload["max_concurrent_runs"] == 2
+        assert payload["active_tasks"] == 1
+        assert payload["task_template"]["api_token"] == "[redacted]"
+
+    def test_schema_exposes_get_and_patch_guidance(self) -> None:
+        schema = schedule_mod.MANAGE_SCHEDULES_TOOL.parameters
+        assert "get" in schema["properties"]["action"]["enum"]
+        assert "include_definition" in schema["properties"]
+        assert "delivery_target" in schema["properties"]
+        assert "patch" in schedule_mod.MANAGE_SCHEDULES_TOOL.description.lower()
+
+    def test_update_preserves_omitted_task_definition_fields(self, monkeypatch: Any) -> None:
+        row = _schedule_row()
+        updated_fields: dict[str, Any] = {}
+
+        async def fake_get_schedule(_db: object, schedule_id: str) -> Any:
+            assert schedule_id == "sched_1"
+            return row
+
+        async def fake_update_schedule(_db: object, schedule_id: str, **fields: Any) -> Any:
+            assert schedule_id == "sched_1"
+            updated_fields.update(fields)
+            for key, value in fields.items():
+                setattr(row, key, value)
+            return row
+
+        async def fake_count_active_tasks(_db: object, schedule_id: str) -> int:
+            assert schedule_id == "sched_1"
+            return 0
+
+        monkeypatch.setattr(schedule_mod, "get_schedule", fake_get_schedule)
+        monkeypatch.setattr(schedule_mod, "update_schedule", fake_update_schedule)
+        monkeypatch.setattr(
+            schedule_mod,
+            "count_active_tasks_for_schedule",
+            fake_count_active_tasks,
+        )
+
+        result = asyncio.run(
+            schedule_mod._handle_update(
+                lambda: _Session(),
+                scheduler=None,
+                user_email="user@example.com",
+                arguments={
+                    "schedule_id": "sched_1",
+                    "allow_silent_completion": False,
+                    "delivery_mode": "latest_active_for_agent",
+                },
+            )
+        )
+
+        assert result.is_error is False
+        payload = json.loads(result.output)
+        assert payload["allow_silent_completion"] is False
+        assert payload["delivery_mode"] == "latest_active_for_agent"
+        assert payload["delivery_target"] == "conv_1"
+        assert payload["task_description"] == "Check the account and preserve these instructions."
+        assert payload["expected_output"] == "A concise status update."
+        assert updated_fields["task_template"]["description"] == (
+            "Check the account and preserve these instructions."
+        )
+
+    def test_update_rejects_inaccessible_delivery_target(self, monkeypatch: Any) -> None:
+        row = _schedule_row()
+
+        async def fake_get_schedule(_db: object, _schedule_id: str) -> Any:
+            return row
+
+        async def fake_get_conversation(_db: object, _conversation_id: str) -> Any:
+            return None
+
+        monkeypatch.setattr(schedule_mod, "get_schedule", fake_get_schedule)
+        monkeypatch.setattr(schedule_mod, "get_conversation", fake_get_conversation)
+
+        result = asyncio.run(
+            schedule_mod._handle_update(
+                lambda: _Session(),
+                scheduler=None,
+                user_email="user@example.com",
+                arguments={
+                    "schedule_id": "sched_1",
+                    "delivery_mode": "specific_conversation",
+                    "delivery_target": "conv_other",
+                },
+            )
+        )
+
+        assert result.is_error is True
+        assert "Conversation conv_other not found" in result.output
+
+    def test_update_recomputes_next_fire_for_timing_changes(self, monkeypatch: Any) -> None:
+        row = _schedule_row(
+            schedule_type="interval",
+            cron_expr=None,
+            interval_seconds=60,
+            task_template={"description": "Run interval task."},
+        )
+        updated_fields: dict[str, Any] = {}
+
+        async def fake_get_schedule(_db: object, _schedule_id: str) -> Any:
+            return row
+
+        async def fake_update_schedule(_db: object, _schedule_id: str, **fields: Any) -> Any:
+            updated_fields.update(fields)
+            for key, value in fields.items():
+                setattr(row, key, value)
+            return row
+
+        async def fake_count_active_tasks(_db: object, _schedule_id: str) -> int:
+            return 0
+
+        monkeypatch.setattr(schedule_mod, "get_schedule", fake_get_schedule)
+        monkeypatch.setattr(schedule_mod, "update_schedule", fake_update_schedule)
+        monkeypatch.setattr(
+            schedule_mod,
+            "count_active_tasks_for_schedule",
+            fake_count_active_tasks,
+        )
+
+        result = asyncio.run(
+            schedule_mod._handle_update(
+                lambda: _Session(),
+                scheduler=None,
+                user_email="user@example.com",
+                arguments={"schedule_id": "sched_1", "interval_seconds": 120},
+            )
+        )
+
+        assert result.is_error is False
+        assert updated_fields["interval_seconds"] == 120
+        assert isinstance(updated_fields["next_fire_at"], datetime)
+
+    def test_update_does_not_mutate_project_or_skill_fields(self, monkeypatch: Any) -> None:
+        row = _schedule_row()
+
+        async def fake_get_schedule(_db: object, _schedule_id: str) -> Any:
+            return row
+
+        monkeypatch.setattr(schedule_mod, "get_schedule", fake_get_schedule)
+
+        result = asyncio.run(
+            schedule_mod._handle_update(
+                lambda: _Session(),
+                scheduler=None,
+                user_email="user@example.com",
+                arguments={
+                    "schedule_id": "sched_1",
+                    "project_id": "proj_other",
+                    "skill_id": "skill_other",
+                },
+            )
+        )
+
+        assert result.is_error is False
+        assert result.output == "No fields to update."
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _schedule_row(**overrides: Any) -> SimpleNamespace:
+    base: dict[str, Any] = {
+        "schedule_id": "sched_1",
+        "name": "Daily check",
+        "description": "Run the daily check.",
+        "schedule_type": "cron",
+        "cron_expr": "0 8 * * *",
+        "interval_seconds": None,
+        "one_shot_at": None,
+        "timezone": "UTC",
+        "agent_id": "agent_1",
+        "workflow_id": "system:general-task",
+        "project_id": "proj_1",
+        "skill_id": None,
+        "task_template": {
+            "title": "Daily check task",
+            "description": "Check the account and preserve these instructions.",
+            "priority": 3,
+            "expected_output": "A concise status update.",
+            "delivery": {"mode": "specific_conversation", "target": "conv_1"},
+            "api_token": "secret-value",
+        },
+        "enabled": True,
+        "max_concurrent_runs": 2,
+        "delete_after_run": False,
+        "completion_mode_family": "direct",
+        "allow_silent_completion": True,
+        "interaction_mode_override": "none",
+        "last_fired_at": datetime(2026, 5, 4, 7, 0, tzinfo=UTC),
+        "next_fire_at": datetime(2026, 5, 5, 8, 0, tzinfo=UTC),
+        "last_run_status": "success",
+        "consecutive_errors": 0,
+        "disabled_reason": None,
+        "created_by": "user@example.com",
+        "created_at": datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        "updated_at": datetime(2026, 5, 4, 7, 0, tzinfo=UTC),
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class _Session:
+    async def __aenter__(self) -> _Session:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
 
 
 class _FakeSchedule:

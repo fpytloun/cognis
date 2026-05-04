@@ -1,7 +1,7 @@
 """Built-in schedule management tool definitions and handlers.
 
 These tools are controller-intercepted — they never reach the executor.
-The agent can create, list, update, delete, and trigger schedules.
+The agent can create, inspect, list, update, delete, and trigger schedules.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from cognis.store.queries import (
     count_active_tasks_for_schedule,
     create_schedule,
     delete_schedule,
+    get_conversation,
     get_schedule,
     list_schedules,
     update_schedule,
@@ -32,17 +33,19 @@ _SOURCE = ToolSource(type="builtin")
 MANAGE_SCHEDULES_TOOL = ToolDefinition(
     name="manage_schedules",
     description=(
-        "Create, list, update, delete, and trigger scheduled tasks. "
+        "Create, inspect, list, update, delete, and trigger scheduled tasks. "
         "Schedules are task factories that create tasks on a cron expression, "
         "fixed interval, or one-shot basis. Use this to set up recurring "
-        "tasks, reminders, heartbeat checks, and timed automations."
+        "tasks, reminders, heartbeat checks, and timed automations. Use update "
+        "as a patch: omitted fields are preserved. Use get/status before editing "
+        "an existing schedule so task instructions are not lost."
     ),
     parameters={
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "create", "update", "delete", "trigger", "status"],
+                "enum": ["list", "get", "create", "update", "delete", "trigger", "status"],
                 "description": "The action to perform.",
             },
             "schedule_id": {
@@ -119,6 +122,10 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                     "'latest_active_for_agent' delivers to the most recent active conversation."
                 ),
             },
+            "delivery_target": {
+                "type": "string",
+                "description": "Conversation ID, required when delivery_mode is specific_conversation.",
+            },
             "expected_output": {
                 "type": "string",
                 "description": (
@@ -140,6 +147,26 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                 "description": (
                     "If true, the agent may complete silently when the work succeeded and there is "
                     "nothing user-actionable to report."
+                ),
+            },
+            "max_concurrent_runs": {
+                "type": "integer",
+                "description": "Maximum active tasks this schedule may have at once.",
+            },
+            "delete_after_run": {
+                "type": "boolean",
+                "description": "Whether to delete a one-shot schedule after it fires.",
+            },
+            "interaction_mode_override": {
+                "type": "string",
+                "enum": ["none", "explicit_gates", "step_requests"],
+                "description": "Interaction policy for tasks created by this schedule.",
+            },
+            "include_definition": {
+                "type": "boolean",
+                "description": (
+                    "For list/status, include the full persisted schedule definition. "
+                    "Defaults to true so prompt and delivery fields are visible for safe edits."
                 ),
             },
         },
@@ -179,6 +206,8 @@ async def handle_schedule_tool(
     try:
         if action == "list":
             return await _handle_list(session_factory, user_email, arguments)
+        if action == "get":
+            return await _handle_get(session_factory, user_email, arguments)
         if action == "create":
             return await _handle_create(session_factory, scheduler, user_email, agent_id, arguments)
         if action == "update":
@@ -190,7 +219,7 @@ async def handle_schedule_tool(
         if action == "status":
             return await _handle_status(session_factory, user_email, arguments)
         return ToolResult(
-            output=f"Unknown action: {action}. Use list, create, update, delete, trigger, or status.",
+            output=f"Unknown action: {action}. Use list, get, create, update, delete, trigger, or status.",
             is_error=True,
         )
     except Exception as exc:
@@ -215,22 +244,48 @@ async def _handle_list(
     if not rows:
         return ToolResult(output="No schedules found.")
 
+    include_definition = arguments.get("include_definition", True)
     items = []
     for r in rows:
-        model = _row_to_model(r)
-        items.append(
-            {
-                "schedule_id": r.schedule_id,
-                "name": r.name,
-                "type": r.schedule_type,
-                "schedule": describe_schedule(model),
-                "enabled": r.enabled,
-                "agent_id": r.agent_id,
-                "next_fire_at": r.next_fire_at.isoformat() if r.next_fire_at else None,
-                "last_run_status": r.last_run_status,
-            }
-        )
+        if include_definition:
+            active_tasks = await _count_active_tasks_safe(session_factory, r.schedule_id)
+            items.append(_schedule_definition_payload(r, active_tasks=active_tasks))
+        else:
+            model = _row_to_model(r)
+            items.append(
+                {
+                    "schedule_id": r.schedule_id,
+                    "name": r.name,
+                    "type": r.schedule_type,
+                    "schedule": describe_schedule(model),
+                    "enabled": r.enabled,
+                    "agent_id": r.agent_id,
+                    "next_fire_at": _iso(r.next_fire_at),
+                    "last_run_status": r.last_run_status,
+                }
+            )
     return ToolResult(output=json.dumps(items, indent=2))
+
+
+async def _handle_get(
+    session_factory: Any,
+    user_email: str,
+    arguments: dict[str, Any],
+) -> ToolResult:
+    """Get the full persisted definition of one schedule."""
+    schedule_id = arguments.get("schedule_id")
+    if not schedule_id:
+        return ToolResult(output="'schedule_id' is required for get.", is_error=True)
+
+    async with session_factory() as db:
+        row = await get_schedule(db, schedule_id)
+        if row is None or row.created_by != user_email:
+            return ToolResult(output=f"Schedule {schedule_id} not found.", is_error=True)
+        active_tasks = await count_active_tasks_for_schedule(db, schedule_id)
+
+    return ToolResult(
+        output=json.dumps(_schedule_definition_payload(row, active_tasks=active_tasks), indent=2)
+    )
 
 
 async def _handle_create(
@@ -287,7 +342,24 @@ async def _handle_create(
     if arguments.get("expected_output"):
         task_template["expected_output"] = arguments["expected_output"]
     delivery_mode = arguments.get("delivery_mode", "preferred_channel")
-    task_template["delivery"] = {"mode": delivery_mode, "target": None}
+    delivery_target = arguments.get("delivery_target")
+    if delivery_mode == "specific_conversation" and not delivery_target:
+        return ToolResult(
+            output="'delivery_target' is required when delivery_mode is specific_conversation.",
+            is_error=True,
+        )
+
+    async with session_factory() as db:
+        if delivery_target is not None:
+            delivery_error = await _validate_delivery_target(db, user_email, str(delivery_target))
+            if delivery_error is not None:
+                return delivery_error
+
+    delivery_mode = arguments.get("delivery_mode", "preferred_channel")
+    task_template["delivery"] = {
+        "mode": delivery_mode,
+        "target": delivery_target,
+    }
 
     target_agent = arguments.get("agent_id") or agent_id
     if not target_agent:
@@ -326,8 +398,11 @@ async def _handle_create(
             workflow_id=arguments.get("workflow_id"),
             task_template=task_template,
             enabled=arguments.get("enabled", True),
+            max_concurrent_runs=arguments.get("max_concurrent_runs", 1),
+            delete_after_run=arguments.get("delete_after_run", False),
             completion_mode_family=arguments.get("completion_mode_family", "default"),
             allow_silent_completion=arguments.get("allow_silent_completion", False),
+            interaction_mode_override=arguments.get("interaction_mode_override", "none"),
             next_fire_at=next_fire,
             created_by=user_email,
         )
@@ -370,51 +445,87 @@ async def _handle_update(
             "schedule_type",
             "cron_expr",
             "interval_seconds",
+            "one_shot_at",
             "timezone",
             "agent_id",
             "workflow_id",
             "enabled",
+            "max_concurrent_runs",
+            "delete_after_run",
             "completion_mode_family",
             "allow_silent_completion",
+            "interaction_mode_override",
         ):
             if key in arguments and arguments[key] is not None:
-                fields[key] = arguments[key]
+                if key == "one_shot_at":
+                    parsed = _parse_datetime_arg(arguments[key])
+                    if parsed is None:
+                        return ToolResult(
+                            output=f"Invalid one_shot_at: {arguments[key]}", is_error=True
+                        )
+                    fields[key] = parsed
+                else:
+                    fields[key] = arguments[key]
 
         template_keys = {
             "task_title",
             "task_description",
             "task_priority",
             "delivery_mode",
+            "delivery_target",
             "expected_output",
         }
         if template_keys & arguments.keys():
             template = dict(existing.task_template)
-            if arguments.get("task_title"):
+            if "task_title" in arguments and arguments["task_title"] is not None:
                 template["title"] = arguments["task_title"]
-            if arguments.get("task_description"):
+            if "task_description" in arguments and arguments["task_description"] is not None:
                 template["description"] = arguments["task_description"]
             if arguments.get("task_priority") is not None:
                 template["priority"] = arguments["task_priority"]
             if arguments.get("expected_output") is not None:
                 template["expected_output"] = arguments["expected_output"]
-            if arguments.get("delivery_mode"):
+            if arguments.get("delivery_mode") or arguments.get("delivery_target") is not None:
                 delivery = template.get("delivery", {})
                 if not isinstance(delivery, dict):
                     delivery = {}
-                delivery["mode"] = arguments["delivery_mode"]
+                if arguments.get("delivery_mode"):
+                    delivery["mode"] = arguments["delivery_mode"]
+                if arguments.get("delivery_target") is not None:
+                    delivery_error = await _validate_delivery_target(
+                        db,
+                        user_email,
+                        str(arguments["delivery_target"]),
+                    )
+                    if delivery_error is not None:
+                        return delivery_error
+                    delivery["target"] = arguments["delivery_target"]
+                if delivery.get("mode") == "specific_conversation" and not delivery.get("target"):
+                    return ToolResult(
+                        output=(
+                            "'delivery_target' is required when delivery_mode is "
+                            "specific_conversation."
+                        ),
+                        is_error=True,
+                    )
                 template["delivery"] = delivery
             fields["task_template"] = template
 
         if not fields:
             return ToolResult(output="No fields to update.")
 
-        await update_schedule(db, schedule_id, **fields)
+        if _requires_next_fire_recompute(fields):
+            fields["next_fire_at"] = _compute_next_fire_for_update(existing, fields)
+
+        row = await update_schedule(db, schedule_id, **fields)
+        active_tasks = await count_active_tasks_for_schedule(db, schedule_id)
+        output = _schedule_definition_payload(row or existing, active_tasks=active_tasks)
         await db.commit()
 
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
 
-    return ToolResult(output=f"Schedule {schedule_id} updated.")
+    return ToolResult(output=json.dumps(output, indent=2))
 
 
 async def _handle_delete(
@@ -480,24 +591,7 @@ async def _handle_status(
             return ToolResult(output=f"Schedule {schedule_id} not found.", is_error=True)
         active_tasks = await count_active_tasks_for_schedule(db, schedule_id)
 
-    model = _row_to_model(row)
-    info = {
-        "schedule_id": row.schedule_id,
-        "name": row.name,
-        "type": row.schedule_type,
-        "schedule": describe_schedule(model),
-        "enabled": row.enabled,
-        "agent_id": row.agent_id,
-        "next_fire_at": row.next_fire_at.isoformat() if row.next_fire_at else None,
-        "last_fired_at": row.last_fired_at.isoformat() if row.last_fired_at else None,
-        "last_run_status": row.last_run_status,
-        "consecutive_errors": row.consecutive_errors,
-        "disabled_reason": row.disabled_reason,
-        "active_tasks": active_tasks,
-        "max_concurrent_runs": row.max_concurrent_runs,
-        "completion_mode_family": getattr(row, "completion_mode_family", "default"),
-        "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
-    }
+    info = _schedule_definition_payload(row, active_tasks=active_tasks)
     return ToolResult(output=json.dumps(info, indent=2))
 
 
@@ -519,6 +613,8 @@ def _row_to_model(row: Any) -> ScheduleModel:
         timezone=row.timezone,
         agent_id=row.agent_id,
         workflow_id=row.workflow_id,
+        project_id=getattr(row, "project_id", None),
+        skill_id=getattr(row, "skill_id", None),
         task_template=row.task_template,
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
@@ -536,3 +632,147 @@ def _row_to_model(row: Any) -> ScheduleModel:
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+async def _count_active_tasks_safe(session_factory: Any, schedule_id: str) -> int:
+    """Return active task count for list output without failing the whole listing."""
+    async with session_factory() as db:
+        return await count_active_tasks_for_schedule(db, schedule_id)
+
+
+def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -> dict[str, Any]:
+    """Serialize the full persisted schedule definition for safe LLM edits."""
+    template = row.task_template if isinstance(row.task_template, dict) else {}
+    delivery = template.get("delivery") if isinstance(template.get("delivery"), dict) else {}
+    model = _row_to_model(row)
+    return {
+        "schedule_id": row.schedule_id,
+        "name": row.name,
+        "description": row.description,
+        "schedule_type": row.schedule_type,
+        "type": row.schedule_type,
+        "cron_expr": row.cron_expr,
+        "interval_seconds": row.interval_seconds,
+        "one_shot_at": _iso(row.one_shot_at),
+        "timezone": row.timezone,
+        "human_schedule": describe_schedule(model),
+        "schedule": describe_schedule(model),
+        "agent_id": row.agent_id,
+        "workflow_id": row.workflow_id,
+        "project_id": getattr(row, "project_id", None),
+        "skill_id": getattr(row, "skill_id", None),
+        "task_title": template.get("title"),
+        "task_description": template.get("description"),
+        "task_priority": template.get("priority"),
+        "expected_output": template.get("expected_output"),
+        "delivery_mode": delivery.get("mode"),
+        "delivery_target": delivery.get("target"),
+        "delivery": _redact_sensitive(delivery),
+        "completion_mode_family": getattr(row, "completion_mode_family", "default"),
+        "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
+        "enabled": row.enabled,
+        "max_concurrent_runs": row.max_concurrent_runs,
+        "delete_after_run": row.delete_after_run,
+        "interaction_mode_override": getattr(row, "interaction_mode_override", "none"),
+        "last_fired_at": _iso(row.last_fired_at),
+        "next_fire_at": _iso(row.next_fire_at),
+        "last_run_status": row.last_run_status,
+        "consecutive_errors": row.consecutive_errors,
+        "disabled_reason": row.disabled_reason,
+        "active_tasks": active_tasks,
+        "created_by": row.created_by,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+        "task_template": _redact_sensitive(template),
+    }
+
+
+def _iso(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _parse_datetime_arg(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+async def _validate_delivery_target(
+    db: Any, user_email: str, conversation_id: str
+) -> ToolResult | None:
+    conversation = await get_conversation(db, conversation_id)
+    if conversation is None or conversation.user_email != user_email:
+        return ToolResult(output=f"Conversation {conversation_id} not found.", is_error=True)
+    return None
+
+
+def _requires_next_fire_recompute(fields: dict[str, Any]) -> bool:
+    timing_keys = {
+        "schedule_type",
+        "cron_expr",
+        "interval_seconds",
+        "one_shot_at",
+        "timezone",
+        "enabled",
+    }
+    return bool(timing_keys & fields.keys())
+
+
+def _compute_next_fire_for_update(existing: Any, fields: dict[str, Any]) -> datetime | None:
+    if fields.get("enabled", existing.enabled) is False:
+        return None
+
+    from cognis.core.scheduler import Scheduler
+
+    temp = type(
+        "_S",
+        (),
+        {
+            "schedule_type": fields.get("schedule_type", existing.schedule_type),
+            "cron_expr": fields.get("cron_expr", existing.cron_expr),
+            "interval_seconds": fields.get("interval_seconds", existing.interval_seconds),
+            "one_shot_at": fields.get("one_shot_at", existing.one_shot_at),
+            "timezone": fields.get("timezone", existing.timezone),
+            "last_fired_at": existing.last_fired_at,
+        },
+    )()
+    sched_inst = Scheduler.__new__(Scheduler)
+    return sched_inst._compute_next_fire(temp, datetime.now(UTC))
+
+
+_SENSITIVE_KEY_PARTS = (
+    "secret",
+    "token",
+    "password",
+    "api_key",
+    "apikey",
+    "credential",
+    "authorization",
+    "auth_header",
+    "bearer",
+    "cookie",
+    "headers",
+    "session",
+)
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            if any(part in key_str.lower() for part in _SENSITIVE_KEY_PARTS):
+                redacted[key_str] = "[redacted]"
+            else:
+                redacted[key_str] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value

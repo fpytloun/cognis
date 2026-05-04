@@ -16,6 +16,7 @@ tags:
   - workflows
 linked_tool_ids:
   - builtin:create_task
+  - builtin:manage_schedules
   - builtin:compose_and_run_workflow
   - builtin:list_workflows
   - builtin:get_workflow
@@ -29,7 +30,8 @@ Use this skill when deciding how to execute non-trivial work in Cognis.
 
 - Keep clearly trivial work inline.
 - Use `create_task` with `system:general-task` when the work is substantial but does not justify explicit step structure.
-- Use `compose_and_run_workflow` when the work is multi-step, recurring, deliverable-sensitive, or should be scheduled.
+- Use `manage_schedules` when the user wants normal task work to run later, at a specific time, or on a recurrence. Prefer this for reminders, timed automations, and recurring general-task work.
+- Use `compose_and_run_workflow` only when the work needs a custom persistent multi-step workflow, strict deliverables, or an adapted reusable workflow definition before it can run safely.
 
 # Workflow Composition Rules
 
@@ -37,7 +39,8 @@ Use this skill when deciding how to execute non-trivial work in Cognis.
 - If an existing workflow is close but not exact, adapt it by deriving a new workflow instead of mutating the original.
 - Treat skills as capability bundles first. If a skill has saved decomposition, it can also provide workflow structure.
 - If a skill is useful but does not declare steps, composition may decompose it first.
-- Schedules force persistent workflows. One-shot compositions should normally stay ephemeral.
+- Most scheduled work should use `manage_schedules` with an existing workflow or general task shape. Only compose a workflow for a schedule when the user explicitly needs custom step structure.
+- Schedules that use composed workflows require persistent workflows. One-shot compositions should normally stay ephemeral unless they are explicitly scheduled.
 
 # Deliverables
 
@@ -49,6 +52,7 @@ Use this skill when deciding how to execute non-trivial work in Cognis.
 
 - Do not mutate system workflows in place.
 - Do not create a custom workflow when an existing one already fits unchanged.
+- Do not use `compose_and_run_workflow` merely because the user gave a time. Use `manage_schedules` for ordinary timed tasks.
 - Do not schedule ephemeral workflows.
 """,
     },

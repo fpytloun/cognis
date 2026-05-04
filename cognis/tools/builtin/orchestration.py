@@ -699,8 +699,9 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
     description=(
         "Compose a proportional workflow from the current request, optionally reusing or "
         "adapting an existing workflow, and immediately create a task or schedule from it. "
-        "Use this when the work is multi-step, recurring, deliverable-sensitive, or should "
-        "be scheduled instead of handled inline."
+        "Use this rarely: only when the work needs custom multi-step structure, strict "
+        "deliverables, or an adapted reusable workflow. For ordinary timed or recurring "
+        "tasks, use manage_schedules instead."
     ),
     parameters={
         "type": "object",
