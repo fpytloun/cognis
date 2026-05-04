@@ -38,6 +38,8 @@
   let targetStep = $state('');
   let lastTaskId = '';
   let initialDefaultsApplied = false;
+  let lastSeenInitialTargetStep = '';
+  let userPickedTargetStep = false;
 
   // Apply caller-provided defaults once on first render.
   $effect(() => {
@@ -45,7 +47,25 @@
     initialDefaultsApplied = true;
     untrack(() => {
       if (initialIntent) intent = initialIntent;
-      if (initialTargetStep) targetStep = initialTargetStep;
+      if (initialTargetStep) {
+        targetStep = initialTargetStep;
+        lastSeenInitialTargetStep = initialTargetStep;
+      }
+    });
+  });
+
+  // Track the externally provided target step. Update the form value whenever
+  // the caller's initialTargetStep changes (e.g. user clicked another step in
+  // the workflow), unless the user has manually picked a different target.
+  $effect(() => {
+    const next = initialTargetStep ?? '';
+    if (next === lastSeenInitialTargetStep) return;
+    lastSeenInitialTargetStep = next;
+    untrack(() => {
+      if (userPickedTargetStep) return;
+      if (!next) return;
+      if (!stepOptions.some((option: StepOption) => option.name === next)) return;
+      targetStep = next;
     });
   });
 
@@ -138,6 +158,7 @@
       intent = pickDefaultIntent();
       body = '';
       targetStep = pickDefaultTargetStep();
+      userPickedTargetStep = false;
     });
   });
 
@@ -163,6 +184,7 @@
     if (!stepOptions.some((option: StepOption) => option.name === stepName)) return;
     intent = 'request_revision';
     targetStep = stepName;
+    userPickedTargetStep = true;
   }
 
   function selectIntent(next: CommentIntent): void {
@@ -255,6 +277,7 @@
       const created = await api.tasks.addComment(task.task_id, payload);
       comments = [created, ...comments];
       body = '';
+      userPickedTargetStep = false;
       if (onSubmitted) await onSubmitted(created);
     } catch (caughtError) {
       addToast(asApiError(caughtError).message, 'error');
@@ -295,13 +318,17 @@
       {#if intent === 'request_revision'}
         <label class="block space-y-1 text-sm font-medium text-slate-200">
           <span>Target step</span>
-          <select bind:value={targetStep} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+          <select
+            value={targetStep}
+            onchange={(event) => { userPickedTargetStep = true; targetStep = (event.currentTarget as HTMLSelectElement).value; }}
+            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+          >
             <option value="">Select step…</option>
             {#each stepOptions as option}
               <option value={option.name}>{option.label}</option>
             {/each}
           </select>
-          <span class="block text-xs text-slate-500">The chosen step and every step after it will be reopened. Prior outputs are kept as superseded history.</span>
+          <span class="block text-xs text-slate-500">Defaults to the step you have selected in the workflow above. The chosen step and every step after it will be reopened; prior outputs are kept as superseded history.</span>
         </label>
       {/if}
 

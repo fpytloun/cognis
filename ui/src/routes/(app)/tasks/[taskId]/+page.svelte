@@ -820,6 +820,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   }
 
   async function handleCommentSubmitted(comment: { intent: string }): Promise<void> {
+    // Clear the one-shot revision seed so the form resumes following the
+    // user's currently selected workflow step on subsequent comments.
+    revisionTargetSeed = null;
     if (comment.intent === 'answer_pause' || comment.intent === 'request_revision') {
       await refreshTaskOnly();
     }
@@ -1507,7 +1510,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
             bind:this={commentsRef}
             task={task}
             stepOptions={revisionStepOptions}
-            initialTargetStep={revisionTargetSeed ?? ''}
+            initialTargetStep={revisionTargetSeed ?? selectedStepName}
             onSubmitted={handleCommentSubmitted}
           />
         </div>
@@ -1604,50 +1607,45 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
         <Card class="hidden overflow-hidden p-0 lg:block">
           <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
+              <div class="min-w-0">
                 <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step detail</p>
                 <h2 class="mt-1 text-lg font-semibold text-white">{selectedStepGroup?.stepName ?? workflowName(task.workflow_id)}</h2>
-                <p class="mt-1 text-sm text-slate-400">Click the diagram or progress chips to focus a step. Latest attempt stays on top, earlier attempts collapse into history.</p>
+                {#if !selectedStepGroup?.latest}
+                  <p class="mt-1 text-sm text-slate-400">Pick a step from the Live workflow above to focus it here.</p>
+                {/if}
               </div>
-              {#if selectedStepGroup}
+              {#if selectedStepGroup && selectedStepGroup.attempts.length > 1}
+                <div class="flex max-w-full flex-wrap items-center gap-2 overflow-x-auto">
+                  <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
+                  {#each selectedStepGroup.attempts as run (run.step_run_id)}
+                    {@const isSelected = (selectedAttempt?.step_run_id ?? selectedStepGroup.latest?.step_run_id) === run.step_run_id}
+                    {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
+                    {@const status = displayStepStatus(run)}
+                    <button
+                      type="button"
+                      class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                      onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
+                      aria-pressed={isSelected}
+                    >
+                      <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
+                      {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
+                      {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
+                      <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
+                    </button>
+                  {/each}
+                  {#if !isLatestAttemptSelected}
+                    <button type="button" class="text-xs text-sky-300 hover:text-sky-200" onclick={() => clearAttemptOverride(selectedStepGroup.stepName)}>Show latest</button>
+                  {/if}
+                </div>
+              {:else if selectedStepGroup?.latest}
                 <span class="rounded-full border border-slate-700 bg-slate-950/80 px-3 py-1 text-xs text-slate-300">
-                  {attemptCountForGroup(selectedStepGroup)} attempt{attemptCountForGroup(selectedStepGroup) === 1 ? '' : 's'}
+                  {attemptLabel(selectedStepGroup.latest)}
                 </span>
               {/if}
             </div>
           </div>
 
-          <div class="grid min-w-0 gap-4 px-4 py-4 sm:px-5 sm:py-5 lg:grid-cols-[260px_minmax(0,1fr)]">
-            <div class="min-w-0 space-y-2">
-              {#each stepGroups as group}
-                {@const latestStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
-                {@const groupAgent = agentFor(group.latest?.agent_id ?? null)}
-                <button
-                  class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/50 bg-sky-500/10' : 'border-slate-800 bg-slate-950/50 hover:border-slate-700 hover:bg-slate-950/80'}`}
-                  onclick={() => openStepDetail(group.stepName, { mobileDrawer: false })}
-                  type="button"
-                >
-                  <div class="flex items-center justify-between gap-3">
-                    <div class="min-w-0">
-                      <div class="flex items-center gap-2">
-                        {#if groupAgent}
-                          <AgentAvatar name={groupAgent.display_name ?? groupAgent.name} avatarUrl={groupAgent.avatar_url} class="h-6 w-6 rounded-xl" />
-                        {/if}
-                        <p class="truncate font-medium text-white">{group.stepName}</p>
-                      </div>
-                      {#if attemptCountForGroup(group) > 1}
-                        <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'} <span class="ml-1 text-slate-400">x{attemptCountForGroup(group)}</span></p>
-                      {:else}
-                        <p class="mt-1 text-xs text-slate-500">{group.stepType === 'gate' ? 'Gate' : 'Execution'}</p>
-                      {/if}
-                    </div>
-                    <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[latestStatus] ?? 'border-slate-600 text-slate-400'}">{latestStatus}</span>
-                  </div>
-                </button>
-              {/each}
-            </div>
-
-            <div class="min-w-0 space-y-4">
+          <div class="min-w-0 space-y-4 px-4 py-4 sm:px-5 sm:py-5">
               {#if selectedStepGroup}
                 {#if selectedStepGroup.latest}
                   {@const attempt = selectedAttempt ?? selectedStepGroup.latest}
@@ -1660,30 +1658,6 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                   {@const feedback = stepEvalFeedback(attempt)}
                   {@const isLatest = isLatestAttemptSelected}
                   <article class="rounded-3xl border border-slate-800 bg-slate-950/60 p-4 sm:p-5">
-                    {#if selectedStepGroup.attempts.length > 1}
-                      <div class="-mx-1 mb-4 flex flex-wrap items-center gap-2 overflow-x-auto px-1 pb-1">
-                        <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
-                        {#each selectedStepGroup.attempts as run (run.step_run_id)}
-                          {@const isSelected = attempt.step_run_id === run.step_run_id}
-                          {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
-                          {@const status = displayStepStatus(run)}
-                          <button
-                            type="button"
-                            class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
-                            onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
-                            aria-pressed={isSelected}
-                          >
-                            <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
-                            {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
-                            {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
-                            <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
-                          </button>
-                        {/each}
-                        {#if !isLatest}
-                          <button type="button" class="text-xs text-sky-300 hover:text-sky-200" onclick={() => clearAttemptOverride(selectedStepGroup.stepName)}>Show latest</button>
-                        {/if}
-                      </div>
-                    {/if}
                     <div class="flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div class="flex flex-wrap items-center gap-2">
@@ -1905,10 +1879,6 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                       </div>
                     {/if}
                   </article>
-
-                  {#if selectedStepGroup.attempts.length > 1 && isLatestAttemptSelected}
-                    <p class="text-xs text-slate-500">{selectedStepGroup.attempts.length - 1} earlier attempt{selectedStepGroup.attempts.length === 2 ? '' : 's'} available — use the Attempts tabs above to switch between them.</p>
-                  {/if}
                 {:else}
                   <div class="rounded-3xl border border-dashed border-slate-700 bg-slate-950/40 px-5 py-10 text-center">
                     <Target class="mx-auto h-10 w-10 text-slate-600" />
@@ -1916,11 +1886,10 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                     <p class="mt-1 text-xs text-slate-500">When the workflow reaches it, execution details and logs will appear here.</p>
                   </div>
                  {/if}
-               {:else}
+                {:else}
                  <p class="text-sm text-slate-400">No steps have been executed yet.</p>
                {/if}
              </div>
-           </div>
          </Card>
 
         </div>
