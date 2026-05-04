@@ -326,7 +326,15 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
 
   function attemptCountForGroup(group: StepGroup | null): number {
     if (!group) return 0;
-    return group.latest?.attempt ?? group.attempts.length;
+    return group.attempts.length;
+  }
+
+  function attemptLabel(stepRun: StepRun): string {
+    return `Attempt #${stepRun.attempt_number}`;
+  }
+
+  function stepTryLabel(stepRun: StepRun): string {
+    return stepRun.attempt > 1 ? `step try #${stepRun.attempt}` : '';
   }
 
   function hasRecordedStepOutput(stepRun: StepRun | null): boolean {
@@ -739,7 +747,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     }
     return [...groups.values()]
       .map((group) => {
-        const attempts = [...group.attempts].sort((a, b) => b.attempt - a.attempt || stepRunSortValue(b) - stepRunSortValue(a));
+        const attempts = [...group.attempts].sort((a, b) => b.attempt_number - a.attempt_number || b.attempt - a.attempt || stepRunSortValue(b) - stepRunSortValue(a));
         return {
           ...group,
           attempts,
@@ -1400,17 +1408,34 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                   </div>
                 </div>
                 {#if selectedStepGroup}
+                  {@const selectedTopAttempt = pickAttemptForStep(selectedStepGroup.stepName)}
                   <div class="flex items-center gap-2">
-                  {#if stepHasOutput[selectedStepGroup.stepName]}
-                    <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open output</Button>
-                  {/if}
-                  {#if stepHasLogs[selectedStepGroup.stepName]}
-                    <Button size="sm" variant="secondary" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
-                  {/if}
-                  <Button class="lg:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
-                    <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
-                    Step detail
-                  </Button>
+                    {#if selectedTopAttempt?.session_id || selectedTopAttempt?.output?.session_id}
+                      <Button size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={() => openStepChat(selectedTopAttempt)}>
+                        {#if chatBusyKey === `step:${selectedTopAttempt.step_run_id}`}
+                          <LoaderCircle class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        {:else}
+                          <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
+                        {/if}
+                        Chat about step
+                      </Button>
+                    {:else}
+                      <Tooltip text="No step session recorded yet.">
+                        <button type="button" aria-disabled="true" class="inline-flex items-center justify-center rounded-xl border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-sm font-medium text-slate-500 cursor-not-allowed">
+                          Chat about step
+                        </button>
+                      </Tooltip>
+                    {/if}
+                    {#if stepHasOutput[selectedStepGroup.stepName]}
+                      <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open output</Button>
+                    {/if}
+                    {#if stepHasLogs[selectedStepGroup.stepName]}
+                      <Button size="sm" variant="secondary" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
+                    {/if}
+                    <Button class="lg:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
+                      <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
+                      Step detail
+                    </Button>
                   </div>
                 {/if}
               </div>
@@ -1476,6 +1501,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
             </div>
           </Card>
         {/if}
+
+        <div id="task-comments-anchor">
+          <TaskComments
+            bind:this={commentsRef}
+            task={task}
+            stepOptions={revisionStepOptions}
+            initialTargetStep={revisionTargetSeed ?? ''}
+            onSubmitted={handleCommentSubmitted}
+          />
+        </div>
 
         {#if taskEscalations.length > 0}
           {@const activeEscalation = taskEscalations[0]}
@@ -1638,7 +1673,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                             onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
                             aria-pressed={isSelected}
                           >
-                            <span class="font-mono text-[11px]">#{run.attempt}</span>
+                            <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
+                            {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
                             {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
                             <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
                           </button>
@@ -1657,7 +1693,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                           {:else if !isLatest}
                             <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-amber-200">Earlier attempt</span>
                           {/if}
-                          <span class="text-xs text-slate-500">#{attempt.attempt}</span>
+                          <span class="text-xs text-slate-500">{attemptLabel(attempt)}</span>
+                          {#if stepTryLabel(attempt)}<span class="text-xs text-slate-500">{stepTryLabel(attempt)}</span>{/if}
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
                           <span>{attempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
@@ -1886,16 +1923,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
            </div>
          </Card>
 
-         <div id="task-comments-anchor">
-           <TaskComments
-             bind:this={commentsRef}
-             task={task}
-             stepOptions={revisionStepOptions}
-             initialTargetStep={revisionTargetSeed ?? ''}
-             onSubmitted={handleCommentSubmitted}
-           />
-         </div>
-       </div>
+        </div>
 
        <div class="space-y-4 lg:hidden">
         <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4" open>
@@ -2156,7 +2184,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                   onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
                   aria-pressed={isSelected}
                 >
-                  <span class="font-mono text-[11px]">#{run.attempt}</span>
+                  <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
+                  {#if stepTryLabel(run)}<span class="text-[10px] text-slate-500">{stepTryLabel(run)}</span>{/if}
                   {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
                   <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
                 </button>

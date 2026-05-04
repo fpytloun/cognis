@@ -35,7 +35,6 @@
   let posting = $state(false);
   let body = $state('');
   let intent = $state<CommentIntent>('record_only');
-  let noop = $state(true);
   let targetStep = $state('');
   let lastTaskId = '';
   let initialDefaultsApplied = false;
@@ -137,7 +136,6 @@
     untrack(() => {
       void load();
       intent = pickDefaultIntent();
-      noop = true;
       body = '';
       targetStep = pickDefaultTargetStep();
     });
@@ -154,13 +152,6 @@
     if (!stepOptions.some((option: StepOption) => option.name === targetStep)) {
       const next = pickDefaultTargetStep();
       untrack(() => { targetStep = next; });
-    }
-  });
-
-  // Auto-disable noop when intent has user-visible side effects.
-  $effect(() => {
-    if (intent === 'answer_pause' || intent === 'request_revision') {
-      untrack(() => { noop = false; });
     }
   });
 
@@ -232,6 +223,23 @@
     }
   }
 
+  function noopForIntent(value: CommentIntent): boolean {
+    return value === 'record_only';
+  }
+
+  function stateEffectLabel(value: CommentIntent): string {
+    switch (value) {
+      case 'record_only':
+        return 'No task state change. This is a human-visible note only.';
+      case 'context_only':
+        return 'Adds context for future agent work without directly changing task status.';
+      case 'answer_pause':
+        return 'Changes task state by resolving the current pause.';
+      case 'request_revision':
+        return 'Changes task state by reopening the workflow from the selected step.';
+    }
+  }
+
   async function submit(): Promise<void> {
     if (!submittable || !task) return;
     posting = true;
@@ -239,7 +247,7 @@
       const payload: Record<string, unknown> = {
         body: body.trim(),
         intent,
-        noop
+        noop: noopForIntent(intent)
       };
       if (requiresTargetStep && targetStep) {
         payload.target_step = targetStep;
@@ -247,7 +255,6 @@
       const created = await api.tasks.addComment(task.task_id, payload);
       comments = [created, ...comments];
       body = '';
-      noop = intent !== 'answer_pause' && intent !== 'request_revision';
       if (onSubmitted) await onSubmitted(created);
     } catch (caughtError) {
       addToast(asApiError(caughtError).message, 'error');
@@ -268,7 +275,6 @@
       <h3 class="mt-1 text-base font-semibold text-white">Notes, context, answers, and revisions</h3>
       <p class="mt-1 text-xs text-slate-400">{intentDescription}</p>
     </div>
-    {#if task}<span class="rounded-full border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-300">Attempt #{task.attempt_number}</span>{/if}
   </div>
 
   {#if task}
@@ -316,15 +322,7 @@
       </label>
 
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <label class="inline-flex items-center gap-2 text-xs text-slate-400">
-          <input
-            type="checkbox"
-            class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-            bind:checked={noop}
-            disabled={intent === 'answer_pause' || intent === 'request_revision'}
-          />
-          <span>Noop (no task state change)</span>
-        </label>
+        <p class="text-xs text-slate-400">{stateEffectLabel(intent)}</p>
         <Button onclick={submit} disabled={!submittable}>
           {posting ? 'Posting…' : intent === 'request_revision' ? 'Request revision' : intent === 'answer_pause' ? 'Submit answer' : 'Add comment'}
         </Button>
@@ -356,7 +354,7 @@
               {#if comment.target_step}
                 <span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-200">→ {comment.target_step}</span>
               {/if}
-              <span class="text-slate-500">attempt #{comment.attempt_number}</span>
+              <span class="text-slate-500">created during attempt #{comment.attempt_number}</span>
               <span class="ml-auto text-slate-500" title={formatAbsoluteTime(comment.created_at)}>{formatRelativeTime(comment.created_at)}</span>
             </header>
             <p class="mt-1 text-xs text-slate-500">{comment.author_email}</p>
