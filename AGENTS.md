@@ -581,6 +581,7 @@ Full architecture and design specifications are in `docs/specs/`:
 | `22-step-profiles.md` | Step profiles (`unrestricted`/`research`/`coding`), tool classification, per-step overrides |
 | `28-agent-sharing.md` | User-to-user agent sharing, `agent_grants`, two-headed runtime identity, Mnemory `(user, owner)` keying, no admin bypass for user-owned resources |
 | `30-projects-and-revisions.md` | Projects with multi-source repos and `project_grants`, project-aware tasks/schedules/conversations, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, and human-as-evaluator revision flow |
+| `31-voice-mode.md` | Voice mode (TTS/STT/conversation): `LLMProvider.synthesize()`, `text_to_speech` routing slot, per-agent voice with system fallback, web microphone with iMessage-style record-preview-send, speaker button on assistant messages with cached playback, sentence-buffered TTS streaming, and bidirectional conversation-mode overlay |
 
 ## Diagram Style
 
