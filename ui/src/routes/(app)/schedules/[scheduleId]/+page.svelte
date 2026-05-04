@@ -27,7 +27,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Conversation, Schedule, ScheduleRun, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, Conversation, Project, Schedule, ScheduleRun, Skill, Workflow } from '$lib/types/api';
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 import Calendar from 'lucide-svelte/icons/calendar';
@@ -48,8 +48,11 @@ import Zap from 'lucide-svelte/icons/zap';
   let runs = $state<ScheduleRun[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
+  let projectAwareWorkflows = $state<Workflow[]>([]);
+  let projects = $state<Project[]>([]);
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
+  let projectWorkflowLoadKey = 0;
 
   let form = $state({
     name: '',
@@ -61,6 +64,7 @@ import Zap from 'lucide-svelte/icons/zap';
     timezone: 'UTC',
     agent_id: '',
     workflow_source: '',
+    project_id: '',
     task_title: '',
     task_description: '',
     priority: 0,
@@ -86,7 +90,7 @@ import Zap from 'lucide-svelte/icons/zap';
   };
 
   let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
-  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(workflows, skills, selectedAgent));
+  let workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectAwareWorkflows, skills, selectedAgent));
 
   function scheduleId(): string {
     return $page.params.scheduleId ?? '';
@@ -96,21 +100,25 @@ import Zap from 'lucide-svelte/icons/zap';
     loading = true;
     error = '';
     try {
-      const [sched, agentList, workflowList, skillList, runList, convList] = await Promise.all([
+      const [sched, agentList, workflowList, skillList, runList, convList, projectList] = await Promise.all([
         api.schedules.detail(scheduleId()),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
         api.skills.list(),
         api.schedules.runs(scheduleId()),
-        api.conversations.listAll()
+        api.conversations.listAll(),
+        api.projects.list().catch(() => [] as Project[])
       ]);
       schedule = sched;
       agents = agentList;
       workflows = workflowList;
+      projectAwareWorkflows = workflowList;
       skills = skillList;
       runs = runList;
       conversations = convList;
+      projects = projectList;
       populateForm(sched);
+      void loadProjectWorkflows(form.project_id);
     } catch (e) {
       error = asApiError(e).message;
     } finally {
@@ -140,6 +148,7 @@ import Zap from 'lucide-svelte/icons/zap';
       timezone: s.timezone,
       agent_id: s.agent_id,
       workflow_source: workflowSourceValueForSelection(s.workflow_id, s.skill_id),
+      project_id: s.project_id ?? '',
       task_title: (tmpl.title as string) ?? '',
       task_description: (tmpl.description as string) ?? '',
       priority: (tmpl.priority as number) ?? 0,
@@ -152,6 +161,33 @@ import Zap from 'lucide-svelte/icons/zap';
       max_concurrent_runs: s.max_concurrent_runs
     };
   }
+
+  async function loadProjectWorkflows(projectId: string): Promise<void> {
+    const key = ++projectWorkflowLoadKey;
+    try {
+      const next = await api.workflows.listAll({ project_id: projectId || null });
+      if (key !== projectWorkflowLoadKey) return;
+      projectAwareWorkflows = next;
+      // Drop the workflow source if it no longer maps to a workflow in the
+      // current project-aware list (skill sources keep working).
+      if (form.workflow_source.startsWith('workflow:')) {
+        const wfId = form.workflow_source.slice('workflow:'.length);
+        if (!next.some((workflow) => workflow.workflow_id === wfId)) {
+          form.workflow_source = '';
+        }
+      }
+    } catch {
+      if (key === projectWorkflowLoadKey) projectAwareWorkflows = workflows;
+    }
+  }
+
+  let lastProjectWorkflowKey = '';
+  $effect(() => {
+    const key = form.project_id;
+    if (key === lastProjectWorkflowKey) return;
+    lastProjectWorkflowKey = key;
+    void loadProjectWorkflows(form.project_id);
+  });
 
   async function handleSave(): Promise<void> {
     if (!schedule) return;
@@ -184,6 +220,7 @@ import Zap from 'lucide-svelte/icons/zap';
         agent_id: form.agent_id,
         workflow_id: workflowSource.workflow_id,
         skill_id: workflowSource.skill_id,
+        project_id: form.project_id || null,
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
@@ -413,13 +450,22 @@ import Zap from 'lucide-svelte/icons/zap';
           <div class="space-y-1">
             <label for="edit-workflow" class="text-xs font-medium uppercase tracking-widest text-slate-400">Workflow</label>
             <select id="edit-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-              <option value="">Auto</option>
+              <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
               {#each workflowSourceOptions as option}
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
           </div>
           <div class="space-y-1">
+            <label for="edit-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
+            <select id="edit-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+              <option value="">None</option>
+              {#each projects as project}
+                <option value={project.project_id}>{project.name}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="space-y-1 sm:col-span-2">
             <label for="edit-concurrent" class="text-xs font-medium uppercase tracking-widest text-slate-400">Max concurrent runs</label>
             <Input id="edit-concurrent" bind:value={form.max_concurrent_runs} type="number" />
           </div>

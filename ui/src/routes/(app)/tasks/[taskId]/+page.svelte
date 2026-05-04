@@ -25,6 +25,7 @@ import Target from 'lucide-svelte/icons/target';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
+  import TaskComments from '$lib/components/tasks/TaskComments.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -43,7 +44,7 @@ import Target from 'lucide-svelte/icons/target';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
-import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type { Agent, Conversation, Deliverable, Escalation, Notification, Project, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -59,6 +60,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let stepResponse = $state('');
   let expandedStepHistory = $state<Set<string>>(new Set());
   let selectedStepName = $state('');
+  let selectedAttemptByStep = $state<Record<string, string>>({});
+  let revisionTargetSeed = $state<string | null>(null);
+  let commentsRef = $state<TaskComments | null>(null);
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
   let taskActionsOpen = $state(false);
@@ -81,12 +85,18 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     expected_output: '',
     agent_id: '',
     workflow_id: '',
+    project_id: '',
     delivery_mode: 'same_conversation',
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests'
   });
+  let projects = $state<Project[]>([]);
+  let projectWorkflowOptions = $state<Workflow[]>([]);
+  let projectWorkflowOptionsLoaded = $state(false);
+  let projectWorkflowLoadKey = 0;
+  let lastProjectWorkflowKey = $state('');
 
   const statusColors: Record<string, string> = {
     pending: 'border-slate-600 text-slate-400',
@@ -564,16 +574,27 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     };
   }
 
-  function openSessionLogsForStep(stepName: string): void {
+  function pickAttemptForStep(stepName: string): StepRun | null {
     const group = stepGroups.find((candidate) => candidate.stepName === stepName);
-    if (!group?.latest) return;
-    openSessionLogs(group.latest);
+    if (!group) return null;
+    const stepRunId = selectedAttemptByStep[stepName];
+    if (stepRunId) {
+      const match = group.attempts.find((run) => run.step_run_id === stepRunId);
+      if (match) return match;
+    }
+    return group.latest ?? null;
+  }
+
+  function openSessionLogsForStep(stepName: string): void {
+    const stepRun = pickAttemptForStep(stepName);
+    if (!stepRun) return;
+    openSessionLogs(stepRun);
   }
 
   function openOutputModalForStep(stepName: string): void {
-    const group = stepGroups.find((candidate) => candidate.stepName === stepName);
-    if (!group?.latest) return;
-    openOutputModal(group.latest);
+    const stepRun = pickAttemptForStep(stepName);
+    if (!stepRun) return;
+    openOutputModal(stepRun);
   }
 
   interface StepGroup {
@@ -699,6 +720,100 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
   let selectedStepGroup = $derived.by(() => {
     const selected = stepGroups.find((group) => group.stepName === selectedStepName);
     return selected ?? stepGroups[0] ?? null;
+  });
+
+  let selectedAttempt = $derived.by(() => {
+    const group = selectedStepGroup;
+    if (!group) return null;
+    const stepRunId = selectedAttemptByStep[group.stepName];
+    if (stepRunId) {
+      const match = group.attempts.find((run) => run.step_run_id === stepRunId);
+      if (match) return match;
+    }
+    return group.latest;
+  });
+
+  let isLatestAttemptSelected = $derived.by(() => {
+    const group = selectedStepGroup;
+    if (!group?.latest) return true;
+    const attempt = selectedAttempt;
+    if (!attempt) return true;
+    return attempt.step_run_id === group.latest.step_run_id;
+  });
+
+  function selectAttempt(stepName: string, stepRunId: string): void {
+    selectedAttemptByStep = { ...selectedAttemptByStep, [stepName]: stepRunId };
+  }
+
+  function clearAttemptOverride(stepName: string): void {
+    if (!(stepName in selectedAttemptByStep)) return;
+    const next = { ...selectedAttemptByStep };
+    delete next[stepName];
+    selectedAttemptByStep = next;
+  }
+
+  let revisionStepOptions = $derived.by(() => {
+    const seen = new Set<string>();
+    const options: Array<{ name: string; label: string }> = [];
+    for (const step of diagramSteps) {
+      if (seen.has(step.name)) continue;
+      seen.add(step.name);
+      options.push({ name: step.name, label: step.name });
+    }
+    for (const group of stepGroups) {
+      if (seen.has(group.stepName)) continue;
+      seen.add(group.stepName);
+      options.push({ name: group.stepName, label: group.stepName });
+    }
+    return options;
+  });
+
+  function startRevisionForStep(stepName: string): void {
+    revisionTargetSeed = stepName;
+    if (commentsRef) commentsRef.setRevisionTarget(stepName);
+    if (typeof document !== 'undefined') {
+      window.requestAnimationFrame(() => {
+        const el = document.getElementById('task-comments-anchor');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }
+
+  async function handleCommentSubmitted(comment: { intent: string }): Promise<void> {
+    if (comment.intent === 'answer_pause' || comment.intent === 'request_revision') {
+      await refreshTaskOnly();
+    }
+  }
+
+  async function loadProjectWorkflowOptions(projectId: string): Promise<void> {
+    const key = ++projectWorkflowLoadKey;
+    projectWorkflowOptionsLoaded = false;
+    try {
+      const next = await api.workflows.listAll({ project_id: projectId || null });
+      if (key !== projectWorkflowLoadKey) return;
+      projectWorkflowOptions = next;
+      projectWorkflowOptionsLoaded = true;
+      // Drop the stale workflow_id if it is no longer eligible for the new project.
+      if (
+        editForm.workflow_id &&
+        !next.some((workflow) => workflow.workflow_id === editForm.workflow_id)
+      ) {
+        editForm.workflow_id = '';
+      }
+    } catch {
+      if (key === projectWorkflowLoadKey) {
+        projectWorkflowOptions = [];
+        projectWorkflowOptionsLoaded = false;
+      }
+    }
+  }
+
+  $effect(() => {
+    if (!configModalOpen) return;
+    const key = `${editForm.project_id}`;
+    if (key === lastProjectWorkflowKey) return;
+    lastProjectWorkflowKey = key;
+    void loadProjectWorkflowOptions(editForm.project_id);
   });
 
   let stepAttemptCounts = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, attemptCountForGroup(group)])));
@@ -836,12 +951,25 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
     });
   });
 
-  let stepHasLogs = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, Boolean(group.latest?.output?.session_id || group.latest?.session_id)])));
+  let stepHasLogs = $derived.by(() => {
+    const entries: Array<[string, boolean]> = [];
+    for (const group of stepGroups) {
+      const stepRunId = selectedAttemptByStep[group.stepName];
+      const candidate = stepRunId
+        ? group.attempts.find((run) => run.step_run_id === stepRunId) ?? group.latest
+        : group.latest;
+      entries.push([group.stepName, Boolean(candidate?.output?.session_id || candidate?.session_id)]);
+    }
+    return Object.fromEntries(entries);
+  });
   let stepHasOutput = $derived.by(() => {
     const entries: Array<[string, boolean]> = [];
     for (const group of stepGroups) {
-      const latest = group.latest;
-      entries.push([group.stepName, hasRecordedStepOutput(latest)]);
+      const stepRunId = selectedAttemptByStep[group.stepName];
+      const candidate = stepRunId
+        ? group.attempts.find((run) => run.step_run_id === stepRunId) ?? group.latest
+        : group.latest;
+      entries.push([group.stepName, hasRecordedStepOutput(candidate)]);
     }
     return Object.fromEntries(entries);
   });
@@ -886,6 +1014,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         priority: task.priority,
         agent_id: task.agent_id,
         workflow_id: task.workflow_id ?? '',
+        project_id: task.project_id ?? '',
         delivery_mode: task.delivery.mode,
         delivery_target: task.delivery.target ?? '',
         completion_mode_family: task.completion_mode_family,
@@ -893,6 +1022,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         interaction_mode_override: task.interaction_mode_override ?? ''
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
+      try {
+        projects = await api.projects.list();
+      } catch {
+        projects = [];
+      }
+      void loadProjectWorkflowOptions(editForm.project_id);
       try {
         await refreshTaskEscalations();
       } catch {
@@ -922,6 +1057,11 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
       } catch {
         taskEscalations = [];
         taskCredentialRequest = null;
+      }
+      try {
+        await commentsRef?.refresh();
+      } catch {
+        // best-effort: comments will retry on next poll
       }
     } catch (caughtError) {
       if (shouldClearTaskFromError(caughtError)) {
@@ -959,6 +1099,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
         priority: Number(editForm.priority),
         agent_id: editForm.agent_id,
         workflow_id: editForm.workflow_id || null,
+        project_id: editForm.project_id || null,
         delivery_mode: editForm.delivery_mode,
         delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null,
         completion_mode_family: editForm.completion_mode_family,
@@ -1148,6 +1289,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <span>Owner agent</span>
               <span class="font-medium text-slate-200">{agentName(task.agent_id)}</span>
               <span class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] {priorityTone(task.priority)}">P{task.priority}</span>
+              {#if task.attempt_number > 1}
+                <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-amber-200" title="Task has been revised">Attempt #{task.attempt_number}</span>
+              {/if}
+              {#if task.project_id}
+                <a href="/projects/{task.project_id}" class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2.5 py-1 text-[11px] font-medium tracking-wide text-violet-200 hover:border-violet-400/60 hover:text-violet-100">Project</a>
+              {/if}
               <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{deliveryModeLabel(task.delivery.mode)}</span>
               <span class="rounded-full border border-slate-700 bg-slate-900/80 px-2.5 py-1 text-[11px] text-slate-300">{completionModeFamilyLabel(task.completion_mode_family)}</span>
               {#if task.allow_silent_completion}
@@ -1428,47 +1575,76 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
             <div class="min-w-0 space-y-4">
               {#if selectedStepGroup}
                 {#if selectedStepGroup.latest}
-                  {@const latestAttempt = selectedStepGroup.latest}
-                  {@const summary = stepOutputSummary(latestAttempt)}
-                  {@const claims = stepOutputClaims(latestAttempt)}
-                  {@const stepError = stepOutputError(latestAttempt)}
-                  {@const outcomeStatus = stepOutcomeStatus(latestAttempt)}
-                  {@const outcomeReason = stepOutcomeReason(latestAttempt)}
-                  {@const visibleStatus = displayStepStatus(latestAttempt)}
-                  {@const feedback = stepEvalFeedback(latestAttempt)}
+                  {@const attempt = selectedAttempt ?? selectedStepGroup.latest}
+                  {@const summary = stepOutputSummary(attempt)}
+                  {@const claims = stepOutputClaims(attempt)}
+                  {@const stepError = stepOutputError(attempt)}
+                  {@const outcomeStatus = stepOutcomeStatus(attempt)}
+                  {@const outcomeReason = stepOutcomeReason(attempt)}
+                  {@const visibleStatus = displayStepStatus(attempt)}
+                  {@const feedback = stepEvalFeedback(attempt)}
+                  {@const isLatest = isLatestAttemptSelected}
                   <article class="rounded-3xl border border-slate-800 bg-slate-950/60 p-4 sm:p-5">
+                    {#if selectedStepGroup.attempts.length > 1}
+                      <div class="-mx-1 mb-4 flex flex-wrap items-center gap-2 overflow-x-auto px-1 pb-1">
+                        <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
+                        {#each selectedStepGroup.attempts as run (run.step_run_id)}
+                          {@const isSelected = attempt.step_run_id === run.step_run_id}
+                          {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
+                          {@const status = displayStepStatus(run)}
+                          <button
+                            type="button"
+                            class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                            onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
+                            aria-pressed={isSelected}
+                          >
+                            <span class="font-mono text-[11px]">#{run.attempt}</span>
+                            {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
+                            <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
+                          </button>
+                        {/each}
+                        {#if !isLatest}
+                          <button type="button" class="text-xs text-sky-300 hover:text-sky-200" onclick={() => clearAttemptOverride(selectedStepGroup.stepName)}>Show latest</button>
+                        {/if}
+                      </div>
+                    {/if}
                     <div class="flex flex-wrap items-start justify-between gap-3">
                       <div>
                         <div class="flex flex-wrap items-center gap-2">
-                          <h3 class="text-lg font-semibold text-white">{latestAttempt.step_name}</h3>
-                          {#if selectedStepGroup.attempts.length > 1}
+                          <h3 class="text-lg font-semibold text-white">{attempt.step_name}</h3>
+                          {#if selectedStepGroup.attempts.length > 1 && isLatest}
                             <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-sky-200">Latest attempt</span>
+                          {:else if !isLatest}
+                            <span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider text-amber-200">Earlier attempt</span>
                           {/if}
-                          <span class="text-xs text-slate-500">#{latestAttempt.attempt}</span>
+                          <span class="text-xs text-slate-500">#{attempt.attempt}</span>
                         </div>
                         <div class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
-                          <span>{latestAttempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
-                          {#if latestAttempt.agent_id}
+                          <span>{attempt.step_type === 'gate' ? 'Gate' : 'Run'}</span>
+                          {#if attempt.agent_id}
                             <span class="inline-flex items-center gap-2 text-slate-300">
-                              <AgentAvatar name={agentName(latestAttempt.agent_id)} avatarUrl={agentFor(latestAttempt.agent_id)?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />
-                              {agentName(latestAttempt.agent_id)}
+                              <AgentAvatar name={agentName(attempt.agent_id)} avatarUrl={agentFor(attempt.agent_id)?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />
+                              {agentName(attempt.agent_id)}
                             </span>
                           {/if}
-                          {#if latestAttempt.started_at}
-                            <Tooltip text={formatAbsoluteTime(latestAttempt.started_at)}>
-                              <span class="inline-flex cursor-help items-center gap-1"><Clock3 class="h-3.5 w-3.5" />started {formatRelativeTime(latestAttempt.started_at)}</span>
+                          {#if attempt.started_at}
+                            <Tooltip text={formatAbsoluteTime(attempt.started_at)}>
+                              <span class="inline-flex cursor-help items-center gap-1"><Clock3 class="h-3.5 w-3.5" />started {formatRelativeTime(attempt.started_at)}</span>
                             </Tooltip>
                           {/if}
-                          {#if latestAttempt.started_at}
-                            <span class="font-mono text-slate-300">{formatDuration(latestAttempt.started_at, latestAttempt.completed_at, tickNow)}</span>
+                          {#if attempt.started_at}
+                            <span class="font-mono text-slate-300">{formatDuration(attempt.started_at, attempt.completed_at, tickNow)}</span>
                           {/if}
                         </div>
                       </div>
                       <div class="flex items-center gap-2">
-                        {#if latestAttempt.output?.session_id || latestAttempt.session_id}
-                          <Button size="sm" variant="secondary" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
+                        {#if attempt.output?.session_id || attempt.session_id}
+                          <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
                         {/if}
-                        <Tooltip text={displayStepStatusHint(latestAttempt)}>
+                        {#if isEditable}
+                          <Button size="sm" variant="secondary" onclick={() => startRevisionForStep(selectedStepGroup.stepName)}>Revise</Button>
+                        {/if}
+                        <Tooltip text={displayStepStatusHint(attempt)}>
                           <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
                         </Tooltip>
                       </div>
@@ -1481,7 +1657,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                     {/if}
 
-                    {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
+                    {#if stepSpecRows(selectedStepGroup, attempt).length > 0}
                       <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
                         <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
                           <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
@@ -1496,7 +1672,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                         </summary>
                         <p class="mt-3 text-xs text-slate-500">Reflects the current workflow template, while runtime rows show this attempt's recorded execution target.</p>
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-                          {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
+                          {#each stepSpecRows(selectedStepGroup, attempt) as row}
                             <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
                               <dt class="text-slate-500">{row.label}</dt>
                               <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
@@ -1510,7 +1686,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
                         <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
                         <span class="flex flex-wrap items-center gap-2">
-                          {#each runtimeCompactRows(latestAttempt) as row}
+                          {#each runtimeCompactRows(attempt) as row}
                             <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
                               {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
                             </span>
@@ -1518,9 +1694,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                           <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
                         </span>
                       </summary>
-                      {#if runtimeRows(latestAttempt).length > 0}
+                      {#if runtimeRows(attempt).length > 0}
                         <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
-                          {#each runtimeRows(latestAttempt) as row}
+                          {#each runtimeRows(attempt) as row}
                             <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
                               <dt class="text-slate-500">{row.label}</dt>
                               <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
@@ -1528,7 +1704,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                           {/each}
                         </dl>
                       {:else}
-                        <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
+                        <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(attempt)}</p>
                       {/if}
                     </details>
 
@@ -1548,8 +1724,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                     {/if}
 
-                    {#if latestAttempt.deliverables.length > 0}
-                      {@const deliverable = latestDeliverable(latestAttempt)}
+                    {#if attempt.deliverables.length > 0}
+                      {@const deliverable = latestDeliverable(attempt)}
                       <div class="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-4">
                         <div class="flex flex-wrap items-center justify-between gap-3">
                           <div>
@@ -1559,7 +1735,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                             {/if}
                           </div>
                           <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
-                            {#each latestAttempt.deliverables as item}
+                            {#each attempt.deliverables as item}
                               <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : item.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : item.status === 'rejected' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
                                 v{item.version} {item.status}
                               </span>
@@ -1578,8 +1754,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                       </div>
                     {/if}
 
-                    {#if activeStepTodos(latestAttempt).length > 0}
-                      {@const todos = activeStepTodos(latestAttempt)}
+                    {#if activeStepTodos(attempt).length > 0}
+                      {@const todos = activeStepTodos(attempt)}
                       <div class="mt-4 rounded-xl border border-slate-800/60 bg-slate-900/40">
                         <div class="border-b border-slate-800/60 px-3 py-1.5 text-xs font-medium text-slate-400">
                           Open todos
@@ -1614,21 +1790,21 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                             </li>
                           {/each}
                         </ul>
-                      {:else if outcomeStatus === 'success' && !stepError && !latestAttempt.evaluation}
+                      {:else if outcomeStatus === 'success' && !stepError && !attempt.evaluation}
                         <p class="mt-3 text-sm text-slate-400">No extra completion metadata was recorded for this attempt.</p>
                       {/if}
 
-                      {#if hasRecordedStepOutput(latestAttempt)}
+                      {#if hasRecordedStepOutput(attempt)}
                         <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800 pt-3">
-                          <Button size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+                          <Button size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
                           <span class="text-xs text-slate-500">Includes deliverable versions, completion metadata, and any recorded reasoning.</span>
                         </div>
                       {/if}
                     </div>
 
-                    {#if latestAttempt.evaluation}
-                      {@const evalDecision = String(latestAttempt.evaluation.decision ?? '')}
-                      {@const evalReasoning = String(latestAttempt.evaluation.reasoning ?? '')}
+                    {#if attempt.evaluation}
+                      {@const evalDecision = String(attempt.evaluation.decision ?? '')}
+                      {@const evalReasoning = String(attempt.evaluation.reasoning ?? '')}
                       {@const evalColor = evalDecision === 'approved' || evalDecision === 'approve' ? 'text-emerald-400' : evalDecision === 'revise' ? 'text-sky-400' : evalDecision === 'failed' || evalDecision === 'reject' ? 'text-rose-400' : 'text-sky-400'}
                       <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
                         <p class="text-xs font-medium uppercase tracking-widest text-slate-500">Evaluation</p>
@@ -1643,56 +1819,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                     {/if}
                   </article>
 
-                  {#if selectedStepGroup.attempts.length > 1}
-                    <div class="rounded-3xl border border-slate-800/80 bg-slate-950/30 p-4">
-                      <button class="flex w-full items-center justify-between gap-3 text-left" onclick={() => toggleStepHistory(selectedStepGroup.stepName)} type="button">
-                        <div>
-                          <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Attempt history</p>
-                          <p class="mt-1 text-sm text-slate-300">{selectedStepGroup.attempts.length - 1} earlier attempt{selectedStepGroup.attempts.length === 2 ? '' : 's'} hidden behind the latest execution.</p>
-                        </div>
-                        {#if expandedStepHistory.has(selectedStepGroup.stepName)}
-                          <ChevronUp class="h-4 w-4 text-slate-400" />
-                        {:else}
-                          <ChevronDown class="h-4 w-4 text-slate-400" />
-                        {/if}
-                      </button>
-
-                      {#if expandedStepHistory.has(selectedStepGroup.stepName)}
-                        <div class="mt-4 space-y-4 border-t border-dashed border-slate-800 pt-4">
-                          {#each selectedStepGroup.attempts.slice(1) as stepRun (stepRun.step_run_id)}
-                            {@const summary = stepOutputSummary(stepRun)}
-                            {@const stepError = stepOutputError(stepRun)}
-                            {@const visibleStatus = displayStepStatus(stepRun)}
-                            <div class="relative pl-5">
-                              <div class="absolute left-1.5 top-0 bottom-0 w-px bg-slate-800"></div>
-                              <div class="absolute left-0 top-2 h-3 w-3 rounded-full border border-slate-600 bg-slate-950"></div>
-                              <div class="mb-2 flex items-center justify-between gap-3 border-b border-slate-800/80 pb-2">
-                                <div>
-                                  <p class="text-xs font-semibold uppercase tracking-[0.25em] text-slate-500">Earlier attempt #{stepRun.attempt}</p>
-                                  <p class="mt-1 text-xs text-slate-500">{stepRun.started_at ? formatAbsoluteTime(stepRun.started_at) : 'No start time recorded'}</p>
-                                </div>
-                                <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
-                              </div>
-                              {#if stepError}
-                                <div class="rounded-xl border border-rose-500/20 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
-                                  <pre class="whitespace-pre-wrap">{stepError}</pre>
-                                </div>
-                              {:else}
-                                {#if summary}
-                                  <div class="prose prose-sm prose-invert max-w-none text-slate-400">{@html renderMarkdown(summary)}</div>
-                                {/if}
-                                {#if hasRecordedStepOutput(stepRun)}
-                                  <div class="mt-3 flex flex-wrap items-center gap-2">
-                                    <Button size="sm" variant="ghost" onclick={() => openOutputModal(stepRun)}>Show full output</Button>
-                                    <span class="text-xs text-slate-500">Opens the finalized result for this attempt.</span>
-                                  </div>
-                                {/if}
-                              {/if}
-                            </div>
-                          {/each}
-                        </div>
-                      {/if}
-                    </div>
+                  {#if selectedStepGroup.attempts.length > 1 && isLatestAttemptSelected}
+                    <p class="text-xs text-slate-500">{selectedStepGroup.attempts.length - 1} earlier attempt{selectedStepGroup.attempts.length === 2 ? '' : 's'} available — use the Attempts tabs above to switch between them.</p>
                   {/if}
                 {:else}
                   <div class="rounded-3xl border border-dashed border-slate-700 bg-slate-950/40 px-5 py-10 text-center">
@@ -1700,16 +1828,26 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                     <p class="mt-4 text-sm text-slate-300">This step has not produced an attempt yet.</p>
                     <p class="mt-1 text-xs text-slate-500">When the workflow reaches it, execution details and logs will appear here.</p>
                   </div>
-                {/if}
-              {:else}
-                <p class="text-sm text-slate-400">No steps have been executed yet.</p>
-              {/if}
-            </div>
-          </div>
-        </Card>
-      </div>
+                 {/if}
+               {:else}
+                 <p class="text-sm text-slate-400">No steps have been executed yet.</p>
+               {/if}
+             </div>
+           </div>
+         </Card>
 
-      <div class="space-y-4 lg:hidden">
+         <div id="task-comments-anchor">
+           <TaskComments
+             bind:this={commentsRef}
+             task={task}
+             stepOptions={revisionStepOptions}
+             initialTargetStep={revisionTargetSeed ?? ''}
+             onSubmitted={handleCommentSubmitted}
+           />
+         </div>
+       </div>
+
+       <div class="space-y-4 lg:hidden">
         <details class="group rounded-3xl border border-slate-800 bg-slate-950/40 p-4" open>
           <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-white">
             Task meta
@@ -1951,21 +2089,41 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
 
       {#snippet children()}
         {#if selectedStepGroup.latest}
-          {@const latestAttempt = selectedStepGroup.latest}
-          {@const summary = stepOutputSummary(latestAttempt)}
-          {@const claims = stepOutputClaims(latestAttempt)}
-          {@const visibleStatus = displayStepStatus(latestAttempt)}
+          {@const attempt = selectedAttempt ?? selectedStepGroup.latest}
+          {@const summary = stepOutputSummary(attempt)}
+          {@const claims = stepOutputClaims(attempt)}
+          {@const visibleStatus = displayStepStatus(attempt)}
+          {#if selectedStepGroup.attempts.length > 1}
+            <div class="-mx-1 mb-3 flex flex-wrap items-center gap-2 overflow-x-auto px-1 pb-1">
+              <span class="text-xs uppercase tracking-[0.2em] text-slate-500">Attempts</span>
+              {#each selectedStepGroup.attempts as run (run.step_run_id)}
+                {@const isSelected = attempt.step_run_id === run.step_run_id}
+                {@const isLatestRun = selectedStepGroup.latest?.step_run_id === run.step_run_id}
+                {@const status = displayStepStatus(run)}
+                <button
+                  type="button"
+                  class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${isSelected ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-950/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
+                  onclick={() => isLatestRun ? clearAttemptOverride(selectedStepGroup.stepName) : selectAttempt(selectedStepGroup.stepName, run.step_run_id)}
+                  aria-pressed={isSelected}
+                >
+                  <span class="font-mono text-[11px]">#{run.attempt}</span>
+                  {#if isLatestRun}<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-sky-200">latest</span>{/if}
+                  <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-slate-600 text-slate-400'}">{status}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
           <div class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
             <div class="flex items-center justify-between gap-3">
               <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
-              {#if latestAttempt.output?.session_id || latestAttempt.session_id}
-                <Button size="sm" variant="secondary" onclick={() => openSessionLogs(latestAttempt)}>Logs</Button>
+              {#if attempt.output?.session_id || attempt.session_id}
+                <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
               {/if}
             </div>
             {#if summary}
               <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>
             {/if}
-            {#if stepSpecRows(selectedStepGroup, latestAttempt).length > 0}
+            {#if stepSpecRows(selectedStepGroup, attempt).length > 0}
               <details class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
                 <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
                   <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Current workflow spec</span>
@@ -1979,7 +2137,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   </span>
                 </summary>
                 <dl class="mt-3 grid gap-2 text-xs">
-                  {#each stepSpecRows(selectedStepGroup, latestAttempt) as row}
+                  {#each stepSpecRows(selectedStepGroup, attempt) as row}
                     <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
                       <dt class="text-slate-500">{row.label}</dt>
                       <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
@@ -1992,7 +2150,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
                 <span class="text-xs uppercase tracking-[0.25em] text-slate-500">Runtime and model</span>
                 <span class="flex flex-wrap items-center gap-2">
-                  {#each runtimeCompactRows(latestAttempt) as row}
+                  {#each runtimeCompactRows(attempt) as row}
                     <span class="rounded-full border border-slate-700 bg-slate-900/70 px-2 py-0.5 text-[11px] text-slate-300">
                       {row.label}: <span class="font-mono text-slate-100">{row.value}</span>
                     </span>
@@ -2000,23 +2158,23 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
                 </span>
               </summary>
-              {#if runtimeSummaryRows(latestAttempt).length > 0}
+              {#if runtimeSummaryRows(attempt).length > 0}
                 <dl class="mt-3 grid gap-2 text-xs">
-                  {#each runtimeSummaryRows(latestAttempt) as row}
+                  {#each runtimeSummaryRows(attempt) as row}
                     <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-900/40 px-2.5 py-2">
                       <dt class="text-slate-500">{row.label}</dt>
                       <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
                     </div>
                   {/each}
                 </dl>
-                {#if runtimeDebugRows(latestAttempt).length > 0}
+                {#if runtimeDebugRows(attempt).length > 0}
                   <details class="mt-3 rounded-xl border border-slate-800/70 bg-slate-900/30 px-3 py-2">
                     <summary class="flex cursor-pointer list-none items-center justify-between gap-3 text-xs font-medium text-slate-300">
                       Debug runtime details
                       <ChevronDown class="h-4 w-4 shrink-0 text-slate-500" />
                     </summary>
                     <dl class="mt-3 grid gap-2 text-xs">
-                      {#each runtimeDebugRows(latestAttempt) as row}
+                      {#each runtimeDebugRows(attempt) as row}
                         <div class="min-w-0 rounded-lg border border-slate-800/70 bg-slate-950/50 px-2.5 py-2">
                           <dt class="text-slate-500">{row.label}</dt>
                           <dd class="mt-1 truncate font-mono text-slate-300" title={row.value}>{row.value}</dd>
@@ -2026,7 +2184,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
                   </details>
                 {/if}
               {:else}
-                <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(latestAttempt)}</p>
+                <p class="mt-3 text-sm text-amber-200">{runtimeMissingMessage(attempt)}</p>
               {/if}
             </details>
             <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
@@ -2043,8 +2201,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
               {:else}
                 <p class="mt-3 text-sm text-slate-400">Open the full output to inspect completion metadata and the finalized assistant output.</p>
               {/if}
-              {#if hasRecordedStepOutput(latestAttempt)}
-                <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(latestAttempt)}>Show full output</Button>
+              {#if hasRecordedStepOutput(attempt)}
+                <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
               {/if}
             </div>
           </div>
@@ -2090,9 +2248,21 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, StepRu
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Workflow</span>
             <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
-              <option value="">Auto</option>
-              {#each workflows as workflow}
+              <option value="">Auto{editForm.project_id ? ' (project-aware)' : ''}</option>
+              {#each (projectWorkflowOptionsLoaded ? projectWorkflowOptions : workflows) as workflow}
                 <option value={workflow.workflow_id}>{workflow.name}</option>
+              {/each}
+            </select>
+            {#if editForm.project_id && projectWorkflowOptionsLoaded && projectWorkflowOptions.length === 0}
+              <span class="block text-xs text-slate-500">No workflows are bound to this project. Pick "Auto" or bind a workflow on the project page.</span>
+            {/if}
+          </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Project</span>
+            <select bind:value={editForm.project_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">
+              <option value="">None</option>
+              {#each projects as project}
+                <option value={project.project_id}>{project.name}</option>
               {/each}
             </select>
           </label>

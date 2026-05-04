@@ -397,10 +397,15 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         created_workflow_id = created_workflow.workflow_id
     if payload.project_id is not None:
         await _validate_project_access(request, payload.project_id)
+    project_id_explicit = "project_id" in payload.model_fields_set
+    workflow_id_explicit = "workflow_id" in payload.model_fields_set
     effective_project_id = (
-        payload.project_id if payload.project_id is not None else getattr(existing_row, "project_id", None)
+        payload.project_id if project_id_explicit else getattr(existing_row, "project_id", None)
     )
-    effective_workflow_id = resolved_workflow_id or getattr(existing_row, "workflow_id", None)
+    if workflow_id_explicit:
+        effective_workflow_id = resolved_workflow_id  # may be None when caller cleared workflow
+    else:
+        effective_workflow_id = resolved_workflow_id or getattr(existing_row, "workflow_id", None)
     if effective_workflow_id is not None:
         await _validate_workflow_access(
             request,
@@ -465,6 +470,16 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 )
             updates = payload.model_dump(exclude_none=True)
             updates.pop("skill_id", None)
+            # Preserve explicit `null` for nullable resource references so the
+            # caller can clear `workflow_id` / `project_id`.  Pydantic's
+            # ``exclude_none`` strips them out, so re-introduce them when the
+            # client explicitly sent ``null``.
+            for nullable_field in ("workflow_id", "project_id"):
+                if (
+                    nullable_field in payload.model_fields_set
+                    and getattr(payload, nullable_field, None) is None
+                ):
+                    updates[nullable_field] = None
             if payload.skill_id is not None:
                 updates["workflow_id"] = resolved_workflow_id
             if "delivery_mode" in updates:

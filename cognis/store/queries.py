@@ -2059,8 +2059,14 @@ async def update_task_fields(
     priority: int | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
+    clear_workflow_id: bool = False,
+    clear_project_id: bool = False,
 ) -> bool:
-    """Update mutable task fields.  Only allowed for draft/queued tasks."""
+    """Update mutable task fields.  Only allowed for draft/queued tasks.
+
+    Pass ``clear_workflow_id=True`` / ``clear_project_id=True`` to explicitly
+    set the corresponding column to ``NULL``.
+    """
     values: dict[str, object] = {}
     if title is not None:
         values["title"] = title
@@ -2072,8 +2078,12 @@ async def update_task_fields(
         values["priority"] = priority
     if workflow_id is not None:
         values["workflow_id"] = workflow_id
+    elif clear_workflow_id:
+        values["workflow_id"] = None
     if project_id is not None:
         values["project_id"] = project_id
+    elif clear_project_id:
+        values["project_id"] = None
     if not values:
         return False
     stmt = (
