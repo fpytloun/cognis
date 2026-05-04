@@ -6,6 +6,7 @@
 
   import { api, asApiError } from '$lib/api/client';
   import {
+    getNextHistoryAfterSeq,
     nextPollDelayMs,
     SESSION_LOG_BOOTSTRAP_MAX_PAGES,
     SESSION_LOG_PAGE_SIZE,
@@ -172,11 +173,11 @@
         while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
           const result = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
           history.push(...(result.items ?? []));
-          finalLastSeq = result.last_seq;
+          finalLastSeq = getNextHistoryAfterSeq(result);
           activeThinking = result.active_thinking ?? [];
           pageCount += 1;
           if (!result.has_more || result.items.length === 0) break;
-          afterSeq = result.last_seq;
+          afterSeq = finalLastSeq;
           if (afterSeq === 0) break;
         }
         if (pageCount >= SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
@@ -194,17 +195,31 @@
         userScrolledUp = false;
         scrollToBottom(true);
       } else {
-        const result = await api.conversations.sessionEvents(conversationId, sessionId, lastSeq, SESSION_LOG_PAGE_SIZE);
         const shouldFollow = !userScrolledUp;
-        if ((result.items ?? []).length > 0) {
-          events = [...events, ...(result.items ?? [])];
+        const nextEvents: MessageEvent[] = [];
+        let afterSeq = lastSeq;
+        let finalLastSeq = lastSeq;
+        let activeThinking: ActiveThinkingSnapshot[] = [];
+        let pageCount = 0;
+        while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
+          const result = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
+          nextEvents.push(...(result.items ?? []));
+          activeThinking = result.active_thinking ?? [];
+          finalLastSeq = getNextHistoryAfterSeq(result);
+          pageCount += 1;
+          if (!result.has_more || result.items.length === 0) break;
+          if (finalLastSeq === 0 || finalLastSeq === afterSeq) break;
+          afterSeq = finalLastSeq;
         }
-        timeline = applyActiveThinkingSnapshots(normalizeHistory(events), result.active_thinking ?? []);
-        if ((result.items ?? []).length > 0 || (result.active_thinking ?? []).length > 0 || timeline.some((item) => item.kind === 'thinking' && item.streaming)) {
+        if (nextEvents.length > 0) {
+          events = [...events, ...nextEvents];
+        }
+        timeline = applyActiveThinkingSnapshots(normalizeHistory(events), activeThinking);
+        if (nextEvents.length > 0 || activeThinking.length > 0 || timeline.some((item) => item.kind === 'thinking' && item.streaming)) {
           await tick();
           if (shouldFollow) scrollToBottom(true);
         }
-        lastSeq = result.last_seq;
+        lastSeq = finalLastSeq;
       }
       pollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
     } catch (caughtError) {

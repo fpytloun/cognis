@@ -45,12 +45,14 @@ export function getNextHistoryAfterSeq(response: {
   last_seq: number;
   items: Array<{ seq: number | null }>;
 }): number {
-  if (response.last_seq > 0) {
-    return response.last_seq;
+  for (let index = response.items.length - 1; index >= 0; index -= 1) {
+    const seq = response.items[index]?.seq;
+    if (typeof seq === 'number' && seq > 0) {
+      return seq;
+    }
   }
 
-  const lastItem = response.items[response.items.length - 1];
-  return typeof lastItem?.seq === 'number' ? lastItem.seq : 0;
+  return response.last_seq > 0 ? response.last_seq : 0;
 }
 
 export function isRestorableChatConversation(conversation: {

@@ -40,7 +40,16 @@ describe('chat page helpers', () => {
     ).toEqual({ sessions: true, history: false });
   });
 
-  it('advances history pagination with response last_seq when rows were skipped', () => {
+  it('advances history pagination with the last returned event seq', () => {
+    expect(
+      getNextHistoryAfterSeq({
+        items: [{ seq: 5 }, { seq: 6 }],
+        last_seq: 42
+      })
+    ).toBe(6);
+  });
+
+  it('falls back to response last_seq when no event seq was returned', () => {
     expect(
       getNextHistoryAfterSeq({
         items: [],
@@ -50,10 +59,10 @@ describe('chat page helpers', () => {
 
     expect(
       getNextHistoryAfterSeq({
-        items: [{ seq: 5 }],
-        last_seq: 0
+        items: [{ seq: null }],
+        last_seq: 42
       })
-    ).toBe(5);
+    ).toBe(42);
   });
 
   it('backs off polling delay with a bounded jittered increase', () => {
