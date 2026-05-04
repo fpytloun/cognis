@@ -70,11 +70,8 @@ def test_old_tool_results_pruned() -> None:
 
     result = prune_tool_outputs(messages, protect_tokens=1000, minimum_savings=100)
     # Old (big) result should be cleared
-    assert "Tool result cleared" in result[2]["content"]
-    assert "list_tool_output_anchors" in result[2]["content"]
-    assert "read_tool_output_anchor" in result[2]["content"]
-    assert "search_tool_output" in result[2]["content"]
-    assert "read_tool_output" in result[2]["content"]
+    assert "Tool output omitted from prompt" in result[2]["content"]
+    assert "Recover with" in result[2]["content"]
     assert "c1" in result[2]["content"]
     # tool_call_id preserved
     assert result[2]["tool_call_id"] == "c1"
@@ -123,9 +120,8 @@ def test_large_arguments_cleared() -> None:
         messages, protect_tokens=200, minimum_savings=100, arg_clear_threshold=1000
     )
     # Tool result should be cleared
-    assert "Tool result cleared" in result[2]["content"]
-    assert "list_tool_output_anchors" in result[2]["content"]
-    assert "search_tool_output" in result[2]["content"]
+    assert "Tool output omitted from prompt" in result[2]["content"]
+    assert "Recover with" in result[2]["content"]
     # Tool call arguments should also be cleared (as a JSON string)
     func = result[1]["tool_calls"][0]["function"]
     assert isinstance(func["arguments"], str), "arguments must be a JSON string"
@@ -188,7 +184,7 @@ def test_tool_attachment_context_pruned_with_matching_tool_result() -> None:
 
     result = prune_tool_outputs(messages, protect_tokens=10, minimum_savings=100)
 
-    assert "Tool result cleared" in result[1]["content"]
+    assert "Tool output omitted from prompt" in result[1]["content"]
     assert result[2]["role"] == "system"
     assert "Tool attachment context cleared" in result[2]["content"]
 

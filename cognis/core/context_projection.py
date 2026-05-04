@@ -144,7 +144,12 @@ def project_messages(
         return ProjectionResult(messages=list(messages), mutable_start_index=0)
 
     preserve_recent_completed_tool_groups = max(0, int(preserve_recent_completed_tool_groups))
-    completed_groups = [group for group in groups if group.completed and not group.protected]
+    latest_turn_start = _latest_real_user_index(messages)
+    completed_groups = [
+        group
+        for group in groups
+        if group.completed and not group.protected and group.assistant_index < latest_turn_start
+    ]
     preserved_slice = (
         completed_groups[-preserve_recent_completed_tool_groups:]
         if preserve_recent_completed_tool_groups > 0
@@ -161,10 +166,8 @@ def project_messages(
     preserved_assistant_indices = {group.assistant_index for group in preserved_slice}
     compacted_groups = [
         group
-        for group in groups
-        if group.completed
-        and not group.protected
-        and group.assistant_index not in preserved_assistant_indices
+        for group in completed_groups
+        if group.assistant_index not in preserved_assistant_indices
     ]
     if not compacted_groups:
         return ProjectionResult(messages=list(messages), mutable_start_index=0)
@@ -238,12 +241,15 @@ def prune_projected_messages(
 
     count = token_counter or default_token_estimate
     result = list(messages)
+    latest_turn_start = _latest_real_user_index(result)
     protected_tokens = 0
     pruneable_result_indices: list[int] = []
     pruneable_call_ids: set[str] = set()
     pruneable_attachment_indices: list[int] = []
 
     for index in range(len(result) - 1, min_index_to_modify - 1, -1):
+        if index >= latest_turn_start:
+            continue
         message = result[index]
         if message.get("role") != "tool":
             continue
@@ -260,7 +266,7 @@ def prune_projected_messages(
                 pruneable_call_ids.add(call_id)
 
     pruneable_call_indices: list[int] = []
-    for index in range(min_index_to_modify, len(result)):
+    for index in range(min_index_to_modify, latest_turn_start):
         message = result[index]
         if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
             continue
@@ -282,7 +288,7 @@ def prune_projected_messages(
         if total_arg_size > arg_clear_threshold:
             pruneable_call_indices.append(index)
 
-    for index in range(min_index_to_modify, len(result)):
+    for index in range(min_index_to_modify, latest_turn_start):
         message = result[index]
         if not message.get("_tool_attachment_context") or message.get("_projected_compacted"):
             continue
@@ -365,3 +371,30 @@ def _collect_tool_groups(messages: list[dict[str, Any]]) -> list[_ToolGroup]:
             )
         )
     return groups
+
+
+def _latest_real_user_index(messages: list[dict[str, Any]]) -> int:
+    """Return the start index of the latest real user turn.
+
+    Tool attachment contexts can be projected as user messages so providers can
+    see media produced by tools. They are not human/workflow turn boundaries and
+    must not cause earlier same-turn tool evidence to become pruneable.
+    """
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if _is_real_turn_boundary(message):
+            return index
+    return len(messages)
+
+
+def _is_real_turn_boundary(message: dict[str, Any]) -> bool:
+    role = message.get("role")
+    if role == "user":
+        return not bool(message.get("_tool_attachment_context"))
+    if role != "system":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    return content.lstrip().startswith("## Workflow Task")
