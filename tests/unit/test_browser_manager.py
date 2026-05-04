@@ -466,8 +466,11 @@ async def test_ensure_playwright_ready_restarts_for_new_display(
     manager = BrowserManager(headed_allowed=True)
     stops: list[str] = []
 
-    async def _fake_stop() -> None:
+    async def _fake_stop(*, headless: bool) -> None:
+        del headless
         stops.append("stop")
+        manager._playwrights.clear()  # noqa: SLF001
+        manager._playwright_displays.clear()  # noqa: SLF001
         manager._playwright = None  # noqa: SLF001
         manager._playwright_display = None  # noqa: SLF001
 
@@ -493,7 +496,9 @@ async def test_ensure_playwright_ready_restarts_for_new_display(
     monkeypatch.delenv("DISPLAY", raising=False)
     monkeypatch.setattr("sys.platform", "linux")
 
-    manager._playwright = object()  # noqa: SLF001
+    manager._playwrights[False] = object()  # noqa: SLF001
+    manager._playwright_displays[False] = None  # noqa: SLF001
+    manager._playwright = manager._playwrights[False]  # noqa: SLF001
     manager._playwright_display = None  # noqa: SLF001
 
     display = await manager._ensure_playwright_ready_locked(headless=False)  # noqa: SLF001
@@ -525,7 +530,9 @@ async def test_ensure_playwright_ready_blocks_restart_with_live_generation_sessi
     monkeypatch.setattr(
         manager, "_ensure_virtual_display_locked", _fake_ensure_virtual_display_locked
     )  # type: ignore[arg-type]
-    manager._playwright = object()  # noqa: SLF001
+    manager._playwrights[False] = object()  # noqa: SLF001
+    manager._playwright_displays[False] = None  # noqa: SLF001
+    manager._playwright = manager._playwrights[False]  # noqa: SLF001
     manager._playwright_display = None  # noqa: SLF001
     manager._runtime_generation = 7  # noqa: SLF001
     manager._sessions = {
@@ -536,6 +543,52 @@ async def test_ensure_playwright_ready_blocks_restart_with_live_generation_sessi
 
     with pytest.raises(RuntimeError, match="different display"):
         await manager._ensure_playwright_ready_locked(headless=False)  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_headed_runtime_can_start_while_headless_session_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = BrowserManager(headed_allowed=True)
+
+    async def _fake_ensure_playwright_browser(**_: object) -> tuple[bool, str]:
+        return True, "available"
+
+    async def _fake_ensure_virtual_display_locked() -> None:
+        manager._xvfb_display = ":99"  # noqa: SLF001
+
+    class _Starter:
+        async def start(self) -> object:
+            return object()
+
+    monkeypatch.setattr(
+        "cognis.tools.executor.browser.manager.ensure_playwright_browser",
+        _fake_ensure_playwright_browser,
+    )
+    monkeypatch.setattr(
+        manager, "_ensure_virtual_display_locked", _fake_ensure_virtual_display_locked
+    )  # type: ignore[arg-type]
+    monkeypatch.setattr("playwright.async_api.async_playwright", lambda: _Starter())
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+
+    headless_runtime = object()
+    manager._playwrights[True] = headless_runtime  # noqa: SLF001
+    manager._playwright_displays[True] = None  # noqa: SLF001
+    manager._sessions = {  # noqa: SLF001
+        "headless-1": SimpleNamespace(
+            runtime_generation=1,
+            headless=True,
+            last_used_at=datetime.now(UTC),
+        )
+    }
+
+    display = await manager._ensure_playwright_ready_locked(headless=False)  # noqa: SLF001
+
+    assert display == ":99"
+    assert manager._playwrights[True] is headless_runtime  # noqa: SLF001
+    assert manager._playwrights[False] is not None  # noqa: SLF001
+    assert manager._playwright_displays[False] == ":99"  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -557,12 +610,12 @@ async def test_open_persistent_context_passes_display_env_without_mutating_proce
     launch_calls: list[dict[str, object]] = []
 
     async def _fake_ensure_playwright_ready_locked(*, headless: bool) -> str | None:
-        del headless
-        manager._playwright = SimpleNamespace(
+        manager._playwrights[headless] = SimpleNamespace(  # noqa: SLF001
             chromium=SimpleNamespace(
                 launch_persistent_context=_fake_launch_persistent_context,
             )
-        )  # noqa: SLF001
+        )
+        manager._playwright = manager._playwrights[headless]  # noqa: SLF001
         manager._runtime_generation = 3  # noqa: SLF001
         return ":99"
 
@@ -596,8 +649,10 @@ async def test_launch_shared_browser_retries_only_retryable_failures(
     recoveries: list[int] = []
 
     async def _fake_ensure_playwright_ready_locked(*, headless: bool) -> str | None:
-        del headless
-        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=_fake_launch))  # noqa: SLF001
+        manager._playwrights[headless] = SimpleNamespace(  # noqa: SLF001
+            chromium=SimpleNamespace(launch=_fake_launch)
+        )
+        manager._playwright = manager._playwrights[headless]  # noqa: SLF001
         return ":99"
 
     async def _fake_launch(**_kwargs: object) -> object:
@@ -606,7 +661,10 @@ async def test_launch_shared_browser_retries_only_retryable_failures(
             raise RuntimeError("x server missing")
         return object()
 
-    async def _fake_recover(*, failure_category: str, retry_count: int) -> None:
+    async def _fake_recover(
+        *, failure_category: str, headless: bool | None = None, retry_count: int
+    ) -> None:
+        del failure_category, headless
         recoveries.append(retry_count)
 
     monkeypatch.setattr(
@@ -629,8 +687,10 @@ async def test_launch_shared_browser_does_not_retry_non_retryable_failures(
     recoveries: list[int] = []
 
     async def _fake_ensure_playwright_ready_locked(*, headless: bool) -> str | None:
-        del headless
-        manager._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=_fake_launch))  # noqa: SLF001
+        manager._playwrights[headless] = SimpleNamespace(  # noqa: SLF001
+            chromium=SimpleNamespace(launch=_fake_launch)
+        )
+        manager._playwright = manager._playwrights[headless]  # noqa: SLF001
         return ":99"
 
     async def _fake_launch(**_kwargs: object) -> object:
@@ -682,6 +742,51 @@ async def test_recover_retryable_launch_failure_blocks_when_other_headed_open_ex
 
 
 @pytest.mark.asyncio
+async def test_recover_retryable_headed_launch_preserves_live_headless_session() -> None:
+    manager = BrowserManager()
+    stopped: list[str] = []
+    xvfb_stopped: list[str] = []
+
+    class _Playwright:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        async def stop(self) -> None:
+            stopped.append(self.label)
+
+    async def _fake_stop_virtual_display_locked() -> None:
+        xvfb_stopped.append("stop")
+
+    headless_runtime = _Playwright("headless")
+    headed_runtime = _Playwright("headed")
+    manager._sessions = {  # noqa: SLF001
+        "headless-1": SimpleNamespace(
+            runtime_generation=1,
+            headless=True,
+            last_used_at=datetime.now(UTC),
+        )
+    }
+    manager._playwrights = {True: headless_runtime, False: headed_runtime}  # noqa: SLF001
+    manager._playwright_displays = {True: None, False: ":99"}  # noqa: SLF001
+    manager._open_in_flight = 1  # noqa: SLF001
+    manager._open_in_flight_by_mode = {True: 0, False: 1}  # noqa: SLF001
+    manager._xvfb_display = ":99"  # noqa: SLF001
+    manager._xvfb_process = SimpleNamespace()  # noqa: SLF001
+    manager._stop_virtual_display_locked = _fake_stop_virtual_display_locked  # type: ignore[method-assign]
+
+    await manager._recover_retryable_launch_failure_locked(  # noqa: SLF001
+        failure_category="display_bootstrap",
+        headless=False,
+        retry_count=1,
+    )
+
+    assert stopped == ["headed"]
+    assert xvfb_stopped == ["stop"]
+    assert manager._playwrights == {True: headless_runtime}  # noqa: SLF001
+    assert manager._sessions["headless-1"].headless is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_close_session_keeps_xvfb_while_headed_open_in_flight() -> None:
     manager = BrowserManager()
     stopped: list[str] = []
@@ -715,6 +820,95 @@ async def test_close_session_keeps_xvfb_while_headed_open_in_flight() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_last_headed_session_cleans_up_while_headless_open_in_flight() -> None:
+    manager = BrowserManager()
+    browser_closed: list[str] = []
+    playwright_stopped: list[str] = []
+    xvfb_stopped: list[str] = []
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    class _Browser:
+        async def close(self) -> None:
+            browser_closed.append("headed")
+
+    class _Playwright:
+        async def stop(self) -> None:
+            playwright_stopped.append("headed")
+
+    async def _fake_stop_virtual_display_locked() -> None:
+        xvfb_stopped.append("stop")
+
+    manager._sessions = {  # noqa: SLF001
+        "sess-1": SimpleNamespace(
+            session_id="sess-1",
+            context=_Context(),
+            headless=False,
+            profile_mode="ephemeral",
+            profile_id=None,
+            display=":99",
+            runtime_generation=1,
+        )
+    }
+    manager._open_in_flight = 1  # noqa: SLF001
+    manager._open_in_flight_by_mode = {True: 1, False: 0}  # noqa: SLF001
+    manager._browsers[False] = _Browser()  # noqa: SLF001
+    manager._playwrights[False] = _Playwright()  # noqa: SLF001
+    manager._playwright_displays[False] = ":99"  # noqa: SLF001
+    manager._xvfb_display = ":99"  # noqa: SLF001
+    manager._xvfb_process = SimpleNamespace()  # noqa: SLF001
+    manager._stop_virtual_display_locked = _fake_stop_virtual_display_locked  # type: ignore[method-assign]
+
+    await manager.close_session("sess-1")
+
+    assert browser_closed == ["headed"]
+    assert playwright_stopped == ["headed"]
+    assert xvfb_stopped == ["stop"]
+    assert False not in manager._playwrights  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_close_headless_session_keeps_xvfb_for_sessionless_headed_runtime() -> None:
+    manager = BrowserManager()
+    xvfb_stopped: list[str] = []
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    class _Playwright:
+        async def stop(self) -> None:
+            return None
+
+    async def _fake_stop_virtual_display_locked() -> None:
+        xvfb_stopped.append("stop")
+
+    manager._sessions = {  # noqa: SLF001
+        "headless-1": SimpleNamespace(
+            session_id="headless-1",
+            context=_Context(),
+            headless=True,
+            profile_mode="ephemeral",
+            profile_id=None,
+            display=None,
+            runtime_generation=1,
+        )
+    }
+    manager._playwrights[False] = _Playwright()  # noqa: SLF001
+    manager._playwright_displays[False] = ":99"  # noqa: SLF001
+    manager._xvfb_display = ":99"  # noqa: SLF001
+    manager._xvfb_process = SimpleNamespace()  # noqa: SLF001
+    manager._stop_virtual_display_locked = _fake_stop_virtual_display_locked  # type: ignore[method-assign]
+
+    await manager.close_session("headless-1")
+
+    assert xvfb_stopped == []
+    assert manager._playwrights.get(False) is not None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
 async def test_close_session_keeps_shared_browser_while_open_in_flight() -> None:
     manager = BrowserManager()
     browser_closed: list[str] = []
@@ -723,7 +917,8 @@ async def test_close_session_keeps_shared_browser_while_open_in_flight() -> None
         async def close(self) -> None:
             return None
 
-    async def _fake_close_shared_browser_locked() -> None:
+    async def _fake_close_shared_browser_locked(*, headless: bool | None = None) -> None:
+        del headless
         browser_closed.append("closed")
 
     manager._sessions = {  # noqa: SLF001
@@ -739,6 +934,7 @@ async def test_close_session_keeps_shared_browser_while_open_in_flight() -> None
     }
     manager._browser = object()  # noqa: SLF001
     manager._open_in_flight = 1  # noqa: SLF001
+    manager._open_in_flight_by_mode = {True: 1, False: 0}  # noqa: SLF001
     manager._close_shared_browser_locked = _fake_close_shared_browser_locked  # type: ignore[method-assign]
 
     await manager.close_session("sess-1")

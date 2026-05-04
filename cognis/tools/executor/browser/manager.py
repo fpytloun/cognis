@@ -222,7 +222,9 @@ class BrowserManager:
         # Back-compat alias kept for external readers (e.g. status/diagnostics).
         # Points at the most recently launched browser regardless of mode.
         self._browser: Any | None = None  # last-touched browser, for diagnostics
-        self._playwright: Any | None = None
+        self._playwrights: dict[bool, Any] = {}  # headless -> Playwright object
+        self._playwright_displays: dict[bool, str | None] = {}  # headless -> display
+        self._playwright: Any | None = None  # last-touched runtime, for diagnostics/tests
         self._sessions: dict[str, BrowserSession] = {}
         self._lock = asyncio.Lock()
         self._xvfb_process: asyncio.subprocess.Process | None = None
@@ -230,9 +232,10 @@ class BrowserManager:
         self._claimed_displays: set[str] = set()
         self._reserved_profile_ids: set[str] = set()
         self._runtime_generation = 0
-        self._playwright_display: str | None = None
+        self._playwright_display: str | None = None  # last-touched display, for diagnostics/tests
         self._headed_open_in_flight = 0
         self._open_in_flight = 0
+        self._open_in_flight_by_mode: dict[bool, int] = {True: 0, False: 0}
         self._patchright_persistent_warning_emitted = False
         self._idle_reaper_task: asyncio.Task[None] | None = None
         self._reap_orphan_profile_locks()
@@ -442,21 +445,29 @@ class BrowserManager:
                     if resolved_mode == "persistent_local":
                         self._reserved_profile_ids.discard(str(resolved_profile_id))
                     self._open_in_flight -= 1
-                    # Tear down the per-mode shared browser if no sessions of
-                    # that mode remain and no concurrent open is in flight.
-                    if (
-                        self._open_in_flight == 0
-                        and not self._has_live_sessions_for_mode_locked(headless)
-                        and self._browsers.get(headless) is not None
-                    ):
-                        await self._close_shared_browser_locked(headless=headless)
+                    self._open_in_flight_by_mode[headless] = max(
+                        0, self._open_in_flight_by_mode.get(headless, 0) - 1
+                    )
                     if not headless:
                         self._headed_open_in_flight -= 1
-                        if (
-                            self._headed_open_in_flight == 0
-                            and not self._has_live_headed_sessions_locked()
-                        ):
-                            await self._stop_virtual_display_locked()
+                    # Tear down the per-mode runtime if no sessions of that
+                    # mode remain and no concurrent open is in flight.
+                    if (
+                        self._open_in_flight_by_mode.get(headless, 0) == 0
+                        and not self._has_live_sessions_for_mode_locked(headless)
+                        and (
+                            self._browsers.get(headless) is not None
+                            or self._playwrights.get(headless) is not None
+                        )
+                    ):
+                        await self._stop_playwright_locked(headless=headless)
+                    if (
+                        not headless
+                        and self._headed_open_in_flight == 0
+                        and not self._has_live_headed_sessions_locked()
+                        and not self._has_live_headed_runtime_locked()
+                    ):
+                        await self._stop_virtual_display_locked()
             except RuntimeError:
                 pass
         return session
@@ -486,12 +497,14 @@ class BrowserManager:
             # are gone and no open is in flight for that mode.
             was_headless = session.headless
             live_same_mode = any(s.headless == was_headless for s in self._sessions.values())
-            in_flight_same_mode = (
-                self._open_in_flight > 0
-            )  # conservative: can't split in-flight by mode yet
+            in_flight_same_mode = self._open_in_flight_by_mode.get(was_headless, 0) > 0
             if not live_same_mode and not in_flight_same_mode:
-                await self._close_shared_browser_locked(headless=was_headless)
-            if self._headed_open_in_flight == 0 and not self._has_live_headed_sessions_locked():
+                await self._stop_playwright_locked(headless=was_headless)
+            if (
+                self._headed_open_in_flight == 0
+                and not self._has_live_headed_sessions_locked()
+                and not self._has_live_headed_runtime_locked()
+            ):
                 await self._stop_virtual_display_locked()
 
     async def cleanup(self) -> None:
@@ -504,7 +517,7 @@ class BrowserManager:
             await self.close_session(session_id)
         async with self._lock:
             await self._close_all_browsers_locked()
-            await self._stop_playwright_locked()
+            await self._stop_all_playwright_locked()
             await self._stop_virtual_display_locked()
 
     async def storage_state(self, session_id: str) -> dict[str, Any]:
@@ -570,6 +583,9 @@ class BrowserManager:
                 if len(self._sessions) + self._open_in_flight >= self.max_sessions:
                     raise RuntimeError("Browser session limit exceeded")
                 self._open_in_flight += 1
+                self._open_in_flight_by_mode[headless] = (
+                    self._open_in_flight_by_mode.get(headless, 0) + 1
+                )
                 if not headless:
                     self._headed_open_in_flight += 1
             return
@@ -579,6 +595,9 @@ class BrowserManager:
             async with self._lock:
                 if len(self._sessions) + self._open_in_flight < self.max_sessions:
                     self._open_in_flight += 1
+                    self._open_in_flight_by_mode[headless] = (
+                        self._open_in_flight_by_mode.get(headless, 0) + 1
+                    )
                     if not headless:
                         self._headed_open_in_flight += 1
                     return
@@ -789,23 +808,29 @@ class BrowserManager:
         if self._needs_virtual_display(headless=headless):
             await self._ensure_virtual_display_locked()
         display = self._active_display(headless=headless)
-        if self._playwright is not None and self._playwright_display != display:
-            if self._sessions:
+        playwright = self._playwrights.get(headless)
+        if playwright is not None and self._playwright_displays.get(headless) != display:
+            if self._has_live_sessions_for_mode_locked(headless):
                 raise RuntimeError("Browser runtime already active for a different display")
-            # Close any remaining per-mode browsers before resetting playwright.
-            await self._close_all_browsers_locked()
-            # Delegate to _stop_playwright_locked to stop playwright; it
-            # calls _close_all_browsers_locked again (idempotent) then stops.
-            await self._stop_playwright_locked()
-        if self._playwright is None:
+            await self._close_shared_browser_locked(headless=headless)
+            await self._stop_playwright_locked(headless=headless)
+            playwright = None
+        if playwright is None:
             async_playwright = self._resolve_async_playwright()
-            self._playwright = await async_playwright().start()
+            playwright = await async_playwright().start()
+            self._playwrights[headless] = playwright
+            self._playwright_displays[headless] = display
+            self._playwright = playwright
             self._playwright_display = display
             self._log_lifecycle(
                 "playwright_start",
                 outcome="success",
+                headless=headless,
                 display=display,
             )
+        else:
+            self._playwright = playwright
+            self._playwright_display = self._playwright_displays.get(headless)
         return display
 
     def _resolve_async_playwright(self) -> Any:
@@ -1090,7 +1115,7 @@ class BrowserManager:
             async with self._lock:
                 display = await self._ensure_playwright_ready_locked(headless=headless)
                 runtime_generation = self._runtime_generation
-                browser_launcher = getattr(self._playwright, self.engine)
+                browser_launcher = getattr(self._playwrights[headless], self.engine)
                 launch_kwargs = self._launch_kwargs(headless=headless, display=display)
             try:
                 context = await browser_launcher.launch_persistent_context(
@@ -1114,6 +1139,7 @@ class BrowserManager:
                 async with self._lock:
                     await self._recover_retryable_launch_failure_locked(
                         failure_category=failure_category,
+                        headless=headless,
                         retry_count=retry_count,
                     )
         await self._apply_context_defaults(context, profile_id=profile_id)
@@ -1146,6 +1172,9 @@ class BrowserManager:
     def _has_live_headed_sessions_locked(self) -> bool:
         return any(not session.headless for session in self._sessions.values())
 
+    def _has_live_headed_runtime_locked(self) -> bool:
+        return self._browsers.get(False) is not None or self._playwrights.get(False) is not None
+
     def _has_live_sessions_for_generation_locked(self, generation: int) -> bool:
         return any(session.runtime_generation == generation for session in self._sessions.values())
 
@@ -1160,24 +1189,45 @@ class BrowserManager:
             if browser is not None:
                 with contextlib.suppress(Exception):
                     await browser.close()
-        self._browser = None  # diagnostic alias
+        self._browser = next(iter(self._browsers.values()), None)  # diagnostic alias
 
     async def _close_all_browsers_locked(self) -> None:
         await self._close_shared_browser_locked(headless=None)
 
-    async def _stop_playwright_locked(self) -> None:
-        await self._close_all_browsers_locked()
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
-            self._log_lifecycle("playwright_stop", outcome="success")
-        self._playwright_display = None
+    async def _stop_playwright_locked(self, *, headless: bool) -> None:
+        await self._close_shared_browser_locked(headless=headless)
+        playwright = self._playwrights.get(headless)
+        display = self._playwright_displays.get(headless)
+        if playwright is not None:
+            await playwright.stop()
+            self._playwrights.pop(headless, None)
+            self._playwright_displays.pop(headless, None)
+            self._log_lifecycle(
+                "playwright_stop",
+                outcome="success",
+                headless=headless,
+                display=display,
+            )
+        else:
+            self._playwright_displays.pop(headless, None)
+        if self._playwright is playwright:
+            replacement_mode = next(iter(self._playwrights), None)
+            if replacement_mode is None:
+                self._playwright = None
+                self._playwright_display = None
+            else:
+                self._playwright = self._playwrights[replacement_mode]
+                self._playwright_display = self._playwright_displays.get(replacement_mode)
+
+    async def _stop_all_playwright_locked(self) -> None:
+        for mode in list(self._playwrights):
+            await self._stop_playwright_locked(headless=mode)
 
     async def _launch_shared_browser_locked(self, *, headless: bool) -> None:
         retry_count = 0
         while True:
             display = await self._ensure_playwright_ready_locked(headless=headless)
-            browser_launcher = getattr(self._playwright, self.engine)
+            browser_launcher = getattr(self._playwrights[headless], self.engine)
             try:
                 browser = await browser_launcher.launch(
                     **self._launch_kwargs(headless=headless, display=display)
@@ -1209,6 +1259,7 @@ class BrowserManager:
                 retry_count += 1
                 await self._recover_retryable_launch_failure_locked(
                     failure_category=failure_category,
+                    headless=headless,
                     retry_count=retry_count,
                 )
 
@@ -1216,27 +1267,37 @@ class BrowserManager:
         self,
         *,
         failure_category: str,
+        headless: bool | None = None,
         retry_count: int,
     ) -> None:
-        if self._sessions:
-            raise RuntimeError("Cannot recover browser launch while live sessions exist")
-        if self._open_in_flight > 1:
-            raise RuntimeError("Cannot recover browser launch while live sessions exist")
+        if headless is None:
+            if self._sessions:
+                raise RuntimeError("Cannot recover browser launch while live sessions exist")
+            if self._open_in_flight > 1:
+                raise RuntimeError("Cannot recover browser launch while live sessions exist")
+        else:
+            if self._has_live_sessions_for_mode_locked(headless):
+                raise RuntimeError("Cannot recover browser launch while live sessions exist")
+            if self._open_in_flight_by_mode.get(headless, 0) > 1:
+                raise RuntimeError("Cannot recover browser launch while live sessions exist")
         self._log_lifecycle(
             "browser_recover",
             outcome="retry",
+            headless=headless,
             failure_category=failure_category,
             retry_count=retry_count,
         )
-        # Close both browsers then restart Playwright/Xvfb so the retry begins
-        # from a clean display-level state.
-        await self._close_all_browsers_locked()
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
-            self._playwright_display = None
-            self._log_lifecycle("playwright_stop", outcome="success")
-        await self._stop_virtual_display_locked()
+        if headless is None:
+            # Legacy/manual path: reset everything only when no sessions are live.
+            await self._close_all_browsers_locked()
+            await self._stop_all_playwright_locked()
+            await self._stop_virtual_display_locked()
+            return
+        # Reset only the failed mode so a headed retry does not disrupt live
+        # headless sessions, or vice versa.
+        await self._stop_playwright_locked(headless=headless)
+        if not headless:
+            await self._stop_virtual_display_locked()
 
     def _classify_launch_failure(self, exc: Exception, *, phase: str) -> str | None:
         if phase not in {"browser_launch", "persistent_launch"}:
@@ -1261,6 +1322,11 @@ class BrowserManager:
             "outcome": outcome,
             "runtime_generation": self._runtime_generation,
             "playwright_display": self._playwright_display,
+            "playwright_displays": {
+                "headless": self._playwright_displays.get(True),
+                "headed": self._playwright_displays.get(False),
+            },
+            "playwright_runtime_count": len(self._playwrights),
             "xvfb_managed": self._xvfb_process is not None,
             "active_session_count": len(self._sessions),
             "headed_session_count": sum(1 for item in self._sessions.values() if not item.headless),
