@@ -278,9 +278,7 @@ CONTROLLER_TOOLS = {
 # double-validating (and to avoid rejecting controller-owned schema
 # choices such as empty-arg ``step_todo_list``).
 _CONTROLLER_INTERCEPTED_TOOLS: frozenset[str] = frozenset(CONTROLLER_TOOLS)
-_FINALIZATION_TOOLS: frozenset[str] = frozenset(
-    {STEP_TODO_WRITE, WRITE_DELIVERABLE, STEP_COMPLETE}
-)
+_FINALIZATION_TOOLS: frozenset[str] = frozenset({STEP_TODO_WRITE, WRITE_DELIVERABLE, STEP_COMPLETE})
 
 
 def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
@@ -289,6 +287,7 @@ def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
     if instruction.get("required_action") == "write_deliverable_then_step_complete":
         return _FINALIZATION_TOOLS
     return frozenset({STEP_TODO_WRITE, STEP_COMPLETE})
+
 
 # Callback types
 TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
@@ -485,8 +484,7 @@ def _truncate_file_diff(text: str) -> tuple[str, bool]:
     if len(text) <= _MAX_FILE_DIFF_BYTES:
         return text, False
     return (
-        text[:_MAX_FILE_DIFF_BYTES]
-        + f"\n... (diff truncated, {len(text)} bytes total)",
+        text[:_MAX_FILE_DIFF_BYTES] + f"\n... (diff truncated, {len(text)} bytes total)",
         True,
     )
 
@@ -3787,10 +3785,7 @@ class AgentLoop:
                         ctx,
                         tc=tc,
                     )
-                    if (
-                        loaded_project_context is None
-                        and not can_continue_after_context
-                    ):
+                    if loaded_project_context is None and not can_continue_after_context:
                         loaded_project_context = self._project_context_loaded_for_tool_target(
                             ctx,
                             tc,
@@ -3798,9 +3793,9 @@ class AgentLoop:
                         )
                         force_project_context_retry = loaded_project_context is not None
                     if loaded_project_context is not None and can_continue_after_context:
-                        loaded_project_contexts_this_cycle[
-                            loaded_project_context.project_root
-                        ] = loaded_project_context
+                        loaded_project_contexts_this_cycle[loaded_project_context.project_root] = (
+                            loaded_project_context
+                        )
                         if loaded_project_context.content_hash not in queued_project_context_hashes:
                             queued_project_context_hashes.add(loaded_project_context.content_hash)
                             post_tool_system_messages.append(
@@ -6021,14 +6016,16 @@ class AgentLoop:
                 if project_id:
                     async with self.session_manager.session_factory() as db:
                         project = await get_project(db, str(project_id))
-                        project_access = project is not None and (
-                            project.status == "active"
-                        ) and (
-                            project.owner_email == ctx.session.user_email
-                            or await get_active_project_grant(
-                                db, str(project_id), ctx.session.user_email
+                        project_access = (
+                            project is not None
+                            and (project.status == "active")
+                            and (
+                                project.owner_email == ctx.session.user_email
+                                or await get_active_project_grant(
+                                    db, str(project_id), ctx.session.user_email
+                                )
+                                is not None
                             )
-                            is not None
                         )
                     if not project_access:
                         return ToolResult(
@@ -6558,12 +6555,16 @@ class AgentLoop:
                 project_id = str(project_id_arg) if project_id_arg else task_row.project_id
                 if project_id_arg:
                     project = await get_project(db, project_id)
-                    project_access = project is not None and (
-                        project.status == "active"
-                    ) and (
-                        project.owner_email == ctx.session.user_email
-                        or await get_active_project_grant(db, project_id, ctx.session.user_email)
-                        is not None
+                    project_access = (
+                        project is not None
+                        and (project.status == "active")
+                        and (
+                            project.owner_email == ctx.session.user_email
+                            or await get_active_project_grant(
+                                db, project_id, ctx.session.user_email
+                            )
+                            is not None
+                        )
                     )
                     if not project_access:
                         return ToolResult(
@@ -8338,7 +8339,8 @@ class AgentLoop:
             stable_tool_id(registered.definition), registered.definition
         )
         allowlisted_parallel_mutation = (
-            definition.source.type == "executor" and definition.name in _PARALLEL_MUTATION_TOOL_NAMES
+            definition.source.type == "executor"
+            and definition.name in _PARALLEL_MUTATION_TOOL_NAMES
         )
         if not definition.read_only and not allowlisted_parallel_mutation:
             return False
@@ -9827,6 +9829,11 @@ class AgentLoop:
             metadata["step_name"] = ctx.step_definition.name
         if ctx.step_run_id:
             metadata["step_run_id"] = ctx.step_run_id
+        metadata["conversation_context"] = {
+            "type": ctx.conversation.context.type,
+            "ref": ctx.conversation.context.ref,
+            "platform_data": dict(ctx.conversation.context.platform_data or {}),
+        }
         return metadata
 
     def _record_execution_evidence(
@@ -9894,9 +9901,13 @@ class AgentLoop:
                 "pull requests unless this current step explicitly says to do so."
             )
         elif "commit" in step_name:
-            lines.append("Commit-related actions are allowed; avoid unrelated implementation edits.")
+            lines.append(
+                "Commit-related actions are allowed; avoid unrelated implementation edits."
+            )
         elif "review" in step_name:
-            lines.append("Focus on review findings unless this current step explicitly asks for fixes.")
+            lines.append(
+                "Focus on review findings unless this current step explicitly asks for fixes."
+            )
         elif any(token in step_name for token in ("summary", "final", "report")):
             lines.append("Summarize and deliver only; do not start new implementation work.")
         return "\n".join(f"- {line}" for line in lines)
@@ -9907,7 +9918,10 @@ class AgentLoop:
         if not ctx.policy.require_step_complete or not (ctx.task_id or ctx.step_run_id):
             return None
         completion_lines = []
-        if self._deliverable_owner_step_run_id(ctx) is not None and ctx.step_definition.require_deliverable:
+        if (
+            self._deliverable_owner_step_run_id(ctx) is not None
+            and ctx.step_definition.require_deliverable
+        ):
             completion_lines.append(
                 "- This step requires a deliverable: call write_deliverable with the step "
                 "artifact before step_complete."
@@ -9926,9 +9940,7 @@ class AgentLoop:
             "done means for this turn.\n"
             "- Later workflow steps handle their own implementation, verification, commit, "
             "pull request, or final-summary work.\n"
-            "\nRequired completion:\n"
-            + "\n".join(completion_lines)
-            + "\n</workflow_step_reminder>"
+            "\nRequired completion:\n" + "\n".join(completion_lines) + "\n</workflow_step_reminder>"
         )
         return {"role": "system", "content": content, "_workflow_step_reminder": True}
 

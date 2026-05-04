@@ -36,9 +36,7 @@ def _without_execution_paths(platform_data: dict[str, Any] | None) -> dict[str, 
     """Return conversation platform data without persisted execution paths."""
 
     payload = dict(platform_data or {})
-    return {
-        key: value for key, value in payload.items() if key not in _EXECUTION_PATH_CONTEXT_KEYS
-    }
+    return {key: value for key, value in payload.items() if key not in _EXECUTION_PATH_CONTEXT_KEYS}
 
 
 def _find_gate_revise_action(pause: Any) -> str | None:
@@ -160,6 +158,16 @@ class CommandDispatcher:
                     data={"code": "turn_active"},
                 )
             return await self._handle_new(conversation, session, agent, user_email)
+
+        # /fork
+        if stripped == "/fork":
+            if has_busy_turn:
+                return CommandResult(
+                    type="error",
+                    text="Cannot fork while a turn is active. Wait for it to finish or cancel it.",
+                    data={"code": "turn_active"},
+                )
+            return await self._handle_fork(conversation, session, agent, user_email)
 
         # /context
         if stripped == "/context":
@@ -356,6 +364,74 @@ class CommandDispatcher:
                 },
             )
 
+    async def _handle_fork(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str,
+    ) -> CommandResult:
+        """Handle /fork."""
+
+        try:
+            (
+                new_conversation,
+                new_session,
+                copied,
+            ) = await self._session_manager.fork_into_new_conversation(
+                source_session=session,
+                source_conversation=conversation,
+                agent=agent,
+                user_email=user_email,
+                title=f"Fork: {conversation.title}" if conversation.title else "Forked chat",
+                intention=f"Forked conversation with {agent.name}",
+                snapshot_extras={"trigger": "user_command:/fork"},
+            )
+        except Exception:
+            logger.exception(
+                "Command /fork failed",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
+            return CommandResult(
+                type="error",
+                text="Could not fork this conversation.",
+                data={"code": "fork_failed"},
+            )
+
+        if not copied:
+            await self._session_manager.mark_failed(
+                new_session.session_id,
+                result_summary="Fork copy failed",
+            )
+            from cognis.store.queries import set_conversation_status
+
+            async with self._session_factory() as db_session:
+                await set_conversation_status(
+                    db_session,
+                    new_conversation.conversation_id,
+                    "archived",
+                )
+                await db_session.commit()
+            return CommandResult(
+                type="error",
+                text="Could not copy this conversation into a fork.",
+                data={"code": "fork_copy_failed"},
+            )
+
+        return CommandResult(
+            type="conversation_created",
+            text="Conversation forked.",
+            data={
+                "code": "fork_created",
+                "conversation_id": new_conversation.conversation_id,
+                "session_id": new_session.session_id,
+                "old_conversation_id": conversation.conversation_id,
+                "previous_conversation_id": conversation.conversation_id,
+                "previous_session_id": session.session_id,
+                "copied": copied,
+            },
+        )
+
     async def _clear_conversation_execution_paths(self, conversation: ConversationModel) -> None:
         """Remove persisted execution paths from one conversation context."""
 
@@ -517,10 +593,7 @@ class CommandDispatcher:
                 tool_summary = [f"{visible_tool_count} visible", f"{inventory_tool_count} eligible"]
                 if isinstance(hidden_searchable_count, int):
                     tool_summary.append(f"{hidden_searchable_count} hidden")
-                if (
-                    isinstance(promoted_requested_count, int)
-                    and promoted_requested_count > 0
-                ):
+                if isinstance(promoted_requested_count, int) and promoted_requested_count > 0:
                     if (
                         isinstance(promoted_visible_count, int)
                         and promoted_visible_count < promoted_requested_count
@@ -1182,6 +1255,7 @@ Available commands:
   /info              Show session details and statistics
   /compact           Compact conversation history
   /summarize         Alias for /compact
+  /fork              Fork this conversation into a new chat
   /new               Start a new conversation
   /reset             Alias for /new
   /clear             Alias for /new

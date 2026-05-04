@@ -51,6 +51,10 @@ from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.projects import build_project_tool_handlers, project_tools
 from cognis.tools.builtin.skill_management import skill_management_tools
 from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
+from cognis.tools.builtin.task_continuation import (
+    build_task_continuation_tool_handlers,
+    task_continuation_tools,
+)
 from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
@@ -291,7 +295,11 @@ async def _resolve_eligible_executor_config(
         explicit_id = execution.get("executor_id")
         selector = execution.get("executor_selector")
         selection_source, _hard_bound = _agent_executor_binding_from_execution(execution)
-        if not explicit_id and selector is not None and not (isinstance(selector, dict) and selector):
+        if (
+            not explicit_id
+            and selector is not None
+            and not (isinstance(selector, dict) and selector)
+        ):
             raise RuntimeError("Agent executor_selector must be a non-empty object")
 
         if explicit_id:
@@ -313,8 +321,12 @@ async def _resolve_eligible_executor_config(
 
         if not explicit_id and not selector:
             if not allow_default:
-                raise RuntimeError("Agent must explicitly configure executor_id or executor_selector")
-            candidates = await list_executors(session, owner_email=executor_owner_email, include_shared=True)
+                raise RuntimeError(
+                    "Agent must explicitly configure executor_id or executor_selector"
+                )
+            candidates = await list_executors(
+                session, owner_email=executor_owner_email, include_shared=True
+            )
             default_matches = [
                 row
                 for row in candidates
@@ -322,9 +334,15 @@ async def _resolve_eligible_executor_config(
                 and is_executor_row_usable(row, policy, owner_email=executor_owner_email)
             ]
             private_defaults = [
-                row for row in default_matches if getattr(row, "owner_email", None) == executor_owner_email
+                row
+                for row in default_matches
+                if getattr(row, "owner_email", None) == executor_owner_email
             ]
-            selected = private_defaults[0] if private_defaults else (default_matches[0] if default_matches else None)
+            selected = (
+                private_defaults[0]
+                if private_defaults
+                else (default_matches[0] if default_matches else None)
+            )
             if selected is None:
                 raise RuntimeError(
                     "No default executor is configured for this shared agent. Configure your executor on the agent page."
@@ -335,7 +353,9 @@ async def _resolve_eligible_executor_config(
                 selection_source="default",
             )
 
-        candidates = await list_executors(session, owner_email=executor_owner_email, include_shared=True)
+        candidates = await list_executors(
+            session, owner_email=executor_owner_email, include_shared=True
+        )
         assert isinstance(selector, dict)
         matches = [
             row
@@ -377,6 +397,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *memory_tools(),
         *agent_management_tools(),
         *project_tools(),
+        *task_continuation_tools(),
         *tool_output_tools(),
         *image_tools(),
         *skill_management_tools(),
@@ -472,6 +493,7 @@ def _build_handler_map(session_factory: Any, status_provider: Any) -> dict[str, 
     handlers: dict[str, Any] = {}
     handlers.update(build_system_tool_handlers(session_factory, status_provider))
     handlers.update(build_project_tool_handlers(session_factory))
+    handlers.update(build_task_continuation_tool_handlers(session_factory))
     handlers.update(build_datetime_tool_handlers())
     handlers.update(executor_tool_handlers())
     return handlers
@@ -644,7 +666,9 @@ def build_step_runtime_factory(
         # Exclude web-category tools — they are injected dynamically below
         # based on available backends.
         agent_tools = [
-            t for t in select_static_tools(tool_agent, access_context=access_context) if t.category != "web"
+            t
+            for t in select_static_tools(tool_agent, access_context=access_context)
+            if t.category != "web"
         ]
 
         # Add dynamic web tool definitions based on available backends

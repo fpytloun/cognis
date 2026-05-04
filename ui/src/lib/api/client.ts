@@ -67,6 +67,7 @@ import type {
   StepRun,
   StepProfileDefinition,
   Task,
+  TaskChatResponse,
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
@@ -878,6 +879,18 @@ export const api = {
 
     rerun(taskId: string): Promise<TaskRerunResponse> {
       return request<TaskRerunResponse>(`/api/v1/tasks/${taskId}/rerun`, {
+        method: 'POST'
+      });
+    },
+
+    chat(taskId: string): Promise<TaskChatResponse> {
+      return request<TaskChatResponse>(`/api/v1/tasks/${taskId}/chat`, {
+        method: 'POST'
+      });
+    },
+
+    stepChat(taskId: string, stepRunId: string): Promise<TaskChatResponse> {
+      return request<TaskChatResponse>(`/api/v1/tasks/${taskId}/steps/${encodeURIComponent(stepRunId)}/chat`, {
         method: 'POST'
       });
     },

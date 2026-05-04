@@ -24,6 +24,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
+from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
 from cognis.tools.executor.browser.handlers import build_manager_from_config
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
 from cognis.tools.executor.definitions import executor_tool_handlers
@@ -195,6 +196,8 @@ class InProcessExecutorProvider:
             metadata=dict(config.metadata),
         )
         system_handlers = build_system_tool_handlers(self.session_factory, self.status_provider)
+        task_continuation_handlers = build_task_continuation_tool_handlers(self.session_factory)
+        system_handlers.update(task_continuation_handlers)
         native_handlers = executor_tool_handlers()
         mcp_clients: dict[str, MCPClient] = {}
         try:
@@ -236,7 +239,9 @@ class InProcessExecutorProvider:
                 registry,
                 CircuitBreaker(failure_threshold=5, recovery_timeout=30.0),
                 runtime_metadata,
-                internal_handlers={INTERNAL_PROJECT_CONTEXT_PROBE_TOOL: handle_project_context_probe},
+                internal_handlers={
+                    INTERNAL_PROJECT_CONTEXT_PROBE_TOOL: handle_project_context_probe
+                },
             )
         except TimeoutError:
             outcome = "timeout"
@@ -440,10 +445,14 @@ def _build_skill_handler(
         staging_dir = Path(tempfile.mkdtemp(prefix="cognis_skill_"))
         try:
             try:
+
                 async def _run() -> str:
                     proc: asyncio.subprocess.Process | None = None
                     runtime_artifact_store = artifact_store
-                    if runtime_artifact_store is None and context.shared_runtime_metadata is not None:
+                    if (
+                        runtime_artifact_store is None
+                        and context.shared_runtime_metadata is not None
+                    ):
                         runtime_artifact_store = context.shared_runtime_metadata.get(
                             "artifact_store"
                         )
@@ -481,7 +490,11 @@ def _build_skill_handler(
                             env[placeholder] = secrets[placeholder]
                     env["SKILL_STAGING_DIR"] = str(staging_dir)
 
-                    cwd = resolve_staged_path(staging_dir, working_dir) if working_dir else staging_dir
+                    cwd = (
+                        resolve_staged_path(staging_dir, working_dir)
+                        if working_dir
+                        else staging_dir
+                    )
 
                     if mode == "script":
                         script_path = resolve_staged_path(staging_dir, entry)

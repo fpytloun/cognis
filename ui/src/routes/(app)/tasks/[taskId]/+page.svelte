@@ -9,6 +9,7 @@ import ChevronUp from 'lucide-svelte/icons/chevron-up';
 import Clock3 from 'lucide-svelte/icons/clock-3';
 import GitBranch from 'lucide-svelte/icons/git-branch';
 import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+import MessageSquarePlus from 'lucide-svelte/icons/message-square-plus';
 import MoreVertical from 'lucide-svelte/icons/more-vertical';
 import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
 import PlayCircle from 'lucide-svelte/icons/play-circle';
@@ -49,6 +50,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   let loading = $state(true);
   let saving = $state(false);
   let rerunBusy = $state(false);
+  let chatBusyKey = $state<string | null>(null);
   let error = $state('');
   let task = $state<TaskDetail | null>(null);
   let agents = $state<Agent[]>([]);
@@ -589,6 +591,36 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     const stepRun = pickAttemptForStep(stepName);
     if (!stepRun) return;
     openSessionLogs(stepRun);
+  }
+
+  async function openTaskChat(): Promise<void> {
+    if (!task || chatBusyKey) return;
+    chatBusyKey = `task:${task.task_id}`;
+    try {
+      const result = await api.tasks.chat(task.task_id);
+      addToast('Opened a chat continuation for this task.', 'success');
+      await goto(`/chat/${result.conversation_id}`);
+    } catch (err) {
+      const apiError = asApiError(err);
+      addToast(apiError.message || 'Could not open task chat.', 'error');
+    } finally {
+      chatBusyKey = null;
+    }
+  }
+
+  async function openStepChat(stepRun: StepRun): Promise<void> {
+    if (!task || chatBusyKey) return;
+    chatBusyKey = `step:${stepRun.step_run_id}`;
+    try {
+      const result = await api.tasks.stepChat(task.task_id, stepRun.step_run_id);
+      addToast('Opened a chat continuation for this step.', 'success');
+      await goto(`/chat/${result.conversation_id}`);
+    } catch (err) {
+      const apiError = asApiError(err);
+      addToast(apiError.message || 'Could not open step chat.', 'error');
+    } finally {
+      chatBusyKey = null;
+    }
   }
 
   function openOutputModalForStep(stepName: string): void {
@@ -1325,6 +1357,14 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
             <Settings2 class="mr-1.5 h-3.5 w-3.5" />
             Configure
           </Button>
+          <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={openTaskChat}>
+            {#if chatBusyKey === `task:${task.task_id}`}
+              <LoaderCircle class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            {:else}
+              <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
+            {/if}
+            Chat about task
+          </Button>
           {#if isCancellable}
             <Button class="hidden lg:inline-flex" size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
           {/if}
@@ -1638,6 +1678,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                         </div>
                       </div>
                       <div class="flex items-center gap-2">
+                        {#if attempt.session_id || attempt.output?.session_id}
+                          <Button size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={() => openStepChat(attempt)}>
+                            {#if chatBusyKey === `step:${attempt.step_run_id}`}
+                              <LoaderCircle class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            {:else}
+                              <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
+                            {/if}
+                            Chat
+                          </Button>
+                        {/if}
                         {#if attempt.output?.session_id || attempt.session_id}
                           <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
                         {/if}
@@ -2116,9 +2166,19 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
           <div class="rounded-3xl border border-slate-800 bg-slate-900/60 p-4">
             <div class="flex items-center justify-between gap-3">
               <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-slate-600 text-slate-400'}">{visibleStatus}</span>
-              {#if attempt.output?.session_id || attempt.session_id}
-                <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
-              {/if}
+              <div class="flex items-center gap-2">
+                {#if attempt.output?.session_id || attempt.session_id}
+                  <Button size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={() => openStepChat(attempt)}>
+                    {#if chatBusyKey === `step:${attempt.step_run_id}`}
+                      <LoaderCircle class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    {:else}
+                      <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
+                    {/if}
+                    Chat
+                  </Button>
+                  <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
+                {/if}
+              </div>
             </div>
             {#if summary}
               <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html renderMarkdown(summary)}</div>

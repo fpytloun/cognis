@@ -36,14 +36,9 @@ from cognis.core.agent_loop import (
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.gate_conditions import evaluate_gate_conditions
-from cognis.core.immutable_prefix import (
-    PREFIX_EVENT_TYPES,
-    ImmutablePrefixEntry,
-    build_context_snapshot_event,
-    build_prefix_message_events,
-)
 from cognis.core.project_runtime import build_project_context_message
 from cognis.core.runtime import ResolvedStepRuntime
+from cognis.core.session_fork import fork_session_events
 from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
@@ -204,13 +199,20 @@ class WorkflowEngine:
             access_context=access_context,
         )
 
+        continuation_profile_id = None
+        platform_data = conversation.context.platform_data or {}
+        if platform_data.get("forked_from") == "task_step":
+            raw_profile_id = platform_data.get("step_profile_id")
+            if isinstance(raw_profile_id, str) and raw_profile_id.strip():
+                continuation_profile_id = raw_profile_id.strip()
+
         direct_step = StepDefinition(
             name="direct",
             type="run",
             prompt=user_message,
             allow_questions=True,
             # Keep the inline hot path, but apply the shipped direct-chat profile.
-            step_profile_id="system:direct-default",
+            step_profile_id=continuation_profile_id or "system:direct-default",
         )
         ctx = StepContext(
             step_definition=direct_step,
@@ -2553,153 +2555,16 @@ class WorkflowEngine:
         source_label: str,
     ) -> bool:
         """Copy events from one session into another session."""
-
-        from cognis.core.session_cache import CachedEvent
-
-        # Read source events — try session cache first, then Intaris
-        source_events: list[CachedEvent] = []
-        if source_cognis_session_id:
-            cache_entry = self._session_cache.get_entry(source_cognis_session_id)
-            if cache_entry is not None and cache_entry.initialized and cache_entry.events:
-                source_events = list(cache_entry.events)
-
-        if not source_events and source_intaris_session_id:
-            try:
-                event_read = await self._providers.guardrails.read_events(
-                    session_id=source_intaris_session_id,
-                    after_seq=0,
-                )
-                for raw_event in sorted(event_read.events, key=lambda e: int(e.get("seq", 0))):
-                    if str(raw_event.get("type") or "") in PREFIX_EVENT_TYPES:
-                        continue
-                    source_events.append(
-                        CachedEvent(
-                            seq=int(raw_event.get("seq", 0)),
-                            type=str(raw_event.get("type", "")),
-                            data=dict(raw_event.get("data", {})),
-                            source=raw_event.get("source"),
-                            ts=raw_event.get("ts"),
-                        )
-                    )
-            except Exception:
-                logger.warning(
-                    "workflow: failed to read source events for fork",
-                    extra={"extra_data": {"source_step": source_label}},
-                    exc_info=True,
-                )
-
-        if not source_events:
-            logger.debug(
-                "workflow: no source events to fork",
-                extra={"extra_data": {"source_step": source_label}},
-            )
-            return False
-
-        # Write source events to the new Intaris session
-        target_intaris_id = target_session.intaris_session_id or target_session.session_id
-        session_events = with_session_events_turn_id(
-            [SessionEvent(type=e.type, data=e.data) for e in source_events],
-            None,
+        return await fork_session_events(
+            providers=self._providers,
+            session_cache=self._session_cache,
+            source_cognis_session_id=source_cognis_session_id,
+            source_intaris_session_id=source_intaris_session_id,
+            target_session=target_session,
+            source_label=source_label,
+            snapshot_source="fork",
+            snapshot_extras={"source_step": source_label},
         )
-        try:
-            append_result = await self._providers.guardrails.record_events(
-                session_id=target_intaris_id,
-                events=session_events,
-                source="cognis:fork",
-            )
-            # Seed the session cache so context assembly doesn't need a cold load
-            await self._session_cache.seed_events(
-                target_session, source_events, append_result.last_seq
-            )
-            prefix_entries = self._session_cache.get_prefix_entries(source_cognis_session_id or "")
-            if prefix_entries:
-                message_events = build_prefix_message_events(
-                    [
-                        ImmutablePrefixEntry(
-                            role=entry.role,
-                            source=entry.source,
-                            content=entry.content,
-                        )
-                        for entry in prefix_entries
-                    ],
-                )
-                message_events = with_session_events_turn_id(message_events, None)
-                message_result = await self._providers.guardrails.record_events(
-                    session_id=target_intaris_id,
-                    events=message_events,
-                    source="cognis",
-                    idempotency_key=f"{target_session.session_id}:immutable_prefix:fork:messages",
-                )
-                if message_result.ok:
-                    resolved_entries = [
-                        ImmutablePrefixEntry(
-                            role=entry.role,
-                            source=entry.source,
-                            content=entry.content,
-                            seq=message_result.first_seq + index,
-                        )
-                        for index, entry in enumerate(prefix_entries)
-                    ]
-                    snapshot_event = build_context_snapshot_event(
-                        resolved_entries,
-                        snapshot_source="fork",
-                        extras={"source_step": source_label},
-                    )
-                    snapshot_events = with_session_events_turn_id([snapshot_event], None)
-                    snapshot_result = await self._providers.guardrails.record_events(
-                        session_id=target_intaris_id,
-                        events=snapshot_events,
-                        source="cognis",
-                        idempotency_key=f"{target_session.session_id}:immutable_prefix:fork:snapshot",
-                    )
-                else:
-                    snapshot_result = None
-                if snapshot_result is not None and snapshot_result.ok:
-                    await self._session_cache.append_recorded_events(
-                        target_session,
-                        message_events,
-                        message_result,
-                    )
-                    await self._session_cache.append_recorded_events(
-                        target_session,
-                        snapshot_events,
-                        snapshot_result,
-                    )
-                    await self._session_cache.store_prefix_snapshot(
-                        target_session.session_id,
-                        resolved_entries,
-                        snapshot_seq=snapshot_result.last_seq,
-                        snapshot_source="fork",
-                    )
-                elif snapshot_result is not None:
-                    logger.warning(
-                        "workflow: failed to persist fork snapshot event",
-                        extra={"extra_data": {"target_session": target_session.session_id}},
-                    )
-                else:
-                    logger.warning(
-                        "workflow: failed to persist fork prefix messages",
-                        extra={"extra_data": {"target_session": target_session.session_id}},
-                    )
-            logger.info(
-                "workflow: forked source events into step session",
-                extra={
-                    "extra_data": {
-                        "source_step": source_label,
-                        "target_session": target_session.session_id,
-                        "event_count": len(source_events),
-                        "last_seq": append_result.last_seq,
-                    }
-                },
-            )
-            return True
-        except Exception:
-            logger.warning(
-                "workflow: failed to fork source events into step session",
-                extra={"extra_data": {"source_step": source_label}},
-                exc_info=True,
-            )
-            return False
 
     async def _resolve_step_runtime(
         self,

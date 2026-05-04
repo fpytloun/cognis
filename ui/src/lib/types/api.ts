@@ -1007,6 +1007,11 @@ export interface TaskRerunResponse {
   created_new: boolean;
 }
 
+export interface TaskChatResponse {
+  conversation_id: string;
+  session_id: string;
+}
+
 export interface WorkflowStep {
   name: string;
   type: string;

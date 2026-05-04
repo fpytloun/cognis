@@ -15,11 +15,13 @@ from cognis.core.immutable_prefix import (
     build_context_snapshot_event,
     build_prefix_message_events,
 )
+from cognis.core.session_fork import fork_session_events
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
+    SessionEvent,
     SessionModel,
     SessionStatus,
     with_session_events_turn_id,
@@ -329,6 +331,62 @@ class SessionManager:
         conversation.active_session_id = session_row.session_id
         session_row.intaris_session_id = session_row.session_id
         return _to_conversation_model(conversation), _to_session_model(session_row)
+
+    async def fork_into_new_conversation(
+        self,
+        *,
+        source_session: SessionModel,
+        source_conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+        title: str | None = None,
+        intention: str | None = None,
+        context: ConversationContext | None = None,
+        extra_prefix_entries: list[ImmutablePrefixEntry] | None = None,
+        extra_history_events: list[SessionEvent] | None = None,
+        snapshot_extras: dict[str, Any] | None = None,
+    ) -> tuple[ConversationModel, SessionModel, bool]:
+        """Fork a source session into a new web conversation."""
+
+        fork_context = context or ConversationContext(
+            type="web",
+            ref=None,
+            platform_data={
+                "forked_from": "conversation",
+                "forked_from_conversation_id": source_conversation.conversation_id,
+                "forked_from_session_id": source_session.session_id,
+            },
+            memory_labels=dict(source_conversation.context.memory_labels),
+        )
+        fork_title = title or (
+            f"Fork: {source_conversation.title}" if source_conversation.title else "Forked chat"
+        )
+        conversation, session = await self.create_conversation_with_root_session(
+            user_email=user_email,
+            agent_id=agent.agent_id,
+            context=fork_context,
+            title=fork_title,
+            title_source="manual",
+            intention=intention or source_session.result_summary or fork_title,
+        )
+        copied = await fork_session_events(
+            providers=self.providers,
+            session_cache=self.session_cache,
+            source_cognis_session_id=source_session.session_id,
+            source_intaris_session_id=source_session.intaris_session_id
+            or source_session.session_id,
+            target_session=session,
+            source_label="conversation_fork",
+            snapshot_source="fork",
+            snapshot_extras={
+                "forked_from_conversation_id": source_conversation.conversation_id,
+                "forked_from_session_id": source_session.session_id,
+                **(snapshot_extras or {}),
+            },
+            extra_prefix_entries=extra_prefix_entries,
+            extra_history_events=extra_history_events,
+        )
+        return conversation, session, copied
 
     async def create_child_session(
         self,
@@ -670,7 +728,9 @@ class SessionManager:
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
-                    agent_owner_email=(await self._require_agent(db_session, current_session.agent_id)).owner_email,
+                    agent_owner_email=(
+                        await self._require_agent(db_session, current_session.agent_id)
+                    ).owner_email,
                 ):
                     await self.providers.guardrails.create_session(
                         session_id=new_session_row.session_id,

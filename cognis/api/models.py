@@ -708,6 +708,11 @@ class TaskActionResponse(BaseModel):
     status: str
 
 
+class TaskChatResponse(BaseModel):
+    conversation_id: str
+    session_id: str
+
+
 class TaskRerunResponse(BaseModel):
     ok: bool
     source_task_id: str
