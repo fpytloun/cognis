@@ -532,9 +532,11 @@ def test_events_to_messages_replays_historic_assistant_image_natively() -> None:
     )
 
     assert messages[0]["role"] == "assistant"
-    content = messages[0]["content"]
+    assert "<assistant_attachments>" in messages[0]["content"]
+    assert messages[1]["role"] == "user"
+    content = messages[1]["content"]
     assert isinstance(content, list)
-    assert "<assistant_attachments>" in content[0]["text"]
+    assert "Assistant attached" in content[0]["text"]
     assert content[1] == {
         "type": "image_url",
         "image_url": {"url": "https://cognis.example.com/artifacts/img_1/banner.png"},

@@ -76,15 +76,15 @@ def test_corrected_full_object_replaces_invalid_partial_payload() -> None:
     acc = StreamAccumulator()
     _feed_tool_delta(
         acc,
-        '{"todos":[content":"Find the Lumilens Todoist project and appropriate section",'
+        '{"todos":[content":"Find the Cognis Todoist project and appropriate section",'
         '"status":"in_progress"}]}',
         name="step_todo_write",
     )
     _feed_tool_delta(
         acc,
-        '{"todos":[{"content":"Find the Lumilens Todoist project and appropriate section",'
+        '{"todos":[{"content":"Find the Cognis Todoist project and appropriate section",'
         '"status":"in_progress"},{"content":"Create the Todoist task for Monday in '
-        'the Lumilens project","status":"pending"}]}',
+        'the Cognis project","status":"pending"}]}',
         name="step_todo_write",
     )
     calls = acc.get_tool_calls()
@@ -93,11 +93,11 @@ def test_corrected_full_object_replaces_invalid_partial_payload() -> None:
     assert calls[0].arguments == {
         "todos": [
             {
-                "content": "Find the Lumilens Todoist project and appropriate section",
+                "content": "Find the Cognis Todoist project and appropriate section",
                 "status": "in_progress",
             },
             {
-                "content": "Create the Todoist task for Monday in the Lumilens project",
+                "content": "Create the Todoist task for Monday in the Cognis project",
                 "status": "pending",
             },
         ]

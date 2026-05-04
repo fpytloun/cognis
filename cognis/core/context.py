@@ -2101,14 +2101,19 @@ def events_to_messages(
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
                 if isinstance(attachments, list) and attachments:
+                    safe_attachments = [a for a in attachments[:20] if isinstance(a, dict)]
+                    assistant_context = _assistant_attachment_context(safe_attachments)
                     messages.append(
-                        _attachment_content_message(
-                            role="assistant",
-                            content=content,
-                            attachments=[a for a in attachments[:20] if isinstance(a, dict)],
-                            model_info=model_info,
-                        )
+                        {"role": "assistant", "content": f"{content}\n\n{assistant_context}"}
                     )
+                    native_context = _attachment_content_message(
+                        role="user",
+                        content="Assistant attached the following artifacts in the previous message.",
+                        attachments=safe_attachments,
+                        model_info=model_info,
+                    )
+                    if isinstance(native_context.get("content"), list):
+                        messages.append(native_context)
                 else:
                     messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
@@ -2299,6 +2304,21 @@ def _current_user_message_already_in_history(
     # Exact match (no attachment note appended during the original
     # recording).
     if normalized_history == user_message.strip():
+        return True
+
+    # Attachment-only current turn: user sent attachment(s) with no message
+    # text (or only a placeholder like "User attached an image file.").
+    # In that case the recording appended an attachment note as the sole
+    # content, so an empty or placeholder user_message matches the tail.
+    current_is_attachment_only = user_attachments and (
+        not user_message.strip()
+        or _looks_like_attachment_note_suffix(user_message.strip())
+        or user_message.strip().startswith("User attached ")
+    )
+    if current_is_attachment_only and (
+        normalized_history.startswith("User attached ")
+        or _looks_like_attachment_note_suffix(normalized_history)
+    ):
         return True
 
     # Match when an attachment note was appended during recording

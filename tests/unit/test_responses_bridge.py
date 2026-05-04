@@ -822,11 +822,11 @@ async def test_responses_stream_recovers_trailing_valid_object_suffix() -> None:
                 "call_id": "call_suffix",
                 "name": "step_todo_write",
                 "arguments": (
-                    '{"todos":[content":"Find the Lumilens Todoist project and '
+                    '{"todos":[content":"Find the Cognis Todoist project and '
                     'appropriate section","status":"in_progress"}]}'
-                    '{"todos":[{"content":"Find the Lumilens Todoist project and '
+                    '{"todos":[{"content":"Find the Cognis Todoist project and '
                     'appropriate section","status":"in_progress"},{"content":'
-                    '"Create the Todoist task for Monday in the Lumilens project",'
+                    '"Create the Todoist task for Monday in the Cognis project",'
                     '"status":"pending"}]}'
                 ),
             },
@@ -846,11 +846,11 @@ async def test_responses_stream_recovers_trailing_valid_object_suffix() -> None:
     assert calls[0].arguments == {
         "todos": [
             {
-                "content": "Find the Lumilens Todoist project and appropriate section",
+                "content": "Find the Cognis Todoist project and appropriate section",
                 "status": "in_progress",
             },
             {
-                "content": "Create the Todoist task for Monday in the Lumilens project",
+                "content": "Create the Todoist task for Monday in the Cognis project",
                 "status": "pending",
             },
         ]
