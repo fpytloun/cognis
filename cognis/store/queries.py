@@ -52,6 +52,7 @@ from cognis.store.models import (
     TaskDependency,
     ToolClassificationOverrideRow,
     ToolClassificationRow,
+    TtsCacheRow,
     User,
     WorkflowRow,
 )
@@ -4932,3 +4933,88 @@ async def expire_stale_pairing_requests(
         .values(status="expired")
     )
     return int(result.rowcount or 0)
+
+
+# --- TTS cache ---
+
+
+async def get_tts_cache_entry(
+    session: AsyncSession,
+    *,
+    message_id: str,
+    voice: str,
+    model: str,
+) -> TtsCacheRow | None:
+    """Look up a cached TTS audio entry by ``(message_id, voice, model)``."""
+    result = await session.execute(
+        select(TtsCacheRow).where(
+            TtsCacheRow.message_id == message_id,
+            TtsCacheRow.voice == voice,
+            TtsCacheRow.model == model,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def insert_tts_cache_entry(
+    session: AsyncSession,
+    *,
+    message_id: str,
+    voice: str,
+    model: str,
+    artifact_id: str,
+    artifact_filename: str,
+    content_type: str,
+    owner_email: str | None,
+    duration_seconds: float | None,
+    size_bytes: int,
+) -> TtsCacheRow:
+    """Insert (or replace) a TTS cache row."""
+    existing = await get_tts_cache_entry(
+        session, message_id=message_id, voice=voice, model=model
+    )
+    if existing is not None:
+        existing.artifact_id = artifact_id
+        existing.artifact_filename = artifact_filename
+        existing.content_type = content_type
+        existing.owner_email = owner_email
+        existing.duration_seconds = duration_seconds
+        existing.size_bytes = size_bytes
+        existing.created_at = _utcnow()
+        await session.flush()
+        return existing
+    row = TtsCacheRow(
+        message_id=message_id,
+        voice=voice,
+        model=model,
+        artifact_id=artifact_id,
+        artifact_filename=artifact_filename,
+        content_type=content_type,
+        owner_email=owner_email,
+        duration_seconds=duration_seconds,
+        size_bytes=size_bytes,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def delete_expired_tts_cache_entries(
+    session: AsyncSession,
+    *,
+    older_than: datetime,
+) -> list[TtsCacheRow]:
+    """Return cache rows older than ``older_than`` and delete them.
+
+    The artifact rows themselves are removed by the caller — this just
+    returns the cache metadata so the artifact store can clean up the
+    underlying blobs.
+    """
+    result = await session.execute(
+        select(TtsCacheRow).where(TtsCacheRow.created_at < older_than)
+    )
+    rows = list(result.scalars().all())
+    for row in rows:
+        await session.delete(row)
+    await session.flush()
+    return rows

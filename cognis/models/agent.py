@@ -125,6 +125,7 @@ class AgentLLMConfig(BaseModel):
     max_tokens: int | None = None
     reasoning_effort: str | None = None
     model_routing: dict[str, str] | None = None
+    voice: str | None = None  # Per-agent TTS voice override
 
     @field_validator("reasoning_effort")
     @classmethod

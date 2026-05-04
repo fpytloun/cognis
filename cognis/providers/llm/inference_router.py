@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from cognis.core.executor_resolution import labels_match
-from cognis.models.config import ImageGenerationResult, SpeechToTextResult
+from cognis.models.config import ImageGenerationResult, SpeechToTextResult, TextToSpeechResult
 from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
 
@@ -203,6 +203,58 @@ class InferenceRouter:
             return SpeechToTextResult.model_validate(result)
         except ExecutorDisconnectedError:
             raise RuntimeError("Executor disconnected during speech-to-text") from None
+
+    async def route_synthesize(
+        self,
+        *,
+        text: str,
+        voice: str,
+        model: str,
+        provider_preset: str | None = None,
+        executor_labels: dict[str, str] | None = None,
+        response_format: str = "mp3",
+        speed: float = 1.0,
+        request_kwargs: dict[str, Any] | None = None,
+    ) -> TextToSpeechResult:
+        conn = await self._find_executor(executor_labels)
+        if conn is None:
+            raise RuntimeError("No executor matches the provider selector for text-to-speech")
+
+        try:
+            result = await conn.rpc_call(
+                method="llm.synthesize",
+                params={
+                    "request_id": uuid.uuid4().hex,
+                    "text": text,
+                    "voice": voice,
+                    "model": model,
+                    "provider_preset": provider_preset,
+                    "response_format": response_format,
+                    "speed": speed,
+                    "request_kwargs": request_kwargs or {},
+                },
+            )
+        except ExecutorDisconnectedError:
+            raise RuntimeError("Executor disconnected during text-to-speech") from None
+
+        encoded = result.get("audio_hex") or result.get("audio_base64")
+        encoding = result.get("audio_encoding", "hex")
+        if not isinstance(encoded, str):
+            raise RuntimeError("Text-to-speech executor returned no audio payload")
+        if encoding != "hex":
+            raise RuntimeError(f"Text-to-speech executor used unsupported encoding {encoding!r}")
+        audio_bytes = bytes.fromhex(encoded)
+        return TextToSpeechResult(
+            audio_bytes=audio_bytes,
+            content_type=str(result.get("content_type", "audio/mpeg")),
+            model=str(result.get("model", model)),
+            voice=str(result.get("voice", voice)),
+            duration_seconds=(
+                float(result["duration_seconds"])
+                if isinstance(result.get("duration_seconds"), int | float)
+                else None
+            ),
+        )
 
     async def _find_executor(self, executor_labels: dict[str, str] | None) -> Any | None:
         active = await self._ws_provider.list_active()

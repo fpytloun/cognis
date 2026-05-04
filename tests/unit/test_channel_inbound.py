@@ -341,7 +341,7 @@ def test_stt_supported_audio_mime_types_uses_model_metadata() -> None:
 async def test_prepare_audio_for_stt_requires_ffmpeg_for_aac(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("cognis.channels.inbound.shutil.which", lambda _: None)
+    monkeypatch.setattr("cognis.audio.preprocessing.shutil.which", lambda _: None)
 
     with pytest.raises(RuntimeError, match="ffmpeg"):
         await _prepare_audio_for_stt(
@@ -361,7 +361,7 @@ async def test_prepare_audio_for_stt_transcodes_when_policy_excludes_mime(
         assert filename == "voice.aac"
         return b"wav-bytes", "audio/wav", "voice-input.wav"
 
-    monkeypatch.setattr("cognis.channels.inbound._transcode_audio_for_stt", fake_transcode)
+    monkeypatch.setattr("cognis.audio.preprocessing.transcode_audio_for_stt", fake_transcode)
 
     content, mime_type, filename = await _prepare_audio_for_stt(
         b"audio-bytes",

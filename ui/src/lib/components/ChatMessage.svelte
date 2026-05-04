@@ -1,12 +1,16 @@
 <script lang="ts">
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
+  import Square from 'lucide-svelte/icons/square';
+  import Volume2 from 'lucide-svelte/icons/volume-2';
   import { onMount } from 'svelte';
+  import { api } from '$lib/api/client';
   import type { MessageTimelineItem } from '$lib/chat';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import { audioPlayer } from '$lib/stores/audio-player';
   import { addToast } from '$lib/stores/toasts';
   import { now as nowStore } from '$lib/stores/now';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
@@ -89,6 +93,39 @@
       }, 2000);
     } catch {
       addToast('Failed to copy message', 'error');
+    }
+  }
+
+  // ---- TTS speaker button -------------------------------------------------
+
+  const ttsKey = $derived(item.messageId ?? `local:${item.timestamp}`);
+  const audioState = $derived($audioPlayer);
+  const isSpeakingThis = $derived(
+    audioState.currentKey === ttsKey && (audioState.isPlaying || audioState.isLoading)
+  );
+
+  let ttsBusy = $state(false);
+
+  async function toggleSpeak(): Promise<void> {
+    if (audioPlayer.isCurrent(ttsKey)) {
+      audioPlayer.stop();
+      return;
+    }
+    if (ttsBusy) return;
+    if (!item.content || !item.content.trim()) return;
+    ttsBusy = true;
+    try {
+      const result = await api.tts.synthesize({
+        text: item.content,
+        message_id: item.messageId ?? null,
+        agent_id: agent?.agent_id ?? null
+      });
+      await audioPlayer.play(ttsKey, result.audio_url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to read message aloud';
+      addToast(message, 'error', 4_000, 'Text-to-speech failed');
+    } finally {
+      ttsBusy = false;
     }
   }
 
@@ -276,6 +313,21 @@
             <span class="sr-only">Streaming</span>
           {/if}
           {#if !item.streaming}
+            <button
+              class="copy-icon-button"
+              onclick={toggleSpeak}
+              type="button"
+              title={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+              aria-label={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+              aria-pressed={isSpeakingThis}
+              disabled={ttsBusy && !isSpeakingThis}
+            >
+              {#if isSpeakingThis}
+                <Square />
+              {:else}
+                <Volume2 />
+              {/if}
+            </button>
             <button
               class="copy-icon-button"
               onclick={copyMessage}

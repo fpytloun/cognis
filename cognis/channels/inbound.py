@@ -12,17 +12,27 @@ Handles the flow from a normalized ``InboundMessage`` to a
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import inspect
 import os
-import shutil
-import tempfile
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.audio.preprocessing import (  # noqa: F401 — re-exported for back-compat
+    STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES as _STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES,
+)
+from cognis.audio.preprocessing import _stt_passthrough_target  # noqa: F401 — re-exported for tests
+from cognis.audio.preprocessing import (  # noqa: F401 — re-exported for back-compat
+    normalized_audio_filename as _normalized_audio_filename,
+)
+from cognis.audio.preprocessing import prepare_audio_for_stt as _prepare_audio_for_stt
+from cognis.audio.preprocessing import (
+    stt_supported_audio_mime_types as _stt_supported_audio_mime_types,
+)
+from cognis.audio.preprocessing import (  # noqa: F401 — re-exported for back-compat
+    transcode_audio_for_stt as _transcode_audio_for_stt,
+)
 from cognis.channels.delivery import _append_attachment_fallback, prepare_media_attachments
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
 from cognis.core.attachment_utils import attachment_placeholder_text
@@ -47,31 +57,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
-
-_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES = {
-    "audio/mpeg": ("audio/mpeg", ".mp3"),
-    "audio/mp3": ("audio/mpeg", ".mp3"),
-    "audio/mp4": ("audio/mp4", ".m4a"),
-    "audio/x-m4a": ("audio/mp4", ".m4a"),
-    "audio/wav": ("audio/wav", ".wav"),
-    "audio/x-wav": ("audio/wav", ".wav"),
-    "audio/webm": ("audio/webm", ".webm"),
-    "audio/ogg": ("audio/ogg", ".ogg"),
-    "audio/oga": ("audio/ogg", ".oga"),
-    "audio/flac": ("audio/flac", ".flac"),
-}
-
-_STT_AUDIO_EXTENSION_BY_MIME = {
-    **_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES,
-    "audio/aac": ("audio/aac", ".aac"),
-    "audio/x-aac": ("audio/aac", ".aac"),
-    "audio/opus": ("audio/opus", ".opus"),
-    "audio/x-opus": ("audio/opus", ".opus"),
-    "audio/amr": ("audio/amr", ".amr"),
-}
-
-_STT_TRANSCODE_TARGET_MIME = "audio/wav"
-_STT_TRANSCODE_TARGET_EXTENSION = ".wav"
 
 
 def _fallback_attachment_content(
@@ -108,118 +93,6 @@ def _filter_turn_attachments_for_voice_input(
     if not bool(message.platform_data.get("voice_input")):
         return attachments
     return [attachment for attachment in attachments if attachment.kind != ArtifactKind.AUDIO]
-
-
-def _normalized_audio_filename(filename: str, default_stem: str = "attachment") -> str:
-    candidate = Path(filename).name if filename else default_stem
-    if candidate:
-        return candidate
-    return default_stem
-
-
-def _stt_supported_audio_mime_types(
-    *,
-    model: str | None = None,
-    model_info: Any | None = None,
-) -> list[str]:
-    configured = getattr(model_info, "supported_audio_mime_types", None)
-    if isinstance(configured, list) and configured:
-        return [str(item).strip().lower() for item in configured if str(item).strip()]
-    return sorted(_STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES)
-
-
-def _stt_passthrough_target(
-    mime_type: str,
-    filename: str,
-    *,
-    supported_mime_types: list[str] | None = None,
-) -> tuple[str, str] | None:
-    supported = {item.strip().lower() for item in (supported_mime_types or []) if item.strip()}
-    supported_map = (
-        {
-            mime: _STT_AUDIO_EXTENSION_BY_MIME.get(mime, (mime, Path(filename).suffix or ".bin"))
-            for mime in supported
-        }
-        if supported
-        else _STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES
-    )
-    normalized = supported_map.get(mime_type.lower())
-    if normalized is None:
-        return None
-    normalized_mime, extension = normalized
-    path = Path(_normalized_audio_filename(filename))
-    if path.suffix.lower() == extension:
-        return normalized_mime, path.name
-    return normalized_mime, f"{path.stem or 'attachment'}{extension}"
-
-
-async def _transcode_audio_for_stt(
-    content: bytes,
-    *,
-    mime_type: str,
-    filename: str,
-) -> tuple[bytes, str, str]:
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        logger.warning(
-            "channel inbound: ffmpeg required for voice transcription but unavailable",
-            extra={"extra_data": {"mime_type": mime_type, "filename": filename}},
-        )
-        raise RuntimeError(
-            "I couldn't transcribe that voice message because its audio format requires ffmpeg conversion "
-            "and ffmpeg is not installed on the host. Install ffmpeg or send MP3/M4A/WAV/OGG/WebM audio."
-        )
-
-    input_suffix = Path(filename).suffix or ".bin"
-    with tempfile.TemporaryDirectory(prefix="cognis_stt_") as tmp_dir:
-        input_path = Path(tmp_dir) / f"input{input_suffix}"
-        output_path = Path(tmp_dir) / f"output{_STT_TRANSCODE_TARGET_EXTENSION}"
-        input_path.write_bytes(content)
-        proc = await asyncio.create_subprocess_exec(
-            ffmpeg,
-            "-y",
-            "-i",
-            str(input_path),
-            str(output_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0 or not output_path.exists():
-            logger.warning(
-                "channel inbound: ffmpeg failed to normalize voice audio",
-                extra={
-                    "extra_data": {
-                        "mime_type": mime_type,
-                        "filename": filename,
-                        "returncode": proc.returncode,
-                    }
-                },
-            )
-            detail = stderr.decode(errors="replace").strip()
-            raise RuntimeError(
-                "I couldn't transcribe that voice message because its audio format could not be converted "
-                f"with ffmpeg. {detail[:200]}"
-            )
-        return output_path.read_bytes(), _STT_TRANSCODE_TARGET_MIME, "voice-input.wav"
-
-
-async def _prepare_audio_for_stt(
-    content: bytes,
-    *,
-    mime_type: str,
-    filename: str,
-    supported_mime_types: list[str] | None = None,
-) -> tuple[bytes, str, str]:
-    passthrough = _stt_passthrough_target(
-        mime_type,
-        filename,
-        supported_mime_types=supported_mime_types,
-    )
-    if passthrough is not None:
-        normalized_mime, normalized_filename = passthrough
-        return content, normalized_mime, normalized_filename
-    return await _transcode_audio_for_stt(content, mime_type=mime_type, filename=filename)
 
 
 class InboundPipeline:

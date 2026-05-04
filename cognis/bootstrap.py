@@ -85,6 +85,9 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "web.rate_limit.searxng_qps": ("web", 5.0),
     "executors.allow_in_process": ("executors", True),
     "executors.allow_subprocess": ("executors", True),
+    "tts.enabled": ("tts", True),
+    "tts.default_voice": ("tts", "alloy"),
+    "tts.cache_ttl_days": ("tts", 30),
 }
 
 _BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = list(SYSTEM_SKILL_DEFAULTS.values())
@@ -237,6 +240,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_project_links_workflows_grants)
         await conn.run_sync(_ensure_step_history_columns)
         await conn.run_sync(_ensure_task_comments_table)
+        await conn.run_sync(_ensure_tts_cache_table)
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -397,6 +401,14 @@ def _ensure_task_comments_table(sync_conn: object) -> None:
     from cognis.store.models import TaskCommentRow
 
     TaskCommentRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_tts_cache_table(sync_conn: object) -> None:
+    """Create the TTS audio cache metadata table."""
+
+    from cognis.store.models import TtsCacheRow
+
+    TtsCacheRow.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_agent_grants_table(sync_conn: object) -> None:

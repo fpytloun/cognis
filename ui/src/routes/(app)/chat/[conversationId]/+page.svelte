@@ -15,6 +15,7 @@ import ChevronUp from 'lucide-svelte/icons/chevron-up';
 import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Copy from 'lucide-svelte/icons/copy';
+import Headphones from 'lucide-svelte/icons/headphones';
 import Info from 'lucide-svelte/icons/info';
 import ListPlus from 'lucide-svelte/icons/list-plus';
 import Menu from 'lucide-svelte/icons/menu';
@@ -29,6 +30,8 @@ import X from 'lucide-svelte/icons/x';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
+  import ConversationMode from '$lib/components/ConversationMode.svelte';
+  import MicRecorderButton from '$lib/components/MicRecorderButton.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
@@ -111,6 +114,7 @@ import X from 'lucide-svelte/icons/x';
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
+  let conversationModeOpen = $state(false);
 
   // Composer drafts persist across tab switches (per conversation) via
   // sessionStorage. A single draft key is kept up to date with the
@@ -1864,10 +1868,45 @@ import X from 'lucide-svelte/icons/x';
     composerElement?.focus();
   }
 
+  async function transcribeVoiceRecording(attachment: AttachmentRef): Promise<string> {
+    const result = await api.stt.transcribeArtifact(attachment.artifact_id);
+    return result.text.trim();
+  }
+
   async function handleSend(): Promise<void> {
-    const content = composer.trim();
+    let content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
+
+    // STT-first: transcribe any voice recordings, replace the composer body
+    // with (or append to) the transcript, and drop the audio from the
+    // outgoing turn payload. Matches the channel inbound behavior.
+    const voiceRecordings = composerAttachments.filter((a) => a.voice_recording);
+    if (voiceRecordings.length > 0) {
+      try {
+        const transcripts: string[] = [];
+        for (const recording of voiceRecordings) {
+          const text = await transcribeVoiceRecording(recording);
+          if (text) transcripts.push(text);
+        }
+        const transcript = transcripts.join(' ').trim();
+        if (transcript) {
+          content = content ? `${content}\n\n${transcript}` : transcript;
+        }
+        composerAttachments = composerAttachments.filter((a) => !a.voice_recording);
+        for (const recording of voiceRecordings) {
+          if (recording.blob_url) URL.revokeObjectURL(recording.blob_url);
+        }
+        if (!content && composerAttachments.length === 0) {
+          addToast("Couldn't transcribe the recording. Try again or type a message.", 'error');
+          return;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Transcription failed';
+        addToast(message, 'error', 4_000, 'Voice transcription failed');
+        return;
+      }
+    }
 
     const normalizedSlashCommand = normalizeSlashCommandInput(content);
     const isSlashCommand = isSystemSlashCommand(content);
@@ -3127,6 +3166,16 @@ import X from 'lucide-svelte/icons/x';
           <div class="flex items-center gap-2">
             <button
               class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
+              onclick={() => { conversationModeOpen = true; }}
+              type="button"
+              title="Conversation mode"
+              aria-label="Open conversation mode"
+              disabled={!currentConversation || isReadOnly(currentConversation)}
+            >
+              <Headphones class="h-4 w-4" />
+            </button>
+            <button
+              class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
               onclick={toggleHeaderInfo}
               type="button"
               title="Session details"
@@ -3660,6 +3709,12 @@ import X from 'lucide-svelte/icons/x';
                   }}
                 />
               </label>
+              <MicRecorderButton
+                disabled={directQuestionSubmitting || !currentConversation || isReadOnly(currentConversation)}
+                onrecorded={(attachment) => {
+                  composerAttachments = [...composerAttachments, attachment];
+                }}
+              />
               <textarea
                 bind:this={composerElement}
                 bind:value={composer}
@@ -3826,6 +3881,37 @@ import X from 'lucide-svelte/icons/x';
     </section>
   </div>
 {/if}
+
+<ConversationMode
+  open={conversationModeOpen}
+  conversationId={currentConversation?.conversation_id ?? ''}
+  agent={currentConversation ? (conversationAgent(currentConversation) ?? null) : null}
+  onclose={() => { conversationModeOpen = false; }}
+  sendEnableTts={(voice) => wsClient.enableTts(voice)}
+  sendDisableTts={() => wsClient.disableTts()}
+  submitText={(text) => {
+    if (!currentConversation) return;
+    wsClient.sendMessage(currentConversation.conversation_id, text, []);
+  }}
+  subscribeSentenceReady={(handler) => {
+    return wsClient.subscribe((event) => {
+      if (event.type === 'tts_sentence_ready' && currentConversation && event.conversation_id === currentConversation.conversation_id) {
+        handler({
+          message_id: event.message_id,
+          sentence_index: event.sentence_index,
+          text: event.text,
+        });
+      }
+    });
+  }}
+  subscribeMessageComplete={(handler) => {
+    return wsClient.subscribe((event) => {
+      if (event.type === 'message_complete' && currentConversation && event.conversation_id === currentConversation.conversation_id) {
+        handler();
+      }
+    });
+  }}
+/>
 
 <style>
   @keyframes slide-in-right {

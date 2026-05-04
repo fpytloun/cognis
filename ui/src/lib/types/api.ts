@@ -183,6 +183,19 @@ export interface AttachmentRef {
   filename: string;
   size_bytes: number;
   url?: string | null;
+  /**
+   * Optional metadata used by the composer for voice recordings to render an
+   * inline audio player. Server-side AttachmentRef does not include this; it
+   * is populated only on the client during the iMessage-style record flow.
+   */
+  duration_seconds?: number | null;
+  /** Local Blob URL for client-side playback before send. */
+  blob_url?: string | null;
+  /**
+   * Marks the attachment as a voice recording so the composer transcribes it
+   * before sending and strips it from the outgoing turn payload.
+   */
+  voice_recording?: boolean;
 }
 
 export interface FileDiff {
@@ -1225,8 +1238,34 @@ export interface ModelRouting {
   compaction: ModelRoutingEntry;
   evaluator: ModelRoutingEntry;
   speech_to_text: ModelRoutingEntry;
+  text_to_speech: ModelRoutingEntry;
   image_generation: ModelRoutingEntry;
   attachment_analysis: ModelRoutingEntry;
+}
+
+export interface TtsSynthesizeRequest {
+  text: string;
+  message_id?: string | null;
+  agent_id?: string | null;
+  voice?: string | null;
+  format?: string;
+  speed?: number;
+}
+
+export interface TtsSynthesizeResponse {
+  audio_url: string;
+  content_type: string;
+  duration_seconds: number | null;
+  voice: string;
+  model: string;
+  cached: boolean;
+}
+
+export interface SttTranscribeResponse {
+  text: string;
+  language: string | null;
+  duration_seconds: number | null;
+  model: string;
 }
 
 export interface SecretMetadata {
@@ -1834,5 +1873,14 @@ export type CognisWebSocketEvent =
   | WebSocketQueuedMessagesUpdatedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent
+  | WebSocketTtsSentenceReadyEvent
   | WebSocketErrorEvent
   | WebSocketPongEvent;
+
+export interface WebSocketTtsSentenceReadyEvent {
+  type: 'tts_sentence_ready';
+  conversation_id: string;
+  message_id: string;
+  sentence_index: number;
+  text: string;
+}

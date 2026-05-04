@@ -797,6 +797,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               {/each}
             </select>
           </label>
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Voice</span>
+            <Input bind:value={form.voice} placeholder="Use system default" disabled={!canEditField('llm_config.voice')} />
+            <span class="block text-xs text-slate-400">TTS voice for the speaker button and conversation mode (e.g. <code>alloy</code>, <code>nova</code>, an ElevenLabs voice ID). Leave empty to use the system default.</span>
+          </label>
         </div>
       </Card>
 

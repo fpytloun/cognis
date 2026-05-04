@@ -259,6 +259,9 @@ class ExecutorRunner:
             elif method == "llm.transcribe":
                 logger.debug("Received llm.transcribe")
                 asyncio.create_task(self._handle_llm_transcribe(ws, msg_id, params))
+            elif method == "llm.synthesize":
+                logger.debug("Received llm.synthesize")
+                asyncio.create_task(self._handle_llm_synthesize(ws, msg_id, params))
             elif method == "channel.start":
                 logger.info("Received channel.start for account %s", params.get("account_id", "?"))
                 asyncio.create_task(self._handle_channel_start(ws, msg_id, params))
@@ -896,6 +899,31 @@ class ExecutorRunner:
                 request_kwargs=request_kwargs,
                 prompt=params.get("prompt"),
                 language=params.get("language"),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_llm_synthesize(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._inference_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
+            return
+
+        try:
+            request_kwargs = dict(params.get("request_kwargs") or {})
+            speed = params.get("speed", 1.0)
+            if not isinstance(speed, int | float):
+                speed = 1.0
+            result = await self._inference_handler.synthesize(
+                text=str(params.get("text", "")),
+                voice=str(params.get("voice", "")),
+                model=str(params.get("model", "")),
+                provider_preset=params.get("provider_preset"),
+                response_format=str(params.get("response_format", "mp3")),
+                speed=float(speed),
+                request_kwargs=request_kwargs,
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:

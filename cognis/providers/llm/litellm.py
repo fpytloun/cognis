@@ -35,6 +35,7 @@ from cognis.models.config import (
     ModelInfo,
     ProviderHealth,
     SpeechToTextResult,
+    TextToSpeechResult,
     TokenUsage,
     normalize_reasoning_level,
 )
@@ -1187,7 +1188,12 @@ class LiteLLMProvider:
         provider_preset = str(dict(provider.config).get("preset", "")).lower()
         model_name = self._transcription_wire_model(resolved_model, provider_preset)
         model_info = await self.get_model_info(resolved_model, provider.provider_id)
-        from cognis.channels.inbound import _prepare_audio_for_stt, _stt_supported_audio_mime_types
+        from cognis.audio.preprocessing import (
+            prepare_audio_for_stt as _prepare_audio_for_stt,
+        )
+        from cognis.audio.preprocessing import (
+            stt_supported_audio_mime_types as _stt_supported_audio_mime_types,
+        )
 
         supported_audio_mime_types = _stt_supported_audio_mime_types(
             model=resolved_model,
@@ -1274,6 +1280,75 @@ class LiteLLMProvider:
             model=resolved_model,
             language=payload.get("language") if isinstance(payload.get("language"), str) else None,
             duration_seconds=float(duration) if isinstance(duration, int | float) else None,
+        )
+
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        voice: str,
+        model: str | None = None,
+        task_type: str = "text_to_speech",
+        response_format: str = "mp3",
+        speed: float = 1.0,
+    ) -> TextToSpeechResult:
+        """Synthesize speech via LiteLLM (OpenAI, ElevenLabs, Azure, etc.).
+
+        When the resolved provider has ``location="executor"`` the call is
+        routed through a matching remote executor; otherwise it is performed
+        locally via ``litellm.aspeech()`` with a direct-HTTP fallback for
+        backends LiteLLM does not yet support.
+        """
+        if not text or not text.strip():
+            raise ValueError("Text-to-speech requires non-empty text")
+        resolved_model, provider = await self._resolve_model_target(model, task_type=task_type)
+        if provider is None:
+            raise ValueError(f"No LLM provider found for synthesis model {resolved_model!r}")
+        provider_preset = str(dict(provider.config).get("preset", "")).lower()
+        wire_model = self._transcription_wire_model(resolved_model, provider_preset)
+        normalized_format = (response_format or "mp3").strip().lower()
+        if normalized_format not in {"mp3", "opus", "aac", "flac", "wav", "pcm"}:
+            normalized_format = "mp3"
+        logger.debug(
+            "llm: text-to-speech request prepared",
+            extra={
+                "extra_data": {
+                    "resolved_model": resolved_model,
+                    "wire_model": wire_model,
+                    "provider_preset": provider_preset,
+                    "voice": voice,
+                    "format": normalized_format,
+                    "executor_routed": self._should_route_to_executor(provider),
+                }
+            },
+        )
+        if self._should_route_to_executor(provider):
+            if self._inference_router is None:
+                raise RuntimeError("Text-to-speech executor routing is unavailable")
+            request_kwargs = await self._resolve_provider_kwargs(provider)
+            return await self._inference_router.route_synthesize(
+                text=text,
+                voice=voice,
+                model=wire_model,
+                provider_preset=provider_preset,
+                executor_labels=dict(provider.config).get("executor_labels"),
+                response_format=normalized_format,
+                speed=speed,
+                request_kwargs=request_kwargs,
+            )
+
+        request_kwargs = await self._resolve_provider_kwargs(provider)
+        return await _run_synthesize_local(
+            text=text,
+            voice=voice,
+            wire_model=wire_model,
+            response_format=normalized_format,
+            speed=speed,
+            request_kwargs=request_kwargs,
+            resolved_model=resolved_model,
+            provider_preset=provider_preset,
+            sanitize_http=self._sanitize_http_error_detail,
+            sanitize_general=self._sanitize_error_detail,
         )
 
     async def enrich_model_info(
@@ -3631,3 +3706,150 @@ class LiteLLMProvider:
             request_kwargs=request_kwargs,
         )
         return cast(ImageGenerationResult, result)
+
+
+# ---------------------------------------------------------------------------
+# Text-to-speech helpers (controller-side and executor-side share this)
+# ---------------------------------------------------------------------------
+
+
+_TTS_FORMAT_TO_CONTENT_TYPE: dict[str, str] = {
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm": "audio/pcm",
+}
+
+
+def _content_type_for_tts_format(format_name: str) -> str:
+    return _TTS_FORMAT_TO_CONTENT_TYPE.get(
+        format_name.strip().lower(), "application/octet-stream"
+    )
+
+
+async def _run_synthesize_local(
+    *,
+    text: str,
+    voice: str,
+    wire_model: str,
+    response_format: str,
+    speed: float,
+    request_kwargs: dict[str, Any],
+    resolved_model: str,
+    provider_preset: str,
+    sanitize_http: Any | None = None,
+    sanitize_general: Any | None = None,
+) -> TextToSpeechResult:
+    """Run a TTS call against an OpenAI-compatible endpoint.
+
+    Tries ``litellm.aspeech()`` first when available; falls back to direct
+    HTTP against ``/v1/audio/speech`` so providers that LiteLLM does not yet
+    abstract (or older LiteLLM versions) still work. Returns the audio bytes
+    and a content type derived from ``response_format``.
+    """
+    content_type = _content_type_for_tts_format(response_format)
+
+    aspeech = getattr(litellm, "aspeech", None)
+    if callable(aspeech):
+        try:
+            result = await aspeech(
+                model=wire_model,
+                input=text,
+                voice=voice,
+                response_format=response_format,
+                speed=speed,
+                api_key=request_kwargs.get("api_key"),
+                api_base=request_kwargs.get("api_base") or request_kwargs.get("base_url"),
+                timeout=request_kwargs.get("timeout", 120),
+            )
+            audio_bytes = _extract_tts_bytes(result)
+            if audio_bytes:
+                return TextToSpeechResult(
+                    audio_bytes=audio_bytes,
+                    content_type=content_type,
+                    model=resolved_model,
+                    voice=voice,
+                    duration_seconds=None,
+                )
+        except Exception as exc:  # noqa: BLE001 — fall back to direct HTTP
+            logger.debug(
+                "litellm.aspeech failed; falling back to direct HTTP",
+                extra={"extra_data": {"error": str(exc)[:200], "model": wire_model}},
+            )
+
+    # Direct HTTP fallback against an OpenAI-compatible /v1/audio/speech.
+    api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
+    if not isinstance(api_base, str) or not api_base:
+        api_base = "https://api.openai.com"
+    api_key = request_kwargs.get("api_key")
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if isinstance(api_key, str) and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    extra_headers = request_kwargs.get("extra_headers")
+    if isinstance(extra_headers, dict):
+        headers.update({str(key): str(value) for key, value in extra_headers.items()})
+
+    body = {
+        "model": wire_model,
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+        "speed": speed,
+    }
+    timeout = request_kwargs.get("timeout", 120)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{api_base.rstrip('/')}/v1/audio/speech",
+                headers=headers,
+                json=body,
+            )
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = sanitize_http(exc) if callable(sanitize_http) else str(exc)
+        raise RuntimeError(f"Text-to-speech request failed: {detail}") from exc
+    except Exception as exc:
+        detail = sanitize_general(exc) if callable(sanitize_general) else str(exc)
+        raise RuntimeError(f"Text-to-speech request failed: {detail}") from exc
+
+    audio_bytes = response.content
+    if not audio_bytes:
+        raise RuntimeError("Text-to-speech returned an empty audio payload")
+    response_content_type = response.headers.get("content-type")
+    if isinstance(response_content_type, str) and response_content_type.startswith("audio/"):
+        content_type = response_content_type.split(";", 1)[0].strip()
+    return TextToSpeechResult(
+        audio_bytes=audio_bytes,
+        content_type=content_type,
+        model=resolved_model,
+        voice=voice,
+        duration_seconds=None,
+    )
+
+
+def _extract_tts_bytes(result: Any) -> bytes:
+    """Pull bytes from a litellm aspeech result, accommodating SDK shapes."""
+    if isinstance(result, bytes | bytearray):
+        return bytes(result)
+    for attr in ("content", "audio_bytes"):
+        value = getattr(result, attr, None)
+        if isinstance(value, bytes | bytearray) and value:
+            return bytes(value)
+    read = getattr(result, "read", None)
+    if callable(read):
+        data = read()
+        if asyncio.iscoroutine(data):
+            data = asyncio.get_event_loop().run_until_complete(data)
+        if isinstance(data, bytes | bytearray):
+            return bytes(data)
+    iter_bytes = getattr(result, "iter_bytes", None)
+    if callable(iter_bytes):
+        chunks: list[bytes] = []
+        for chunk in iter_bytes():
+            if isinstance(chunk, bytes | bytearray):
+                chunks.append(bytes(chunk))
+        if chunks:
+            return b"".join(chunks)
+    return b""

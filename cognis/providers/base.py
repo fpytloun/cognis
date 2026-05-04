@@ -12,6 +12,7 @@ from cognis.models.config import (
     ModelInfo,
     ProviderHealth,
     SpeechToTextResult,
+    TextToSpeechResult,
     TokenUsage,
 )
 from cognis.models.session import (
@@ -269,6 +270,16 @@ class LLMProvider(Protocol):
         prompt: str | None = None,
         language: str | None = None,
     ) -> SpeechToTextResult: ...
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        voice: str,
+        model: str | None = None,
+        task_type: str = "text_to_speech",
+        response_format: str = "mp3",
+        speed: float = 1.0,
+    ) -> TextToSpeechResult: ...
     def count_tokens(self, text: str, model: str) -> int: ...
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int: ...
     async def list_models(self) -> list[dict[str, Any]]: ...

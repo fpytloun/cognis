@@ -67,6 +67,7 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "compaction",
     "evaluator",
     "speech_to_text",
+    "text_to_speech",
     "image_generation",
     "attachment_analysis",
 )
@@ -128,6 +129,21 @@ def _looks_like_transcription_model(model_name: str) -> bool:
     return any(token in normalized for token in ("transcribe", "whisper", "speech-to-text"))
 
 
+def _looks_like_tts_model(model_name: str) -> bool:
+    normalized = model_name.strip().lower().replace("_", "-")
+    return any(
+        token in normalized
+        for token in (
+            "tts",
+            "text-to-speech",
+            "speech-1",
+            "eleven",
+            "elevenlabs",
+            "piper",
+        )
+    )
+
+
 def _route_model_is_eligible(
     task_type: str,
     *,
@@ -138,6 +154,11 @@ def _route_model_is_eligible(
         display_name = getattr(model_info, "display_name", None)
         return _looks_like_transcription_model(model_id) or (
             isinstance(display_name, str) and _looks_like_transcription_model(display_name)
+        )
+    if task_type == "text_to_speech":
+        display_name = getattr(model_info, "display_name", None)
+        return _looks_like_tts_model(model_id) or (
+            isinstance(display_name, str) and _looks_like_tts_model(display_name)
         )
     if task_type == "image_generation":
         return bool(getattr(model_info, "supports_image_generation", False))
@@ -836,6 +857,9 @@ async def model_routing_get(request: Request) -> ModelRoutingResponse:
         evaluator=_routing_entry_from_row("evaluator", route_by_task.get("evaluator")),
         speech_to_text=_routing_entry_from_row(
             "speech_to_text", route_by_task.get("speech_to_text")
+        ),
+        text_to_speech=_routing_entry_from_row(
+            "text_to_speech", route_by_task.get("text_to_speech")
         ),
         image_generation=_routing_entry_from_row(
             "image_generation", route_by_task.get("image_generation")

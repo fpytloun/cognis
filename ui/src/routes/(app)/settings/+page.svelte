@@ -93,7 +93,7 @@ import { onMount, tick } from 'svelte';
     system: 'system',
     account: 'account'
   };
-  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'image_generation', 'attachment_analysis'] as const;
+  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'text_to_speech', 'image_generation', 'attachment_analysis'] as const;
   const TEXT_ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator'] as const;
   type RoutingKey = (typeof ROUTING_KEYS)[number];
   type RoutingFormEntry = { model: string; reasoningEffort: string };
@@ -108,6 +108,7 @@ import { onMount, tick } from 'svelte';
     { key: 'compaction', label: 'compaction', description: 'Context compaction summaries.', supportsThinking: true },
     { key: 'evaluator', label: 'evaluator', description: 'Workflow step evaluation. Falls back to default if not set.', supportsThinking: true },
     { key: 'speech_to_text', label: 'speech_to_text', description: 'Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.', supportsThinking: false },
+    { key: 'text_to_speech', label: 'text_to_speech', description: 'Voice synthesis for the speaker button and conversation mode. Use models like tts-1, tts-1-hd, gpt-4o-mini-tts, eleven_multilingual_v2, or a Piper-compatible HTTP server.', supportsThinking: false },
     { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false },
     { key: 'attachment_analysis', label: 'attachment_analysis', description: 'Fallback model for artifact_read and binary read analysis when the main chat model lacks image/PDF/file capabilities.', supportsThinking: false }
   ];
@@ -123,6 +124,7 @@ import { onMount, tick } from 'svelte';
       compaction: { model: null, reasoning_effort: null },
       evaluator: { model: null, reasoning_effort: null },
       speech_to_text: { model: null, reasoning_effort: null },
+      text_to_speech: { model: null, reasoning_effort: null },
       image_generation: { model: null, reasoning_effort: null },
       attachment_analysis: { model: null, reasoning_effort: null }
     };
@@ -135,6 +137,7 @@ import { onMount, tick } from 'svelte';
       compaction: emptyRoutingEntry(),
       evaluator: emptyRoutingEntry(),
       speech_to_text: emptyRoutingEntry(),
+      text_to_speech: emptyRoutingEntry(),
       image_generation: emptyRoutingEntry(),
       attachment_analysis: emptyRoutingEntry()
     };
@@ -432,6 +435,18 @@ import { onMount, tick } from 'svelte';
     return normalized.includes('transcribe') || normalized.includes('whisper') || normalized.includes('speech-to-text');
   }
 
+  function looksLikeTtsModel(value: string): boolean {
+    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+    return (
+      normalized.includes('tts') ||
+      normalized.includes('text-to-speech') ||
+      normalized.includes('speech-1') ||
+      normalized.includes('eleven') ||
+      normalized.includes('elevenlabs') ||
+      normalized.includes('piper')
+    );
+  }
+
   function findModelEntry(modelId: string): ModelEntry | null {
     const normalized = modelId.trim();
     if (!normalized) {
@@ -499,6 +514,12 @@ import { onMount, tick } from 'svelte';
       return options.filter((option) => {
         const entry = findModelEntry(option.value);
         return looksLikeTranscriptionModel(option.value) || looksLikeTranscriptionModel(entry?.display_name ?? '');
+      });
+    }
+    if (routeKey === 'text_to_speech') {
+      return options.filter((option) => {
+        const entry = findModelEntry(option.value);
+        return looksLikeTtsModel(option.value) || looksLikeTtsModel(entry?.display_name ?? '');
       });
     }
     return options;
@@ -1006,6 +1027,10 @@ import { onMount, tick } from 'svelte';
         model: modelRouting.speech_to_text.model ?? '',
         reasoningEffort: ''
       },
+      text_to_speech: {
+        model: modelRouting.text_to_speech?.model ?? '',
+        reasoningEffort: ''
+      },
       image_generation: {
         model: modelRouting.image_generation.model ?? '',
         reasoningEffort: ''
@@ -1270,6 +1295,10 @@ import { onMount, tick } from 'svelte';
         },
         speech_to_text: {
           model: routingForm.speech_to_text.model || null,
+          reasoning_effort: null
+        },
+        text_to_speech: {
+          model: routingForm.text_to_speech.model || null,
           reasoning_effort: null
         },
         image_generation: {

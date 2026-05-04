@@ -257,7 +257,7 @@ class InferenceHandler:
         prompt: str | None = None,
         language: str | None = None,
     ) -> dict[str, Any]:
-        from cognis.channels.inbound import _prepare_audio_for_stt
+        from cognis.audio.preprocessing import prepare_audio_for_stt as _prepare_audio_for_stt
 
         audio_bytes, mime_type, filename = await _prepare_audio_for_stt(
             audio_bytes,
@@ -312,6 +312,41 @@ class InferenceHandler:
             "model": model,
             "language": payload.get("language"),
             "duration_seconds": payload.get("duration"),
+        }
+
+
+    async def synthesize(
+        self,
+        *,
+        text: str,
+        voice: str,
+        model: str,
+        provider_preset: str | None = None,
+        response_format: str = "mp3",
+        speed: float = 1.0,
+        request_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run text-to-speech via LiteLLM on the executor side."""
+        from cognis.providers.llm.litellm import _run_synthesize_local
+
+        wire_model = _transcription_wire_model(model, provider_preset or "")
+        result = await _run_synthesize_local(
+            text=text,
+            voice=voice,
+            wire_model=wire_model,
+            response_format=response_format,
+            speed=speed,
+            request_kwargs=dict(request_kwargs),
+            resolved_model=model,
+            provider_preset=provider_preset or "",
+        )
+        return {
+            "audio_hex": result.audio_bytes.hex(),
+            "audio_encoding": "hex",
+            "content_type": result.content_type,
+            "model": result.model,
+            "voice": result.voice,
+            "duration_seconds": result.duration_seconds,
         }
 
 

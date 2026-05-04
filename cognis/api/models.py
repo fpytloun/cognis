@@ -606,6 +606,7 @@ class ModelRoutingResponse(BaseModel):
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
@@ -616,6 +617,7 @@ class ModelRoutingUpdateRequest(BaseModel):
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
@@ -1571,3 +1573,62 @@ class WebSocketChunkGap(BaseModel):
 
 class WebSocketPong(BaseModel):
     type: str = "pong"
+
+
+# ---------------------------------------------------------------------------
+# Voice mode (TTS / STT)
+# ---------------------------------------------------------------------------
+
+
+class TtsSynthesizeRequest(BaseModel):
+    """Request body for ``POST /api/v1/tts/synthesize``.
+
+    ``message_id`` enables artifact caching keyed on
+    ``(message_id, voice, model)``. ``agent_id`` lets the server resolve
+    the per-agent voice override. ``voice`` overrides everything.
+    """
+
+    text: str
+    message_id: str | None = None
+    agent_id: str | None = None
+    voice: str | None = None
+    format: str = "mp3"
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+
+
+class TtsSynthesizeResponse(BaseModel):
+    audio_url: str
+    content_type: str
+    duration_seconds: float | None = None
+    voice: str
+    model: str
+    cached: bool = False
+
+
+class SttTranscribeResponse(BaseModel):
+    text: str
+    language: str | None = None
+    duration_seconds: float | None = None
+    model: str
+
+
+# ---------------------------------------------------------------------------
+# Voice mode WebSocket frames
+# ---------------------------------------------------------------------------
+
+
+class WebSocketEnableTts(BaseModel):
+    type: str = "enable_tts"
+    voice: str | None = None
+
+
+class WebSocketDisableTts(BaseModel):
+    type: str = "disable_tts"
+
+
+class WebSocketTtsSentenceReady(BaseModel):
+    type: str = "tts_sentence_ready"
+    conversation_id: str
+    message_id: str
+    sentence_index: int
+    text: str

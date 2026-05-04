@@ -37,6 +37,7 @@ export interface AgentFormState {
   temperature: string;
   maxTokens: string;
   reasoningEffort: string;
+  voice: string;
   availableWorkflowIds: string[];
   defaultWorkflowId: string;
   workflowSelectionMode: string;
@@ -100,6 +101,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     temperature: '',
     maxTokens: '',
     reasoningEffort: '',
+    voice: '',
     availableWorkflowIds: systemWorkflowIds,
     defaultWorkflowId: 'system:direct',
     workflowSelectionMode: 'automatic',
@@ -160,6 +162,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
     maxTokens: typeof llmConfig.max_tokens === 'number' ? String(llmConfig.max_tokens) : '',
     reasoningEffort:
       typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
+    voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
     availableWorkflowIds: Array.isArray(execution.available_workflow_ids)
       ? execution.available_workflow_ids.filter((value): value is string => typeof value === 'string')
       : [],
@@ -319,7 +322,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       model: form.model || undefined,
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
-      reasoning_effort: form.reasoningEffort || undefined
+      reasoning_effort: form.reasoningEffort || undefined,
+      voice: form.voice || undefined
     },
     execution: {
       executor_id: form.executorId || undefined,
@@ -345,7 +349,8 @@ export function formStateToSystemOverridePayload(form: AgentFormState): Record<s
       model: form.model || undefined,
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
-      reasoning_effort: form.reasoningEffort || undefined
+      reasoning_effort: form.reasoningEffort || undefined,
+      voice: form.voice || undefined
     }
   };
 }

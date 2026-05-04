@@ -61,6 +61,7 @@ class LLMProviderConfig(BaseModel):
     executor_labels: dict[str, str] | None = None
     models: list[ModelInfo] = Field(default_factory=list)
     default_model: str | None = None
+    default_voice: str | None = None  # Provider-level fallback voice for TTS
     status: str = "active"
 
 
@@ -112,6 +113,7 @@ class ModelRoutingPolicy(BaseModel):
     compaction: dict[str, str | None] = Field(default_factory=dict)
     evaluator: dict[str, str | None] = Field(default_factory=dict)
     speech_to_text: dict[str, str | None] = Field(default_factory=dict)
+    text_to_speech: dict[str, str | None] = Field(default_factory=dict)
     image_generation: dict[str, str | None] = Field(default_factory=dict)
     attachment_analysis: dict[str, str | None] = Field(default_factory=dict)
 
@@ -151,6 +153,16 @@ class SpeechToTextResult(BaseModel):
     text: str
     model: str
     language: str | None = None
+    duration_seconds: float | None = None
+
+
+class TextToSpeechResult(BaseModel):
+    """Result of a text-to-speech synthesis call."""
+
+    audio_bytes: bytes
+    content_type: str
+    model: str
+    voice: str
     duration_seconds: float | None = None
 
 

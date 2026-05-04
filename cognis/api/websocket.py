@@ -113,6 +113,11 @@ class AuthenticatedWebSocket:
     pending_sends: int = 0
     dropped_chunks: dict[str, int] = field(default_factory=dict)
     recovery_notified: set[str] = field(default_factory=set)
+    # Voice mode (conversation overlay). Populated by `enable_tts`/
+    # `disable_tts` inbound frames; consumed by `WebSocketTurnObserver`
+    # to gate `tts_sentence_ready` emission.
+    tts_enabled: bool = False
+    tts_voice: str | None = None
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def allow_inbound_message(self) -> bool:
@@ -177,6 +182,23 @@ class WebSocketTurnObserver:
 
     def __init__(self, manager: WebSocketConnectionManager) -> None:
         self._manager = manager
+        # Per-(conversation_id, message_id) sentence buffer for the
+        # `tts_sentence_ready` voice-mode frame.
+        from cognis.core.sentence_buffer import SentenceBuffer
+
+        self._SentenceBuffer = SentenceBuffer
+        self._sentence_buffers: dict[tuple[str, str], SentenceBuffer] = {}
+
+    def _get_sentence_buffer(self, conversation_id: str, message_id: str) -> Any:
+        key = (conversation_id, message_id)
+        buf = self._sentence_buffers.get(key)
+        if buf is None:
+            buf = self._SentenceBuffer()
+            self._sentence_buffers[key] = buf
+        return buf
+
+    def _release_sentence_buffer(self, conversation_id: str, message_id: str) -> Any:
+        return self._sentence_buffers.pop((conversation_id, message_id), None)
 
     async def on_token(
         self,
@@ -188,6 +210,23 @@ class WebSocketTurnObserver:
         chunk_index: int | None = None,
         content_offset: int | None = None,
     ) -> None:
+        # Conversation-mode TTS streaming: feed the sentence buffer and
+        # emit `tts_sentence_ready` to TTS-enabled subscribers only when
+        # at least one connection on this conversation has it enabled.
+        if delta and self._manager.has_tts_enabled_subscribers(conversation_id):
+            buffer = self._get_sentence_buffer(conversation_id, message_id)
+            for index, sentence in buffer.feed(delta):
+                await self._manager.send_to_tts_subscribers(
+                    conversation_id,
+                    {
+                        "type": "tts_sentence_ready",
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "sentence_index": index,
+                        "text": sentence,
+                    },
+                )
+
         await self._manager.send_to_conversation(
             conversation_id,
             {
@@ -263,6 +302,24 @@ class WebSocketTurnObserver:
         queued_messages = self._manager.app.state.turn_scheduler.queued_messages(
             result.conversation_id
         )
+        # Flush any trailing sentence to TTS-enabled subscribers.
+        if result.message_id and self._manager.has_tts_enabled_subscribers(result.conversation_id):
+            buffer = self._release_sentence_buffer(result.conversation_id, result.message_id)
+            if buffer is not None:
+                trailing = buffer.flush()
+                if trailing is not None:
+                    index, sentence = trailing
+                    await self._manager.send_to_tts_subscribers(
+                        result.conversation_id,
+                        {
+                            "type": "tts_sentence_ready",
+                            "conversation_id": result.conversation_id,
+                            "message_id": result.message_id,
+                            "sentence_index": index,
+                            "text": sentence,
+                        },
+                    )
+
         payload: dict[str, Any] = {
             "type": "message_complete",
             "conversation_id": result.conversation_id,
@@ -497,6 +554,30 @@ class WebSocketConnectionManager:
         for cid in list(connection_ids):
             conn = self._connections.get(cid)
             if conn is not None:
+                coroutines.append(conn.send_json(payload))
+        if coroutines:
+            await asyncio.gather(*coroutines, return_exceptions=True)
+
+    def has_tts_enabled_subscribers(self, conversation_id: str) -> bool:
+        """Return True when at least one TTS-enabled connection is subscribed."""
+        connection_ids = self._by_conversation.get(conversation_id, set())
+        for cid in connection_ids:
+            conn = self._connections.get(cid)
+            if conn is not None and conn.tts_enabled:
+                return True
+        return False
+
+    async def send_to_tts_subscribers(
+        self, conversation_id: str, payload: dict[str, Any]
+    ) -> None:
+        """Fan out a payload only to TTS-enabled connections."""
+        connection_ids = self._by_conversation.get(conversation_id, set())
+        if not connection_ids:
+            return
+        coroutines = []
+        for cid in list(connection_ids):
+            conn = self._connections.get(cid)
+            if conn is not None and conn.tts_enabled:
                 coroutines.append(conn.send_json(payload))
         if coroutines:
             await asyncio.gather(*coroutines, return_exceptions=True)
@@ -1037,6 +1118,17 @@ async def handle_websocket(websocket: WebSocket) -> None:
 
             if message_type == "step_response":
                 await _handle_step_response(websocket.app, manager, connection, message)
+                continue
+
+            if message_type == "enable_tts":
+                voice = message.get("voice")
+                connection.tts_enabled = True
+                connection.tts_voice = voice if isinstance(voice, str) and voice.strip() else None
+                continue
+
+            if message_type == "disable_tts":
+                connection.tts_enabled = False
+                connection.tts_voice = None
                 continue
 
             if message_type == "reconnect":

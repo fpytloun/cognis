@@ -15,6 +15,7 @@ from sqlalchemy import (
     JSON,
     TIMESTAMP,
     Boolean,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -1058,6 +1059,33 @@ class PushSubscriptionRow(Base):
     )
 
     __table_args__ = (Index("ix_push_subscriptions_user_enabled", "user_email", "enabled"),)
+
+
+class TtsCacheRow(Base):
+    """Cached text-to-speech artifact metadata.
+
+    Cognis caches synthesized audio in the artifact store under namespace
+    ``tts``. This row tracks the (message, voice, model) tuple that maps to
+    a cached artifact so subsequent speaker-button clicks can serve from
+    cache without re-synthesizing. Pruned by TTL (``tts.cache_ttl_days``).
+    """
+
+    __tablename__ = "tts_cache"
+
+    message_id: Mapped[str] = mapped_column(String, primary_key=True)
+    voice: Mapped[str] = mapped_column(String, primary_key=True)
+    model: Mapped[str] = mapped_column(String, primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_filename: Mapped[str] = mapped_column(String, nullable=False)
+    content_type: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_tts_cache_created_at", "created_at"),)
 
 
 class RememberQueueRow(Base):

@@ -203,6 +203,14 @@ class CognisWebSocketClient {
     this.startPongTimeout();
   }
 
+  enableTts(voice: string | null = null): void {
+    this.sendRaw({ type: 'enable_tts', voice });
+  }
+
+  disableTts(): void {
+    this.sendRaw({ type: 'disable_tts' });
+  }
+
   private sendRaw(payload: Record<string, unknown>): void {
     const serialized = JSON.stringify(payload);
     if (

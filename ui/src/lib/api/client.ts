@@ -66,12 +66,15 @@ import type {
   SystemDiagnostics,
   StepRun,
   StepProfileDefinition,
+  SttTranscribeResponse,
   Task,
   TaskChatResponse,
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
   ToolDefinitionSummary,
+  TtsSynthesizeRequest,
+  TtsSynthesizeResponse,
   UserCreatePayload,
   UserDetail,
   UserSummary,
@@ -1266,6 +1269,63 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(payload)
       });
+    }
+  },
+
+  tts: {
+    synthesize(payload: TtsSynthesizeRequest): Promise<TtsSynthesizeResponse> {
+      return request<TtsSynthesizeResponse>('/api/v1/tts/synthesize', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    }
+  },
+
+  stt: {
+    async transcribe(file: Blob, opts: { filename?: string; language?: string; prompt?: string } = {}): Promise<SttTranscribeResponse> {
+      const form = new FormData();
+      form.append('file', file, opts.filename ?? 'voice-input.webm');
+      if (opts.language) form.append('language', opts.language);
+      if (opts.prompt) form.append('prompt', opts.prompt);
+      const response = await fetch('/api/v1/stt/transcribe', {
+        method: 'POST',
+        body: form,
+        credentials: 'include'
+      });
+      if (!response.ok) {
+        let detail = 'Transcription failed';
+        try {
+          const body = await response.json();
+          detail = body?.error?.message ?? detail;
+        } catch {
+          // ignore
+        }
+        throw new Error(detail);
+      }
+      return response.json();
+    },
+
+    async transcribeArtifact(artifactId: string, opts: { language?: string; prompt?: string } = {}): Promise<SttTranscribeResponse> {
+      const form = new FormData();
+      form.append('artifact_id', artifactId);
+      if (opts.language) form.append('language', opts.language);
+      if (opts.prompt) form.append('prompt', opts.prompt);
+      const response = await fetch('/api/v1/stt/transcribe', {
+        method: 'POST',
+        body: form,
+        credentials: 'include'
+      });
+      if (!response.ok) {
+        let detail = 'Transcription failed';
+        try {
+          const body = await response.json();
+          detail = body?.error?.message ?? detail;
+        } catch {
+          // ignore
+        }
+        throw new Error(detail);
+      }
+      return response.json();
     }
   },
 

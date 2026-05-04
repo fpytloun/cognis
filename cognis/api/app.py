@@ -36,9 +36,11 @@ from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
 from cognis.api.routes.settings import router as settings_router
 from cognis.api.routes.skills import router as skills_router
+from cognis.api.routes.stt import router as stt_router
 from cognis.api.routes.system import router as system_router
 from cognis.api.routes.tasks import router as tasks_router
 from cognis.api.routes.tools import router as tools_router
+from cognis.api.routes.tts import router as tts_router
 from cognis.api.routes.users import router as users_router
 from cognis.api.routes.workflows import router as workflows_router
 from cognis.api.runtime_support import build_shared_runtime, build_step_runtime_factory
@@ -688,6 +690,8 @@ def create_app() -> FastAPI:
     app.include_router(notifications_router)
     app.include_router(projects_router)
     app.include_router(push_router)
+    app.include_router(tts_router)
+    app.include_router(stt_router)
     app.include_router(users_router)
 
     @app.exception_handler(StarletteHTTPException)
