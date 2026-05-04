@@ -1044,6 +1044,14 @@ class TaskQueue:
 
         from cognis.core.decision import select_workflow
 
+        def _selection_text() -> str:
+            parts = [f"Title: {task.title}"]
+            if task.description:
+                parts.append(f"Description: {task.description}")
+            if task.expected_output:
+                parts.append(f"Expected output: {task.expected_output}")
+            return "\n".join(parts)
+
         try:
             available = await self._workflow_registry.list_all(
                 owner_email=task.created_by,
@@ -1082,7 +1090,10 @@ class TaskQueue:
                             {
                                 "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
                                 "name": f"Skill: {skill.name}",
+                                "description": skill.description,
                                 "criteria": skill_workflow_criteria(skill),
+                                "tags": list(skill.tags),
+                                "candidate_type": "skill_workflow",
                             }
                         )
             if not workflow_candidates:
@@ -1090,7 +1101,7 @@ class TaskQueue:
 
             selection = await select_workflow(
                 llm=self._llm_provider,
-                task_description=task.description or task.title,
+                task_description=_selection_text(),
                 available_workflows=workflow_candidates,
                 default_workflow_id="system:general-task",
             )
@@ -1103,7 +1114,7 @@ class TaskQueue:
                     skill_id=selected_skill_id,
                     lifecycle="ephemeral",
                     composition_source="agent_composed",
-                    composition_intent=task.description or task.title,
+                    composition_intent=_selection_text(),
                 )
                 workflow_id = created_workflow.workflow_id
             logger.info(

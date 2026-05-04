@@ -1559,7 +1559,11 @@ class TurnScheduler:
 
             # Handle delegation
             if decision is not None and decision.decision == "delegate":
-                workflow_id = await self._select_workflow(agent, content)
+                workflow_id = await self._select_workflow(
+                    agent,
+                    content,
+                    project_id=conversation.project_id,
+                )
                 task = await self._task_queue.submit(
                     created_by=user_email,
                     agent_id=agent.agent_id,
@@ -1569,6 +1573,7 @@ class TurnScheduler:
                     source_ref=conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
+                    project_id=conversation.project_id,
                     workspace_root=current_workspace_root.get(),
                     working_directory=current_effective_working_directory.get(),
                     status="queued",
@@ -2161,11 +2166,26 @@ class TurnScheduler:
     # Workflow selection
     # ------------------------------------------------------------------
 
-    async def _select_workflow(self, agent: Any, task_description: str) -> str:
+    async def _select_workflow(
+        self,
+        agent: Any,
+        task_description: str,
+        *,
+        project_id: str | None = None,
+    ) -> str:
         """Select the best workflow for a delegated task."""
         execution = agent.execution or {}
         available_ids = execution.get("available_workflow_ids")
-        available_workflows = await self._workflow_registry.list_all(owner_email=agent.owner_email)
+        available_workflows = await self._workflow_registry.list_all(
+            owner_email=agent.owner_email,
+            project_id=project_id,
+        )
+        project_workflow_ids: set[str] = set()
+        if project_id is not None:
+            from cognis.store.queries import list_project_workflow_ids
+
+            async with self._session_factory() as db_session:
+                project_workflow_ids = set(await list_project_workflow_ids(db_session, project_id))
         if isinstance(available_ids, list) and available_ids:
             available_workflows = [
                 w for w in available_workflows if w.workflow_id in set(available_ids)
@@ -2177,6 +2197,7 @@ class TurnScheduler:
                 "description": workflow.description,
                 "criteria": workflow.criteria,
                 "tags": list(workflow.tags),
+                "project_bound": workflow.workflow_id in project_workflow_ids,
             }
             for workflow in available_workflows
         ]
@@ -2193,14 +2214,19 @@ class TurnScheduler:
                 {
                     "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
                     "name": f"Skill: {skill.name}",
+                    "description": skill.description,
                     "criteria": skill_workflow_criteria(skill),
+                    "tags": list(skill.tags),
+                    "candidate_type": "skill_workflow",
                 }
             )
         if not workflow_candidates:
             default_workflow_id = execution.get("default_workflow_id")
             if isinstance(default_workflow_id, str):
                 resolved_default = await self._workflow_registry.get(
-                    default_workflow_id, owner_email=agent.owner_email
+                    default_workflow_id,
+                    owner_email=agent.owner_email,
+                    project_id=project_id,
                 )
                 if resolved_default is not None:
                     return default_workflow_id

@@ -118,6 +118,41 @@ _WORKFLOW_SELECTION_STOPWORDS: frozenset[str] = frozenset(
     }
 )
 
+_WORKFLOW_RESEARCH_INTENT_TOKENS: frozenset[str] = frozenset(
+    {
+        "analyze",
+        "audit",
+        "assessment",
+        "blast",
+        "cause",
+        "confirmed",
+        "hypotheses",
+        "incident",
+        "investigate",
+        "investigation",
+        "leakage",
+        "report",
+        "rejected",
+        "research",
+        "root",
+        "security",
+    }
+)
+
+_WORKFLOW_IMPLEMENTATION_INTENT_TOKENS: frozenset[str] = frozenset(
+    {
+        "add",
+        "build",
+        "change",
+        "code",
+        "create",
+        "fix",
+        "implement",
+        "refactor",
+        "update",
+    }
+)
+
 
 class DecisionResult(BaseModel):
     """Normalized decision-engine output."""
@@ -380,6 +415,28 @@ def _workflow_candidate_text(workflow: dict[str, Any]) -> str:
     ) + (f"\n{tag_text}" if tag_text else "")
 
 
+def _is_skill_workflow_candidate(workflow: dict[str, Any]) -> bool:
+    return workflow.get("candidate_type") == "skill_workflow" or str(
+        workflow.get("workflow_id", "")
+    ).startswith("skill:")
+
+
+def _workflow_name_tokens(workflow: dict[str, Any]) -> set[str]:
+    return _workflow_selection_tokens(str(workflow.get("name", "")))
+
+
+def _meaningful_workflow_match(
+    task_description: str,
+    workflow: dict[str, Any],
+    score: float,
+) -> bool:
+    task_tokens = _workflow_selection_tokens(task_description)
+    name_overlap = bool(_workflow_name_tokens(workflow) & task_tokens)
+    if _is_skill_workflow_candidate(workflow):
+        return name_overlap or score >= 3.0
+    return score >= 2.0 or name_overlap
+
+
 def _score_workflow_candidate(task_description: str, workflow: dict[str, Any]) -> float:
     task_tokens = _workflow_selection_tokens(task_description)
     candidate_tokens = _workflow_selection_tokens(_workflow_candidate_text(workflow))
@@ -389,8 +446,17 @@ def _score_workflow_candidate(task_description: str, workflow: dict[str, Any]) -
     if overlap == 0:
         return 0.0
     score = float(overlap)
+    workflow_id = str(workflow.get("workflow_id", ""))
+    if workflow_id == "system:research" and task_tokens & _WORKFLOW_RESEARCH_INTENT_TOKENS:
+        score += 2.0
+    if (
+        workflow_id == "system:software-development"
+        and task_tokens & _WORKFLOW_RESEARCH_INTENT_TOKENS
+        and not (task_tokens & _WORKFLOW_IMPLEMENTATION_INTENT_TOKENS)
+    ):
+        score -= 1.0
     if bool(workflow.get("project_bound")):
-        score += 1.5
+        score += 4.0
     return score
 
 
@@ -405,6 +471,14 @@ def _select_by_candidate_metadata(
     scored = [(workflow, score) for workflow, score in scored if score > 0]
     if not scored:
         return None
+    project_scored = [
+        (workflow, score)
+        for workflow, score in scored
+        if bool(workflow.get("project_bound"))
+        and _meaningful_workflow_match(task_description, workflow, score)
+    ]
+    if project_scored:
+        scored = project_scored
     scored.sort(
         key=lambda item: (
             item[1],
@@ -414,9 +488,7 @@ def _select_by_candidate_metadata(
         reverse=True,
     )
     workflow, score = scored[0]
-    workflow_name_tokens = _workflow_selection_tokens(str(workflow.get("name", "")))
-    task_tokens = _workflow_selection_tokens(task_description)
-    if score < 2.0 and not (workflow_name_tokens and workflow_name_tokens & task_tokens):
+    if not _meaningful_workflow_match(task_description, workflow, score):
         return None
     return WorkflowSelectionResult(
         workflow_id=str(workflow["workflow_id"]),
@@ -496,7 +568,10 @@ async def select_workflow(
             "content": (
                 f"Task: {task_description}\n\n"
                 "Select the workflow whose description, criteria, and tags best match the task. "
-                "Prefer a project-bound workflow over a global/system workflow when both are suitable. "
+                "Use the full task text, including any expected output or deliverable requirements, as selection signal. "
+                "Strongly prefer a project-bound workflow over a global/system workflow when it meaningfully matches. "
+                "Only choose skill-derived workflows when the task explicitly matches that skill's domain; do not choose them from generic verbs or weak similarity. "
+                "For concrete personal/tool actions, prefer system:general-task unless a specialized workflow clearly fits. "
                 "Return JSON with workflow_id, confidence, and reason.\n\n"
                 f"Available workflows:\n{workflow_options}"
             ),
@@ -522,14 +597,38 @@ async def select_workflow(
             raise ValueError("Classifier returned empty response")
         payload = extract_json_object(content, label="classifier")
         workflow_id = str(payload.get("workflow_id", ""))
+        confidence = float(payload.get("confidence", 0.5))
 
         # Validate the selected workflow exists
         if workflow_id not in valid_ids:
             workflow_id = default_workflow_id or "system:general-task"
+        else:
+            selected = next(
+                (workflow for workflow in available_workflows if workflow["workflow_id"] == workflow_id),
+                None,
+            )
+            if selected is not None and _is_skill_workflow_candidate(selected):
+                selected_score = _score_workflow_candidate(task_description, selected)
+                if confidence < 0.85 or not _meaningful_workflow_match(
+                    task_description, selected, selected_score
+                ):
+                    fallback = _select_by_candidate_metadata(
+                        task_description,
+                        [
+                            workflow
+                            for workflow in available_workflows
+                            if not _is_skill_workflow_candidate(workflow)
+                        ],
+                    )
+                    workflow_id = (
+                        fallback.workflow_id
+                        if fallback is not None
+                        else default_workflow_id or "system:general-task"
+                    )
 
         return WorkflowSelectionResult(
             workflow_id=workflow_id,
-            confidence=float(payload.get("confidence", 0.5)),
+            confidence=confidence,
             reason=str(payload.get("reason", "Classifier selection")),
             source="classifier",
         )

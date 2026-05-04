@@ -287,6 +287,85 @@ async def test_select_workflow_uses_research_metadata_before_classifier() -> Non
 
 
 @pytest.mark.asyncio
+async def test_select_workflow_uses_expected_output_for_investigation_report() -> None:
+    result = await select_workflow(
+        llm=_CountingWorkflowLLM(),
+        task_description=(
+            "Title: Investigate cross-user MCP data leakage in scheduled daily brief\n"
+            "Expected output: Technical incident report with: confirmed vs rejected hypotheses; "
+            "exact root cause if found; affected code paths with file/line references; "
+            "security/blast-radius assessment; recommended immediate mitigation; proposed "
+            "permanent fix; tests/validation plan; and whether this appears to be direct MCP "
+            "credential mix or synthesis/context contamination."
+        ),
+        available_workflows=[
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Plan, research, synthesize with evaluation.",
+                "criteria": "Research tasks, investigation, incident analysis, audits, information gathering, and synthesis reports.",
+                "tags": ["research", "analysis", "investigation"],
+            },
+            {
+                "workflow_id": "system:software-development",
+                "name": "Software Development",
+                "description": "Full development pipeline for code and UI changes.",
+                "criteria": "Implementation tasks, feature development, bug fixes, and tests.",
+                "tags": ["code", "development", "tests"],
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:research"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_rejects_weak_skill_workflow_classifier_pick() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "skill:contact-lens-shopping", "confidence": 0.9, "reason": "add selected items"}'
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = await select_workflow(
+        llm=llm,
+        task_description=(
+            "Title: Add selected family movies to Radarr\n"
+            "Expected output: Concise Czech completion report listing each requested movie, "
+            "resolved title/year/TMDB ID, whether it was added or already existed, and any "
+            "errors/blockers."
+        ),
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic background tasks that need direct execution.",
+            },
+            {
+                "workflow_id": "skill:contact-lens-shopping",
+                "name": "Skill: contact-lens-shopping",
+                "description": "Buy contact lenses from a known vendor.",
+                "criteria": "Tasks explicitly matching the skill domain: contact-lens-shopping. Tags: shopping, contact-lenses. Do not use for unrelated tasks that only share generic action verbs.",
+                "tags": ["shopping", "contact-lenses"],
+                "candidate_type": "skill_workflow",
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "system:general-task"
+
+
+@pytest.mark.asyncio
 async def test_select_workflow_uses_candidate_metadata_before_classifier() -> None:
     llm = _CountingWorkflowLLM()
 
@@ -336,6 +415,34 @@ async def test_select_workflow_prefers_matching_project_bound_workflow() -> None
                 "description": "Create customer onboarding reports from usage metrics.",
                 "criteria": "Project-specific reporting workflow for onboarding analysis.",
                 "tags": ["report", "onboarding", "metrics"],
+                "project_bound": True,
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "project:onboarding-report"
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_strongly_prefers_meaningful_project_bound_workflow() -> None:
+    result = await select_workflow(
+        llm=_CountingWorkflowLLM(),
+        task_description="Create the customer onboarding report from usage metrics",
+        available_workflows=[
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Research customer onboarding reports and usage metrics.",
+                "criteria": "Gather information and write customer onboarding metric reports.",
+                "tags": ["research", "report", "onboarding", "customer", "metrics"],
+            },
+            {
+                "workflow_id": "project:onboarding-report",
+                "name": "Onboarding Report",
+                "description": "Create onboarding reports.",
+                "criteria": "Project-specific reporting workflow.",
+                "tags": ["report"],
                 "project_bound": True,
             },
         ],

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import uuid
 from typing import Any
 
@@ -49,27 +48,16 @@ def decode_skill_workflow_candidate_id(candidate_id: str) -> str | None:
     return None
 
 
-def _summarize_skill_instructions(instructions: str, *, limit: int = 180) -> str:
-    """Extract a short plain-text summary from skill instructions."""
-
-    cleaned = re.sub(r"\s+", " ", instructions.replace("#", " ")).strip()
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: limit - 1].rstrip() + "..."
-
-
 def skill_workflow_criteria(source: SkillWorkflowSource) -> str:
     """Build classifier-facing criteria text for a decomposed skill."""
 
     tags = [tag for tag in (getattr(source, "tags", None) or []) if isinstance(tag, str)]
-    parts = [f"Tasks that match the skill {source.name}."]
+    parts = [f"Tasks explicitly matching the skill domain: {source.name}."]
     if source.description:
         parts.append(source.description.strip())
-    summary = _summarize_skill_instructions(source.instructions)
-    if summary:
-        parts.append(f"Instructions summary: {summary}")
     if tags:
         parts.append("Tags: " + ", ".join(tags))
+    parts.append("Do not use for unrelated tasks that only share generic action verbs.")
     return " ".join(part for part in parts if part)
 
 
