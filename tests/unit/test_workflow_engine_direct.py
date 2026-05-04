@@ -51,7 +51,10 @@ async def test_run_direct_turn_enables_questions() -> None:
     )
 
     await engine.run_direct_turn(
-        conversation=SimpleNamespace(conversation_id="conv-1"),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
+        ),
         session=SimpleNamespace(user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="Need help",
@@ -111,7 +114,10 @@ async def test_run_direct_turn_threads_follow_up_metadata() -> None:
     )
 
     await engine.run_direct_turn(
-        conversation=SimpleNamespace(conversation_id="conv-1"),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
+        ),
         session=SimpleNamespace(user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="",

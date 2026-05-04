@@ -229,7 +229,7 @@ async def test_submit_turn_blocks_same_conversation_for_live_direct_question() -
                 conversation_id="conv-1", user_email="user@example.com", status="active"
             ),
             SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
-            SimpleNamespace(agent_id="agent-1"),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
             False,
         )
 
@@ -288,7 +288,7 @@ async def test_submit_turn_blocks_same_conversation_for_live_auth_challenge() ->
                 conversation_id="conv-1", user_email="user@example.com", status="active"
             ),
             SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
-            SimpleNamespace(agent_id="agent-1"),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
             False,
         )
 
@@ -348,7 +348,7 @@ async def test_submit_turn_ignores_task_backed_step_questions() -> None:
                 conversation_id="conv-1", user_email="user@example.com", status="active"
             ),
             SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
-            SimpleNamespace(agent_id="agent-1"),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
             False,
         )
 
@@ -893,7 +893,7 @@ async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
                 conversation_id="conv-1", user_email="user@example.com", title="", status="active"
             ),
             SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
-            SimpleNamespace(agent_id="agent-1"),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
             False,
         )
 
@@ -910,14 +910,17 @@ async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
     first_observer = _RecordingObserver()
     second_observer = _RecordingObserver()
 
-    first_error = await scheduler.submit_turn(
-        "conv-1",
-        "first",
-        user_email="user@example.com",
-        turn_observers=[first_observer],
+    first_error = await asyncio.wait_for(
+        scheduler.submit_turn(
+            "conv-1",
+            "first",
+            user_email="user@example.com",
+            turn_observers=[first_observer],
+        ),
+        timeout=1,
     )
     assert first_error is None
-    await first_started.wait()
+    await asyncio.wait_for(first_started.wait(), timeout=1)
 
     second_error = await scheduler.submit_turn(
         "conv-1",
@@ -1559,7 +1562,7 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
             conversation_id="conv-1", title="", user_email="user@example.com"
         ),
         session=SimpleNamespace(session_id="sess-1"),
-        agent=SimpleNamespace(agent_id="agent-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
         content="",
         user_email="user@example.com",
         attachments=[
@@ -1624,6 +1627,7 @@ async def test_run_turn_delegation_inherits_conversation_execution_paths() -> No
             conversation_id="conv-1",
             title="",
             user_email="user@example.com",
+            project_id=None,
             context=SimpleNamespace(
                 platform_data={
                     "workspace_root": "/workspace/cognis",
@@ -1632,7 +1636,7 @@ async def test_run_turn_delegation_inherits_conversation_execution_paths() -> No
             ),
         ),
         session=SimpleNamespace(session_id="sess-1"),
-        agent=SimpleNamespace(agent_id="agent-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
         content="please handle this in the background",
         user_email="user@example.com",
         attachments=None,
@@ -1710,7 +1714,7 @@ async def test_run_turn_merges_absorbed_delivery_metadata() -> None:
             conversation_id="conv-1", title="", user_email="user@example.com"
         ),
         session=SimpleNamespace(session_id="sess-1"),
-        agent=SimpleNamespace(agent_id="agent-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
         content="hello",
         user_email="user@example.com",
         attachments=[],
@@ -1804,7 +1808,7 @@ async def test_run_turn_error_merges_absorbed_delivery_metadata() -> None:
             conversation_id="conv-1", title="", user_email="user@example.com"
         ),
         session=SimpleNamespace(session_id="sess-1"),
-        agent=SimpleNamespace(agent_id="agent-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
         content="hello",
         user_email="user@example.com",
         attachments=[],

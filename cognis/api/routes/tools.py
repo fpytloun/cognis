@@ -111,7 +111,7 @@ async def _discover_local_mcp_tools(
     user_email: str,
     *,
     timeout_seconds: int = 30,
-) -> list[dict[str, Any]]:
+) -> list[ToolDefinition]:
     raw_servers = []
     if isinstance(agent.tools, dict):
         raw_servers = agent.tools.get("mcp_servers", [])
@@ -138,7 +138,11 @@ async def _discover_local_mcp_tools(
         tools = await asyncio.wait_for(connection.list_tools(), timeout=timeout_seconds)
     finally:
         await request.app.state.providers.executor.cancel(handle)
-    return [tool for tool in tools if tool.get("source", {}).get("type") == "local_mcp"]
+    definitions = [
+        tool if isinstance(tool, ToolDefinition) else ToolDefinition.model_validate(tool)
+        for tool in tools
+    ]
+    return [tool for tool in definitions if tool.source.type == "local_mcp"]
 
 
 @router.get("/api/v1/tools", response_model=list[ToolResponse])
@@ -299,13 +303,17 @@ async def _get_classification_row_for_tool(
 ) -> ToolClassificationRow | None:
     async with request.app.state.session_factory() as session:
         return (
-            await session.execute(
-                select(ToolClassificationRow).where(
-                    ToolClassificationRow.tool_id == tool_id,
-                    ToolClassificationRow.scope_key == user_email,
+            (
+                await session.execute(
+                    select(ToolClassificationRow).where(
+                        ToolClassificationRow.tool_id == tool_id,
+                        ToolClassificationRow.scope_key == user_email,
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
 
 async def _get_classification_override_for_tool(
@@ -426,7 +434,9 @@ async def _resolve_effective_tools_response(
 
     configured_tools: list[ToolDefinition] = []
     for tool in [
-        tool for tool in select_static_tools(agent, access_context=access_context) if tool.category != "web"
+        tool
+        for tool in select_static_tools(agent, access_context=access_context)
+        if tool.category != "web"
     ]:
         if tool.source.type == "builtin" or is_tool_enabled(
             tool, selected.enabled_tools or [], selected.enabled_tool_groups or []
@@ -851,9 +861,8 @@ async def test_agent_mcp_servers(request: Request, agent_id: str) -> MCPServerTe
 
     grouped: dict[str, list[str]] = {}
     for tool in discovered:
-        source = tool.get("source", {})
-        server_name = str(source.get("server_name") or "mcp")
-        grouped.setdefault(server_name, []).append(str(tool.get("name", "")))
+        server_name = tool.source.server_name or "mcp"
+        grouped.setdefault(server_name, []).append(tool.name)
 
     items = [
         MCPServerTestItemResponse(
@@ -981,7 +990,9 @@ async def update_mcp_server_route(
 ) -> dict[str, Any]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        existing = await get_mcp_server(session, server_id, owner_email=user.email, include_shared=True)
+        existing = await get_mcp_server(
+            session, server_id, owner_email=user.email, include_shared=True
+        )
         if existing is None:
             raise api_exception(404, "not_found", "MCP server not found")
         if _mcp_is_shared(existing) and user.role != "admin":
@@ -1041,7 +1052,9 @@ async def update_mcp_server_route(
 async def delete_mcp_server_route(request: Request, server_id: str) -> dict[str, str]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        existing = await get_mcp_server(session, server_id, owner_email=user.email, include_shared=True)
+        existing = await get_mcp_server(
+            session, server_id, owner_email=user.email, include_shared=True
+        )
         if existing is None:
             raise api_exception(404, "not_found", "MCP server not found")
         if _mcp_is_shared(existing) and user.role != "admin":
@@ -1086,13 +1099,17 @@ async def requeue_tool_classification(
     async with request.app.state.session_factory() as session:
         if payload.tool_id:
             row = (
-                await session.execute(
-                    select(ToolClassificationRow).where(
-                        ToolClassificationRow.tool_id == payload.tool_id,
-                        ToolClassificationRow.scope_key == user.email,
+                (
+                    await session.execute(
+                        select(ToolClassificationRow).where(
+                            ToolClassificationRow.tool_id == payload.tool_id,
+                            ToolClassificationRow.scope_key == user.email,
+                        )
                     )
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             if row is None:
                 raise api_exception(404, "not_found", "Tool classification not found")
             rows = [row]

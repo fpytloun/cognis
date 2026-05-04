@@ -282,6 +282,7 @@ def create_app() -> FastAPI:
                 signed_url_ttl_seconds=config_runtime.artifact_signed_url_ttl_seconds,
             )
         )
+        context_assembler.set_artifact_store(artifact_store)
 
         from cognis.core.artifact_maintenance import ArtifactMaintenanceService
         from cognis.store.queries import get_setting_value

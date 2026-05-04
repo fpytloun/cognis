@@ -10,6 +10,7 @@ import re
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 from typing import Any
 
 from prometheus_client import Counter
@@ -56,6 +57,11 @@ MNEMORY_SESSION_REPAIRED_TOTAL = Counter(
     "cognis_mnemory_session_repaired_total",
     "Mnemory session repairs performed while rebuilding immutable prefixes.",
     labelnames=("reason",),
+)
+HISTORY_ATTACHMENT_REPLAY_TOTAL = Counter(
+    "cognis_history_attachment_replay_total",
+    "Historic attachment replay outcomes during context assembly.",
+    labelnames=("outcome",),
 )
 
 EVENT_TYPES_FOR_CONTEXT = [
@@ -380,6 +386,7 @@ class ContextAssembler:
         max_context_tokens: int | None = None,
         compaction_threshold: float,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        artifact_store: Any | None = None,
     ) -> None:
         self.memory = memory
         self.guardrails = guardrails
@@ -389,6 +396,7 @@ class ContextAssembler:
         del max_context_tokens
         self.compaction_threshold = compaction_threshold
         self.session_factory = session_factory
+        self.artifact_store = artifact_store
 
     @classmethod
     async def from_session_factory(
@@ -400,6 +408,7 @@ class ContextAssembler:
         llm: Any,
         session_cache: Any,
         session_manager: Any,
+        artifact_store: Any | None = None,
     ) -> ContextAssembler:
         """Create a context assembler with DB-backed settings."""
 
@@ -417,7 +426,13 @@ class ContextAssembler:
             if isinstance(compaction_threshold, (int, float))
             else 0.85,
             session_factory=session_factory,
+            artifact_store=artifact_store,
         )
+
+    def set_artifact_store(self, artifact_store: Any | None) -> None:
+        """Wire artifact storage after construction when app startup creates it later."""
+
+        self.artifact_store = artifact_store
 
     async def assemble(
         self,
@@ -740,10 +755,12 @@ class ContextAssembler:
         )
 
         # History messages (append-only)
-        history_messages = self._events_to_messages(
+        history_messages = await self._events_to_messages(
             self.session_cache.get_events_since_compaction(
                 session.session_id, EVENT_TYPES_FOR_CONTEXT
-            )
+            ),
+            model_info=model_info,
+            owner_email=session.user_email,
         )
         messages.extend(history_messages)
 
@@ -889,15 +906,16 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            current_turn_attachments = _current_turn_attachment_message(
-                user_message=user_message,
-                user_message_role=user_message_role,
-                user_attachments=user_attachments,
-                model_info=model_info,
-                include_user_message=False,
-            )
-            if current_turn_attachments is not None:
-                messages.append(current_turn_attachments)
+            if not _history_tail_has_native_attachment(history_messages):
+                current_turn_attachments = _current_turn_attachment_message(
+                    user_message=user_message,
+                    user_message_role=user_message_role,
+                    user_attachments=user_attachments,
+                    model_info=model_info,
+                    include_user_message=False,
+                )
+                if current_turn_attachments is not None:
+                    messages.append(current_turn_attachments)
 
         projection = project_messages(messages)
         messages = self._prune_messages(
@@ -1102,10 +1120,12 @@ class ContextAssembler:
             }
         )
 
-        history_messages = self._events_to_messages(
+        history_messages = await self._events_to_messages(
             self.session_cache.get_events_since_compaction(
                 session.session_id, EVENT_TYPES_FOR_CONTEXT
-            )
+            ),
+            model_info=model_info,
+            owner_email=session.user_email,
         )
         messages.extend(history_messages)
 
@@ -1213,15 +1233,16 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            current_turn_attachments = _current_turn_attachment_message(
-                user_message=user_message,
-                user_message_role=user_message_role,
-                user_attachments=user_attachments,
-                model_info=model_info,
-                include_user_message=False,
-            )
-            if current_turn_attachments is not None:
-                messages.append(current_turn_attachments)
+            if not _history_tail_has_native_attachment(history_messages):
+                current_turn_attachments = _current_turn_attachment_message(
+                    user_message=user_message,
+                    user_message_role=user_message_role,
+                    user_attachments=user_attachments,
+                    model_info=model_info,
+                    include_user_message=False,
+                )
+                if current_turn_attachments is not None:
+                    messages.append(current_turn_attachments)
 
         projection = project_messages(messages)
         messages = self._prune_messages(
@@ -1467,7 +1488,9 @@ class ContextAssembler:
                     reason="record_failed",
                 )
             await self.session_cache.append_recorded_events(session, message_events, append_result)
-            await self.session_cache.append_recorded_events(session, snapshot_events, snapshot_result)
+            await self.session_cache.append_recorded_events(
+                session, snapshot_events, snapshot_result
+            )
             await self.session_cache.store_prefix_snapshot(
                 session.session_id,
                 resolved_entries,
@@ -1749,8 +1772,115 @@ class ContextAssembler:
             tool_schema_tokens += self.llm.count_tokens(schemas, resolved_model)
         return system_prompt_tokens, tool_schema_tokens
 
-    def _events_to_messages(self, events: list[Any]) -> list[dict[str, Any]]:
-        return events_to_messages(events)
+    async def _events_to_messages(
+        self,
+        events: list[Any],
+        *,
+        model_info: Any | None,
+        owner_email: str | None,
+    ) -> list[dict[str, Any]]:
+        hydrated_events = await self._hydrate_history_attachment_urls(
+            events,
+            owner_email=owner_email,
+        )
+        return events_to_messages(hydrated_events, model_info=model_info)
+
+    async def _hydrate_history_attachment_urls(
+        self,
+        events: list[Any],
+        *,
+        owner_email: str | None,
+    ) -> list[Any]:
+        if self.artifact_store is None or self.session_factory is None:
+            return events
+
+        artifact_ids: set[str] = set()
+        for event in events:
+            data = event.get("data", {}) if isinstance(event, dict) else getattr(event, "data", {})
+            if not isinstance(data, dict):
+                continue
+            attachments = data.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for attachment in attachments[:20]:
+                if not isinstance(attachment, dict):
+                    continue
+                artifact_id = attachment.get("artifact_id")
+                if isinstance(artifact_id, str) and artifact_id:
+                    artifact_ids.add(artifact_id)
+        if not artifact_ids:
+            return events
+
+        from cognis.store.queries import get_artifact_record
+
+        hydrated_by_id: dict[str, dict[str, Any] | None] = {}
+        async with self.session_factory() as session:
+            for artifact_id in sorted(artifact_ids):
+                row = await get_artifact_record(session, artifact_id)
+                if row is None or row.status == "deleted":
+                    hydrated_by_id[artifact_id] = None
+                    HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_missing").inc()
+                    continue
+                if row.owner_email and owner_email and row.owner_email != owner_email:
+                    hydrated_by_id[artifact_id] = None
+                    HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(
+                        outcome="text_fallback_unauthorized"
+                    ).inc()
+                    continue
+                try:
+                    url = await self.artifact_store.async_get_public_url(
+                        row.namespace,
+                        row.object_id,
+                        row.filename,
+                    )
+                except Exception:
+                    hydrated_by_id[artifact_id] = None
+                    HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_missing").inc()
+                    continue
+                hydrated_by_id[artifact_id] = {
+                    "artifact_id": row.artifact_id,
+                    "kind": row.kind,
+                    "mime_type": row.mime_type,
+                    "filename": row.filename,
+                    "size_bytes": row.size_bytes,
+                    "url": url,
+                }
+
+        hydrated_events: list[Any] = []
+        for event in events:
+            if isinstance(event, dict):
+                event_type = event.get("type", "")
+                event_data = event.get("data", {})
+                if not isinstance(event_data, dict):
+                    hydrated_events.append(event)
+                    continue
+                next_data = dict(event_data)
+                next_event = {**event, "type": event_type, "data": next_data}
+            else:
+                event_data = getattr(event, "data", {})
+                if not isinstance(event_data, dict):
+                    hydrated_events.append(event)
+                    continue
+                next_data = dict(event_data)
+
+                next_event = SimpleNamespace(type=str(getattr(event, "type", "")), data=next_data)
+
+            attachments = next_data.get("attachments")
+            if isinstance(attachments, list):
+                next_attachments: list[dict[str, Any]] = []
+                for attachment in attachments[:20]:
+                    if not isinstance(attachment, dict):
+                        continue
+                    artifact_id = attachment.get("artifact_id")
+                    hydrated = (
+                        hydrated_by_id.get(artifact_id) if isinstance(artifact_id, str) else None
+                    )
+                    next_attachments.append(
+                        {**attachment, **hydrated} if hydrated else dict(attachment)
+                    )
+                next_data["attachments"] = next_attachments
+            hydrated_events.append(next_event)
+        return hydrated_events
 
     def _prune_messages(
         self,
@@ -1796,7 +1926,71 @@ class ContextAssembler:
         return pruned_messages
 
 
-def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
+def _attachment_content_message(
+    *,
+    role: str,
+    content: str,
+    attachments: list[dict[str, Any]],
+    model_info: Any | None,
+) -> dict[str, Any]:
+    if model_info is None:
+        if role == "assistant":
+            return {
+                "role": role,
+                "content": f"{content}\n\n{_assistant_attachment_context(attachments)}",
+            }
+        return {"role": role, "content": f"{content}\n\n{_attachment_note(attachments)}"}
+
+    attachment_blocks, unsupported = _native_attachment_blocks(attachments, model_info)
+    if not attachment_blocks:
+        HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_unsupported").inc(
+            len(attachments)
+        )
+        if role == "assistant":
+            return {
+                "role": role,
+                "content": f"{content}\n\n{_assistant_attachment_context(attachments)}",
+            }
+        return {"role": role, "content": f"{content}\n\n{_attachment_note(attachments)}"}
+
+    HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="native").inc(len(attachment_blocks))
+    blocks: list[dict[str, Any]] = []
+    if role == "assistant":
+        assistant_context = _assistant_attachment_context(attachments)
+        intro = f"{content}\n\n{assistant_context}" if content else assistant_context
+    else:
+        note = _attachment_note(attachments)
+        intro = f"{content}\n\n{note}" if content else note
+    if intro:
+        blocks.append({"type": "text", "text": intro})
+    blocks.extend(attachment_blocks)
+    if unsupported:
+        unsupported_attachments = _filter_attachments_by_names(attachments, unsupported)
+        if role == "assistant":
+            blocks.append(
+                {"type": "text", "text": _assistant_attachment_context(unsupported_attachments)}
+            )
+        else:
+            blocks.append({"type": "text", "text": _attachment_note(unsupported_attachments)})
+        HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_unsupported").inc(
+            len(unsupported_attachments)
+        )
+    return {"role": role, "content": blocks}
+
+
+def _assistant_attachment_context(attachments: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for attachment in attachments:
+        label = _attachment_label(attachment).replace("\r", " ").replace("\n", " ")
+        lines.append(f"- {html.escape(label, quote=True)}")
+    return "<assistant_attachments>\n" + "\n".join(lines) + "\n</assistant_attachments>"
+
+
+def events_to_messages(
+    events: list[Any],
+    *,
+    model_info: Any | None = None,
+) -> list[dict[str, Any]]:
     """Convert session events to LLM message dicts.
 
     This is the canonical event-to-message formatter used by both the
@@ -1853,13 +2047,6 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
                 }
             )
 
-    def _assistant_attachment_context(attachments: list[dict[str, Any]]) -> str:
-        lines: list[str] = []
-        for attachment in attachments:
-            label = _attachment_label(attachment).replace("\r", " ").replace("\n", " ")
-            lines.append(f"- {html.escape(label, quote=True)}")
-        return "<assistant_attachments>\n" + "\n".join(lines) + "\n</assistant_attachments>"
-
     for event in events:
         if isinstance(event, dict):
             event_type = str(event.get("type", ""))
@@ -1898,16 +2085,32 @@ def events_to_messages(events: list[Any]) -> list[dict[str, Any]]:
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
                 if isinstance(attachments, list) and attachments:
-                    content = f"{content}\n\n{_attachment_note([a for a in attachments if isinstance(a, dict)])}"
-                messages.append({"role": "user", "content": content})
+                    messages.append(
+                        _attachment_content_message(
+                            role="user",
+                            content=content,
+                            attachments=[a for a in attachments[:20] if isinstance(a, dict)],
+                            model_info=model_info,
+                        )
+                    )
+                else:
+                    messages.append({"role": "user", "content": content})
         elif event_type == "assistant_message":
             _append_orphan_placeholders()
             content = event_data.get("content")
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
                 if isinstance(attachments, list) and attachments:
-                    content = f"{content}\n\n{_assistant_attachment_context([a for a in attachments if isinstance(a, dict)])}"
-                messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        _attachment_content_message(
+                            role="assistant",
+                            content=content,
+                            attachments=[a for a in attachments[:20] if isinstance(a, dict)],
+                            model_info=model_info,
+                        )
+                    )
+                else:
+                    messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";
             # fall back to "output" for forward-compatibility.
@@ -2109,6 +2312,19 @@ def _current_user_message_already_in_history(
         if _looks_like_attachment_note_suffix(suffix):
             return True
 
+    return False
+
+
+def _history_tail_has_native_attachment(history_messages: list[dict[str, Any]]) -> bool:
+    for message in reversed(history_messages):
+        if message.get("role") != "user":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "file"} for part in content
+        )
     return False
 
 

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.models.tool import ToolDefinition, ToolSource
 from cognis.security import generate_api_key_material
 from cognis.store.queries import create_agent, create_api_key, create_llm_provider, create_user
 
@@ -297,17 +298,17 @@ def test_mcp_routes_use_executor_discovery(monkeypatch: object, tmp_path: Path) 
         asyncio.run(_seed())
 
         class _FakeConnection:
-            async def list_tools(self) -> list[dict[str, object]]:
+            async def list_tools(self) -> list[ToolDefinition]:
                 return [
-                    {
-                        "name": "filesystem/read_file",
-                        "description": "Read file",
-                        "source": {"type": "local_mcp", "server_name": "filesystem"},
-                        "category": "mcp",
-                        "read_only": True,
-                        "timeout_seconds": 30,
-                        "non_bypassable": False,
-                    }
+                    ToolDefinition(
+                        name="filesystem/read_file",
+                        description="Read file",
+                        source=ToolSource(type="local_mcp", server_name="filesystem"),
+                        category="mcp",
+                        read_only=True,
+                        timeout_seconds=30,
+                        non_bypassable=False,
+                    )
                 ]
 
         called = {"spawn": 0, "cancel": 0}
@@ -331,7 +332,7 @@ def test_mcp_routes_use_executor_discovery(monkeypatch: object, tmp_path: Path) 
         app.state.providers.executor.cancel = _fake_cancel
         app.state.providers.secrets.resolve_for_execution = _fake_resolve_for_execution
 
-        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        headers = _auth_headers(app, email="owner@example.com", role="user")
         test_response = client.post("/api/v1/agents/agent-mcp/mcp/test", headers=headers)
         tools_response = client.get("/api/v1/agents/agent-mcp/tools", headers=headers)
 

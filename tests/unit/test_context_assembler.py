@@ -1450,7 +1450,7 @@ async def test_context_assembler_projects_older_tool_groups_into_stable_placehol
     )
 
     tool_messages = [message for message in result.messages if message.get("role") == "tool"]
-    assert "Older tool result compacted from prompt." in str(tool_messages[0]["content"])
+    assert "Tool output omitted from prompt." in str(tool_messages[0]["content"])
     assert "call_id 'call-1'" in str(tool_messages[0]["content"])
     assert tool_messages[1]["content"] == "recent-1"
     assert tool_messages[2]["content"] == "recent-2"

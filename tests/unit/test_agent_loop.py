@@ -79,9 +79,7 @@ async def test_llm_stream_idle_timeout_resets_on_meaningful_activity() -> None:
 
     chunks = [
         chunk
-        async for chunk in _iterate_llm_stream_with_idle_timeout(
-            _stream(), idle_timeout_seconds=1
-        )
+        async for chunk in _iterate_llm_stream_with_idle_timeout(_stream(), idle_timeout_seconds=1)
     ]
 
     assert len(chunks) == 4
@@ -806,12 +804,17 @@ def test_parallel_execution_groups_split_write_before_document_asset_read() -> N
         tool_call=ToolCall(
             call_id="call-doc",
             name="document_generate",
-            arguments={"content": "![chart](asset:chart)", "assets": [{"name": "chart", "path": "/tmp/chart.png"}]},
+            arguments={
+                "content": "![chart](asset:chart)",
+                "assets": [{"name": "chart", "path": "/tmp/chart.png"}],
+            },
         ),
         tool_id="builtin:document_generate",
     )
 
-    groups = agent_loop._parallel_execution_groups(_parallel_group_ctx(), [write, document_generate])
+    groups = agent_loop._parallel_execution_groups(
+        _parallel_group_ctx(), [write, document_generate]
+    )
 
     assert [[item.tool_call.call_id for item in group] for group in groups] == [
         ["call-write"],
@@ -822,7 +825,9 @@ def test_parallel_execution_groups_split_write_before_document_asset_read() -> N
 def test_parallel_execution_groups_keep_apply_patch_exclusive_after_untracked_tool() -> None:
     agent_loop = AgentLoop.__new__(AgentLoop)
     web_fetch = _PreparedRegularToolCall(
-        tool_call=ToolCall(call_id="call-web", name="web_fetch", arguments={"url": "https://example.com"}),
+        tool_call=ToolCall(
+            call_id="call-web", name="web_fetch", arguments={"url": "https://example.com"}
+        ),
         tool_id="builtin:web_fetch",
     )
     patch = _PreparedRegularToolCall(
@@ -838,8 +843,7 @@ def test_parallel_execution_groups_keep_apply_patch_exclusive_after_untracked_to
     ]
 
 
-@pytest.mark.asyncio
-async def test_run_step_flushes_parallel_batch_before_serial_regular_tool() -> None:
+def test_parallelizability_marks_serial_regular_tool_as_batch_boundary() -> None:
     read_tool = ToolDefinition(
         name="web_fetch",
         description="Fetch a URL",
@@ -857,108 +861,33 @@ async def test_run_step_flushes_parallel_batch_before_serial_regular_tool() -> N
         read_only=False,
     )
 
-    class _LLM:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        async def get_model_info(self, model: str | None) -> SimpleNamespace:
-            del model
-            return _test_model_info()
-
-        def count_tokens(self, text: str, model: str | None = None) -> int:
-            del model
-            return len(text)
-
-        async def stream_generate(self, messages: list[dict[str, object]], **_: object):
-            del messages
-            self.calls += 1
-            if self.calls == 1:
-                yield {
-                    "choices": [
-                        {
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "call_read",
-                                        "function": {"name": "web_fetch", "arguments": "{}"},
-                                    },
-                                    {
-                                        "index": 1,
-                                        "id": "call_write",
-                                        "function": {
-                                            "name": "memory_write_note",
-                                            "arguments": "{}",
-                                        },
-                                    },
-                                ]
-                            }
-                        }
-                    ]
-                }
-                return
-            yield {"choices": [{"delta": {"content": "done"}}]}
-
-    executed: list[str] = []
-
     class _ToolRouter:
         def _is_non_bypassable(self, _name: str, non_bypassable: bool) -> bool:
             return non_bypassable
 
-        async def execute(self, tool_call: ToolCall, *args: object, **kwargs: object) -> SimpleNamespace:
-            del args, kwargs
-            executed.append(tool_call.name)
-            return SimpleNamespace(
-                output=json.dumps({"tool": tool_call.name, "status": "ok"}),
-                is_error=False,
-                duration_ms=1,
-                metadata={},
-                attachments=[],
-            )
-
     registry = ToolRegistry()
     registry.register(RegisteredTool(definition=read_tool, handler=None))
     registry.register(RegisteredTool(definition=write_tool, handler=None))
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    agent_loop.tool_router = _ToolRouter()
+    ctx = _parallel_group_ctx()
 
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_LLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=_ToolRouter(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-read", name="web_fetch", arguments={}),
+            registry,
+        )
+        is True
     )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
-            session_id="sess-batch-flush",
-            intaris_session_id="sess-batch-flush",
-            mnemory_session_id=None,
-            user_email="user@example.com",
-            agent_id="agent-1",
-        ),
-        conversation=SimpleNamespace(
-            conversation_id="conv-batch-flush",
-            title=None,
-            title_source="unset",
-        ),
-        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
-        policy=CHAT_POLICY,
-        user_message="fetch something and then save it",
-        user_attachments=[],
-        system_initiated=False,
-        tool_registry=registry,
+    assert (
+        agent_loop._is_parallelizable_regular_tool_call(
+            ctx,
+            ToolCall(call_id="call-write", name="memory_write_note", arguments={}),
+            registry,
+        )
+        is False
     )
-
-    output = await agent_loop.run_step(ctx)
-
-    assert output is not None
-    assert output.content == "done"
-    assert executed == ["web_fetch", "memory_write_note"]
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +1584,10 @@ class _TerminalTodosThenExtraToolLLM:
                                         "arguments": json.dumps(
                                             {
                                                 "todos": [
-                                                    {"content": "Inspect scope", "status": "completed"}
+                                                    {
+                                                        "content": "Inspect scope",
+                                                        "status": "completed",
+                                                    }
                                                 ]
                                             }
                                         ),
@@ -1737,7 +1669,10 @@ class _TerminalTodosThenTodoCorrectionLLM:
                                         "arguments": json.dumps(
                                             {
                                                 "todos": [
-                                                    {"content": "Inspect scope", "status": "completed"}
+                                                    {
+                                                        "content": "Inspect scope",
+                                                        "status": "completed",
+                                                    }
                                                 ]
                                             }
                                         ),
@@ -2196,21 +2131,11 @@ class _MixedProjectContextLLM:
                     "id": "call_write_project",
                     "function": {
                         "name": "write",
-                        "arguments": json.dumps(
-                            {"file_path": self.write_path, "content": "x"}
-                        ),
+                        "arguments": json.dumps({"file_path": self.write_path, "content": "x"}),
                     },
                 }
             )
-            yield {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": tool_calls
-                        }
-                    }
-                ]
-            }
+            yield {"choices": [{"delta": {"tool_calls": tool_calls}}]}
             return
 
         assert any(
@@ -2229,7 +2154,9 @@ class _MixedProjectContextLLM:
             if message.get("role") == "system"
             and "/workspace/cognis/AGENTS.md" in str(message.get("content"))
         ]
-        tool_indexes = [index for index, message in enumerate(messages) if message.get("role") == "tool"]
+        tool_indexes = [
+            index for index, message in enumerate(messages) if message.get("role") == "tool"
+        ]
         assert tool_indexes and project_system_indexes
         assert max(tool_indexes) < min(project_system_indexes)
         yield {"choices": [{"delta": {"content": "Mutating tool was retried."}}]}
@@ -2404,7 +2331,7 @@ async def test_project_context_is_not_loaded_from_ambient_workdir_only() -> None
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2468,7 +2395,7 @@ async def test_explicit_cross_project_path_still_triggers_project_probe() -> Non
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-cross-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2541,7 +2468,7 @@ async def test_read_only_tool_continues_after_project_context_load() -> None:
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-read-only-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2633,7 +2560,7 @@ async def test_mutating_trailing_tool_retries_after_read_only_project_context_lo
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-mixed-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2731,7 +2658,7 @@ async def test_cross_project_mutating_trailing_tool_loads_own_project_context() 
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-cross-mixed-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2812,7 +2739,7 @@ async def test_mutating_tool_retries_with_matching_earlier_project_context() -> 
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-multi-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2909,7 +2836,7 @@ async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-explicit-project",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -3239,9 +3166,7 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
                     StepCompletionMetadataField(
                         name="source_strategy", type="array", required=False
                     ),
-                    StepCompletionMetadataField(
-                        name="open_questions", type="array", required=True
-                    ),
+                    StepCompletionMetadataField(name="open_questions", type="array", required=True),
                 ]
             ),
         ),
@@ -3253,12 +3178,10 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
     )
 
     tools = loop._build_controller_tool_schemas(ctx)
-    step_complete_tool = next(
-        tool for tool in tools if tool["function"]["name"] == "step_complete"
-    )
-    metadata_properties = step_complete_tool["function"]["parameters"]["properties"][
-        "metadata"
-    ]["properties"]
+    step_complete_tool = next(tool for tool in tools if tool["function"]["name"] == "step_complete")
+    metadata_properties = step_complete_tool["function"]["parameters"]["properties"]["metadata"][
+        "properties"
+    ]
 
     assert metadata_properties["source_strategy"]["items"] == {"type": "string"}
     assert metadata_properties["open_questions"]["items"] == {"type": "string"}
@@ -3290,16 +3213,12 @@ def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> 
     )
     question_ctx = StepContext(
         **base,
-        step_definition=StepDefinition(
-            name="plan", type="run", prompt="", allow_questions=True
-        ),
+        step_definition=StepDefinition(name="plan", type="run", prompt="", allow_questions=True),
         interaction_mode="step_requests",
     )
     autonomous_ctx = StepContext(
         **base,
-        step_definition=StepDefinition(
-            name="plan", type="run", prompt="", allow_questions=True
-        ),
+        step_definition=StepDefinition(name="plan", type="run", prompt="", allow_questions=True),
         interaction_mode="none",
     )
 
@@ -3549,13 +3468,17 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
                                     {
                                         "index": 0,
                                         "id": "call_1",
-                                        "function": {"name": "bash", "arguments": "{}"},
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": '{"command":"pwd"}',
+                                        },
                                     }
                                 ]
                             }
                         }
                     ]
                 }
+                yield {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}
                 return
             yield {"choices": [{"delta": {"content": "done"}}]}
 
@@ -3590,6 +3513,18 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
         user_message="run something",
         user_attachments=[],
         system_initiated=False,
+        tool_registry=ToolRegistry(),
+    )
+    ctx.tool_registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run a shell command",
+                parameters={},
+                source=ToolSource(type="executor"),
+            ),
+            handler=None,
+        )
     )
 
     agent_loop = AgentLoop(
@@ -3611,7 +3546,7 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
     assert order[0] == "record:user_message"
     assert order[1] == "reasoning"
     assert "record:system_message" in order
-    assert order.index("record:tool_call") < order.index("execute")
+    assert order.index("record:tool_call") < order.index("record:tool_result")
     assert "record:tool_result" in order
     assert "record:assistant_message" in order
 
@@ -3756,7 +3691,7 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
         ),
         conversation=SimpleNamespace(
             conversation_id="conv-fallback",
-            context=SimpleNamespace(platform_data={}),
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -3887,7 +3822,10 @@ async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
         user_email="user@example.com",
         agent_id="agent-1",
     )
-    conversation = SimpleNamespace(conversation_id="conv-discovery", context=SimpleNamespace(platform_data={}))
+    conversation = SimpleNamespace(
+        conversation_id="conv-discovery",
+        context=SimpleNamespace(type="web", ref=None, platform_data={}),
+    )
     agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
 
     first_output = await agent_loop.run_step(
@@ -3911,9 +3849,7 @@ async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
     assert first_output is not None
     assert "mcp_rohlik__fetch_orders" in fake_llm.tool_sets[0]
     assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[0]
-    assert session_cache.get_discovered_tool_ids(session.session_id) == {
-        stable_tool_id(get_events)
-    }
+    assert session_cache.get_discovered_tool_ids(session.session_id) == {stable_tool_id(get_events)}
 
     second_output = await agent_loop.run_step(
         StepContext(
@@ -4002,7 +3938,7 @@ async def test_cached_discovered_tool_is_revalidated_against_permissions() -> No
                             "callable_name": get_events.name,
                             "scope": "session",
                         }
-                    ]
+                    ],
                 },
             )
         ],
@@ -4169,11 +4105,7 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
             if "builtin:zzz_target_tool" in content:
                 return {
                     "choices": [
-                        {
-                            "message": {
-                                "content": '{"tool_ids": ["builtin:zzz_target_tool"]}'
-                            }
-                        }
+                        {"message": {"content": '{"tool_ids": ["builtin:zzz_target_tool"]}'}}
                     ]
                 }
             return {"choices": [{"message": {"content": '{"tool_ids": []}'}}]}
@@ -4232,7 +4164,9 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-skill-chunk", intaris_session_id="sess-skill-chunk"),
+        session=SimpleNamespace(
+            session_id="sess-skill-chunk", intaris_session_id="sess-skill-chunk"
+        ),
         conversation=SimpleNamespace(conversation_id="conv-skill-chunk"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -4357,153 +4291,6 @@ async def test_skill_activation_cache_key_changes_when_tags_change() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relevant_skill_suggestions_use_classifier() -> None:
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"skill_ids": ["skill_evening", "skill_unknown"], "confidence": {"skill_evening": "high", "skill_unknown": "low"}}'
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-skill-suggest", intaris_session_id="sess-skill-suggest"),
-        conversation=SimpleNamespace(conversation_id="conv-skill-suggest"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_evening",
-                        "name": "evening-summary",
-                        "description": "Summarize the evening.",
-                        "tags": ["summary"],
-                    },
-                    {
-                        "skill_id": "skill_morning",
-                        "name": "morning-summary",
-                        "description": "Summarize the morning.",
-                        "tags": ["summary"],
-                    },
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Prepare the evening summary.",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(
-        ctx,
-        user_message="expanded workflow prompt should not be used here",
-    )
-
-    assert message is not None
-    assert message["role"] == "system"
-    assert "evening-summary" in str(message["content"])
-    assert "morning-summary" not in str(message["content"])
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_use_raw_intent_not_expanded_prompt() -> None:
-    """The skill suggestion classifier must see only raw intent — task title,
-    task description, and user message — not the full expanded workflow prompt.
-
-    Regression: a daily-brief general-task included boilerplate like
-    "For coding work, prefer the smallest correct change…" which misled the
-    classifier into picking cognis-coding for a briefing task.
-    """
-    captured: list[list[dict[str, object]]] = []
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            captured.append(messages)
-            return {"choices": [{"message": {"content": '{"skill_ids": []}'}}]}
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(
-            session_id="sess-intent", intaris_session_id="sess-intent"
-        ),
-        conversation=SimpleNamespace(conversation_id="conv-intent"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_evening",
-                        "name": "evening-summary",
-                        "description": "Summarize the evening.",
-                        "tags": ["summary"],
-                    }
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Prepare the daily brief.",
-        task_title="Daily brief",
-        task_description="Prepare today's morning briefing.",
-    )
-
-    expanded_boilerplate = (
-        "For coding work, prefer the smallest correct change, preserve "
-        "existing patterns, and update directly affected docs only when needed. "
-        "When you have completed the objective, call write_deliverable…"
-    )
-    await agent_loop._build_relevant_skills_message(
-        ctx,
-        user_message=expanded_boilerplate,
-    )
-
-    assert captured, "classifier was never invoked"
-    user_prompt = str(captured[0][-1].get("content") or "")
-    # Raw intent must appear.
-    assert "Daily brief" in user_prompt
-    assert "Prepare today's morning briefing." in user_prompt
-    assert "Prepare the daily brief." in user_prompt
-    # Expanded workflow boilerplate must NOT appear.
-    assert "For coding work" not in user_prompt
-    assert "write_deliverable" not in user_prompt
-
-
-@pytest.mark.asyncio
 async def test_skill_activation_classifier_scopes_to_policy_hidden_tools_only() -> None:
     """B1 — classifier candidates must exclude policy-visible tools.
 
@@ -4511,6 +4298,7 @@ async def test_skill_activation_classifier_scopes_to_policy_hidden_tools_only() 
     should only unlock tools that the step profile would NOT normally show.
     Cap-hidden policy-visible tools are reachable via search_tools.
     """
+
     class _ClassifierLLM:
         def __init__(self) -> None:
             self.received_candidates: list[str] = []
@@ -4759,323 +4547,6 @@ async def test_skill_activation_emits_transparency_notice_to_model() -> None:
     assert "<skill_activation" in notice
     assert "browser_open" in notice
     assert "search_tools" in notice  # self-correction hint
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_suppress_low_confidence_singleton() -> None:
-    """Confidence threshold — a single low-confidence skill pick must be suppressed."""
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"skill_ids": ["skill_coding"], "confidence": {"skill_coding": "low"}}'
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-conf", intaris_session_id="sess-conf"),
-        conversation=SimpleNamespace(conversation_id="conv-conf"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_coding",
-                        "name": "cognis-coding",
-                        "description": "Cognis coding helper.",
-                        "tags": ["coding"],
-                    }
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Prepare the daily brief.",
-        task_title="Daily brief",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(
-        ctx,
-        user_message="irrelevant expanded prompt",
-    )
-    # Low-confidence singleton should be suppressed.
-    assert message is None
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_keep_high_confidence_pick() -> None:
-    """Confidence threshold — a single high-confidence pick must be kept."""
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"skill_ids": ["skill_brief"], "confidence": {"skill_brief": "high"}}'
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-conf2", intaris_session_id="sess-conf2"),
-        conversation=SimpleNamespace(conversation_id="conv-conf2"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_brief",
-                        "name": "daily-brief",
-                        "description": "Morning briefing skill.",
-                        "tags": ["briefing"],
-                    }
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Prepare the daily brief.",
-        task_title="Daily brief",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(
-        ctx,
-        user_message="irrelevant expanded prompt",
-    )
-    assert message is not None
-    assert "daily-brief" in str(message["content"])
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_keep_two_medium_picks() -> None:
-    """Confidence threshold — two medium picks together meet the threshold."""
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"skill_ids": ["skill_a", "skill_b"], '
-                                '"confidence": {"skill_a": "medium", "skill_b": "medium"}}'
-                            )
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-med", intaris_session_id="sess-med"),
-        conversation=SimpleNamespace(conversation_id="conv-med"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_a",
-                        "name": "skill-alpha",
-                        "description": "Alpha skill.",
-                        "tags": [],
-                    },
-                    {
-                        "skill_id": "skill_b",
-                        "name": "skill-beta",
-                        "description": "Beta skill.",
-                        "tags": [],
-                    },
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Do something.",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(
-        ctx,
-        user_message="irrelevant",
-    )
-    assert message is not None
-    assert "skill-alpha" in str(message["content"])
-    assert "skill-beta" in str(message["content"])
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_suppress_duplicate_medium_singleton() -> None:
-    """Duplicate medium-confidence IDs must not bypass the singleton suppression."""
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"skill_ids": ["skill_a", "skill_a"], '
-                                '"confidence": {"skill_a": "medium"}}'
-                            )
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-meddup", intaris_session_id="sess-meddup"),
-        conversation=SimpleNamespace(conversation_id="conv-meddup"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_a",
-                        "name": "skill-alpha",
-                        "description": "Alpha skill.",
-                        "tags": [],
-                    }
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Do something.",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(ctx, user_message="irrelevant")
-    assert message is None
-
-
-@pytest.mark.asyncio
-async def test_relevant_skill_suggestions_suppress_missing_confidence_singleton() -> None:
-    """Missing confidence is treated conservatively, not as high confidence."""
-
-    class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"skill_ids": ["skill_a"]}'
-                        }
-                    }
-                ]
-            }
-
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-    ctx = StepContext(
-        step_definition=StepDefinition(name="execute", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-noconf", intaris_session_id="sess-noconf"),
-        conversation=SimpleNamespace(conversation_id="conv-noconf"),
-        agent=AgentDefinition(
-            agent_id="agent-1",
-            owner_email="user@example.com",
-            name="Agent",
-            skills={
-                "_runtime_skill_summaries": [
-                    {
-                        "skill_id": "skill_a",
-                        "name": "skill-alpha",
-                        "description": "Alpha skill.",
-                        "tags": [],
-                    }
-                ]
-            },
-        ),
-        policy=CHAT_POLICY,
-        user_message="Do something.",
-    )
-
-    message = await agent_loop._build_relevant_skills_message(ctx, user_message="irrelevant")
-    assert message is None
 
 
 @pytest.mark.asyncio
@@ -5377,9 +4848,7 @@ async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
     assert output is None
     assert fake_llm.calls == 3
     assert "model did not produce output" in "".join(tokens)
-    assert "sess-hung-llm" in agent_loop.session_lock.stale_unlocked_session_ids(
-        max_idle_seconds=0
-    )
+    assert "sess-hung-llm" in agent_loop.session_lock.stale_unlocked_session_ids(max_idle_seconds=0)
 
 
 def test_step_complete_rejects_silent_notification_when_not_allowed() -> None:
@@ -6660,7 +6129,7 @@ async def test_tool_output_helper_results_recover_via_helper_call_id() -> None:
         arguments={"call_id": "source-call", "offset": 1, "limit": 40},
     )
     result = ToolResult(
-        output="<tool_result name=\"read_tool_output\" trust=\"untrusted\">\n1: line\n</tool_result>",
+        output='<tool_result name="read_tool_output" trust="untrusted">\n1: line\n</tool_result>',
         metadata={
             "_raw_output": "1: line",
             "original_size": 7,

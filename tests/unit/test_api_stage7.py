@@ -398,9 +398,7 @@ def test_task_create_rejects_same_conversation_outside_chat(
         assert response.status_code == 400
 
 
-def test_task_create_rejects_unknown_delivery_mode(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_task_create_rejects_unknown_delivery_mode(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
@@ -897,7 +895,9 @@ def test_websocket_direct_chat_step_response_resolves_auth_challenge(
         assert resolved.resolution is not None
         assert resolved.resolution["decision"] == "continue"
         assert resolved.resolution["challenge_completed"] is True
-        assert str(resolved.resolution["response_ref"]).startswith("$credential:challenge_auth_direct_ok")
+        assert str(resolved.resolution["response_ref"]).startswith(
+            "$credential:challenge_auth_direct_ok"
+        )
 
 
 def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
@@ -1599,6 +1599,8 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             "items": [],
             "last_seq": 0,
             "has_more": False,
+            "has_active_turn": False,
+            "active_streams": [],
             "active_session_id": _session_id,
             "active_session_last_seq": 0,
             "history_truncated": False,
@@ -1769,6 +1771,7 @@ def test_conversation_session_events_return_empty_when_stream_missing(
             "items": [],
             "last_seq": 0,
             "has_more": False,
+            "active_thinking": [],
         }
 
 
@@ -1848,6 +1851,7 @@ def test_session_events_route_returns_empty_when_stream_missing(
             "items": [],
             "last_seq": 0,
             "has_more": False,
+            "active_thinking": [],
         }
 
 

@@ -447,7 +447,10 @@ class FollowUpPolicy:
             response = await _generate({"response_format": {"type": "json_object"}})
             content = extract_text_from_response(response)
             if not content or not content.strip():
-                return self._classifier_fallback("empty")
+                response = await _generate({})
+                content = extract_text_from_response(response)
+                if not content or not content.strip():
+                    return self._classifier_fallback("empty")
             payload = extract_json_object(content, label="follow_up_classifier")
             mode = str(payload.get("mode", "notify")).strip().lower()
             if mode not in {FollowUpMode.INTEGRATE.value, FollowUpMode.NOTIFY.value}:

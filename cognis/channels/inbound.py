@@ -748,7 +748,8 @@ class InboundPipeline:
         direct_questions = [
             notif
             for notif in pending
-            if notif.notification_type in {"step_question", "auth_challenge"} and notif.task_id is None
+            if notif.notification_type in {"step_question", "auth_challenge"}
+            and notif.task_id is None
         ]
         if not direct_questions:
             return None
@@ -871,9 +872,9 @@ class InboundPipeline:
                         },
                         exc_info=True,
                     )
-                    if self._is_voice_input(message) and str(
-                        attachment.mime_type or ""
-                    ).startswith("audio/"):
+                    if self._is_voice_input(message) and str(attachment.mime_type or "").startswith(
+                        "audio/"
+                    ):
                         raise
                     continue
             await session.commit()
@@ -937,12 +938,15 @@ class ChannelTurnObserver:
         conversation_id: str,
         session_id: str,
         message_id: str,
-        turn_id: str | None,
-        delta: str,
+        turn_id: str | None = None,
+        delta: str = "",
         chunk_index: int | None = None,
         content_offset: int | None = None,
     ) -> None:
         """Accumulate tokens and send typing indicator."""
+        if not delta and turn_id is not None:
+            delta = turn_id
+            turn_id = None
         self._turn_active = True
         self._accumulated_text += delta
 
@@ -961,7 +965,7 @@ class ChannelTurnObserver:
         call_id: str,
         tool_name: str,
         arguments: dict[str, Any] | None,
-        turn_id: str | None,
+        turn_id: str | None = None,
     ) -> None:
         """Flush buffered text (immediate mode) and send typing indicator."""
         self._turn_active = True
@@ -1022,12 +1026,18 @@ class ChannelTurnObserver:
                     if isinstance(att, dict):
                         raw_result_attachments.append(att)
         manager = self._channel_manager_ref()
-        outbound_media, attachment_fallback_lines, _had_attachment_failures = (
-            await prepare_media_attachments(
-                raw_result_attachments,
-                session_factory=(getattr(manager, "_session_factory", None) if manager is not None else None),
-                artifact_store=(getattr(manager, "_artifact_store", None) if manager is not None else None),
-            )
+        (
+            outbound_media,
+            attachment_fallback_lines,
+            _had_attachment_failures,
+        ) = await prepare_media_attachments(
+            raw_result_attachments,
+            session_factory=(
+                getattr(manager, "_session_factory", None) if manager is not None else None
+            ),
+            artifact_store=(
+                getattr(manager, "_artifact_store", None) if manager is not None else None
+            ),
         )
 
         if not self._turn_active and not outbound_media and not attachment_fallback_lines:
@@ -1297,6 +1307,8 @@ class ChannelTurnObserver:
         the next inbound message starts with a clean list.
         """
         self._turn_scheduler.remove_observer(self._conversation_id, self)
+
+
 def _signal_image_preview_payload(attachments: list[dict[str, Any]]) -> dict[str, str] | None:
     for attachment in attachments:
         mime_type = attachment.get("mime_type")

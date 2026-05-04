@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -178,7 +179,9 @@ def test_resolve_source_names_expands_all_to_prior_run_steps() -> None:
         StepDefinition(name="setup", type="run"),
         StepDefinition(name="gate", type="gate", gate={"message": "Continue?"}),
         StepDefinition(name="collect", type="run"),
-        StepDefinition(name="synthesize", type="run", input=StepInputConfig(type="last", source="all")),
+        StepDefinition(
+            name="synthesize", type="run", input=StepInputConfig(type="last", source="all")
+        ),
     ]
 
     names = resolve_source_names(steps[3], 3, steps)
@@ -455,6 +458,87 @@ def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
             "content": "Tady je soubor.\n\nAttachments: report.pdf (pdf, artifact_id=file_1)",
         }
     ]
+
+
+def test_events_to_messages_replays_historic_user_image_natively() -> None:
+    events = [
+        {
+            "type": "user_message",
+            "data": {
+                "content": "Tady je snimek.",
+                "attachments": [
+                    {
+                        "artifact_id": "img_1",
+                        "filename": "xray.png",
+                        "mime_type": "image/png",
+                        "kind": "image",
+                        "size_bytes": 123,
+                        "url": "https://cognis.example.com/artifacts/img_1/xray.png",
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(
+        events,
+        model_info=SimpleNamespace(
+            supports_vision=True,
+            supports_pdf_input=False,
+            supports_audio_input=False,
+            supports_file_input=False,
+        ),
+    )
+
+    assert messages[0]["role"] == "user"
+    content = messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "Attachments: xray.png" in content[0]["text"]
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://cognis.example.com/artifacts/img_1/xray.png"},
+    }
+
+
+def test_events_to_messages_replays_historic_assistant_image_natively() -> None:
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "Here it is.",
+                "attachments": [
+                    {
+                        "artifact_id": "img_1",
+                        "filename": "banner.png",
+                        "mime_type": "image/png",
+                        "kind": "image",
+                        "size_bytes": 123,
+                        "url": "https://cognis.example.com/artifacts/img_1/banner.png",
+                    }
+                ],
+            },
+        }
+    ]
+
+    messages = events_to_messages(
+        events,
+        model_info=SimpleNamespace(
+            supports_vision=True,
+            supports_pdf_input=False,
+            supports_audio_input=False,
+            supports_file_input=False,
+        ),
+    )
+
+    assert messages[0]["role"] == "assistant"
+    content = messages[0]["content"]
+    assert isinstance(content, list)
+    assert "<assistant_attachments>" in content[0]["text"]
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://cognis.example.com/artifacts/img_1/banner.png"},
+    }
 
 
 def test_events_to_messages_escapes_assistant_attachment_context() -> None:

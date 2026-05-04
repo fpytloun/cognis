@@ -1096,12 +1096,26 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
     step_def = StepDefinition(name="execute", type="run", prompt="Do work")
     workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
     conversation = SimpleNamespace(conversation_id="conv-1")
-    session = SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+    session = SimpleNamespace(
+        session_id="sess-1",
+        intaris_session_id="sess-1",
+        user_email="user@example.com",
+        parent_session_id=None,
+        delegation_mode="primary",
+    )
     updated_statuses: list[tuple[str, str]] = []
 
-    async def _resolve_step_agent(*args: object, **kwargs: object) -> SimpleNamespace:
+    async def _resolve_step_agents(
+        *args: object, **kwargs: object
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
         del args, kwargs
-        return SimpleNamespace(agent_id="agent-1", agent_type="primary")
+        agent = SimpleNamespace(
+            agent_id="agent-1",
+            agent_type="primary",
+            owner_email="user@example.com",
+            is_system=False,
+        )
+        return agent, agent
 
     async def _reuse_or_create(*args: object, **kwargs: object):
         del args, kwargs
@@ -1117,6 +1131,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
             tool_registry=None,
             executor_connection=None,
             executor_environment=None,
+            runtime_info=None,
             cleanup=lambda: asyncio.sleep(0),
         )
 
@@ -1138,7 +1153,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
         del args, kwargs
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(engine, "_resolve_step_agent", _resolve_step_agent)
+    monkeypatch.setattr(engine, "_resolve_step_agents", _resolve_step_agents)
     monkeypatch.setattr(engine, "_reuse_or_create_step_session", _reuse_or_create)
     monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
     monkeypatch.setattr(engine, "_resolve_step_runtime", _resolve_runtime)
