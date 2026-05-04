@@ -110,6 +110,7 @@ bring the codebase in line with the updated specs.
 | 32 | [Workflow-First Composition and Ephemeral Workflows](stage-32-workflow-composition.md) | DONE | `compose_and_run_workflow`, hidden workflow-composer and skill-decomposer agents, ephemeral workflow lifecycle, coding workflow family, skill `steps:` extension, promote-from-task UX |
 | 33 | [Projects, Step Metadata Gating, and Human-as-Evaluator Revisions](stage-33-projects-and-revisions.md) | DONE | Projects with multi-source repos and shareable grants, project-aware tasks/schedules/conversations, project-bound workflow eligibility, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, human-driven revisions with classifier-selected re-entry steps and preserved step-run history |
 | 34 | [Voice Mode (TTS, STT, Conversation Mode)](stage-34-voice-mode.md) | PLANNED | `LLMProvider.synthesize()` and executor routing, `text_to_speech` model routing slot, `tts_cache` table, `POST /api/v1/tts/synthesize` and `POST /api/v1/stt/transcribe`, per-agent voice with system fallback, speaker button on assistant messages, web microphone with iMessage-style record-preview-send (STT-first), sentence-buffered TTS streaming, and bidirectional conversation-mode overlay |
+| 35 | [Conversation Search](stage-35-conversation-search.md) | PLANNED | Intaris-owned hybrid search: lexical Tier 1 (PG `tsvector` + `pg_trgm`, SQLite FTS5 trigram) mandatory, vector Tier 2 (pgvector / Qdrant URL or local-mode) optional, outbox-backed indexer, `INTARIS_SEARCH_ENABLED` feature flag (default `true`), `/api/v1/search/*` endpoints + Intaris UI. Cognis proxy + join with `conversations`, in-conversation Cmd+F with magnifier and client-first/server-fallback, sidebar promote-to-search with explicit submit, three LLM tools (`list_conversations`, `search_conversations`, `read_conversation_messages` with anchor-based pagination), `conversation_id` propagated through `RuntimeAccessContext` and tool runtime metadata, strict user scoping (no admin bypass, no agent-grant expansion). |
 
 ## Scope Boundary
 
@@ -131,6 +132,12 @@ Stage 34 is independent of stages 28–33 and adds voice mode end-to-end:
 TTS provider plumbing, the web mic flow, speaker buttons, sentence-buffered
 streaming, and a dedicated conversation-mode overlay. Its phases (34.1–34.9)
 are individually mergeable.
+
+Stage 35 is independent of stages 28–34 and adds conversation search across
+Intaris and Cognis. The bulk of the work (35.1–35.5) lands in Intaris and
+can be reviewed without Cognis. The Cognis-side phases (35.6–35.8) can be
+drafted in parallel once the Intaris API shape is stable. All phases are
+individually mergeable.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,
