@@ -427,6 +427,7 @@ class ExecutorRunner:
                     [b for b in web_backends if b not in {"brave", "searxng"}],
                 ),
                 "web_secrets": secrets,
+                "controller_url": self.config.controller_url,
                 "browser": browser_config_dict,
                 "environment": _build_environment_payload(),
                 "mcp_servers": mcp_statuses,
@@ -466,6 +467,9 @@ class ExecutorRunner:
 
             # Register skill tool handlers from controller-provided manifests
             skill_manifests_raw = params.get("skill_manifests") or []
+            self._runtime_metadata["skill_manifests"] = [
+                manifest for manifest in skill_manifests_raw if isinstance(manifest, dict)
+            ]
             await self._register_skill_handlers(skill_manifests_raw, secrets)
 
             if self._inference_handler is None:
@@ -1248,6 +1252,7 @@ class ExecutorRunner:
     def _public_runtime_metadata(self) -> dict[str, Any]:
         metadata = dict(self._runtime_metadata)
         metadata.pop("web_secrets", None)
+        metadata.pop("skill_manifests", None)
         metadata.pop(BROWSER_MANAGER_KEY, None)
         metadata.pop(LSP_MANAGER_KEY, None)
         metadata.pop(_FILE_FRESHNESS_KEY, None)

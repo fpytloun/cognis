@@ -7,6 +7,7 @@ from cognis.models.skill import (
     AgentSkillRef,
     ResolvedSkill,
     ResolvedSkillSet,
+    SkillAssetRef,
     SkillToolSpec,
 )
 from cognis.tools.skill_parser import (
@@ -645,6 +646,79 @@ def test_skill_management_tool_count() -> None:
 
     tools = skill_management_tools()
     assert len(tools) == 11
+
+
+def test_skill_load_runtime_summaries_include_callable_names() -> None:
+    from cognis.tools.builtin.skill_management import _skill_tool_runtime_summaries
+
+    summaries = _skill_tool_runtime_summaries(
+        "youtube-transcript",
+        [
+            {
+                "name": "get_transcript",
+                "description": "Fetch a transcript",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+                "recipe": {
+                    "mode": "script",
+                    "entry": "assets/youtube_transcript.py",
+                    "required_assets": ["assets/youtube_transcript.py"],
+                },
+            }
+        ],
+    )
+
+    assert summaries == [
+        {
+            "name": "get_transcript",
+            "callable_name": "skill_youtube-transcript__get_transcript",
+            "stable_tool_id": "skill:youtube-transcript:get_transcript",
+            "description": "Fetch a transcript",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+            "recipe": {
+                "mode": "script",
+                "entry": "assets/youtube_transcript.py",
+                "required_assets": ["assets/youtube_transcript.py"],
+            },
+        }
+    ]
+
+
+def test_skill_load_asset_manifest_strips_internal_references() -> None:
+    from cognis.tools.builtin.skill_management import _skill_asset_llm_manifest
+
+    manifest = _skill_asset_llm_manifest(
+        [
+            SkillAssetRef(
+                filename="assets/youtube_transcript.py",
+                asset_id="sa-script",
+                artifact_namespace="skills",
+                artifact_object_id="ska-private",
+                content_hash="a" * 64,
+                size_bytes=12,
+                content_type="text/x-python",
+                url="https://controller.test/signed",
+                signed_url="https://storage.test/private",
+            )
+        ]
+    )
+
+    assert manifest == [
+        {
+            "filename": "assets/youtube_transcript.py",
+            "asset_id": "sa-script",
+            "content_hash": "a" * 64,
+            "size_bytes": 12,
+            "content_type": "text/x-python",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

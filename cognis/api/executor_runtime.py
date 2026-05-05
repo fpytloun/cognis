@@ -299,7 +299,7 @@ async def _build_configure_payload(
                 db_session, dummy_agent, owner_email=row.owner_email
             )
         for skill in resolved.skills:
-            if skill.tools:
+            if skill.tools or skill.asset_manifest:
                 manifest: dict[str, Any] = {
                     "skill_id": skill.skill_id,
                     "version_id": skill.version_id,

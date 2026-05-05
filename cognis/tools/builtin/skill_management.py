@@ -27,7 +27,7 @@ from cognis.tools.skill_service import (
     normalize_skill_tools,
     resolve_current_skill_version,
 )
-from cognis.tools.skills import skill_tools_to_definitions
+from cognis.tools.skills import _qualified_skill_tool_name, skill_tools_to_definitions
 
 logger = get_logger(__name__)
 
@@ -699,6 +699,9 @@ async def _handle_skill_load(
         )
         steps = getattr(version_row, "steps", None) if version_row is not None else None
 
+    asset_manifest = _skill_asset_llm_manifest(asset_refs)
+    available_skill_tools = _skill_tool_runtime_summaries(row.skill_id, tools)
+
     protected_context_parts = [
         "<loaded_skill>",
         f"<skill_id>{row.skill_id}</skill_id>",
@@ -711,6 +714,23 @@ async def _handle_skill_load(
     if tools:
         protected_context_parts.append(
             "<tool_summaries>\n" + json.dumps(tools, indent=2, default=str) + "\n</tool_summaries>"
+        )
+    if available_skill_tools:
+        protected_context_parts.append(
+            "<available_skill_tools>\n"
+            + json.dumps(available_skill_tools, indent=2, default=str)
+            + "\n</available_skill_tools>"
+        )
+    if asset_manifest:
+        protected_context_parts.append(
+            "<asset_manifest>\n"
+            + json.dumps(asset_manifest, indent=2, default=str)
+            + "\n</asset_manifest>"
+        )
+        protected_context_parts.append(
+            "<asset_guidance>Prefer available_skill_tools for runnable skill behavior. "
+            "Use skill_asset_materialize only when you need an asset-only script or "
+            "need to inspect an asset as an executor-local file.</asset_guidance>"
         )
     if templates:
         protected_context_parts.append(
@@ -765,6 +785,15 @@ async def _handle_skill_load(
         "step_count": len(steps or []),
         "template_count": len(templates or {}),
         "asset_count": len(asset_refs),
+        "available_skill_tools": available_skill_tools,
+        "asset_manifest": asset_manifest,
+        "asset_guidance": (
+            "Prefer available_skill_tools for runnable behavior. Use "
+            "skill_asset_materialize(skill_id, asset_id) only for asset-only scripts "
+            "or asset inspection."
+            if asset_manifest
+            else None
+        ),
         "message": "Skill loaded into working context for this turn.",
         "tags": row.tags or [],
         "linked_tool_ids": row.linked_tool_ids or [],
@@ -789,6 +818,62 @@ async def _handle_skill_load(
             },
         },
     )
+
+
+def _skill_tool_runtime_summaries(
+    skill_id: str,
+    tools: list[dict[str, Any]] | dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return LLM-facing runtime names for skill-defined tools."""
+
+    if not tools:
+        return []
+    raw_items = list(tools.values()) if isinstance(tools, dict) else tools
+    if not isinstance(raw_items, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        raw_name = str(raw.get("name") or "").strip()
+        if not raw_name:
+            continue
+        recipe = raw.get("recipe") if isinstance(raw.get("recipe"), dict) else {}
+        summary: dict[str, Any] = {
+            "name": raw_name,
+            "callable_name": _qualified_skill_tool_name(skill_id, raw_name),
+            "stable_tool_id": f"skill:{skill_id}:{raw_name}",
+            "description": raw.get("description") or "",
+            "parameters": raw.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if recipe:
+            summary["recipe"] = {
+                "mode": recipe.get("mode"),
+                "entry": recipe.get("entry"),
+                "required_assets": recipe.get("required_assets") or [],
+            }
+        summaries.append(summary)
+    return summaries
+
+
+def _skill_asset_llm_manifest(asset_refs: list[Any]) -> list[dict[str, Any]]:
+    """Return asset metadata safe to expose to the LLM."""
+
+    manifest: list[dict[str, Any]] = []
+    for ref in asset_refs:
+        raw = ref.model_dump(mode="json", exclude_none=True) if hasattr(ref, "model_dump") else ref
+        if not isinstance(raw, dict):
+            continue
+        manifest.append(
+            {
+                "filename": raw.get("filename"),
+                "asset_id": raw.get("asset_id"),
+                "content_hash": raw.get("content_hash"),
+                "size_bytes": raw.get("size_bytes", 0),
+                "content_type": raw.get("content_type", "application/octet-stream"),
+            }
+        )
+    return manifest
 
 
 async def _handle_skill_get(

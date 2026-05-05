@@ -88,6 +88,55 @@ async def test_handle_configure_filters_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_configure_exposes_skill_assets_to_materialize_tool(tmp_path: Path) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    target = tmp_path / "youtube_transcript.py"
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": ["skill_asset_materialize"],
+            "enabled_tool_groups": [],
+            "config": {},
+            "skill_manifests": [
+                {
+                    "skill_id": "youtube-transcript",
+                    "asset_manifest": [
+                        {
+                            "filename": "assets/youtube_transcript.py",
+                            "asset_id": "sa-script",
+                            "content_b64": "cHJpbnQoJ2hpJykK",
+                            "content_type": "text/x-python",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "skill_asset_materialize",
+            "arguments": {
+                "skill_id": "youtube-transcript",
+                "asset_id": "sa-script",
+                "target_path": str(target),
+            },
+        },
+    )
+
+    result = ws.sent[-1]["result"]
+    assert result["is_error"] is False
+    assert target.read_text() == "print('hi')\n"
+    assert "skill_manifests" not in ws.sent[0]["result"]["runtime_metadata"]
+
+
+@pytest.mark.asyncio
 async def test_handle_tool_list_returns_configured_definitions() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()

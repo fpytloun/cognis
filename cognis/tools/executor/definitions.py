@@ -41,6 +41,7 @@ from cognis.tools.executor.filesystem import (
     handle_list_directory,
     handle_multiedit,
     handle_read,
+    handle_skill_asset_materialize,
     handle_write,
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
@@ -129,6 +130,36 @@ ARTIFACT_SAVE_TOOL = ToolDefinition(
             },
         },
         "required": ["file_path", "source_artifact_id"],
+    },
+    source=_EXECUTOR_SOURCE,
+    category="filesystem",
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=60,
+)
+
+SKILL_ASSET_MATERIALIZE_TOOL = ToolDefinition(
+    name="skill_asset_materialize",
+    description=(
+        "Materialize an attached skill asset onto the executor filesystem and return "
+        "its local_path. Prefer calling available skill tools directly for runnable "
+        "skill behavior; use this for asset-only scripts or asset inspection."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string", "description": "Skill ID that owns the asset."},
+            "asset_id": {"type": "string", "description": "Asset ID from skill_load asset_manifest."},
+            "filename": {
+                "type": "string",
+                "description": "Optional asset filename to disambiguate when asset_id is not known.",
+            },
+            "target_path": {
+                "type": "string",
+                "description": "Optional absolute executor path to write. Defaults to a stable temp-cache path.",
+            },
+        },
+        "required": ["skill_id"],
     },
     source=_EXECUTOR_SOURCE,
     category="filesystem",
@@ -629,6 +660,7 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     READ_TOOL,
     WRITE_TOOL,
     ARTIFACT_SAVE_TOOL,
+    SKILL_ASSET_MATERIALIZE_TOOL,
     EDIT_TOOL,
     APPLY_PATCH_TOOL,
     MULTIEDIT_TOOL,
@@ -651,6 +683,7 @@ _HANDLER_MAP: dict[
     "read": handle_read,
     "write": handle_write,
     "artifact_save": handle_artifact_save,
+    "skill_asset_materialize": handle_skill_asset_materialize,
     "edit": handle_edit,
     "apply_patch": handle_apply_patch,
     "multiedit": handle_multiedit,

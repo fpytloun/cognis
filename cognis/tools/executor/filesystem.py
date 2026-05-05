@@ -6,14 +6,18 @@ import asyncio
 import base64
 import contextlib
 import difflib
+import hashlib
+import json
 import mimetypes
 import os
 import re
 import shutil
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from cognis.logging import get_logger
 from cognis.models.tool import ToolResult
@@ -521,6 +525,181 @@ async def handle_artifact_save(arguments: dict[str, Any], context: ToolExecution
         return ToolResult(output=str(output), metadata={"files_written": [str(path)]})
 
     return await _with_file_lock(context, path, _write_binary)
+
+
+async def handle_skill_asset_materialize(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    """Materialize a skill asset to an executor-local path."""
+
+    skill_id = str(arguments.get("skill_id") or "").strip()
+    asset_id = str(arguments.get("asset_id") or "").strip()
+    filename_arg = str(arguments.get("filename") or "").strip()
+    if not skill_id:
+        return ToolResult(output="skill_id is required", is_error=True)
+
+    asset = _find_skill_asset(context, skill_id, asset_id=asset_id, filename=filename_arg)
+    if asset is None:
+        return ToolResult(
+            output=(
+                "Skill asset not found in this executor runtime. Call skill_load and use an "
+                "asset_id from asset_manifest, or ensure the executor has been reconfigured."
+            ),
+            is_error=True,
+        )
+
+    filename = str(asset.get("filename") or "").strip()
+    if not filename:
+        return ToolResult(output="Skill asset is missing filename metadata", is_error=True)
+
+    try:
+        content = await _load_skill_asset_content(asset, context)
+    except Exception as exc:
+        return ToolResult(output=f"Failed to load skill asset: {exc}", is_error=True)
+
+    expected_hash = str(asset.get("content_hash") or "").strip()
+    if expected_hash:
+        actual_hash = hashlib.sha256(content).hexdigest()
+        if actual_hash != expected_hash:
+            return ToolResult(output=f"Asset hash mismatch for {filename}", is_error=True)
+
+    target_path = str(arguments.get("target_path") or "").strip()
+    try:
+        if target_path:
+            path = _resolve_path(target_path, context)
+            if path.exists() and path.is_dir():
+                path = _resolve_asset_target_in_directory(path, filename)
+        else:
+            path = _default_skill_asset_path(skill_id, asset, filename)
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
+
+    async def _write_asset() -> ToolResult:
+        if path.exists():
+            try:
+                await _assert_can_modify_existing(context, path)
+            except RuntimeError as exc:
+                return ToolResult(output=str(exc), is_error=True)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            await _record_write(context, path)
+        except (OSError, PermissionError) as exc:
+            return ToolResult(output=f"Cannot materialize skill asset: {exc}", is_error=True)
+
+        output = {
+            "local_path": str(path),
+            "skill_id": skill_id,
+            "asset_id": asset.get("asset_id"),
+            "filename": filename,
+            "content_type": asset.get("content_type") or "application/octet-stream",
+            "size_bytes": len(content),
+            "content_hash": hashlib.sha256(content).hexdigest(),
+        }
+        return ToolResult(
+            output=json.dumps(output, sort_keys=True),
+            metadata={"files_written": [str(path)], "skill_asset": output},
+        )
+
+    return await _with_file_lock(context, path, _write_asset)
+
+
+def _find_skill_asset(
+    context: ToolExecutionContext,
+    skill_id: str,
+    *,
+    asset_id: str,
+    filename: str,
+) -> dict[str, Any] | None:
+    manifests = context.runtime_metadata.get("skill_manifests")
+    if not isinstance(manifests, list):
+        manifests = []
+    candidates: list[dict[str, Any]] = []
+    for manifest in manifests:
+        if not isinstance(manifest, dict) or manifest.get("skill_id") != skill_id:
+            continue
+        for raw_asset in manifest.get("asset_manifest") or []:
+            if isinstance(raw_asset, dict):
+                candidates.append(raw_asset)
+    if asset_id:
+        for asset in candidates:
+            if str(asset.get("asset_id") or "") == asset_id:
+                return asset
+        return None
+    if filename:
+        for asset in candidates:
+            if str(asset.get("filename") or "") == filename:
+                return asset
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
+async def _load_skill_asset_content(
+    asset: dict[str, Any], context: ToolExecutionContext
+) -> bytes:
+    content_b64 = asset.get("content_b64")
+    if isinstance(content_b64, str) and content_b64.strip():
+        return base64.b64decode(content_b64, validate=True)
+
+    url = str(asset.get("url") or "").strip()
+    if url:
+        import httpx
+
+        _validate_skill_asset_url(url, context)
+        async with httpx.AsyncClient(timeout=60) as client:
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+            except Exception as exc:
+                raise ValueError("failed to fetch controller-provided asset URL") from exc
+            return response.content
+
+    artifact_store = None
+    if context.shared_runtime_metadata is not None:
+        artifact_store = context.shared_runtime_metadata.get("artifact_store")
+    artifact_store = artifact_store or context.runtime_metadata.get("artifact_store")
+    artifact_oid = str(asset.get("artifact_object_id") or "").strip()
+    filename = str(asset.get("filename") or "").strip()
+    if artifact_store is not None and artifact_oid and filename:
+        namespace = str(asset.get("artifact_namespace") or "skills")
+        content, _content_type = await artifact_store.async_load(namespace, artifact_oid, filename)
+        return content
+
+    raise ValueError("asset has no materializable content, URL, or artifact store reference")
+
+
+def _default_skill_asset_path(skill_id: str, asset: dict[str, Any], filename: str) -> Path:
+    safe_skill = re.sub(r"[^a-zA-Z0-9_.-]+", "_", skill_id).strip("._") or "skill"
+    safe_asset = re.sub(
+        r"[^a-zA-Z0-9_.-]+",
+        "_",
+        str(asset.get("asset_id") or asset.get("content_hash") or "asset"),
+    ).strip("._") or "asset"
+    root = Path(tempfile.gettempdir()) / "cognis_skill_assets" / safe_skill / safe_asset
+    target = (root / filename).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise ValueError(f"Unsafe skill asset filename rejected: {filename}")
+    return target
+
+
+def _resolve_asset_target_in_directory(directory: Path, filename: str) -> Path:
+    root = directory.resolve()
+    target = (root / filename).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"Unsafe skill asset filename rejected: {filename}")
+    return target
+
+
+def _validate_skill_asset_url(url: str, context: ToolExecutionContext) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("skill asset URL must be an HTTP(S) controller URL")
+    controller_url = str(context.runtime_metadata.get("controller_url") or "").strip()
+    if not controller_url:
+        raise ValueError("skill asset URL requires a configured controller origin")
+    controller = urlparse(controller_url.replace("ws://", "http://", 1).replace("wss://", "https://", 1))
+    if controller.netloc and parsed.netloc != controller.netloc:
+        raise ValueError("skill asset URL host does not match the configured controller")
 
 
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:

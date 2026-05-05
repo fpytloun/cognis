@@ -651,6 +651,8 @@ def build_step_runtime_factory(
             "executor_agent_id": executor_agent.agent_id,
             **db_config,
         }
+        if artifact_store is not None:
+            runtime_metadata["artifact_store"] = artifact_store
         workspace_root = current_workspace_root.get()
         working_directory = current_effective_working_directory.get()
         if workspace_root:
@@ -701,6 +703,19 @@ def build_step_runtime_factory(
                     if skill.skill_id != "cognis-agent-manager"
                 ]
             if resolved_skills.skills:
+                runtime_metadata["skill_manifests"] = [
+                    {
+                        "skill_id": skill.skill_id,
+                        "version_id": skill.version_id,
+                        "content_hash": skill.content_hash,
+                        "asset_manifest": [
+                            asset.model_dump(mode="json", exclude_none=True)
+                            for asset in skill.asset_manifest
+                        ],
+                    }
+                    for skill in resolved_skills.skills
+                    if skill.asset_manifest or skill.tools
+                ]
                 # Build compact metadata for the immutable prompt prefix
                 metadata = build_available_skills_metadata(resolved_skills)
                 if metadata:

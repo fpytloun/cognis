@@ -22,6 +22,7 @@ from cognis.tools.executor.filesystem import (
     handle_list_directory,
     handle_multiedit,
     handle_read,
+    handle_skill_asset_materialize,
     handle_write,
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
@@ -64,6 +65,7 @@ class TestDefinitions:
             "read",
             "write",
             "artifact_save",
+            "skill_asset_materialize",
             "edit",
             "apply_patch",
             "multiedit",
@@ -88,7 +90,15 @@ class TestDefinitions:
             assert d.name in handlers, f"Missing handler for {d.name}"
 
     def test_write_tools_are_non_bypassable(self) -> None:
-        write_tools = {"write", "artifact_save", "edit", "apply_patch", "multiedit", "bash"}
+        write_tools = {
+            "write",
+            "artifact_save",
+            "skill_asset_materialize",
+            "edit",
+            "apply_patch",
+            "multiedit",
+            "bash",
+        }
         for tool in ALL_EXECUTOR_TOOLS:
             if tool.name in write_tools:
                 assert tool.non_bypassable, f"{tool.name} should be non_bypassable"
@@ -349,6 +359,166 @@ class TestWriteTool:
 
         assert result.is_error
         assert "Provide source_artifact_id" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_writes_attached_asset(self, tmp_path: Path) -> None:
+        target = tmp_path / "youtube_transcript.py"
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "youtube-transcript",
+                        "asset_manifest": [
+                            {
+                                "filename": "assets/youtube_transcript.py",
+                                "asset_id": "sa-script",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_type": "text/x-python",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {
+                "skill_id": "youtube-transcript",
+                "asset_id": "sa-script",
+                "target_path": str(target),
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "print('hi')\n"
+        assert result.metadata is not None
+        assert result.metadata["skill_asset"]["local_path"] == str(target)
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_directory_traversal_filename(
+        self, tmp_path: Path
+    ) -> None:
+        target_dir = tmp_path / "assets"
+        target_dir.mkdir()
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "bad-skill",
+                        "asset_manifest": [
+                            {
+                                "filename": "../outside.py",
+                                "asset_id": "sa-bad",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {"skill_id": "bad-skill", "asset_id": "sa-bad", "target_path": str(target_dir)},
+            context,
+        )
+
+        assert result.is_error
+        assert "Unsafe skill asset filename" in result.output
+        assert not (tmp_path / "outside.py").exists()
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_hash_mismatch(self, tmp_path: Path) -> None:
+        target = tmp_path / "tool.py"
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "bad-hash",
+                        "asset_manifest": [
+                            {
+                                "filename": "tool.py",
+                                "asset_id": "sa-hash",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_hash": "0" * 64,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {"skill_id": "bad-hash", "asset_id": "sa-hash", "target_path": str(target)},
+            context,
+        )
+
+        assert result.is_error
+        assert "Asset hash mismatch" in result.output
+        assert not target.exists()
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_url_without_controller_origin(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "tool.py"
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "url-skill",
+                        "asset_manifest": [
+                            {
+                                "filename": "tool.py",
+                                "asset_id": "sa-url",
+                                "url": "https://controller.test/private/tool.py",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {"skill_id": "url-skill", "asset_id": "sa-url", "target_path": str(target)},
+            context,
+        )
+
+        assert result.is_error
+        assert "configured controller origin" in result.output
+        assert not target.exists()
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_url_from_wrong_host(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "tool.py"
+        context = _context(
+            runtime_metadata={
+                "controller_url": "wss://controller.test/api/executor/ws",
+                "skill_manifests": [
+                    {
+                        "skill_id": "url-skill",
+                        "asset_manifest": [
+                            {
+                                "filename": "tool.py",
+                                "asset_id": "sa-url",
+                                "url": "https://evil.test/private/tool.py",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {"skill_id": "url-skill", "asset_id": "sa-url", "target_path": str(target)},
+            context,
+        )
+
+        assert result.is_error
+        assert "host does not match" in result.output
+        assert not target.exists()
 
 
 class TestEditTool:
