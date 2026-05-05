@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -15,6 +16,7 @@ from cognis.api.models import (
     ExecutorTokenResponse,
     ExecutorUpdateRequest,
 )
+from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.executor_policy import (
     ensure_executor_type_allowed,
     load_executor_policy,
@@ -165,13 +167,35 @@ async def generate_executor_token_route(
     executor_id: str,
 ) -> ExecutorTokenResponse:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
-    if row is None:
-        raise api_exception(404, "not_found", "Executor not found")
-    _require_executor_mutation_access(request, row)
-    token = request.app.state.providers.auth.sign_executor_token(executor_id)
-    return ExecutorTokenResponse(executor_id=executor_id, token=token, expires_in=30 * 24 * 3600)
+    async with executor_token_lock(executor_id):
+        async with request.app.state.session_factory() as session:
+            row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
+            if row is None:
+                raise api_exception(404, "not_found", "Executor not found")
+            _require_executor_mutation_access(request, row)
+            if row.executor_type != "websocket":
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    "Only WebSocket executors use persistent tokens",
+                )
+            result = await session.execute(
+                update(ExecutorRow)
+                .where(ExecutorRow.executor_id == executor_id)
+                .values(token_version=ExecutorRow.token_version + 1)
+                .returning(ExecutorRow.token_version)
+            )
+            token_version = int(result.scalar_one())
+            await session.commit()
+        connected = request.app.state.providers.executor.websocket.get_connection(executor_id)
+        if connected is not None:
+            with contextlib.suppress(Exception):
+                await connected.close()
+    token = request.app.state.providers.auth.sign_executor_token(
+        executor_id,
+        token_version=token_version,
+    )
+    return ExecutorTokenResponse(executor_id=executor_id, token=token, expires_in=None)
 
 
 @router.put("/api/v1/executors/{executor_id}", response_model=ExecutorConfigResponse)

@@ -484,7 +484,7 @@ class SessionCache:
 - JWKS endpoint at `GET /.well-known/jwks.json`
 - User JWT: `sub` = email, `aud` = `["cognis"]`, `role` = user role
 - Service JWT (to Mnemory/Intaris): `sub` = user email, `aud` = `["mnemory", "intaris"]`
-- Executor JWT: `sub` = executor_id, `aud` = `["cognis-executor"]`, `typ` = `"executor"`. Default TTL 30 days (configurable). Short-lived (5 min) for subprocess executors.
+- Executor JWT: `sub` = executor_id, `aud` = `["cognis-executor"]`, `typ` = `"executor"`. Remote executor tokens do not expire and are revoked by bumping the executor's `token_version`. Short-lived (5 min) tokens are still used for subprocess executors.
 - Password hashing: argon2id (`time_cost=3, memory_cost=65536, parallelism=4`)
 
 ### Content redaction

@@ -187,3 +187,87 @@ def test_regular_user_cannot_mutate_owned_local_executor(
 
         assert update_response.status_code == 403
         assert token_response.status_code == 403
+
+
+def test_executor_token_generation_rotates_token_version(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_executor(
+                    session,
+                    executor_id="remote-1",
+                    name="Remote",
+                    executor_type="websocket",
+                    owner_email="user@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        headers = _auth_headers(client.app, email="user@example.com", role="user")
+        first = client.post("/api/v1/executors/remote-1/token", headers=headers)
+        second = client.post("/api/v1/executors/remote-1/token", headers=headers)
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_payload = first.json()
+        second_payload = second.json()
+        assert first_payload["expires_in"] is None
+        assert second_payload["expires_in"] is None
+
+        first_claims = client.app.state.auth_provider.verify_executor_token(first_payload["token"])
+        second_claims = client.app.state.auth_provider.verify_executor_token(second_payload["token"])
+        assert first_claims["etv"] == 1
+        assert second_claims["etv"] == 2
+
+        async def _load_token_version() -> int:
+            async with client.app.state.session_factory() as session:
+                row = await executors_routes.get_executor_row(session, "remote-1")
+                assert row is not None
+                return row.token_version
+
+        assert asyncio.run(_load_token_version()) == 2
+
+
+def test_persistent_token_generation_rejects_non_websocket_executors(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_executor(
+                    session,
+                    executor_id="subprocess-1",
+                    name="Subprocess",
+                    executor_type="subprocess",
+                    owner_email="admin@example.com",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/executors/subprocess-1/token",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "validation_error"

@@ -1405,7 +1405,7 @@ class ExecutorUpdateRequest(BaseModel):
 class ExecutorTokenResponse(BaseModel):
     executor_id: str
     token: str
-    expires_in: int
+    expires_in: int | None = None
 
 
 # --- MCP Servers ---

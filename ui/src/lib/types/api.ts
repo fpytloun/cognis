@@ -732,7 +732,7 @@ export interface ExecutorRuntimeMetadata {
 export interface ExecutorTokenResponse {
   executor_id: string;
   token: string;
-  expires_in: number;
+  expires_in: number | null;
 }
 
 export interface SkillVersion {

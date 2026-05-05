@@ -23,6 +23,7 @@ from cognis.api.models import (
     AgentResponse,
     DeliverableResponse,
     EffectiveToolItemResponse,
+    ExecutorTokenResponse,
     MessageHistoryResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
@@ -158,6 +159,12 @@ def test_deliverable_response_round_trip() -> None:
 
     assert response.outputs == {"tests": "passed"}
     assert response.status == "approved"
+
+
+def test_executor_token_response_allows_non_expiring_tokens() -> None:
+    response = ExecutorTokenResponse(executor_id="exec-1", token="jwt", expires_in=None)
+
+    assert response.expires_in is None
 
 
 def test_message_history_response_round_trips_active_streams() -> None:

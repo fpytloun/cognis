@@ -2690,7 +2690,7 @@ import { onMount, tick } from 'svelte';
                     showExecutorForm = true;
                   }}>Edit</Button>
                 {/if}
-                {#if canManage && exec.executor_type !== 'in_process'}
+                {#if canManage && exec.executor_type === 'websocket'}
                   <Button variant="secondary" size="sm" onclick={async () => {
                     try {
                       executorToken = await api.executor.generateToken(exec.executor_id);
@@ -2744,7 +2744,7 @@ import { onMount, tick } from 'svelte';
             {#if canManage && executorToken && executorToken.executor_id === exec.executor_id}
               {@const execCommand = `cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken.token}`}
               <div class="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-3">
-                <p class="text-sm text-emerald-100">Copy this token now. It is not stored in the UI.</p>
+                <p class="text-sm text-emerald-100">Copy this token now. It does not expire; generate a new token to revoke older tokens.</p>
                 <textarea readonly class="min-h-[72px] w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-100">{executorToken.token}</textarea>
                 <p class="text-xs text-slate-400 mt-2">Run this command on the remote machine:</p>
                 <pre class="w-full rounded-2xl border border-emerald-500/20 bg-slate-950/80 px-4 py-3 font-mono text-xs text-slate-200 whitespace-pre-wrap break-all">{execCommand}</pre>

@@ -211,6 +211,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_last_read_at)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
+        await conn.run_sync(_ensure_executor_token_version_column)
         await conn.run_sync(_ensure_skill_versioning_columns)
         await conn.run_sync(_ensure_skill_linked_tools_column)
         await conn.run_sync(_ensure_skill_decomposition_columns)
@@ -599,6 +600,19 @@ def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:
             text(
                 "ALTER TABLE executors ADD COLUMN runtime_state VARCHAR NOT NULL DEFAULT 'offline'"
             )
+        )
+
+
+def _ensure_executor_token_version_column(sync_conn: object) -> None:
+    """Add revokable executor token version for existing databases."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("executors")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    if "token_version" not in columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE executors ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
         )
 
 

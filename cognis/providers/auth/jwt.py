@@ -39,15 +39,16 @@ class JWTAuthProvider:
         self._public_key = public_key_path.read_text(encoding="utf-8")
         self._kid = hashlib.sha256(self._public_key.encode()).hexdigest()[:16]
 
-    def _sign(self, claims: dict[str, Any], expires_in: int) -> str:
+    def _sign(self, claims: dict[str, Any], expires_in: int | None) -> str:
         now = datetime.now(UTC)
         payload = {
             **claims,
             "iss": "cognis",
             "iat": int(now.timestamp()),
-            "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
             "jti": uuid.uuid4().hex,
         }
+        if expires_in is not None:
+            payload["exp"] = int((now + timedelta(seconds=expires_in)).timestamp())
         return jwt.encode(payload, self._private_key, algorithm="ES256", headers={"kid": self._kid})
 
     def sign_access_token(self, subject: str, name: str | None, role: str) -> str:
@@ -85,16 +86,28 @@ class JWTAuthProvider:
             payload["aow"] = agent_owner_email
         return self._sign(payload, self.token_ttl_seconds)
 
-    def sign_executor_token(self, executor_id: str, ttl_seconds: int = 30 * 24 * 3600) -> str:
-        """Sign a long-lived JWT for executor authentication.
+    def sign_executor_token(
+        self,
+        executor_id: str,
+        ttl_seconds: int | None = None,
+        *,
+        token_version: int = 0,
+    ) -> str:
+        """Sign a revokable JWT for executor authentication.
 
-        Default TTL is 30 days.  For subprocess executors use a short TTL
-        (e.g. 300 seconds).  The token carries ``typ=executor`` and
-        ``aud=["cognis-executor"]`` so it cannot be confused with user or
-        service tokens.
+        Remote executor tokens do not expire by default because stateless
+        executors (for example Kubernetes pods) need stable credentials.
+        They are revoked by bumping the persisted executor token version.
+        Subprocess executors pass a short ``ttl_seconds`` because the
+        controller mints those tokens on demand.
         """
         return self._sign(
-            {"sub": executor_id, "aud": ["cognis-executor"], "typ": "executor"},
+            {
+                "sub": executor_id,
+                "aud": ["cognis-executor"],
+                "typ": "executor",
+                "etv": token_version,
+            },
             ttl_seconds,
         )
 
@@ -115,6 +128,29 @@ class JWTAuthProvider:
             issuer="cognis",
             options=options,
         )
+        jti = claims.get("jti")
+        if jti in self._revoked_jtis:
+            raise JWTError("Token revoked")
+        return claims
+
+    def verify_executor_token(self, token: str) -> dict[str, Any]:
+        """Verify an executor token, including legacy expired tokens.
+
+        Executor tokens are revokable via the executor row's token version,
+        so this verifier intentionally ignores ``exp`` for backward
+        compatibility with 30-day tokens issued before executor tokens became
+        non-expiring.  It must only be used for ``typ=executor`` tokens.
+        """
+        claims = jwt.decode(
+            token,
+            self._public_key,
+            algorithms=["ES256"],
+            audience="cognis-executor",
+            issuer="cognis",
+            options={"verify_aud": True, "verify_exp": False},
+        )
+        if claims.get("typ") != "executor":
+            raise JWTError("Invalid token type")
         jti = claims.get("jti")
         if jti in self._revoked_jtis:
             raise JWTError("Token revoked")

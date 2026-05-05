@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from cognis.api.executor_runtime import reconcile_executor
+from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
@@ -47,7 +49,7 @@ async def handle_executor_websocket(
         return
 
     try:
-        claims = providers.auth.verify_jwt(token, audience=["cognis-executor"])
+        claims = providers.auth.verify_executor_token(token)
     except Exception:
         await _send_error(ws, msg_id, -32000, "Authentication failed")
         await _close_ws(ws, 4401, "Invalid token")
@@ -60,41 +62,54 @@ async def handle_executor_websocket(
         return
 
     policy = await load_executor_policy(session_factory)
-    async with session_factory() as session:
-        row = await get_executor_row(session, executor_id)
-    if row is None:
-        await _send_error(ws, msg_id, -32004, "Executor not found")
-        await _close_ws(ws, 4404, "Executor not found")
-        return
+    async with executor_token_lock(executor_id):
+        async with session_factory() as session:
+            row = await get_executor_row(session, executor_id)
+        if row is None:
+            await _send_error(ws, msg_id, -32004, "Executor not found")
+            await _close_ws(ws, 4404, "Executor not found")
+            return
 
-    if row.status != "active":
-        await _send_error(ws, msg_id, -32005, "Executor is inactive")
-        await _close_ws(ws, 4403, "Executor inactive")
-        return
-    if not is_executor_type_allowed(row.executor_type, policy):
-        await _send_error(ws, msg_id, -32006, "Executor type is disabled by policy")
-        await _close_ws(ws, 4403, "Executor type disabled")
-        return
+        if row.executor_type != "websocket" and _executor_token_expired(claims):
+            await _send_error(ws, msg_id, -32000, "Authentication failed")
+            await _close_ws(ws, 4401, "Invalid token")
+            return
 
-    _logger.info(
-        "executor_ws: registering executor %s (type=%s, owner=%s)",
-        executor_id,
-        row.executor_type,
-        row.owner_email,
-    )
-    conn = ws_provider.register_connection(
-        executor_id,
-        ws,
-        ExecutorCapabilities(),
-        ready=False,
-        metadata=_executor_connection_metadata(
-            labels=row.labels or {},
-            environment=params.get("environment"),
-            platform=params.get("platform") or {},
-            status=row.status,
-            owner_email=row.owner_email,
-        ),
-    )
+        token_version = _executor_token_version(claims)
+        expected_token_version = int(getattr(row, "token_version", 0) or 0)
+        if token_version != expected_token_version:
+            await _send_error(ws, msg_id, -32000, "Executor token has been revoked")
+            await _close_ws(ws, 4401, "Invalid token")
+            return
+
+        if row.status != "active":
+            await _send_error(ws, msg_id, -32005, "Executor is inactive")
+            await _close_ws(ws, 4403, "Executor inactive")
+            return
+        if not is_executor_type_allowed(row.executor_type, policy):
+            await _send_error(ws, msg_id, -32006, "Executor type is disabled by policy")
+            await _close_ws(ws, 4403, "Executor type disabled")
+            return
+
+        _logger.info(
+            "executor_ws: registering executor %s (type=%s, owner=%s)",
+            executor_id,
+            row.executor_type,
+            row.owner_email,
+        )
+        conn = ws_provider.register_connection(
+            executor_id,
+            ws,
+            ExecutorCapabilities(),
+            ready=False,
+            metadata=_executor_connection_metadata(
+                labels=row.labels or {},
+                environment=params.get("environment"),
+                platform=params.get("platform") or {},
+                status=row.status,
+                owner_email=row.owner_email,
+            ),
+        )
 
     # Acknowledge executor.ready before sending executor.configure.
     # The runner waits for this response before entering the normal
@@ -245,6 +260,21 @@ async def _resolve_executor_mcp_payload(
 async def _close_ws(ws: WebSocket, code: int, reason: str) -> None:
     with contextlib.suppress(Exception):
         await ws.close(code=code, reason=reason)
+
+
+def _executor_token_version(claims: dict[str, Any]) -> int:
+    try:
+        return int(claims.get("etv", 0) or 0)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _executor_token_expired(claims: dict[str, Any]) -> bool:
+    try:
+        exp = int(claims["exp"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    return exp <= int(datetime.now(UTC).timestamp())
 
 
 def _executor_connection_metadata(

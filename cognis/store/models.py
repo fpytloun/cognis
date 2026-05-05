@@ -787,6 +787,7 @@ class ExecutorRow(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     runtime_state: Mapped[str] = mapped_column(String, nullable=False, default="offline")
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     is_default: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True

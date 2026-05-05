@@ -16,6 +16,15 @@ from cognis.providers.executor.websocket import (
 )
 
 
+def test_executor_token_expired_helper_requires_valid_future_exp() -> None:
+    from cognis.api.executor_ws import _executor_token_expired
+
+    assert _executor_token_expired({}) is True
+    assert _executor_token_expired({"exp": "not-int"}) is True
+    assert _executor_token_expired({"exp": 1}) is True
+    assert _executor_token_expired({"exp": 4_102_444_800}) is False
+
+
 class FakeWebSocket:
     """Minimal WebSocket mock for testing."""
 

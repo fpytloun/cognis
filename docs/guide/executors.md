@@ -383,7 +383,7 @@ sudo chown alice:alice /etc/cognis/executor-alice.env
 sudo systemctl enable --now cognis-executor@alice
 ```
 
-Generate the token in **Settings > Executors > Generate token**.
+Generate the token in **Settings > Executors > Generate token**. Executor tokens do not expire; generating a new token revokes older tokens for that executor.
 
 ### User-level executor (no root)
 
