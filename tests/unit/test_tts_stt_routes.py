@@ -81,11 +81,13 @@ class _StubLLMProvider:
 
     async def resolve_model_target(
         self, _explicit: str | None, *, task_type: str
-    ) -> tuple[str, Any]:
+    ) -> tuple[str, str | None]:
+        # Mirror the real LiteLLMProvider contract: returns
+        # ``(model_id, provider_id | None)`` — second element is a string id.
         if task_type == "text_to_speech":
-            return "tts-1", _ProviderRow()
+            return "tts-1", "stub-provider"
         if task_type == "speech_to_text":
-            return "whisper-1", _ProviderRow()
+            return "whisper-1", "stub-provider"
         raise ValueError(f"unknown task_type {task_type}")
 
     async def synthesize(self, text: str, *, voice: str, **kwargs: Any) -> TextToSpeechResult:
@@ -125,9 +127,24 @@ class _StubLLMProvider:
         )
 
 
-class _ProviderRow:
-    def __init__(self) -> None:
-        self.config: dict[str, Any] = {"preset": "openai"}
+async def _seed_stub_provider(client: TestClient) -> None:
+    """Insert a minimal LLMProvider row that the route can ``session.get`` by id."""
+    from cognis.store.models import LLMProvider as LLMProviderRow
+
+    async with client.app.state.session_factory() as session:
+        if await session.get(LLMProviderRow, "stub-provider") is not None:
+            return
+        session.add(
+            LLMProviderRow(
+                provider_id="stub-provider",
+                display_name="Stub",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai"},
+                status="active",
+            )
+        )
+        await session.commit()
 
 
 def _install_stub_llm(client: TestClient) -> _StubLLMProvider:
@@ -146,6 +163,7 @@ def test_tts_synthesize_cache_miss_then_hit(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_user(client))
+        asyncio.run(_seed_stub_provider(client))
         asyncio.run(_seed_tts_routing(client))
         stub = _install_stub_llm(client)
         headers = _auth_headers(client.app)
@@ -199,6 +217,30 @@ def test_tts_synthesize_rejects_when_disabled(
         assert response.status_code == 503
         body = response.json()
         assert body["error"]["code"] == "tts_disabled"
+
+
+def test_tts_synthesize_handles_string_provider_id_from_resolve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: ``LLMProvider.resolve_model_target`` returns a provider_id
+    *string*, not a row. Earlier the route accessed ``.config`` on the second
+    element directly and crashed with ``AttributeError``."""
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client))
+        asyncio.run(_seed_stub_provider(client))
+        asyncio.run(_seed_tts_routing(client))
+        _install_stub_llm(client)
+
+        response = client.post(
+            "/api/v1/tts/synthesize",
+            headers=_auth_headers(client.app),
+            json={"text": "Hi there.", "voice": "alloy"},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["voice"] == "alloy"
+        # No message_id → no cache row, but the synthesize call must succeed.
+        assert body["cached"] is False
 
 
 def test_tts_synthesize_validates_empty_text(

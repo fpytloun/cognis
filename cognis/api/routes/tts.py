@@ -93,8 +93,10 @@ async def synthesize_tts(
 
     llm = request.app.state.providers.llm
     # Resolve TTS model and provider through the existing routing chain.
+    # ``resolve_model_target`` returns ``(model_id, provider_id | None)`` —
+    # the second element is the provider id string, not a row.
     try:
-        resolved_model, provider_row = await llm.resolve_model_target(
+        resolved_model, resolved_provider_id = await llm.resolve_model_target(
             None, task_type="text_to_speech"
         )
     except Exception as exc:
@@ -103,16 +105,20 @@ async def synthesize_tts(
             "tts_unconfigured",
             f"No TTS model is configured. Set the text_to_speech route in settings. ({exc})",
         ) from exc
-    if provider_row is None:
+    if resolved_provider_id is None:
         raise api_exception(
             503,
             "tts_unconfigured",
             "TTS routing has no provider. Configure a text-to-speech model in settings.",
         )
 
-    provider_default_voice = None
-    if isinstance(provider_row.config, dict):
-        provider_default_voice = provider_default_voice_from_config(provider_row.config)
+    provider_default_voice: str | None = None
+    async with request.app.state.session_factory() as session:
+        from cognis.store.models import LLMProvider as LLMProviderRow
+
+        provider_row = await session.get(LLMProviderRow, resolved_provider_id)
+        if provider_row is not None and isinstance(provider_row.config, dict):
+            provider_default_voice = provider_default_voice_from_config(provider_row.config)
 
     voice = resolve_voice(
         explicit=payload.voice,
