@@ -194,6 +194,60 @@ def test_tts_synthesize_cache_miss_then_hit(
         assert len(stub.synthesize_calls) == 1
 
 
+def test_tts_synthesize_recovers_from_stale_artifact_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: when the ``tts_cache`` row was pruned but the matching
+    ``artifacts`` row is still present, a re-synthesize for the same
+    deterministic ``artifact_id`` must update the existing row instead of
+    crashing with a UniqueViolation on ``artifacts_pkey``.
+    """
+    from sqlalchemy import delete
+
+    from cognis.store.models import TtsCacheRow
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client))
+        asyncio.run(_seed_stub_provider(client))
+        asyncio.run(_seed_tts_routing(client))
+        _install_stub_llm(client)
+        headers = _auth_headers(client.app)
+
+        first = client.post(
+            "/api/v1/tts/synthesize",
+            headers=headers,
+            json={"text": "Hello stale.", "message_id": "msg_stale", "voice": "nova"},
+        )
+        assert first.status_code == 200, first.text
+
+        # Simulate a TTL prune that wiped the tts_cache row but left the
+        # artifacts row in place.
+        async def _wipe_cache_only() -> None:
+            async with client.app.state.session_factory() as session:
+                await session.execute(delete(TtsCacheRow))
+                await session.commit()
+
+        asyncio.run(_wipe_cache_only())
+
+        # Second call — must succeed (no IntegrityError on artifacts_pkey).
+        second = client.post(
+            "/api/v1/tts/synthesize",
+            headers=headers,
+            json={"text": "Hello stale.", "message_id": "msg_stale", "voice": "nova"},
+        )
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["cached"] is False
+        # The cache row is freshly inserted; a third call should hit the cache.
+        third = client.post(
+            "/api/v1/tts/synthesize",
+            headers=headers,
+            json={"text": "Hello stale.", "message_id": "msg_stale", "voice": "nova"},
+        )
+        assert third.status_code == 200
+        assert third.json()["cached"] is True
+
+
 def test_tts_synthesize_rejects_when_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -71,6 +71,16 @@
   let unsubscribePlaying: (() => void) | null = null;
   let unsubscribeIdle: (() => void) | null = null;
   let waitingForAssistant = false;
+  // True only between ``endUtterance()`` (VAD-driven) and the resulting
+  // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
+  // forced stop (e.g. user clicked End conversation, mute, or close) can
+  // be distinguished from a real utterance handoff and skip STT entirely.
+  let utteranceFinalizing = false;
+  // True once ``teardown()`` has been called for this open cycle. Async
+  // continuations (STT response, TTS sentence frames, queue idle) all
+  // gate on this so they do not fire ``submitText``/``audioPlayer.play``
+  // after the overlay has been closed.
+  let disposed = false;
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
@@ -105,13 +115,23 @@
       clearInterval(vadHandle);
       vadHandle = null;
     }
-    speakingDetected = false;
     lastVoiceAt = 0;
+    // Note: ``speakingDetected`` is intentionally NOT reset here so the
+    // ``recorder.onstop`` handler that runs immediately after a VAD-driven
+    // ``endUtterance`` can decide whether the captured blob actually
+    // contained speech. ``startListening()`` resets it for the next cycle.
   }
 
   function teardownAudio(): void {
     clearVad();
+    // Forced stop. Detach the onstop handler so it does NOT fire
+    // ``onUtterance`` with whatever was captured before the user ended
+    // the session — Whisper happily hallucinates phrases on near-silent
+    // audio, which would then be ``submitText``-ed as a chat message.
+    utteranceFinalizing = false;
     if (recorder && recorder.state !== 'inactive') {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
       try {
         recorder.stop();
       } catch {
@@ -119,6 +139,7 @@
       }
     }
     recorder = null;
+    chunks = [];
     if (stream) {
       stream.getTracks().forEach((track) => track.stop());
       stream = null;
@@ -132,6 +153,7 @@
       audioContext = null;
     }
     analyser = null;
+    speakingDetected = false;
   }
 
   async function startListening(): Promise<void> {
@@ -161,7 +183,17 @@
       if (event.data && event.data.size > 0) chunks.push(event.data);
     };
     recorder.onstop = () => {
+      // Only treat this as a real utterance handoff when ``endUtterance``
+      // (VAD-driven) marked it. Forced stops from teardown/mute/close are
+      // explicitly NOT finalizing — drop the bytes and do not call STT.
+      const finalizing = utteranceFinalizing;
+      utteranceFinalizing = false;
+      if (!finalizing || disposed || !speakingDetected) {
+        chunks = [];
+        return;
+      }
       const captured = new Blob(chunks, { type: mimeType || 'audio/webm' });
+      chunks = [];
       void onUtterance(captured, extensionFor(mimeType));
     };
     recorder.start();
@@ -198,12 +230,15 @@
   }
 
   function endUtterance(): void {
+    // VAD-driven stop. Mark this as a real utterance handoff so the
+    // ``recorder.onstop`` handler proceeds with STT.
+    utteranceFinalizing = true;
     clearVad();
     if (recorder && recorder.state !== 'inactive') {
       try {
         recorder.stop();
       } catch {
-        // ignore
+        utteranceFinalizing = false;
       }
     }
     if (audioContext) {
@@ -222,6 +257,7 @@
   }
 
   async function onUtterance(blob: Blob, ext: string): Promise<void> {
+    if (disposed) return;
     if (blob.size === 0) {
       void startListening();
       return;
@@ -230,6 +266,7 @@
     try {
       const filename = `voice-${Date.now()}.${ext}`;
       const result = await api.stt.transcribe(blob, { filename });
+      if (disposed) return;
       const text = result.text.trim();
       if (!text) {
         // Heard nothing — go back to listening.
@@ -240,6 +277,7 @@
       waitingForAssistant = true;
       submitText(text);
     } catch (err) {
+      if (disposed) return;
       const message = err instanceof Error ? err.message : 'Transcription failed';
       addToast(message, 'error', 4_000, 'Voice transcription failed');
       void startListening();
@@ -251,6 +289,7 @@
     sentence_index: number;
     text: string;
   }): Promise<void> {
+    if (disposed) return;
     waitingForAssistant = false;
     modeState = 'speaking';
     try {
@@ -259,10 +298,12 @@
         message_id: frame.message_id,
         agent_id: agent?.agent_id ?? null
       });
+      if (disposed) return;
       queue?.enqueue({ url: result.audio_url, id: `${frame.message_id}:${frame.sentence_index}` });
       // Update transcript drawer (append to last assistant entry or create one).
       transcript = updateTranscriptForAssistant(transcript, frame.message_id, frame.text);
     } catch (err) {
+      if (disposed) return;
       const message = err instanceof Error ? err.message : 'Synthesis failed';
       addToast(message, 'error', 4_000, 'Voice synthesis failed');
     }
@@ -282,23 +323,25 @@
   }
 
   function handleMessageComplete(): void {
+    if (disposed) return;
     waitingForAssistant = false;
     // Queue may still be playing the last sentence; the idle callback
     // re-arms the mic when playback drains.
   }
 
   function startConversationLoop(): void {
+    disposed = false;
     if (!queue) {
       queue = new AudioQueue();
       unsubscribeIdle = queue.onIdle(() => {
         // Only re-arm the mic when no further audio is coming and we
         // already heard message_complete. If we are still streaming the
         // assistant's reply, the next sentence will keep the queue busy.
-        if (!waitingForAssistant && !muted && open) {
-          void startListening();
-        }
+        if (disposed || waitingForAssistant || muted || !open) return;
+        void startListening();
       });
       unsubscribePlaying = queue.onPlayingChange((playing) => {
+        if (disposed) return;
         if (playing) {
           modeState = 'speaking';
           // Pause any per-message TTS playback to enforce single-stream invariant.
@@ -315,6 +358,7 @@
   }
 
   function teardown(): void {
+    disposed = true;
     if (queue) {
       queue.clear();
       queue = null;

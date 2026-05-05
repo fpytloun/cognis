@@ -3709,12 +3709,6 @@ import X from 'lucide-svelte/icons/x';
                   }}
                 />
               </label>
-              <MicRecorderButton
-                disabled={directQuestionSubmitting || !currentConversation || isReadOnly(currentConversation)}
-                onrecorded={(attachment) => {
-                  composerAttachments = [...composerAttachments, attachment];
-                }}
-              />
               <textarea
                 bind:this={composerElement}
                 bind:value={composer}
@@ -3754,6 +3748,13 @@ import X from 'lucide-svelte/icons/x';
                 >
                   <Square class="h-3 w-3 fill-current" />
                 </button>
+              {:else}
+                <MicRecorderButton
+                  disabled={directQuestionSubmitting || !currentConversation || isReadOnly(currentConversation)}
+                  onrecorded={(attachment) => {
+                    composerAttachments = [...composerAttachments, attachment];
+                  }}
+                />
               {/if}
             </div>
           </form>

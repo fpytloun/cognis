@@ -2,7 +2,6 @@
   import Mic from 'lucide-svelte/icons/mic';
   import Square from 'lucide-svelte/icons/square';
 
-  import Button from '$lib/components/ui/Button.svelte';
   import { addToast } from '$lib/stores/toasts';
   import type { AttachmentRef } from '$lib/types/api';
 
@@ -207,28 +206,35 @@
   }
 </script>
 
-<div class={`inline-flex items-center gap-2 ${className}`}>
-  <Button
-    size="sm"
-    variant={recording ? 'danger' : 'secondary'}
-    type="button"
-    onclick={handleClick}
-    disabled={disabled || (busy && !recording)}
-    aria-label={recording ? 'Stop recording' : 'Record voice message'}
-    title={recording ? 'Stop recording' : 'Record voice message'}
-  >
-    {#if recording}
-      <Square class="h-4 w-4 sm:mr-2" />
-      <span class="hidden sm:inline">Stop</span>
-    {:else}
-      <Mic class="h-4 w-4 sm:mr-2" />
-      <span class="hidden sm:inline">Voice</span>
-    {/if}
-  </Button>
+<span class={`inline-flex items-center gap-1 ${className}`}>
   {#if recording}
-    <span class="inline-flex items-center gap-1 rounded-full bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-rose-300" aria-live="polite">
+    <span
+      class="inline-flex items-center gap-1 rounded-full bg-rose-500/20 px-2 py-0.5 text-[11px] font-medium text-rose-300"
+      aria-live="polite"
+    >
       <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-rose-400"></span>
       {formatTime(elapsedSeconds)}
     </span>
+    <button
+      type="button"
+      onclick={handleClick}
+      disabled={disabled || (busy && !recording)}
+      aria-label="Stop recording"
+      title="Stop recording"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-rose-500/15 text-rose-300 transition hover:bg-rose-500/25 hover:text-rose-200 disabled:pointer-events-none disabled:opacity-40"
+    >
+      <Square class="h-4 w-4 fill-current" />
+    </button>
+  {:else}
+    <button
+      type="button"
+      onclick={handleClick}
+      disabled={disabled || busy}
+      aria-label="Record voice message"
+      title="Record voice message"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 disabled:pointer-events-none disabled:opacity-40"
+    >
+      <Mic class="h-4 w-4" />
+    </button>
   {/if}
-</div>
+</span>

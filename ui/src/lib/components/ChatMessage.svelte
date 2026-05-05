@@ -100,11 +100,18 @@
 
   const ttsKey = $derived(item.messageId ?? `local:${item.timestamp}`);
   const audioState = $derived($audioPlayer);
+  // True while the audio is actively playing — show Stop icon.
   const isSpeakingThis = $derived(
-    audioState.currentKey === ttsKey && (audioState.isPlaying || audioState.isLoading)
+    audioState.currentKey === ttsKey && audioState.isPlaying
   );
 
   let ttsBusy = $state(false);
+
+  // True while the synthesize HTTP call is in flight OR the audio element
+  // is preparing the stream — show a spinner.
+  const isLoadingThis = $derived(
+    ttsBusy || (audioState.currentKey === ttsKey && audioState.isLoading)
+  );
 
   async function toggleSpeak(): Promise<void> {
     if (audioPlayer.isCurrent(ttsKey)) {
@@ -317,12 +324,14 @@
               class="copy-icon-button"
               onclick={toggleSpeak}
               type="button"
-              title={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
-              aria-label={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+              title={isLoadingThis ? 'Loading audio…' : isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+              aria-label={isLoadingThis ? 'Loading audio' : isSpeakingThis ? 'Stop reading' : 'Read aloud'}
               aria-pressed={isSpeakingThis}
-              disabled={ttsBusy && !isSpeakingThis}
+              disabled={isLoadingThis}
             >
-              {#if isSpeakingThis}
+              {#if isLoadingThis}
+                <span class="inline-block h-3.5 w-3.5 animate-spin rounded-full border border-current border-t-transparent" aria-hidden="true"></span>
+              {:else if isSpeakingThis}
                 <Square />
               {:else}
                 <Volume2 />
