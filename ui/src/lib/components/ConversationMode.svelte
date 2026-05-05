@@ -4,7 +4,7 @@
   import Mic from 'lucide-svelte/icons/mic';
   import X from 'lucide-svelte/icons/x';
 
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { api } from '$lib/api/client';
   import Button from '$lib/components/ui/Button.svelte';
   import { audioPlayer } from '$lib/stores/audio-player';
@@ -70,7 +70,11 @@
   let unsubscribeMessage: (() => void) | null = null;
   let unsubscribePlaying: (() => void) | null = null;
   let unsubscribeIdle: (() => void) | null = null;
-  let waitingForAssistant = false;
+  let loopActive = false;
+  let assistantTurnActive = false;
+  let pendingSentenceSyntheses = 0;
+  let listeningGeneration = 0;
+  const activeSentenceKeys = new Set<string>();
   // True only between ``endUtterance()`` (VAD-driven) and the resulting
   // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
   // forced stop (e.g. user clicked End conversation, mute, or close) can
@@ -80,7 +84,7 @@
   // continuations (STT response, TTS sentence frames, queue idle) all
   // gate on this so they do not fire ``submitText``/``audioPlayer.play``
   // after the overlay has been closed.
-  let disposed = false;
+  let disposed = true;
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
@@ -122,7 +126,31 @@
     // contained speech. ``startListening()`` resets it for the next cycle.
   }
 
+  function sentenceCacheMessageId(messageId: string, sentenceIndex: number): string {
+    return `${messageId}:tts_sentence:${sentenceIndex}`;
+  }
+
+  function shouldStartListening(): boolean {
+    return (
+      !disposed &&
+      open &&
+      !muted &&
+      !assistantTurnActive &&
+      pendingSentenceSyntheses === 0 &&
+      (queue?.isEmpty() ?? true) &&
+      recorder === null &&
+      stream === null
+    );
+  }
+
+  function maybeStartListening(): void {
+    if (shouldStartListening()) {
+      void startListening();
+    }
+  }
+
   function teardownAudio(): void {
+    listeningGeneration += 1;
     clearVad();
     // Forced stop. Detach the onstop handler so it does NOT fire
     // ``onUtterance`` with whatever was captured before the user ended
@@ -154,26 +182,39 @@
     }
     analyser = null;
     speakingDetected = false;
+    modeState = 'idle';
   }
 
   async function startListening(): Promise<void> {
-    if (muted) return;
+    if (!shouldStartListening()) return;
+    const generation = ++listeningGeneration;
     modeState = 'listening';
     chunks = [];
     speakingDetected = false;
     lastVoiceAt = 0;
+    let nextStream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      nextStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch {
+      if (disposed || generation !== listeningGeneration || !open) return;
       addToast('Microphone access denied. Allow it in browser settings.', 'error');
       teardownAudio();
       onclose();
       return;
     }
+    if (disposed || generation !== listeningGeneration || !open || muted) {
+      nextStream.getTracks().forEach((track) => track.stop());
+      return;
+    }
+    stream = nextStream;
     const mimeType = pickMimeType();
     try {
       recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
     } catch {
+      if (disposed || generation !== listeningGeneration || !open) {
+        teardownAudio();
+        return;
+      }
       addToast('Recording is not supported in this browser', 'error');
       teardownAudio();
       onclose();
@@ -183,6 +224,9 @@
       if (event.data && event.data.size > 0) chunks.push(event.data);
     };
     recorder.onstop = () => {
+      if (generation === listeningGeneration) {
+        recorder = null;
+      }
       // Only treat this as a real utterance handoff when ``endUtterance``
       // (VAD-driven) marked it. Forced stops from teardown/mute/close are
       // explicitly NOT finalizing — drop the bytes and do not call STT.
@@ -199,6 +243,10 @@
     recorder.start();
 
     // Set up energy-based VAD on the same stream.
+    if (disposed || generation !== listeningGeneration || !open || stream === null) {
+      teardownAudio();
+      return;
+    }
     audioContext = new AudioContext();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
@@ -208,6 +256,10 @@
     const utteranceStartedAt = Date.now();
 
     vadHandle = setInterval(() => {
+      if (disposed || generation !== listeningGeneration || !open) {
+        teardownAudio();
+        return;
+      }
       if (!analyser) return;
       analyser.getFloatTimeDomainData(buffer);
       let sum = 0;
@@ -274,7 +326,7 @@
         return;
       }
       transcript = [...transcript, { role: 'user', text }];
-      waitingForAssistant = true;
+      assistantTurnActive = true;
       submitText(text);
     } catch (err) {
       if (disposed) return;
@@ -290,12 +342,15 @@
     text: string;
   }): Promise<void> {
     if (disposed) return;
-    waitingForAssistant = false;
+    const sentenceKey = `${frame.message_id}:${frame.sentence_index}`;
+    if (activeSentenceKeys.has(sentenceKey)) return;
+    activeSentenceKeys.add(sentenceKey);
+    pendingSentenceSyntheses += 1;
     modeState = 'speaking';
     try {
       const result = await api.tts.synthesize({
         text: frame.text,
-        message_id: frame.message_id,
+        message_id: sentenceCacheMessageId(frame.message_id, frame.sentence_index),
         agent_id: agent?.agent_id ?? null
       });
       if (disposed) return;
@@ -306,6 +361,9 @@
       if (disposed) return;
       const message = err instanceof Error ? err.message : 'Synthesis failed';
       addToast(message, 'error', 4_000, 'Voice synthesis failed');
+    } finally {
+      pendingSentenceSyntheses = Math.max(0, pendingSentenceSyntheses - 1);
+      maybeStartListening();
     }
   }
 
@@ -324,21 +382,26 @@
 
   function handleMessageComplete(): void {
     if (disposed) return;
-    waitingForAssistant = false;
+    assistantTurnActive = false;
     // Queue may still be playing the last sentence; the idle callback
     // re-arms the mic when playback drains.
+    maybeStartListening();
   }
 
   function startConversationLoop(): void {
+    if (loopActive) return;
+    loopActive = true;
     disposed = false;
+    assistantTurnActive = false;
+    pendingSentenceSyntheses = 0;
+    activeSentenceKeys.clear();
+    transcript = [];
     if (!queue) {
       queue = new AudioQueue();
       unsubscribeIdle = queue.onIdle(() => {
-        // Only re-arm the mic when no further audio is coming and we
-        // already heard message_complete. If we are still streaming the
-        // assistant's reply, the next sentence will keep the queue busy.
-        if (disposed || waitingForAssistant || muted || !open) return;
-        void startListening();
+        // Only re-arm when the assistant turn is complete, all sentence
+        // synthesis calls have settled, and playback has drained.
+        maybeStartListening();
       });
       unsubscribePlaying = queue.onPlayingChange((playing) => {
         if (disposed) return;
@@ -358,7 +421,12 @@
   }
 
   function teardown(): void {
+    const shouldDisableTts = loopActive;
+    loopActive = false;
     disposed = true;
+    assistantTurnActive = false;
+    pendingSentenceSyntheses = 0;
+    activeSentenceKeys.clear();
     if (queue) {
       queue.clear();
       queue = null;
@@ -380,7 +448,9 @@
       unsubscribeIdle();
       unsubscribeIdle = null;
     }
-    sendDisableTts();
+    if (shouldDisableTts) {
+      sendDisableTts();
+    }
   }
 
   function handleClose(): void {
@@ -393,16 +463,16 @@
     if (muted) {
       teardownAudio();
       modeState = 'idle';
-    } else if (queue && queue.isEmpty() && !waitingForAssistant) {
-      void startListening();
+    } else {
+      maybeStartListening();
     }
   }
 
   $effect(() => {
     if (open) {
-      startConversationLoop();
+      untrack(startConversationLoop);
       return () => {
-        teardown();
+        untrack(teardown);
       };
     }
   });

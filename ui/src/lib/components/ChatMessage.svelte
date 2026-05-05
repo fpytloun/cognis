@@ -99,6 +99,7 @@
   // ---- TTS speaker button -------------------------------------------------
 
   const ttsKey = $derived(item.messageId ?? `local:${item.timestamp}`);
+  const ttsCacheMessageId = $derived(item.messageId ? `${item.messageId}:tts_full` : null);
   const audioState = $derived($audioPlayer);
   // True while the audio is actively playing — show Stop icon.
   const isSpeakingThis = $derived(
@@ -124,7 +125,7 @@
     try {
       const result = await api.tts.synthesize({
         text: item.content,
-        message_id: item.messageId ?? null,
+        message_id: ttsCacheMessageId,
         agent_id: agent?.agent_id ?? null
       });
       await audioPlayer.play(ttsKey, result.audio_url);
