@@ -3754,6 +3754,10 @@ import X from 'lucide-svelte/icons/x';
                   onrecorded={(attachment) => {
                     composerAttachments = [...composerAttachments, attachment];
                   }}
+                  onsendrecorded={async () => {
+                    await tick();
+                    await handleSend();
+                  }}
                 />
               {/if}
             </div>

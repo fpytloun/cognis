@@ -1,9 +1,12 @@
 <script lang="ts">
   import Mic from 'lucide-svelte/icons/mic';
   import Square from 'lucide-svelte/icons/square';
+  import ArrowUp from 'lucide-svelte/icons/arrow-up';
+  import { onDestroy } from 'svelte';
 
   import { addToast } from '$lib/stores/toasts';
   import type { AttachmentRef } from '$lib/types/api';
+  import { ScreenWakeLock } from '$lib/utils';
 
   /**
    * iMessage-style microphone recorder.
@@ -20,11 +23,12 @@
 
   interface Props {
     onrecorded: (attachment: AttachmentRef) => void | Promise<void>;
+    onsendrecorded?: () => void | Promise<void>;
     disabled?: boolean;
     class?: string;
   }
 
-  let { onrecorded, disabled = false, class: className = '' }: Props = $props();
+  let { onrecorded, onsendrecorded = undefined, disabled = false, class: className = '' }: Props = $props();
 
   let recorder: MediaRecorder | null = null;
   let stream: MediaStream | null = null;
@@ -34,6 +38,8 @@
   let elapsedSeconds = $state(0);
   let timerHandle: ReturnType<typeof setInterval> | null = null;
   let startedAt = 0;
+  let sendAfterStop = false;
+  const wakeLock = new ScreenWakeLock();
 
   function pickMimeType(): string {
     const candidates = [
@@ -80,9 +86,11 @@
     }
     busy = true;
     try {
+      void wakeLock.acquire();
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch {
       busy = false;
+      void wakeLock.release();
       addToast('Microphone access denied. Allow it in browser settings.', 'error');
       return;
     }
@@ -92,6 +100,7 @@
     } catch (err) {
       busy = false;
       stopTracks();
+      void wakeLock.release();
       addToast('Recording is not supported in this browser', 'error');
       return;
     }
@@ -102,13 +111,15 @@
       }
     };
     recorder.onstop = () => {
-      void handleStop(mimeType);
+      void handleStop(mimeType, sendAfterStop);
+      sendAfterStop = false;
     };
     recorder.onerror = () => {
       stopTracks();
       clearTimer();
       recording = false;
       busy = false;
+      void wakeLock.release();
     };
     recorder.start();
     startedAt = Date.now();
@@ -120,18 +131,20 @@
     busy = false;
   }
 
-  async function handleStop(originalMime: string): Promise<void> {
+  async function handleStop(originalMime: string, sendNow: boolean): Promise<void> {
     clearTimer();
     stopTracks();
     recording = false;
     if (chunks.length === 0) {
       busy = false;
+      void wakeLock.release();
       return;
     }
     const blob = new Blob(chunks, { type: originalMime || 'audio/webm' });
     chunks = [];
     if (blob.size === 0) {
       busy = false;
+      void wakeLock.release();
       return;
     }
     const ext = extensionFor(blob.type);
@@ -171,23 +184,30 @@
         voice_recording: true
       };
       await onrecorded(attachment);
+      if (sendNow) {
+        await onsendrecorded?.();
+      }
     } catch (err) {
       URL.revokeObjectURL(blobUrl);
       const message = err instanceof Error ? err.message : 'Failed to upload recording';
       addToast(message, 'error', 4_000, 'Voice recording failed');
     } finally {
       busy = false;
+      void wakeLock.release();
     }
   }
 
-  function stopRecording(): void {
+  function stopRecording(sendNow = false): void {
     if (!recorder || !recording) return;
+    sendAfterStop = sendNow;
     try {
       recorder.stop();
     } catch {
+      sendAfterStop = false;
       stopTracks();
       clearTimer();
       recording = false;
+      void wakeLock.release();
     }
   }
 
@@ -204,6 +224,12 @@
     const s = (seconds % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
   }
+
+  onDestroy(() => {
+    stopTracks();
+    clearTimer();
+    void wakeLock.release();
+  });
 </script>
 
 <span class={`inline-flex items-center gap-1 ${className}`}>
@@ -224,6 +250,16 @@
       class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-rose-500/15 text-rose-300 transition hover:bg-rose-500/25 hover:text-rose-200 disabled:pointer-events-none disabled:opacity-40"
     >
       <Square class="h-4 w-4 fill-current" />
+    </button>
+    <button
+      type="button"
+      onclick={() => stopRecording(true)}
+      disabled={disabled || busy}
+      aria-label="Finish recording and send"
+      title="Finish recording and send"
+      class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:pointer-events-none disabled:opacity-40"
+    >
+      <ArrowUp class="h-4 w-4" stroke-width="2.5" />
     </button>
   {:else}
     <button

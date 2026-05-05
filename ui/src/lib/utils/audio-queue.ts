@@ -21,8 +21,13 @@ export class AudioQueue {
   private current: HTMLAudioElement | null = null;
   private playing = false;
   private cancelled = false;
+  private unlocked = false;
   private idleCallbacks: Array<() => void> = [];
   private playingCallbacks: Array<(playing: boolean) => void> = [];
+  private playbackErrorCallbacks: Array<() => void> = [];
+
+  private readonly silentDataUrl =
+    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
 
   enqueue(entry: AudioQueueEntry): void {
     if (this.cancelled) {
@@ -46,8 +51,8 @@ export class AudioQueue {
       this.current.onended = null;
       this.current.onerror = null;
       this.current.src = '';
-      this.current = null;
     }
+    this.current = null;
     if (this.playing) {
       this.playing = false;
       this.notifyPlaying(false);
@@ -80,6 +85,35 @@ export class AudioQueue {
     };
   }
 
+  /** Subscribe to playback failures, usually mobile autoplay blocking. */
+  onPlaybackError(cb: () => void): () => void {
+    this.playbackErrorCallbacks.push(cb);
+    return () => {
+      this.playbackErrorCallbacks = this.playbackErrorCallbacks.filter((entry) => entry !== cb);
+    };
+  }
+
+  /** Prime the reusable audio element from a user gesture when possible. */
+  async unlock(): Promise<boolean> {
+    if (this.unlocked) return true;
+    if (typeof Audio === 'undefined') return false;
+    const audio = this.ensureAudio();
+    audio.src = this.silentDataUrl;
+    try {
+      await audio.play();
+      audio.pause();
+      audio.currentTime = 0;
+      this.unlocked = true;
+      if (this.queue.length > 0 && !this.playing) {
+        void this.playNext();
+      }
+      return true;
+    } catch {
+      this.unlocked = false;
+      return false;
+    }
+  }
+
   private notifyIdle(): void {
     for (const cb of [...this.idleCallbacks]) {
       try {
@@ -100,6 +134,24 @@ export class AudioQueue {
     }
   }
 
+  private notifyPlaybackError(): void {
+    for (const cb of [...this.playbackErrorCallbacks]) {
+      try {
+        cb();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private ensureAudio(): HTMLAudioElement {
+    if (this.current) return this.current;
+    const audio = new Audio();
+    audio.preload = 'auto';
+    this.current = audio;
+    return audio;
+  }
+
   private async playNext(): Promise<void> {
     if (this.cancelled) {
       this.cancelled = false;
@@ -114,32 +166,40 @@ export class AudioQueue {
       this.notifyIdle();
       return;
     }
-    const audio = new Audio(entry.url);
-    this.current = audio;
+    const audio = this.ensureAudio();
     if (!this.playing) {
       this.playing = true;
       this.notifyPlaying(true);
     }
     audio.onended = () => {
       if (this.current === audio) {
-        this.current = null;
+        audio.src = '';
       }
       void this.playNext();
     };
     audio.onerror = () => {
       if (this.current === audio) {
-        this.current = null;
+        audio.src = '';
       }
+      this.notifyPlaybackError();
       void this.playNext();
     };
+    audio.src = entry.url;
     try {
       await audio.play();
     } catch {
-      // Autoplay blocked or user navigated away — drop this entry and continue.
+      // Autoplay blocked: keep the sentence queued so a later user tap can
+      // unlock playback and continue instead of losing the assistant reply.
+      this.unlocked = false;
       if (this.current === audio) {
-        this.current = null;
+        audio.src = '';
       }
-      void this.playNext();
+      this.queue.unshift(entry);
+      if (this.playing) {
+        this.playing = false;
+        this.notifyPlaying(false);
+      }
+      this.notifyPlaybackError();
     }
   }
 }

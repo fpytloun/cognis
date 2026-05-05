@@ -10,6 +10,7 @@
   import { audioPlayer } from '$lib/stores/audio-player';
   import { addToast } from '$lib/stores/toasts';
   import { AudioQueue } from '$lib/utils/audio-queue';
+  import { ScreenWakeLock } from '$lib/utils';
   import type { Agent } from '$lib/types/api';
 
   /**
@@ -70,6 +71,8 @@
   let unsubscribeMessage: (() => void) | null = null;
   let unsubscribePlaying: (() => void) | null = null;
   let unsubscribeIdle: (() => void) | null = null;
+  let unsubscribePlaybackError: (() => void) | null = null;
+  let wakeLock: ScreenWakeLock | null = null;
   let loopActive = false;
   let assistantTurnActive = false;
   let pendingSentenceSyntheses = 0;
@@ -85,6 +88,7 @@
   // gate on this so they do not fire ``submitText``/``audioPlayer.play``
   // after the overlay has been closed.
   let disposed = true;
+  let playbackNeedsGesture = $state(false);
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
@@ -149,6 +153,13 @@
     }
   }
 
+  async function unlockPlayback(): Promise<boolean> {
+    if (!queue) return false;
+    const ok = await queue.unlock();
+    playbackNeedsGesture = !ok;
+    return ok;
+  }
+
   function teardownAudio(): void {
     listeningGeneration += 1;
     clearVad();
@@ -187,6 +198,7 @@
 
   async function startListening(): Promise<void> {
     if (!shouldStartListening()) return;
+    void wakeLock?.acquire();
     const generation = ++listeningGeneration;
     modeState = 'listening';
     chunks = [];
@@ -392,6 +404,9 @@
     if (loopActive) return;
     loopActive = true;
     disposed = false;
+    playbackNeedsGesture = false;
+    if (!wakeLock) wakeLock = new ScreenWakeLock();
+    void wakeLock.acquire();
     assistantTurnActive = false;
     pendingSentenceSyntheses = 0;
     activeSentenceKeys.clear();
@@ -411,7 +426,12 @@
           audioPlayer.stop();
         }
       });
+      unsubscribePlaybackError = queue.onPlaybackError(() => {
+        if (disposed) return;
+        playbackNeedsGesture = true;
+      });
     }
+    void unlockPlayback();
     unsubscribeSentence = subscribeSentenceReady((frame) => void handleSentenceReady(frame));
     unsubscribeMessage = subscribeMessageComplete(handleMessageComplete);
     const llmConfig = (agent?.llm_config ?? {}) as Record<string, unknown>;
@@ -424,6 +444,7 @@
     const shouldDisableTts = loopActive;
     loopActive = false;
     disposed = true;
+    playbackNeedsGesture = false;
     assistantTurnActive = false;
     pendingSentenceSyntheses = 0;
     activeSentenceKeys.clear();
@@ -432,6 +453,7 @@
       queue = null;
     }
     teardownAudio();
+    void wakeLock?.release();
     if (unsubscribeSentence) {
       unsubscribeSentence();
       unsubscribeSentence = null;
@@ -448,6 +470,10 @@
       unsubscribeIdle();
       unsubscribeIdle = null;
     }
+    if (unsubscribePlaybackError) {
+      unsubscribePlaybackError();
+      unsubscribePlaybackError = null;
+    }
     if (shouldDisableTts) {
       sendDisableTts();
     }
@@ -456,6 +482,10 @@
   function handleClose(): void {
     teardown();
     onclose();
+  }
+
+  async function handleEnablePlayback(): Promise<void> {
+    await unlockPlayback();
   }
 
   function toggleMute(): void {
@@ -526,6 +556,11 @@
       </div>
 
       <div class="flex items-center gap-3">
+        {#if playbackNeedsGesture}
+          <Button variant="primary" type="button" onclick={() => void handleEnablePlayback()}>
+            Enable audio
+          </Button>
+        {/if}
         <Button variant="secondary" type="button" onclick={toggleMute} aria-pressed={muted}>
           {#if muted}
             <Mic class="h-4 w-4 sm:mr-2" />
