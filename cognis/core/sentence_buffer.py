@@ -10,13 +10,15 @@ Design choices:
   code aloud, and the result would sound jarring).
 - Markdown formatting (links, bold, italics, headings, inline code) is
   stripped before emitting so the TTS provider sees clean prose.
-- Boundary detection is tuned for low-latency voice: full sentence
-  terminators emit at whitespace and can also emit at the current stream
-  boundary once the fragment is long enough. Long clauses and oversized
-  fragments emit at soft boundaries so a voice reply can start before a
-  very long sentence is complete.
-- Buffering is per-message-id; ``feed`` returns a list of newly completed
-  sentences so callers can yield zero, one, or many frames per token.
+- Boundary detection is strict: only ``.``, ``!``, ``?`` followed by
+  whitespace counts as a mid-stream boundary. This guarantees each
+  emitted segment is a full sentence so multilingual TTS can detect
+  language correctly. The ``flush`` call at turn end emits any trailing
+  fragment regardless of length so short closing sentences ("Yes.",
+  "Sure!") are still spoken.
+- A small minimum length (``_MIN_MIDSTREAM_CHARS``) is applied to
+  mid-stream emissions so abbreviations like ``Mr.`` keep accumulating
+  with the rest of the sentence instead of being emitted on their own.
 """
 
 from __future__ import annotations
@@ -34,10 +36,10 @@ _MARKDOWN_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 
 _FENCE = "```"
 
-_MIN_SENTENCE_CHARS = 8
-_EARLY_TERMINATOR_MIN_CHARS = 24
-_SOFT_BOUNDARY_MIN_CHARS = 80
-_MAX_SEGMENT_CHARS = 180
+# Mid-stream emissions below this length are treated as likely abbreviations
+# (e.g. "Mr.", "Dr.", initials) and held back so they merge with the rest of
+# the sentence on the next boundary or at flush time.
+_MIN_MIDSTREAM_CHARS = 8
 
 
 def strip_markdown_for_tts(text: str) -> str:
@@ -77,25 +79,28 @@ class SentenceBuffer:
                 break
             self._buffer = remainder
             cleaned = strip_markdown_for_tts(sentence)
-            if cleaned and len(cleaned) >= _MIN_SENTENCE_CHARS:
-                ready.append((self._next_index, cleaned))
-                self.emitted_sentences.append(cleaned)
-                self._next_index += 1
+            if not cleaned:
+                continue
+            ready.append((self._next_index, cleaned))
+            self.emitted_sentences.append(cleaned)
+            self._next_index += 1
         return ready
 
     def flush(self) -> tuple[int, str] | None:
         """Emit any trailing partial sentence after the stream ends.
 
-        Returns ``None`` when there is nothing to flush or the trailing
-        text is empty/too short. Otherwise returns the same
-        ``(index, text)`` shape as ``feed``.
+        Returns ``None`` when the buffer is empty or contains only
+        whitespace/markdown. Otherwise returns the same ``(index, text)``
+        shape as ``feed``. Unlike ``feed``, ``flush`` does NOT enforce a
+        minimum length so short closing sentences ("Yes.", "Sure!") are
+        still spoken.
         """
         if not self._buffer.strip():
             self._buffer = ""
             return None
         cleaned = strip_markdown_for_tts(self._buffer)
         self._buffer = ""
-        if not cleaned or len(cleaned) < _MIN_SENTENCE_CHARS:
+        if not cleaned:
             return None
         result = (self._next_index, cleaned)
         self.emitted_sentences.append(cleaned)
@@ -109,6 +114,15 @@ class SentenceBuffer:
         ``` we toggle ``_in_code_block`` and consume up to the closing
         fence (or wait for it). No sentence is emitted while inside
         a code block.
+
+        Boundaries are strict: only sentence terminators followed by
+        whitespace count. The end of the current buffer is NOT a
+        boundary on its own; ``flush`` handles the final fragment.
+
+        Boundaries that would yield a sentence shorter than
+        ``_MIN_MIDSTREAM_CHARS`` are treated as abbreviation noise
+        (e.g. ``Mr.``, ``Dr.``, initials) and skipped so the walker
+        keeps searching for the next real terminator.
         """
         index = 0
         buffer = self._buffer
@@ -136,36 +150,17 @@ class SentenceBuffer:
                 continue
             char = buffer[index]
             if char in ".!?":
-                # Look ahead: either whitespace/newline, or end of buffer.
                 next_char = buffer[index + 1] if index + 1 < n else ""
                 if next_char and next_char.isspace():
                     sentence = buffer[: index + 1]
-                    # Skip the trailing whitespace too.
-                    rest_start = index + 1
-                    while rest_start < n and buffer[rest_start].isspace():
-                        rest_start += 1
-                    return sentence, buffer[rest_start:], True
-                if next_char == "":
-                    # Streamed chunks often end exactly after punctuation.
-                    # Emit long-enough fragments now instead of waiting for
-                    # the next token or final message_complete.
-                    sentence = buffer[: index + 1]
-                    if len(strip_markdown_for_tts(sentence)) >= _EARLY_TERMINATOR_MIN_CHARS:
-                        return sentence, buffer[index + 1 :], True
-                    return "", buffer, False
-            if char in ",;:\n" and index >= _SOFT_BOUNDARY_MIN_CHARS:
-                sentence = buffer[: index + 1]
-                if len(strip_markdown_for_tts(sentence)) >= _SOFT_BOUNDARY_MIN_CHARS:
-                    rest_start = index + 1
-                    while rest_start < n and buffer[rest_start].isspace():
-                        rest_start += 1
-                    return sentence, buffer[rest_start:], True
-            if index >= _MAX_SEGMENT_CHARS and char.isspace():
-                sentence = buffer[:index]
-                if len(strip_markdown_for_tts(sentence)) >= _SOFT_BOUNDARY_MIN_CHARS:
-                    rest_start = index + 1
-                    while rest_start < n and buffer[rest_start].isspace():
-                        rest_start += 1
-                    return sentence, buffer[rest_start:], True
+                    cleaned = strip_markdown_for_tts(sentence)
+                    if len(cleaned) >= _MIN_MIDSTREAM_CHARS:
+                        rest_start = index + 1
+                        while rest_start < n and buffer[rest_start].isspace():
+                            rest_start += 1
+                        return sentence, buffer[rest_start:], True
+                    # Too short — likely an abbreviation. Continue
+                    # walking so the surrounding sentence is captured
+                    # whole on the next real boundary.
             index += 1
         return "", buffer, False

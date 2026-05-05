@@ -100,17 +100,39 @@ def test_sentence_buffer_emits_sentences_on_boundary() -> None:
     assert [idx for idx, _ in out] == [0, 1]
 
 
-def test_sentence_buffer_emits_long_sentence_at_stream_boundary() -> None:
+def test_sentence_buffer_does_not_emit_without_trailing_whitespace() -> None:
+    """Mid-stream emission requires a terminator + whitespace boundary.
+
+    Strict boundaries keep multilingual TTS from receiving fragments that
+    are too short to detect language correctly. ``flush`` covers the
+    trailing-fragment case at turn end.
+    """
     buf = SentenceBuffer()
     out = buf.feed("This is a complete streamed sentence.")
-    assert [text for _, text in out] == ["This is a complete streamed sentence."]
+    assert out == []
+    flushed = buf.flush()
+    assert flushed is not None
+    _, text = flushed
+    assert text == "This is a complete streamed sentence."
 
 
-def test_sentence_buffer_emits_long_clause_before_sentence_end() -> None:
+def test_sentence_buffer_does_not_soft_emit_on_clause_boundaries() -> None:
     buf = SentenceBuffer()
-    clause = "This assistant response has enough words to start speaking before the full sentence is complete,"
+    clause = "This assistant response is long enough to look like a candidate for soft emission,"
     out = buf.feed(clause)
-    assert [text for _, text in out] == [clause]
+    assert out == []
+
+
+def test_sentence_buffer_flush_emits_short_trailing_sentence() -> None:
+    """Final short sentences like 'Yes.' must still be spoken."""
+    buf = SentenceBuffer()
+    out = buf.feed("Hello world. Yes.")
+    assert [text for _, text in out] == ["Hello world."]
+    flushed = buf.flush()
+    assert flushed is not None
+    index, text = flushed
+    assert text == "Yes."
+    assert index == 1
 
 
 def test_sentence_buffer_flush_returns_trailing() -> None:
@@ -152,6 +174,13 @@ def test_sentence_buffer_min_length_drops_short_fragments() -> None:
     out = buf.feed("Mr. ")
     # "Mr." is shorter than the minimum, so it should not be emitted.
     assert out == []
+
+
+def test_sentence_buffer_merges_abbreviation_into_next_sentence() -> None:
+    """A short abbreviation must accumulate into the surrounding sentence."""
+    buf = SentenceBuffer()
+    out = buf.feed("Mr. Smith said hello today. ")
+    assert [text for _, text in out] == ["Mr. Smith said hello today."]
 
 
 # ---------------------------------------------------------------------------

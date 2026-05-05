@@ -59,7 +59,6 @@
 
   let queue: AudioQueue | null = null;
   let recorder: MediaRecorder | null = null;
-  let stream: MediaStream | null = null;
   let chunks: Blob[] = [];
 
   let audioContext: AudioContext | null = null;
@@ -74,8 +73,8 @@
   let unsubscribePlaybackError: (() => void) | null = null;
   let wakeLock: ScreenWakeLock | null = null;
   let loopActive = false;
-  let assistantTurnActive = false;
-  let pendingSentenceSyntheses = 0;
+  let assistantTurnActive = $state(false);
+  let pendingSentenceSyntheses = $state(0);
   let listeningGeneration = 0;
   let audioMessageId: string | null = null;
   let nextAudioSentenceIndex = 0;
@@ -83,6 +82,14 @@
   const readyAudioByIndex = new Map<number, { url: string; id: string }>();
   const failedAudioIndexes = new Set<number>();
   const pendingTtsControllers = new Set<AbortController>();
+  /**
+   * Every ``MediaStream`` ever acquired by this overlay. iOS Safari (PWA)
+   * keeps the microphone indicator alive until every track on every stream
+   * is explicitly stopped, so we register each stream the moment we
+   * receive it and walk the registry on teardown / watchdog.
+   */
+  const acquiredStreams = new Set<MediaStream>();
+  let teardownWatchdog: ReturnType<typeof setTimeout> | null = null;
   // True only between ``endUtterance()`` (VAD-driven) and the resulting
   // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
   // forced stop (e.g. user clicked End conversation, mute, or close) can
@@ -95,12 +102,18 @@
   let disposed = true;
   let playbackNeedsGesture = $state(false);
   let playbackErrorNotified = false;
+  let retryNotified = false;
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
   const VAD_SILENCE_MS = 1500;
   const MIN_UTTERANCE_MS = 500;
-  const TTS_SENTENCE_TIMEOUT_MS = 8_000;
+  // Single TTS attempt timeout. Backend low-latency synthesize occasionally
+  // takes 10-20s on a slow provider; we accept that to avoid skipping
+  // sentences. A second retry is attempted on timeout/failure with the
+  // same ceiling.
+  const TTS_SENTENCE_TIMEOUT_MS = 15_000;
+  const TTS_MAX_ATTEMPTS = 2;
 
   function pickMimeType(): string {
     const candidates = [
@@ -150,7 +163,7 @@
       pendingSentenceSyntheses === 0 &&
       (queue?.isEmpty() ?? true) &&
       recorder === null &&
-      stream === null
+      acquiredStreams.size === 0
     );
   }
 
@@ -181,9 +194,16 @@
     readyAudioByIndex.clear();
     failedAudioIndexes.clear();
     playbackErrorNotified = false;
+    retryNotified = false;
   }
 
-  async function synthesizeSentence(frame: {
+  /**
+   * Run a single TTS attempt with a hard client-side timeout via
+   * ``AbortController``. The controller is registered in
+   * ``pendingTtsControllers`` so ``teardown`` can abort everything in
+   * flight on close.
+   */
+  async function ttsAttempt(frame: {
     message_id: string;
     sentence_index: number;
     text: string;
@@ -207,6 +227,32 @@
     }
   }
 
+  /**
+   * Synthesize a sentence with up to ``TTS_MAX_ATTEMPTS`` tries. Aborts
+   * immediately when the overlay is disposed so closing the conversation
+   * never has to wait on a retry.
+   */
+  async function synthesizeSentence(frame: {
+    message_id: string;
+    sentence_index: number;
+    text: string;
+  }): Promise<Awaited<ReturnType<typeof api.tts.synthesize>>> {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= TTS_MAX_ATTEMPTS; attempt += 1) {
+      if (disposed) throw new DOMException('Aborted', 'AbortError');
+      try {
+        return await ttsAttempt(frame);
+      } catch (err) {
+        lastError = err;
+        if (disposed) throw err;
+        if (attempt < TTS_MAX_ATTEMPTS) {
+          notifyTtsRetry();
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Synthesis failed');
+  }
+
   async function unlockPlayback(): Promise<boolean> {
     if (!queue) return false;
     const ok = await queue.unlock();
@@ -220,6 +266,34 @@
     addToast('Voice playback was blocked or timed out, so audio was skipped.', 'warning', 3_000);
   }
 
+  function notifyTtsRetry(): void {
+    if (retryNotified || disposed) return;
+    retryNotified = true;
+    addToast('Voice synthesis is slow, retrying…', 'info', 3_000);
+  }
+
+  /**
+   * Force-stop every track on every stream we have ever acquired in this
+   * overlay session. Called during teardown and again from the watchdog
+   * to ensure iOS Safari (PWA) releases the microphone indicator.
+   */
+  function stopAllAcquiredStreams(): void {
+    for (const acquired of acquiredStreams) {
+      try {
+        for (const track of acquired.getTracks()) {
+          try {
+            track.stop();
+          } catch {
+            // ignore per-track failures
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    acquiredStreams.clear();
+  }
+
   function teardownAudio(): void {
     listeningGeneration += 1;
     clearVad();
@@ -228,28 +302,33 @@
     // the session — Whisper happily hallucinates phrases on near-silent
     // audio, which would then be ``submitText``-ed as a chat message.
     utteranceFinalizing = false;
-    if (recorder && recorder.state !== 'inactive') {
+    if (recorder) {
       recorder.ondataavailable = null;
       recorder.onstop = null;
-      try {
-        recorder.stop();
-      } catch {
-        // ignore
+      recorder.onerror = null;
+      if (recorder.state !== 'inactive') {
+        try {
+          recorder.stop();
+        } catch {
+          // ignore
+        }
       }
     }
     recorder = null;
     chunks = [];
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      stream = null;
-    }
+    stopAllAcquiredStreams();
     if (audioContext) {
-      try {
-        void audioContext.close();
-      } catch {
-        // ignore
-      }
+      const ctx = audioContext;
       audioContext = null;
+      // Close fire-and-forget so teardown stays synchronous from the
+      // user's tap. AudioContext.close() can take a frame on iOS.
+      queueMicrotask(() => {
+        try {
+          void ctx.close();
+        } catch {
+          // ignore
+        }
+      });
     }
     analyser = null;
     speakingDetected = false;
@@ -274,15 +353,31 @@
       onclose();
       return;
     }
+    // Always register the stream so teardown / watchdog can release it
+    // even if startListening bails out at the next gate below.
+    acquiredStreams.add(nextStream);
     if (disposed || generation !== listeningGeneration || !open || muted) {
-      nextStream.getTracks().forEach((track) => track.stop());
+      try {
+        for (const track of nextStream.getTracks()) track.stop();
+      } catch {
+        // ignore
+      }
+      acquiredStreams.delete(nextStream);
       return;
     }
-    stream = nextStream;
     const mimeType = pickMimeType();
+    let nextRecorder: MediaRecorder;
     try {
-      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      nextRecorder = mimeType
+        ? new MediaRecorder(nextStream, { mimeType })
+        : new MediaRecorder(nextStream);
     } catch {
+      try {
+        for (const track of nextStream.getTracks()) track.stop();
+      } catch {
+        // ignore
+      }
+      acquiredStreams.delete(nextStream);
       if (disposed || generation !== listeningGeneration || !open) {
         teardownAudio();
         return;
@@ -292,13 +387,23 @@
       onclose();
       return;
     }
-    recorder.ondataavailable = (event) => {
+    recorder = nextRecorder;
+    nextRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) chunks.push(event.data);
     };
-    recorder.onstop = () => {
-      if (generation === listeningGeneration) {
+    nextRecorder.onstop = () => {
+      if (recorder === nextRecorder) {
         recorder = null;
       }
+      // Once the recorder has stopped its tracks are no longer needed.
+      // Stop them eagerly so iOS Safari drops the microphone indicator
+      // even if VAD did not get there first.
+      try {
+        for (const track of nextStream.getTracks()) track.stop();
+      } catch {
+        // ignore
+      }
+      acquiredStreams.delete(nextStream);
       // Only treat this as a real utterance handoff when ``endUtterance``
       // (VAD-driven) marked it. Forced stops from teardown/mute/close are
       // explicitly NOT finalizing — drop the bytes and do not call STT.
@@ -312,17 +417,28 @@
       chunks = [];
       void onUtterance(captured, extensionFor(mimeType));
     };
-    recorder.start();
+    nextRecorder.onerror = () => {
+      if (recorder === nextRecorder) {
+        recorder = null;
+      }
+      try {
+        for (const track of nextStream.getTracks()) track.stop();
+      } catch {
+        // ignore
+      }
+      acquiredStreams.delete(nextStream);
+    };
+    nextRecorder.start();
 
     // Set up energy-based VAD on the same stream.
-    if (disposed || generation !== listeningGeneration || !open || stream === null) {
+    if (disposed || generation !== listeningGeneration || !open) {
       teardownAudio();
       return;
     }
     audioContext = new AudioContext();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 1024;
-    const source = audioContext.createMediaStreamSource(stream);
+    const source = audioContext.createMediaStreamSource(nextStream);
     source.connect(analyser);
     const buffer = new Float32Array(analyser.fftSize);
     const utteranceStartedAt = Date.now();
@@ -366,17 +482,21 @@
       }
     }
     if (audioContext) {
-      try {
-        void audioContext.close();
-      } catch {
-        // ignore
-      }
+      const ctx = audioContext;
       audioContext = null;
+      queueMicrotask(() => {
+        try {
+          void ctx.close();
+        } catch {
+          // ignore
+        }
+      });
     }
     analyser = null;
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      stream = null;
+    // ``recorder.onstop`` will release the stream for us; if no recorder
+    // is attached for some reason, fall through and stop everything.
+    if (!recorder) {
+      stopAllAcquiredStreams();
     }
   }
 
@@ -432,7 +552,7 @@
       drainReadyAudio();
       // Update transcript drawer (append to last assistant entry or create one).
       transcript = updateTranscriptForAssistant(transcript, frame.message_id, frame.text);
-    } catch (err) {
+    } catch {
       if (disposed) return;
       failedAudioIndexes.add(frame.sentence_index);
       drainReadyAudio();
@@ -516,7 +636,11 @@
     resetAudioOrdering(null);
     activeSentenceKeys.clear();
     for (const controller of pendingTtsControllers) {
-      controller.abort();
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
     }
     pendingTtsControllers.clear();
     if (queue) {
@@ -524,7 +648,12 @@
       queue = null;
     }
     teardownAudio();
-    void wakeLock?.release();
+    if (wakeLock) {
+      const lock = wakeLock;
+      queueMicrotask(() => {
+        void lock.release();
+      });
+    }
     if (unsubscribeSentence) {
       unsubscribeSentence();
       unsubscribeSentence = null;
@@ -548,9 +677,23 @@
     if (shouldDisableTts) {
       sendDisableTts();
     }
+    // Defense in depth for iOS Safari (PWA): some browsers keep the
+    // microphone indicator alive for a short window after the synchronous
+    // teardown. Re-walk the registry shortly after to make sure every
+    // track has actually been stopped.
+    if (teardownWatchdog !== null) {
+      clearTimeout(teardownWatchdog);
+    }
+    teardownWatchdog = setTimeout(() => {
+      teardownWatchdog = null;
+      stopAllAcquiredStreams();
+    }, 250);
   }
 
   function handleClose(): void {
+    // Mark disposed first so any in-flight async work bails out before
+    // we spend time on the parent state flip and synchronous teardown.
+    disposed = true;
     onclose();
     teardown();
   }
@@ -583,6 +726,11 @@
 
   onDestroy(() => {
     teardown();
+    if (teardownWatchdog !== null) {
+      clearTimeout(teardownWatchdog);
+      teardownWatchdog = null;
+    }
+    stopAllAcquiredStreams();
   });
 
   function stateLabel(s: ModeState): string {
@@ -644,7 +792,7 @@
         </Button>
       </div>
 
-      {#if playbackNeedsGesture}
+      {#if playbackNeedsGesture && !assistantTurnActive && pendingSentenceSyntheses === 0}
         <p class="text-center text-xs text-slate-500">Audio playback was blocked. Tap the conversation area to retry; text remains available.</p>
       {/if}
 
