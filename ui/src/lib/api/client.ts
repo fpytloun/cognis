@@ -1273,10 +1273,11 @@ export const api = {
   },
 
   tts: {
-    synthesize(payload: TtsSynthesizeRequest): Promise<TtsSynthesizeResponse> {
+    synthesize(payload: TtsSynthesizeRequest, opts: { signal?: AbortSignal } = {}): Promise<TtsSynthesizeResponse> {
       return request<TtsSynthesizeResponse>('/api/v1/tts/synthesize', {
         method: 'POST',
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: opts.signal
       });
     }
   },

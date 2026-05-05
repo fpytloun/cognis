@@ -188,18 +188,18 @@ export class AudioQueue {
     try {
       await audio.play();
     } catch {
-      // Autoplay blocked: keep the sentence queued so a later user tap can
-      // unlock playback and continue instead of losing the assistant reply.
+      // Autoplay was blocked or playback failed. Drop this sentence and keep
+      // draining so conversation mode never gets wedged in Speaking.
       this.unlocked = false;
       if (this.current === audio) {
         audio.src = '';
       }
-      this.queue.unshift(entry);
       if (this.playing) {
         this.playing = false;
         this.notifyPlaying(false);
       }
       this.notifyPlaybackError();
+      void this.playNext();
     }
   }
 }

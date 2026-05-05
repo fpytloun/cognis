@@ -82,6 +82,7 @@
   const activeSentenceKeys = new Set<string>();
   const readyAudioByIndex = new Map<number, { url: string; id: string }>();
   const failedAudioIndexes = new Set<number>();
+  const pendingTtsControllers = new Set<AbortController>();
   // True only between ``endUtterance()`` (VAD-driven) and the resulting
   // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
   // forced stop (e.g. user clicked End conversation, mute, or close) can
@@ -93,11 +94,13 @@
   // after the overlay has been closed.
   let disposed = true;
   let playbackNeedsGesture = $state(false);
+  let playbackErrorNotified = false;
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
   const VAD_SILENCE_MS = 1500;
   const MIN_UTTERANCE_MS = 500;
+  const TTS_SENTENCE_TIMEOUT_MS = 8_000;
 
   function pickMimeType(): string {
     const candidates = [
@@ -177,6 +180,31 @@
     nextAudioSentenceIndex = 0;
     readyAudioByIndex.clear();
     failedAudioIndexes.clear();
+    playbackErrorNotified = false;
+  }
+
+  async function synthesizeSentence(frame: {
+    message_id: string;
+    sentence_index: number;
+    text: string;
+  }): Promise<Awaited<ReturnType<typeof api.tts.synthesize>>> {
+    const controller = new AbortController();
+    pendingTtsControllers.add(controller);
+    const timeout = window.setTimeout(() => controller.abort(), TTS_SENTENCE_TIMEOUT_MS);
+    try {
+      return await api.tts.synthesize(
+        {
+          text: frame.text,
+          message_id: sentenceCacheMessageId(frame.message_id, frame.sentence_index),
+          agent_id: agent?.agent_id ?? null,
+          low_latency: true
+        },
+        { signal: controller.signal }
+      );
+    } finally {
+      window.clearTimeout(timeout);
+      pendingTtsControllers.delete(controller);
+    }
   }
 
   async function unlockPlayback(): Promise<boolean> {
@@ -184,6 +212,12 @@
     const ok = await queue.unlock();
     playbackNeedsGesture = !ok;
     return ok;
+  }
+
+  function notifyPlaybackSkipped(): void {
+    if (playbackErrorNotified || disposed) return;
+    playbackErrorNotified = true;
+    addToast('Voice playback was blocked or timed out, so audio was skipped.', 'warning', 3_000);
   }
 
   function teardownAudio(): void {
@@ -389,12 +423,7 @@
     pendingSentenceSyntheses += 1;
     modeState = 'speaking';
     try {
-      const result = await api.tts.synthesize({
-        text: frame.text,
-        message_id: sentenceCacheMessageId(frame.message_id, frame.sentence_index),
-        agent_id: agent?.agent_id ?? null,
-        low_latency: true
-      });
+      const result = await synthesizeSentence(frame);
       if (disposed) return;
       readyAudioByIndex.set(frame.sentence_index, {
         url: result.audio_url,
@@ -407,8 +436,7 @@
       if (disposed) return;
       failedAudioIndexes.add(frame.sentence_index);
       drainReadyAudio();
-      const message = err instanceof Error ? err.message : 'Synthesis failed';
-      addToast(message, 'error', 4_000, 'Voice synthesis failed');
+      notifyPlaybackSkipped();
     } finally {
       pendingSentenceSyntheses = Math.max(0, pendingSentenceSyntheses - 1);
       maybeStartListening();
@@ -466,6 +494,7 @@
       unsubscribePlaybackError = queue.onPlaybackError(() => {
         if (disposed) return;
         playbackNeedsGesture = true;
+        notifyPlaybackSkipped();
       });
     }
     void unlockPlayback();
@@ -486,6 +515,10 @@
     pendingSentenceSyntheses = 0;
     resetAudioOrdering(null);
     activeSentenceKeys.clear();
+    for (const controller of pendingTtsControllers) {
+      controller.abort();
+    }
+    pendingTtsControllers.clear();
     if (queue) {
       queue.clear();
       queue = null;
@@ -518,12 +551,15 @@
   }
 
   function handleClose(): void {
-    teardown();
     onclose();
+    teardown();
   }
 
-  async function handleEnablePlayback(): Promise<void> {
-    await unlockPlayback();
+  function handleOverlayPointerDown(event: PointerEvent): void {
+    if ((event.target as HTMLElement | null)?.closest('button')) return;
+    if (playbackNeedsGesture) {
+      void unlockPlayback();
+    }
   }
 
   function toggleMute(): void {
@@ -565,7 +601,7 @@
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/95 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="Voice conversation mode">
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/95 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="Voice conversation mode" tabindex="-1" onpointerdown={handleOverlayPointerDown}>
     <button
       type="button"
       class="absolute right-5 top-5 inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/80 text-slate-300 transition hover:bg-slate-800 hover:text-white"
@@ -594,11 +630,6 @@
       </div>
 
       <div class="flex items-center gap-3">
-        {#if playbackNeedsGesture}
-          <Button variant="primary" type="button" onclick={() => void handleEnablePlayback()}>
-            Enable audio
-          </Button>
-        {/if}
         <Button variant="secondary" type="button" onclick={toggleMute} aria-pressed={muted}>
           {#if muted}
             <Mic class="h-4 w-4 sm:mr-2" />
@@ -612,6 +643,10 @@
           End conversation
         </Button>
       </div>
+
+      {#if playbackNeedsGesture}
+        <p class="text-center text-xs text-slate-500">Audio playback was blocked. Tap the conversation area to retry; text remains available.</p>
+      {/if}
 
       {#if transcript.length > 0}
         <div class="max-h-48 w-full overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-200">
