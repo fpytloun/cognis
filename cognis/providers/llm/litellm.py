@@ -1291,6 +1291,7 @@ class LiteLLMProvider:
         task_type: str = "text_to_speech",
         response_format: str = "mp3",
         speed: float = 1.0,
+        low_latency: bool = False,
     ) -> TextToSpeechResult:
         """Synthesize speech via LiteLLM (OpenAI, ElevenLabs, Azure, etc.).
 
@@ -1322,10 +1323,18 @@ class LiteLLMProvider:
                 }
             },
         )
+        request_kwargs = await self._resolve_provider_kwargs(provider)
+        if low_latency:
+            configured_timeout = request_kwargs.get("timeout", 120)
+            request_kwargs["timeout"] = (
+                min(configured_timeout, 20)
+                if isinstance(configured_timeout, int | float)
+                else 20
+            )
+
         if self._should_route_to_executor(provider):
             if self._inference_router is None:
                 raise RuntimeError("Text-to-speech executor routing is unavailable")
-            request_kwargs = await self._resolve_provider_kwargs(provider)
             return await self._inference_router.route_synthesize(
                 text=text,
                 voice=voice,
@@ -1335,9 +1344,9 @@ class LiteLLMProvider:
                 response_format=normalized_format,
                 speed=speed,
                 request_kwargs=request_kwargs,
+                low_latency=low_latency,
             )
 
-        request_kwargs = await self._resolve_provider_kwargs(provider)
         return await _run_synthesize_local(
             text=text,
             voice=voice,
@@ -1349,6 +1358,7 @@ class LiteLLMProvider:
             provider_preset=provider_preset,
             sanitize_http=self._sanitize_http_error_detail,
             sanitize_general=self._sanitize_error_detail,
+            prefer_direct_http=low_latency,
         )
 
     async def enrich_model_info(
@@ -3741,6 +3751,7 @@ async def _run_synthesize_local(
     provider_preset: str,
     sanitize_http: Any | None = None,
     sanitize_general: Any | None = None,
+    prefer_direct_http: bool = False,
 ) -> TextToSpeechResult:
     """Run a TTS call against an OpenAI-compatible endpoint.
 
@@ -3750,9 +3761,14 @@ async def _run_synthesize_local(
     and a content type derived from ``response_format``.
     """
     content_type = _content_type_for_tts_format(response_format)
+    direct_first = prefer_direct_http and provider_preset in {
+        "openai",
+        "openai_compatible",
+        "litellm_proxy",
+    }
 
     aspeech = getattr(litellm, "aspeech", None)
-    if callable(aspeech):
+    if callable(aspeech) and not direct_first:
         try:
             result = await aspeech(
                 model=wire_model,

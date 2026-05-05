@@ -94,11 +94,23 @@ def test_sentence_buffer_emits_sentences_on_boundary() -> None:
     buf = SentenceBuffer()
     assert buf.feed("Hello") == []
     assert buf.feed(" world.") == []
-    # Boundary requires whitespace after the terminator.
     out = buf.feed(" Next sentence here. ")
     assert [text for _, text in out] == ["Hello world.", "Next sentence here."]
     # Indices are monotonically increasing.
     assert [idx for idx, _ in out] == [0, 1]
+
+
+def test_sentence_buffer_emits_long_sentence_at_stream_boundary() -> None:
+    buf = SentenceBuffer()
+    out = buf.feed("This is a complete streamed sentence.")
+    assert [text for _, text in out] == ["This is a complete streamed sentence."]
+
+
+def test_sentence_buffer_emits_long_clause_before_sentence_end() -> None:
+    buf = SentenceBuffer()
+    clause = "This assistant response has enough words to start speaking before the full sentence is complete,"
+    out = buf.feed(clause)
+    assert [text for _, text in out] == [clause]
 
 
 def test_sentence_buffer_flush_returns_trailing() -> None:

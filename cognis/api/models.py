@@ -1594,6 +1594,7 @@ class TtsSynthesizeRequest(BaseModel):
     voice: str | None = None
     format: str = "mp3"
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    low_latency: bool = False
 
 
 class TtsSynthesizeResponse(BaseModel):

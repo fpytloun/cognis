@@ -215,6 +215,7 @@ class InferenceRouter:
         response_format: str = "mp3",
         speed: float = 1.0,
         request_kwargs: dict[str, Any] | None = None,
+        low_latency: bool = False,
     ) -> TextToSpeechResult:
         conn = await self._find_executor(executor_labels)
         if conn is None:
@@ -232,6 +233,7 @@ class InferenceRouter:
                     "response_format": response_format,
                     "speed": speed,
                     "request_kwargs": request_kwargs or {},
+                    "low_latency": low_latency,
                 },
             )
         except ExecutorDisconnectedError:

@@ -10,10 +10,11 @@ Design choices:
   code aloud, and the result would sound jarring).
 - Markdown formatting (links, bold, italics, headings, inline code) is
   stripped before emitting so the TTS provider sees clean prose.
-- Boundary detection is permissive: ``.``, ``!``, ``?`` followed by
-  whitespace or end-of-string. We require a minimum sentence length
-  (default 8 characters) to avoid emitting one-word frames after
-  abbreviations like "Mr." or initials.
+- Boundary detection is tuned for low-latency voice: full sentence
+  terminators emit at whitespace and can also emit at the current stream
+  boundary once the fragment is long enough. Long clauses and oversized
+  fragments emit at soft boundaries so a voice reply can start before a
+  very long sentence is complete.
 - Buffering is per-message-id; ``feed`` returns a list of newly completed
   sentences so callers can yield zero, one, or many frames per token.
 """
@@ -31,11 +32,12 @@ _MARKDOWN_INLINE_CODE = re.compile(r"`([^`]+)`")
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MARKDOWN_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 
-# Sentence boundary: terminator + whitespace OR end of buffer.
-_SENTENCE_BOUNDARY = re.compile(r"([.!?]+)([\s\n]+)")
 _FENCE = "```"
 
 _MIN_SENTENCE_CHARS = 8
+_EARLY_TERMINATOR_MIN_CHARS = 24
+_SOFT_BOUNDARY_MIN_CHARS = 80
+_MAX_SEGMENT_CHARS = 180
 
 
 def strip_markdown_for_tts(text: str) -> str:
@@ -144,7 +146,26 @@ class SentenceBuffer:
                         rest_start += 1
                     return sentence, buffer[rest_start:], True
                 if next_char == "":
-                    # Boundary requires whitespace; wait for more tokens.
+                    # Streamed chunks often end exactly after punctuation.
+                    # Emit long-enough fragments now instead of waiting for
+                    # the next token or final message_complete.
+                    sentence = buffer[: index + 1]
+                    if len(strip_markdown_for_tts(sentence)) >= _EARLY_TERMINATOR_MIN_CHARS:
+                        return sentence, buffer[index + 1 :], True
                     return "", buffer, False
+            if char in ",;:\n" and index >= _SOFT_BOUNDARY_MIN_CHARS:
+                sentence = buffer[: index + 1]
+                if len(strip_markdown_for_tts(sentence)) >= _SOFT_BOUNDARY_MIN_CHARS:
+                    rest_start = index + 1
+                    while rest_start < n and buffer[rest_start].isspace():
+                        rest_start += 1
+                    return sentence, buffer[rest_start:], True
+            if index >= _MAX_SEGMENT_CHARS and char.isspace():
+                sentence = buffer[:index]
+                if len(strip_markdown_for_tts(sentence)) >= _SOFT_BOUNDARY_MIN_CHARS:
+                    rest_start = index + 1
+                    while rest_start < n and buffer[rest_start].isspace():
+                        rest_start += 1
+                    return sentence, buffer[rest_start:], True
             index += 1
         return "", buffer, False

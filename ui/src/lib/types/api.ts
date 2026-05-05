@@ -1250,6 +1250,7 @@ export interface TtsSynthesizeRequest {
   voice?: string | null;
   format?: string;
   speed?: number;
+  low_latency?: boolean;
 }
 
 export interface TtsSynthesizeResponse {

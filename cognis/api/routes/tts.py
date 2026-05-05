@@ -168,6 +168,7 @@ async def synthesize_tts(
             voice=voice,
             response_format=response_format,
             speed=payload.speed,
+            low_latency=payload.low_latency,
         )
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc

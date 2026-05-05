@@ -77,7 +77,11 @@
   let assistantTurnActive = false;
   let pendingSentenceSyntheses = 0;
   let listeningGeneration = 0;
+  let audioMessageId: string | null = null;
+  let nextAudioSentenceIndex = 0;
   const activeSentenceKeys = new Set<string>();
+  const readyAudioByIndex = new Map<number, { url: string; id: string }>();
+  const failedAudioIndexes = new Set<number>();
   // True only between ``endUtterance()`` (VAD-driven) and the resulting
   // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
   // forced stop (e.g. user clicked End conversation, mute, or close) can
@@ -151,6 +155,28 @@
     if (shouldStartListening()) {
       void startListening();
     }
+  }
+
+  function drainReadyAudio(): void {
+    while (true) {
+      if (failedAudioIndexes.has(nextAudioSentenceIndex)) {
+        failedAudioIndexes.delete(nextAudioSentenceIndex);
+        nextAudioSentenceIndex += 1;
+        continue;
+      }
+      const entry = readyAudioByIndex.get(nextAudioSentenceIndex);
+      if (!entry) break;
+      readyAudioByIndex.delete(nextAudioSentenceIndex);
+      queue?.enqueue(entry);
+      nextAudioSentenceIndex += 1;
+    }
+  }
+
+  function resetAudioOrdering(messageId: string | null): void {
+    audioMessageId = messageId;
+    nextAudioSentenceIndex = 0;
+    readyAudioByIndex.clear();
+    failedAudioIndexes.clear();
   }
 
   async function unlockPlayback(): Promise<boolean> {
@@ -354,6 +380,9 @@
     text: string;
   }): Promise<void> {
     if (disposed) return;
+    if (audioMessageId !== frame.message_id) {
+      resetAudioOrdering(frame.message_id);
+    }
     const sentenceKey = `${frame.message_id}:${frame.sentence_index}`;
     if (activeSentenceKeys.has(sentenceKey)) return;
     activeSentenceKeys.add(sentenceKey);
@@ -363,14 +392,21 @@
       const result = await api.tts.synthesize({
         text: frame.text,
         message_id: sentenceCacheMessageId(frame.message_id, frame.sentence_index),
-        agent_id: agent?.agent_id ?? null
+        agent_id: agent?.agent_id ?? null,
+        low_latency: true
       });
       if (disposed) return;
-      queue?.enqueue({ url: result.audio_url, id: `${frame.message_id}:${frame.sentence_index}` });
+      readyAudioByIndex.set(frame.sentence_index, {
+        url: result.audio_url,
+        id: `${frame.message_id}:${frame.sentence_index}`,
+      });
+      drainReadyAudio();
       // Update transcript drawer (append to last assistant entry or create one).
       transcript = updateTranscriptForAssistant(transcript, frame.message_id, frame.text);
     } catch (err) {
       if (disposed) return;
+      failedAudioIndexes.add(frame.sentence_index);
+      drainReadyAudio();
       const message = err instanceof Error ? err.message : 'Synthesis failed';
       addToast(message, 'error', 4_000, 'Voice synthesis failed');
     } finally {
@@ -409,6 +445,7 @@
     void wakeLock.acquire();
     assistantTurnActive = false;
     pendingSentenceSyntheses = 0;
+    resetAudioOrdering(null);
     activeSentenceKeys.clear();
     transcript = [];
     if (!queue) {
@@ -447,6 +484,7 @@
     playbackNeedsGesture = false;
     assistantTurnActive = false;
     pendingSentenceSyntheses = 0;
+    resetAudioOrdering(null);
     activeSentenceKeys.clear();
     if (queue) {
       queue.clear();

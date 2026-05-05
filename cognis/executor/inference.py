@@ -325,11 +325,20 @@ class InferenceHandler:
         response_format: str = "mp3",
         speed: float = 1.0,
         request_kwargs: dict[str, Any],
+        low_latency: bool = False,
     ) -> dict[str, Any]:
         """Run text-to-speech via LiteLLM on the executor side."""
         from cognis.providers.llm.litellm import _run_synthesize_local
 
         wire_model = _transcription_wire_model(model, provider_preset or "")
+        if low_latency:
+            configured_timeout = request_kwargs.get("timeout", 120)
+            request_kwargs = dict(request_kwargs)
+            request_kwargs["timeout"] = (
+                min(configured_timeout, 20)
+                if isinstance(configured_timeout, int | float)
+                else 20
+            )
         result = await _run_synthesize_local(
             text=text,
             voice=voice,
@@ -339,6 +348,7 @@ class InferenceHandler:
             request_kwargs=dict(request_kwargs),
             resolved_model=model,
             provider_preset=provider_preset or "",
+            prefer_direct_http=low_latency,
         )
         return {
             "audio_hex": result.audio_bytes.hex(),

@@ -924,6 +924,7 @@ class ExecutorRunner:
                 response_format=str(params.get("response_format", "mp3")),
                 speed=float(speed),
                 request_kwargs=request_kwargs,
+                low_latency=bool(params.get("low_latency", False)),
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
