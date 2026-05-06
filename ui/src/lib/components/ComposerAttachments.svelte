@@ -4,7 +4,9 @@
   import Play from 'lucide-svelte/icons/play';
   import X from 'lucide-svelte/icons/x';
 
+  import { haptic } from '$lib/haptics';
   import type { AttachmentRef } from '$lib/types/api';
+  import { formatVoiceDuration } from '$lib/utils/voice-recorder';
 
   /**
    * Composer attachment preview strip.
@@ -41,13 +43,6 @@
     return attachment.blob_url ?? attachment.url ?? null;
   }
 
-  function formatDuration(seconds: number | null | undefined): string {
-    if (!seconds || !Number.isFinite(seconds)) return '0:00';
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds) % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  }
-
   function togglePlay(attachment: AttachmentRef): void {
     const id = attachment.artifact_id;
     let audio = audioElements.get(id);
@@ -70,6 +65,9 @@
     });
     void audio.play().then(() => {
       playingId = id;
+      haptic.light();
+    }).catch(() => {
+      playingId = null;
     });
   }
 </script>
@@ -111,15 +109,15 @@
             {/if}
           </button>
           <Mic class="h-3.5 w-3.5 text-rose-300" />
-          <span class="font-medium tabular-nums">{formatDuration(attachment.duration_seconds)}</span>
+          <span class="font-medium tabular-nums">{formatVoiceDuration(attachment.duration_seconds ?? 0)}</span>
           {#if attachment.voice_recording}
-            <span class="text-[10px] uppercase tracking-wider text-slate-400">voice</span>
+            <span class="text-[10px] uppercase tracking-wider text-slate-400">ready</span>
           {/if}
           <button
             aria-label={`Remove ${attachment.filename}`}
             class="text-slate-400 transition hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
             {disabled}
-            onclick={() => onremove(attachment.artifact_id)}
+            onclick={() => { haptic.warning(); onremove(attachment.artifact_id); }}
             type="button"
           >
             <X class="h-3.5 w-3.5" />

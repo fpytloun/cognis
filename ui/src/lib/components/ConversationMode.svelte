@@ -6,11 +6,20 @@
 
   import { onDestroy, untrack } from 'svelte';
   import { api } from '$lib/api/client';
+  import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import Button from '$lib/components/ui/Button.svelte';
+  import { haptic } from '$lib/haptics';
   import { audioPlayer } from '$lib/stores/audio-player';
   import { addToast } from '$lib/stores/toasts';
   import { AudioQueue } from '$lib/utils/audio-queue';
   import { ScreenWakeLock } from '$lib/utils';
+  import {
+    audioExtensionForMimeType,
+    normalizeVoiceLevel,
+    pickSupportedAudioMimeType,
+    rmsFromTimeDomainData,
+    stopMediaStreamTracks,
+  } from '$lib/utils/voice-recorder';
   import type { Agent } from '$lib/types/api';
 
   /**
@@ -56,6 +65,13 @@
   let modeState: ModeState = $state('idle');
   let muted = $state(false);
   let transcript: Array<{ role: 'user' | 'assistant'; text: string }> = $state([]);
+  let transcriptOpen = $state(false);
+  let voiceLevel = $state(0);
+  let listeningHint = $state('');
+  let missedUtterance = $state('');
+  let pushToTalkActive = $state(false);
+  let pushToTalkStopPending = false;
+  let suppressPushToTalkClick = false;
 
   let queue: AudioQueue | null = null;
   let recorder: MediaRecorder | null = null;
@@ -79,6 +95,7 @@
   let audioMessageId: string | null = null;
   let nextAudioSentenceIndex = 0;
   const activeSentenceKeys = new Set<string>();
+  const ignoredTtsMessageIds = new Set<string>();
   const readyAudioByIndex = new Map<number, { url: string; id: string }>();
   const failedAudioIndexes = new Set<number>();
   const pendingTtsControllers = new Set<AbortController>();
@@ -90,6 +107,7 @@
    */
   const acquiredStreams = new Set<MediaStream>();
   let teardownWatchdog: ReturnType<typeof setTimeout> | null = null;
+  let missedRestartTimer: number | null = null;
   // True only between ``endUtterance()`` (VAD-driven) and the resulting
   // ``recorder.onstop`` firing. ``teardownAudio`` does NOT set this, so a
   // forced stop (e.g. user clicked End conversation, mute, or close) can
@@ -106,8 +124,12 @@
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
+  const VAD_CALIBRATION_MS = 700;
+  const VAD_NOISE_MULTIPLIER = 3.2;
   const VAD_SILENCE_MS = 1500;
+  const VAD_HINT_MS = 5000;
   const MIN_UTTERANCE_MS = 500;
+  const MAX_UTTERANCE_MS = 45000;
   // Single TTS attempt timeout. Backend low-latency synthesize occasionally
   // takes 10-20s on a slow provider; we accept that to avoid skipping
   // sentences. A second retry is attempted on timeout/failure with the
@@ -115,39 +137,24 @@
   const TTS_SENTENCE_TIMEOUT_MS = 15_000;
   const TTS_MAX_ATTEMPTS = 2;
 
-  function pickMimeType(): string {
-    const candidates = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/ogg;codecs=opus',
-      'audio/mp4'
-    ];
-    for (const candidate of candidates) {
-      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(candidate)) {
-        return candidate;
-      }
-    }
-    return '';
-  }
-
-  function extensionFor(mimeType: string): string {
-    if (mimeType.includes('webm')) return 'webm';
-    if (mimeType.includes('ogg')) return 'ogg';
-    if (mimeType.includes('mp4')) return 'm4a';
-    if (mimeType.includes('wav')) return 'wav';
-    return 'bin';
-  }
-
   function clearVad(): void {
     if (vadHandle !== null) {
       clearInterval(vadHandle);
       vadHandle = null;
     }
     lastVoiceAt = 0;
+    voiceLevel = 0;
     // Note: ``speakingDetected`` is intentionally NOT reset here so the
     // ``recorder.onstop`` handler that runs immediately after a VAD-driven
     // ``endUtterance`` can decide whether the captured blob actually
     // contained speech. ``startListening()`` resets it for the next cycle.
+  }
+
+  function clearMissedRestartTimer(): void {
+    if (missedRestartTimer !== null) {
+      clearTimeout(missedRestartTimer);
+      missedRestartTimer = null;
+    }
   }
 
   function sentenceCacheMessageId(messageId: string, sentenceIndex: number): string {
@@ -195,6 +202,11 @@
     failedAudioIndexes.clear();
     playbackErrorNotified = false;
     retryNotified = false;
+  }
+
+  function selectedVoice(): string | null {
+    const llmConfig = (agent?.llm_config ?? {}) as Record<string, unknown>;
+    return typeof llmConfig.voice === 'string' && llmConfig.voice.trim() ? llmConfig.voice : null;
   }
 
   /**
@@ -279,17 +291,7 @@
    */
   function stopAllAcquiredStreams(): void {
     for (const acquired of acquiredStreams) {
-      try {
-        for (const track of acquired.getTracks()) {
-          try {
-            track.stop();
-          } catch {
-            // ignore per-track failures
-          }
-        }
-      } catch {
-        // ignore
-      }
+      stopMediaStreamTracks(acquired);
     }
     acquiredStreams.clear();
   }
@@ -340,6 +342,15 @@
     void wakeLock?.acquire();
     const generation = ++listeningGeneration;
     modeState = 'listening';
+    listeningHint = '';
+    missedUtterance = '';
+    voiceLevel = 0;
+    const vadAvailable = typeof AudioContext !== 'undefined';
+    if (!vadAvailable && !pushToTalkActive) {
+      modeState = 'idle';
+      listeningHint = 'Hold Push to talk to record.';
+      return;
+    }
     chunks = [];
     speakingDetected = false;
     lastVoiceAt = 0;
@@ -357,26 +368,18 @@
     // even if startListening bails out at the next gate below.
     acquiredStreams.add(nextStream);
     if (disposed || generation !== listeningGeneration || !open || muted) {
-      try {
-        for (const track of nextStream.getTracks()) track.stop();
-      } catch {
-        // ignore
-      }
+      stopMediaStreamTracks(nextStream);
       acquiredStreams.delete(nextStream);
       return;
     }
-    const mimeType = pickMimeType();
+    const mimeType = pickSupportedAudioMimeType();
     let nextRecorder: MediaRecorder;
     try {
       nextRecorder = mimeType
         ? new MediaRecorder(nextStream, { mimeType })
         : new MediaRecorder(nextStream);
     } catch {
-      try {
-        for (const track of nextStream.getTracks()) track.stop();
-      } catch {
-        // ignore
-      }
+      stopMediaStreamTracks(nextStream);
       acquiredStreams.delete(nextStream);
       if (disposed || generation !== listeningGeneration || !open) {
         teardownAudio();
@@ -398,11 +401,7 @@
       // Once the recorder has stopped its tracks are no longer needed.
       // Stop them eagerly so iOS Safari drops the microphone indicator
       // even if VAD did not get there first.
-      try {
-        for (const track of nextStream.getTracks()) track.stop();
-      } catch {
-        // ignore
-      }
+      stopMediaStreamTracks(nextStream);
       acquiredStreams.delete(nextStream);
       // Only treat this as a real utterance handoff when ``endUtterance``
       // (VAD-driven) marked it. Forced stops from teardown/mute/close are
@@ -415,33 +414,56 @@
       }
       const captured = new Blob(chunks, { type: mimeType || 'audio/webm' });
       chunks = [];
-      void onUtterance(captured, extensionFor(mimeType));
+      void onUtterance(captured, audioExtensionForMimeType(mimeType));
     };
     nextRecorder.onerror = () => {
       if (recorder === nextRecorder) {
         recorder = null;
       }
-      try {
-        for (const track of nextStream.getTracks()) track.stop();
-      } catch {
-        // ignore
-      }
+      stopMediaStreamTracks(nextStream);
       acquiredStreams.delete(nextStream);
     };
     nextRecorder.start();
+
+    if (pushToTalkStopPending) {
+      pushToTalkStopPending = false;
+      speakingDetected = true;
+      endUtterance();
+      return;
+    }
 
     // Set up energy-based VAD on the same stream.
     if (disposed || generation !== listeningGeneration || !open) {
       teardownAudio();
       return;
     }
-    audioContext = new AudioContext();
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 1024;
-    const source = audioContext.createMediaStreamSource(nextStream);
-    source.connect(analyser);
+    if (!vadAvailable) {
+      listeningHint = 'Release Push to talk when done.';
+      return;
+    }
+    try {
+      audioContext = new AudioContext();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      const source = audioContext.createMediaStreamSource(nextStream);
+      source.connect(analyser);
+    } catch {
+      addToast('Voice activity detection is not available. Use push-to-talk.', 'warning', 4_000);
+      if (pushToTalkActive) {
+        listeningHint = 'Release Push to talk when done.';
+      } else {
+        teardownAudio();
+        modeState = 'idle';
+        listeningHint = 'Hold Push to talk to record.';
+      }
+      return;
+    }
     const buffer = new Float32Array(analyser.fftSize);
     const utteranceStartedAt = Date.now();
+    let speechStartedAt = 0;
+    let calibrationSamples = 0;
+    let calibrationTotal = 0;
+    let vadThreshold = VAD_RMS_THRESHOLD;
 
     vadHandle = setInterval(() => {
       if (disposed || generation !== listeningGeneration || !open) {
@@ -450,14 +472,24 @@
       }
       if (!analyser) return;
       analyser.getFloatTimeDomainData(buffer);
-      let sum = 0;
-      for (let i = 0; i < buffer.length; i += 1) {
-        sum += buffer[i] * buffer[i];
-      }
-      const rms = Math.sqrt(sum / buffer.length);
+      const rms = rmsFromTimeDomainData(buffer);
       const now = Date.now();
-      if (rms > VAD_RMS_THRESHOLD) {
+      if (!speakingDetected && now - utteranceStartedAt <= VAD_CALIBRATION_MS) {
+        calibrationSamples += 1;
+        calibrationTotal += rms;
+        const noiseFloor = calibrationTotal / calibrationSamples;
+        vadThreshold = Math.max(VAD_RMS_THRESHOLD, noiseFloor * VAD_NOISE_MULTIPLIER);
+      }
+      voiceLevel = normalizeVoiceLevel(rms, vadThreshold);
+      if (!speakingDetected && now - utteranceStartedAt > VAD_HINT_MS) {
+        listeningHint = 'Speak when ready, or hold Push to talk.';
+      }
+      if (speechStartedAt > 0 && now - speechStartedAt > MAX_UTTERANCE_MS) {
+        endUtterance();
+      } else if (rms > vadThreshold) {
+        if (!speakingDetected) speechStartedAt = now;
         speakingDetected = true;
+        listeningHint = '';
         lastVoiceAt = now;
       } else if (
         speakingDetected &&
@@ -507,16 +539,24 @@
       return;
     }
     modeState = 'processing';
+    listeningHint = '';
+    voiceLevel = 0;
     try {
       const filename = `voice-${Date.now()}.${ext}`;
       const result = await api.stt.transcribe(blob, { filename });
       if (disposed) return;
       const text = result.text.trim();
       if (!text) {
-        // Heard nothing — go back to listening.
-        void startListening();
+        missedUtterance = "I didn't catch that.";
+        haptic.warning();
+        clearMissedRestartTimer();
+        missedRestartTimer = window.setTimeout(() => {
+          missedRestartTimer = null;
+          if (!disposed) void startListening();
+        }, 650);
         return;
       }
+      haptic.success();
       transcript = [...transcript, { role: 'user', text }];
       assistantTurnActive = true;
       submitText(text);
@@ -524,6 +564,7 @@
       if (disposed) return;
       const message = err instanceof Error ? err.message : 'Transcription failed';
       addToast(message, 'error', 4_000, 'Voice transcription failed');
+      haptic.error();
       void startListening();
     }
   }
@@ -534,6 +575,7 @@
     text: string;
   }): Promise<void> {
     if (disposed) return;
+    if (ignoredTtsMessageIds.has(frame.message_id)) return;
     if (audioMessageId !== frame.message_id) {
       resetAudioOrdering(frame.message_id);
     }
@@ -542,14 +584,17 @@
     activeSentenceKeys.add(sentenceKey);
     pendingSentenceSyntheses += 1;
     modeState = 'speaking';
+    voiceLevel = 0;
     try {
       const result = await synthesizeSentence(frame);
       if (disposed) return;
+      if (ignoredTtsMessageIds.has(frame.message_id)) return;
       readyAudioByIndex.set(frame.sentence_index, {
         url: result.audio_url,
         id: `${frame.message_id}:${frame.sentence_index}`,
       });
       drainReadyAudio();
+      if (frame.sentence_index === 0) haptic.light();
       // Update transcript drawer (append to last assistant entry or create one).
       transcript = updateTranscriptForAssistant(transcript, frame.message_id, frame.text);
     } catch {
@@ -595,7 +640,9 @@
     pendingSentenceSyntheses = 0;
     resetAudioOrdering(null);
     activeSentenceKeys.clear();
+    ignoredTtsMessageIds.clear();
     transcript = [];
+    transcriptOpen = false;
     if (!queue) {
       queue = new AudioQueue();
       unsubscribeIdle = queue.onIdle(() => {
@@ -620,9 +667,8 @@
     void unlockPlayback();
     unsubscribeSentence = subscribeSentenceReady((frame) => void handleSentenceReady(frame));
     unsubscribeMessage = subscribeMessageComplete(handleMessageComplete);
-    const llmConfig = (agent?.llm_config ?? {}) as Record<string, unknown>;
-    const voice = typeof llmConfig.voice === 'string' && llmConfig.voice.trim() ? llmConfig.voice : null;
-    sendEnableTts(voice);
+    haptic.success();
+    sendEnableTts(selectedVoice());
     void startListening();
   }
 
@@ -632,9 +678,17 @@
     disposed = true;
     playbackNeedsGesture = false;
     assistantTurnActive = false;
+    pushToTalkActive = false;
+    pushToTalkStopPending = false;
+    suppressPushToTalkClick = false;
+    listeningHint = '';
+    missedUtterance = '';
+    voiceLevel = 0;
     pendingSentenceSyntheses = 0;
     resetAudioOrdering(null);
     activeSentenceKeys.clear();
+    ignoredTtsMessageIds.clear();
+    clearMissedRestartTimer();
     for (const controller of pendingTtsControllers) {
       try {
         controller.abort();
@@ -694,6 +748,7 @@
     // Mark disposed first so any in-flight async work bails out before
     // we spend time on the parent state flip and synchronous teardown.
     disposed = true;
+    haptic.warning();
     onclose();
     teardown();
   }
@@ -707,12 +762,114 @@
 
   function toggleMute(): void {
     muted = !muted;
+    haptic.light();
     if (muted) {
       teardownAudio();
       modeState = 'idle';
     } else {
       maybeStartListening();
     }
+  }
+
+  function interruptAssistant(relisten = true): void {
+    if (!queue && pendingTtsControllers.size === 0 && !assistantTurnActive) return;
+    haptic.warning();
+    for (const controller of pendingTtsControllers) {
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
+    }
+    pendingTtsControllers.clear();
+    queue?.clear();
+    pendingSentenceSyntheses = 0;
+    assistantTurnActive = false;
+    playbackNeedsGesture = false;
+    if (audioMessageId) ignoredTtsMessageIds.add(audioMessageId);
+    resetAudioOrdering(null);
+    sendDisableTts();
+    sendEnableTts(selectedVoice());
+    if (relisten) maybeStartListening();
+  }
+
+  function handlePushToTalkDown(event: PointerEvent): void {
+    if (!open || disposed || event.pointerType === 'mouse') return;
+    suppressPushToTalkClick = true;
+    haptic.medium();
+    try {
+      (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    } catch {
+      // ignore
+    }
+    if (muted) muted = false;
+    if (assistantTurnActive || pendingSentenceSyntheses > 0 || queue?.isPlaying()) {
+      interruptAssistant(false);
+    }
+    pushToTalkActive = true;
+    pushToTalkStopPending = false;
+    if (!recorder) {
+      void startListening();
+    }
+  }
+
+  function handlePushToTalkUp(event: PointerEvent): void {
+    if (!pushToTalkActive) return;
+    pushToTalkActive = false;
+    try {
+      (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+    } catch {
+      // ignore
+    }
+    haptic.light();
+    if (recorder) {
+      speakingDetected = true;
+      endUtterance();
+    } else {
+      pushToTalkStopPending = true;
+    }
+    window.setTimeout(() => {
+      suppressPushToTalkClick = false;
+    }, 450);
+  }
+
+  function handlePushToTalkCancel(event: PointerEvent): void {
+    if (!pushToTalkActive) return;
+    pushToTalkActive = false;
+    pushToTalkStopPending = false;
+    suppressPushToTalkClick = true;
+    try {
+      (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
+    } catch {
+      // ignore
+    }
+    teardownAudio();
+    window.setTimeout(() => {
+      suppressPushToTalkClick = false;
+      if (!disposed) maybeStartListening();
+    }, 450);
+  }
+
+  function handlePushToTalkClick(event: MouseEvent): void {
+    if (suppressPushToTalkClick) {
+      event.preventDefault();
+      return;
+    }
+    if (pushToTalkActive || recorder) {
+      pushToTalkActive = false;
+      if (recorder) {
+        speakingDetected = true;
+        endUtterance();
+      }
+      return;
+    }
+    haptic.medium();
+    if (muted) muted = false;
+    if (assistantTurnActive || pendingSentenceSyntheses > 0 || queue?.isPlaying()) {
+      interruptAssistant(false);
+    }
+    pushToTalkActive = true;
+    void startListening();
   }
 
   $effect(() => {
@@ -735,69 +892,154 @@
 
   function stateLabel(s: ModeState): string {
     if (muted) return 'Muted — tap to listen';
+    if (missedUtterance) return missedUtterance;
+    if (listeningHint) return listeningHint;
     switch (s) {
       case 'listening':
-        return 'Listening…';
+        return listeningHint || 'Listening…';
       case 'processing':
         return 'Transcribing…';
       case 'speaking':
-        return 'Speaking…';
+        return pendingSentenceSyntheses > 0 ? 'Preparing audio…' : 'Speaking…';
       default:
         return 'Connecting…';
     }
   }
+
+  function stateToneClass(): string {
+    if (muted) return 'from-slate-500/35 via-slate-600/25 to-slate-800/35';
+    if (missedUtterance) return 'from-amber-500/40 via-sky-500/25 to-slate-600/30';
+    if (modeState === 'listening') return 'from-emerald-400/45 via-sky-400/30 to-cyan-500/35';
+    if (modeState === 'processing') return 'from-sky-400/45 via-cyan-400/30 to-violet-500/35';
+    if (modeState === 'speaking') return 'from-sky-500/45 via-cyan-500/30 to-violet-500/40';
+    return 'from-slate-500/35 via-sky-500/20 to-slate-800/35';
+  }
+
+  function agentLabel(): string {
+    return agent?.display_name ?? agent?.name ?? 'Cognis';
+  }
+
+  function voiceLabel(): string {
+    return selectedVoice() ?? 'system voice';
+  }
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/95 backdrop-blur-md" role="dialog" aria-modal="true" aria-label="Voice conversation mode" tabindex="-1" onpointerdown={handleOverlayPointerDown}>
+  <div
+    class="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Voice conversation mode"
+    tabindex="-1"
+    onpointerdown={handleOverlayPointerDown}
+    style="padding-left: max(1rem, env(safe-area-inset-left, 0px)); padding-right: max(1rem, env(safe-area-inset-right, 0px)); padding-top: max(1rem, calc(env(safe-area-inset-top, 0px) + 0.5rem)); padding-bottom: max(1rem, calc(env(safe-area-inset-bottom, 0px) + 0.5rem));"
+  >
     <button
       type="button"
-      class="absolute right-5 top-5 inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/80 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+      class="absolute z-10 inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-900/80 text-slate-300 transition hover:bg-slate-800 hover:text-white"
+      style="right: max(1rem, env(safe-area-inset-right, 0px)); top: max(1rem, calc(env(safe-area-inset-top, 0px) + 0.5rem));"
       aria-label="End conversation"
       onclick={handleClose}
     >
       <X class="h-5 w-5" />
     </button>
 
-    <div class="flex w-full max-w-2xl flex-col items-center gap-6 px-6">
-      <div class="relative h-48 w-48 sm:h-64 sm:w-64">
-        <div
-          class="absolute inset-0 rounded-full bg-gradient-to-br from-sky-500/40 via-cyan-500/30 to-violet-500/40 transition"
-          class:animate-pulse={modeState === 'speaking' || modeState === 'listening'}
-        ></div>
-        <div class="absolute inset-3 rounded-full bg-slate-950 shadow-2xl shadow-sky-500/30"></div>
-        <div class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center">
-          <Headphones class="h-12 w-12 text-sky-300" />
-          <span class="text-sm font-medium uppercase tracking-[0.3em] text-slate-300">Conversation</span>
+    <div class="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-between gap-5">
+      <div class="flex w-full items-center gap-3 pr-14">
+        <AgentAvatar name={agentLabel()} avatarUrl={agent?.avatar_url ?? null} class="h-11 w-11 rounded-2xl" />
+        <div class="min-w-0">
+          <p class="truncate text-base font-semibold text-white">{agentLabel()}</p>
+          <p class="truncate text-xs text-slate-500">Conversation mode · {voiceLabel()}</p>
         </div>
       </div>
 
-      <div class="text-center">
-        <p class="text-base font-medium text-slate-100">{stateLabel(modeState)}</p>
-        <p class="mt-1 text-xs text-slate-400">{conversationId}</p>
+      <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 text-center">
+        <button
+          type="button"
+          class="relative h-56 w-56 rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:h-72 sm:w-72"
+          aria-label={playbackNeedsGesture ? 'Enable audio playback' : modeState === 'speaking' ? 'Interrupt assistant and listen' : 'Voice conversation status'}
+          onclick={() => {
+            if (playbackNeedsGesture) void unlockPlayback();
+            else if (modeState === 'speaking') interruptAssistant();
+          }}
+        >
+          <span
+            class={`absolute inset-0 rounded-full bg-gradient-to-br ${stateToneClass()} transition`}
+            class:animate-pulse={modeState === 'speaking' || modeState === 'listening'}
+          ></span>
+          <span class="absolute inset-3 rounded-full bg-slate-950 shadow-2xl shadow-sky-500/30"></span>
+          <span class="absolute inset-0 flex flex-col items-center justify-center gap-3">
+            <Headphones class="h-12 w-12 text-sky-300 sm:h-14 sm:w-14" />
+            <span class="text-xs font-medium uppercase tracking-[0.3em] text-slate-300">Conversation</span>
+            {#if modeState === 'listening' && !muted}
+              <span class="mt-1 flex h-10 items-end gap-1" aria-hidden="true">
+                {#each [0.35, 0.7, 1, 0.6, 0.85, 0.45] as scale}
+                  <span
+                    class="w-1 rounded-full bg-sky-300 transition-[height] duration-75"
+                    style={`height: ${Math.max(8, Math.round(38 * Math.max(0.15, voiceLevel * scale)))}px;`}
+                  ></span>
+                {/each}
+              </span>
+            {/if}
+          </span>
+        </button>
+
+        <div>
+          <p class="text-lg font-semibold text-slate-100" aria-live="polite">{stateLabel(modeState)}</p>
+          <p class="mt-2 text-sm text-slate-500">
+            {#if playbackNeedsGesture}
+              Tap the orb to enable audio playback.
+            {:else if modeState === 'speaking'}
+              Tap the orb to interrupt and speak.
+            {:else if modeState === 'listening'}
+              Voice stays local until transcription submits text.
+            {:else}
+              Keep this screen open for hands-free replies.
+            {/if}
+          </p>
+        </div>
       </div>
 
-      <div class="flex items-center gap-3">
-        <Button variant="secondary" type="button" onclick={toggleMute} aria-pressed={muted}>
+      <div class="w-full space-y-3">
+        <div class="grid grid-cols-[1fr_auto] gap-3">
+          <button
+            type="button"
+            class={`inline-flex min-h-[56px] items-center justify-center rounded-2xl border px-4 text-base font-semibold transition ${pushToTalkActive ? 'border-sky-300 bg-sky-400 text-slate-950' : 'border-sky-500/40 bg-sky-500/15 text-sky-100 hover:bg-sky-500/25'}`}
+            onpointerdown={handlePushToTalkDown}
+            onpointerup={handlePushToTalkUp}
+            onpointercancel={handlePushToTalkCancel}
+            onclick={handlePushToTalkClick}
+          >
+            <Mic class="mr-2 h-5 w-5" />
+            {pushToTalkActive ? 'Release to send' : 'Hold to talk'}
+          </button>
+          <Button variant="secondary" type="button" class="min-h-[56px] px-4" onclick={toggleMute} aria-pressed={muted}>
           {#if muted}
-            <Mic class="h-4 w-4 sm:mr-2" />
+            <Mic class="h-5 w-5 sm:mr-2" />
             <span class="hidden sm:inline">Unmute</span>
           {:else}
-            <MicOff class="h-4 w-4 sm:mr-2" />
-            <span class="hidden sm:inline">Mute mic</span>
+            <MicOff class="h-5 w-5 sm:mr-2" />
+            <span class="hidden sm:inline">Mute</span>
           {/if}
-        </Button>
-        <Button variant="danger" type="button" onclick={handleClose}>
-          End conversation
-        </Button>
+          </Button>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <Button variant="secondary" type="button" aria-expanded={transcriptOpen} aria-controls="conversation-mode-transcript" onclick={() => { haptic.light(); transcriptOpen = !transcriptOpen; }}>
+            {transcriptOpen ? 'Hide transcript' : 'Show transcript'}
+          </Button>
+          <Button variant="danger" type="button" onclick={handleClose}>
+            End conversation
+          </Button>
+        </div>
       </div>
 
       {#if playbackNeedsGesture && !assistantTurnActive && pendingSentenceSyntheses === 0}
-        <p class="text-center text-xs text-slate-500">Audio playback was blocked. Tap the conversation area to retry; text remains available.</p>
+        <p class="text-center text-xs text-slate-500">Audio playback was blocked. Tap the orb to retry; text remains available.</p>
       {/if}
 
-      {#if transcript.length > 0}
-        <div class="max-h-48 w-full overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-3 text-sm text-slate-200">
+      {#if transcriptOpen && transcript.length > 0}
+        <div id="conversation-mode-transcript" class="max-h-56 w-full overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900/70 p-3 text-left text-sm text-slate-200">
           {#each transcript as entry, i (i)}
             <p class={`mb-2 last:mb-0 ${entry.role === 'user' ? 'text-sky-300' : 'text-slate-200'}`}>
               <span class="text-[10px] font-medium uppercase tracking-wider text-slate-500">{entry.role}</span>

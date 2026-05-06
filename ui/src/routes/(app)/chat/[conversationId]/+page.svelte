@@ -65,6 +65,7 @@ import X from 'lucide-svelte/icons/x';
   import { registerOverlay } from '$lib/stores/overlays';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
+  import { haptic } from '$lib/haptics';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import {
     enableWebPush,
@@ -115,6 +116,7 @@ import X from 'lucide-svelte/icons/x';
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
   let conversationModeOpen = $state(false);
+  let voiceTranscribing = $state(false);
 
   // Composer drafts persist across tab switches (per conversation) via
   // sessionStorage. A single draft key is kept up to date with the
@@ -1880,6 +1882,7 @@ import X from 'lucide-svelte/icons/x';
   async function handleSend(): Promise<void> {
     let content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
+    if (voiceTranscribing) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
 
     // STT-first: transcribe any voice recordings, replace the composer body
@@ -1887,6 +1890,8 @@ import X from 'lucide-svelte/icons/x';
     // outgoing turn payload. Matches the channel inbound behavior.
     const voiceRecordings = composerAttachments.filter((a) => a.voice_recording);
     if (voiceRecordings.length > 0) {
+      voiceTranscribing = true;
+      haptic.light();
       try {
         const transcripts: string[] = [];
         for (const recording of voiceRecordings) {
@@ -1903,12 +1908,16 @@ import X from 'lucide-svelte/icons/x';
         }
         if (!content && composerAttachments.length === 0) {
           addToast("Couldn't transcribe the recording. Try again or type a message.", 'error');
+          haptic.error();
           return;
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Transcription failed';
         addToast(message, 'error', 4_000, 'Voice transcription failed');
+        haptic.error();
         return;
+      } finally {
+        voiceTranscribing = false;
       }
     }
 
@@ -1999,6 +2008,7 @@ import X from 'lucide-svelte/icons/x';
           typeof pendingStepTool?.arguments?.step_name === 'string'
             ? (pendingStepTool.arguments.step_name as string)
             : pendingDirectQuestion?.stepName;
+        haptic.success();
         wsClient.respondStepQuestion(notificationId, content, stepName);
         return;
       }
@@ -2012,6 +2022,7 @@ import X from 'lucide-svelte/icons/x';
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
+    haptic.success();
     wsClient.sendMessage(currentConversation.conversation_id, outboundContent, attachments, clientMessageId);
   }
 
@@ -3676,10 +3687,16 @@ import X from 'lucide-svelte/icons/x';
                 }}
               />
             {/if}
+            {#if voiceTranscribing}
+              <div class="flex items-center gap-2 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-100" aria-live="polite">
+                <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-300"></span>
+                Transcribing voice message…
+              </div>
+            {/if}
             <ComposerAttachments
               attachments={composerAttachments}
               onremove={removeAttachment}
-              disabled={directQuestionSubmitting}
+              disabled={directQuestionSubmitting || voiceTranscribing}
             />
             <!--
               iMessage-style single-line composer:
@@ -3704,14 +3721,14 @@ import X from 'lucide-svelte/icons/x';
             <div class="flex items-center gap-1 rounded-3xl border border-slate-700 bg-transparent px-2 py-1 transition focus-within:border-sky-400/50 focus-within:ring-2 focus-within:ring-sky-300/20">
               <label
                 aria-label="Attach files"
-                class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting ? 'pointer-events-none opacity-40' : ''}`}
+                class={`inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 focus-within:bg-slate-800/60 focus-within:text-slate-200 ${directQuestionSubmitting || voiceTranscribing ? 'pointer-events-none opacity-40' : ''}`}
               >
                 <Paperclip class="h-4 w-4 pointer-events-none" />
                 <input
                   class="sr-only"
                   type="file"
                   multiple
-                  disabled={directQuestionSubmitting}
+                  disabled={directQuestionSubmitting || voiceTranscribing}
                   onchange={(event) => {
                     const files = (event.currentTarget as HTMLInputElement).files;
                     if (!files || files.length === 0) return;
@@ -3725,7 +3742,7 @@ import X from 'lucide-svelte/icons/x';
                 bind:value={composer}
                 rows={1}
                 class="min-h-[36px] max-h-[200px] flex-1 resize-none self-center bg-transparent px-1 py-[0.4rem] text-[16px] leading-5 text-slate-100 placeholder:text-slate-500 focus:outline-none focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 sm:text-sm"
-                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting}
+                disabled={!currentConversation || isReadOnly(currentConversation) || isLlmUnavailableForSetup() || directQuestionSubmitting || voiceTranscribing}
                 enterkeyhint={enterToSend ? 'send' : 'enter'}
                 autocapitalize="sentences"
                 spellcheck="true"
@@ -3740,7 +3757,7 @@ import X from 'lucide-svelte/icons/x';
                   aria-label={turnInProgress ? 'Queue message' : pendingDirectQuestion ? 'Answer' : 'Send'}
                   title={turnInProgress ? 'Queue message after current turn' : pendingDirectQuestion ? 'Answer' : 'Send'}
                   class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
-                  disabled={directQuestionSubmitting}
+                  disabled={directQuestionSubmitting || voiceTranscribing}
                 >
                   <ArrowUp class="h-4 w-4" stroke-width="2.5" />
                   {#if turnInProgress}
@@ -3755,13 +3772,13 @@ import X from 'lucide-svelte/icons/x';
                   aria-label="Cancel turn"
                   title="Cancel turn"
                   class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
-                  onclick={() => currentConversation && wsClient.cancelTurn(currentConversation.conversation_id)}
+                  onclick={() => { haptic.warning(); currentConversation && wsClient.cancelTurn(currentConversation.conversation_id); }}
                 >
                   <Square class="h-3 w-3 fill-current" />
                 </button>
               {:else}
                 <MicRecorderButton
-                  disabled={directQuestionSubmitting || !currentConversation || isReadOnly(currentConversation)}
+                  disabled={directQuestionSubmitting || voiceTranscribing || !currentConversation || isReadOnly(currentConversation)}
                   onrecorded={(attachment) => {
                     composerAttachments = [...composerAttachments, attachment];
                   }}
