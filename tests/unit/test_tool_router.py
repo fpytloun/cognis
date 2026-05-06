@@ -312,6 +312,62 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     assert 'trust="untrusted"' in result.output
 
 
+def test_decision_cache_key_buckets_read_only_by_tool_name() -> None:
+    """Read-only decision cache shares one slot per (session, tool) regardless of args."""
+
+    key_a = ToolRouter._decision_cache_key(
+        "session-a", "read", {"file_path": "/a/foo.py"}, read_only=True
+    )
+    key_b = ToolRouter._decision_cache_key(
+        "session-a", "read", {"file_path": "/b/bar.py"}, read_only=True
+    )
+    key_other_tool = ToolRouter._decision_cache_key(
+        "session-a", "grep", {"pattern": "foo"}, read_only=True
+    )
+
+    assert key_a == key_b
+    assert key_a != key_other_tool
+
+
+def test_decision_cache_key_separates_writes_by_arguments() -> None:
+    """Non-read-only callers retain per-argument keys to prevent cross-payload reuse."""
+
+    key_a = ToolRouter._decision_cache_key(
+        "session-a", "write", {"file_path": "/a/foo.py"}, read_only=False
+    )
+    key_b = ToolRouter._decision_cache_key(
+        "session-a", "write", {"file_path": "/b/bar.py"}, read_only=False
+    )
+
+    assert key_a != key_b
+
+
+@pytest.mark.asyncio
+async def test_tool_router_caches_read_only_approval_across_arguments() -> None:
+    """The first read-only approval warms the cache for subsequent reads of the same tool."""
+
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+
+    first = await router.evaluate_tool_call(
+        ToolCall(call_id="r1", name="memory_search", arguments={"query": "alpha"}),
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _readonly_registry(),
+    )
+    second = await router.evaluate_tool_call(
+        ToolCall(call_id="r2", name="memory_search", arguments={"query": "beta"}),
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _readonly_registry(),
+    )
+
+    assert first.decision == "approve"
+    assert second.decision == "approve"
+    assert second.source == "guardrails_cache"
+    assert guardrails.evaluate_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_tool_router_does_not_cache_escalate_for_read_only_tools() -> None:
     class _EscalateThenApproveGuardrails:

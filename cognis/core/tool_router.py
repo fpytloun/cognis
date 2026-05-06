@@ -297,7 +297,9 @@ class ToolRouter:
         if not read_only:
             return None
         self._purge_stale_decision_cache()
-        entry = self._decision_cache.get(self._decision_cache_key(session_id, tool_name, arguments))
+        entry = self._decision_cache.get(
+            self._decision_cache_key(session_id, tool_name, arguments, read_only=read_only)
+        )
         if entry is None:
             return None
         expires_at, decision = entry
@@ -323,7 +325,9 @@ class ToolRouter:
     ) -> None:
         if not read_only or decision.decision != "approve":
             return
-        self._decision_cache[self._decision_cache_key(session_id, tool_name, arguments)] = (
+        self._decision_cache[
+            self._decision_cache_key(session_id, tool_name, arguments, read_only=read_only)
+        ] = (
             monotonic() + self._decision_cache_ttl_seconds,
             decision,
         )
@@ -340,8 +344,20 @@ class ToolRouter:
 
     @staticmethod
     def _decision_cache_key(
-        session_id: str, tool_name: str, arguments: dict[str, Any]
+        session_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        read_only: bool = False,
     ) -> tuple[str, str, str]:
+        # Read-only tool decisions are independent of arguments — Intaris
+        # classifies a read regardless of the file path. Bucketing by tool
+        # name lets a session's first read warm the cache for every
+        # subsequent read of the same tool. Non-read-only callers retain
+        # the per-argument key so write/destructive paths cannot share
+        # cached approvals across distinct payloads.
+        if read_only:
+            return session_id, tool_name, "*"
         payload = json.dumps(arguments, sort_keys=True, default=str, separators=(",", ":"))
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
         return session_id, tool_name, digest
@@ -553,8 +569,7 @@ class ToolRouter:
                 return self._sanitize_result(
                     tool_call.name,
                     ToolResult(
-                        output=decision.reasoning
-                        or "Agent management requires explicit approval.",
+                        output=decision.reasoning or "Agent management requires explicit approval.",
                         is_error=True,
                         metadata={"evaluation": eval_meta},
                     ),
@@ -942,9 +957,7 @@ class ToolRouter:
                 else None
             ),
         )
-        next_metadata = {
-            k: v for k, v in metadata.items() if k != "attachment_analysis_request"
-        }
+        next_metadata = {k: v for k, v in metadata.items() if k != "attachment_analysis_request"}
         if analysis.metadata:
             next_metadata.update(analysis.metadata)
         return analysis.model_copy(update={"metadata": next_metadata, "attachments": None})
@@ -1049,7 +1062,9 @@ class ToolRouter:
         self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
     ) -> ToolCall:
         arguments = dict(tool_call.arguments)
-        if tool_call.name == "artifact_save" and (artifact_id := arguments.get("source_artifact_id")):
+        if tool_call.name == "artifact_save" and (
+            artifact_id := arguments.get("source_artifact_id")
+        ):
             content, mime_type, filename = await self._load_binary_artifact(
                 str(artifact_id), session.user_email
             )
@@ -1096,7 +1111,10 @@ class ToolRouter:
                     sanitized[key] = {
                         str(env_key): "<resolved-at-execution>"
                         if isinstance(env_value, str)
-                        and (env_value.startswith("$credential:") or env_value.startswith("$auth_challenge:"))
+                        and (
+                            env_value.startswith("$credential:")
+                            or env_value.startswith("$auth_challenge:")
+                        )
                         else self._sanitize_sensitive_refs_for_guardrails(env_value)
                         for env_key, env_value in item.items()
                     }
@@ -1294,7 +1312,9 @@ class ToolRouter:
         payload.setdefault("kind", "otp_code" if field == "code" else "manual_continue")
         payload.setdefault("label", challenge_id.replace("_", " ").strip().title())
         payload.setdefault("message", "Authentication is required to continue.")
-        payload.setdefault("required_fields", [field] if field not in {"response", "completed"} else [])
+        payload.setdefault(
+            "required_fields", [field] if field not in {"response", "completed"} else []
+        )
         payload["expires_at"] = (datetime.now(UTC) + timedelta(seconds=timeout_seconds)).isoformat()
         pause_id = f"auth_{uuid.uuid4().hex[:12]}"
         metadata = dict(tool_call.runtime_metadata or {})
@@ -1303,8 +1323,12 @@ class ToolRouter:
             user_email=session.user_email,
             conversation_id=session.conversation_id,
             task_id=metadata.get("task_id") if isinstance(metadata.get("task_id"), str) else None,
-            step_name=metadata.get("step_name") if isinstance(metadata.get("step_name"), str) else None,
-            step_run_id=metadata.get("step_run_id") if isinstance(metadata.get("step_run_id"), str) else None,
+            step_name=metadata.get("step_name")
+            if isinstance(metadata.get("step_name"), str)
+            else None,
+            step_run_id=metadata.get("step_run_id")
+            if isinstance(metadata.get("step_run_id"), str)
+            else None,
             session_id=session.session_id,
             notification_id=pause_id,
             payload=payload,

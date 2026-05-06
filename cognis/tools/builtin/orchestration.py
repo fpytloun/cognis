@@ -67,8 +67,11 @@ ORCHESTRATION_TOOL_NAMES = (
 DELEGATE_TOOL = ToolDefinition(
     name="delegate",
     description=(
-        "Delegate work to a sub-session. The sub-session runs a focused task "
-        "and returns a result. By default (wait=false) the sub-session runs in "
+        "Delegate work to a sub-session. For non-trivial codebase exploration, "
+        "prefer delegating to `system:explore` rather than reading and grepping "
+        "many files directly — the sub-session returns a focused report and "
+        "keeps your context small for synthesis. The sub-session runs a focused "
+        "task and returns a result. By default (wait=false) the sub-session runs in "
         "the background while the main chat stays responsive — you will receive "
         "a follow-up with the result. Set wait=true to block until the sub-session "
         "completes and receive its output directly as the tool result. Use wait=true "

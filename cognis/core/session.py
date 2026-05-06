@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -26,7 +27,11 @@ from cognis.models.session import (
     SessionStatus,
     with_session_events_turn_id,
 )
-from cognis.runtime_context import scoped_runtime_context
+from cognis.runtime_context import (
+    current_effective_working_directory,
+    current_workspace_root,
+    scoped_runtime_context,
+)
 from cognis.store import queries
 
 logger = get_logger(__name__)
@@ -87,6 +92,88 @@ def _normalize_intention(value: str | None, fallback: str = "Conversation") -> s
     if len(resolved) <= _MAX_INTENTION_LENGTH:
         return resolved
     return resolved[: _MAX_INTENTION_LENGTH - 3].rstrip() + "..."
+
+
+def _resolve_runtime_workdir() -> str | None:
+    """Pick the most specific working directory from the runtime context vars."""
+
+    return current_effective_working_directory.get() or current_workspace_root.get()
+
+
+async def _project_source_paths(db_session: AsyncSession, project_id: str | None) -> list[str]:
+    """Return local_path entries from a project's sources, if any."""
+
+    if not project_id:
+        return []
+    try:
+        sources = await queries.list_project_sources(db_session, project_id)
+    except Exception:
+        # Best-effort: missing/unreadable project sources should not block
+        # session creation. Intaris path policy enforcement still works
+        # without project sources, just less broadly.
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        local_path = (source.local_path or "").strip()
+        if not local_path or local_path in seen:
+            continue
+        paths.append(local_path)
+        seen.add(local_path)
+    return paths
+
+
+def _intaris_session_details(
+    working_directory: str | None,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the ``details`` payload for ``guardrails.create_session``.
+
+    Including ``working_directory`` enables Intaris's classifier path
+    policy: in-project reads fast-path through the read-only allowlist
+    instead of falling through to the LLM evaluation path.
+    """
+
+    details: dict[str, Any] = {"source": "cognis"}
+    if working_directory:
+        details["working_directory"] = working_directory
+    if extra:
+        for key, value in extra.items():
+            if value is not None:
+                details[key] = value
+    return details
+
+
+def _intaris_session_policy(
+    working_directory: str | None,
+    *,
+    project_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the ``policy`` payload for ``guardrails.create_session``.
+
+    ``allow_paths`` widens the in-project boundary so that read tools
+    targeting the working directory, the cognis data directory, or any
+    configured project source remain on Intaris's fast path.
+    """
+
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _add(pattern: str) -> None:
+        if pattern and pattern not in seen:
+            paths.append(pattern)
+            seen.add(pattern)
+
+    if working_directory:
+        _add(f"{working_directory}/*")
+    home = str(Path.home())
+    _add(f"{home}/.cognis/*")
+    for raw_path in project_paths or []:
+        if raw_path:
+            _add(f"{raw_path}/*")
+
+    return {"allow_paths": paths} if paths else {}
 
 
 class SessionManager:
@@ -178,6 +265,9 @@ class SessionManager:
                     agent_id=agent_id,
                     session_id=session_id,
                 )
+                project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -188,6 +278,8 @@ class SessionManager:
                         intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        details=_intaris_session_details(workdir),
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -233,6 +325,9 @@ class SessionManager:
                     user_email=user_email,
                     agent_id=agent_id,
                 )
+                project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -243,6 +338,8 @@ class SessionManager:
                         intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        details=_intaris_session_details(workdir),
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -306,6 +403,9 @@ class SessionManager:
                 resolved_intention = _normalize_intention(
                     intention or self._build_root_intention(agent, title)
                 )
+                project_id = getattr(conversation, "project_id", None)
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -316,6 +416,8 @@ class SessionManager:
                         intention=resolved_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        details=_intaris_session_details(workdir),
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -417,13 +519,21 @@ class SessionManager:
                 resolved_intention = _normalize_intention(
                     intention or self._build_child_intention(child_agent, task_description)
                 )
-                details = {
-                    "delegated_by_agent": parent_session.agent_id,
-                    "effective_agent_id": effective_agent_id,
-                    "task_description": task_description,
-                    "expected_output": expected_output,
-                    "constraints": constraints or {},
-                }
+                project_id = await self._lookup_conversation_project_id(
+                    db_session, parent_session.conversation_id
+                )
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
+                child_details = _intaris_session_details(
+                    workdir,
+                    extra={
+                        "delegated_by_agent": parent_session.agent_id,
+                        "effective_agent_id": effective_agent_id,
+                        "task_description": task_description,
+                        "expected_output": expected_output,
+                        "constraints": constraints or {},
+                    },
+                )
                 with scoped_runtime_context(
                     user_email=parent_session.user_email,
                     agent_id=parent_session.agent_id,
@@ -436,7 +546,8 @@ class SessionManager:
                         user_id=parent_session.user_email,
                         parent_session_id=parent_session.intaris_session_id
                         or parent_session.session_id,
-                        details=details,
+                        details=child_details,
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -725,6 +836,9 @@ class SessionManager:
                 )
 
                 # 3. Create Intaris session for the new root
+                project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
@@ -737,6 +851,8 @@ class SessionManager:
                         intention=_normalize_intention(intention),
                         agent_id=current_session.agent_id,
                         user_id=current_session.user_email,
+                        details=_intaris_session_details(workdir),
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
 
                 await queries.set_session_intaris_session_id(
@@ -1027,6 +1143,19 @@ class SessionManager:
                 completion_reason=f"conversation_{conversation_status}",
             )
         return True
+
+    async def _lookup_conversation_project_id(
+        self, db_session: AsyncSession, conversation_id: str | None
+    ) -> str | None:
+        """Return the project_id for a conversation, if one is bound."""
+
+        if not conversation_id:
+            return None
+        try:
+            row = await queries.get_conversation(db_session, conversation_id)
+        except Exception:
+            return None
+        return getattr(row, "project_id", None) if row is not None else None
 
     async def _require_agent(self, db_session: AsyncSession, agent_id: str) -> AgentDefinition:
         # System agents are Python constants, not in DB

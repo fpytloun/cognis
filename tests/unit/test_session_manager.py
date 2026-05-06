@@ -17,6 +17,8 @@ class _Guardrails:
         self.fail = fail
         self.calls: list[tuple[str, str, str | None]] = []
         self.status_calls: list[tuple[str, str, str | None]] = []
+        self.last_details: dict | None = None
+        self.last_policy: dict | None = None
 
     async def create_session(
         self,
@@ -28,9 +30,10 @@ class _Guardrails:
         policy: dict | None = None,
         details: dict | None = None,
     ) -> None:
-        del policy, details
         if self.fail:
             raise RuntimeError("intaris unavailable")
+        self.last_details = dict(details) if details is not None else None
+        self.last_policy = dict(policy) if policy is not None else None
         self.calls.append((session_id, agent_id, parent_session_id))
 
     async def update_session_status(
@@ -654,5 +657,138 @@ async def test_soft_delete_conversation_clears_active_session_and_marks_session_
         assert stored_session is not None
         assert stored_session.status == "completed"
         assert stored_session.completion_reason == "conversation_deleted"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_root_session_passes_workdir_and_allow_paths_to_intaris(tmp_path) -> None:
+    """Working directory + base allow_paths must reach Intaris on session create."""
+
+    from cognis.runtime_context import scoped_runtime_context
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    workdir = "/home/user/projects/cognis"
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        effective_working_directory=workdir,
+    ):
+        conversation, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            title="Wired",
+        )
+    del conversation, root
+
+    assert providers.guardrails.last_details is not None
+    assert providers.guardrails.last_details["working_directory"] == workdir
+    assert providers.guardrails.last_details["source"] == "cognis"
+    assert providers.guardrails.last_policy is not None
+    allow_paths = providers.guardrails.last_policy["allow_paths"]
+    assert f"{workdir}/*" in allow_paths
+    assert any(path.endswith("/.cognis/*") for path in allow_paths)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_root_session_omits_workdir_when_runtime_context_unset(tmp_path) -> None:
+    """Without a working directory in the runtime context, details must not advertise one."""
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="No workdir",
+    )
+    del conversation, root
+
+    assert providers.guardrails.last_details is not None
+    assert "working_directory" not in providers.guardrails.last_details
+    assert providers.guardrails.last_policy is not None
+    # Even without a workdir we still seed the cognis data dir so artifact and
+    # tool-output paths under ~/.cognis stay on the fast path.
+    assert any(
+        path.endswith("/.cognis/*") for path in providers.guardrails.last_policy["allow_paths"]
+    )
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_intaris_session_policy_includes_project_source_paths(tmp_path) -> None:
+    """Project source local_path entries must be added to allow_paths."""
+
+    from cognis.runtime_context import scoped_runtime_context
+    from cognis.store.queries import create_project_source
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    async with session_factory() as session:
+        from cognis.store.models import ProjectRow
+
+        session.add(
+            ProjectRow(
+                project_id="proj-1",
+                name="Test Project",
+                owner_email="user@example.com",
+            )
+        )
+        await session.flush()
+        await create_project_source(
+            session,
+            project_id="proj-1",
+            name="cognis",
+            local_path="/home/user/src/cognis",
+            remote_url=None,
+            default_branch="main",
+        )
+        await create_project_source(
+            session,
+            project_id="proj-1",
+            name="intaris",
+            local_path="/home/user/src/intaris",
+            remote_url=None,
+            default_branch="main",
+        )
+        await session.commit()
+
+    workdir = "/home/user/projects/work"
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        effective_working_directory=workdir,
+    ):
+        conversation = await manager.create_conversation(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            title="Project conv",
+            project_id="proj-1",
+        )
+        await manager.create_root_session(
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            intention="work",
+        )
+
+    allow_paths = providers.guardrails.last_policy["allow_paths"]
+    assert "/home/user/src/cognis/*" in allow_paths
+    assert "/home/user/src/intaris/*" in allow_paths
+    assert f"{workdir}/*" in allow_paths
 
     await engine.dispose()
