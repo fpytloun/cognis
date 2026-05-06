@@ -663,7 +663,7 @@ async def test_soft_delete_conversation_clears_active_session_and_marks_session_
 
 @pytest.mark.asyncio
 async def test_create_root_session_passes_workdir_and_allow_paths_to_intaris(tmp_path) -> None:
-    """Working directory + base allow_paths must reach Intaris on session create."""
+    """Executor-visible working directory must reach Intaris on session create."""
 
     from cognis.runtime_context import scoped_runtime_context
 
@@ -692,7 +692,7 @@ async def test_create_root_session_passes_workdir_and_allow_paths_to_intaris(tmp
     assert providers.guardrails.last_policy is not None
     allow_paths = providers.guardrails.last_policy["allow_paths"]
     assert f"{workdir}/*" in allow_paths
-    assert any(path.endswith("/.cognis/*") for path in allow_paths)
+    assert not any(path.endswith("/.cognis/*") for path in allow_paths)
 
     await engine.dispose()
 
@@ -716,11 +716,7 @@ async def test_create_root_session_omits_workdir_when_runtime_context_unset(tmp_
     assert providers.guardrails.last_details is not None
     assert "working_directory" not in providers.guardrails.last_details
     assert providers.guardrails.last_policy is not None
-    # Even without a workdir we still seed the cognis data dir so artifact and
-    # tool-output paths under ~/.cognis stay on the fast path.
-    assert any(
-        path.endswith("/.cognis/*") for path in providers.guardrails.last_policy["allow_paths"]
-    )
+    assert providers.guardrails.last_policy == {}
 
     await engine.dispose()
 

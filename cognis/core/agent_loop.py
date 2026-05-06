@@ -326,9 +326,12 @@ _PROJECT_TOUCH_TOOL_NAMES = frozenset(
         "glob",
         "grep",
         "bash",
+        "artifact_publish",
     }
 )
-_READ_ONLY_PROJECT_TOUCH_TOOL_NAMES = frozenset({"read", "list_directory", "glob", "grep"})
+_READ_ONLY_PROJECT_TOUCH_TOOL_NAMES = frozenset(
+    {"read", "list_directory", "glob", "grep", "artifact_publish"}
+)
 _PARALLEL_MUTATION_TOOL_NAMES = frozenset(
     {
         "write",
@@ -10166,6 +10169,12 @@ class AgentLoop:
             raw_path = ctx.working_directory or ctx.workspace_root
             if raw_path is None:
                 return None
+        elif tc.name == "artifact_publish":
+            raw_path = (
+                tc.arguments.get("path") if isinstance(tc.arguments.get("path"), str) else None
+            )
+            path_kind = "file"
+            explicit_path = raw_path is not None
         return {
             "path": raw_path or "",
             "path_kind": path_kind,
@@ -10397,6 +10406,18 @@ class AgentLoop:
             metadata["workspace_root"] = ctx.workspace_root
         if ctx.working_directory:
             metadata["working_directory"] = ctx.working_directory
+        if ctx.executor_environment is not None:
+            metadata["executor_environment"] = {
+                "available": bool(getattr(ctx.executor_environment, "available", False)),
+                "executor_id": getattr(ctx.executor_environment, "executor_id", None),
+                "executor_type": getattr(ctx.executor_environment, "executor_type", None),
+                "user": getattr(ctx.executor_environment, "user", None),
+                "home": getattr(ctx.executor_environment, "home", None),
+                "cwd": getattr(ctx.executor_environment, "cwd", None),
+                "hostname": getattr(ctx.executor_environment, "hostname", None),
+                "source": getattr(ctx.executor_environment, "source", None),
+                "observed_at": getattr(ctx.executor_environment, "observed_at", None),
+            }
         if ctx.current_model:
             metadata["resolved_model"] = ctx.current_model
         if ctx.current_provider_id:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -153,8 +152,9 @@ def _intaris_session_policy(
     """Build the ``policy`` payload for ``guardrails.create_session``.
 
     ``allow_paths`` widens the in-project boundary so that read tools
-    targeting the working directory, the cognis data directory, or any
-    configured project source remain on Intaris's fast path.
+    targeting the executor-visible working directory or any configured
+    project source remain on Intaris's fast path. Do not add controller-local
+    paths here; remote executors have a different filesystem namespace.
     """
 
     paths: list[str] = []
@@ -167,8 +167,6 @@ def _intaris_session_policy(
 
     if working_directory:
         _add(f"{working_directory}/*")
-    home = str(Path.home())
-    _add(f"{home}/.cognis/*")
     for raw_path in project_paths or []:
         if raw_path:
             _add(f"{raw_path}/*")

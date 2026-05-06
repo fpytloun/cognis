@@ -227,12 +227,12 @@ def _registry() -> ToolRegistry:
     return registry
 
 
-def _readonly_registry() -> ToolRegistry:
+def _readonly_registry(name: str = "memory_search") -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         RegisteredTool(
             definition=ToolDefinition(
-                name="memory_search",
+                name=name,
                 description="memory search",
                 parameters={"type": "object", "properties": {}},
                 source=ToolSource(type="builtin"),
@@ -341,7 +341,7 @@ def test_extract_output_anchor_names_handles_missing_metadata() -> None:
 
 
 def test_decision_cache_key_buckets_read_only_by_tool_name() -> None:
-    """Read-only decision cache shares one slot per (session, tool) regardless of args."""
+    """Read-only cache shares one slot per session/tool/runtime regardless of args."""
 
     key_a = ToolRouter._decision_cache_key(
         "session-a", "read", {"file_path": "/a/foo.py"}, read_only=True
@@ -355,6 +355,27 @@ def test_decision_cache_key_buckets_read_only_by_tool_name() -> None:
 
     assert key_a == key_b
     assert key_a != key_other_tool
+
+
+def test_decision_cache_key_separates_read_only_by_executor_runtime() -> None:
+    """Executor switches must not reuse path-policy decisions from another runtime."""
+
+    key_a = ToolRouter._decision_cache_key(
+        "session-a",
+        "read",
+        {"file_path": "/a/foo.py"},
+        read_only=True,
+        context={"executor_environment": {"executor_id": "exec-a", "cwd": "/home/a"}},
+    )
+    key_b = ToolRouter._decision_cache_key(
+        "session-a",
+        "read",
+        {"file_path": "/a/foo.py"},
+        read_only=True,
+        context={"executor_environment": {"executor_id": "exec-b", "cwd": "/home/b"}},
+    )
+
+    assert key_a != key_b
 
 
 def test_decision_cache_key_separates_writes_by_arguments() -> None:
@@ -394,6 +415,37 @@ async def test_tool_router_caches_read_only_approval_across_arguments() -> None:
     assert second.decision == "approve"
     assert second.source == "guardrails_cache"
     assert guardrails.evaluate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tool_router_passes_executor_runtime_to_guardrails() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+
+    await router.evaluate_tool_call(
+        ToolCall(
+            call_id="r1",
+            name="artifact_publish",
+            arguments={"path": "/home/riker/image.png"},
+            runtime_metadata={
+                "working_directory": "/home/riker",
+                "executor_environment": {
+                    "executor_id": "riker-laptop",
+                    "executor_type": "websocket",
+                    "cwd": "/home/riker",
+                    "home": "/home/riker",
+                },
+            },
+        ),
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _readonly_registry("artifact_publish"),
+    )
+
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
+    assert context["working_directory"] == "/home/riker"
+    assert context["executor_environment"]["cwd"] == "/home/riker"
 
 
 @pytest.mark.asyncio

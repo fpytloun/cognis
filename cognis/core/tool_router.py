@@ -225,11 +225,12 @@ class ToolRouter:
         if self._is_non_bypassable(
             registered_tool.definition.name, registered_tool.definition.non_bypassable
         ):
+            evaluation_context = self._evaluation_context(tool_call)
             evaluation = await self.guardrails.evaluate(
                 session_id=_guardrails_session_id(session),
                 tool_name=tool_call.name,
                 arguments=tool_call.arguments,
-                context={},
+                context=evaluation_context,
             )
             return PermissionDecision(
                 decision=evaluation.decision,
@@ -254,11 +255,13 @@ class ToolRouter:
         if permission is Permission.ALLOW:
             return PermissionDecision(decision="approve", source="agent")
 
+        evaluation_context = self._evaluation_context(tool_call)
         cached = self._get_cached_decision(
             session.session_id,
             tool_call.name,
             tool_call.arguments,
             registered_tool.definition.read_only,
+            context=evaluation_context,
         )
         if cached is not None:
             TOOL_DECISION_CACHE_HITS.labels(decision=cached.decision).inc()
@@ -268,7 +271,7 @@ class ToolRouter:
             session_id=_guardrails_session_id(session),
             tool_name=tool_call.name,
             arguments=tool_call.arguments,
-            context={},
+            context=evaluation_context,
         )
         decision_result = PermissionDecision(
             decision=evaluation.decision,
@@ -285,8 +288,21 @@ class ToolRouter:
             tool_call.arguments,
             registered_tool.definition.read_only,
             decision_result,
+            context=evaluation_context,
         )
         return decision_result
+
+    @staticmethod
+    def _evaluation_context(tool_call: ToolCall) -> dict[str, Any]:
+        """Build non-content runtime context for Intaris tool evaluation."""
+
+        runtime = tool_call.runtime_metadata or {}
+        context: dict[str, Any] = {}
+        for key in ("workspace_root", "working_directory", "executor_environment"):
+            value = runtime.get(key)
+            if value is not None:
+                context[key] = value
+        return context
 
     def _get_cached_decision(
         self,
@@ -294,12 +310,20 @@ class ToolRouter:
         tool_name: str,
         arguments: dict[str, Any],
         read_only: bool,
+        *,
+        context: dict[str, Any] | None = None,
     ) -> PermissionDecision | None:
         if not read_only:
             return None
         self._purge_stale_decision_cache()
         entry = self._decision_cache.get(
-            self._decision_cache_key(session_id, tool_name, arguments, read_only=read_only)
+            self._decision_cache_key(
+                session_id,
+                tool_name,
+                arguments,
+                read_only=read_only,
+                context=context,
+            )
         )
         if entry is None:
             return None
@@ -323,11 +347,19 @@ class ToolRouter:
         arguments: dict[str, Any],
         read_only: bool,
         decision: PermissionDecision,
+        *,
+        context: dict[str, Any] | None = None,
     ) -> None:
         if not read_only or decision.decision != "approve":
             return
         self._decision_cache[
-            self._decision_cache_key(session_id, tool_name, arguments, read_only=read_only)
+            self._decision_cache_key(
+                session_id,
+                tool_name,
+                arguments,
+                read_only=read_only,
+                context=context,
+            )
         ] = (
             monotonic() + self._decision_cache_ttl_seconds,
             decision,
@@ -350,6 +382,7 @@ class ToolRouter:
         arguments: dict[str, Any],
         *,
         read_only: bool = False,
+        context: dict[str, Any] | None = None,
     ) -> tuple[str, str, str]:
         # Read-only tool decisions are independent of arguments — Intaris
         # classifies a read regardless of the file path. Bucketing by tool
@@ -358,7 +391,18 @@ class ToolRouter:
         # the per-argument key so write/destructive paths cannot share
         # cached approvals across distinct payloads.
         if read_only:
-            return session_id, tool_name, "*"
+            payload = json.dumps(
+                {
+                    "executor_environment": (context or {}).get("executor_environment"),
+                    "working_directory": (context or {}).get("working_directory"),
+                    "workspace_root": (context or {}).get("workspace_root"),
+                },
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+            return session_id, tool_name, digest
         payload = json.dumps(arguments, sort_keys=True, default=str, separators=(",", ":"))
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
         return session_id, tool_name, digest
