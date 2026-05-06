@@ -10,7 +10,17 @@
   --app-viewport-offset-top: 0px;
   --app-bottom-inset: 0px;
   --app-bottom-chrome-bg: #07111a;
-  --app-bottom-control-inset: 0.375rem;
+  /*
+   * iOS PWA standalone reserves a ~34pt strip at the bottom for the
+   * home-indicator gesture and paints it with `theme-color`. Our visible
+   * chrome (bottom tab bar, chat composer) sits at the layout viewport
+   * bottom, which is the top of that reserved strip. Adding any extra
+   * padding-bottom would just stack on top of the unavoidable system
+   * strip and make the gap visibly larger than native apps. Keep the
+   * inset at 0 and let the system strip be the only space below the
+   * controls.
+   */
+  --app-bottom-control-inset: 0px;
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
   --theme-void: #020617;
@@ -20,10 +30,6 @@
   --theme-accent: #38bdf8;
   --theme-accent-strong: #0284c7;
   --theme-accent-soft: #06b6d4;
-}
-
-:root[data-keyboard='open'] {
-  --app-bottom-control-inset: 0px;
 }
 
 html {

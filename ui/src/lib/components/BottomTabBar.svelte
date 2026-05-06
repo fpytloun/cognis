@@ -104,7 +104,7 @@
         {@const Icon = tab.icon}
         <li class="contents">
           <a
-            class={`flex min-h-[48px] flex-col items-center justify-end gap-0.5 px-2 pb-1.5 pt-1 text-[10px] leading-none transition ${
+            class={`flex min-h-[48px] flex-col items-center justify-end gap-0.5 px-2 pb-0 pt-1 text-[10px] leading-none transition ${
               active
                 ? 'text-sky-300'
                 : isOnTabRoute
