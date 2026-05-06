@@ -3560,7 +3560,7 @@ import X from 'lucide-svelte/icons/x';
           {/if}
         </div>
 
-        <div bind:this={footerChromeEl} class="shrink-0 space-y-3 bg-slate-950/95 backdrop-blur">
+        <div bind:this={footerChromeEl} class="shrink-0 space-y-3 backdrop-blur" style="background: var(--app-bottom-chrome-bg);">
           {#if shouldShowChatTodoDrawer}
             <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
               <button
@@ -3627,12 +3627,12 @@ import X from 'lucide-svelte/icons/x';
             the full width of the chat area. No outer card, no recessed
             background — the textarea below carries its own border. The
             visualViewport-sized app shell moves the footer above the
-            keyboard; `--app-bottom-inset` now stays at 0 so the pill
-            also sits flush with the bottom edge in standalone PWA mode.
-            On tablet and up we keep a small padding so the pill never
-            bleeds into the window chrome.
+            keyboard. The bottom control inset is capped so iOS rounded
+            corners/home-indicator safe area does not become a large blank
+            slab, while still leaving a small native-feeling clearance
+            below the input.
           -->
-          <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 pb-[var(--app-bottom-inset,0px)] sm:space-y-3 sm:px-5 sm:py-4 sm:pb-[calc(0.5rem+var(--app-bottom-inset,0px))]" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
+          <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 sm:space-y-3 sm:px-5 sm:pt-4" style="background: var(--app-bottom-chrome-bg); padding-bottom: var(--app-bottom-control-inset);" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->
             {#if slashSuggestionsVisible}
               <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
