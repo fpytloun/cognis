@@ -12,6 +12,7 @@ from cognis.api.common import (
 )
 from cognis.api.models import CredentialResponse, CredentialUpsertRequest
 from cognis.api.serializers import credential_to_response
+from cognis.core.credential_grants import grant_credential_to_agent
 from cognis.store.queries import get_agent
 
 router = APIRouter(prefix="/api/v1/credentials", tags=["credentials"])
@@ -44,7 +45,7 @@ async def upsert_credential_route(
             agent = await get_agent(session, payload.agent_id)
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
-        await check_agent_access(request, agent, required="use")
+        await check_agent_access(request, agent, required="edit")
     row = await request.app.state.providers.credentials.upsert_credential(
         credential_id=payload.credential_id,
         user_email=user.email,
@@ -57,6 +58,15 @@ async def upsert_credential_route(
         metadata=payload.metadata,
         expires_at=payload.expires_at,
     )
+    if payload.agent_id is not None:
+        async with request.app.state.session_factory() as session:
+            await grant_credential_to_agent(
+                session,
+                agent_id=payload.agent_id,
+                credential_id=row.credential_id,
+                owner_email=user.email,
+            )
+            await session.commit()
     return credential_to_response(row)
 
 

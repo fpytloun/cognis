@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_user
+from cognis.store.queries import create_agent, create_user, get_agent
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -150,6 +150,66 @@ def test_credential_request_approve_requires_declared_fields(
         )
 
         assert response.status_code == 400
+
+
+def test_credential_request_approval_grants_created_credential_to_agent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    permissions={},
+                    status="active",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="credential_request",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "credential_id": "github_login",
+                    "kind": "username_password",
+                    "label": "GitHub Login",
+                    "agent_id": "agent-1",
+                    "required_fields": ["username", "password"],
+                },
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={
+                "decision": "approve",
+                "response_payload": {"username": "alice", "password": "secret"},
+            },
+        )
+
+        assert response.status_code == 200
+
+        async def _agent_permissions() -> dict:
+            async with client.app.state.session_factory() as session:
+                agent = await get_agent(session, "agent-1")
+                assert agent is not None
+                return agent.permissions or {}
+
+        permissions = asyncio.run(_agent_permissions())
+        assert permissions["allowed_credentials"] == ["github_login"]
 
 
 def test_credential_request_approve_rejects_empty_declared_fields(

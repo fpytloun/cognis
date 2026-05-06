@@ -39,6 +39,10 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.context import _native_attachment_blocks
 from cognis.core.context_budget import resolve_context_budget
 from cognis.core.context_projection import DEFAULT_COMPACTED_TOOL_GROUPS, project_messages
+from cognis.core.credential_grants import (
+    grant_credential_to_agent,
+    grant_credential_to_agent_definition,
+)
 from cognis.core.decision import build_routing_reminder
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
@@ -5138,11 +5142,28 @@ class AgentLoop:
                                     tc.call_id, tc.name, err_content, True, None, None
                                 )
                             continue
+                        created_credential_id = resolution.data.get("credential_id")
+                        credential_granted = False
+                        if tc.name == REQUEST_CREDENTIAL and isinstance(
+                            created_credential_id, str
+                        ):
+                            grant_credential_to_agent_definition(ctx.agent, created_credential_id)
+                            async with self.session_manager.session_factory() as db_session:
+                                credential_granted = await grant_credential_to_agent(
+                                    db_session,
+                                    agent_id=ctx.agent.agent_id,
+                                    credential_id=created_credential_id,
+                                    owner_email=ctx.session.user_email,
+                                )
+                                if credential_granted:
+                                    await db_session.commit()
                         resp_content = json.dumps(
                             {
-                                "credential_id": resolution.data.get("credential_id"),
+                                "credential_id": created_credential_id,
                                 "credential_label": resolution.data.get("credential_label"),
                                 "credential_kind": resolution.data.get("credential_kind"),
+                                "credential_granted_to_agent": bool(created_credential_id),
+                                "agent_permissions_updated": credential_granted,
                                 "response_ref": resolution.data.get("response_ref"),
                                 "challenge_completed": resolution.data.get(
                                     "challenge_completed", False

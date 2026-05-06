@@ -11,7 +11,7 @@ import pytest
 
 from cognis.core.tool_router import ToolRoute, ToolRouter, _extract_output_anchor_names
 from cognis.models.agent import AgentDefinition, AgentPermissions
-from cognis.models.credential import CredentialAccessError
+from cognis.models.credential import CredentialAccessError, CredentialRecord
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
     Permission,
@@ -155,6 +155,31 @@ class _CredentialProvider:
         if ref == "$credential:reddit_mfa.otp":
             return SimpleNamespace(value="123456")
         raise AssertionError(f"unexpected ref: {ref}")
+
+
+class _BrowserAuthStateCredentialProvider:
+    def __init__(self, *, existing: bool = False) -> None:
+        self.existing = existing
+        self.upserts: list[dict[str, object]] = []
+
+    async def get_credential(self, credential_id: str, user_email: str) -> CredentialRecord | None:
+        if not self.existing:
+            return None
+        return CredentialRecord(
+            credential_id=credential_id,
+            user_email=user_email,
+            kind="browser_storage_state",
+            label="Existing browser state",
+        )
+
+    async def upsert_credential(self, **kwargs: object) -> CredentialRecord:
+        self.upserts.append(kwargs)
+        return CredentialRecord(
+            credential_id=str(kwargs["credential_id"]),
+            user_email=str(kwargs["user_email"]),
+            kind="browser_storage_state",
+            label=str(kwargs["label"]),
+        )
 
 
 def _registry_with_result_limit(max_result_size: int = 20) -> ToolRegistry:
@@ -722,6 +747,62 @@ async def test_tool_router_returns_recoverable_result_for_credential_resolution_
     assert result.metadata["recoverable"] is True
     assert result.metadata["credential_id"] == "rohlik"
     assert "Credential not allowed for agent" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_persist_browser_auth_state_grants_new_credential_to_agent() -> None:
+    provider = _BrowserAuthStateCredentialProvider()
+    router = ToolRouter(guardrails=_Guardrails(), credentials_provider=provider)
+    agent = _agent()
+
+    result = await router._persist_browser_auth_state_if_needed(  # noqa: SLF001
+        ToolResult(
+            output="captured",
+            metadata={
+                "browser_auth_state": {
+                    "credential_id": "bazos-browser",
+                    "label": "Bazos browser state",
+                    "kind": "browser_storage_state",
+                    "metadata": {"origin": "https://www.bazos.cz"},
+                    "payload": {"storage_state": {"cookies": [], "origins": []}},
+                }
+            },
+        ),
+        _session(),
+        agent,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["saved_credential_id"] == "bazos-browser"
+    assert result.metadata["credential_granted_to_agent"] is True
+    assert provider.upserts[0]["credential_id"] == "bazos-browser"
+    assert agent.permissions is not None
+    assert "bazos-browser" in agent.permissions.allowed_credentials
+
+
+@pytest.mark.asyncio
+async def test_tool_router_persist_browser_auth_state_rejects_existing_ungranted_credential() -> None:
+    provider = _BrowserAuthStateCredentialProvider(existing=True)
+    router = ToolRouter(guardrails=_Guardrails(), credentials_provider=provider)
+
+    with pytest.raises(CredentialAccessError, match="Credential not allowed"):
+        await router._persist_browser_auth_state_if_needed(  # noqa: SLF001
+            ToolResult(
+                output="captured",
+                metadata={
+                    "browser_auth_state": {
+                        "credential_id": "bazos-browser",
+                        "label": "Bazos browser state",
+                        "payload": {"storage_state": {"cookies": [], "origins": []}},
+                    }
+                },
+            ),
+            _session(),
+            _agent(),
+        )
+
+    assert provider.upserts == []
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,10 @@ from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.credential_grants import (
+    grant_credential_to_agent,
+    grant_credential_to_agent_definition,
+)
 from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -1438,9 +1442,12 @@ class ToolRouter:
                     }
                 }
             )
-        if agent.permissions is not None and credential_id not in set(
-            agent.permissions.allowed_credentials
-        ):
+        allowed = set(agent.permissions.allowed_credentials if agent.permissions else [])
+        existing = None
+        get_credential = getattr(self.credentials_provider, "get_credential", None)
+        if callable(get_credential):
+            existing = await get_credential(credential_id, session.user_email)
+        if existing is not None and credential_id not in allowed:
             raise CredentialAccessError(
                 "credential_not_allowed",
                 f"Credential not allowed for agent: {credential_id}",
@@ -1457,8 +1464,23 @@ class ToolRouter:
             else {},
             description="Saved browser authentication state",
         )
+        grant_credential_to_agent_definition(agent, created.credential_id)
+        granted = False
+        if self._session_factory is not None:
+            async with self._session_factory() as db:
+                granted = await grant_credential_to_agent(
+                    db,
+                    agent_id=agent.agent_id,
+                    credential_id=created.credential_id,
+                    owner_email=session.user_email,
+                )
+                if granted:
+                    await db.commit()
         next_metadata = {k: v for k, v in result.metadata.items() if k != "browser_auth_state"}
         next_metadata["saved_credential_id"] = created.credential_id
+        next_metadata["credential_granted_to_agent"] = True
+        if granted:
+            next_metadata["agent_permissions_updated"] = True
         return result.model_copy(
             update={
                 "metadata": next_metadata,

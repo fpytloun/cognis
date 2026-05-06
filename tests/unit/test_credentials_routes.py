@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_user
+from cognis.store.queries import create_agent, create_user, get_agent
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -32,6 +32,14 @@ def test_credentials_crud(monkeypatch: object, tmp_path: Path) -> None:
                     password_hash=client.app.state.password_hasher.hash("password123"),
                     role="user",
                 )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    permissions={},
+                    status="active",
+                )
                 await session.commit()
 
         asyncio.run(_seed())
@@ -45,10 +53,20 @@ def test_credentials_crud(monkeypatch: object, tmp_path: Path) -> None:
                 "label": "GitHub Work",
                 "payload": {"token": "abc123"},
                 "metadata": {"origin": "https://github.com"},
+                "agent_id": "agent-1",
             },
         )
         assert response.status_code == 200
         assert response.json()["credential_id"] == "github_work"
+
+        async def _agent_permissions() -> dict:
+            async with client.app.state.session_factory() as session:
+                agent = await get_agent(session, "agent-1")
+                assert agent is not None
+                return agent.permissions or {}
+
+        permissions = asyncio.run(_agent_permissions())
+        assert permissions["allowed_credentials"] == ["github_work"]
 
         listed = client.get(
             "/api/v1/credentials",

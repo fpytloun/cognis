@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from cognis.api.common import require_current_user
 from cognis.api.models import CredentialUpsertRequest
+from cognis.core.credential_grants import grant_credential_to_agent
 from cognis.core.notification_resolution import (
     build_auth_challenge_resolution_data,
     build_credential_request_resolution_data,
@@ -172,6 +173,21 @@ async def resolve_notification(
                 response_payload=payload.response_payload,
                 credential=payload.credential,
             )
+            requested = notification.payload if isinstance(notification.payload, dict) else {}
+            agent_id = requested.get("agent_id")
+            credential_id = data.get("credential_id")
+            if isinstance(agent_id, str) and isinstance(credential_id, str):
+                async with request.app.state.session_factory() as session:
+                    granted = await grant_credential_to_agent(
+                        session,
+                        agent_id=agent_id,
+                        credential_id=credential_id,
+                        owner_email=user.email,
+                    )
+                    if granted:
+                        await session.commit()
+                    data["credential_granted_to_agent"] = True
+                    data["agent_permissions_updated"] = granted
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif notification.notification_type == "auth_challenge":
