@@ -67,6 +67,7 @@ import X from 'lucide-svelte/icons/x';
   import { addToast } from '$lib/stores/toasts';
   import { haptic } from '$lib/haptics';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
+  import { pastedFilesFromClipboardData, readPastedFilesFromNavigator } from '$lib/clipboard';
   import {
     enableWebPush,
     hasEnabledWebPush,
@@ -2071,15 +2072,13 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function handlePaste(event: ClipboardEvent): Promise<void> {
-    const items = event.clipboardData?.items;
-    if (!items) return;
-    const files: File[] = [];
-    for (const item of items) {
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (file) files.push(file);
-      }
+    let files = pastedFilesFromClipboardData(event.clipboardData);
+    if (files.length > 0) {
+      event.preventDefault();
+      await uploadFiles(files);
+      return;
     }
+    files = await readPastedFilesFromNavigator();
     if (files.length > 0) {
       event.preventDefault();
       await uploadFiles(files);

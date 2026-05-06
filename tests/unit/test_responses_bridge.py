@@ -48,7 +48,6 @@ def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
                 {
                     "type": "input_file",
                     "file_url": "https://example.com/report.pdf",
-                    "filename": "report.pdf",
                 },
             ],
         }
@@ -103,6 +102,30 @@ def test_messages_to_responses_input_normalizes_existing_input_file_with_file_id
     result = messages_to_responses_input(messages)
 
     assert result == [{"role": "user", "content": [{"type": "input_file", "file_id": "file-123"}]}]
+
+
+def test_messages_to_responses_input_drops_filename_for_existing_input_file_url() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_file",
+                    "file_url": "https://example.com/report.pdf",
+                    "filename": "report.pdf",
+                }
+            ],
+        }
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [{"type": "input_file", "file_url": "https://example.com/report.pdf"}],
+        }
+    ]
 
 
 def test_split_messages_for_responses_extracts_prefix_into_instructions() -> None:

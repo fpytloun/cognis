@@ -1002,8 +1002,6 @@ def _normalize_message_content(content: Any) -> Any:
                     item["file_id"] = part["file_id"]
                 elif isinstance(part.get("file_url"), str) and part["file_url"]:
                     item["file_url"] = part["file_url"]
-                    if isinstance(part.get("filename"), str) and part["filename"]:
-                        item["filename"] = part["filename"]
                 if len(item) > 1:
                     normalized.append(item)
                 continue
@@ -1032,8 +1030,6 @@ def _normalize_message_content(content: Any) -> Any:
                         item["file_id"] = file_data["file_id"]
                     elif isinstance(file_data.get("file_url"), str) and file_data["file_url"]:
                         item["file_url"] = file_data["file_url"]
-                    if "file_url" in item and isinstance(file_data.get("filename"), str):
-                        item["filename"] = file_data["filename"]
                     if len(item) > 1:
                         normalized.append(item)
                 continue
