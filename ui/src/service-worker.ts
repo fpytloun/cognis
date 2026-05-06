@@ -76,6 +76,7 @@ type WebPushPayload = {
   url?: string;
   tag?: string;
   kind?: string;
+  icon?: unknown;
 };
 
 function parsePushPayload(event: PushEvent): WebPushPayload {
@@ -84,6 +85,17 @@ function parsePushPayload(event: PushEvent): WebPushPayload {
     return event.data.json() as WebPushPayload;
   } catch {
     return { body: event.data.text() };
+  }
+}
+
+function notificationIcon(value: unknown): string {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/pwa/icon-192.png';
+  try {
+    const url = new URL(value, sw.location.origin);
+    if (url.origin !== sw.location.origin) return '/pwa/icon-192.png';
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return '/pwa/icon-192.png';
   }
 }
 
@@ -185,7 +197,7 @@ sw.addEventListener('push', (event) => {
       if (await hasVisibleClientFor(target.pathname)) return;
       await sw.registration.showNotification(payload.title || 'Cognis', {
         body: payload.body || 'Cognis needs your attention.',
-        icon: '/pwa/icon-192.png',
+        icon: notificationIcon(payload.icon),
         badge: '/pwa/icon-192.png',
         tag: payload.tag || 'cognis',
         data: { url: target.pathname, kind: payload.kind || 'notification' },

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -26,8 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.config import CognisConfig
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
-from cognis.store.models import PushSubscriptionRow
-from cognis.store.queries import get_conversation
+from cognis.store.models import Agent, Conversation, PushSubscriptionRow
+from cognis.store.queries import get_agent, get_conversation
 
 logger = get_logger(__name__)
 
@@ -42,6 +42,7 @@ _ALLOWED_PUSH_ENDPOINT_SUFFIXES = (
     ".push.services.mozilla.com",
     ".notify.windows.com",
 )
+_MAX_PUSH_LABEL_LENGTH = 80
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +137,47 @@ def _warn_on_default_subject(subject: str) -> None:
             "web_push: using development VAPID subject; set COGNIS_VAPID_SUBJECT "
             "to a real mailto: or https: contact because Apple Web Push and FCM may reject it"
         )
+
+
+def _push_label(value: str | None) -> str:
+    label = " ".join((value or "").split())
+    if len(label) <= _MAX_PUSH_LABEL_LENGTH:
+        return label
+    return f"{label[: _MAX_PUSH_LABEL_LENGTH - 3].rstrip()}..."
+
+
+def _agent_notification_title(agent: Agent | None) -> str:
+    return _push_label(agent.display_name if agent else None) or _push_label(
+        agent.name if agent else None
+    ) or "Cognis"
+
+
+def _agent_notification_icon(agent: Agent | None) -> str | None:
+    if agent is None:
+        return None
+    if agent.avatar_image_id:
+        return f"/api/v1/images/{quote(agent.avatar_image_id, safe='')}"
+    if agent.avatar_url and _is_same_origin_relative_icon(agent.avatar_url):
+        return agent.avatar_url
+    return None
+
+
+def _is_same_origin_relative_icon(value: str) -> bool:
+    if not value.startswith("/") or value.startswith("//"):
+        return False
+    if any(ord(char) < 32 for char in value):
+        return False
+    parsed = urlparse(value)
+    return not parsed.scheme and not parsed.netloc
+
+
+def _conversation_notification_body(action: str, conversation: Conversation) -> str:
+    title = _push_label(conversation.title)
+    if title:
+        return f"{action} in {title}."
+    if action == "New reply":
+        return "New reply in this chat."
+    return f"{action}."
 
 
 def _runtime_config_from_key(
@@ -407,6 +449,7 @@ class WebPushService:
         url: str,
         tag: str,
         kind: str,
+        icon: str | None = None,
     ) -> dict[str, int]:
         """Send a push payload to all enabled browser subscriptions for a user."""
 
@@ -432,16 +475,16 @@ class WebPushService:
             extra={"kind": kind, "subscription_count": len(rows)},
         )
 
-        payload = json.dumps(
-            {
-                "title": title,
-                "body": body,
-                "url": url,
-                "tag": tag,
-                "kind": kind,
-            },
-            separators=(",", ":"),
-        )
+        payload_data = {
+            "title": title,
+            "body": body,
+            "url": url,
+            "tag": tag,
+            "kind": kind,
+        }
+        if icon:
+            payload_data["icon"] = icon
+        payload = json.dumps(payload_data, separators=(",", ":"))
         statuses = await asyncio.gather(
             *(self._send_one(row, payload) for row in rows), return_exceptions=True
         )
@@ -477,23 +520,27 @@ class WebPushService:
             return None
         async with self._session_factory() as session:
             conversation = await get_conversation(session, conversation_id)
+            agent = await get_agent(session, conversation.agent_id) if conversation else None
         if conversation is None or conversation.context_type != "web":
             return None
 
         url = f"/chat/{conversation_id}"
         tag = conversation_id
         user_email = conversation.user_email
+        title = _agent_notification_title(agent)
+        icon = _agent_notification_icon(agent)
 
         if event.type == EventType.TURN_COMPLETED:
             if event.data.get("task_id") or event.data.get("channel_deliverable"):
                 return None
             return {
                 "user_email": user_email,
-                "title": "Cognis",
-                "body": "New web chat message.",
+                "title": title,
+                "body": _conversation_notification_body("New reply", conversation),
                 "url": url,
                 "tag": tag,
                 "kind": "message",
+                **({"icon": icon} if icon else {}),
             }
 
         if event.type in {
@@ -508,11 +555,12 @@ class WebPushService:
             }[event.type]
             return {
                 "user_email": user_email,
-                "title": "Cognis",
-                "body": status,
+                "title": title,
+                "body": _conversation_notification_body(status.rstrip("."), conversation),
                 "url": url,
                 "tag": f"task:{event.data.get('task_id') or conversation_id}",
                 "kind": "task",
+                **({"icon": icon} if icon else {}),
             }
 
         if event.type == EventType.NOTIFICATION_CREATED:
@@ -526,11 +574,12 @@ class WebPushService:
             }.get(notification_type, "Cognis needs your attention.")
             return {
                 "user_email": user_email,
-                "title": "Cognis",
-                "body": body,
+                "title": title,
+                "body": _conversation_notification_body(body.rstrip("."), conversation),
                 "url": url,
                 "tag": f"notification:{event.data.get('notification_id') or conversation_id}",
                 "kind": notification_type,
+                **({"icon": icon} if icon else {}),
             }
         return None
 

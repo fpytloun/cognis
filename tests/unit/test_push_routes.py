@@ -204,6 +204,8 @@ def test_turn_completed_web_chat_creates_push_payload(
                     agent_id="agent_1",
                     owner_email="user@example.com",
                     name="Agent",
+                    display_name="Research Agent",
+                    avatar_image_id="img_avatar",
                 )
                 await create_conversation(
                     session,
@@ -211,6 +213,7 @@ def test_turn_completed_web_chat_creates_push_payload(
                     agent_id="agent_1",
                     context_type="web",
                     conversation_id="conv_1",
+                    title="Launch planning",
                 )
                 await session.commit()
             service = WebPushService(
@@ -238,12 +241,108 @@ def test_turn_completed_web_chat_creates_push_payload(
 
         assert payload == {
             "user_email": "user@example.com",
-            "title": "Cognis",
-            "body": "New web chat message.",
+            "title": "Research Agent",
+            "body": "New reply in Launch planning.",
             "url": "/chat/conv_1",
             "tag": "conv_1",
             "kind": "message",
+            "icon": "/api/v1/images/img_avatar",
         }
+
+
+def test_turn_completed_push_payload_rejects_protocol_relative_avatar_url(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> dict[str, str] | None:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_unsafe_avatar",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    avatar_url="//tracker.example/icon.png",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_unsafe_avatar",
+                    context_type="web",
+                    conversation_id="conv_unsafe_avatar",
+                    title="Private chat",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+            )
+            return await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={"conversation_id": "conv_unsafe_avatar"},
+                )
+            )
+
+        payload = asyncio.run(_run())
+
+        assert payload is not None
+        assert "icon" not in payload
+
+
+def test_turn_completed_push_payload_allows_same_origin_avatar_url(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> dict[str, str] | None:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_safe_avatar",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    avatar_url="/avatars/local.png",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_safe_avatar",
+                    context_type="web",
+                    conversation_id="conv_safe_avatar",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+            )
+            return await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={"conversation_id": "conv_safe_avatar"},
+                )
+            )
+
+        payload = asyncio.run(_run())
+
+        assert payload is not None
+        assert payload["icon"] == "/avatars/local.png"
 
 
 def test_register_push_subscription_rejects_untrusted_endpoint(
