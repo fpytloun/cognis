@@ -3560,7 +3560,7 @@ import X from 'lucide-svelte/icons/x';
           {/if}
         </div>
 
-        <div bind:this={footerChromeEl} class="shrink-0 space-y-3 backdrop-blur" style="background: var(--app-bottom-chrome-bg);">
+        <div bind:this={footerChromeEl} class="shrink-0 space-y-3" style="background: var(--app-bottom-chrome-bg);">
           {#if shouldShowChatTodoDrawer}
             <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
               <button
@@ -3627,10 +3627,9 @@ import X from 'lucide-svelte/icons/x';
             the full width of the chat area. No outer card, no recessed
             background — the textarea below carries its own border. The
             visualViewport-sized app shell moves the footer above the
-            keyboard. The bottom control inset is capped so iOS rounded
-            corners/home-indicator safe area does not become a large blank
-            slab, while still leaving a small native-feeling clearance
-            below the input.
+            keyboard. The bottom control inset is a fixed small clearance
+            when the keyboard is closed and zero while it is open, so iOS
+            rounded-corner safe area does not become a large blank slab.
           -->
           <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 sm:space-y-3 sm:px-5 sm:pt-4" style="background: var(--app-bottom-chrome-bg); padding-bottom: var(--app-bottom-control-inset);" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
             <!-- Slash command suggestions dropdown -->

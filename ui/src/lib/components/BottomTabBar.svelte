@@ -94,7 +94,7 @@
 {#if visible}
   <nav
     bind:this={navEl}
-    class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 backdrop-blur lg:hidden"
+    class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 lg:hidden"
     style="background: var(--app-bottom-chrome-bg); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); padding-bottom: var(--app-bottom-control-inset);"
     aria-label="Primary"
   >
