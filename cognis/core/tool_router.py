@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
@@ -1519,7 +1520,7 @@ class ToolRouter:
             raise ValueError("Inline attachment missing content_b64")
         content = base64.b64decode(content_b64)
         mime_type = str(raw.get("mime_type") or "application/octet-stream")
-        filename = str(raw.get("filename") or "attachment")
+        filename = sanitize_artifact_filename(str(raw.get("filename") or "attachment"))
         kind = _kind_for_mime_type(mime_type)
         artifact_id = self.artifact_store.generate_id("doc" if kind is ArtifactKind.PDF else "att")
         namespace = "documents" if kind is ArtifactKind.PDF else "attachments"

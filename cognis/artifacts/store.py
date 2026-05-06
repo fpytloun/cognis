@@ -80,6 +80,20 @@ def _validate_path_component(component: str) -> None:
         raise ValueError(f"Unsafe path component: {component}")
 
 
+def sanitize_artifact_filename(filename: str | None, *, default: str = "attachment") -> str:
+    """Return a safe storage filename derived from a user-facing filename."""
+    fallback = re.sub(r"[^a-zA-Z0-9._:@-]+", "_", default).strip("._") or "attachment"
+    raw = (filename or "").replace("\\", "/").strip()
+    candidate = Path(raw).name if raw else fallback
+    sanitized = re.sub(r"[^a-zA-Z0-9._:@-]+", "_", candidate).strip("._")
+    if not sanitized:
+        sanitized = fallback
+    if not sanitized[0].isalnum():
+        sanitized = f"{fallback}_{sanitized}"
+    _validate_path_component(sanitized)
+    return sanitized
+
+
 @runtime_checkable
 class ArtifactBackend(Protocol):
     """Protocol for artifact storage backends.

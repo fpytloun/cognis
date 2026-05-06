@@ -11,6 +11,7 @@ from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
+from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.models.artifact import ArtifactKind
 from cognis.store.queries import create_artifact_record, get_artifact_record
 
@@ -45,7 +46,7 @@ async def upload_artifact(
         raise api_exception(400, "validation_error", "Artifact too large")
 
     artifact_id = artifact_store.generate_id("att")
-    filename = file.filename or "attachment"
+    filename = sanitize_artifact_filename(file.filename, default="attachment")
     content_type = (
         file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     )

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig, S3ArtifactBackend
+from cognis.artifacts.store import (
+    ArtifactStore,
+    ArtifactStoreConfig,
+    S3ArtifactBackend,
+    sanitize_artifact_filename,
+)
 
 
 class _FakePaginator:
@@ -62,6 +67,33 @@ def test_public_url_uses_cognis_base_url(tmp_path) -> None:
         "https://cognis.example.com/api/v1/artifacts/content/images/img_123/image?"
     )
     assert "minio.minio.svc.cluster.local" not in url
+
+
+def test_sanitize_artifact_filename_preserves_json_extension() -> None:
+    assert sanitize_artifact_filename("export (1).json") == "export_1_.json"
+
+
+def test_sanitize_artifact_filename_drops_path_components() -> None:
+    assert sanitize_artifact_filename("../chat export.json") == "chat_export.json"
+    assert sanitize_artifact_filename(r"C:\\tmp\\data.json") == "data.json"
+
+
+def test_filesystem_store_accepts_sanitized_json_upload_name(tmp_path) -> None:
+    store = ArtifactStore(
+        ArtifactStoreConfig(
+            backend="filesystem",
+            path=str(tmp_path),
+            base_url="https://cognis.example.com",
+            signing_secret="test-secret",
+        )
+    )
+    filename = sanitize_artifact_filename("export (1).json")
+
+    store.save("attachments", "att_123", filename, b"{}", "application/json")
+
+    content, content_type = store.load("attachments", "att_123", filename)
+    assert content == b"{}"
+    assert content_type == "application/json"
 
 
 def test_s3_delete_object_deletes_prefix_keys_individually() -> None:
