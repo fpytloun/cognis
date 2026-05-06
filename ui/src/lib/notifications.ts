@@ -236,6 +236,32 @@ export async function reconcileWebPushSubscription(): Promise<boolean> {
   }
 }
 
+export async function disableWebPushForCurrentDevice(): Promise<boolean> {
+  if (!isWebPushSupported()) {
+    setWebPushEnabled(false);
+    return false;
+  }
+
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      setWebPushEnabled(false);
+      return false;
+    }
+    if (subscription.endpoint) {
+      await api.push.unsubscribe(subscription.endpoint).catch(() => undefined);
+    }
+    const removed = await subscription.unsubscribe();
+    if (removed) {
+      setWebPushEnabled(false);
+    }
+    return removed;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Show a browser notification.
  *

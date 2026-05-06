@@ -1411,6 +1411,17 @@ export interface PushSubscriptionResponse {
   enabled: boolean;
 }
 
+export interface PushSubscriptionStatusResponse {
+  configured: boolean;
+  enabled_subscriptions: number;
+  last_error: string | null;
+}
+
+export interface PushSubscriptionTestResponse {
+  sent_to: number;
+  errors: number;
+}
+
 export interface PushSubscriptionPayload {
   endpoint: string;
   expirationTime?: number | null;

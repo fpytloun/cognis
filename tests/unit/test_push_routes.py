@@ -162,6 +162,34 @@ def test_unregister_push_subscription_disables_endpoint(
         assert row.enabled is False
 
 
+def test_push_subscription_test_endpoint_sends_to_current_user(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        asyncio.run(_seed_user(client))
+
+        async def _fake_send_to_user(**kwargs: object) -> dict[str, int]:
+            assert kwargs["user_email"] == "user@example.com"
+            assert kwargs["kind"] == "test"
+            return {"sent_to": 1, "errors": 0}
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            client.app.state.web_push_service,
+            "send_to_user",
+            _fake_send_to_user,
+        )
+
+        response = client.post(
+            "/api/v1/push/subscriptions/test",
+            headers=_auth_headers(client.app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"sent_to": 1, "errors": 0}
+
+
 def test_turn_completed_web_chat_creates_push_payload(
     monkeypatch: object, tmp_path: Path
 ) -> None:

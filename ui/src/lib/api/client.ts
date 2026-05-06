@@ -43,6 +43,8 @@ import type {
   Notification,
   PushSubscriptionPayload,
   PushSubscriptionResponse,
+  PushSubscriptionStatusResponse,
+  PushSubscriptionTestResponse,
   ModelRouting,
   ProviderTestResult,
   PairingRequest,
@@ -1446,6 +1448,16 @@ export const api = {
       return request<PushSubscriptionResponse>('/api/v1/push/subscriptions', {
         method: 'POST',
         body: JSON.stringify(payload)
+      });
+    },
+
+    status(): Promise<PushSubscriptionStatusResponse> {
+      return request<PushSubscriptionStatusResponse>('/api/v1/push/subscriptions/status');
+    },
+
+    test(): Promise<PushSubscriptionTestResponse> {
+      return request<PushSubscriptionTestResponse>('/api/v1/push/subscriptions/test', {
+        method: 'POST'
       });
     },
 

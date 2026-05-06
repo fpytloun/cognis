@@ -62,6 +62,13 @@ class PushSubscriptionStatusResponse(BaseModel):
     last_error: str | None = None
 
 
+class PushSubscriptionTestResponse(BaseModel):
+    """Result of sending a test notification to the current user."""
+
+    sent_to: int
+    errors: int
+
+
 def _get_service(request: Request) -> WebPushService:
     service: WebPushService | None = getattr(request.app.state, "web_push_service", None)
     if service is None:
@@ -125,6 +132,7 @@ async def subscription_status(request: Request) -> PushSubscriptionStatusRespons
             select(PushSubscriptionRow.last_error)
             .where(
                 PushSubscriptionRow.user_email == user.email,
+                PushSubscriptionRow.enabled.is_(True),
                 PushSubscriptionRow.last_error.is_not(None),
             )
             .order_by(PushSubscriptionRow.updated_at.desc())
@@ -135,6 +143,25 @@ async def subscription_status(request: Request) -> PushSubscriptionStatusRespons
         enabled_subscriptions=int(count_result.scalar_one() or 0),
         last_error=error_result.scalar_one_or_none(),
     )
+
+
+@router.post("/subscriptions/test", response_model=PushSubscriptionTestResponse)
+async def test_subscription(request: Request) -> PushSubscriptionTestResponse:
+    """Send a privacy-safe test Web Push notification to the current user."""
+
+    user = require_current_user(request)
+    service = _get_service(request)
+    if not service.enabled:
+        raise HTTPException(status_code=503, detail=service.disabled_reason or "Web Push disabled")
+    result = await service.send_to_user(
+        user_email=user.email,
+        title="Cognis",
+        body="Test notification.",
+        url="/",
+        tag="cognis-test",
+        kind="test",
+    )
+    return PushSubscriptionTestResponse(**result)
 
 
 @router.post("/subscriptions/unsubscribe", response_model=dict[str, Any])

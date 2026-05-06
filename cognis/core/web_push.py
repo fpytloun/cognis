@@ -89,12 +89,106 @@ def _public_key_from_pem(private_key_pem: str) -> str | None:
     return _b64url(public_bytes)
 
 
+def _to_sec1_pem(private_key_pem: str) -> str | None:
+    """Normalize VAPID private keys to SEC1 PEM for py_vapid compatibility."""
+
+    try:
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode("utf-8"),
+            password=None,
+        )
+    except Exception:
+        return None
+    if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+        return None
+    sec1 = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return sec1.decode("utf-8").strip()
+
+
+def _validate_py_vapid_key(private_key_pem: str) -> str | None:
+    """Return a reason when py_vapid cannot load the resolved private key."""
+
+    try:
+        from py_vapid import Vapid01
+    except Exception as exc:
+        return f"py_vapid unavailable: {type(exc).__name__}"
+    try:
+        Vapid01.from_pem(private_key_pem.encode("utf-8"))
+    except Exception as exc:
+        return f"VAPID key cannot be loaded by py_vapid: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _endpoint_host(endpoint: str) -> str:
+    try:
+        return urlparse(endpoint).hostname or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _warn_on_default_subject(subject: str) -> None:
+    if subject == "mailto:admin@localhost":
+        logger.warning(
+            "web_push: using development VAPID subject; set COGNIS_VAPID_SUBJECT "
+            "to a real mailto: or https: contact because Apple Web Push and FCM may reject it"
+        )
+
+
+def _runtime_config_from_key(
+    *,
+    private_key: str,
+    public_key_override: str,
+    subject: str,
+    public_key_error: str,
+) -> WebPushRuntimeConfig:
+    derived_public_key = _public_key_from_pem(private_key) or ""
+    if public_key_override and derived_public_key and public_key_override != derived_public_key:
+        return WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject=subject,
+            reason="COGNIS_VAPID_PUBLIC_KEY does not match the resolved private key",
+        )
+    public_key = public_key_override or derived_public_key
+    sec1_private_key = _to_sec1_pem(private_key) or ""
+    if not public_key or not sec1_private_key:
+        return WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject=subject,
+            reason=public_key_error,
+        )
+
+    invalid_reason = _validate_py_vapid_key(sec1_private_key)
+    if invalid_reason:
+        return WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject=subject,
+            reason=invalid_reason,
+        )
+
+    return WebPushRuntimeConfig(
+        enabled=True,
+        public_key=public_key,
+        private_key=sec1_private_key,
+        subject=subject,
+    )
+
+
 def _generate_vapid_private_key(path: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     private_key = ec.generate_private_key(ec.SECP256R1())
     pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
         encryption_algorithm=serialization.NoEncryption(),
     )
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -111,19 +205,22 @@ def validate_push_endpoint(endpoint: str) -> None:
     """Validate a browser push endpoint before the controller ever calls it."""
 
     parsed = urlparse(endpoint)
+    host = (parsed.hostname or "").rstrip(".").lower()
     if parsed.scheme != "https" or not parsed.hostname:
+        logger.warning("web_push: rejected push endpoint with invalid scheme or host")
         raise ValueError("Push endpoint must be an HTTPS URL")
-    host = parsed.hostname.rstrip(".").lower()
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         ip = None
     if ip is not None:
+        logger.warning("web_push: rejected push endpoint with IP host", extra={"host": host})
         raise ValueError("Push endpoint must use a trusted push service hostname")
     if host in _ALLOWED_PUSH_ENDPOINT_HOSTS:
         return
     if any(host.endswith(suffix) for suffix in _ALLOWED_PUSH_ENDPOINT_SUFFIXES):
         return
+    logger.warning("web_push: rejected untrusted push endpoint", extra={"host": host})
     raise ValueError("Push endpoint host is not a trusted browser push service")
 
 
@@ -131,23 +228,15 @@ def load_web_push_config(config: CognisConfig) -> WebPushRuntimeConfig:
     """Load VAPID keys from env/file, generating a dev key when appropriate."""
 
     subject = config.vapid_subject or "mailto:admin@localhost"
+    _warn_on_default_subject(subject)
     env_private = _normalize_private_key(config.vapid_private_key)
     env_public = config.vapid_public_key.strip()
     if env_private:
-        public_key = env_public or _public_key_from_pem(env_private) or ""
-        if public_key:
-            return WebPushRuntimeConfig(
-                enabled=True,
-                public_key=public_key,
-                private_key=env_private,
-                subject=subject,
-            )
-        return WebPushRuntimeConfig(
-            enabled=False,
-            public_key="",
-            private_key="",
+        return _runtime_config_from_key(
+            private_key=env_private,
+            public_key_override=env_public,
             subject=subject,
-            reason="COGNIS_VAPID_PUBLIC_KEY is required when the private key is not PEM",
+            public_key_error="COGNIS_VAPID_PUBLIC_KEY is required when the private key is not PEM",
         )
 
     path = config.vapid_private_key_path
@@ -166,13 +255,11 @@ def load_web_push_config(config: CognisConfig) -> WebPushRuntimeConfig:
                 subject=subject,
                 reason="Unable to read VAPID private key file",
             )
-        public_key = env_public or _public_key_from_pem(private_key) or ""
-        return WebPushRuntimeConfig(
-            enabled=bool(public_key),
-            public_key=public_key,
-            private_key=private_key if public_key else "",
+        return _runtime_config_from_key(
+            private_key=private_key,
+            public_key_override=env_public,
             subject=subject,
-            reason=None if public_key else "Unable to derive VAPID public key",
+            public_key_error="Unable to derive VAPID public key",
         )
 
     if config.require_external_crypto:
@@ -194,13 +281,11 @@ def load_web_push_config(config: CognisConfig) -> WebPushRuntimeConfig:
             subject=subject,
             reason="Unable to create VAPID private key file",
         )
-    public_key = _public_key_from_pem(private_key) or ""
-    return WebPushRuntimeConfig(
-        enabled=bool(public_key),
-        public_key=public_key,
-        private_key=private_key if public_key else "",
+    return _runtime_config_from_key(
+        private_key=private_key,
+        public_key_override=env_public,
         subject=subject,
-        reason=None if public_key else "Unable to generate VAPID public key",
+        public_key_error="Unable to generate VAPID public key",
     )
 
 
@@ -216,12 +301,16 @@ class WebPushService:
     ) -> None:
         self._session_factory = session_factory
         self._config = config
-        self._pending_tasks: set[asyncio.Task[None]] = set()
+        self._pending_tasks: set[asyncio.Task[dict[str, int]]] = set()
         event_bus.subscribe(EventType.TURN_COMPLETED, self._handle_event)
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_event)
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_event)
         event_bus.subscribe(EventType.NOTIFICATION_CREATED, self._handle_event)
+        if config.enabled:
+            logger.info("web_push: service enabled")
+        else:
+            logger.info("web_push: service disabled", extra={"reason": config.reason})
 
     @property
     def enabled(self) -> bool:
@@ -254,7 +343,9 @@ class WebPushService:
                 select(PushSubscriptionRow).where(PushSubscriptionRow.endpoint == endpoint)
             )
             row = result.scalar_one_or_none()
+            action = "updated"
             if row is None:
+                action = "created"
                 row = PushSubscriptionRow(
                     subscription_id=f"push_{uuid.uuid4().hex[:16]}",
                     user_email=user_email,
@@ -278,6 +369,11 @@ class WebPushService:
                 row.last_error = None
                 row.updated_at = now
             await session.commit()
+            logger.info(
+                "web_push: subscription %s",
+                action,
+                extra={"endpoint_host": _endpoint_host(endpoint), "platform": platform},
+            )
             return PushSubscription(
                 subscription_id=row.subscription_id,
                 endpoint=row.endpoint,
@@ -311,11 +407,12 @@ class WebPushService:
         url: str,
         tag: str,
         kind: str,
-    ) -> None:
+    ) -> dict[str, int]:
         """Send a push payload to all enabled browser subscriptions for a user."""
 
         if not self._config.enabled:
-            return
+            logger.debug("web_push: send skipped because service is disabled", extra={"kind": kind})
+            return {"sent_to": 0, "errors": 0}
 
         async with self._session_factory() as session:
             result = await session.execute(
@@ -327,7 +424,13 @@ class WebPushService:
             rows = list(result.scalars().all())
 
         if not rows:
-            return
+            logger.debug("web_push: send skipped with no enabled subscriptions", extra={"kind": kind})
+            return {"sent_to": 0, "errors": 0}
+
+        logger.info(
+            "web_push: sending notification",
+            extra={"kind": kind, "subscription_count": len(rows)},
+        )
 
         payload = json.dumps(
             {
@@ -339,19 +442,29 @@ class WebPushService:
             },
             separators=(",", ":"),
         )
-        await asyncio.gather(
+        statuses = await asyncio.gather(
             *(self._send_one(row, payload) for row in rows), return_exceptions=True
         )
+        errors = 0
+        sent = 0
+        for status in statuses:
+            if status == "sent":
+                sent += 1
+            else:
+                errors += 1
+        return {"sent_to": sent, "errors": errors}
 
     async def _handle_event(self, event: Event) -> None:
         payload = await self._event_payload(event)
         if payload is None:
+            logger.debug("web_push: event produced no push payload", extra={"event_type": event.type.value})
             return
+        logger.debug("web_push: dispatching event push", extra={"event_type": event.type.value})
         task = asyncio.create_task(self.send_to_user(**payload))
         self._pending_tasks.add(task)
         task.add_done_callback(self._on_delivery_done)
 
-    def _on_delivery_done(self, task: asyncio.Task[None]) -> None:
+    def _on_delivery_done(self, task: asyncio.Task[dict[str, int]]) -> None:
         self._pending_tasks.discard(task)
         try:
             task.result()
@@ -421,10 +534,21 @@ class WebPushService:
             }
         return None
 
-    async def _send_one(self, row: PushSubscriptionRow, payload: str) -> None:
+    async def _send_one(self, row: PushSubscriptionRow, payload: str) -> str:
         status, error = await asyncio.to_thread(self._send_sync, row, payload)
         if status == "sent":
-            return
+            async with self._session_factory() as session:
+                await session.execute(
+                    update(PushSubscriptionRow)
+                    .where(PushSubscriptionRow.subscription_id == row.subscription_id)
+                    .values(last_error=None, updated_at=datetime.now(UTC))
+                )
+                await session.commit()
+            logger.debug(
+                "web_push: delivery succeeded",
+                extra={"endpoint_host": _endpoint_host(row.endpoint)},
+            )
+            return status
         async with self._session_factory() as session:
             values: dict[str, Any] = {
                 "last_error": error[:500] if error else status,
@@ -432,12 +556,25 @@ class WebPushService:
             }
             if status == "gone":
                 values["enabled"] = False
+                logger.info(
+                    "web_push: subscription disabled after push service returned gone",
+                    extra={"endpoint_host": _endpoint_host(row.endpoint)},
+                )
+            else:
+                logger.warning(
+                    "web_push: delivery failed",
+                    extra={
+                        "endpoint_host": _endpoint_host(row.endpoint),
+                        "error_class": (error or status).split(":", 1)[0],
+                    },
+                )
             await session.execute(
                 update(PushSubscriptionRow)
                 .where(PushSubscriptionRow.subscription_id == row.subscription_id)
                 .values(**values)
             )
             await session.commit()
+        return status
 
     def _send_sync(self, row: PushSubscriptionRow, payload: str) -> tuple[str, str | None]:
         try:

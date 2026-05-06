@@ -28,6 +28,16 @@ import { onMount, tick } from 'svelte';
   import { thinkingEffortLabel } from '$lib/thinking';
   import { auth } from '$lib/stores/auth';
   import {
+    disableWebPushForCurrentDevice,
+    enableWebPush,
+    hasEnabledWebPush,
+    isStandaloneDisplay,
+    isWebPushSupported,
+    needsIosHomeScreenInstall,
+    permissionState,
+    reconcileWebPushSubscription
+  } from '$lib/notifications';
+  import {
     executorMcpFailureDetails,
     executorObservedNote,
     executorRuntimeBadgeStatus,
@@ -46,6 +56,8 @@ import { onMount, tick } from 'svelte';
     LLMProviderOAuthStatus,
     ModelRouting,
     ProviderTestResult,
+    PushSubscriptionStatusResponse,
+    PushSubscriptionTestResponse,
     SecretMetadata,
     Setting,
     SettingsCategory,
@@ -58,7 +70,7 @@ import { onMount, tick } from 'svelte';
     WebConfigStatus
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
 
   type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
 
@@ -80,12 +92,13 @@ import { onMount, tick } from 'svelte';
     browser_storage_state: 'Set metadata.origin to the bound site origin when entering this manually, for example https://www.rohlik.cz.'
   };
 
-  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'web', 'tools', 'executors', 'users', 'system', 'account'];
-  const USER_TABS: SettingsTab[] = ['secrets', 'tools', 'executors', 'account'];
+  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'notifications', 'web', 'tools', 'executors', 'users', 'system', 'account'];
+  const USER_TABS: SettingsTab[] = ['secrets', 'notifications', 'tools', 'executors', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
     secrets: 'secrets',
+    notifications: 'notifications',
     web: 'web search',
     tools: 'tools',
     executors: 'executors',
@@ -280,6 +293,16 @@ import { onMount, tick } from 'svelte';
   let createdApiKey = $state<ApiKeyCreateResponse | null>(null);
   let newApiKeyName = $state('');
   let newApiKeyExpiresInDays = $state('');
+  let pushVapid = $state<{ enabled: boolean; public_key: string | null; reason: string | null } | null>(null);
+  let pushStatus = $state<PushSubscriptionStatusResponse | null>(null);
+  let pushTestResult = $state<PushSubscriptionTestResponse | null>(null);
+  let pushPermission = $state<NotificationPermission | 'unsupported'>('unsupported');
+  let pushSupported = $state(false);
+  let pushStandalone = $state(false);
+  let pushNeedsInstall = $state(false);
+  let pushEnabledOnDevice = $state(false);
+  let pushBusy = $state(false);
+  let pushError = $state('');
   let initialSnapshot = $state('');
 
   // User management state
@@ -1080,6 +1103,8 @@ import { onMount, tick } from 'svelte';
     accountNameForm = auth.getSnapshot().user?.name ?? '';
     accountNameDirty = false;
 
+    await refreshPushStatus();
+
     mcpServerConfigs = await api.tools.listMcpServerConfigs().catch(() => []);
 
     if (isAdmin) {
@@ -1135,6 +1160,89 @@ import { onMount, tick } from 'svelte';
       return isAdmin;
     }
     return !server.owner_email || server.owner_email === currentUserEmail;
+  }
+
+  async function refreshPushStatus(): Promise<void> {
+    pushPermission = permissionState();
+    pushSupported = isWebPushSupported();
+    pushStandalone = isStandaloneDisplay();
+    pushNeedsInstall = needsIosHomeScreenInstall();
+    pushEnabledOnDevice = hasEnabledWebPush();
+    [pushVapid, pushStatus] = await Promise.all([
+      api.push.vapidPublicKey().catch(() => null),
+      api.push.status().catch(() => null)
+    ]);
+    if (pushEnabledOnDevice) {
+      const reconciled = await reconcileWebPushSubscription();
+      pushEnabledOnDevice = reconciled;
+      if (reconciled) {
+        pushStatus = await api.push.status().catch(() => pushStatus);
+      }
+    }
+  }
+
+  async function enableDeviceNotifications(): Promise<void> {
+    pushBusy = true;
+    pushError = '';
+    pushTestResult = null;
+    try {
+      const result = await enableWebPush();
+      if (!result.ok) {
+        pushError = result.message;
+        addToast(result.message, 'error', 5_000, 'Unable to enable notifications');
+        return;
+      }
+      addToast(result.message, 'success');
+      await refreshPushStatus();
+    } catch (caughtError) {
+      pushError = asApiError(caughtError).message;
+      addToast(pushError, 'error', 5_000, 'Unable to enable notifications');
+    } finally {
+      pushBusy = false;
+    }
+  }
+
+  async function disableDeviceNotifications(): Promise<void> {
+    pushBusy = true;
+    pushError = '';
+    pushTestResult = null;
+    try {
+      const removed = await disableWebPushForCurrentDevice();
+      if (removed) {
+        addToast('Notifications disabled on this device.', 'success');
+      } else {
+        pushError = 'Unable to remove the browser push subscription on this device.';
+        addToast(pushError, 'error', 5_000, 'Notifications still enabled');
+      }
+      await refreshPushStatus();
+    } catch (caughtError) {
+      pushError = asApiError(caughtError).message;
+      addToast(pushError, 'error', 5_000, 'Unable to disable notifications');
+    } finally {
+      pushBusy = false;
+    }
+  }
+
+  async function sendTestNotification(): Promise<void> {
+    pushBusy = true;
+    pushError = '';
+    pushTestResult = null;
+    try {
+      pushTestResult = await api.push.test();
+      await refreshPushStatus();
+      if (pushTestResult.sent_to > 0 && pushTestResult.errors === 0) {
+        addToast('Test notification sent.', 'success');
+      } else if (pushTestResult.sent_to === 0) {
+        addToast('No enabled push subscriptions were found.', 'error', 5_000, 'Test notification not sent');
+      } else {
+        addToast('Some subscriptions failed during test delivery.', 'error', 5_000, 'Test notification partial failure');
+      }
+    } catch (caughtError) {
+      pushError = asApiError(caughtError).message;
+      addToast(pushError, 'error', 5_000, 'Unable to send test notification');
+    } finally {
+      pushBusy = false;
+    }
   }
 
   async function loadSettings(): Promise<void> {
@@ -1837,12 +1945,12 @@ import { onMount, tick } from 'svelte';
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadSettings();
 
-    // Same-tab tap on Settings: reset to the default sub-tab (providers)
+    // Same-tab tap on Settings: reset to the default sub-tab
     // and scroll the content shell to the top. The bottom tab bar has
     // already navigated to `/settings` (bare path) so the `?tab=` query
     // is cleared; we only need to reset local state and scroll.
     const unsubTabReset = onTabReset('/settings', () => {
-      activeTab = 'providers';
+      activeTab = tabs[0] ?? 'account';
       clearPersistedScroll('/settings');
       const el = document.querySelector<HTMLElement>('[data-app-content="true"]');
       if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
@@ -2409,6 +2517,100 @@ import { onMount, tick } from 'svelte';
             {/each}
           </div>
         </Card>
+      </div>
+    {:else if activeTab === 'notifications'}
+      <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
+        <Card class="space-y-5 p-5">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Notifications</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">This device</h2>
+            <p class="mt-2 text-sm leading-6 text-slate-400">Native PWA notifications use the browser's Web Push subscription for this device.</p>
+          </div>
+
+          <div class="space-y-2 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-400">Browser support</span>
+              <span class={pushSupported ? 'text-emerald-300' : 'text-rose-300'}>{pushSupported ? 'supported' : 'unsupported'}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-400">Permission</span>
+              <span class="text-slate-100">{pushPermission}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-400">Display mode</span>
+              <span class="text-slate-100">{pushStandalone ? 'installed PWA' : 'browser tab'}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-400">Device subscription</span>
+              <span class={pushEnabledOnDevice ? 'text-emerald-300' : 'text-slate-300'}>{pushEnabledOnDevice ? 'enabled' : 'not enabled'}</span>
+            </div>
+          </div>
+
+          {#if pushNeedsInstall}
+            <p class="rounded-2xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">On iPhone or iPad, add Cognis to the Home Screen and open it there before enabling notifications.</p>
+          {/if}
+
+          {#if pushError}
+            <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{pushError}</p>
+          {/if}
+
+          <div class="flex flex-wrap gap-2">
+            {#if pushEnabledOnDevice}
+              <Button onclick={disableDeviceNotifications} disabled={pushBusy} variant="secondary">Disable on this device</Button>
+            {:else}
+              <Button onclick={enableDeviceNotifications} disabled={pushBusy || !pushSupported}>Enable on this device</Button>
+            {/if}
+            <Button onclick={refreshPushStatus} disabled={pushBusy} variant="secondary">Refresh status</Button>
+          </div>
+        </Card>
+
+        <div class="space-y-5">
+          <Card class="space-y-5 p-5">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Server delivery</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Push service status</h2>
+            </div>
+
+            <div class="grid gap-3 md:grid-cols-3">
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">Configured</p>
+                <p class={pushVapid?.enabled ? 'mt-2 text-2xl font-semibold text-emerald-300' : 'mt-2 text-2xl font-semibold text-rose-300'}>{pushVapid?.enabled ? 'yes' : 'no'}</p>
+              </div>
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">Enabled subscriptions</p>
+                <p class="mt-2 text-2xl font-semibold text-white">{pushStatus?.enabled_subscriptions ?? 0}</p>
+              </div>
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">Last test</p>
+                <p class="mt-2 text-sm text-slate-100">{pushTestResult ? `${pushTestResult.sent_to} sent, ${pushTestResult.errors} failed` : 'not run'}</p>
+              </div>
+            </div>
+
+            {#if pushVapid && !pushVapid.enabled}
+              <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{pushVapid.reason ?? 'Web Push is not configured on this server.'}</p>
+            {/if}
+
+            {#if pushStatus?.last_error}
+              <div class="rounded-2xl border border-amber-400/30 bg-amber-400/10 px-4 py-3">
+                <p class="text-sm font-medium text-amber-100">Last delivery error</p>
+                <p class="mt-2 break-words font-mono text-xs leading-5 text-amber-50/90">{pushStatus.last_error}</p>
+              </div>
+            {/if}
+
+            <div class="flex flex-wrap gap-2">
+              <Button onclick={sendTestNotification} disabled={pushBusy || !pushVapid?.enabled || !pushStatus?.enabled_subscriptions}>Send test notification</Button>
+              <Button onclick={refreshPushStatus} disabled={pushBusy} variant="secondary">Refresh</Button>
+            </div>
+          </Card>
+
+          <Card class="space-y-3 p-5">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Operator note</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">VAPID subject</h2>
+            </div>
+            <p class="text-sm leading-6 text-slate-400">For reliable delivery, set <code>COGNIS_VAPID_SUBJECT</code> to a real <code>mailto:</code> or <code>https:</code> contact URI. Development defaults such as <code>mailto:admin@localhost</code> may be rejected by Apple Web Push or FCM.</p>
+          </Card>
+        </div>
       </div>
     {:else if activeTab === 'web'}
       <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">

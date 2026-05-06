@@ -185,6 +185,7 @@ import X from 'lucide-svelte/icons/x';
   let pushSubscriptionKnownEnabled = $state(hasEnabledWebPush());
   let pushPromptBusy = $state(false);
   let pushPromptError = $state('');
+  let pushDeliveryError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
   let lastSubmittedMessage = '';
@@ -378,6 +379,7 @@ import X from 'lucide-svelte/icons/x';
   async function enableChatNotifications(): Promise<void> {
     pushPromptBusy = true;
     pushPromptError = '';
+    pushDeliveryError = '';
     try {
       const result = await enableWebPush();
       if (result.ok) {
@@ -395,6 +397,8 @@ import X from 'lucide-svelte/icons/x';
   async function reconcileChatNotifications(): Promise<void> {
     if (!pushSubscriptionKnownEnabled) return;
     pushSubscriptionKnownEnabled = await reconcileWebPushSubscription();
+    const status = await api.push.status().catch(() => null);
+    pushDeliveryError = status?.last_error ?? '';
   }
 
   function isReadOnly(conversation: Conversation | null): boolean {
@@ -3312,6 +3316,12 @@ import X from 'lucide-svelte/icons/x';
                 {#if pushPromptError}
                   <p class="mt-2 text-xs text-rose-200">{pushPromptError}</p>
                 {/if}
+                {#if pushDeliveryError}
+                  <p class="mt-2 break-words font-mono text-xs text-amber-100">Last delivery error: {pushDeliveryError}</p>
+                {/if}
+                <button class="mt-2 text-xs font-medium text-sky-100 underline-offset-4 hover:underline" type="button" onclick={() => goto('/settings?tab=notifications')}>
+                  Manage in Settings
+                </button>
               </div>
               <div class="flex shrink-0 items-center gap-2">
                 {#if !needsIosHomeScreenInstall()}

@@ -245,6 +245,8 @@ ENV_TEMPLATE = """\
 # COGNIS_VAPID_PRIVATE_KEY=
 # COGNIS_VAPID_PUBLIC_KEY=
 # COGNIS_VAPID_PRIVATE_KEY_PATH=~/.cognis/keys/vapid_private.pem
+# Must be a real operator contact URI (RFC 8292), for example mailto:ops@example.com
+# or https://example.com/contact. Some push services reject localhost subjects.
 # COGNIS_VAPID_SUBJECT=mailto:admin@localhost
 
 # Logging

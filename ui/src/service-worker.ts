@@ -87,6 +87,81 @@ function parsePushPayload(event: PushEvent): WebPushPayload {
   }
 }
 
+function arrayBufferToUrlBase64(value: ArrayBuffer | null): string | null {
+  if (!value) return null;
+  const bytes = new Uint8Array(value);
+  let raw = '';
+  for (const byte of bytes) raw += String.fromCharCode(byte);
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function urlBase64ToArrayBuffer(value: string): ArrayBuffer {
+  const padding = '='.repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  const output = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) {
+    output[i] = raw.charCodeAt(i);
+  }
+  return output.buffer as ArrayBuffer;
+}
+
+async function fetchApplicationServerKey(): Promise<ArrayBuffer | null> {
+  try {
+    const response = await fetch('/api/v1/push/vapid-public-key', { credentials: 'same-origin' });
+    if (!response.ok) return null;
+    const payload = await response.json() as { enabled?: boolean; public_key?: string | null };
+    if (!payload.enabled || !payload.public_key) return null;
+    return urlBase64ToArrayBuffer(payload.public_key);
+  } catch {
+    return null;
+  }
+}
+
+async function uploadPushSubscription(subscription: PushSubscription): Promise<void> {
+  const json = subscription.toJSON() as {
+    endpoint?: string;
+    expirationTime?: number | null;
+    keys?: { p256dh?: string; auth?: string };
+  };
+  const endpoint = json.endpoint ?? subscription.endpoint;
+  const p256dh = json.keys?.p256dh;
+  const auth = json.keys?.auth;
+  if (!endpoint || !p256dh || !auth) return;
+  const response = await fetch('/api/v1/push/subscriptions', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      endpoint,
+      expirationTime: json.expirationTime ?? null,
+      keys: { p256dh, auth },
+      platform: 'pwa'
+    })
+  });
+  if (!response.ok) {
+    throw new Error('Push subscription upload failed');
+  }
+}
+
+sw.addEventListener('pushsubscriptionchange', (event) => {
+  const changeEvent = event as ExtendableEvent & { oldSubscription?: PushSubscription | null };
+  changeEvent.waitUntil(
+    (async () => {
+      const existingKey = arrayBufferToUrlBase64(changeEvent.oldSubscription?.options.applicationServerKey ?? null);
+      const applicationServerKey = existingKey
+        ? urlBase64ToArrayBuffer(existingKey)
+        : await fetchApplicationServerKey();
+      if (!applicationServerKey) return;
+      const subscription = await sw.registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey
+      });
+      await uploadPushSubscription(subscription);
+    })()
+  );
+});
+
 async function hasVisibleClientFor(pathname: string): Promise<boolean> {
   const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
   return clients.some((client) => {
