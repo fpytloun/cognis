@@ -47,7 +47,17 @@ export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics 
   const visualHeight = input.visualViewportHeight ?? innerHeight;
   const visualOffsetTop = input.visualViewportOffsetTop ?? 0;
   const keyboardOverlap = innerHeight - (visualOffsetTop + visualHeight);
-  const keyboardOpen = keyboardOverlap > 80;
+  // Two ways the on-screen keyboard manifests:
+  //   1. Overlay mode (default iOS Safari/PWA): innerHeight stays at the full
+  //      layout viewport while visualViewport.height shrinks, producing a
+  //      significant keyboardOverlap.
+  //   2. iOS may also push the visual viewport down (offsetTop > 0) when an
+  //      input gains focus, even with `interactive-widget=resizes-content`.
+  //      Body has `position: fixed; overflow: hidden`, so we cannot scroll the
+  //      document; we must mirror that visualViewport offset in the shell or
+  //      the chat composer ends up below the visible area, producing the
+  //      "everything scrolls when keyboard opens" regression.
+  const keyboardOpen = keyboardOverlap > 80 || visualOffsetTop > 0;
   const height = keyboardOpen ? visualHeight : innerHeight;
   const offsetTop = keyboardOpen ? visualOffsetTop : 0;
   return {
@@ -75,10 +85,23 @@ function readViewportMetrics(): ViewportMetrics {
 
 function syncViewportVariables(metrics = readViewportMetrics()): void {
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
-  const height = metrics.height || window.innerHeight;
   const root = document.documentElement;
-  root.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
-  root.style.setProperty('--app-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
+  if (metrics.keyboardOpen) {
+    // Pin the shell to the visible viewport above the keyboard (and any iOS
+    // form-accessory bar, which visualViewport already excludes from its
+    // height).
+    root.style.setProperty('--app-viewport-height', `${Math.round(metrics.height)}px`);
+    root.style.setProperty('--app-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
+  } else {
+    // Keyboard closed: clear the inline overrides so the shell falls back to
+    // the `:root` rule's `100dvh`. On iOS PWA standalone with
+    // `viewport-fit=cover`, `100dvh` covers the full physical viewport
+    // including the home-indicator safe area, while `window.innerHeight` can
+    // underreport by ~34pt and leave a visible strip below the bottom tab bar
+    // and chat composer.
+    root.style.removeProperty('--app-viewport-height');
+    root.style.removeProperty('--app-viewport-offset-top');
+  }
   root.style.setProperty('--app-bottom-inset', '0px');
   root.dataset.keyboard = metrics.keyboardOpen ? 'open' : 'closed';
 }
@@ -137,9 +160,9 @@ export const viewportMetrics = readable<ViewportMetrics>(
     window.removeEventListener('focusin', scheduleUpdate, true);
     window.removeEventListener('focusout', scheduleUpdate, true);
     const root = document.documentElement;
-    root.style.setProperty('--app-viewport-height', '100dvh');
-    root.style.setProperty('--app-viewport-offset-top', '0px');
-    root.style.setProperty('--app-bottom-inset', '0px');
+    root.style.removeProperty('--app-viewport-height');
+    root.style.removeProperty('--app-viewport-offset-top');
+    root.style.removeProperty('--app-bottom-inset');
     delete root.dataset.keyboard;
   };
 });

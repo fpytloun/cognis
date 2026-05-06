@@ -70,4 +70,19 @@ describe('viewport stores', () => {
       })
     ).toEqual({ height: 520, offsetTop: 16, keyboardOpen: true });
   });
+
+  it('detects keyboard via visual viewport offset alone (resize-content scroll)', () => {
+    // iOS may push the visual viewport down on input focus even when the
+    // overall overlap is small (e.g. the layout viewport shrunk via
+    // `interactive-widget=resizes-content` but iOS still scrolled the visual
+    // viewport to expose the input). The shell must mirror that offset, or
+    // the chat composer ends up below the visible area.
+    expect(
+      calculateViewportMetrics({
+        innerHeight: 700,
+        visualViewportHeight: 700,
+        visualViewportOffsetTop: 200,
+      })
+    ).toEqual({ height: 700, offsetTop: 200, keyboardOpen: true });
+  });
 });
