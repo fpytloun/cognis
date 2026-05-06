@@ -26,16 +26,17 @@
 </script>
 
 <div
-  class="cursor-pointer rounded-2xl border p-3 transition-colors hover:bg-slate-800/40 {selected ? 'border-sky-500/60 bg-sky-950/20' : 'border-slate-800 bg-slate-950/70'}"
+  class="group cursor-pointer rounded-2xl border p-3 transition-colors hover:bg-slate-800/40 {selected ? 'border-sky-500/60 bg-sky-950/20' : 'border-slate-800 bg-slate-950/70'}"
   onclick={onclick}
   role="button"
   tabindex="0"
   onkeydown={(e) => { if (e.key === 'Enter' && onclick) onclick(e as unknown as MouseEvent); }}
+  title={task.title}
 >
   <div class="flex items-start justify-between gap-2">
     <a
       href="/tasks/{task.task_id}"
-      class="text-sm font-medium text-white hover:text-sky-300 hover:underline"
+      class="min-w-0 break-words text-sm font-medium text-white hover:text-sky-300 hover:underline xl:line-clamp-2 xl:group-hover:line-clamp-none xl:group-focus-within:line-clamp-none"
       onclick={(e) => e.stopPropagation()}
     >
       {task.title}

@@ -69,6 +69,22 @@ describe('renderMarkdown', () => {
     expect(preCount(html)).toBe(2);
   });
 
+  it('highlights fenced code blocks with known languages', () => {
+    const html = renderMarkdown(['```python', 'def hello():', '    return "world"', '```'].join('\n'));
+
+    expect(html).toContain('class="hljs language-python"');
+    expect(html).toContain('hljs-keyword');
+    expect(html).toContain('hello');
+  });
+
+  it('keeps unknown-language code blocks readable and escaped', () => {
+    const html = renderMarkdown(['```not-a-real-language', '<script>alert("x")</script>', '```'].join('\n'));
+
+    expect(html).toContain('class="language-not-a-real-language"');
+    expect(html).toContain('&lt;script&gt;alert("x")&lt;/script&gt;');
+    expect(html).not.toContain('<script>');
+  });
+
   it('keeps valid long enclosing fences as a single code block', () => {
     const html = renderMarkdown(
       [

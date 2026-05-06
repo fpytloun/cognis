@@ -1,3 +1,5 @@
+@import 'highlight.js/styles/github-dark.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -143,6 +145,20 @@ textarea:focus-visible,
 .chat-markdown pre {
   position: relative;
   padding-top: 3rem;
+}
+
+.chat-markdown pre code.hljs {
+  padding: 0;
+  background: transparent;
+}
+
+.chat-markdown.prose-user pre {
+  background: rgb(2 6 23);
+  color: rgb(226 232 240);
+}
+
+.chat-markdown.prose-user pre code {
+  color: inherit;
 }
 
 .docs-markdown {

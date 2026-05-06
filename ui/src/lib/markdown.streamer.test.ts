@@ -43,7 +43,8 @@ describe('createMarkdownStreamer', () => {
     const intermediate = '```ts\nlet x = 1;\n';
     // Tail is an unclosed fence - should not be split.
     const html1 = s.render(intermediate);
-    expect(html1).toContain('let x = 1;');
+    expect(html1).toContain('hljs-keyword');
+    expect(html1).toContain('x =');
 
     const closed = intermediate + '```\n\nFollow-up.';
     const html2 = s.finalize(closed);

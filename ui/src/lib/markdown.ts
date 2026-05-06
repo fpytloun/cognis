@@ -1,4 +1,5 @@
 import DOMPurify from 'dompurify';
+import hljs from 'highlight.js/lib/common';
 import { marked, Renderer } from 'marked';
 
 marked.setOptions({
@@ -116,6 +117,20 @@ function markOutgoingLinks(html: string): string {
   return html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ');
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function languageClass(lang: string): string {
+  const normalized = lang.trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+  return normalized.replace(/[^a-z0-9_-]/g, '');
+}
+
 function applyOutgoingLinkTargets(html: string): string {
   if (typeof document === 'undefined') return html;
   const template = document.createElement('template');
@@ -132,6 +147,21 @@ function applyOutgoingLinkTargets(html: string): string {
 function createLinkRenderer(): Renderer {
   const renderer = new Renderer();
   const baseLink = renderer.link.bind(renderer);
+
+  renderer.code = (token) => {
+    const lang = languageClass(token.lang ?? '');
+    try {
+      if (lang && hljs.getLanguage(lang)) {
+        const highlighted = hljs.highlight(token.text, { language: lang, ignoreIllegals: true }).value;
+        return `<pre><code class="hljs language-${lang}">${highlighted}</code></pre>`;
+      }
+    } catch {
+      // Fall through to escaped plain text if highlight.js cannot parse it.
+    }
+
+    const className = lang ? ` class="language-${lang}"` : '';
+    return `<pre><code${className}>${escapeHtml(token.text)}</code></pre>`;
+  };
 
   renderer.link = (token) => {
     const html = baseLink(token);

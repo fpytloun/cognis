@@ -2957,9 +2957,10 @@ import X from 'lucide-svelte/icons/x';
               {@const unread = conversation.has_unread && !isActive}
               {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
               <a
-                class={`flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
+                class={`group flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
                 href={`/chat/${conversation.conversation_id}`}
                 onclick={closeMobileList}
+                title={conversationTitle(conversation)}
               >
                 <div class="relative grid h-9 w-9 shrink-0 place-items-center">
                   {#if inProgress}
@@ -2971,7 +2972,7 @@ import X from 'lucide-svelte/icons/x';
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
-                  <p class="truncate text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
+                  <p class="break-words text-sm lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
                   <div class="mt-0.5 flex items-center gap-2">
                     <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
                     {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}
@@ -3076,7 +3077,7 @@ import X from 'lucide-svelte/icons/x';
                   class="min-w-0 flex-1 truncate text-left text-lg font-semibold text-white transition hover:text-sky-300 sm:text-xl"
                   onclick={startEditTitle}
                   type="button"
-                  title="Click to edit title"
+                  title={currentConversation ? `${conversationTitle(currentConversation)} - click to edit title` : 'Click to edit title'}
                 >
                   {currentConversation ? conversationTitle(currentConversation) : 'Conversation'}
                 </button>

@@ -1327,7 +1327,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
           />
           <div class="min-w-0">
             <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
-            <h1 class="mt-1 truncate text-2xl font-semibold text-white">{task.title}</h1>
+            <h1 class="mt-1 break-words text-2xl font-semibold text-white" title={task.title}>{task.title}</h1>
             <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-400">
               <span>Owner agent</span>
               <span class="font-medium text-slate-200">{agentName(task.agent_id)}</span>

@@ -439,7 +439,7 @@ import Zap from 'lucide-svelte/icons/zap';
                 <div class="min-w-0 flex-1">
                   <div class="flex flex-wrap items-center gap-2">
                     <TypeIcon class="h-4 w-4 shrink-0 text-slate-400" />
-                    <h3 class="truncate font-medium text-white">{schedule.name}</h3>
+                    <h3 class="break-words font-medium text-white lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal" title={schedule.name}>{schedule.name}</h3>
                     {#if !schedule.enabled}
                       <Badge class="bg-slate-700/50 text-slate-400">Disabled</Badge>
                     {/if}

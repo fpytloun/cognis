@@ -77,14 +77,14 @@
   {:else}
     <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {#each projects as project}
-        <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 transition hover:border-sky-500/60 hover:bg-slate-900">
+        <div class="group rounded-2xl border border-slate-800 bg-slate-900/70 p-4 transition hover:border-sky-500/60 hover:bg-slate-900">
           <div class="flex items-start gap-3">
             <button type="button" class="shrink-0 cursor-pointer" onclick={() => { profileProject = project; }} aria-label={`Show ${project.name} profile`}>
               <AgentAvatar name={project.name} avatarUrl={project.avatar_url} class="h-12 w-12 rounded-xl" />
             </button>
             <div class="min-w-0 flex-1">
               <div class="flex min-w-0 items-start justify-between gap-2">
-                <a class="truncate text-lg font-semibold text-white hover:text-sky-200" href={`/projects/${project.project_id}`}>{project.name}</a>
+                <a class="min-w-0 break-words text-lg font-semibold text-white hover:text-sky-200 lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal" href={`/projects/${project.project_id}`} title={project.name}>{project.name}</a>
                 <a
                   class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-200"
                   href={taskBoardProjectUrl(project.project_id)}
@@ -116,7 +116,7 @@
         <AgentAvatar name={profileProject.name} avatarUrl={profileProject.avatar_url} class="h-20 w-20" />
       </button>
       <div class="min-w-0">
-        <p class="truncate text-lg font-semibold text-slate-100">{profileProject.name}</p>
+        <p class="break-words text-lg font-semibold text-slate-100" title={profileProject.name}>{profileProject.name}</p>
         <p class="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">Project</p>
       </div>
     </div>
