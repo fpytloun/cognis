@@ -54,6 +54,7 @@ class ConversationModel(BaseModel):
     context: ConversationContext
     project_id: str | None = None
     active_session_id: str | None = None
+    active_executor_id: str | None = None
     status: str = "active"
     last_message_at: datetime | None = None
     created_at: datetime | None = None

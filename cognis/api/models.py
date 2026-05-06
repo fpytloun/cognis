@@ -219,6 +219,7 @@ class ConversationResponse(BaseModel):
     title: str | None = None
     context: ConversationContextModel
     active_session_id: str | None = None
+    active_executor_id: str | None = None
     status: str
     last_message_at: datetime | None = None
     last_read_at: datetime | None = None

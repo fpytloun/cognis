@@ -197,6 +197,7 @@ class WorkflowEngine:
             agent=agent,
             user_email=session.user_email,
             access_context=access_context,
+            conversation_id=conversation.conversation_id,
         )
 
         continuation_profile_id = None
@@ -231,6 +232,8 @@ class WorkflowEngine:
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
+            executor_pool=getattr(runtime, "executor_pool", None),
+            active_executor_id=getattr(runtime, "active_executor_id", None),
             runtime_info=runtime.runtime_info or {},
             workspace_root=current_workspace_root.get(),
             working_directory=current_effective_working_directory.get(),
@@ -874,6 +877,9 @@ class WorkflowEngine:
                 executor_agent=executor_agent,
                 user_email=task.created_by,
                 access_context=access_context,
+                conversation_id=getattr(conversation, "conversation_id", None)
+                if conversation is not None
+                else None,
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
@@ -973,6 +979,8 @@ class WorkflowEngine:
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
+            executor_pool=getattr(runtime, "executor_pool", None),
+            active_executor_id=getattr(runtime, "active_executor_id", None),
             runtime_info=runtime.runtime_info or {},
             workflow_state=state,
             workflow_steps=workflow.steps,
@@ -2573,18 +2581,34 @@ class WorkflowEngine:
         user_email: str,
         executor_agent: AgentDefinition | None = None,
         access_context: RuntimeAccessContext | None = None,
+        conversation_id: str | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
-            return cast(
-                ResolvedStepRuntime,
-                await self._step_runtime_factory(
-                    agent=agent,
-                    user_email=user_email,
-                    executor_agent=executor_agent,
-                    access_context=access_context,
-                ),
-            )
+            try:
+                return cast(
+                    ResolvedStepRuntime,
+                    await self._step_runtime_factory(
+                        agent=agent,
+                        user_email=user_email,
+                        executor_agent=executor_agent,
+                        access_context=access_context,
+                        conversation_id=conversation_id,
+                    ),
+                )
+            except TypeError as exc:
+                # Older factory signature without conversation_id
+                if "conversation_id" not in str(exc):
+                    raise
+                return cast(
+                    ResolvedStepRuntime,
+                    await self._step_runtime_factory(
+                        agent=agent,
+                        user_email=user_email,
+                        executor_agent=executor_agent,
+                        access_context=access_context,
+                    ),
+                )
 
         raise RuntimeError("Step runtime factory unavailable; refusing shared executor fallback")
 

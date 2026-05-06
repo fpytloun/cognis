@@ -1327,3 +1327,214 @@ async def test_lsp_renders_normalized_statuses() -> None:
     assert result.text is not None
     assert "exec-1 (websocket) - ready" in result.text
     assert "exec-2 (subprocess) - disabled" in result.text
+
+
+# ---------------------------------------------------------------------------
+# Stage 36: /executor slash command
+# ---------------------------------------------------------------------------
+
+
+def _conversation_with_active(active: str | None = None) -> ConversationModel:
+    return ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        active_executor_id=active,
+    )
+
+
+@pytest.mark.asyncio
+async def test_executor_command_no_arg_shows_status(monkeypatch) -> None:
+    """/executor with no arg renders the active executor + assigned pool."""
+
+    from cognis.core.executor_pool import (
+        ExecutorAvailability,
+        ExecutorPool,
+        ResolvedExecutorTarget,
+    )
+
+    pool = ExecutorPool(
+        primary=[
+            ResolvedExecutorTarget(
+                executor_id="exec-primary",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="explicit",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            )
+        ],
+        additional=[
+            ResolvedExecutorTarget(
+                executor_id="exec-add",
+                executor_type="websocket",
+                is_primary=False,
+                selection_source="additional_explicit",
+                description="Mac",
+                state=ExecutorAvailability.USABLE,
+            )
+        ],
+    )
+
+    async def _fake_pool(self, agent, user_email):  # type: ignore[no-untyped-def]
+        return pool
+
+    monkeypatch.setattr(
+        CommandDispatcher,
+        "_resolve_executor_pool_for_command",
+        _fake_pool,
+    )
+
+    dispatcher = CommandDispatcher(
+        session_factory=_DBSessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        "/executor",
+        conversation=_conversation_with_active(active="exec-primary"),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert result.type == "system_message"
+    assert "Active executor: exec-primary" in result.text
+    assert "exec-add" in result.text
+    assert "additional" in result.text
+
+
+@pytest.mark.asyncio
+async def test_executor_command_switch_succeeds(monkeypatch) -> None:
+    """/executor <id> with assigned + usable target persists the switch."""
+
+    from cognis.core.executor_pool import (
+        ExecutorAvailability,
+        ExecutorPool,
+        ResolvedExecutorTarget,
+    )
+
+    pool = ExecutorPool(
+        primary=[
+            ResolvedExecutorTarget(
+                executor_id="exec-1",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="explicit",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            ),
+            ResolvedExecutorTarget(
+                executor_id="exec-2",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="selector",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            ),
+        ]
+    )
+
+    async def _fake_pool(self, agent, user_email):  # type: ignore[no-untyped-def]
+        return pool
+
+    monkeypatch.setattr(
+        CommandDispatcher,
+        "_resolve_executor_pool_for_command",
+        _fake_pool,
+    )
+
+    persisted: dict[str, str | None] = {"id": None}
+
+    async def _set_active(_session, conversation_id, active_executor_id):
+        persisted["id"] = active_executor_id
+        return True
+
+    import cognis.store.queries as store_queries
+
+    monkeypatch.setattr(
+        store_queries,
+        "set_conversation_active_executor",
+        _set_active,
+    )
+
+    dispatcher = CommandDispatcher(
+        session_factory=_DBSessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        "/executor exec-2",
+        conversation=_conversation_with_active(active="exec-1"),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert result.type == "system_message"
+    assert persisted["id"] == "exec-2"
+    assert result.data.get("code") == "executor_switched"
+    assert result.data.get("executor_id") == "exec-2"
+
+
+@pytest.mark.asyncio
+async def test_executor_command_switch_to_unassigned_errors(monkeypatch) -> None:
+    """/executor <unassigned> returns an error and leaves active unchanged."""
+
+    from cognis.core.executor_pool import (
+        ExecutorAvailability,
+        ExecutorPool,
+        ResolvedExecutorTarget,
+    )
+
+    pool = ExecutorPool(
+        primary=[
+            ResolvedExecutorTarget(
+                executor_id="exec-1",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="explicit",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            )
+        ]
+    )
+
+    async def _fake_pool(self, agent, user_email):  # type: ignore[no-untyped-def]
+        return pool
+
+    monkeypatch.setattr(
+        CommandDispatcher,
+        "_resolve_executor_pool_for_command",
+        _fake_pool,
+    )
+
+    dispatcher = CommandDispatcher(
+        session_factory=_DBSessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        "/executor exec-ghost",
+        conversation=_conversation_with_active(active="exec-1"),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert result.type == "error"
+    assert "not assigned" in result.text.lower()
+    assert result.data.get("reason") == "not_assigned"

@@ -240,18 +240,26 @@ def _build_environment_info(
     *,
     workspace_root: str | None = None,
     effective_working_directory: str | None = None,
+    executor_pool: Any = None,
+    active_executor_id: str | None = None,
 ) -> str:
     """Build environment information for the LLM context.
 
     Provides the LLM with the selected tool executor environment so it
     generates correct absolute paths in tool calls instead of guessing.
+
+    Stage 36 (multi-executor agents): when ``executor_pool`` is provided
+    and contains more than one assigned executor, the block also enumerates
+    the agent's primary and additional executors with their factual state.
     """
 
     env = executor_environment or _local_environment_snapshot()
+    pool_block = _format_executor_pool(executor_pool, active_executor_id=active_executor_id)
+
     if not env.available:
         executor_label = env.executor_id or "selected remote executor"
         executor_type = env.executor_type or "remote"
-        return (
+        base = (
             "Environment:\n"
             f"- Executor: {executor_label} ({executor_type})\n"
             "- Environment details: unavailable from this executor\n"
@@ -259,8 +267,9 @@ def _build_environment_info(
             "to its own local home directory. Do not guess controller paths. "
             "If you need the current date or time, call get_current_datetime."
         )
+        return base + pool_block
 
-    return (
+    base = (
         "Environment:\n"
         + (_format_executor_label(env))
         + f"- Platform: {env.platform_os or 'unknown'} ({env.platform_arch or 'unknown'})\n"
@@ -279,6 +288,53 @@ def _build_environment_info(
         + "working directory above when available. If you need the current date or time, "
         + "call get_current_datetime."
     )
+    return base + pool_block
+
+
+def _format_executor_pool(
+    executor_pool: Any,
+    *,
+    active_executor_id: str | None = None,
+) -> str:
+    """Format the agent's full executor pool for the environment block (Stage 36).
+
+    Returns an empty string when the pool is unavailable or when only a
+    single primary executor is assigned (degenerate case — no need to
+    list ourselves twice). Otherwise returns a newline-prefixed listing
+    that the controller appends to the environment block.
+    """
+
+    if executor_pool is None:
+        return ""
+    targets = list(getattr(executor_pool, "all", None) or [])
+    if len(targets) <= 1:
+        return ""
+    lines = ["", "Assigned executors (Stage 36 multi-executor agents):"]
+    for target in targets:
+        kind = "primary" if getattr(target, "is_primary", False) else "additional"
+        marker = (
+            " [active]"
+            if (
+                active_executor_id is not None
+                and getattr(target, "executor_id", None) == active_executor_id
+            )
+            else ""
+        )
+        state_value = getattr(getattr(target, "state", None), "value", "unknown")
+        line = (
+            f"- {target.executor_id} ({getattr(target, 'executor_type', 'unknown')}) "
+            f"[{kind}] state={state_value}{marker}"
+        )
+        description = getattr(target, "description", None)
+        if description:
+            line += f" — {description}"
+        lines.append(line)
+    lines.append(
+        "Pass target_executor=<id> on a tool call to route a single call to a "
+        "specific executor (without changing the active one). Call switch_executor "
+        "to change the conversation's active executor."
+    )
+    return "\n".join(lines)
 
 
 def _local_environment_snapshot() -> ExecutorEnvironmentSnapshot:
@@ -458,6 +514,8 @@ class ContextAssembler:
         workspace_root: str | None = None,
         effective_working_directory: str | None = None,
         include_project_context: bool = True,
+        executor_pool: Any = None,
+        active_executor_id: str | None = None,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -503,6 +561,8 @@ class ContextAssembler:
                 workspace_root=workspace_root,
                 effective_working_directory=effective_working_directory,
                 include_project_context=include_project_context,
+                executor_pool=executor_pool,
+                active_executor_id=active_executor_id,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -759,6 +819,8 @@ class ContextAssembler:
                     executor_environment,
                     workspace_root=workspace_root,
                     effective_working_directory=effective_working_directory,
+                    executor_pool=executor_pool,
+                    active_executor_id=active_executor_id,
                 ),
                 "_audit_source": "environment_info",
                 "_audit_role": "system",
@@ -1009,6 +1071,8 @@ class ContextAssembler:
         workspace_root: str | None = None,
         effective_working_directory: str | None = None,
         include_project_context: bool = True,
+        executor_pool: Any = None,
+        active_executor_id: str | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -1127,6 +1191,8 @@ class ContextAssembler:
                     executor_environment,
                     workspace_root=workspace_root,
                     effective_working_directory=effective_working_directory,
+                    executor_pool=executor_pool,
+                    active_executor_id=active_executor_id,
                 ),
                 "_audit_source": "environment_info",
                 "_audit_role": "system",

@@ -1242,6 +1242,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
         ),
         project_id=getattr(row, "project_id", None),
         active_session_id=row.active_session_id,
+        active_executor_id=getattr(row, "active_executor_id", None),
         status=row.status,
         last_message_at=row.last_message_at,
         created_at=row.created_at,

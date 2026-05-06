@@ -955,29 +955,40 @@ async def test_eligible_executor_allows_explicit_shared_executor(
 
 
 @pytest.mark.asyncio
-async def test_eligible_executor_selector_must_match_exactly_one(
+async def test_eligible_executor_selector_picks_one_when_multi_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Stage 36: a primary selector matching N>=1 usable executors no longer raises.
+
+    The controller picks one usable primary and persists it.
+    """
+
     async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
         return [
             _executor_row("exec-a", labels={"role": "local"}),
             _executor_row("exec-b", labels={"role": "local"}),
         ]
 
-    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    async def _get_executor_row(*_: object, **__: object) -> SimpleNamespace | None:
+        return None
 
-    with pytest.raises(RuntimeError, match="matched 2 eligible executors"):
-        await runtime_support._resolve_eligible_executor_config(
-            _runtime_providers(),
-            AgentDefinition(
-                agent_id="agent-1",
-                owner_email="alice@example.com",
-                name="Agent",
-                execution={"executor_selector": {"role": "local"}},
-            ),
-            "alice@example.com",
-            ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
-        )
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_selector": {"role": "local"}},
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+    )
+    # Stage 36 picks the lexicographically smallest usable primary at ties
+    assert config["executor_id"] == "exec-a"
+    assert config["selection_source"] == "selector"
 
 
 @pytest.mark.asyncio
@@ -1251,3 +1262,124 @@ async def test_runtime_factory_uses_unique_in_process_handle_per_run(
         await second.cleanup()
 
     assert executor.cancelled_ids == executor.spawned_ids
+
+
+# ---------------------------------------------------------------------------
+# Stage 36: initial active executor pick + conversation-level pin
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_initial_active_executor_persisted_for_explicit_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 36: explicit executor_id is persisted as the conversation's initial active."""
+
+    async def _get_executor_row(*_: object, **__: object) -> SimpleNamespace:
+        return _executor_row("exec-1")
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [_executor_row("exec-1")]
+
+    persisted: dict[str, str | None] = {"id": None}
+
+    async def _initialize(_session, conversation_id, executor_id):
+        persisted["id"] = executor_id
+        return True
+
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(
+        store_queries,
+        "initialize_conversation_active_executor",
+        _initialize,
+    )
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_id": "exec-1"},
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_id="conv-1",
+    )
+    assert config["executor_id"] == "exec-1"
+    assert persisted["id"] == "exec-1"
+
+
+@pytest.mark.asyncio
+async def test_pinned_active_executor_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 36: conversation_active_executor_id pins runtime to that executor."""
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [
+            _executor_row("exec-pri", labels={"tier": "primary"}),
+            _executor_row("exec-add"),
+        ]
+
+    async def _get_executor_row(_session, executor_id, **_kwargs):
+        if executor_id == "exec-pri":
+            return _executor_row("exec-pri", labels={"tier": "primary"})
+        if executor_id == "exec-add":
+            return _executor_row("exec-add")
+        return None
+
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={
+                "executor_id": "exec-pri",
+                "additional_executors": [{"executor_id": "exec-add"}],
+            },
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_active_executor_id="exec-add",
+    )
+    # Pin overrides the primary binding
+    assert config["executor_id"] == "exec-add"
+    assert config["selection_source"] == "conversation_active_additional"
+
+
+@pytest.mark.asyncio
+async def test_pinned_unassigned_executor_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 36: pinned executor that's no longer assigned raises a factual error."""
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [_executor_row("exec-pri")]
+
+    async def _get_executor_row(_session, executor_id, **_kwargs):
+        if executor_id == "exec-pri":
+            return _executor_row("exec-pri")
+        return None
+
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+
+    with pytest.raises(RuntimeError, match="no longer assigned"):
+        await runtime_support._resolve_eligible_executor_config(
+            _runtime_providers(),
+            AgentDefinition(
+                agent_id="agent-1",
+                owner_email="alice@example.com",
+                name="Agent",
+                execution={"executor_id": "exec-pri"},
+            ),
+            "alice@example.com",
+            ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+            conversation_active_executor_id="exec-ghost",
+        )

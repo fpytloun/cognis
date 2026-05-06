@@ -209,6 +209,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_agent_type_columns)
         await conn.run_sync(_ensure_user_management_columns)
         await conn.run_sync(_ensure_conversation_last_read_at)
+        await conn.run_sync(_ensure_conversation_active_executor_id)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_executor_token_version_column)
@@ -566,6 +567,19 @@ def _ensure_conversation_last_read_at(sync_conn: object) -> None:
 
     if "last_read_at" not in columns:
         execute(text("ALTER TABLE conversations ADD COLUMN last_read_at TIMESTAMP"))
+
+
+def _ensure_conversation_active_executor_id(sync_conn: object) -> None:
+    """Add conversations.active_executor_id (Stage 36 multi-executor agents)."""
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "active_executor_id" not in columns:
+        execute(text("ALTER TABLE conversations ADD COLUMN active_executor_id VARCHAR"))
 
 
 def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:

@@ -50,13 +50,24 @@ class ExecutorEnvironmentSnapshot:
 
 @dataclass(slots=True)
 class ResolvedStepRuntime:
-    """Resolved runtime objects for one step execution."""
+    """Resolved runtime objects for one step execution.
+
+    Stage 36 (multi-executor agents): ``executor_pool`` carries the agent's
+    full assigned executor pool (primary + additional) when available, and
+    ``active_executor_id`` is the executor selected for the *active*
+    routing slot. Tool calls without an explicit ``target_executor`` go to
+    the active executor; tool calls with ``target_executor=X`` resolve X
+    against ``executor_pool``. Both fields default to None for backward
+    compatibility with single-executor callers.
+    """
 
     tool_registry: Any
     executor_connection: Any
     cleanup: Callable[[], Awaitable[None]]
     executor_environment: ExecutorEnvironmentSnapshot | None
     runtime_info: dict[str, Any] | None = None
+    executor_pool: Any = None  # Optional[ExecutorPool] (avoid forward ref)
+    active_executor_id: str | None = None
 
 
 def build_local_executor_environment(

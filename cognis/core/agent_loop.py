@@ -266,6 +266,7 @@ REQUEST_AUTH_CHALLENGE = "request_auth_challenge"
 LIST_CREDENTIALS = "list_credentials"
 STEP_TODO_WRITE = "step_todo_write"
 STEP_TODO_LIST = "step_todo_list"
+SWITCH_EXECUTOR = "switch_executor"  # Stage 36: multi-executor agents
 CONTROLLER_TOOLS = {
     WRITE_DELIVERABLE,
     STEP_COMPLETE,
@@ -275,6 +276,7 @@ CONTROLLER_TOOLS = {
     LIST_CREDENTIALS,
     STEP_TODO_WRITE,
     STEP_TODO_LIST,
+    SWITCH_EXECUTOR,
     SEARCH_TOOLS_TOOL.name,
 }
 
@@ -1703,6 +1705,11 @@ class StepContext:
     classified_tool_definitions: dict[str, ToolDefinition] = field(default_factory=dict)
     executor_connection: Any = None  # ExecutorConnection for this step
     executor_environment: ExecutorEnvironmentSnapshot | None = None
+    # Stage 36 multi-executor agents:
+    # - executor_pool carries the agent's full assigned pool (primary + additional)
+    # - active_executor_id is the conversation's current active routing slot
+    executor_pool: Any = None  # Optional[ExecutorPool]
+    active_executor_id: str | None = None
     runtime_info: dict[str, Any] = field(default_factory=dict)
     workflow_state: WorkflowState | None = None
     workflow_steps: list[StepDefinition] | None = None  # All steps for source resolution
@@ -2014,6 +2021,7 @@ class AgentLoop:
         executor_agent: AgentDefinition,
         user_email: str,
         access_context: RuntimeAccessContext | None = None,
+        conversation_id: str | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
@@ -2024,8 +2032,26 @@ class AgentLoop:
                     user_email=user_email,
                     executor_agent=executor_agent,
                     access_context=access_context,
+                    conversation_id=conversation_id,
                 )
             except TypeError as exc:
+                if "conversation_id" in str(exc):
+                    # Older factory without conversation_id support
+                    try:
+                        return await self._step_runtime_factory(
+                            agent=agent,
+                            user_email=user_email,
+                            executor_agent=executor_agent,
+                            access_context=access_context,
+                        )
+                    except TypeError as exc2:
+                        if "access_context" not in str(exc2):
+                            raise
+                        return await self._step_runtime_factory(
+                            agent=agent,
+                            user_email=user_email,
+                            executor_agent=executor_agent,
+                        )
                 if "access_context" not in str(exc):
                     raise
                 return await self._step_runtime_factory(
@@ -2126,6 +2152,9 @@ class AgentLoop:
                 executor_agent=child_executor_agent,
                 user_email=child_session.user_email,
                 access_context=child_access_context,
+                conversation_id=getattr(conversation, "conversation_id", None)
+                if conversation is not None
+                else None,
             )
 
             child_step = StepDefinition(
@@ -2147,6 +2176,8 @@ class AgentLoop:
                 tool_registry=child_runtime.tool_registry,
                 executor_connection=child_runtime.executor_connection,
                 executor_environment=child_runtime.executor_environment,
+                executor_pool=getattr(child_runtime, "executor_pool", None),
+                active_executor_id=getattr(child_runtime, "active_executor_id", None),
                 runtime_info=child_runtime.runtime_info or {},
                 workspace_root=current_workspace_root.get(),
                 working_directory=current_effective_working_directory.get(),
@@ -2644,6 +2675,11 @@ class AgentLoop:
                 include_project_context=(
                     ctx.workspace_root_explicit or ctx.working_directory_explicit
                 ),
+                executor_pool=getattr(ctx, "executor_pool", None),
+                active_executor_id=(
+                    getattr(ctx, "active_executor_id", None)
+                    or getattr(ctx.conversation, "active_executor_id", None)
+                ),
             )
         except ImmutablePrefixUnavailable:
             await self._record_system_notice_audit(
@@ -2725,6 +2761,15 @@ class AgentLoop:
                 if workflow_step_reminder is not None:
                     messages.append(workflow_step_reminder)
                 workflow_step_reminder_added = True
+
+            # Stage 36: non-primary active executor reminder. Injected on every
+            # LLM turn while the active executor is in the agent's *additional*
+            # set. Primaries are by definition legitimate hosts and need no
+            # reminder. The reminder is non-persistent (stripped from history)
+            # via the standard internal-fields prefix convention.
+            non_primary_reminder = self._build_non_primary_active_reminder(ctx)
+            if non_primary_reminder is not None:
+                messages.append(non_primary_reminder)
 
             # Post-deliverable nudge: if the model wrote the deliverable,
             # marked all todos terminal, and stopped calling tools without
@@ -4160,6 +4205,107 @@ class AgentLoop:
                     if ctx.policy.require_step_complete:
                         ctx.post_deliverable_pending = True
                         ctx.post_deliverable_reminders_sent = 0
+                    continue
+
+                if tc.name == SWITCH_EXECUTOR:
+                    # Stage 36: switch the conversation's active executor.
+                    # The active executor binding persists across turns and
+                    # steps until the next switch (by the agent or by the
+                    # user via /executor). The controller never auto-changes
+                    # it; this tool is the agent's only mutator.
+                    _append_tool_call_event(events_to_record, tc, tool_id)
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:switch_executor",
+                        on_token=on_token,
+                    )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
+                    target_executor_id_arg = (
+                        tc.arguments.get("executor_id") if isinstance(tc.arguments, dict) else None
+                    )
+                    reason_arg = (
+                        tc.arguments.get("reason") if isinstance(tc.arguments, dict) else None
+                    )
+                    pool = getattr(ctx, "executor_pool", None)
+                    if pool is None or not isinstance(target_executor_id_arg, str):
+                        err_payload = {
+                            "status": "error",
+                            "reason": "no_pool" if pool is None else "missing_argument",
+                            "detail": (
+                                "Executor pool unavailable for this step."
+                                if pool is None
+                                else "switch_executor requires an executor_id argument."
+                            ),
+                        }
+                        err_content = json.dumps(err_payload)
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
+                        _append_tool_result_event(
+                            events_to_record, tc, err_content, True, tool_id=tool_id
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:switch_executor",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(
+                                tc.call_id, tc.name, err_content, True, None, None
+                            )
+                        continue
+
+                    from cognis.core.executor_switching import perform_executor_switch
+
+                    outcome = await perform_executor_switch(
+                        conversation_id=ctx.conversation.conversation_id,
+                        pool=pool,
+                        executor_id=target_executor_id_arg.strip(),
+                        actor="agent",
+                        session_factory=self.session_manager.session_factory,
+                        reason=reason_arg if isinstance(reason_arg, str) else None,
+                    )
+                    is_error = outcome.status == "error"
+                    if not is_error and outcome.target is not None:
+                        # Update the in-memory ctx.active_executor_id so any
+                        # subsequent code reading it sees the new value. The
+                        # actual runtime swap happens at the next step start
+                        # (or on next persisted-pin lookup); this is purely
+                        # advisory for the rest of the current turn.
+                        ctx.active_executor_id = outcome.target.executor_id
+                        # Also reflect it on the conversation object for
+                        # observers reading ctx.conversation.
+                        with contextlib.suppress(Exception):
+                            ctx.conversation.active_executor_id = outcome.target.executor_id
+                    result_content = json.dumps(outcome.to_tool_result())
+                    messages.append(_tool_result_message(tc, result_content, protected=True))
+                    _append_tool_result_event(
+                        events_to_record, tc, result_content, is_error, tool_id=tool_id
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_result:switch_executor",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(
+                            tc.call_id, tc.name, result_content, is_error, None, None
+                        )
                     continue
 
                 if tc.name == STEP_COMPLETE:
@@ -8885,16 +9031,108 @@ class AgentLoop:
         ctx: StepContext,
         tc: ToolCall,
     ) -> ToolResult:
+        # Stage 36: handle per-call target_executor override.
+        # Strip target_executor from arguments BEFORE the call leaves the
+        # controller (Intaris and the executor RPC must never see it).
+        target_executor_id: str | None = None
+        if isinstance(tc.arguments, dict) and "target_executor" in tc.arguments:
+            raw_target = tc.arguments.get("target_executor")
+            if isinstance(raw_target, str) and raw_target.strip():
+                target_executor_id = raw_target.strip()
+            sanitized_arguments = {
+                k: v for k, v in tc.arguments.items() if k != "target_executor"
+            }
+            tc = tc.model_copy(update={"arguments": sanitized_arguments})
+
+        executor_connection = self._get_executor(ctx)
+        if target_executor_id is not None:
+            pool = getattr(ctx, "executor_pool", None)
+            if pool is None:
+                return ToolResult(
+                    output=(
+                        "target_executor was specified but the executor pool is "
+                        "unavailable for this step. The tool was not executed."
+                    ),
+                    is_error=True,
+                )
+            target = pool.by_id(target_executor_id)
+            if target is None:
+                return ToolResult(
+                    output=(
+                        f"Executor '{target_executor_id}' is not assigned to this agent. "
+                        "The tool was not executed. Use switch_executor to change the "
+                        "active executor or specify a target_executor that is in your "
+                        "assigned pool."
+                    ),
+                    is_error=True,
+                )
+            if not target.usable:
+                return ToolResult(
+                    output=(
+                        f"Executor '{target_executor_id}' is not usable "
+                        f"(state: {target.state.value}). The tool was not executed."
+                    ),
+                    is_error=True,
+                )
+            # Resolve a live connection for the target executor. The active
+            # connection (ctx.executor_connection) is reused when the target
+            # is the active executor; otherwise we look up by ID.
+            ctx_active = getattr(ctx, "active_executor_id", None)
+            if ctx_active and target_executor_id == ctx_active:
+                pass  # use ctx.executor_connection
+            else:
+                resolved_conn = self._resolve_target_connection(
+                    target_executor_id=target_executor_id,
+                    target_executor_type=target.executor_type,
+                )
+                if resolved_conn is None:
+                    return ToolResult(
+                        output=(
+                            f"Could not establish a connection to executor "
+                            f"'{target_executor_id}' (type: {target.executor_type}). "
+                            "The tool was not executed."
+                        ),
+                        is_error=True,
+                    )
+                executor_connection = resolved_conn
+
         try:
             return await self.tool_router.execute(
                 tc.model_copy(update={"runtime_metadata": self._tool_runtime_metadata(ctx)}),
                 ctx.session,
                 ctx.agent,
                 self._get_tool_registry(ctx),
-                self._get_executor(ctx),
+                executor_connection,
             )
         except Exception as exc:
             return ToolResult(output=f"Tool execution failed: {str(exc)[:1000]}", is_error=True)
+
+    def _resolve_target_connection(
+        self,
+        *,
+        target_executor_id: str,
+        target_executor_type: str,
+    ) -> Any:
+        """Resolve a live executor connection by id (Stage 36).
+
+        Returns None when no connection is available. Used by per-call
+        ``target_executor`` routing for executors other than the active one.
+        """
+        executor_provider = getattr(self.providers, "executor", None)
+        if executor_provider is None:
+            return None
+        # WebSocket remote executors expose a ws sub-provider with
+        # get_connection(executor_id). In-process and subprocess types
+        # are not yet routable per-call (the active connection model
+        # is one-handle-per-step); for those, return None and let the
+        # caller surface a factual error.
+        ws_provider = getattr(executor_provider, "websocket", None)
+        if ws_provider is None:
+            return None
+        try:
+            return ws_provider.get_connection(target_executor_id)
+        except Exception:
+            return None
 
     async def _finalize_regular_tool_result(
         self,
@@ -10284,6 +10522,45 @@ class AgentLoop:
         )
         return {"role": "system", "content": content, "_workflow_step_reminder": True}
 
+    def _build_non_primary_active_reminder(
+        self, ctx: StepContext
+    ) -> dict[str, Any] | None:
+        """Stage 36: remind the agent it is on a non-primary executor.
+
+        Returns ``None`` when the active executor is a primary, when the
+        pool is unknown, or when the active executor is unassigned (in
+        which case other paths surface factual errors).
+        """
+
+        pool = getattr(ctx, "executor_pool", None)
+        if pool is None:
+            return None
+        active_id = getattr(ctx, "active_executor_id", None) or getattr(
+            ctx.conversation, "active_executor_id", None
+        )
+        if not isinstance(active_id, str) or not active_id:
+            return None
+        target = pool.by_id(active_id)
+        if target is None or target.is_primary:
+            return None
+        primary_ids = sorted(t.executor_id for t in pool.primary if t.executor_id)
+        primary_hint = ", ".join(primary_ids) if primary_ids else "(none configured)"
+        content = (
+            "<executor_reminder>\n"
+            f"You are routing tool calls to a non-primary (additional) executor: "
+            f"{target.executor_id} ({target.executor_type}).\n"
+            "This was set by an earlier switch_executor call or /executor command. "
+            "All subsequent tool calls without target_executor will use this executor. "
+            "Call switch_executor when you want to return to a primary executor.\n"
+            f"Primary executors available to you: {primary_hint}\n"
+            "</executor_reminder>"
+        )
+        return {
+            "role": "system",
+            "content": content,
+            "_executor_reminder": True,
+        }
+
     _MAX_POST_DELIVERABLE_REMINDERS = 2
 
     def _maybe_inject_post_deliverable_reminder(
@@ -10535,6 +10812,7 @@ class AgentLoop:
             STEP_REQUEST_INPUT_TOOL,
             STEP_TODO_LIST_TOOL,
             STEP_TODO_WRITE_TOOL,
+            SWITCH_EXECUTOR_TOOL,
             WRITE_DELIVERABLE_TOOL,
         )
 
@@ -10588,6 +10866,32 @@ class AgentLoop:
         for tool_def in orchestration_tools(ctx.orchestration_mode):
             tools.append(_to_schema(tool_def))
 
+        # Stage 36: switch_executor — exposed only when the agent has at
+        # least two USABLE assigned executors. Hiding it when fewer are
+        # usable avoids offering a no-op tool to the LLM.
+        pool = getattr(ctx, "executor_pool", None)
+        if pool is not None:
+            usable_ids = sorted(
+                t.executor_id for t in pool.all if t.usable and t.executor_id
+            )
+            if len(usable_ids) >= 2:
+                import copy as _copy
+
+                schema = _copy.deepcopy(SWITCH_EXECUTOR_TOOL.parameters)
+                properties = schema.setdefault("properties", {})
+                executor_field = properties.setdefault("executor_id", {"type": "string"})
+                executor_field["enum"] = usable_ids
+                tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": SWITCH_EXECUTOR_TOOL.name,
+                            "description": SWITCH_EXECUTOR_TOOL.description,
+                            "parameters": schema,
+                        },
+                    }
+                )
+
         return tools
 
     def _get_controller_tool_parameters(self, tool_name: str) -> dict[str, Any] | None:
@@ -10602,6 +10906,7 @@ class AgentLoop:
             STEP_REQUEST_INPUT_TOOL,
             STEP_TODO_LIST_TOOL,
             STEP_TODO_WRITE_TOOL,
+            SWITCH_EXECUTOR_TOOL,
             WRITE_DELIVERABLE_TOOL,
         )
 
@@ -10614,6 +10919,7 @@ class AgentLoop:
             REQUEST_CREDENTIAL_TOOL.name: REQUEST_CREDENTIAL_TOOL,
             REQUEST_AUTH_CHALLENGE_TOOL.name: REQUEST_AUTH_CHALLENGE_TOOL,
             LIST_CREDENTIALS_TOOL.name: LIST_CREDENTIALS_TOOL,
+            SWITCH_EXECUTOR_TOOL.name: SWITCH_EXECUTOR_TOOL,
             SEARCH_TOOLS_TOOL.name: SEARCH_TOOLS_TOOL,
         }
         for tool_def in orchestration_tools(OrchestrationMode.FULL):
@@ -10759,25 +11065,62 @@ class AgentLoop:
         """Get tool schemas from the executor's tool registry.
 
         Returns schemas in the OpenAI function calling format.
+
+        Stage 36: when the agent has multiple usable assigned executors that
+        observe the same tool, an optional ``target_executor`` parameter is
+        overlaid onto the tool's input schema with an enum of valid executor
+        ids. This lets the LLM route a single call to a specific executor
+        without changing the conversation's active executor.
         """
         registry = self._get_tool_registry(ctx)
         if registry is None:
             return []
 
+        from cognis.core.executor_pool import tool_observed_on
         from cognis.tools.builtin.orchestration import ORCHESTRATION_TOOL_NAMES
+
+        pool = getattr(ctx, "executor_pool", None)
+
+        def _executors_offering(tool_name: str) -> list[str]:
+            if pool is None:
+                return []
+            return sorted(
+                t.executor_id
+                for t in pool.all
+                if tool_observed_on(t, tool_name)
+            )
 
         schemas: list[dict[str, Any]] = []
         for tool_def in registry.list_tools():
             # Skip controller and orchestration tools (handled separately)
             if tool_def.name in CONTROLLER_TOOLS or tool_def.name in ORCHESTRATION_TOOL_NAMES:
                 continue
+            parameters = tool_def.parameters
+            # Add target_executor overlay only for executor-routed tools
+            # available on more than one assigned executor.
+            if pool is not None and tool_def.source.type == "executor":
+                offering = _executors_offering(tool_def.name)
+                if len(offering) >= 2:
+                    import copy as _copy
+
+                    parameters = _copy.deepcopy(parameters)
+                    properties = parameters.setdefault("properties", {})
+                    properties["target_executor"] = {
+                        "type": "string",
+                        "enum": offering,
+                        "description": (
+                            "Optional. Run this single call on a specific "
+                            "assigned executor. Omit to use the active "
+                            "executor for the conversation."
+                        ),
+                    }
             schemas.append(
                 {
                     "type": "function",
                     "function": {
                         "name": tool_def.name,
                         "description": tool_def.description,
-                        "parameters": tool_def.parameters,
+                        "parameters": parameters,
                     },
                 }
             )

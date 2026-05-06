@@ -342,6 +342,7 @@ class Conversation(Base):
     memory_labels: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     active_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )

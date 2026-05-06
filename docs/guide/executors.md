@@ -111,6 +111,51 @@ executors. The command reports normalized executor-local status:
 `/lsp` is read-only. It does not auto-install language servers or trigger any
 network fetches.
 
+## Multi-executor agents (Stage 36)
+
+An agent can be assigned more than one executor. The model is intentionally
+asymmetric:
+
+- **Primary executors** (configured via `execution.executor_id` or
+  `execution.executor_selector`) are auto-eligible. The controller picks
+  one usable primary the first time a conversation needs an executor and
+  pins it as the conversation's `active_executor_id`.
+- **Additional executors** (configured via
+  `execution.additional_executors`) are reachable only when the agent
+  asks for them explicitly: per-call via the `target_executor` parameter
+  on a tool call, or session-wide via the `switch_executor` tool. The
+  controller never picks them automatically.
+
+Once the controller has picked the initial active executor, it does NOT
+change the binding for any reason. If the active executor goes offline or
+becomes unassigned, tool calls return factual `is_error=True` results
+naming the executor and its state. The agent decides whether to retry,
+call `switch_executor` to move to a different executor, or stop. The
+controller does not auto-fall-back, does not silently re-route, and does
+not cancel the turn.
+
+### `switch_executor` tool
+
+Available to the LLM whenever the agent has more than one assigned
+executor. The schema is constrained to currently usable assigned
+executor ids. On success it persists the new active to the
+conversation row; on failure it leaves it unchanged.
+
+### `/executor` slash command
+
+```
+/executor              Show the active executor + the agent's full pool
+/executor <id>         Switch the conversation's active executor to <id>
+```
+
+Uses the same shared backend helper as `switch_executor` and produces
+the same audit story regardless of who triggered the switch.
+
+When the active executor is non-primary (i.e., chosen via
+`switch_executor` or `/executor`), every LLM turn carries a hidden
+reminder noting the routing target so the agent does not lose track. No
+reminder is injected for primary actives.
+
 ## Browser automation
 
 Browser automation is executor-native. The controller handles orchestration,

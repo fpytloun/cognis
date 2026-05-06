@@ -40,6 +40,7 @@ For a first agent, keep personality instructions short and practical. Add more c
 ### Tools and permissions
 
 - executor binding (specific executor or label selector)
+- additional executors (optional, agent-only routable — see below)
 - inherited tool categories from the selected executor
 - category and per-tool disable switches
 - per-tool permission policy (`allow`, `evaluate`, `deny`)
@@ -58,6 +59,25 @@ If you leave the executor empty, Cognis resolves it from the agent's label
 selector or the system default executor.
 
 This means agent safety is shaped by both executor capabilities and the agent's own restrictions.
+
+### Additional executors (Stage 36)
+
+The agent editor lets you attach additional executors next to the primary
+executor binding. Each entry is either a specific executor or a label
+selector, plus an optional description.
+
+Additional executors are not auto-selected. The agent reaches them in two ways:
+
+- `target_executor=<id>` on a single tool call — runs that one call on
+  the named executor without changing the conversation's active binding.
+- `switch_executor` tool (or the `/executor <id>` slash command) — moves
+  the conversation's active routing slot to that executor for all
+  subsequent tool calls until the next switch.
+
+When the active executor is in the additional set, every LLM turn shows
+a hidden reminder so the agent stays aware that it is on a non-primary
+host. The controller never auto-changes the binding; the agent (or user)
+is the only mutator.
 
 ### MCP servers
 

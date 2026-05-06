@@ -195,6 +195,16 @@ class CommandDispatcher:
         if stripped == "/lsp":
             return await self._handle_lsp(user_email=user_email)
 
+        # /executor [executor_id]
+        if stripped == "/executor" or stripped.startswith("/executor "):
+            arg = stripped[len("/executor") :].strip() or ""
+            return await self._handle_executor(
+                conversation=conversation,
+                agent=agent,
+                user_email=user_email,
+                executor_id=arg or None,
+            )
+
         # /help
         if stripped == "/help":
             return self._handle_help()
@@ -976,6 +986,154 @@ class CommandDispatcher:
         """Handle /help — show available slash commands."""
         return CommandResult(type="system_message", text=_HELP_TEXT)
 
+    async def _handle_executor(
+        self,
+        *,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+        executor_id: str | None,
+    ) -> CommandResult:
+        """Handle /executor [executor_id] — Stage 36 multi-executor agents.
+
+        With no argument: show the active executor and the agent's full
+        assigned pool (primary + additional) in a system message.
+        With an argument: switch the conversation's active executor to that
+        id, using the same shared backend helper as the ``switch_executor``
+        controller tool.
+        """
+
+        # Resolve the agent's executor pool.
+        pool = await self._resolve_executor_pool_for_command(agent, user_email)
+        if pool is None:
+            return CommandResult(
+                type="error",
+                text=(
+                    "Could not resolve the agent's executor pool. "
+                    "This usually means executor policy is unavailable."
+                ),
+                data={"code": "pool_unavailable"},
+            )
+
+        if executor_id:
+            from cognis.core.executor_switching import perform_executor_switch
+
+            outcome = await perform_executor_switch(
+                conversation_id=conversation.conversation_id,
+                pool=pool,
+                executor_id=executor_id,
+                actor="user",
+                session_factory=self._session_factory,
+                reason="user requested via /executor",
+            )
+            data: dict[str, Any] = {
+                "code": "executor_switched" if outcome.status == "ok" else "executor_switch_failed",
+            }
+            if outcome.target is not None:
+                data["executor_id"] = outcome.target.executor_id
+                data["is_primary"] = outcome.is_primary
+            if outcome.status == "error" and outcome.error_reason:
+                data["reason"] = outcome.error_reason
+            result_type = "system_message" if outcome.status == "ok" else "error"
+            return CommandResult(
+                type=result_type,
+                text=outcome.to_user_message(),
+                data=data,
+            )
+
+        # No argument: show pool status.
+        return self._render_executor_status(conversation, pool)
+
+    async def _resolve_executor_pool_for_command(
+        self,
+        agent: AgentDefinition,
+        user_email: str,
+    ) -> Any:
+        """Resolve the agent's executor pool for /executor display/switch."""
+
+        from cognis.core.executor_policy import load_executor_policy
+        from cognis.core.executor_pool import resolve_executor_pool
+
+        if self._session_factory is None:
+            return None
+        try:
+            policy = await load_executor_policy(self._session_factory)
+        except Exception:
+            logger.debug("/executor: failed to load executor policy", exc_info=True)
+            return None
+        try:
+            return await resolve_executor_pool(
+                session_factory=self._session_factory,
+                agent_execution=(
+                    agent.execution if isinstance(agent.execution, dict) else {}
+                ),
+                user_email=user_email,
+                executor_owner_email=user_email,
+                policy=policy,
+            )
+        except Exception:
+            logger.debug("/executor: failed to resolve executor pool", exc_info=True)
+            return None
+
+    def _render_executor_status(
+        self,
+        conversation: ConversationModel,
+        pool: Any,
+    ) -> CommandResult:
+        """Render a system message describing the active executor and pool."""
+
+        active_id = getattr(conversation, "active_executor_id", None)
+        active_target = pool.by_id(active_id) if active_id else None
+        all_targets = pool.all
+
+        lines: list[str] = []
+        if active_target is not None:
+            kind = "primary" if active_target.is_primary else "additional"
+            lines.append(
+                f"Active executor: {active_target.executor_id} "
+                f"({active_target.executor_type}) [{kind}]"
+            )
+            lines.append(f"  State: {active_target.state.value}")
+            if active_target.description:
+                lines.append(f"  Description: {active_target.description}")
+            tool_count = len(active_target.observed_tool_names) or len(
+                active_target.enabled_tools
+            )
+            lines.append(f"  Tools available: {tool_count}")
+        elif active_id:
+            lines.append(
+                f"Active executor: {active_id} (not in current assigned pool)"
+            )
+        else:
+            lines.append(
+                "Active executor: none (the controller will pick a primary "
+                "automatically the first time a tool runs)"
+            )
+
+        lines.append("")
+        if not all_targets:
+            lines.append(
+                "Assigned executors: none — configure the agent's "
+                "execution.executor_id, execution.executor_selector, or "
+                "execution.additional_executors."
+            )
+            return CommandResult(type="system_message", text="\n".join(lines))
+
+        lines.append("Assigned executors:")
+        for target in all_targets:
+            kind = "primary" if target.is_primary else "additional"
+            marker = " [active]" if target.executor_id == active_id else ""
+            line = (
+                f"  - {target.executor_id} ({target.executor_type}) "
+                f"[{kind}] state={target.state.value}{marker}"
+            )
+            if target.description:
+                line += f" — {target.description}"
+            lines.append(line)
+        lines.append("")
+        lines.append("Usage: /executor <executor_id>  (to switch active executor)")
+        return CommandResult(type="system_message", text="\n".join(lines))
+
     async def _handle_approve_deny(
         self,
         conversation: ConversationModel,
@@ -1249,6 +1407,7 @@ _HELP_TEXT = """\
 Available commands:
   /help              Show this help message
   /lsp               Show LSP diagnostics status
+  /executor [id]     Show active executor + assigned pool, or switch active
   /model [name]      List available models or switch model
   /thinking [level]  Show or set reasoning effort
   /context           Show context window usage

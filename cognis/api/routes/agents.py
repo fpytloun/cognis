@@ -101,6 +101,93 @@ def _grant_to_response(row: object, *, include_overrides: bool = False) -> Agent
     )
 
 
+def _validate_agent_execution(execution: object) -> None:
+    """Validate ``execution`` field on agent create/update payloads.
+
+    Stage 36: validates ``additional_executors`` if present. Each entry must
+    be a dict with exactly one of ``executor_id`` (non-empty string) or
+    ``executor_selector`` (non-empty mapping). Optional ``description`` (str).
+    """
+
+    if execution is None:
+        return
+    if not isinstance(execution, dict):
+        raise api_exception(
+            400, "validation_error", "execution must be an object"
+        )
+
+    primary_id = execution.get("executor_id")
+    if primary_id is not None and not (isinstance(primary_id, str) and primary_id.strip()):
+        raise api_exception(
+            400, "validation_error", "execution.executor_id must be a non-empty string"
+        )
+    primary_selector = execution.get("executor_selector")
+    if primary_selector is not None and (
+        not isinstance(primary_selector, dict) or not primary_selector
+    ):
+        raise api_exception(
+            400,
+            "validation_error",
+            "execution.executor_selector must be a non-empty object",
+        )
+
+    raw_additional = execution.get("additional_executors")
+    if raw_additional is None:
+        return
+    if not isinstance(raw_additional, list):
+        raise api_exception(
+            400,
+            "validation_error",
+            "execution.additional_executors must be a list",
+        )
+    seen_ids: set[str] = set()
+    if isinstance(primary_id, str) and primary_id.strip():
+        seen_ids.add(primary_id.strip())
+    for index, entry in enumerate(raw_additional):
+        path = f"execution.additional_executors[{index}]"
+        if not isinstance(entry, dict):
+            raise api_exception(400, "validation_error", f"{path} must be an object")
+        entry_id = entry.get("executor_id")
+        entry_selector = entry.get("executor_selector")
+        has_id = bool(isinstance(entry_id, str) and entry_id.strip())
+        has_selector = bool(isinstance(entry_selector, dict) and bool(entry_selector))
+        if has_id == has_selector:
+            raise api_exception(
+                400,
+                "validation_error",
+                f"{path} must specify exactly one of executor_id or executor_selector",
+            )
+        if has_id:
+            normalized_id = entry_id.strip()
+            if normalized_id in seen_ids:
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    f"{path} duplicates executor_id '{normalized_id}' "
+                    "(also a primary or earlier additional binding)",
+                )
+            seen_ids.add(normalized_id)
+        if has_selector:
+            for k, v in entry_selector.items():
+                if not isinstance(k, str) or not k.strip():
+                    raise api_exception(
+                        400,
+                        "validation_error",
+                        f"{path}.executor_selector keys must be non-empty strings",
+                    )
+                if not isinstance(v, (str, int, bool)):
+                    raise api_exception(
+                        400,
+                        "validation_error",
+                        f"{path}.executor_selector values must be strings, ints, or bools",
+                    )
+        description = entry.get("description")
+        if description is not None and not isinstance(description, str):
+            raise api_exception(
+                400, "validation_error", f"{path}.description must be a string"
+            )
+
+
 def _normalized_grantee_execution(payload: dict[str, object] | None) -> dict[str, object]:
     if not isinstance(payload, dict):
         return {}
@@ -176,6 +263,9 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         validate_agent_id(agent_id)
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
+
+    # Stage 36: validate execution.additional_executors structure (if any)
+    _validate_agent_execution(payload.execution)
 
     # Use display_name as alias for name (backward compat)
     name = payload.name or payload.display_name or agent_id
@@ -265,6 +355,9 @@ async def update_agent_route(
     forbid_mutation_for_viewer(request)
     if agent_id in SYSTEM_AGENTS:
         return await _update_system_agent_route(request, agent_id, payload)
+    # Stage 36: validate execution.additional_executors structure (if any)
+    if "execution" in payload.model_fields_set:
+        _validate_agent_execution(payload.execution)
     async with request.app.state.session_factory() as session:
         row = await get_agent(session, agent_id)
         if row is None:

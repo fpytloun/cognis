@@ -66,6 +66,7 @@ def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> Conv
             else row.context.memory_labels,
         ),
         active_session_id=getattr(row, "active_session_id", None),
+        active_executor_id=getattr(row, "active_executor_id", None),
         status=row.status,
         last_message_at=last_message_at,
         last_read_at=last_read_at,

@@ -301,6 +301,45 @@ STEP_TODO_LIST_TOOL = ToolDefinition(
 )
 
 
+# Stage 36: switch_executor — controller-handled tool that changes the
+# conversation's active executor for subsequent executor-routed tool calls.
+# The active executor binding persists across turns and steps until the
+# next switch (by the agent or by the user via /executor). The controller
+# never auto-changes it; this tool is the agent's only mutator.
+SWITCH_EXECUTOR_TOOL = ToolDefinition(
+    name="switch_executor",
+    description=(
+        "Change the active executor for subsequent tool calls in this conversation. "
+        "Use when you want to keep working on a different assigned executor without "
+        "specifying target_executor on every call. The target executor must be one "
+        "of the executors assigned to you (primary or additional) and currently "
+        "usable. Switching to a non-primary (additional) executor will be flagged "
+        "in your context until you switch back to a primary."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "executor_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Assigned executor id to make active. Must be one of the agent's "
+                    "primary or additional executors."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief, optional reason for the switch.",
+            },
+        },
+        "required": ["executor_id"],
+    },
+    source=_SOURCE,
+    category="workflow",
+    read_only=False,
+)
+
+
 def workflow_tools() -> list[ToolDefinition]:
     """Return built-in workflow tool definitions.
 
@@ -316,4 +355,5 @@ def workflow_tools() -> list[ToolDefinition]:
         LIST_CREDENTIALS_TOOL,
         STEP_TODO_WRITE_TOOL,
         STEP_TODO_LIST_TOOL,
+        SWITCH_EXECUTOR_TOOL,
     ]

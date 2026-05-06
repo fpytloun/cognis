@@ -311,7 +311,8 @@ class TestWorkflowToolDefinitions:
         from cognis.tools.builtin.workflow import workflow_tools
 
         defs = workflow_tools()
-        assert len(defs) == 8
+        # Stage 36 added switch_executor, bringing the count to 9.
+        assert len(defs) == 9
 
     def test_workflow_tool_names(self) -> None:
         from cognis.tools.builtin.workflow import workflow_tools

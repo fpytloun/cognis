@@ -11,8 +11,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from cognis.api.executor_runtime import reconcile_executor
-from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
+from cognis.core.executor_token_locks import executor_token_lock
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
 from cognis.ownership import is_shared_owner_email

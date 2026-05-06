@@ -1502,6 +1502,53 @@ async def update_conversation_active_session_if_unset(
     return bool(result.rowcount)
 
 
+async def set_conversation_active_executor(
+    session: AsyncSession,
+    conversation_id: str,
+    active_executor_id: str | None,
+) -> bool:
+    """Set the conversation-level active executor ID (Stage 36).
+
+    Used by the ``switch_executor`` controller tool, the ``/executor``
+    slash command, and the controller's one-time initial pick when the
+    conversation first needs an executor.
+    """
+
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        return False
+    conversation.active_executor_id = active_executor_id
+    conversation.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def initialize_conversation_active_executor(
+    session: AsyncSession,
+    conversation_id: str,
+    active_executor_id: str,
+) -> bool:
+    """Set the active executor only if it is currently unset (Stage 36).
+
+    The controller is allowed to make exactly one such initial pick per
+    conversation. After that, only ``switch_executor`` / ``/executor``
+    may change the binding.
+    """
+
+    result = await session.execute(
+        update(Conversation)
+        .where(
+            Conversation.conversation_id == conversation_id,
+            Conversation.active_executor_id.is_(None),
+        )
+        .values(
+            active_executor_id=active_executor_id,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    return bool(result.rowcount)
+
+
 async def touch_conversation(
     session: AsyncSession, conversation_id: str, when: datetime | None = None
 ) -> bool:

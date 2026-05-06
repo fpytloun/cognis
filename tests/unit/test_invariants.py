@@ -174,7 +174,8 @@ async def test_reconcile_invariants_clears_active_session_pointer_to_terminal_se
 ) -> None:
     engine, factory = await _bootstrap_db(tmp_path)
     try:
-        from cognis.store.models import Conversation, Session as SessionRow
+        from cognis.store.models import Conversation
+        from cognis.store.models import Session as SessionRow
 
         async with factory() as session:
             conv = Conversation(

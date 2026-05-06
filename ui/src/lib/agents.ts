@@ -14,6 +14,17 @@ export interface MCPServerFormState {
   timeoutSeconds: number;
 }
 
+/**
+ * Stage 36 (multi-executor agents): one entry in
+ * ``execution.additional_executors``. Exactly one of ``executorId`` or
+ * ``executorSelector`` (newline-separated ``key=value`` pairs) must be set.
+ */
+export interface AdditionalExecutorEntry {
+  executorId: string;
+  executorSelector: string;
+  description: string;
+}
+
 export interface AgentFormState {
   agentId: string;
   customId: boolean;
@@ -47,6 +58,13 @@ export interface AgentFormState {
   originalTools: Record<string, unknown>;
   executorId: string;
   executorSelector: string;
+  /**
+   * Stage 36: additional executors assigned to the agent. Each entry must
+   * have either an explicit executor_id or a non-empty selector (not both).
+   * Additional executors are NOT auto-selected by the controller; they are
+   * reachable only via target_executor on a tool call or switch_executor.
+   */
+  additionalExecutors: AdditionalExecutorEntry[];
   disabledCategories: string[];
   disabledTools: string[];
   optInBuiltinTools: string[];
@@ -111,6 +129,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     originalTools: {},
     executorId: '',
     executorSelector: '',
+    additionalExecutors: [],
     disabledCategories: [],
     disabledTools: [],
     optInBuiltinTools: [],
@@ -179,6 +198,20 @@ export function agentToFormState(agent: Agent): AgentFormState {
             .map(([key, value]) => `${key}=${String(value)}`)
             .join('\n')
         : '',
+    additionalExecutors: Array.isArray(execution.additional_executors)
+      ? (execution.additional_executors as unknown[])
+          .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object'))
+          .map((entry) => ({
+            executorId: typeof entry.executor_id === 'string' ? entry.executor_id : '',
+            executorSelector:
+              entry.executor_selector && typeof entry.executor_selector === 'object'
+                ? Object.entries(entry.executor_selector as Record<string, unknown>)
+                    .map(([key, value]) => `${key}=${String(value)}`)
+                    .join('\n')
+                : '',
+            description: typeof entry.description === 'string' ? entry.description : ''
+          }))
+      : [],
     stepAgentOverridesJson: JSON.stringify(execution.step_agent_overrides ?? {}, null, 2),
     mcpServers: Array.isArray(tools.mcp_servers)
       ? tools.mcp_servers
@@ -329,6 +362,39 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       executor_id: form.executorId || undefined,
       executor_selector:
         !form.executorId && Object.keys(executorSelector).length > 0 ? executorSelector : undefined,
+      additional_executors:
+        form.additionalExecutors.length > 0
+          ? form.additionalExecutors
+              .map((entry) => {
+                const id = entry.executorId.trim();
+                const selectorEntries = Object.fromEntries(
+                  nonEmptyLines(entry.executorSelector)
+                    .map((line) => {
+                      const [key, ...rest] = line.split('=');
+                      return [key?.trim(), rest.join('=').trim()] as const;
+                    })
+                    .filter(([key, value]) => Boolean(key) && Boolean(value))
+                );
+                if (id) {
+                  return {
+                    executor_id: id,
+                    ...(entry.description.trim()
+                      ? { description: entry.description.trim() }
+                      : {})
+                  };
+                }
+                if (Object.keys(selectorEntries).length > 0) {
+                  return {
+                    executor_selector: selectorEntries,
+                    ...(entry.description.trim()
+                      ? { description: entry.description.trim() }
+                      : {})
+                  };
+                }
+                return null;
+              })
+              .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+          : undefined,
       available_workflow_ids: form.availableWorkflowIds,
       default_workflow_id: form.defaultWorkflowId || undefined,
       workflow_selection_mode: form.workflowSelectionMode,

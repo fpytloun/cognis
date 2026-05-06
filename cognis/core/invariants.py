@@ -24,7 +24,8 @@ from prometheus_client import Counter, Gauge
 from sqlalchemy import select, update
 
 from cognis.logging import get_logger
-from cognis.store.models import Conversation, Session as SessionRow, StepRun, Task
+from cognis.store.models import Conversation, StepRun, Task
+from cognis.store.models import Session as SessionRow
 
 logger = get_logger(__name__)
 

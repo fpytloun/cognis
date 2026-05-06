@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -21,7 +22,6 @@ from cognis.core.executor_policy import (
     is_executor_type_allowed,
     load_executor_policy,
 )
-from cognis.core.executor_resolution import labels_match
 from cognis.core.runtime import (
     ResolvedStepRuntime,
     build_local_executor_environment,
@@ -262,20 +262,44 @@ async def _resolve_eligible_executor_config(
     agent: AgentDefinition,
     user_email: str,
     policy: ExecutorPolicy,
+    *,
+    conversation_active_executor_id: str | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve the only executor eligible for an agent execution.
 
-    Eligibility is intentionally strict: agents must name an executor by
-    ``executor_id`` or by a non-empty label selector. Defaults and first-active
-    fallbacks are not execution-eligible because they can silently move work to
-    the controller or to the wrong user's machine.
+    Stage 36 multi-executor agents:
+
+    - Primary executors (``execution.executor_id`` or
+      ``execution.executor_selector``) are the only auto-eligible binding.
+    - When ``conversation_active_executor_id`` is set, it pins the runtime
+      to that executor (provided it is currently assigned to the agent and
+      usable). The pin is the conversation's persisted choice from a prior
+      ``switch_executor`` or ``/executor``.
+    - When the pin is set but unassigned or unusable, the controller does
+      NOT silently re-route. It raises so the tool dispatch path can
+      surface a factual error.
+    - When no pin is set and the agent is on its first turn, the
+      controller picks one usable primary executor (preferring
+      ``runtime_state == active`` over ``degraded``, then sorted by id)
+      and persists it via ``initialize_conversation_active_executor``.
+      This is the one and only initial pick — the controller never
+      re-picks afterwards.
+    - A primary selector matching N>=1 usable executors is supported (no
+      longer raises on multi-match) — the initial pick chooses one.
     """
 
     session_factory = getattr(providers, "_session_factory", None)
     if session_factory is None:
         raise RuntimeError("Session factory unavailable; cannot resolve executor")
 
-    from cognis.store.queries import get_active_agent_grant, get_executor_row, list_executors
+    from cognis.core.executor_pool import pick_initial_active, resolve_executor_pool
+    from cognis.store.queries import (
+        get_active_agent_grant,
+        get_executor_row,
+        initialize_conversation_active_executor,
+        list_executors,
+    )
 
     executor_owner_email = user_email
     execution = agent.execution if isinstance(agent.execution, dict) else {}
@@ -302,7 +326,46 @@ async def _resolve_eligible_executor_config(
         ):
             raise RuntimeError("Agent executor_selector must be a non-empty object")
 
+        # Stage 36: conversation-level active executor pin overrides primary
+        # binding. The pin must point at an executor that is currently
+        # ASSIGNED to the agent (primary or additional) AND usable. If not,
+        # we raise so the tool dispatch path returns a factual error — the
+        # controller never silently re-routes.
+        if isinstance(conversation_active_executor_id, str) and conversation_active_executor_id:
+            pool = await resolve_executor_pool(
+                session_factory=session_factory,
+                agent_execution=execution,
+                user_email=user_email,
+                executor_owner_email=executor_owner_email,
+                policy=policy,
+            )
+            target = pool.by_id(conversation_active_executor_id)
+            if target is None:
+                raise RuntimeError(
+                    f"Conversation-active executor '{conversation_active_executor_id}' "
+                    "is no longer assigned to this agent. Use switch_executor "
+                    "or /executor to choose a usable executor."
+                )
+            if target.row is None or not is_executor_row_usable(
+                target.row, policy, owner_email=executor_owner_email
+            ):
+                raise RuntimeError(
+                    f"Conversation-active executor '{conversation_active_executor_id}' "
+                    f"is not usable (state: {target.state.value})"
+                )
+            return _executor_config_from_row(
+                target.row,
+                executor_owner_email=executor_owner_email,
+                selection_source=(
+                    "conversation_active_primary"
+                    if target.is_primary
+                    else "conversation_active_additional"
+                ),
+            )
+
         if explicit_id:
+            # Explicit primary id is a single-row lookup — keep the legacy
+            # path (no pool resolution needed).
             row = await get_executor_row(
                 session,
                 str(explicit_id),
@@ -313,6 +376,24 @@ async def _resolve_eligible_executor_config(
                 raise RuntimeError(f"Executor '{explicit_id}' is not available to this user")
             if not is_executor_row_usable(row, policy, owner_email=executor_owner_email):
                 raise RuntimeError(f"Executor '{explicit_id}' is not active or allowed by policy")
+            # Persist as the conversation's initial active executor on first turn.
+            if isinstance(conversation_id, str) and conversation_id:
+                try:
+                    await initialize_conversation_active_executor(
+                        session, conversation_id, str(explicit_id)
+                    )
+                    commit = getattr(session, "commit", None)
+                    if callable(commit):
+                        await commit()
+                except Exception:
+                    rollback = getattr(session, "rollback", None)
+                    if callable(rollback):
+                        with contextlib.suppress(Exception):
+                            await rollback()
+                    logger.debug(
+                        "stage36: failed to persist initial active executor (explicit)",
+                        exc_info=True,
+                    )
             return _executor_config_from_row(
                 row,
                 executor_owner_email=executor_owner_email,
@@ -353,22 +434,44 @@ async def _resolve_eligible_executor_config(
                 selection_source="default",
             )
 
-        candidates = await list_executors(
-            session, owner_email=executor_owner_email, include_shared=True
-        )
+        # Stage 36: selector path. A primary selector matching N>=1 usable
+        # executors yields a primary set of size N; the controller picks
+        # one (preferring runtime_state==active over degraded, then sorted
+        # by id) and persists it as the conversation's initial active
+        # executor.
         assert isinstance(selector, dict)
-        matches = [
-            row
-            for row in candidates
-            if is_executor_row_usable(row, policy, owner_email=executor_owner_email)
-            and labels_match(row.labels, {str(k): str(v) for k, v in selector.items()})
-        ]
-        if len(matches) != 1:
+        pool = await resolve_executor_pool(
+            session_factory=session_factory,
+            agent_execution=execution,
+            user_email=user_email,
+            executor_owner_email=executor_owner_email,
+            policy=policy,
+        )
+        initial = pick_initial_active(pool)
+        if initial is None or initial.row is None:
+            usable_count = len(pool.usable_primaries())
             raise RuntimeError(
-                f"Executor selector for agent '{agent.agent_id}' matched {len(matches)} eligible executors"
+                f"Executor selector for agent '{agent.agent_id}' matched {usable_count} usable executors"
             )
+        if isinstance(conversation_id, str) and conversation_id:
+            try:
+                await initialize_conversation_active_executor(
+                    session, conversation_id, initial.executor_id
+                )
+                commit = getattr(session, "commit", None)
+                if callable(commit):
+                    await commit()
+            except Exception:
+                rollback = getattr(session, "rollback", None)
+                if callable(rollback):
+                    with contextlib.suppress(Exception):
+                        await rollback()
+                logger.debug(
+                    "stage36: failed to persist initial active executor (selector)",
+                    exc_info=True,
+                )
         return _executor_config_from_row(
-            matches[0],
+            initial.row,
             executor_owner_email=executor_owner_email,
             selection_source=selection_source,
         )
@@ -621,6 +724,7 @@ def build_step_runtime_factory(
         *,
         executor_agent: AgentDefinition | None = None,
         access_context: RuntimeAccessContext | None = None,
+        conversation_id: str | None = None,
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
@@ -633,12 +737,57 @@ def build_step_runtime_factory(
         if policy is None:
             raise RuntimeError("Executor policy unavailable; refusing to run agent tools")
         selection_source, hard_bound_executor = _agent_executor_binding(executor_agent)
+
+        # Stage 36: read conversation-level active_executor_id (if any) to
+        # pin the runtime to a previously-switched executor.
+        conversation_active_executor_id: str | None = None
+        if conversation_id and session_factory is not None:
+            from cognis.store.queries import get_conversation
+
+            try:
+                async with session_factory() as db_session:
+                    conv_row = await get_conversation(db_session, conversation_id)
+                    if conv_row is not None:
+                        conversation_active_executor_id = getattr(
+                            conv_row, "active_executor_id", None
+                        )
+            except Exception:
+                logger.debug(
+                    "stage36: failed to read conversation.active_executor_id",
+                    exc_info=True,
+                )
+
         executor_config = await _resolve_eligible_executor_config(
             providers,
             executor_agent,
             user_email,
             policy,
+            conversation_active_executor_id=conversation_active_executor_id,
+            conversation_id=conversation_id,
         )
+
+        # Stage 36: resolve the agent's full executor pool (primary + additional)
+        # so downstream code can route per-call to other assigned executors.
+        from cognis.core.executor_pool import resolve_executor_pool
+
+        executor_owner_email_for_pool = executor_config.get(
+            "executor_owner_email", user_email
+        )
+        try:
+            executor_pool_obj = await resolve_executor_pool(
+                session_factory=session_factory,
+                agent_execution=(
+                    executor_agent.execution
+                    if isinstance(executor_agent.execution, dict)
+                    else {}
+                ),
+                user_email=user_email,
+                executor_owner_email=executor_owner_email_for_pool,
+                policy=policy,
+            )
+        except Exception:
+            logger.debug("stage36: executor pool resolution failed", exc_info=True)
+            executor_pool_obj = None
 
         enabled_tools = executor_config.get("enabled_tools") if executor_config else None
         enabled_groups = executor_config.get("enabled_tool_groups") if executor_config else None
@@ -838,6 +987,8 @@ def build_step_runtime_factory(
                     tool_agent=tool_agent,
                     executor_agent=executor_agent,
                 ),
+                executor_pool=executor_pool_obj,
+                active_executor_id=executor_config.get("executor_id"),
             )
 
         if resolved_type in ("websocket", "subprocess"):
@@ -945,6 +1096,8 @@ def build_step_runtime_factory(
                             tool_agent=tool_agent,
                             executor_agent=executor_agent,
                         ),
+                        executor_pool=executor_pool_obj,
+                        active_executor_id=executor_id,
                     )
                 except Exception as exc:
                     message = f"Selected executor '{executor_id}' failed while listing tools"

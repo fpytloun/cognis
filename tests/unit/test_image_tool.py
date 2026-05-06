@@ -69,17 +69,16 @@ async def test_handle_image_tool_returns_channel_attachments() -> None:
     async def session_factory() -> object:
         yield _Session()
 
-    with scoped_runtime_context(user_email="user@example.com"):
-        with patch(
-            "cognis.tools.builtin.image.create_artifact_record", AsyncMock()
-        ) as create_record:
-            result = await handle_image_tool(
-                "image_generate",
-                {"prompt": "banner"},
-                provider,
-                artifact_store=artifact_store,
-                session_factory=session_factory,
-            )
+    with scoped_runtime_context(user_email="user@example.com"), patch(
+        "cognis.tools.builtin.image.create_artifact_record", AsyncMock()
+    ) as create_record:
+        result = await handle_image_tool(
+            "image_generate",
+            {"prompt": "banner"},
+            provider,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+        )
 
     payload = json.loads(result.output)
     assert payload["images"][0]["image_id"] == "img_123"
@@ -168,18 +167,17 @@ async def test_handle_image_tool_returns_error_when_artifact_registration_fails(
     async def session_factory() -> object:
         yield _Session()
 
-    with scoped_runtime_context(user_email="user@example.com"):
-        with patch(
-            "cognis.tools.builtin.image.create_artifact_record",
-            AsyncMock(side_effect=RuntimeError("db down")),
-        ):
-            result = await handle_image_tool(
-                "image_generate",
-                {"prompt": "banner"},
-                provider,
-                artifact_store=artifact_store,
-                session_factory=session_factory,
-            )
+    with scoped_runtime_context(user_email="user@example.com"), patch(
+        "cognis.tools.builtin.image.create_artifact_record",
+        AsyncMock(side_effect=RuntimeError("db down")),
+    ):
+        result = await handle_image_tool(
+            "image_generate",
+            {"prompt": "banner"},
+            provider,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+        )
 
     assert result.is_error
     assert "registration failed" in result.output.lower()

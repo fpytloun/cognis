@@ -17,6 +17,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     formStateToPayload,
     formStateToSystemOverridePayload,
     slugify,
+    type AdditionalExecutorEntry,
     type AgentFormState
   } from '$lib/agents';
   import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
@@ -527,6 +528,84 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <textarea bind:value={form.executorSelector} class="min-h-[72px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" placeholder="tier=standard&#10;location=local" disabled={readonly || !!form.executorId}></textarea>
             <span class="block text-xs text-slate-400">Used when no explicit executor is selected. Matches executor labels like Kubernetes selectors.</span>
           </label>
+        </div>
+
+        <!-- Stage 36: Additional executors (multi-executor agents) -->
+        <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
+          <div class="mb-2 flex items-center justify-between">
+            <div>
+              <p class="text-sm font-medium text-slate-200">Additional executors (optional)</p>
+              <p class="mt-1 text-xs text-slate-400">
+                Extra executors the agent can target via <code class="text-slate-300">target_executor</code>
+                or <code class="text-slate-300">switch_executor</code>. Never auto-selected by the controller.
+              </p>
+            </div>
+            <button
+              type="button"
+              class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-200 hover:bg-slate-800"
+              disabled={readonly}
+              onclick={() => {
+                form.additionalExecutors = [
+                  ...form.additionalExecutors,
+                  { executorId: '', executorSelector: '', description: '' }
+                ];
+              }}
+            >
+              Add
+            </button>
+          </div>
+          {#if form.additionalExecutors.length === 0}
+            <p class="text-xs text-slate-500">No additional executors configured.</p>
+          {/if}
+          {#each form.additionalExecutors as additional, idx (idx)}
+            <div class="mt-3 grid gap-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3 md:grid-cols-2">
+              <label class="space-y-1 text-xs font-medium text-slate-200">
+                <span>Executor</span>
+                <select
+                  bind:value={additional.executorId}
+                  class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-sm text-slate-100"
+                  disabled={readonly || !!additional.executorSelector.trim()}
+                >
+                  <option value="">— or use selector below —</option>
+                  {#each executors as executor}
+                    <option value={executor.executor_id}>{executor.name} ({executor.executor_type})</option>
+                  {/each}
+                </select>
+              </label>
+              <label class="space-y-1 text-xs font-medium text-slate-200">
+                <span>Selector (key=value, one per line)</span>
+                <textarea
+                  bind:value={additional.executorSelector}
+                  class="min-h-[60px] w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 font-mono text-xs text-slate-100"
+                  placeholder="role=browser&#10;loc=local"
+                  disabled={readonly || !!additional.executorId.trim()}
+                ></textarea>
+              </label>
+              <label class="space-y-1 text-xs font-medium text-slate-200 md:col-span-2">
+                <span>Description (optional)</span>
+                <input
+                  bind:value={additional.description}
+                  class="w-full rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-sm text-slate-100"
+                  placeholder="e.g. personal Mac for coding"
+                  disabled={readonly}
+                />
+              </label>
+              <div class="md:col-span-2">
+                <button
+                  type="button"
+                  class="rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-xs text-rose-200 hover:bg-rose-500/20"
+                  disabled={readonly}
+                  onclick={() => {
+                    form.additionalExecutors = form.additionalExecutors.filter(
+                      (_entry: AdditionalExecutorEntry, i: number) => i !== idx
+                    );
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          {/each}
         </div>
 
         <div class="grid gap-4 md:grid-cols-2">

@@ -16,12 +16,12 @@ from cognis.api.models import (
     ExecutorTokenResponse,
     ExecutorUpdateRequest,
 )
-from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.executor_policy import (
     ensure_executor_type_allowed,
     load_executor_policy,
     validate_executor_mcp_scope,
 )
+from cognis.core.executor_token_locks import executor_token_lock
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.store.models import ExecutorRow
 from cognis.store.queries import (
