@@ -160,9 +160,12 @@ textarea:focus-visible,
   background: transparent;
 }
 
+/* Code blocks inside the outgoing (sky-tinted) bubble use a deeper sky
+ * tone so the contrast holds without falling back to a slate slab that
+ * would clash with the bubble's blue. */
 .chat-markdown.prose-user pre {
-  background: rgb(2 6 23);
-  color: rgb(226 232 240);
+  background: rgb(8 47 73 / 0.85);
+  color: rgb(224 242 254);
 }
 
 .chat-markdown.prose-user pre code {

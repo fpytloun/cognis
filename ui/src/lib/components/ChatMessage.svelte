@@ -67,8 +67,12 @@
   });
 
   function bubbleClass(): string {
+    // Outgoing bubble uses a tonal sky-600 with a subtle border and light
+    // text instead of the previous vivid sky-500 + near-black text. The
+    // result is clearly an outgoing message but reads quietly against the
+    // slate-950 conversation surface, matching the rest of the chat style.
     return item.role === 'user'
-      ? 'ml-auto bg-sky-500 text-slate-950'
+      ? 'ml-auto bg-sky-600/90 text-slate-50 border border-sky-400/30'
       : item.role === 'assistant'
         ? 'bg-slate-900 text-slate-100 border border-slate-800'
         : 'bg-slate-800/70 text-slate-200 border border-slate-700';
@@ -76,7 +80,7 @@
 
   function proseClass(): string {
     return item.role === 'user'
-      ? 'prose-user prose-headings:text-slate-950 prose-p:text-slate-950 prose-strong:text-slate-950 prose-code:text-slate-800 prose-code:before:content-none prose-code:after:content-none prose-a:text-slate-900 prose-a:underline'
+      ? 'prose-user prose-headings:text-slate-50 prose-p:text-slate-50 prose-strong:text-white prose-code:text-sky-100 prose-code:before:content-none prose-code:after:content-none prose-a:text-sky-100 prose-a:underline'
       : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
   }
 
