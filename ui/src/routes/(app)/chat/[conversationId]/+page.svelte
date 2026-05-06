@@ -3632,9 +3632,16 @@ import X from 'lucide-svelte/icons/x';
             rounded-corner safe area does not become a large blank slab.
           -->
           <form class="shrink-0 space-y-2 border-t border-slate-800/60 px-3 pt-3 sm:space-y-3 sm:px-5 sm:pt-4" style="background: var(--app-bottom-chrome-bg); padding-bottom: var(--app-bottom-control-inset);" onsubmit={(event) => { event.preventDefault(); void handleSend(); }}>
-            <!-- Slash command suggestions dropdown -->
+            <!--
+              Slash command suggestions dropdown. Caps its height and scrolls
+              internally so a long match list cannot push the composer up
+              and force the timeline to reflow (the regression that read as
+              "the whole page including the header scrolls when typing /").
+              `overscroll-contain` keeps the gesture trapped inside the box
+              instead of bubbling to the timeline.
+            -->
             {#if slashSuggestionsVisible}
-              <div class="mb-1 rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
+              <div class="mb-1 max-h-[40vh] overflow-y-auto overscroll-contain rounded-xl border border-slate-700 bg-slate-900/95 py-1 text-sm shadow-lg">
                 {#each slashFilteredSuggestions as suggestion, i}
                   <button
                     class="flex w-full items-center gap-3 px-3 py-1.5 text-left text-xs transition {i === slashSelectedIndex ? 'bg-slate-700/60 text-slate-100' : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200'}"
