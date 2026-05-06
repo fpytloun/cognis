@@ -163,8 +163,39 @@ async def test_recall_truncates_oversized_query_payload() -> None:
     bounded_query = client.last_json["query"]
     assert isinstance(bounded_query, str)
     assert len(bounded_query) < len(long_query)
+    # Must stay within Mnemory's schema limit of 10_000 chars
+    assert len(bounded_query) <= 10_000
     assert "middle truncated" in bounded_query
     assert client.last_json["messages"] == [{"role": "user", "content": bounded_query}]
+
+
+@pytest.mark.asyncio
+async def test_recall_truncates_oversized_context_payload() -> None:
+    """context field is also capped to Mnemory's 10_000-char schema limit."""
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    client = _Client(
+        {
+            "session_id": "mem-existing",
+            "search_results": [],
+            "stats": {},
+        }
+    )
+    provider.client = client
+    long_context = "b" * 20_000
+
+    with scoped_runtime_context(user_email="user@example.com", agent_id="agent-1"):
+        await provider.recall(
+            query="hello",
+            session_id="mem-existing",
+            managed=True,
+            context=long_context,
+        )
+
+    assert client.last_json is not None
+    sent_context = client.last_json["context"]
+    assert isinstance(sent_context, str)
+    assert len(sent_context) < len(long_context)
+    assert len(sent_context) <= 10_000
 
 
 @pytest.mark.asyncio

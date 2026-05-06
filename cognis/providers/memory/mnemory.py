@@ -27,7 +27,10 @@ MNEMORY_SESSION_FORGED_TOTAL = Counter(
 
 T = TypeVar("T")
 
-_MAX_RECALL_QUERY_CHARS = 12_000
+# Mnemory's RecallRequest schema enforces max_length=10_000 on both
+# ``query`` and ``context``.  Keep a small safety margin below that limit
+# so we never hit a 422 Unprocessable Content from the server.
+_MAX_RECALL_QUERY_CHARS = 9_500
 
 
 def _truncate_recall_text(text: str) -> tuple[str, bool]:
@@ -175,6 +178,7 @@ class MnemoryProvider:
         instruction_mode: str | None = None,
     ) -> dict[str, Any]:
         bounded_query, query_truncated = _truncate_recall_text(query)
+        bounded_context, context_truncated = _truncate_recall_text(context or "")
         payload: dict[str, Any] = {
             "session_id": session_id,
             "query": bounded_query,
@@ -182,7 +186,7 @@ class MnemoryProvider:
             "include_instructions": include_instructions,
             "managed": managed,
             "search_mode": search_mode,
-            "context": context,
+            "context": bounded_context or None,
             "labels": labels or {},
             "ttl": 86400,
         }
@@ -196,6 +200,7 @@ class MnemoryProvider:
                     "search_mode": search_mode,
                     "query_len": len(query),
                     "query_truncated": query_truncated,
+                    "context_truncated": context_truncated,
                 }
             },
         )

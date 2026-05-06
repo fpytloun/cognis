@@ -648,8 +648,12 @@ async def test_context_assembler_adopts_forged_per_turn_mnemory_session_and_mark
 
 
 @pytest.mark.asyncio
-async def test_context_assembler_raises_on_mnemory_failure() -> None:
-    """Mnemory is a mandatory provider — failure must raise, not degrade."""
+async def test_context_assembler_degrades_on_mnemory_failure() -> None:
+    """Mnemory recall failure must degrade gracefully, not abort the turn.
+
+    The result should mark the assembly as degraded with source "memory",
+    include a visible system notice, and contain no recalled-memory block.
+    """
     assembler = ContextAssembler(
         memory=_Memory(fail=True),
         guardrails=_Guardrails(),
@@ -660,14 +664,28 @@ async def test_context_assembler_raises_on_mnemory_failure() -> None:
         compaction_threshold=0.85,
     )
 
-    with pytest.raises(RuntimeError, match="mnemory unavailable"):
-        await assembler.assemble(
-            session=_session(),
-            conversation=_conversation(),
-            agent=_agent(),
-            user_message="should fail",
-            tool_definitions=[],
-        )
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="should degrade",
+        tool_definitions=[],
+    )
+
+    assert result.degraded is True
+    assert "memory" in result.degraded_sources
+    assert result.system_notices
+    assert any("recall" in n.lower() or "memory" in n.lower() for n in result.system_notices)
+    # No mutable recalled-memories block (search results) should appear.
+    # The immutable prefix may still contain core_memories from the identity
+    # bootstrap, but the per-turn search-results block must be absent.
+    mutable_search_block_present = any(
+        isinstance(m.get("content"), str)
+        and "Recalled memories:" in m["content"]
+        and "memory_context" in m["content"]
+        for m in result.messages
+    )
+    assert not mutable_search_block_present
 
 
 @pytest.mark.asyncio

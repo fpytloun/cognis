@@ -2661,6 +2661,21 @@ class AgentLoop:
         messages = context_result.messages
         pending_audit_messages = list(getattr(context_result, "audit_messages", []) or [])
 
+        # Surface any degraded-context notices (e.g. recall failure) to the
+        # UI immediately so the user sees them before the LLM response arrives.
+        for _notice_text in getattr(context_result, "system_notices", []) or []:
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.SYSTEM_NOTICE,
+                    data={
+                        "conversation_id": ctx.conversation.conversation_id,
+                        "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
+                        "message": _notice_text,
+                    },
+                )
+            )
+
         def _queue_audit_message(*, role: str, source: str, content: str) -> None:
             self._append_pending_audit_message(
                 messages,

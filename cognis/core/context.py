@@ -109,6 +109,7 @@ class ContextAssemblyResult(BaseModel):
     audit_messages: list[dict[str, Any]] = Field(default_factory=list)
     degraded: bool = False
     degraded_sources: list[str] = Field(default_factory=list)
+    system_notices: list[str] = Field(default_factory=list)
     resolved_model: str
     static_tokens: int = 0
     dynamic_tokens: int = 0
@@ -561,15 +562,24 @@ class ContextAssembler:
                 recall_result, cache_result, intention_result = gathered_results
 
         degraded_sources: list[str] = []
+        system_notices: list[str] = []
 
-        # Mnemory is mandatory — raise if recall failed
+        # Mnemory recall is best-effort — a failure (e.g. 422 from an
+        # oversized payload that slipped past our cap, or a transient
+        # network error) must not abort the turn.  We degrade gracefully:
+        # continue with an empty recall payload and surface a visible
+        # system notice so the user knows memories were skipped.
         if isinstance(recall_result, Exception):
-            logger.error(
-                "context: Mnemory recall failed (mandatory provider)",
+            logger.warning(
+                "context: Mnemory recall failed (degraded, continuing without recalled memories)",
                 extra={"extra_data": {"session_id": session.session_id}},
                 exc_info=recall_result,
             )
-            raise recall_result
+            degraded_sources.append("memory")
+            system_notices.append(
+                "Memory recall failed for this turn; continuing without recalled memories."
+            )
+            recall_result = {"search_results": []}
 
         # Intaris event refresh is mandatory — raise if failed
         if isinstance(cache_result, Exception):
@@ -630,7 +640,8 @@ class ContextAssembler:
         # ----- Memory handling: split into immutable and mutable parts -----
         mutable_search_results: str | None = None
 
-        # recall_result is guaranteed to be a dict here (we raise on Exception above).
+        # recall_result is guaranteed to be a dict here (Exception branch above
+        # replaces it with an empty payload).
         recall_payload: dict[str, Any] = recall_result
         recall_session_id = str(recall_payload.get("session_id") or "").strip()
         if (
@@ -966,6 +977,7 @@ class ContextAssembler:
             audit_messages=audit_messages,
             degraded=bool(degraded_sources),
             degraded_sources=sorted(set(degraded_sources)),
+            system_notices=list(system_notices),
             resolved_model=resolved_model,
             static_tokens=static_tokens,
             dynamic_tokens=dynamic_tokens,
