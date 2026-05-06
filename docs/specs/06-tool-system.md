@@ -277,6 +277,7 @@ bash_tool = ToolDefinition(
             "description": {"type": "string", "description": "Brief description of what this does"},
             "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
             "workdir": {"type": "string", "description": "Working directory"},
+            "target_executor": {"type": "string", "description": "Optional assigned executor ID for this call"},
         },
         "required": ["command"],
     },
@@ -287,6 +288,36 @@ bash_tool = ToolDefinition(
     timeout_seconds=120,
 )
 ```
+
+### Multi-Executor Targeting
+
+Executor-routed tools may include an optional `target_executor` parameter. This
+parameter is consumed by the controller and stripped before the tool request is
+sent over JSON-RPC to the executor.
+
+Rules:
+
+- `target_executor` must be a real executor ID resolved from the agent's primary
+  or additional executor bindings. Aliases are not supported.
+- If `target_executor` is omitted, the call routes to the current active
+  executor.
+- If `target_executor` is present, only that call routes to the named executor;
+  the active executor does not change.
+- If the target executor is unavailable, the tool is not evaluated by Intaris
+  and no RPC is sent. The controller returns a factual error, for example:
+  `Target executor "infra-runner" is offline; tool was not executed.`
+- If the target executor is available but does not expose the requested tool,
+  the controller returns a tool error listing the executor state and available
+  assigned executors for that tool.
+- Guardrails evaluation includes the resolved target executor ID, primary vs.
+  additional membership, labels, runtime state, and environment snapshot when
+  available.
+
+When an executor-routed tool is exposed to the model, the controller augments
+the JSON schema with `target_executor` for tools that can run on more than one
+assigned executor. The underlying `ToolDefinition` remains executor-neutral so
+the same definition can be reused across in-process, subprocess, websocket, and
+compiled-lite executors.
 
 ### Web Tools
 
@@ -385,6 +416,51 @@ implemented sub-session orchestration tool today is `delegate`.
 
 These tools submit **requests** to the Decision Engine, which approves,
 modifies, or rejects them. The LLM cannot force delegation.
+
+### Built-in Executor Routing Tools
+
+Executor routing tools are controller-handled. They mutate turn-local runtime
+state and never execute on an executor.
+
+```python
+# switch_executor — Change the active executor for subsequent executor-routed tools
+switch_executor_tool = ToolDefinition(
+    name="switch_executor",
+    description=(
+        "Switch the active executor for subsequent executor-routed tool calls. "
+        "Use target_executor on individual tools for one-off execution instead."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target_executor": {"type": "string", "description": "Assigned executor ID"},
+            "reason": {"type": "string", "description": "Why this executor is needed"},
+        },
+        "required": ["target_executor"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+```
+
+`switch_executor` validation:
+
+- The target must be in the resolved primary or additional executor set for the
+  current agent.
+- The target must be usable: active DB status, `active` or `degraded` runtime
+  state, matching desired/applied config generation, ready connection for
+  remote executors, and at least one observed tool.
+- On success, the tool result includes the target executor's environment and
+  available tool summary.
+- On failure, the active executor is unchanged and the result states the target
+  executor's factual state. The result must not speculate about why the
+  executor is unavailable.
+- If the agent is active on a non-primary executor, Cognis injects a reminder to
+  switch back to a primary executor when the non-primary work is complete.
+- If the active non-primary executor becomes unavailable and the work requires
+  that executor, Cognis notifies the user and cancels the turn instead of
+  continuing on a different host.
 
 ## Built-in Task Inspection Tools
 
@@ -691,10 +767,19 @@ class ToolRouter:
                 arguments=tool_call.arguments,
             )
 
-        # Executor-native and local MCP → evaluate then execute on executor
-        decision = await self.evaluate_tool_call(tool_call, agent, session)
+        # Executor-native and local MCP → resolve target, evaluate, execute
+        target = await executor_pool.resolve_tool_target(tool_call, agent)
+        if not target.usable:
+            return ToolResult(
+                output=f'Target executor "{target.executor_id}" is {target.runtime_state}; tool was not executed.',
+                is_error=True,
+            )
+
+        decision = await self.evaluate_tool_call(
+            tool_call.without_controller_args(), agent, session, target_executor=target
+        )
         if decision.decision == "approve":
-            return await executor.tool_execute(tool_call)
+            return await target.connection.tool_execute(tool_call.without_controller_args())
         elif decision.decision == "deny":
             return ToolResult(denied=True, reasoning=decision.reasoning)
         elif decision.decision == "escalate":

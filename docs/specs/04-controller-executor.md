@@ -524,16 +524,117 @@ This keeps the controller free of platform-side connection state while
 allowing stateful platform-side services to live next to the executor
 controlled by the user.
 
+### Multi-Executor Agent Runtime
+
+Agents resolve to an executor pool instead of a single executor when their
+`execution` config includes additional executor bindings. The primary executor
+binding remains `execution.executor_id` or `execution.executor_selector`; any
+`execution.additional_executors` entries are secondary hands that the agent may
+use explicitly.
+
+```python
+class ResolvedExecutorTarget(BaseModel):
+    executor_id: str
+    executor_type: str
+    primary: bool
+    description: str | None = None
+    labels: dict[str, Any] = {}
+    runtime_state: str
+    connected: bool
+    ready: bool
+    usable: bool
+    unavailable_reason: str | None = None
+    observed_tools: list[ToolDefinition] = []
+    environment: ExecutorEnvironmentSnapshot | None = None
+
+
+class ResolvedExecutorPool(BaseModel):
+    primary_executor_ids: list[str]
+    active_executor_id: str
+    executors: dict[str, ResolvedExecutorTarget]
+```
+
+The controller owns the pool and active executor pointer. Executors do not know
+whether they are primary or additional; they only receive normal `tool.execute`
+RPCs. Runtime context and tool routing metadata carry the selected executor ID.
+
+#### Primary Executor Set
+
+- Explicit primary binding resolves to one primary executor.
+- Primary label selector may resolve to multiple primary executors; all usable
+  matches are valid primary execution targets.
+- If the current active executor is primary and usable, it remains active.
+- Otherwise the controller selects a usable primary executor by deterministic
+  ordering: `active` state before `degraded`, then `executor_id`.
+- If no primary executor is usable, the turn fails before model execution with a
+  clear user-visible error.
+
+#### Additional Executors
+
+- Additional bindings may be direct executor IDs or label selectors.
+- Selector bindings expand to all eligible matching executors.
+- Descriptions are included in context to explain why an executor exists, but
+  tool routing uses real executor IDs only.
+- Additional executors never become primary. If active execution is on an
+  additional executor, Cognis injects a reminder to switch back when the work
+  on that executor is complete.
+
+#### Executor Availability
+
+An executor is usable for switching and tool execution only when all of these
+are true:
+
+- DB `status == "active"`.
+- Runtime state is `active` or `degraded`.
+- Desired and applied config versions match.
+- Remote executors have a live ready WebSocket connection.
+- The requested tool is enabled and present in the executor's observed tool
+  inventory.
+- Deployment policy allows that executor type.
+
+Unavailable executors remain visible in context and UI with their factual state
+(`offline`, `stale`, `blocked`, `reconfiguring`, disconnected, policy-denied,
+or missing tool), but the controller does not dispatch tool calls to them.
+
+#### Active Executor Recovery
+
+The controller checks the active executor before each model cycle and before
+each executor-routed tool call. If the active executor is no longer usable:
+
+1. Switch back to a usable primary executor if one exists.
+2. Inject a hidden reminder explaining the forced switch and the previous
+   executor state.
+3. Continue only if the work can safely continue on the primary executor.
+4. If the failed executor is required for the requested work, notify the user
+   and cancel the turn instead of continuing on the wrong host.
+
+Reminder shape:
+
+```text
+<executor_context_reminder>
+The previously active executor "infra-runner" is no longer usable.
+Observed state: offline.
+The controller switched active execution back to primary executor "local-macbook".
+Continue only if the remaining work can safely run on the primary executor.
+If this work requires "infra-runner", notify the user and stop the turn.
+</executor_context_reminder>
+```
+
+The reminder must be factual. It must not speculate about why the executor is
+offline.
+
 ### Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
 | Executor fails to connect within 30s | Mark failed, retry spawn |
-| WebSocket disconnects during tool execution | Wait for reconnect (30s), then fail the tool call |
+| WebSocket disconnects during tool execution | Fail the tool call with executor state; do not retry on a different executor unless the agent explicitly requested a different target |
 | Tool exceeds timeout | Controller sends tool.cancel, waits 10s, force-kills |
 | Executor exceeds resource limits | Executor self-enforces and reports error |
 | Controller goes down (tool-only run) | Executor detects disconnect, exits cleanly |
 | Controller goes down (runtime-hosted run) | Executor keeps the runtime lease for a grace period, buffers events locally, then marks the run orphaned if the controller does not reclaim it |
+| Active additional executor goes offline before next model call | Switch to a usable primary executor, inject a factual reminder, and continue only if safe |
+| Required executor is offline or lacks the requested tool | Notify the user and cancel the turn; do not run the work on another host |
 
 ## Executor Implementations
 
@@ -604,21 +705,34 @@ Executors settings tab.
 
 ### Executor Selection
 
-Agent `execution` config specifies executor preferences:
+Agent `execution` config specifies primary and additional executor preferences:
 
 ```python
+class AgentExecutorBinding(BaseModel):
+    executor_id: str | None = None
+    executor_selector: dict[str, str] | None = None
+    description: str | None = None
+
+
 class AgentExecutionConfig(BaseModel):
-    executor_id: str | None = None         # Explicit executor
-    executor_selector: dict[str, str] = {} # Label matching
+    executor_id: str | None = None          # Primary explicit executor
+    executor_selector: dict[str, str] = {}  # Primary label matching
+    additional_executors: list[AgentExecutorBinding] = []
     timeout_seconds: int = 300
 ```
 
-Resolution order:
-1. If `executor_id` is set → use that specific executor
-2. If `executor_selector` is set → find executor matching all labels
-3. Else → use the default executor (`is_default=True`)
-4. Among matching executors, verify the required tool is enabled
-5. If no match → error: "No executor available for tool X"
+Resolution rules:
+
+1. If primary `executor_id` is set → add that executor to the primary set.
+2. If primary `executor_selector` is set → add all eligible matching executors
+   to the primary set.
+3. Expand `additional_executors` into the additional set by direct ID or label
+   selector.
+4. Remove duplicates; primary membership wins over additional membership.
+5. Mark every resolved executor with availability and observed tool inventory.
+6. Select an active primary executor; if none is usable, fail the turn.
+7. For each executor-routed tool call, route to `target_executor` when present,
+   otherwise to the active executor.
 
 ### Native Tool Dispatch
 

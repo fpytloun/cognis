@@ -154,6 +154,83 @@ Notes:
 - `execution.executor_id` binds an agent to a specific executor.
 - `execution.executor_selector` binds an agent by label match (k8s-style).
 
+### Multi-Executor Assignment
+
+Agents may use more than one executor. The existing `execution.executor_id` and
+`execution.executor_selector` fields remain the **primary executor binding**.
+Additional executor bindings extend the agent's reach to other machines without
+changing the default execution location.
+
+```python
+class AgentExecutorBinding(BaseModel):
+    executor_id: str | None = None
+    executor_selector: dict[str, str] | None = None
+    description: str | None = None
+
+
+class AgentExecutionConfig(BaseModel):
+    executor_id: str | None = None              # Primary explicit executor
+    executor_selector: dict[str, str] | None = None  # Primary label selector
+    additional_executors: list[AgentExecutorBinding] = []
+    timeout_seconds: int = 300
+```
+
+Primary binding rules:
+
+- `executor_id` resolves to exactly one primary executor.
+- `executor_selector` may resolve to multiple primary executors. This is valid;
+  all matching eligible executors form the primary executor set.
+- If both `executor_id` and `executor_selector` are present, validation rejects
+  the config to avoid ambiguous primary placement.
+- If neither is present, shared-agent fallback may still use a default executor
+  only where the sharing rules explicitly allow it. New agent configs should
+  prefer explicit primary binding.
+
+Additional binding rules:
+
+- Each additional binding uses either `executor_id` or `executor_selector`, not
+  both.
+- A selector may resolve to multiple additional executors.
+- The optional `description` is shown to the agent in context so it can decide
+  when that executor is appropriate, for example "Linux host with kubectl and
+  Terraform access".
+- Additional executors are only usable by ID after resolution; there is no alias
+  layer. Tool calls and executor switching use the real `executor_id`.
+
+Runtime behavior:
+
+- The active executor starts as a usable primary executor.
+- If multiple primary executors are usable, selection is deterministic: keep the
+  current primary if still usable, otherwise prefer `active`, then `degraded`,
+  then sort by `executor_id`.
+- The agent can call the controller-handled `switch_executor` tool to change
+  the active executor for subsequent executor-routed tool calls in the current
+  turn or workflow step.
+- Executor-native tools may accept `target_executor` to route a single call to
+  a specific assigned executor without changing the active executor.
+- If the active executor is not one of the resolved primary executors, Cognis
+  injects a hidden reminder instructing the agent to return to a primary
+  executor when the non-primary work is complete.
+
+Availability rules:
+
+- An executor is usable only when its DB `status` is `active`, its runtime state
+  is `active` or `degraded`, its desired and applied config versions match, and
+  a live ready connection exists for remote executors.
+- `degraded` executors may be used, but the routing metadata and context should
+  surface the degraded state.
+- `offline`, `stale`, `blocked`, `reconfiguring`, disconnected, or policy-denied
+  executors are not usable for switching or tool execution.
+- Switching to an unusable executor fails without changing the active executor.
+- Tool calls targeting an unusable executor fail before guardrails evaluation or
+  RPC dispatch with a factual state message, for example: `Target executor
+  "infra-runner" is offline; tool was not executed.`
+- If the active executor becomes unusable mid-turn, Cognis switches back to a
+  usable primary executor and injects a reminder explaining the forced switch.
+  If the unavailable executor is required for the current work and no usable
+  equivalent exists, Cognis notifies the user and cancels the turn rather than
+  continuing on the wrong host.
+
 ### Permissions
 
 ```python

@@ -111,6 +111,8 @@ bring the codebase in line with the updated specs.
 | 33 | [Projects, Step Metadata Gating, and Human-as-Evaluator Revisions](stage-33-projects-and-revisions.md) | DONE | Projects with multi-source repos and shareable grants, project-aware tasks/schedules/conversations, project-bound workflow eligibility, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, human-driven revisions with classifier-selected re-entry steps and preserved step-run history |
 | 34 | [Voice Mode (TTS, STT, Conversation Mode)](stage-34-voice-mode.md) | DONE | `LLMProvider.synthesize()` and executor routing, `text_to_speech` model routing slot, `tts_cache` table, `POST /api/v1/tts/synthesize` and `POST /api/v1/stt/transcribe`, per-agent voice with system fallback, speaker button on assistant messages, web microphone with iMessage-style record-preview-send (STT-first), sentence-buffered TTS streaming, and bidirectional conversation-mode overlay |
 | 35 | [Conversation Search](stage-35-conversation-search.md) | PLANNED | Intaris-owned hybrid search: lexical Tier 1 (PG `tsvector` + `pg_trgm`, SQLite FTS5 trigram) mandatory, vector Tier 2 (pgvector / Qdrant URL or local-mode) optional, outbox-backed indexer, `INTARIS_SEARCH_ENABLED` feature flag (default `true`), `/api/v1/search/*` endpoints + Intaris UI. Cognis proxy + join with `conversations`, in-conversation Cmd+F with magnifier and client-first/server-fallback, sidebar promote-to-search with explicit submit, three LLM tools (`list_conversations`, `search_conversations`, `read_conversation_messages` with anchor-based pagination), `conversation_id` propagated through `RuntimeAccessContext` and tool runtime metadata, strict user scoping (no admin bypass, no agent-grant expansion). |
+| 36 | [Multi-Executor Agents](stage-36-multi-executor-agents.md) | PLANNED | Agents keep one primary direct/label executor binding and may add secondary executor bindings. Tool calls can use `target_executor`, agents can call `switch_executor`, active secondary executor loss switches back to primary with factual reminders, and required offline executors notify the user and cancel the turn. |
+| 37 | [Separate Executor Package and Portable Lite Binary](stage-37-portable-executor.md) | PLANNED | Split executor install surface from controller, keep normal Python/Docker installation, add a tiny Nuitka-built lite binary for shell/filesystem/search remote hands without browser/LSP/LLM/channel/PDF/controller machinery. |
 
 ## Scope Boundary
 
@@ -138,6 +140,12 @@ Intaris and Cognis. The bulk of the work (35.1–35.5) lands in Intaris and
 can be reviewed without Cognis. The Cognis-side phases (35.6–35.8) can be
 drafted in parallel once the Intaris API shape is stable. All phases are
 individually mergeable.
+
+Stage 36 should land before Stage 37 because portable lite executors are most
+useful when agents can bind additional remote hands without replacing their
+primary executor. Stage 37 then reduces the installation friction for those
+additional executors while keeping the full Docker executor available for
+browser, LSP, and toolchain-heavy workloads.
 
 **Still out of scope / not yet shipped**: multi-user production hardening,
 Docker/K8s executors, A2A federation, cost tracking dashboard,
