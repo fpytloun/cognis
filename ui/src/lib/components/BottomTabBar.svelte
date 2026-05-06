@@ -95,7 +95,7 @@
   <nav
     bind:this={navEl}
     class="fixed inset-x-0 bottom-0 z-[60] border-t border-slate-800/80 bg-slate-950/95 backdrop-blur lg:hidden"
-    style="padding-left: env(safe-area-inset-left, 0); padding-right: env(safe-area-inset-right, 0);"
+    style="padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);"
     aria-label="Primary"
   >
     <ul class="grid grid-cols-5">

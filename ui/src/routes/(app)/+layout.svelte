@@ -369,7 +369,7 @@ import X from 'lucide-svelte/icons/x';
 </svelte:head>
 
 {#if !bootstrapped || $auth.status === 'loading'}
-  <div class="mx-auto flex min-h-[100dvh] max-w-5xl items-center justify-center px-6 py-16">
+  <div class="app-fullscreen-safe mx-auto flex max-w-5xl items-center justify-center">
     <LoadingState label="Loading workspace" description="Restoring your Cognis session and preparing the UI shell." />
   </div>
 {:else}

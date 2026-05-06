@@ -27,6 +27,7 @@ const root = resolve(__dirname, '..');
 const staticDir = resolve(root, 'static');
 const outDir = resolve(staticDir, 'pwa');
 const sourceLogo = resolve(root, '..', 'Logo.JPG');
+const fallbackLogo = resolve(outDir, 'icon-512.png');
 
 const BG = { r: 4, g: 12, b: 15 };
 
@@ -75,7 +76,9 @@ const splashTargets = [
   { name: 'apple-splash-2048-2732.png', w: 2048, h: 2732 }, // 12.9" iPad Pro
   { name: 'apple-splash-1668-2388.png', w: 1668, h: 2388 }, // 11" iPad Pro
   { name: 'apple-splash-1536-2048.png', w: 1536, h: 2048 }, // 9.7" iPad
+  { name: 'apple-splash-1320-2868.png', w: 1320, h: 2868 }, // iPhone 16 Pro Max
   { name: 'apple-splash-1290-2796.png', w: 1290, h: 2796 }, // iPhone 14 Pro Max
+  { name: 'apple-splash-1206-2622.png', w: 1206, h: 2622 }, // iPhone 16 Pro
   { name: 'apple-splash-1179-2556.png', w: 1179, h: 2556 }, // iPhone 14 Pro
   { name: 'apple-splash-1170-2532.png', w: 1170, h: 2532 }, // iPhone 13/14
   { name: 'apple-splash-1125-2436.png', w: 1125, h: 2436 }, // iPhone X/11/12/13 mini
@@ -93,15 +96,22 @@ async function main() {
     return;
   }
 
-  if (!existsSync(sourceLogo)) {
-    console.error('[pwa-assets] source logo missing at', sourceLogo);
-    process.exit(1);
+  let logoPath = sourceLogo;
+  let logoMime = 'image/jpeg';
+  if (!existsSync(logoPath)) {
+    if (!existsSync(fallbackLogo)) {
+      console.error('[pwa-assets] source logo missing at', sourceLogo);
+      process.exit(1);
+    }
+    logoPath = fallbackLogo;
+    logoMime = 'image/png';
+    console.warn('[pwa-assets] source logo missing; using existing icon fallback.');
   }
   mkdirSync(staticDir, { recursive: true });
   mkdirSync(outDir, { recursive: true });
 
-  const logoBuffer = readFileSync(sourceLogo);
-  const logoDataUri = `data:image/jpeg;base64,${logoBuffer.toString('base64')}`;
+  const logoBuffer = readFileSync(logoPath);
+  const logoDataUri = `data:${logoMime};base64,${logoBuffer.toString('base64')}`;
   const svgWrapper = makeRasterSvg(logoDataUri);
   writeFileSync(resolve(staticDir, 'favicon.svg'), svgWrapper);
   writeFileSync(resolve(outDir, 'icon.svg'), svgWrapper);

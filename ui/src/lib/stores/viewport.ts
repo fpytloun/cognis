@@ -36,23 +36,41 @@ interface ViewportMetrics {
   keyboardOpen: boolean;
 }
 
+export interface ViewportInput {
+  innerHeight: number;
+  visualViewportHeight?: number;
+  visualViewportOffsetTop?: number;
+}
+
+export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics {
+  const innerHeight = Math.max(0, input.innerHeight);
+  const visualHeight = input.visualViewportHeight ?? innerHeight;
+  const visualOffsetTop = input.visualViewportOffsetTop ?? 0;
+  const keyboardOverlap = innerHeight - (visualOffsetTop + visualHeight);
+  const keyboardOpen = keyboardOverlap > 80;
+  const height = keyboardOpen ? visualHeight : innerHeight;
+  const offsetTop = keyboardOpen ? visualOffsetTop : 0;
+  return {
+    height: Math.max(0, height),
+    offsetTop: Math.max(0, offsetTop),
+    keyboardOpen,
+  };
+}
+
 function readViewportMetrics(): ViewportMetrics {
   if (typeof window === 'undefined') {
     return { height: 0, offsetTop: 0, keyboardOpen: false };
   }
   const vv = window.visualViewport;
-  // Use the visible *height* of the viewport (not offsetTop + height) so the
-  // shell is sized to the area above the keyboard. `offsetTop` is published
-  // separately so the shell can shift down when iOS moves the visual
-  // viewport to keep a focused input visible.
-  const height = vv ? vv.height : window.innerHeight;
-  const offsetTop = vv ? vv.offsetTop : 0;
-  const keyboardOverlap = vv ? window.innerHeight - (offsetTop + height) : 0;
-  return {
-    height: Math.max(0, height),
-    offsetTop: Math.max(0, offsetTop),
-    keyboardOpen: keyboardOverlap > 80,
-  };
+  // When the keyboard is closed, the shell must paint the full layout
+  // viewport, including iOS rounded-corner/home-indicator areas. Only switch
+  // to visualViewport sizing while the keyboard is actually reducing the
+  // usable area.
+  return calculateViewportMetrics({
+    innerHeight: window.innerHeight,
+    visualViewportHeight: vv?.height,
+    visualViewportOffsetTop: vv?.offsetTop,
+  });
 }
 
 function syncViewportVariables(metrics = readViewportMetrics()): void {

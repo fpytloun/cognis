@@ -17,6 +17,6 @@
   <title>Cognis</title>
 </svelte:head>
 
-<div class="mx-auto flex min-h-[100dvh] max-w-5xl items-center justify-center overflow-y-auto px-6 py-16" style="padding-left: max(1.5rem, env(safe-area-inset-left)); padding-right: max(1.5rem, env(safe-area-inset-right)); padding-top: calc(env(safe-area-inset-top) + 2rem); padding-bottom: calc(env(safe-area-inset-bottom) + 2rem);">
+<div class="app-fullscreen-safe mx-auto flex max-w-5xl items-center justify-center overflow-y-auto">
   <LoadingState label="Opening Cognis" description="Checking your session and routing you to the right workspace." />
 </div>

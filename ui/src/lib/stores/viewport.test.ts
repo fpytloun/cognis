@@ -1,7 +1,7 @@
 import { get } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isMobile, isTouch } from './viewport';
+import { calculateViewportMetrics, isMobile, isTouch } from './viewport';
 
 describe('viewport stores', () => {
   const originalInnerWidth = window.innerWidth;
@@ -49,5 +49,25 @@ describe('viewport stores', () => {
       onchange: null
     })) as unknown as typeof window.matchMedia;
     expect(isTouch()).toBe(true);
+  });
+
+  it('uses layout viewport height when visual viewport only differs by safe area', () => {
+    expect(
+      calculateViewportMetrics({
+        innerHeight: 874,
+        visualViewportHeight: 840,
+        visualViewportOffsetTop: 0,
+      })
+    ).toEqual({ height: 874, offsetTop: 0, keyboardOpen: false });
+  });
+
+  it('uses visual viewport height and offset while keyboard is open', () => {
+    expect(
+      calculateViewportMetrics({
+        innerHeight: 874,
+        visualViewportHeight: 520,
+        visualViewportOffsetTop: 16,
+      })
+    ).toEqual({ height: 520, offsetTop: 16, keyboardOpen: true });
   });
 });

@@ -16,7 +16,7 @@
   <title>Application Error · Cognis</title>
 </svelte:head>
 
-<div class="flex min-h-[100dvh] items-center justify-center overflow-y-auto px-6 py-16" style="padding-left: max(1.5rem, env(safe-area-inset-left)); padding-right: max(1.5rem, env(safe-area-inset-right)); padding-top: calc(env(safe-area-inset-top) + 2rem); padding-bottom: calc(env(safe-area-inset-bottom) + 2rem);">
+<div class="app-fullscreen-safe flex items-center justify-center overflow-y-auto">
   <div class="w-full max-w-xl rounded-3xl border border-rose-500/30 bg-slate-900/90 p-8 shadow-card backdrop-blur">
     <p class="text-sm font-medium uppercase tracking-[0.3em] text-rose-300">Error {status}</p>
     <h1 class="mt-3 text-3xl font-semibold text-white">Something went wrong</h1>
