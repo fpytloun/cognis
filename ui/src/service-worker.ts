@@ -203,15 +203,25 @@ sw.addEventListener('pushsubscriptionchange', (event) => {
   );
 });
 
-async function hasVisibleClientFor(pathname: string): Promise<boolean> {
+function conversationPath(conversationId: string | undefined): string | null {
+  if (!conversationId) return null;
+  return `/chat/${encodeURIComponent(conversationId)}`;
+}
+
+function isForegroundClient(client: WindowClient): boolean {
+  return client.focused || client.visibilityState === 'visible';
+}
+
+async function hasForegroundClientFor(target: URL, conversationId: string | undefined): Promise<boolean> {
+  const targetConversationPath = conversationPath(conversationId);
   const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
   return clients.some((client) => {
     const windowClient = client as WindowClient;
     try {
       const url = new URL(windowClient.url);
-      return url.origin === sw.location.origin
-        && url.pathname === pathname
-        && windowClient.visibilityState === 'visible';
+      if (url.origin !== sw.location.origin || !isForegroundClient(windowClient)) return false;
+      return url.pathname === target.pathname
+        || (targetConversationPath !== null && url.pathname === targetConversationPath);
     } catch {
       return false;
     }
@@ -223,7 +233,7 @@ sw.addEventListener('push', (event) => {
   event.waitUntil(
     (async () => {
       const target = new URL(payload.url || '/chat', sw.location.origin);
-      if (await hasVisibleClientFor(target.pathname)) return;
+      if (await hasForegroundClientFor(target, payload.conversation_id)) return;
       await sw.registration.showNotification(payload.title || 'Cognis', {
         body: payload.body || 'Cognis needs your attention.',
         icon: notificationIcon(payload.icon),
