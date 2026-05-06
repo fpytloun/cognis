@@ -1997,9 +1997,14 @@ import { onMount, tick } from 'svelte';
 {:else}
   <section class="space-y-5">
     <div bind:this={settingsPanelAnchor}></div>
-    <!-- Mobile: horizontally scrollable pill strip. Desktop: flex-wrap.
-         Previously 9 buttons wrapped to 3 lines on phones. -->
-    <div class="sticky top-0 z-10 -mx-2 overflow-x-auto border-b border-slate-800/80 bg-slate-950/95 px-2 py-1 backdrop-blur sm:mx-0 sm:px-0 md:hidden">
+    <!--
+      Mobile: horizontally scrollable pill strip rendered in normal flow
+      (not sticky/backdrop-blur), so it sits directly under the page
+      header and scrolls with the rest of the content. Sticky + blur
+      previously made it read as a detached floating bar.
+      Desktop: flex-wrap row.
+    -->
+    <div class="-mx-2 overflow-x-auto px-2 md:hidden">
       <div bind:this={mobileTabListEl} class="flex gap-2 pb-1" role="tablist" aria-label="Settings sections">
         {#each tabs as tab}
           <Button
@@ -2290,8 +2295,13 @@ import { onMount, tick } from 'svelte';
             </button>
           {/if}
 
-          <!-- Actions -->
-          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4 pb-20 md:pb-0">
+          <!--
+            Action row lives inside the editor card on all viewports. The
+            previous mobile-only fixed bottom action bar hovered over the
+            page tab nav and read as detached chrome; an inline row keeps
+            the buttons next to the form they belong to.
+          -->
+          <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
             <Button onclick={saveProvider} disabled={!isAdmin || busy}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
             <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
             {#if selectedProviderId}
@@ -2314,19 +2324,6 @@ import { onMount, tick } from 'svelte';
         </Card>
         </div>
       </div>
-      {#if isAdmin}
-        <div
-          class="fixed inset-x-0 z-30 border-t border-slate-800/80 bg-slate-950/95 px-3 py-2 backdrop-blur md:hidden"
-          style="bottom: var(--app-shell-bottom-offset, 0px);"
-        >
-          <div class="flex items-center gap-2">
-            <Button class="flex-1 justify-center" onclick={saveProvider} disabled={!isAdmin || busy}>
-              {selectedProviderId ? 'Save provider' : 'Create provider'}
-            </Button>
-            <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
-          </div>
-        </div>
-      {/if}
     {:else if activeTab === 'routing'}
       <Card class="p-5">
         <div class="flex items-center justify-between gap-3">
