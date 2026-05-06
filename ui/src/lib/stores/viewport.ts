@@ -47,17 +47,15 @@ export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics 
   const visualHeight = input.visualViewportHeight ?? innerHeight;
   const visualOffsetTop = input.visualViewportOffsetTop ?? 0;
   const keyboardOverlap = innerHeight - (visualOffsetTop + visualHeight);
-  // Two ways the on-screen keyboard manifests:
-  //   1. Overlay mode (default iOS Safari/PWA): innerHeight stays at the full
-  //      layout viewport while visualViewport.height shrinks, producing a
-  //      significant keyboardOverlap.
-  //   2. iOS may also push the visual viewport down (offsetTop > 0) when an
-  //      input gains focus, even with `interactive-widget=resizes-content`.
-  //      Body has `position: fixed; overflow: hidden`, so we cannot scroll the
-  //      document; we must mirror that visualViewport offset in the shell or
-  //      the chat composer ends up below the visible area, producing the
-  //      "everything scrolls when keyboard opens" regression.
-  const keyboardOpen = keyboardOverlap > 80 || visualOffsetTop > 0;
+  // The on-screen keyboard manifests as overlay mode in iOS PWA standalone:
+  // window.innerHeight stays at the full layout viewport while
+  // visualViewport.height shrinks by roughly the keyboard height. We do NOT
+  // treat a positive visualOffsetTop alone as keyboard-open: iOS uses the
+  // same mechanism to centre a focused input even with no keyboard overlap,
+  // and reacting to it would push the app shell down past the fixed mobile
+  // header on non-chat routes (visible "top bounces" regression on Projects,
+  // Tasks, Settings when an input gains focus).
+  const keyboardOpen = keyboardOverlap > 80;
   const height = keyboardOpen ? visualHeight : innerHeight;
   const offsetTop = keyboardOpen ? visualOffsetTop : 0;
   return {

@@ -71,18 +71,19 @@ describe('viewport stores', () => {
     ).toEqual({ height: 520, offsetTop: 16, keyboardOpen: true });
   });
 
-  it('detects keyboard via visual viewport offset alone (resize-content scroll)', () => {
-    // iOS may push the visual viewport down on input focus even when the
-    // overall overlap is small (e.g. the layout viewport shrunk via
-    // `interactive-widget=resizes-content` but iOS still scrolled the visual
-    // viewport to expose the input). The shell must mirror that offset, or
-    // the chat composer ends up below the visible area.
+  it('does not treat visual viewport offset alone as keyboard open', () => {
+    // iOS may push the visual viewport down to centre a focused input on
+    // pages with no keyboard overlap (e.g. Projects, Tasks, Settings). If we
+    // marked that as keyboard-open the app shell would jump to top: offsetTop
+    // and detach from the fixed mobile header at top: 0 of the viewport,
+    // producing a "top bounces" regression. Only a real overlap (keyboard
+    // covering the bottom of the layout viewport) counts.
     expect(
       calculateViewportMetrics({
         innerHeight: 700,
         visualViewportHeight: 700,
         visualViewportOffsetTop: 200,
       })
-    ).toEqual({ height: 700, offsetTop: 200, keyboardOpen: true });
+    ).toEqual({ height: 700, offsetTop: 0, keyboardOpen: false });
   });
 });
