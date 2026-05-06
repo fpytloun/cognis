@@ -114,14 +114,20 @@ def _validate_py_vapid_key(private_key_pem: str) -> str | None:
     """Return a reason when py_vapid cannot load the resolved private key."""
 
     try:
-        from py_vapid import Vapid01
-    except Exception as exc:
-        return f"py_vapid unavailable: {type(exc).__name__}"
-    try:
-        Vapid01.from_pem(private_key_pem.encode("utf-8"))
+        _load_py_vapid_key(private_key_pem)
     except Exception as exc:
         return f"VAPID key cannot be loaded by py_vapid: {type(exc).__name__}: {exc}"
     return None
+
+
+def _load_py_vapid_key(private_key_pem: str) -> Any:
+    """Load a VAPID object for pywebpush; PEM strings are not accepted by webpush()."""
+
+    try:
+        from py_vapid import Vapid
+    except Exception as exc:
+        raise RuntimeError(f"py_vapid unavailable: {type(exc).__name__}") from exc
+    return Vapid.from_pem(private_key_pem.encode("utf-8"))
 
 
 def _endpoint_host(endpoint: str) -> str:
@@ -343,6 +349,12 @@ class WebPushService:
     ) -> None:
         self._session_factory = session_factory
         self._config = config
+        self._vapid_key: Any | None = None
+        if config.enabled:
+            try:
+                self._vapid_key = _load_py_vapid_key(config.private_key)
+            except Exception:
+                logger.exception("web_push: failed to load VAPID key for delivery")
         self._pending_tasks: set[asyncio.Task[dict[str, int]]] = set()
         event_bus.subscribe(EventType.TURN_COMPLETED, self._handle_event)
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_event)
@@ -631,6 +643,9 @@ class WebPushService:
         except Exception as exc:
             return "error", f"pywebpush unavailable: {type(exc).__name__}"
 
+        if self._vapid_key is None:
+            return "error", "VAPID key unavailable"
+
         try:
             webpush(
                 subscription_info={
@@ -638,7 +653,7 @@ class WebPushService:
                     "keys": {"p256dh": row.p256dh, "auth": row.auth},
                 },
                 data=payload,
-                vapid_private_key=self._config.private_key,
+                vapid_private_key=self._vapid_key,
                 vapid_claims={"sub": self._config.subject},
                 timeout=_PUSH_SEND_TIMEOUT_SECONDS,
                 ttl=60,

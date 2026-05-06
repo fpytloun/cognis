@@ -157,3 +157,36 @@ def test_send_one_clears_last_error_after_success(
 
     assert response.status_code == 200
     assert response.json()["last_error"] is None
+
+
+def test_send_sync_passes_loaded_vapid_key_to_pywebpush(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
+    monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
+    captured: dict[str, object] = {}
+
+    def _fake_webpush(**kwargs: object) -> None:
+        captured["vapid_private_key"] = kwargs.get("vapid_private_key")
+
+    monkeypatch.setattr("pywebpush.webpush", _fake_webpush)  # type: ignore[attr-defined]
+
+    with TestClient(create_app()) as client:
+        from py_vapid import Vapid01
+
+        row = PushSubscriptionRow(
+            subscription_id="push_object_key",
+            user_email="user@example.com",
+            endpoint="https://fcm.googleapis.com/fcm/send/sub-object-key",
+            p256dh="p256dh-key",
+            auth="auth-key",
+            enabled=True,
+        )
+
+        status, error = client.app.state.web_push_service._send_sync(row, "{}")
+
+    assert status == "sent"
+    assert error is None
+    assert isinstance(captured["vapid_private_key"], Vapid01)
+    assert not isinstance(captured["vapid_private_key"], str)
