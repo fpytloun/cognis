@@ -148,11 +148,16 @@ _INTARIS_MAX_RECOVERY_WAIT_SECONDS = 60.0
 
 
 def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) -> str:
-    if content.strip():
-        return content
-    if not attachments:
-        return content
-    return "User attached files."
+    """Return the content to persist for a user message event.
+
+    The original content is always preserved as-is so that attachment-only
+    messages record an empty string instead of a synthetic placeholder.  The
+    UI optimistic-bubble deduplication relies on the persisted/broadcast
+    content matching the content the user actually typed (empty string when
+    only files were attached).  Placeholder text for the LLM context is
+    injected separately during prompt assembly.
+    """
+    return content
 
 
 def _indent_block(text: str, *, prefix: str = "    ") -> list[str]:
@@ -3378,13 +3383,17 @@ class AgentLoop:
 
             current_assistant_message_index: int | None = None
 
-            # Record assistant message
+            # Record assistant message.
+            # turn_id is included so that multiple assistant_message events within
+            # the same turn are merged into one bubble during history replay
+            # (matching the live-WS experience driven by message_complete).
             if content or pending_assistant_attachments:
                 events_to_record.append(
                     SessionEvent(
                         type="assistant_message",
                         data={
                             "content": content,
+                            "turn_id": ctx.turn_id,
                             "attachments": strip_attachment_payload_bytes(
                                 pending_assistant_attachments
                             ),
@@ -8417,7 +8426,10 @@ class AgentLoop:
             return
 
         recorded_user_message = _user_message_for_recording(content, attachments)
-        if recorded_user_message:
+        # Record if there is text content OR if the user only sent attachments
+        # (attachment-only messages have content="" which is falsy but still need
+        # to be persisted so the history and WS events are faithful to what was sent).
+        if recorded_user_message or attachments:
             await self._record_events_strict(
                 ctx,
                 [
@@ -8986,9 +8998,31 @@ class AgentLoop:
                 file_diffs or None,
             )
         if normalized_result_attachments:
-            normalized_attachments = normalized_result_attachments
-            collected_attachments.extend(normalized_attachments)
-            pending_assistant_attachments.extend(normalized_attachments)
+            # Deduplicate by artifact_id against what the user already sent and what
+            # has been collected earlier in this turn.  This prevents artifact_get_url
+            # and similar tools from echoing an artifact that the user originally
+            # uploaded, while still allowing brand-new artifacts (image_generate,
+            # document_generate, artifact_publish on a freshly-created file) to be
+            # promoted to the assistant message bubble.
+            seen_ids: set[str] = {
+                str(a.artifact_id)
+                for a in ctx.user_attachments
+                if getattr(a, "artifact_id", None)
+            }
+            seen_ids.update(
+                str(a.get("artifact_id", ""))
+                for a in collected_attachments
+                if isinstance(a, dict) and a.get("artifact_id")
+            )
+            new_result_attachments = [
+                a
+                for a in normalized_result_attachments
+                if not (isinstance(a, dict) and str(a.get("artifact_id", "")) in seen_ids)
+            ]
+            # Always track in collected_attachments (used for step_output.attachments and
+            # message_complete WS event) but only promote NEW artifacts to the message.
+            collected_attachments.extend(normalized_result_attachments)
+            pending_assistant_attachments.extend(new_result_attachments)
         activation_notice: str | None = None
         if result.metadata:
             self._merge_promoted_tool_ids(promoted_tool_ids, result.metadata)

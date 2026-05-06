@@ -1590,7 +1590,9 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
         event for event in observed if getattr(event, "type", None) == EventType.USER_MESSAGE
     ]
     assert len(user_events) == 1
-    assert user_events[0].data["content"] == "User attached an audio file."
+    # The server now broadcasts the raw (empty) content for attachment-only messages
+    # so the UI optimistic-bubble deduplication can match it directly.
+    assert user_events[0].data["content"] == ""
 
 
 @pytest.mark.asyncio

@@ -526,13 +526,16 @@ class TurnScheduler:
         if attachment_error is not None:
             return attachment_error
 
-        effective_content = _effective_user_content(content, normalized_attachments)
+        # Used ONLY for conversation bootstrapping (title generation, intention bootstrap).
+        # All other paths use the raw content so that attachment-only messages record and
+        # broadcast an empty string, which the UI optimistic-bubble deduplication expects.
+        bootstrap_content = _effective_user_content(content, normalized_attachments)
 
         # Load conversation runtime only after validating attachments so
         # failed first sends do not bootstrap a session unnecessarily.
         try:
             runtime = await self._load_conversation_runtime(
-                conversation_id, user_message=effective_content
+                conversation_id, user_message=bootstrap_content
             )
         except SessionCreationFailedError:
             return TurnError(
@@ -606,7 +609,7 @@ class TurnScheduler:
                 queue.append(
                     _QueuedMessage(
                         queue_id=self._new_queue_id(),
-                        content=effective_content,
+                        content=content,
                         user_email=user_email,
                         client_message_id=client_message_id,
                         attachments=[
@@ -684,7 +687,7 @@ class TurnScheduler:
             queue.append(
                 _QueuedMessage(
                     queue_id=self._new_queue_id(),
-                    content=effective_content,
+                    content=content,
                     user_email=user_email,
                     client_message_id=client_message_id,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
@@ -725,7 +728,7 @@ class TurnScheduler:
             conversation=conversation,
             session=session,
             agent=agent,
-            content=effective_content,
+            content=content,
             user_email=user_email,
             attachments=normalized_attachments,
             outbound_attachments=outbound_attachments,
@@ -1530,14 +1533,13 @@ class TurnScheduler:
             # conversation see channel-originated messages in real time
             # (without waiting for a page refresh / history reload).
             if not system_initiated:
-                published_user_content = _effective_user_content(content, attachments or [])
                 await self._event_bus.publish(
                     Event(
                         type=EventType.USER_MESSAGE,
                         data={
                             "conversation_id": conversation_id,
                             "session_id": session.session_id,
-                            "content": published_user_content,
+                            "content": content,
                             "turn_id": turn_id,
                             "attachments": [
                                 item.model_dump(mode="json") for item in (attachments or [])

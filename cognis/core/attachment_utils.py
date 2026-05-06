@@ -224,6 +224,9 @@ def attachment_placeholder_text(kinds: Iterable[ArtifactKind | str]) -> str:
     if len(normalized) != 1:
         return "User attached files."
     kind = normalized[0]
+    # ArtifactKind.FILE has value "file" which would produce "a file file." — handle separately.
+    if kind == ArtifactKind.FILE:
+        return "User attached a file."
     article = "an" if kind in {ArtifactKind.AUDIO, ArtifactKind.IMAGE} else "a"
     return f"User attached {article} {kind.value} file."
 

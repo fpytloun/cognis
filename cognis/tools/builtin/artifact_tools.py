@@ -576,10 +576,14 @@ async def _handle_artifact_get_url(
         )
 
     item = _artifact_url_item(row, url=url, ttl_seconds=ttl_seconds)
+    # artifact_get_url returns a signed URL for the artifact.  The LLM and the
+    # tool-call block UI already have the URL from the JSON output; returning the
+    # artifact as an attachment would echo a file the user already uploaded into the
+    # assistant message bubble.  The assistant bubble should only carry genuinely new
+    # artifacts (e.g. generated files), not re-deliveries of existing ones.
     return ToolResult(
         output=json.dumps(item, indent=2, sort_keys=True),
         metadata=item,
-        attachments=[_artifact_attachment_item(row, url=url)],
     )
 
 

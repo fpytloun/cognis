@@ -366,9 +366,24 @@ function findOptimisticUserMessageIndex(
   const item = items[index];
   if (item?.kind !== 'message') return -1;
   if (!isRecentOptimisticUserMessage(item)) return -1;
-  if (item.content !== content) return -1;
-  if (!sameAttachmentIds(item.attachments, attachments)) return -1;
-  return index;
+
+  // Primary match: exact content equality (covers the normal case and the
+  // fixed server path where attachment-only messages keep content="").
+  if (item.content === content && sameAttachmentIds(item.attachments, attachments)) {
+    return index;
+  }
+
+  // Defensive match for histories recorded before the server fix: if the
+  // optimistic bubble is attachment-only (empty content) and the incoming
+  // event carries a server-side placeholder like "User attached a file."
+  // but has the same attachment ids, treat them as the same message.
+  const isOptimisticAttachmentOnly = item.content === '' && (item.attachments?.length ?? 0) > 0;
+  const isServerPlaceholder = content.startsWith('User attached ');
+  if (isOptimisticAttachmentOnly && isServerPlaceholder && sameAttachmentIds(item.attachments, attachments)) {
+    return index;
+  }
+
+  return -1;
 }
 
 function findUserMessageByCorrelationIndex(

@@ -1445,16 +1445,10 @@ async def test_tool_router_handles_artifact_get_url(
     assert (
         '"url": "https://cognis.example.com/images/img_4/image"' in result.metadata["_raw_output"]
     )
-    assert result.attachments == [
-        {
-            "artifact_id": "img_4",
-            "url": "https://cognis.example.com/images/img_4/image",
-            "filename": "image",
-            "kind": "image",
-            "mime_type": "image/jpeg",
-            "size_bytes": 512,
-        }
-    ]
+    # artifact_get_url no longer returns attachments; the signed URL is in the JSON
+    # output and metadata — the agent should surface it as text, not echo the file
+    # back into the assistant message bubble.
+    assert not result.attachments
 
 
 @pytest.mark.asyncio
