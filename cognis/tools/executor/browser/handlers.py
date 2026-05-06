@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
+import tempfile
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,6 +19,7 @@ from cognis.tools.executor.browser.manager import (
     BROWSER_MANAGER_KEY,
     BrowserManager,
 )
+from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
 
@@ -236,6 +240,10 @@ _PLAYWRIGHT_LOCATOR_PREFIXES = (
     "data-testid=",
     "data-test-id=",
 )
+_MAX_BROWSER_DOWNLOAD_BYTES = 50 * 1024 * 1024
+_MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
+_MAX_BROWSER_UPLOAD_FILES = 10
+_MAX_BROWSER_DOWNLOAD_TIMEOUT_MS = 120_000
 
 
 def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -478,7 +486,9 @@ def _frame_at(session: Any, frame_index: int | None) -> Any:
     if frame_index is None:
         return session.page
     if frame_index < 0 or frame_index >= len(frames):
-        raise ValueError("Browser ref points to a frame that is no longer available; refresh browser_snapshot and retry")
+        raise ValueError(
+            "Browser ref points to a frame that is no longer available; refresh browser_snapshot and retry"
+        )
     return frames[frame_index]
 
 
@@ -524,6 +534,33 @@ def _candidate_summary(candidate: dict[str, Any]) -> dict[str, Any]:
         "frame_name": candidate.get("frame_name"),
         "in_shadow_dom": candidate.get("in_shadow_dom"),
     }
+
+
+def _safe_filename(value: Any, fallback: str) -> str:
+    filename = Path(str(value or "")).name.strip()
+    return filename or fallback
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, str) and value.strip():
+        return [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and item.strip()]
+
+
+def _coerce_int_list(value: Any) -> list[int]:
+    if isinstance(value, int):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    items: list[int] = []
+    for item in value:
+        try:
+            items.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return items
 
 
 async def _resolve_ref_target(
@@ -616,6 +653,137 @@ async def _resolve_selector_target(
     if await locator.count() != 1:
         raise ValueError("Resolved selector candidate became stale; inspect the page again")
     return locator.nth(0), target
+
+
+async def _resolve_selector_locator_any_frame(
+    session: Any,
+    *,
+    selector: str,
+) -> tuple[Any, dict[str, Any]]:
+    _validate_css_selector("browser_upload", selector)
+    matches: list[tuple[Any, dict[str, Any]]] = []
+    for frame_index, frame in enumerate(_session_frames(session)):
+        locator = frame.locator(selector)
+        try:
+            count = await locator.count()
+        except Exception:
+            continue
+        for index in range(count):
+            matches.append(
+                (
+                    locator.nth(index),
+                    {
+                        "ref": None,
+                        "exact_selector": selector,
+                        "frame_index": frame_index,
+                        "frame_url": _frame_url(frame),
+                        "frame_name": _frame_name(frame),
+                    },
+                )
+            )
+    if not matches:
+        raise ValueError(
+            "No element matched selector. Use browser_query or browser_snapshot for inspection."
+        )
+    if len(matches) > 1:
+        preview = [_candidate_summary(info) for _, info in matches[:5]]
+        raise ValueError(
+            f"Selector matched multiple candidates; use browser_query or browser_snapshot and pick a ref. Candidates: {json.dumps(preview)}"
+        )
+    return matches[0]
+
+
+async def _resolve_upload_target(
+    session: Any,
+    *,
+    ref: Any,
+    selector: Any,
+    mode: str,
+) -> tuple[Any, dict[str, Any], str]:
+    if isinstance(ref, str) and ref:
+        if mode == "input":
+            target = session.ref_map.get(ref)
+            if isinstance(target, dict):
+                selector_value = target.get("selector")
+                frame_index = _coerce_frame_index(target.get("frame_index"))
+            else:
+                selector_value = target
+                frame_index = None
+            if not selector_value:
+                raise ValueError(f"Unknown browser ref: {ref}")
+            frame = _frame_at(session, frame_index)
+            locator = frame.locator(str(selector_value))
+            if await locator.count() != 1:
+                raise ValueError(
+                    f"Browser ref {ref} is stale or ambiguous; refresh browser_snapshot and retry"
+                )
+            info = dict(getattr(session, "ref_metadata", {}).get(ref, {}))
+            info.update(
+                {
+                    "ref": ref,
+                    "exact_selector": str(selector_value),
+                    "frame_index": frame_index,
+                    "frame_url": _frame_url(frame),
+                    "frame_name": _frame_name(frame),
+                }
+            )
+            return locator.nth(0), info, "ref"
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        return chosen, info, "ref"
+    if isinstance(selector, str) and selector:
+        if mode == "input":
+            chosen, info = await _resolve_selector_locator_any_frame(session, selector=selector)
+        else:
+            chosen, info = await _resolve_selector_target(
+                session, selector=selector, mode="clickable"
+            )
+        return chosen, info, "selector"
+    raise ValueError("Provide either ref or selector")
+
+
+def _upload_file_payloads(arguments: dict[str, Any], context: ToolExecutionContext) -> list[Any]:
+    files: list[Any] = []
+    total_bytes = 0
+    for raw_path in _coerce_string_list(arguments.get("file_paths")):
+        path = resolve_path(raw_path, context=context)
+        if not path.is_file():
+            raise ValueError(f"Upload file does not exist or is not a file: {path}")
+        total_bytes += path.stat().st_size
+        files.append(str(path))
+    source_artifacts = arguments.get("source_artifacts")
+    if isinstance(source_artifacts, list):
+        for index, item in enumerate(source_artifacts, start=1):
+            if not isinstance(item, dict):
+                continue
+            content_b64 = item.get("content_b64")
+            if not isinstance(content_b64, str) or not content_b64.strip():
+                continue
+            try:
+                content = base64.b64decode(content_b64, validate=True)
+            except Exception as exc:
+                raise ValueError("browser_upload received invalid artifact content.") from exc
+            filename = _safe_filename(item.get("filename"), f"artifact-{index}")
+            mime_type = str(item.get("mime_type") or "") or mimetypes.guess_type(filename)[0]
+            total_bytes += len(content)
+            files.append(
+                {
+                    "name": filename,
+                    "mimeType": mime_type or "application/octet-stream",
+                    "buffer": content,
+                }
+            )
+    if not files:
+        raise ValueError("browser_upload requires file_paths or source_artifact_ids")
+    if len(files) > _MAX_BROWSER_UPLOAD_FILES:
+        raise ValueError(
+            f"browser_upload supports at most {_MAX_BROWSER_UPLOAD_FILES} files per call"
+        )
+    if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
+        raise ValueError(
+            "browser_upload payload is too large: "
+            f"{total_bytes} bytes exceeds {_MAX_BROWSER_UPLOAD_BYTES} bytes"
+        )
+    return files
 
 
 def _store_ref_maps(session: Any, elements: list[dict[str, Any]]) -> None:
@@ -1052,6 +1220,256 @@ async def handle_browser_submit_form(
     )
 
 
+async def handle_browser_select(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    ref = arguments.get("ref")
+    selector = arguments.get("selector")
+    if isinstance(ref, str) and ref:
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        source = "ref"
+    elif isinstance(selector, str) and selector:
+        chosen, info = await _resolve_selector_target(session, selector=selector, mode="fillable")
+        source = "selector"
+    else:
+        raise ValueError("Provide either ref or selector")
+
+    options: list[dict[str, Any]] = []
+    options.extend({"value": item} for item in _coerce_string_list(arguments.get("values")))
+    options.extend({"label": item} for item in _coerce_string_list(arguments.get("labels")))
+    options.extend({"index": item} for item in _coerce_int_list(arguments.get("indexes")))
+    if not options:
+        raise ValueError("browser_select requires values, labels, or indexes")
+    selected = await chosen.select_option(options)
+    await _wait_after(session.page, arguments)
+    return ToolResult(
+        output=json.dumps(
+            {
+                "action": "select",
+                "source": source,
+                "selected_count": len(selected) if isinstance(selected, list) else None,
+                "target": _candidate_summary(info),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+async def handle_browser_upload(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    mode = str(arguments.get("mode", "input") or "input").lower()
+    if mode not in {"input", "file_chooser"}:
+        raise ValueError("browser_upload mode must be 'input' or 'file_chooser'")
+    files = _upload_file_payloads(arguments, context)
+    chosen, info, source = await _resolve_upload_target(
+        session,
+        ref=arguments.get("ref"),
+        selector=arguments.get("selector"),
+        mode=mode,
+    )
+    if mode == "input":
+        await chosen.set_input_files(files)
+    else:
+        async with session.page.expect_file_chooser() as chooser_info:
+            await humanizer.humanize_click(
+                session.page, chosen, intensity=_resolve_intensity(arguments, manager)
+            )
+        chooser = await chooser_info.value
+        await chooser.set_files(files)
+    await _wait_after(session.page, arguments)
+    return ToolResult(
+        output=json.dumps(
+            {
+                "action": "upload",
+                "source": source,
+                "mode": mode,
+                "file_count": len(files),
+                "target": _candidate_summary(info),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+async def handle_browser_download_wait(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    ref = arguments.get("ref")
+    selector = arguments.get("selector")
+    if isinstance(ref, str) and ref:
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        source = "ref"
+    elif isinstance(selector, str) and selector:
+        chosen, info = await _resolve_selector_target(session, selector=selector, mode="clickable")
+        source = "selector"
+    else:
+        raise ValueError("Provide either ref or selector")
+    timeout_ms = max(
+        1,
+        min(int(arguments.get("timeout_ms", 30000) or 30000), _MAX_BROWSER_DOWNLOAD_TIMEOUT_MS),
+    )
+    async with session.page.expect_download(timeout=timeout_ms) as download_info:
+        await humanizer.humanize_click(
+            session.page, chosen, intensity=_resolve_intensity(arguments, manager)
+        )
+    download = await download_info.value
+    filename = _safe_filename(getattr(download, "suggested_filename", None), "download.bin")
+    with tempfile.TemporaryDirectory(prefix="cognis-browser-download-") as temp_dir:
+        destination = Path(temp_dir) / filename
+        await download.save_as(str(destination))
+        size_bytes = destination.stat().st_size
+        if size_bytes > _MAX_BROWSER_DOWNLOAD_BYTES:
+            raise ValueError(
+                "Downloaded file is too large to return as an attachment: "
+                f"{size_bytes} bytes exceeds {_MAX_BROWSER_DOWNLOAD_BYTES} bytes"
+            )
+        content = destination.read_bytes()
+    await _wait_after(session.page, arguments)
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return ToolResult(
+        output=json.dumps(
+            {
+                "action": "download_wait",
+                "source": source,
+                "filename": filename,
+                "mime_type": mime_type,
+                "size_bytes": len(content),
+                "target": _candidate_summary(info),
+            },
+            ensure_ascii=False,
+        ),
+        attachments=[
+            {
+                "kind": "file",
+                "mime_type": mime_type,
+                "filename": filename,
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            }
+        ],
+    )
+
+
+async def handle_browser_scroll(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    delta_x = int(arguments.get("delta_x", 0) or 0)
+    delta_y = int(arguments.get("delta_y", 600) or 600)
+    ref = arguments.get("ref")
+    selector = arguments.get("selector")
+    if isinstance(ref, str) and ref:
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        await chosen.evaluate(
+            "(el, delta) => el.scrollBy(delta.x, delta.y)", {"x": delta_x, "y": delta_y}
+        )
+        source = "ref"
+        target = _candidate_summary(info)
+    elif isinstance(selector, str) and selector:
+        chosen, info = await _resolve_selector_target(session, selector=selector, mode="actionable")
+        await chosen.evaluate(
+            "(el, delta) => el.scrollBy(delta.x, delta.y)", {"x": delta_x, "y": delta_y}
+        )
+        source = "selector"
+        target = _candidate_summary(info)
+    else:
+        await session.page.evaluate(
+            "(delta) => window.scrollBy(delta.x, delta.y)", {"x": delta_x, "y": delta_y}
+        )
+        source = "page"
+        target = None
+    await _wait_after(session.page, arguments)
+    return ToolResult(
+        output=json.dumps(
+            {
+                "action": "scroll",
+                "source": source,
+                "delta_x": delta_x,
+                "delta_y": delta_y,
+                "target": target,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+async def handle_browser_hover(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    ref = arguments.get("ref")
+    selector = arguments.get("selector")
+    if isinstance(ref, str) and ref:
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        source = "ref"
+    elif isinstance(selector, str) and selector:
+        chosen, info = await _resolve_selector_target(session, selector=selector, mode="actionable")
+        source = "selector"
+    else:
+        raise ValueError("Provide either ref or selector")
+    await chosen.hover()
+    await _wait_after(session.page, arguments)
+    return ToolResult(
+        output=json.dumps(
+            {"action": "hover", "source": source, "target": _candidate_summary(info)},
+            ensure_ascii=False,
+        )
+    )
+
+
+async def _resolve_drag_endpoint(
+    session: Any, ref: Any, selector: Any, name: str
+) -> tuple[Any, dict[str, Any], str]:
+    if isinstance(ref, str) and ref:
+        chosen, info = await _resolve_ref_target(session, ref=ref, require_editable=False)
+        return chosen, info, "ref"
+    if isinstance(selector, str) and selector:
+        chosen, info = await _resolve_selector_target(session, selector=selector, mode="actionable")
+        return chosen, info, "selector"
+    raise ValueError(f"Provide either {name}_ref or {name}_selector")
+
+
+async def handle_browser_drag_drop(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    source_locator, source_info, source_kind = await _resolve_drag_endpoint(
+        session,
+        arguments.get("source_ref"),
+        arguments.get("source_selector"),
+        "source",
+    )
+    target_locator, target_info, target_kind = await _resolve_drag_endpoint(
+        session,
+        arguments.get("target_ref"),
+        arguments.get("target_selector"),
+        "target",
+    )
+    await source_locator.drag_to(target_locator)
+    await _wait_after(session.page, arguments)
+    return ToolResult(
+        output=json.dumps(
+            {
+                "action": "drag_drop",
+                "source": source_kind,
+                "target_source": target_kind,
+                "source_target": _candidate_summary(source_info),
+                "drop_target": _candidate_summary(target_info),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 async def handle_browser_press(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
@@ -1085,7 +1503,9 @@ async def handle_browser_wait_for(
     timeout_ms = int(arguments.get("timeout_ms", 10000) or 10000)
     state = str(arguments.get("state") or "visible")
     if state not in {"attached", "visible", "hidden", "detached"}:
-        raise ValueError("browser_wait_for state must be one of attached, visible, hidden, detached")
+        raise ValueError(
+            "browser_wait_for state must be one of attached, visible, hidden, detached"
+        )
     if isinstance(selector, str) and selector:
         _validate_css_selector("browser_wait_for", selector)
         last_error: Exception | None = None

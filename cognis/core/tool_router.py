@@ -77,6 +77,8 @@ IMAGE_GENERATION_TOTAL = Counter(
 )
 
 logger = get_logger(__name__)
+_MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
+_MAX_BROWSER_UPLOAD_FILES = 10
 
 _AUTH_STATE_KIND_HINT = (
     "Use browser_fill value_ref for raw credential fields; use auth_state_ref only "
@@ -1087,6 +1089,37 @@ class ToolRouter:
                 arguments.setdefault("source_artifact_filename", row.filename)
                 arguments.setdefault("source_artifact_mime_type", row.mime_type)
                 arguments.setdefault("source_artifact_size_bytes", row.size_bytes)
+        if tool_call.name == "browser_upload":
+            arguments.pop("source_artifacts", None)
+            artifact_ids = arguments.get("source_artifact_ids")
+            if isinstance(artifact_ids, list):
+                if len(artifact_ids) > _MAX_BROWSER_UPLOAD_FILES:
+                    raise ValueError(
+                        f"browser_upload supports at most {_MAX_BROWSER_UPLOAD_FILES} files per call"
+                    )
+                source_artifacts: list[dict[str, Any]] = []
+                total_bytes = 0
+                for artifact_id in artifact_ids:
+                    if not isinstance(artifact_id, str) or not artifact_id.strip():
+                        continue
+                    row = await self._get_accessible_artifact_record(
+                        artifact_id, session.user_email
+                    )
+                    total_bytes += int(row.size_bytes or 0)
+                    if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
+                        raise ValueError(
+                            "browser_upload artifact payload is too large: "
+                            f"{total_bytes} bytes exceeds {_MAX_BROWSER_UPLOAD_BYTES} bytes"
+                        )
+                    source_artifacts.append(
+                        {
+                            "artifact_id": artifact_id,
+                            "filename": row.filename,
+                            "mime_type": row.mime_type,
+                            "size_bytes": row.size_bytes,
+                        }
+                    )
+                arguments["source_artifacts"] = source_artifacts
         assets = arguments.get("assets") if tool_call.name == "document_generate" else None
         if isinstance(assets, list):
             sanitized_assets: list[dict[str, Any]] = []
@@ -1126,6 +1159,37 @@ class ToolRouter:
             arguments["source_artifact_content"] = await self._load_text_artifact(
                 str(artifact_id), session.user_email
             )
+        if tool_call.name == "browser_upload":
+            arguments.pop("source_artifacts", None)
+            artifact_ids = arguments.get("source_artifact_ids")
+            if isinstance(artifact_ids, list):
+                if len(artifact_ids) > _MAX_BROWSER_UPLOAD_FILES:
+                    raise ValueError(
+                        f"browser_upload supports at most {_MAX_BROWSER_UPLOAD_FILES} files per call"
+                    )
+                source_artifacts: list[dict[str, Any]] = []
+                total_bytes = 0
+                for artifact_id in artifact_ids:
+                    if not isinstance(artifact_id, str) or not artifact_id.strip():
+                        continue
+                    content, mime_type, filename = await self._load_binary_artifact(
+                        artifact_id, session.user_email
+                    )
+                    total_bytes += len(content)
+                    if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
+                        raise ValueError(
+                            "browser_upload artifact payload is too large: "
+                            f"{total_bytes} bytes exceeds {_MAX_BROWSER_UPLOAD_BYTES} bytes"
+                        )
+                    source_artifacts.append(
+                        {
+                            "artifact_id": artifact_id,
+                            "filename": filename,
+                            "mime_type": mime_type,
+                            "content_b64": base64.b64encode(content).decode("ascii"),
+                        }
+                    )
+                arguments["source_artifacts"] = source_artifacts
         assets = arguments.get("assets") if tool_call.name == "document_generate" else None
         if isinstance(assets, list):
             resolved_assets: list[dict[str, Any]] = []

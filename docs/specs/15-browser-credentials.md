@@ -539,16 +539,19 @@ Initial executor-native browser tools:
 - `browser_type`
 - `browser_press`
 - `browser_wait_for`
+- `browser_select`
+- `browser_upload`
+- `browser_download_wait`
+- `browser_scroll`
+- `browser_hover`
+- `browser_drag_drop`
 - `browser_screenshot`
 - `browser_close`
 - `browser_save_auth_state`
 
 Likely follow-ups:
 
-- `browser_select`
-- `browser_upload`
-- `browser_download_wait`
-- `browser_list_sessions`
+- richer native file drop payload synthesis for sites that reject file chooser APIs
 
 ## Browser Tool Semantics
 

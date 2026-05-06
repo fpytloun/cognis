@@ -350,6 +350,175 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=60,
         ),
         ToolDefinition(
+            name="browser_select",
+            description="Select one or more options in a native <select> element by value, label, or index.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Option values to select.",
+                    },
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Option labels to select.",
+                    },
+                    "indexes": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Zero-based option indexes to select.",
+                    },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after selecting, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
+            name="browser_upload",
+            description=(
+                "Attach one or more files to a page. Use mode='input' for a file input "
+                "or mode='file_chooser' for an attachment button that opens a chooser. "
+                "Use source_artifact_ids for Cognis artifacts or file_paths for executor-local files."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["input", "file_chooser"]},
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": "Executor-local absolute paths to attach.",
+                    },
+                    "source_artifact_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 10,
+                        "description": "Cognis artifact ids to materialize directly into the browser upload.",
+                    },
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after uploading, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=90,
+        ),
+        ToolDefinition(
+            name="browser_download_wait",
+            description="Click a target and wait for a browser download, returning the downloaded file as a Cognis attachment artifact.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "timeout_ms": {"type": "integer"},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after the download starts, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=120,
+        ),
+        ToolDefinition(
+            name="browser_scroll",
+            description="Scroll the page or a target element by a pixel delta to reveal lazy-loaded or off-screen controls.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "delta_x": {"type": "integer"},
+                    "delta_y": {"type": "integer"},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after scrolling, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_hover",
+            description="Hover a visible enabled target to reveal menus, toolbars, or drag handles.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "ref": {"type": "string"},
+                    "selector": {"type": "string"},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after hovering, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_drag_drop",
+            description="Drag one visible enabled element onto another, useful for drag-and-drop upload zones or sortable UIs.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "source_ref": {"type": "string"},
+                    "source_selector": {"type": "string"},
+                    "target_ref": {"type": "string"},
+                    "target_selector": {"type": "string"},
+                    "wait_after_ms": {
+                        "type": "integer",
+                        "description": "Optional delay after drag-and-drop, in milliseconds.",
+                    },
+                },
+                "required": ["session_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
+            timeout_seconds=60,
+        ),
+        ToolDefinition(
             name="browser_press",
             description="Press a keyboard key or type text/value_ref into the currently focused element or frame.",
             parameters={

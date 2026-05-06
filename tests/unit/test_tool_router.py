@@ -1831,6 +1831,110 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_resolves_browser_upload_artifacts_without_guardrails_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _CapturingExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(ToolResult(output="uploaded"))
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self, tool_call: ToolCall, timeout_seconds: int | None = None
+        ) -> ToolResult:
+            del timeout_seconds
+            self.seen_call = tool_call
+            return self.result
+
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="att_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="att_1",
+                filename="photo.png",
+                mime_type="image/png",
+                size_bytes=9,
+            )
+        ),
+    )
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="browser_upload",
+                description="upload artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+                non_bypassable=True,
+            )
+        )
+    )
+
+    guardrails = _Guardrails()
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_Store(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="browser-upload-1",
+            name="browser_upload",
+            arguments={
+                "session_id": "browser-1",
+                "ref": "e1",
+                "source_artifact_ids": ["att_1"],
+                "source_artifacts": [
+                    {
+                        "filename": "evil.bin",
+                        "mime_type": "application/octet-stream",
+                        "content_b64": base64.b64encode(b"evil").decode("ascii"),
+                    }
+                ],
+            },
+        ),
+        _session(),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert evaluate_arguments["source_artifacts"] == [
+        {
+            "artifact_id": "att_1",
+            "filename": "photo.png",
+            "mime_type": "image/png",
+            "size_bytes": 9,
+        }
+    ]
+    assert "content_b64" not in str(evaluate_arguments)
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["source_artifacts"][0]["filename"] == "photo.png"
+    assert (
+        base64.b64decode(executor.seen_call.arguments["source_artifacts"][0]["content_b64"])
+        == b"png-bytes"
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_router_omits_document_asset_binary_payloads_from_guardrails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

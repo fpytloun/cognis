@@ -9,6 +9,8 @@ from cognis.tools.executor.browser.definitions import browser_tool_definitions
 from cognis.tools.executor.browser.handlers import (
     handle_browser_click,
     handle_browser_close,
+    handle_browser_download_wait,
+    handle_browser_drag_drop,
     handle_browser_eval,
     handle_browser_fill,
     handle_browser_focus,
@@ -16,6 +18,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_get_focus,
     handle_browser_get_network,
     handle_browser_get_text,
+    handle_browser_hover,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
@@ -23,9 +26,12 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_query,
     handle_browser_save_auth_state,
     handle_browser_screenshot,
+    handle_browser_scroll,
+    handle_browser_select,
     handle_browser_snapshot,
     handle_browser_submit_form,
     handle_browser_type,
+    handle_browser_upload,
     handle_browser_wait_for,
 )
 from cognis.tools.executor.document import (
@@ -149,7 +155,10 @@ SKILL_ASSET_MATERIALIZE_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "skill_id": {"type": "string", "description": "Skill ID that owns the asset."},
-            "asset_id": {"type": "string", "description": "Asset ID from skill_load asset_manifest."},
+            "asset_id": {
+                "type": "string",
+                "description": "Asset ID from skill_load asset_manifest.",
+            },
             "filename": {
                 "type": "string",
                 "description": "Optional asset filename to disambiguate when asset_id is not known.",
@@ -711,6 +720,12 @@ _HANDLER_MAP: dict[
     "browser_focus": handle_browser_focus,
     "browser_type": handle_browser_type,
     "browser_submit_form": handle_browser_submit_form,
+    "browser_select": handle_browser_select,
+    "browser_upload": handle_browser_upload,
+    "browser_download_wait": handle_browser_download_wait,
+    "browser_scroll": handle_browser_scroll,
+    "browser_hover": handle_browser_hover,
+    "browser_drag_drop": handle_browser_drag_drop,
     "browser_press": handle_browser_press,
     "browser_wait_for": handle_browser_wait_for,
     "browser_screenshot": handle_browser_screenshot,

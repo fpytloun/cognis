@@ -12,21 +12,27 @@ from cognis.models.tool import ExecutorHandle, ToolCall
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
     handle_browser_click,
+    handle_browser_download_wait,
+    handle_browser_drag_drop,
     handle_browser_eval,
     handle_browser_fill,
     handle_browser_focus,
     handle_browser_get_console,
     handle_browser_get_focus,
     handle_browser_get_network,
+    handle_browser_hover,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
     handle_browser_press,
     handle_browser_query,
     handle_browser_save_auth_state,
+    handle_browser_scroll,
+    handle_browser_select,
     handle_browser_snapshot,
     handle_browser_submit_form,
     handle_browser_type,
+    handle_browser_upload,
     handle_browser_wait_for,
 )
 from cognis.tools.registry import ToolExecutionContext
@@ -43,8 +49,13 @@ class _FakeLocator:
         self.filled: str | None = None
         self.clicked = False
         self.focused = False
+        self.hovered = False
+        self.dragged_to: _FakeLocator | None = None
         self.typed: tuple[str, int | None] | None = None
         self.evaluated: str | None = None
+        self.evaluated_args: tuple[Any, ...] = ()
+        self.selected_options: list[dict[str, Any]] | None = None
+        self.input_files: list[Any] | None = None
         self.visible = visible
         self.enabled = enabled
         self.editable = editable
@@ -89,8 +100,66 @@ class _FakeLocator:
     async def press_sequentially(self, text: str, delay: int | None = None) -> None:
         self.typed = (text, delay)
 
-    async def evaluate(self, script: str) -> None:
+    async def evaluate(self, script: str, *args: Any) -> None:
         self.evaluated = script
+        self.evaluated_args = args
+
+    async def select_option(self, options: list[dict[str, Any]]) -> list[str]:
+        self.selected_options = options
+        return [str(next(iter(item.values()))) for item in options]
+
+    async def set_input_files(self, files: list[Any]) -> None:
+        self.input_files = files
+
+    async def hover(self) -> None:
+        self.hovered = True
+
+    async def drag_to(self, target: _FakeLocator) -> None:
+        self.dragged_to = target
+
+
+class _FakeAsyncValue:
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    @property
+    def value(self) -> Any:
+        async def _get() -> Any:
+            return self._value
+
+        return _get()
+
+    async def __aenter__(self) -> _FakeAsyncValue:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        del exc_type, exc, tb
+
+
+class _FakeFileChooser:
+    def __init__(self) -> None:
+        self.files: list[Any] | None = None
+
+    async def set_files(self, files: list[Any]) -> None:
+        self.files = files
+
+
+class _FakeDownload:
+    suggested_filename = "report.txt"
+
+    async def save_as(self, path: str) -> None:
+        from pathlib import Path
+
+        Path(path).write_text("downloaded", encoding="utf-8")
+
+
+class _LargeFakeDownload:
+    suggested_filename = "large.bin"
+
+    async def save_as(self, path: str) -> None:
+        from pathlib import Path
+
+        Path(path).write_bytes(b"0123456789")
 
 
 class _FakeKeyboard:
@@ -116,6 +185,8 @@ class _FakePage:
         self.keyboard = _FakeKeyboard()
         self.frames = [self]
         self.active_element: dict[str, Any] | None = None
+        self.file_chooser = _FakeFileChooser()
+        self.download = _FakeDownload()
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
@@ -288,6 +359,13 @@ class _FakePage:
 
     async def wait_for_timeout(self, timeout: int) -> None:
         self.last_wait_for_timeout = timeout
+
+    def expect_file_chooser(self) -> _FakeAsyncValue:
+        return _FakeAsyncValue(self.file_chooser)
+
+    def expect_download(self, timeout: int) -> _FakeAsyncValue:
+        self.last_download_timeout = timeout
+        return _FakeAsyncValue(self.download)
 
 
 class _FakeManager:
@@ -775,6 +853,170 @@ async def test_browser_submit_form_supports_native(monkeypatch: pytest.MonkeyPat
     assert visible.evaluated is not None
     assert "requestSubmit" in visible.evaluated
     assert '"action": "submit_form"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_select_selects_by_value_and_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    select = _FakeLocator(visible=True, enabled=True, editable=True)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = select
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_select(
+        {"session_id": "sess-1", "ref": "e1", "values": ["cz"], "labels": ["English"]},
+        _context(),
+    )
+    assert select.selected_options == [{"value": "cz"}, {"label": "English"}]
+    assert '"action": "select"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_upload_sets_files_on_input_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    upload_file = tmp_path / "note.txt"
+    upload_file.write_text("hello", encoding="utf-8")
+    manager = _FakeManager()
+    file_input = _FakeLocator(visible=False, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = file_input
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_upload(
+        {"session_id": "sess-1", "ref": "e1", "file_paths": [str(upload_file)]},
+        _context(),
+    )
+    assert file_input.input_files == [str(upload_file)]
+    assert '"file_count": 1' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_upload_uses_file_chooser_with_artifact_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    button = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = button
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_upload(
+        {
+            "session_id": "sess-1",
+            "ref": "e1",
+            "mode": "file_chooser",
+            "source_artifacts": [
+                {
+                    "filename": "image.png",
+                    "mime_type": "image/png",
+                    "content_b64": "aGVsbG8=",
+                }
+            ],
+        },
+        _context(),
+    )
+    assert manager.session.page.file_chooser.files == [
+        {"name": "image.png", "mimeType": "image/png", "buffer": b"hello"}
+    ]
+    assert button.clicked is True
+    assert '"mode": "file_chooser"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_upload_rejects_oversized_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    file_input = _FakeLocator(visible=False, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = file_input
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    monkeypatch.setattr(browser_handlers, "_MAX_BROWSER_UPLOAD_BYTES", 5)
+    with pytest.raises(ValueError, match="too large"):
+        await handle_browser_upload(
+            {
+                "session_id": "sess-1",
+                "ref": "e1",
+                "source_artifacts": [
+                    {
+                        "filename": "large.bin",
+                        "mime_type": "application/octet-stream",
+                        "content_b64": "MDEyMzQ1Njc4OQ==",
+                    }
+                ],
+            },
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_download_wait_returns_attachment(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    button = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = button
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_download_wait(
+        {"session_id": "sess-1", "ref": "e1", "timeout_ms": 1234},
+        _context(),
+    )
+    assert manager.session.page.last_download_timeout == 1234
+    assert result.attachments is not None
+    assert result.attachments[0]["filename"] == "report.txt"
+    assert result.attachments[0]["content_b64"] == "ZG93bmxvYWRlZA=="
+
+
+@pytest.mark.asyncio
+async def test_browser_download_wait_clamps_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    button = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = button
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    monkeypatch.setattr(browser_handlers, "_MAX_BROWSER_DOWNLOAD_TIMEOUT_MS", 50)
+    await handle_browser_download_wait(
+        {"session_id": "sess-1", "ref": "e1", "timeout_ms": 5000},
+        _context(),
+    )
+    assert manager.session.page.last_download_timeout == 50
+
+
+@pytest.mark.asyncio
+async def test_browser_download_wait_rejects_oversized_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    manager.session.page.download = _LargeFakeDownload()
+    button = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = button
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    monkeypatch.setattr(browser_handlers, "_MAX_BROWSER_DOWNLOAD_BYTES", 5)
+    with pytest.raises(ValueError, match="too large"):
+        await handle_browser_download_wait(
+            {"session_id": "sess-1", "ref": "e1"},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_browser_scroll_hovers_and_drag_drops(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    source = _FakeLocator(visible=True, enabled=True, editable=False)
+    target = _FakeLocator(visible=True, enabled=True, editable=False)
+    manager.session.page.locator_map['[data-cognis-ref="e1"]'] = source
+    manager.session.page.locator_map['[data-cognis-ref="e2"]'] = target
+    manager.session.ref_map["e2"] = '[data-cognis-ref="e2"]'
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    scroll_result = await handle_browser_scroll(
+        {"session_id": "sess-1", "ref": "e1", "delta_y": 250},
+        _context(),
+    )
+    hover_result = await handle_browser_hover({"session_id": "sess-1", "ref": "e1"}, _context())
+    drag_result = await handle_browser_drag_drop(
+        {"session_id": "sess-1", "source_ref": "e1", "target_ref": "e2"},
+        _context(),
+    )
+
+    assert source.evaluated == "(el, delta) => el.scrollBy(delta.x, delta.y)"
+    assert source.evaluated_args == ({"x": 0, "y": 250},)
+    assert source.hovered is True
+    assert source.dragged_to is target
+    assert '"action": "scroll"' in scroll_result.output
+    assert '"action": "hover"' in hover_result.output
+    assert '"action": "drag_drop"' in drag_result.output
 
 
 @pytest.mark.asyncio
