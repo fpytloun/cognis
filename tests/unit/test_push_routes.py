@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.artifacts.store import ArtifactMetadata
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.web_push import WebPushRuntimeConfig, WebPushService
 from cognis.store.models import PushSubscriptionRow
@@ -32,6 +33,71 @@ async def _seed_user(client: TestClient, email: str = "user@example.com") -> Non
             role="user",
         )
         await session.commit()
+
+
+class _FakeArtifactStore:
+    async def async_load_metadata(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+    ) -> ArtifactMetadata:
+        assert namespace == "avatars"
+        assert filename == "image"
+        return ArtifactMetadata(content_type="image/png", size=128, owner_email="user@example.com")
+
+    async def async_get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        assert namespace == "avatars"
+        assert filename == "image"
+        assert ttl_seconds == 3600
+        return f"https://cognis.example/api/v1/artifacts/content/avatars/{object_id}/image?sig=test"
+
+
+class _FailingArtifactStore:
+    async def async_load_metadata(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+    ) -> ArtifactMetadata:
+        return ArtifactMetadata(content_type="image/png", size=128, owner_email="user@example.com")
+
+    async def async_get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        raise ValueError("signing unavailable")
+
+
+class _WrongOwnerArtifactStore:
+    async def async_load_metadata(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+    ) -> ArtifactMetadata:
+        return ArtifactMetadata(content_type="image/png", size=128, owner_email="other@example.com")
+
+    async def async_get_public_url(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        raise AssertionError("avatar URL should not be signed for the wrong owner")
 
 
 def test_vapid_public_key_is_available(monkeypatch: object, tmp_path: Path) -> None:
@@ -225,6 +291,7 @@ def test_turn_completed_web_chat_creates_push_payload(
                     private_key="private",
                     subject="mailto:test@example.com",
                 ),
+                artifact_store=_FakeArtifactStore(),
             )
             return await service._event_payload(  # noqa: SLF001
                 Event(
@@ -246,8 +313,107 @@ def test_turn_completed_web_chat_creates_push_payload(
             "url": "/chat/conv_1",
             "tag": "conv_1",
             "kind": "message",
-            "icon": "/api/v1/images/img_avatar",
+            "conversation_id": "conv_1",
+            "icon": "https://cognis.example/api/v1/artifacts/content/avatars/img_avatar/image?sig=test",
         }
+
+
+def test_turn_completed_push_payload_omits_avatar_when_signing_fails(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> dict[str, str] | None:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_signing_failure",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    avatar_image_id="img_avatar",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_signing_failure",
+                    context_type="web",
+                    conversation_id="conv_signing_failure",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+                artifact_store=_FailingArtifactStore(),
+            )
+            return await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={"conversation_id": "conv_signing_failure"},
+                )
+            )
+
+        payload = asyncio.run(_run())
+
+        assert payload is not None
+        assert payload["conversation_id"] == "conv_signing_failure"
+        assert "icon" not in payload
+
+
+def test_turn_completed_push_payload_does_not_sign_wrong_owner_avatar(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> dict[str, str] | None:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_wrong_owner_avatar",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    avatar_image_id="img_other_user",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_wrong_owner_avatar",
+                    context_type="web",
+                    conversation_id="conv_wrong_owner_avatar",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+                artifact_store=_WrongOwnerArtifactStore(),
+            )
+            return await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={"conversation_id": "conv_wrong_owner_avatar"},
+                )
+            )
+
+        payload = asyncio.run(_run())
+
+        assert payload is not None
+        assert payload["conversation_id"] == "conv_wrong_owner_avatar"
+        assert "icon" not in payload
 
 
 def test_turn_completed_push_payload_rejects_protocol_relative_avatar_url(

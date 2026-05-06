@@ -76,6 +76,7 @@ type WebPushPayload = {
   url?: string;
   tag?: string;
   kind?: string;
+  conversation_id?: string;
   icon?: unknown;
 };
 
@@ -89,14 +90,42 @@ function parsePushPayload(event: PushEvent): WebPushPayload {
 }
 
 function notificationIcon(value: unknown): string {
-  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/pwa/icon-192.png';
+  if (typeof value !== 'string' || value.startsWith('//')) return '/pwa/icon-192.png';
   try {
     const url = new URL(value, sw.location.origin);
     if (url.origin !== sw.location.origin) return '/pwa/icon-192.png';
-    return `${url.pathname}${url.search}`;
+    return url.href;
   } catch {
     return '/pwa/icon-192.png';
   }
+}
+
+function isIosWebKit(): boolean {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent || '');
+}
+
+function sameOriginTarget(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const url = new URL(value, sw.location.origin);
+    if (url.origin !== sw.location.origin) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function notificationTarget(notification: Notification): string {
+  const data = notification.data as { url?: unknown; conversation_id?: unknown } | undefined;
+  const dataUrl = sameOriginTarget(data?.url);
+  if (dataUrl) return dataUrl;
+  if (typeof data?.conversation_id === 'string' && data.conversation_id.trim()) {
+    return new URL(`/chat/${encodeURIComponent(data.conversation_id)}`, sw.location.origin).href;
+  }
+  if (/^conv_[A-Za-z0-9_-]+$/.test(notification.tag || '')) {
+    return new URL(`/chat/${encodeURIComponent(notification.tag)}`, sw.location.origin).href;
+  }
+  return new URL('/chat', sw.location.origin).href;
 }
 
 function arrayBufferToUrlBase64(value: ArrayBuffer | null): string | null {
@@ -200,7 +229,11 @@ sw.addEventListener('push', (event) => {
         icon: notificationIcon(payload.icon),
         badge: '/pwa/icon-192.png',
         tag: payload.tag || 'cognis',
-        data: { url: target.pathname, kind: payload.kind || 'notification' },
+        data: {
+          url: `${target.pathname}${target.search}${target.hash}`,
+          conversation_id: payload.conversation_id,
+          kind: payload.kind || 'notification'
+        },
       });
     })()
   );
@@ -210,20 +243,37 @@ sw.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(
     (async () => {
-      const data = event.notification.data as { url?: string } | undefined;
-      const target = new URL(data?.url || '/chat', sw.location.origin).href;
+      const target = notificationTarget(event.notification);
       const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
+
       for (const client of clients) {
         const windowClient = client as WindowClient;
         try {
-          if (new URL(windowClient.url).origin !== sw.location.origin) continue;
+          if (new URL(windowClient.url).href !== target) continue;
           await windowClient.focus();
-          await windowClient.navigate(target);
           return;
         } catch {
           // Try the next window client.
         }
       }
+
+      if (isIosWebKit()) {
+        await sw.clients.openWindow(target);
+        return;
+      }
+
+      for (const client of clients) {
+        const windowClient = client as WindowClient;
+        try {
+          if (new URL(windowClient.url).origin !== sw.location.origin) continue;
+          const navigated = await windowClient.navigate(target);
+          await (navigated ?? windowClient).focus();
+          return;
+        } catch {
+          // Try the next window client.
+        }
+      }
+
       await sw.clients.openWindow(target);
     })()
   );

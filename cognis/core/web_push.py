@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -156,16 +156,6 @@ def _agent_notification_title(agent: Agent | None) -> str:
     return _push_label(agent.display_name if agent else None) or _push_label(
         agent.name if agent else None
     ) or "Cognis"
-
-
-def _agent_notification_icon(agent: Agent | None) -> str | None:
-    if agent is None:
-        return None
-    if agent.avatar_image_id:
-        return f"/api/v1/images/{quote(agent.avatar_image_id, safe='')}"
-    if agent.avatar_url and _is_same_origin_relative_icon(agent.avatar_url):
-        return agent.avatar_url
-    return None
 
 
 def _is_same_origin_relative_icon(value: str) -> bool:
@@ -346,9 +336,11 @@ class WebPushService:
         session_factory: async_sessionmaker[AsyncSession],
         event_bus: EventBus,
         config: WebPushRuntimeConfig,
+        artifact_store: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._config = config
+        self._artifact_store = artifact_store
         self._vapid_key: Any | None = None
         if config.enabled:
             try:
@@ -462,6 +454,7 @@ class WebPushService:
         tag: str,
         kind: str,
         icon: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, int]:
         """Send a push payload to all enabled browser subscriptions for a user."""
 
@@ -496,6 +489,8 @@ class WebPushService:
         }
         if icon:
             payload_data["icon"] = icon
+        if conversation_id:
+            payload_data["conversation_id"] = conversation_id
         payload = json.dumps(payload_data, separators=(",", ":"))
         statuses = await asyncio.gather(
             *(self._send_one(row, payload) for row in rows), return_exceptions=True
@@ -540,7 +535,7 @@ class WebPushService:
         tag = conversation_id
         user_email = conversation.user_email
         title = _agent_notification_title(agent)
-        icon = _agent_notification_icon(agent)
+        icon = await self._agent_notification_icon(agent)
 
         if event.type == EventType.TURN_COMPLETED:
             if event.data.get("task_id") or event.data.get("channel_deliverable"):
@@ -552,6 +547,7 @@ class WebPushService:
                 "url": url,
                 "tag": tag,
                 "kind": "message",
+                "conversation_id": conversation_id,
                 **({"icon": icon} if icon else {}),
             }
 
@@ -572,6 +568,7 @@ class WebPushService:
                 "url": url,
                 "tag": f"task:{event.data.get('task_id') or conversation_id}",
                 "kind": "task",
+                "conversation_id": conversation_id,
                 **({"icon": icon} if icon else {}),
             }
 
@@ -591,8 +588,35 @@ class WebPushService:
                 "url": url,
                 "tag": f"notification:{event.data.get('notification_id') or conversation_id}",
                 "kind": notification_type,
+                "conversation_id": conversation_id,
                 **({"icon": icon} if icon else {}),
             }
+        return None
+
+    async def _agent_notification_icon(self, agent: Agent | None) -> str | None:
+        if agent is None:
+            return None
+        if agent.avatar_image_id and self._artifact_store is not None:
+            try:
+                meta = await self._artifact_store.async_load_metadata(
+                    "avatars",
+                    agent.avatar_image_id,
+                    "image",
+                )
+                if meta is None or meta.owner_email != agent.owner_email:
+                    return None
+                if not str(getattr(meta, "content_type", "")).startswith("image/"):
+                    return None
+                return await self._artifact_store.async_get_public_url(
+                    "avatars",
+                    agent.avatar_image_id,
+                    "image",
+                    ttl_seconds=3600,
+                )
+            except Exception:
+                logger.debug("web_push: unable to sign agent avatar for notification", exc_info=True)
+        if agent.avatar_url and _is_same_origin_relative_icon(agent.avatar_url):
+            return agent.avatar_url
         return None
 
     async def _send_one(self, row: PushSubscriptionRow, payload: str) -> str:

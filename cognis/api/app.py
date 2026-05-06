@@ -409,6 +409,7 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             event_bus=event_bus,
             config=load_web_push_config(config_runtime),
+            artifact_store=artifact_store,
         )
 
         # Reconcile pending notifications from before restart (re-registers
