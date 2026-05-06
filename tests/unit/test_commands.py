@@ -1538,3 +1538,92 @@ async def test_executor_command_switch_to_unassigned_errors(monkeypatch) -> None
     assert result.type == "error"
     assert "not assigned" in result.text.lower()
     assert result.data.get("reason") == "not_assigned"
+
+
+@pytest.mark.asyncio
+async def test_executor_command_in_task_conversation_propagates_to_task_pin(
+    monkeypatch,
+) -> None:
+    """Stage 36: /executor in a task-bound conversation updates the task pin."""
+
+    from cognis.core.executor_pool import (
+        ExecutorAvailability,
+        ExecutorPool,
+        ResolvedExecutorTarget,
+    )
+
+    pool = ExecutorPool(
+        primary=[
+            ResolvedExecutorTarget(
+                executor_id="exec-1",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="explicit",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            ),
+            ResolvedExecutorTarget(
+                executor_id="exec-2",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="selector",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            ),
+        ]
+    )
+
+    async def _fake_pool(self, agent, user_email):  # type: ignore[no-untyped-def]
+        return pool
+
+    monkeypatch.setattr(
+        CommandDispatcher,
+        "_resolve_executor_pool_for_command",
+        _fake_pool,
+    )
+
+    persisted_conv: list[tuple[str, str]] = []
+    persisted_task: list[tuple[str, str]] = []
+
+    async def _set_active(_session, conversation_id, executor_id):
+        persisted_conv.append((conversation_id, executor_id))
+        return True
+
+    async def _set_task(_session, task_id, executor_id):
+        persisted_task.append((task_id, executor_id))
+        return True
+
+    import cognis.store.queries as store_queries
+
+    monkeypatch.setattr(store_queries, "set_conversation_active_executor", _set_active)
+    monkeypatch.setattr(store_queries, "set_task_active_executor", _set_task)
+
+    # Conversation context.type=task, ref=task-id triggers task-pin update.
+    conversation = ConversationModel(
+        conversation_id="conv-step-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="task", ref="task-99"),
+        active_executor_id="exec-1",
+    )
+
+    dispatcher = CommandDispatcher(
+        session_factory=_DBSessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    result = await dispatcher.dispatch(
+        "/executor exec-2",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert result is not None
+    assert result.type == "system_message"
+    assert persisted_conv == [("conv-step-1", "exec-2")]
+    assert persisted_task == [("task-99", "exec-2")]

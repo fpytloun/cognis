@@ -680,7 +680,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                           <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
                           <span class="font-mono">{tool.source?.type === 'skill' && tool.source?.raw_tool_name ? tool.source.raw_tool_name : tool.name}</span>
                         </label>
-                        <span class="text-xs text-slate-500">{tool.description}</span>
+                        <span class="text-xs text-slate-500">
+                          {tool.description}
+                          {#if (tool as EffectiveToolItem).available_on && ((tool as EffectiveToolItem).available_on?.length ?? 0) > 1}
+                            <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-300" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
+                              on: {((tool as EffectiveToolItem).available_on ?? []).join(', ')}
+                            </span>
+                          {/if}
+                        </span>
                         <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
                           {#each permissionOptions as option}
                             <option value={option}>{option || 'inherit'}</option>

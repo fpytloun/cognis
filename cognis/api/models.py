@@ -1150,6 +1150,9 @@ class EffectiveToolItemResponse(BaseModel):
     disabled_reason: str | None = None
     timeout_seconds: int = 30
     non_bypassable: bool = False
+    # Stage 36: list of assigned executor ids that observe this tool. Empty
+    # for non-executor tools. Helps UIs render a per-executor matrix.
+    available_on: list[str] = Field(default_factory=list)
 
 
 class EffectiveToolsStateResponse(BaseModel):
@@ -1163,10 +1166,23 @@ class EffectiveToolsExecutorResponse(BaseModel):
     executor_id: str | None = None
     executor_type: str | None = None
     selection_source: str = "unresolved"
+    # Stage 36 multi-executor agents — these fields are populated when the
+    # executor is one of several assigned to the agent. ``is_active`` marks
+    # the conversation's currently-active executor; ``state`` carries the
+    # ExecutorAvailability value (usable, degraded, offline, blocked,
+    # reconfiguring, policy_denied, not_found, unauthorized).
+    is_primary: bool | None = None
+    is_active: bool | None = None
+    state: str | None = None
+    description: str | None = None
 
 
 class EffectiveToolsResponse(BaseModel):
+    # Back-compat: ``executor`` is the active (or primary) executor that
+    # the existing UI displays. Stage 36 adds ``executors`` for the full
+    # assigned pool.
     executor: EffectiveToolsExecutorResponse
+    executors: list[EffectiveToolsExecutorResponse] = Field(default_factory=list)
     configured_state: EffectiveToolsStateResponse
     live_state: EffectiveToolsStateResponse
     warnings: list[str] = Field(default_factory=list)

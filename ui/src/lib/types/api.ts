@@ -394,6 +394,11 @@ export interface EffectiveToolItem {
   disabled_reason?: string | null;
   timeout_seconds: number;
   non_bypassable: boolean;
+  /**
+   * Stage 36: ids of assigned executors that observe this tool. Empty
+   * for non-executor (controller) tools.
+   */
+  available_on?: string[];
 }
 
 export interface EffectiveToolsState {
@@ -407,10 +412,25 @@ export interface EffectiveToolsExecutorSummary {
   executor_id: string | null;
   executor_type: string | null;
   selection_source: string;
+  /**
+   * Stage 36 multi-executor agents — populated when this entry is part
+   * of the agent's full assigned pool (primary + additional). Optional
+   * for back-compat with the singular ``executor`` field.
+   */
+  is_primary?: boolean | null;
+  is_active?: boolean | null;
+  state?: string | null;
+  description?: string | null;
 }
 
 export interface EffectiveToolsResponse {
+  /** Active or primary executor (back-compat). */
   executor: EffectiveToolsExecutorSummary;
+  /**
+   * Stage 36: full assigned pool (primary executors first, then
+   * additional). Empty when the legacy single-executor resolver runs.
+   */
+  executors?: EffectiveToolsExecutorSummary[];
   configured_state: EffectiveToolsState;
   live_state: EffectiveToolsState;
   warnings: string[];

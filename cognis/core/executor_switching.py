@@ -100,7 +100,14 @@ class SwitchOutcome:
                 f"Executor '{executor_id}' is unavailable (state: {state}). "
                 "Active executor unchanged."
             )
-        return f"Could not switch executor: {self.error_detail or self.error_reason or 'error'}"
+        if self.error_reason == "conversation_missing":
+            return (
+                "Could not switch executor — conversation state was not "
+                "found. Try again after refreshing the page."
+            )
+        # Catch-all: prefer the explicit detail over the bare reason code.
+        detail = self.error_detail or self.error_reason or "error"
+        return f"Could not switch executor: {detail}"
 
 
 async def perform_executor_switch(
@@ -111,6 +118,7 @@ async def perform_executor_switch(
     actor: SwitchActor,
     session_factory: Any,
     reason: str | None = None,
+    task_id: str | None = None,
 ) -> SwitchOutcome:
     """Switch the conversation's active executor.
 
@@ -118,6 +126,11 @@ async def perform_executor_switch(
     responsible for any audit logging beyond this helper's structured
     log entry, and for surfacing the outcome to the agent (tool result)
     or user (system message).
+
+    Stage 36: when ``task_id`` is provided (i.e., the switch happened
+    inside a task-step conversation), the task-level active executor
+    pin is updated as well, so subsequent steps of the same task
+    automatically inherit the new binding.
     """
 
     target = pool.by_id(executor_id)
@@ -170,8 +183,12 @@ async def perform_executor_switch(
             ),
         )
 
-    # Persist the new active executor
-    from cognis.store.queries import set_conversation_active_executor
+    # Persist the new active executor on the conversation, and on the
+    # task (if any) so subsequent steps of the same task inherit the pin.
+    from cognis.store.queries import (
+        set_conversation_active_executor,
+        set_task_active_executor,
+    )
 
     async with session_factory() as session:
         ok = await set_conversation_active_executor(
@@ -187,6 +204,16 @@ async def perform_executor_switch(
                     f"Conversation '{conversation_id}' not found; cannot persist switch."
                 ),
             )
+        if task_id:
+            # Best-effort task pin update; failure here should not undo the
+            # conversation-level switch the agent already saw succeed.
+            try:
+                await set_task_active_executor(session, task_id, target.executor_id)
+            except Exception:
+                logger.debug(
+                    "executor_switch: failed to persist task pin",
+                    exc_info=True,
+                )
         await session.commit()
 
     available_tools = sorted(target.observed_tool_names)

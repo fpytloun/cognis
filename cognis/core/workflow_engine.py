@@ -880,6 +880,7 @@ class WorkflowEngine:
                 conversation_id=getattr(conversation, "conversation_id", None)
                 if conversation is not None
                 else None,
+                task_id=task.task_id,
             )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
@@ -2582,33 +2583,56 @@ class WorkflowEngine:
         executor_agent: AgentDefinition | None = None,
         access_context: RuntimeAccessContext | None = None,
         conversation_id: str | None = None,
+        task_id: str | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
-            try:
-                return cast(
-                    ResolvedStepRuntime,
-                    await self._step_runtime_factory(
-                        agent=agent,
-                        user_email=user_email,
-                        executor_agent=executor_agent,
-                        access_context=access_context,
-                        conversation_id=conversation_id,
-                    ),
-                )
-            except TypeError as exc:
-                # Older factory signature without conversation_id
-                if "conversation_id" not in str(exc):
-                    raise
-                return cast(
-                    ResolvedStepRuntime,
-                    await self._step_runtime_factory(
-                        agent=agent,
-                        user_email=user_email,
-                        executor_agent=executor_agent,
-                        access_context=access_context,
-                    ),
-                )
+            attempts: list[dict[str, Any]] = [
+                {
+                    "agent": agent,
+                    "user_email": user_email,
+                    "executor_agent": executor_agent,
+                    "access_context": access_context,
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                },
+                # Compat: factory without task_id
+                {
+                    "agent": agent,
+                    "user_email": user_email,
+                    "executor_agent": executor_agent,
+                    "access_context": access_context,
+                    "conversation_id": conversation_id,
+                },
+                # Compat: factory without conversation_id
+                {
+                    "agent": agent,
+                    "user_email": user_email,
+                    "executor_agent": executor_agent,
+                    "access_context": access_context,
+                },
+                # Compat: factory without access_context
+                {
+                    "agent": agent,
+                    "user_email": user_email,
+                    "executor_agent": executor_agent,
+                },
+            ]
+            last_exc: TypeError | None = None
+            for kwargs in attempts:
+                try:
+                    return cast(
+                        ResolvedStepRuntime,
+                        await self._step_runtime_factory(**kwargs),
+                    )
+                except TypeError as exc:
+                    msg = str(exc)
+                    last_exc = exc
+                    # Only retry if the error is about an unexpected kwarg.
+                    if "unexpected keyword" not in msg and "got an unexpected" not in msg:
+                        raise
+            if last_exc is not None:
+                raise last_exc
 
         raise RuntimeError("Step runtime factory unavailable; refusing shared executor fallback")
 
@@ -2707,13 +2731,35 @@ class WorkflowEngine:
         step_def: StepDefinition,
         agent: AgentDefinition,
     ) -> tuple[Any, Any]:
-        """Create a conversation and session for a workflow step."""
+        """Create a conversation and session for a workflow step.
+
+        Stage 36: copies the task-level ``active_executor_id`` pin (if any)
+        into the new step conversation so all steps of a task run on the
+        same executor unless the agent or user explicitly switches.
+        """
         from cognis.models.session import ConversationContext
 
         context = ConversationContext(
             type="task",
             ref=task.task_id,
         )
+        # Stage 36: read the task-level active executor pin so it carries
+        # forward to this step's conversation.
+        task_active_executor_id: str | None = None
+        try:
+            async with self._session_factory() as db_session:
+                from cognis.store.queries import get_task
+
+                task_row = await get_task(db_session, task.task_id)
+                if task_row is not None:
+                    task_active_executor_id = getattr(
+                        task_row, "active_executor_id", None
+                    )
+        except Exception:
+            logger.debug(
+                "stage36: failed to read task.active_executor_id",
+                exc_info=True,
+            )
         conversation, session = await self._session_manager.create_conversation_with_root_session(
             user_email=task.created_by,
             agent_id=agent.agent_id,
@@ -2721,6 +2767,7 @@ class WorkflowEngine:
             title=f"Task: {task.title} / Step: {step_def.name}",
             title_source="manual",
             intention=f"Task: {task.title} — Step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
+            initial_active_executor_id=task_active_executor_id,
         )
         return conversation, session
 

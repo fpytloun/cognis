@@ -210,6 +210,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_user_management_columns)
         await conn.run_sync(_ensure_conversation_last_read_at)
         await conn.run_sync(_ensure_conversation_active_executor_id)
+        await conn.run_sync(_ensure_task_active_executor_id)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_executor_token_version_column)
@@ -580,6 +581,25 @@ def _ensure_conversation_active_executor_id(sync_conn: object) -> None:
 
     if "active_executor_id" not in columns:
         execute(text("ALTER TABLE conversations ADD COLUMN active_executor_id VARCHAR"))
+
+
+def _ensure_task_active_executor_id(sync_conn: object) -> None:
+    """Add tasks.active_executor_id (Stage 36 task-level executor pin).
+
+    Workflow steps each create their own conversation; without a task-level
+    pin, every step would re-pick a primary executor independently. The task
+    pin is the durable carrier of the agent's executor choice across all
+    steps of a single task.
+    """
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("tasks")}
+    except Exception:
+        return  # table doesn't exist yet (create_all will handle it)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "active_executor_id" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN active_executor_id VARCHAR"))
 
 
 def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:

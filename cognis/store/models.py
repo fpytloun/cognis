@@ -539,6 +539,11 @@ class Task(Base):
     workflow_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     queue_name: Mapped[str] = mapped_column(String, nullable=False, default="default")
     scheduled_for: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Stage 36: task-level active executor pin. Initialised on the first
+    # step that resolves a runtime; carried forward to every step
+    # conversation so all steps of a task run on the same executor unless
+    # the agent explicitly switches.
+    active_executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )

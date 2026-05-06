@@ -156,6 +156,65 @@ async def test_switch_to_unassigned_fails(factory_and_conv) -> None:
 
 
 @pytest.mark.asyncio
+async def test_switch_with_task_id_updates_task_pin(monkeypatch, factory_and_conv) -> None:
+    """Stage 36: passing task_id updates the task pin alongside the conversation pin."""
+
+    factory, conv = factory_and_conv
+    pool = ExecutorPool(primary=[_target("exec-1"), _target("exec-2")])
+
+    task_calls: list[tuple[str, str]] = []
+
+    async def _set_task(_session, task_id, executor_id):
+        task_calls.append((task_id, executor_id))
+        return True
+
+    import cognis.store.queries as store_queries
+
+    monkeypatch.setattr(store_queries, "set_task_active_executor", _set_task)
+
+    outcome = await perform_executor_switch(
+        conversation_id=conv.conversation_id,
+        pool=pool,
+        executor_id="exec-2",
+        actor="agent",
+        session_factory=factory,
+        task_id="task-99",
+    )
+    assert outcome.status == "ok"
+    assert conv.active_executor_id == "exec-2"
+    assert task_calls == [("task-99", "exec-2")]
+
+
+@pytest.mark.asyncio
+async def test_switch_with_task_id_swallows_task_pin_failure(
+    monkeypatch, factory_and_conv
+) -> None:
+    """Task pin failure must NOT undo a successful conversation switch."""
+
+    factory, conv = factory_and_conv
+    pool = ExecutorPool(primary=[_target("exec-1"), _target("exec-2")])
+
+    async def _set_task_boom(_session, _task_id, _executor_id):
+        raise RuntimeError("simulated DB failure")
+
+    import cognis.store.queries as store_queries
+
+    monkeypatch.setattr(store_queries, "set_task_active_executor", _set_task_boom)
+
+    outcome = await perform_executor_switch(
+        conversation_id=conv.conversation_id,
+        pool=pool,
+        executor_id="exec-2",
+        actor="agent",
+        session_factory=factory,
+        task_id="task-99",
+    )
+    # Conversation switch still wins
+    assert outcome.status == "ok"
+    assert conv.active_executor_id == "exec-2"
+
+
+@pytest.mark.asyncio
 async def test_switch_to_unusable_fails(factory_and_conv) -> None:
     factory, conv = factory_and_conv
     pool = ExecutorPool(

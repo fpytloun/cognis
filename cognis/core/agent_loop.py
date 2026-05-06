@@ -4281,6 +4281,7 @@ class AgentLoop:
                         actor="agent",
                         session_factory=self.session_manager.session_factory,
                         reason=reason_arg if isinstance(reason_arg, str) else None,
+                        task_id=ctx.task_id,
                     )
                     is_error = outcome.status == "error"
                     if not is_error and outcome.target is not None:
@@ -9047,6 +9048,24 @@ class AgentLoop:
             }
             tc = tc.model_copy(update={"arguments": sanitized_arguments})
 
+        # Defensive: reject target_executor on non-executor tools so the
+        # LLM cannot accidentally route, e.g., a memory or orchestration
+        # tool to a remote executor.
+        if target_executor_id is not None:
+            registry = self._get_tool_registry(ctx)
+            if registry is not None:
+                registered = registry.get(tc.name)
+                if registered is not None and registered.definition.source.type != "executor":
+                    return ToolResult(
+                        output=(
+                            f"target_executor is only supported on executor-routed "
+                            f"tools. The tool '{tc.name}' is "
+                            f"{registered.definition.source.type}-routed and was not "
+                            "executed."
+                        ),
+                        is_error=True,
+                    )
+
         executor_connection = self._get_executor(ctx)
         if target_executor_id is not None:
             pool = getattr(ctx, "executor_pool", None)
@@ -9118,17 +9137,20 @@ class AgentLoop:
     ) -> Any:
         """Resolve a live executor connection by id (Stage 36).
 
-        Returns None when no connection is available. Used by per-call
-        ``target_executor`` routing for executors other than the active one.
+        Per-call ``target_executor`` routing only works against executors
+        that expose a stable lookup-by-id connection — currently
+        WebSocket remote executors. In-process and subprocess executors
+        use an ephemeral spawn-per-step model and are not addressable
+        mid-step; the schema overlay in
+        ``_get_executor_tool_schemas`` filters them out so the LLM
+        cannot ask for them. This method returns ``None`` for any
+        non-WebSocket type as a defence-in-depth check.
         """
         executor_provider = getattr(self.providers, "executor", None)
         if executor_provider is None:
             return None
-        # WebSocket remote executors expose a ws sub-provider with
-        # get_connection(executor_id). In-process and subprocess types
-        # are not yet routable per-call (the active connection model
-        # is one-handle-per-step); for those, return None and let the
-        # caller surface a factual error.
+        if target_executor_type != "websocket":
+            return None
         ws_provider = getattr(executor_provider, "websocket", None)
         if ws_provider is None:
             return None
@@ -11087,11 +11109,18 @@ class AgentLoop:
 
         Returns schemas in the OpenAI function calling format.
 
-        Stage 36: when the agent has multiple usable assigned executors that
-        observe the same tool, an optional ``target_executor`` parameter is
-        overlaid onto the tool's input schema with an enum of valid executor
-        ids. This lets the LLM route a single call to a specific executor
-        without changing the conversation's active executor.
+        Stage 36: when the agent has multiple per-call-routable assigned
+        executors that observe the same tool, an optional
+        ``target_executor`` parameter is overlaid on the tool's input
+        schema with an enum of valid executor ids. This lets the LLM
+        route a single call to a specific executor without changing the
+        conversation's active executor.
+
+        Per-call routing only works for the active executor (any type)
+        and for additional executors of type ``websocket`` (the only
+        type that exposes a stable lookup-by-id connection model). The
+        enum is filtered accordingly so the LLM cannot ask for
+        unreachable per-call routing.
         """
         registry = self._get_tool_registry(ctx)
         if registry is None:
@@ -11101,6 +11130,14 @@ class AgentLoop:
         from cognis.tools.builtin.orchestration import ORCHESTRATION_TOOL_NAMES
 
         pool = getattr(ctx, "executor_pool", None)
+        active_id = getattr(ctx, "active_executor_id", None)
+
+        def _per_call_routable(target: Any) -> bool:
+            if not target.usable:
+                return False
+            if active_id is not None and target.executor_id == active_id:
+                return True
+            return target.executor_type == "websocket"
 
         def _executors_offering(tool_name: str) -> list[str]:
             if pool is None:
@@ -11108,7 +11145,7 @@ class AgentLoop:
             return sorted(
                 t.executor_id
                 for t in pool.all
-                if tool_observed_on(t, tool_name)
+                if tool_observed_on(t, tool_name) and _per_call_routable(t)
             )
 
         schemas: list[dict[str, Any]] = []
@@ -11118,7 +11155,7 @@ class AgentLoop:
                 continue
             parameters = tool_def.parameters
             # Add target_executor overlay only for executor-routed tools
-            # available on more than one assigned executor.
+            # available on more than one per-call-routable assigned executor.
             if pool is not None and tool_def.source.type == "executor":
                 offering = _executors_offering(tool_def.name)
                 if len(offering) >= 2:

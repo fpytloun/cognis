@@ -265,6 +265,7 @@ async def _resolve_eligible_executor_config(
     *,
     conversation_active_executor_id: str | None = None,
     conversation_id: str | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve the only executor eligible for an agent execution.
 
@@ -298,8 +299,34 @@ async def _resolve_eligible_executor_config(
         get_active_agent_grant,
         get_executor_row,
         initialize_conversation_active_executor,
+        initialize_task_active_executor,
         list_executors,
     )
+
+    async def _persist_initial_active_executor(
+        session: Any, executor_id: str
+    ) -> None:
+        """Idempotently persist the initial active executor on conversation+task."""
+
+        try:
+            if isinstance(conversation_id, str) and conversation_id:
+                await initialize_conversation_active_executor(
+                    session, conversation_id, executor_id
+                )
+            if isinstance(task_id, str) and task_id:
+                await initialize_task_active_executor(session, task_id, executor_id)
+            commit = getattr(session, "commit", None)
+            if callable(commit):
+                await commit()
+        except Exception:
+            rollback = getattr(session, "rollback", None)
+            if callable(rollback):
+                with contextlib.suppress(Exception):
+                    await rollback()
+            logger.debug(
+                "stage36: failed to persist initial active executor",
+                exc_info=True,
+            )
 
     executor_owner_email = user_email
     execution = agent.execution if isinstance(agent.execution, dict) else {}
@@ -353,6 +380,11 @@ async def _resolve_eligible_executor_config(
                     f"Conversation-active executor '{conversation_active_executor_id}' "
                     f"is not usable (state: {target.state.value})"
                 )
+            # Backfill: if the conversation pin came from a pre-existing
+            # source but the task pin is still NULL (e.g. mid-deploy
+            # upgrade), seed the task pin too. The IS NULL guards keep
+            # this idempotent.
+            await _persist_initial_active_executor(session, target.executor_id)
             return _executor_config_from_row(
                 target.row,
                 executor_owner_email=executor_owner_email,
@@ -376,24 +408,8 @@ async def _resolve_eligible_executor_config(
                 raise RuntimeError(f"Executor '{explicit_id}' is not available to this user")
             if not is_executor_row_usable(row, policy, owner_email=executor_owner_email):
                 raise RuntimeError(f"Executor '{explicit_id}' is not active or allowed by policy")
-            # Persist as the conversation's initial active executor on first turn.
-            if isinstance(conversation_id, str) and conversation_id:
-                try:
-                    await initialize_conversation_active_executor(
-                        session, conversation_id, str(explicit_id)
-                    )
-                    commit = getattr(session, "commit", None)
-                    if callable(commit):
-                        await commit()
-                except Exception:
-                    rollback = getattr(session, "rollback", None)
-                    if callable(rollback):
-                        with contextlib.suppress(Exception):
-                            await rollback()
-                    logger.debug(
-                        "stage36: failed to persist initial active executor (explicit)",
-                        exc_info=True,
-                    )
+            # Persist as the conversation+task's initial active executor on first turn.
+            await _persist_initial_active_executor(session, str(explicit_id))
             return _executor_config_from_row(
                 row,
                 executor_owner_email=executor_owner_email,
@@ -453,23 +469,7 @@ async def _resolve_eligible_executor_config(
             raise RuntimeError(
                 f"Executor selector for agent '{agent.agent_id}' matched {usable_count} usable executors"
             )
-        if isinstance(conversation_id, str) and conversation_id:
-            try:
-                await initialize_conversation_active_executor(
-                    session, conversation_id, initial.executor_id
-                )
-                commit = getattr(session, "commit", None)
-                if callable(commit):
-                    await commit()
-            except Exception:
-                rollback = getattr(session, "rollback", None)
-                if callable(rollback):
-                    with contextlib.suppress(Exception):
-                        await rollback()
-                logger.debug(
-                    "stage36: failed to persist initial active executor (selector)",
-                    exc_info=True,
-                )
+        await _persist_initial_active_executor(session, initial.executor_id)
         return _executor_config_from_row(
             initial.row,
             executor_owner_email=executor_owner_email,
@@ -725,6 +725,7 @@ def build_step_runtime_factory(
         executor_agent: AgentDefinition | None = None,
         access_context: RuntimeAccessContext | None = None,
         conversation_id: str | None = None,
+        task_id: str | None = None,
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
@@ -739,21 +740,33 @@ def build_step_runtime_factory(
         selection_source, hard_bound_executor = _agent_executor_binding(executor_agent)
 
         # Stage 36: read conversation-level active_executor_id (if any) to
-        # pin the runtime to a previously-switched executor.
+        # pin the runtime to a previously-switched executor. For task-driven
+        # workflows, also fall back to the task-level pin so all steps of a
+        # task run on the same executor (workflow engine seeds the step
+        # conversation from the task pin, but a freshly-created task pin
+        # may not yet be reflected on the conversation row when the first
+        # step resolves).
         conversation_active_executor_id: str | None = None
-        if conversation_id and session_factory is not None:
-            from cognis.store.queries import get_conversation
+        if session_factory is not None and (conversation_id or task_id):
+            from cognis.store.queries import get_conversation, get_task
 
             try:
                 async with session_factory() as db_session:
-                    conv_row = await get_conversation(db_session, conversation_id)
-                    if conv_row is not None:
-                        conversation_active_executor_id = getattr(
-                            conv_row, "active_executor_id", None
-                        )
+                    if conversation_id:
+                        conv_row = await get_conversation(db_session, conversation_id)
+                        if conv_row is not None:
+                            conversation_active_executor_id = getattr(
+                                conv_row, "active_executor_id", None
+                            )
+                    if conversation_active_executor_id is None and task_id:
+                        task_row = await get_task(db_session, task_id)
+                        if task_row is not None:
+                            conversation_active_executor_id = getattr(
+                                task_row, "active_executor_id", None
+                            )
             except Exception:
                 logger.debug(
-                    "stage36: failed to read conversation.active_executor_id",
+                    "stage36: failed to read conversation/task active_executor_id",
                     exc_info=True,
                 )
 
@@ -764,6 +777,7 @@ def build_step_runtime_factory(
             policy,
             conversation_active_executor_id=conversation_active_executor_id,
             conversation_id=conversation_id,
+            task_id=task_id,
         )
 
         # Stage 36: resolve the agent's full executor pool (primary + additional)

@@ -42,14 +42,31 @@ def loop_with_pool():
 
 def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     """Build a minimal StepContext-like object."""
+    from cognis.models.tool import ToolDefinition, ToolSource
+    from cognis.tools.registry import RegisteredTool, ToolRegistry
 
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run a shell command",
+                parameters={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+                source=ToolSource(type="executor"),
+                category="shell",
+            )
+        )
+    )
     ctx = MagicMock()
     ctx.executor_pool = pool
     ctx.executor_connection = MagicMock(name="active_connection")
     ctx.active_executor_id = active_executor_id or (pool.primary[0].executor_id if pool.primary else None)
     ctx.session = MagicMock()
     ctx.agent = MagicMock()
-    ctx.tool_registry = MagicMock()
+    ctx.tool_registry = registry
     return ctx
 
 
@@ -151,6 +168,42 @@ async def test_target_executor_same_as_active_uses_active_connection(loop_with_p
     call = loop_with_pool.tool_router.execute.await_args
     # Should use the active connection
     assert call.args[4] is ctx.executor_connection
+
+
+@pytest.mark.asyncio
+async def test_target_executor_rejected_on_non_executor_tool(loop_with_pool) -> None:
+    """Defensive: target_executor on a builtin/memory tool returns a factual error."""
+    from cognis.models.tool import ToolDefinition, ToolSource
+    from cognis.tools.registry import RegisteredTool, ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="recall_memories",
+                description="Recall memories",
+                parameters={"type": "object"},
+                source=ToolSource(type="builtin"),  # not executor
+                category="memory",
+            )
+        )
+    )
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = MagicMock()
+    ctx.executor_pool = pool
+    ctx.executor_connection = MagicMock()
+    ctx.active_executor_id = "exec-active"
+    ctx.tool_registry = registry
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+
+    tc = _toolcall("recall_memories", {"query": "x", "target_executor": "exec-active"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+    assert result.is_error is True
+    assert "executor-routed" in result.output.lower()
+    loop_with_pool.tool_router.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

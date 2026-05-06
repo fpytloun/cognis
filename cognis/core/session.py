@@ -375,8 +375,15 @@ class SessionManager:
         title: str | None = None,
         title_source: str = "unset",
         intention: str | None = None,
+        initial_active_executor_id: str | None = None,
     ) -> tuple[ConversationModel, SessionModel]:
-        """Create a conversation and root session atomically."""
+        """Create a conversation and root session atomically.
+
+        Stage 36: when ``initial_active_executor_id`` is provided, it is
+        copied into the new conversation's ``active_executor_id`` so the
+        conversation starts already pinned. Used by the workflow engine to
+        propagate the task-level pin into each step conversation.
+        """
 
         async with self.session_factory() as db_session:
             try:
@@ -392,6 +399,12 @@ class SessionManager:
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
                 )
+                # Stage 36: seed the conversation's active_executor_id from
+                # the task-level pin (if provided). The runtime factory
+                # treats the conversation pin as authoritative, so this
+                # carries the agent's prior choice into the new step.
+                if initial_active_executor_id:
+                    conversation.active_executor_id = initial_active_executor_id
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation.conversation_id,

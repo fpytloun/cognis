@@ -134,6 +134,13 @@ call `switch_executor` to move to a different executor, or stop. The
 controller does not auto-fall-back, does not silently re-route, and does
 not cancel the turn.
 
+For task workflows, the binding is persisted at the task level. All steps
+of a single task run on the same executor by default — even though each
+step creates its own conversation, the task pin carries forward and the
+controller never re-picks between steps. `switch_executor` or
+`/executor` issued mid-workflow propagates to the task pin and is
+inherited by every subsequent step.
+
 ### `switch_executor` tool
 
 Available to the LLM whenever the agent has more than one assigned

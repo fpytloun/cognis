@@ -1018,6 +1018,17 @@ class CommandDispatcher:
         if executor_id:
             from cognis.core.executor_switching import perform_executor_switch
 
+            # Stage 36: when the conversation is a task-step conversation,
+            # propagate the switch to the task-level pin so subsequent
+            # steps inherit the new binding.
+            task_id_for_switch: str | None = None
+            if (
+                conversation.context.type == "task"
+                and isinstance(conversation.context.ref, str)
+                and conversation.context.ref
+            ):
+                task_id_for_switch = conversation.context.ref
+
             outcome = await perform_executor_switch(
                 conversation_id=conversation.conversation_id,
                 pool=pool,
@@ -1025,6 +1036,7 @@ class CommandDispatcher:
                 actor="user",
                 session_factory=self._session_factory,
                 reason="user requested via /executor",
+                task_id=task_id_for_switch,
             )
             data: dict[str, Any] = {
                 "code": "executor_switched" if outcome.status == "ok" else "executor_switch_failed",

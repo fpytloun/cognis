@@ -1958,6 +1958,52 @@ async def get_task(session: AsyncSession, task_id: str) -> Task | None:
     return result.scalar_one_or_none()
 
 
+async def set_task_active_executor(
+    session: AsyncSession,
+    task_id: str,
+    active_executor_id: str | None,
+) -> bool:
+    """Set the task-level active executor ID (Stage 36).
+
+    Used by the ``switch_executor`` controller tool and the ``/executor``
+    slash command when invoked from a task-step conversation, so the
+    binding carries forward to subsequent steps of the same task.
+    """
+
+    task = await get_task(session, task_id)
+    if task is None:
+        return False
+    task.active_executor_id = active_executor_id
+    task.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def initialize_task_active_executor(
+    session: AsyncSession,
+    task_id: str,
+    active_executor_id: str,
+) -> bool:
+    """Set the task active executor only if it is currently unset (Stage 36).
+
+    The controller is allowed to make exactly one such initial pick per task.
+    After that, only ``switch_executor`` / ``/executor`` may change it.
+    """
+
+    result = await session.execute(
+        update(Task)
+        .where(
+            Task.task_id == task_id,
+            Task.active_executor_id.is_(None),
+        )
+        .values(
+            active_executor_id=active_executor_id,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    return bool(result.rowcount)
+
+
 async def create_task_comment(
     session: AsyncSession,
     *,

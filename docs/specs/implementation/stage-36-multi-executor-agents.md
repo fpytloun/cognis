@@ -2,7 +2,7 @@
 
 ## Status
 
-IN_PROGRESS
+COMPLETE
 
 ## Goal
 
@@ -60,6 +60,14 @@ These are hard rules. The implementation MUST NOT violate them.
    `target_executor` in that very tool call, or (b) the
    `active_executor_id` value advertised in the environment block of the
    request that produced the tool call. There is no third source.
+
+6. **Workflow same-executor invariant.** All steps of a single task run
+   on the same executor by default. Each step creates its own
+   conversation, but the task-level pin (`tasks.active_executor_id`)
+   carries forward, so the controller does not re-pick between steps.
+   The agent or user can still call `switch_executor` / `/executor`
+   mid-workflow; the new binding is propagated to the task pin and
+   inherited by all subsequent step conversations.
 
 ## Design Summary
 
@@ -146,13 +154,24 @@ its state.
 
 ### 36.3 Active Executor State
 
-- Persist `conversation.active_executor_id`. Read at runtime resolution
-  time. Pass it into the existing strict resolver to override
+- Persist `conversation.active_executor_id` AND `tasks.active_executor_id`.
+  The conversation pin is authoritative for chat conversations; the task
+  pin is authoritative for multi-step task workflows where each step
+  creates its own conversation row.
+- Read at runtime resolution time. The runtime factory checks the
+  conversation pin first; if unset, it falls back to the task pin. The
+  resolver passes the chosen value into the resolver to override
   `execution.get("executor_id")` for runtime selection.
 - The controller initialises `active_executor_id` once, the first time the
-  runtime is built for that conversation, choosing from the usable primary
-  set (preferring `runtime_state == active`, then `degraded`, then sorted
-  by `executor_id`).
+  runtime is built for that conversation/task, choosing from the usable
+  primary set (preferring `runtime_state == active`, then `degraded`,
+  then sorted by `executor_id`). Both the conversation pin and the task
+  pin are seeded atomically.
+- New step conversations created by the workflow engine inherit the
+  task pin at creation time so each step starts already pinned.
+- `switch_executor` and `/executor` issued from a task-step conversation
+  also update the task pin so the change carries forward to subsequent
+  steps.
 - The controller never re-picks; if the persisted active is offline or no
   longer assigned, factual errors flow through to tool results until the
   agent or user acts.

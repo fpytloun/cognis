@@ -612,8 +612,57 @@ async def _resolve_effective_tools_response(
         connected = True
         live_items = configured_items
 
+    # Stage 36: resolve the agent's full executor pool so the response can
+    # describe primary + additional executors and per-tool availability.
+    pool_executors: list[EffectiveToolsExecutorResponse] = []
+    pool_observed_tool_names: dict[str, set[str]] = {}
+    try:
+        from cognis.core.executor_pool import resolve_executor_pool
+
+        pool = await resolve_executor_pool(
+            session_factory=session_factory,
+            agent_execution=execution,
+            user_email=acting_user_email,
+            executor_owner_email=executor_owner_email,
+            policy=policy,
+        )
+        for target in pool.all:
+            pool_executors.append(
+                EffectiveToolsExecutorResponse(
+                    executor_id=target.executor_id,
+                    executor_type=target.executor_type or None,
+                    selection_source=target.selection_source,
+                    is_primary=target.is_primary,
+                    is_active=(
+                        selected is not None
+                        and target.executor_id == selected.executor_id
+                    ),
+                    state=target.state.value,
+                    description=target.description,
+                )
+            )
+            pool_observed_tool_names[target.executor_id] = target.observed_tool_names
+    except Exception:
+        # Non-fatal: degenerate to legacy single-executor shape.
+        pool = None
+
+    # Annotate tool items with the list of executors that observe each tool.
+    if pool_observed_tool_names:
+        def _available_on(tool_name: str) -> list[str]:
+            return sorted(
+                executor_id
+                for executor_id, names in pool_observed_tool_names.items()
+                if tool_name in names
+            )
+
+        for item in configured_items:
+            item.available_on = _available_on(item.name)
+        for item in live_items:
+            item.available_on = _available_on(item.name)
+
     return EffectiveToolsResponse(
         executor=executor_summary,
+        executors=pool_executors,
         configured_state=EffectiveToolsStateResponse(
             tools=configured_items,
             connected=True,
