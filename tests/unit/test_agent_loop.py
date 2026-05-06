@@ -6728,3 +6728,181 @@ def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
     content = str(reminder["content"])
     assert "overrides task-level finishing instructions and loaded skill instructions" in content
     assert "call write_deliverable" in content
+
+
+def _post_deliverable_ctx() -> StepContext:
+    return StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt="Plan."),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="A"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-1",
+    )
+
+
+def _post_deliverable_loop() -> AgentLoop:
+    return AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+
+def test_post_deliverable_reminder_emits_when_armed_and_todos_terminal() -> None:
+    agent_loop = _post_deliverable_loop()
+    ctx = _post_deliverable_ctx()
+    ctx.post_deliverable_pending = True
+    ctx.todos = [{"content": "do x", "status": "completed"}]
+    messages: list[dict] = []
+
+    agent_loop._maybe_inject_post_deliverable_reminder(ctx, messages)
+
+    assert len(messages) == 1
+    msg = messages[0]
+    assert msg["role"] == "system"
+    assert msg.get("_post_deliverable_reminder") is True
+    assert "step_complete" in msg["content"]
+    assert ctx.post_deliverable_reminders_sent == 1
+
+
+def test_post_deliverable_reminder_skipped_when_todos_pending() -> None:
+    agent_loop = _post_deliverable_loop()
+    ctx = _post_deliverable_ctx()
+    ctx.post_deliverable_pending = True
+    ctx.todos = [{"content": "still working", "status": "in_progress"}]
+    messages: list[dict] = []
+
+    agent_loop._maybe_inject_post_deliverable_reminder(ctx, messages)
+
+    assert messages == []
+    # The flag should remain armed for the cycle when todos eventually terminate.
+    assert ctx.post_deliverable_pending is True
+    assert ctx.post_deliverable_reminders_sent == 0
+
+
+def test_post_deliverable_reminder_caps_at_two() -> None:
+    agent_loop = _post_deliverable_loop()
+    ctx = _post_deliverable_ctx()
+    ctx.post_deliverable_pending = True
+    ctx.todos = [{"content": "done", "status": "completed"}]
+    messages: list[dict] = []
+
+    for _ in range(5):
+        agent_loop._maybe_inject_post_deliverable_reminder(ctx, messages)
+
+    assert len(messages) == 2
+    assert ctx.post_deliverable_reminders_sent == 2
+
+
+def test_post_deliverable_reminder_disarms_when_step_complete_not_required() -> None:
+    agent_loop = _post_deliverable_loop()
+    ctx = _post_deliverable_ctx()
+    ctx.policy = CHAT_POLICY  # require_step_complete=False
+    ctx.post_deliverable_pending = True
+    messages: list[dict] = []
+
+    agent_loop._maybe_inject_post_deliverable_reminder(ctx, messages)
+
+    assert messages == []
+    assert ctx.post_deliverable_pending is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_delegate_batches_run_concurrently() -> None:
+    """Multiple consecutive ``delegate`` calls in one turn must fan out via gather."""
+
+    started: list[str] = []
+    in_flight: list[str] = []
+    peak_concurrent = 0
+
+    agent_loop = _post_deliverable_loop()
+
+    async def fake_handle_orchestration_tool(
+        tc: ToolCall,
+        *,
+        ctx,
+        events_to_record,
+        on_token=None,
+        on_tool_call=None,
+        on_tool_result=None,
+    ) -> ToolResult:
+        nonlocal peak_concurrent
+        in_flight.append(tc.call_id)
+        peak_concurrent = max(peak_concurrent, len(in_flight))
+        started.append(tc.call_id)
+        # Yield control so siblings actually overlap when fanned out.
+        await asyncio.sleep(0.01)
+        in_flight.remove(tc.call_id)
+        return ToolResult(output=f"done-{tc.call_id}")
+
+    async def noop_flush(*args, **kwargs):
+        return None
+
+    agent_loop._handle_orchestration_tool = fake_handle_orchestration_tool  # type: ignore[assignment]
+    agent_loop._flush_events_incremental = noop_flush  # type: ignore[assignment]
+
+    ctx = _post_deliverable_ctx()
+    ctx.tool_registry = ToolRegistry()
+    delegates = [
+        ToolCall(call_id=f"d{i}", name="delegate", arguments={"task": f"explore {i}"})
+        for i in range(3)
+    ]
+    events: list = []
+
+    results = await agent_loop._precompute_parallel_delegate_batches(
+        ctx,
+        delegates,
+        events_to_record=events,
+    )
+
+    # Every delegate index has a precomputed result.
+    assert {0, 1, 2} == set(results.keys())
+    for idx, call_id in enumerate(("d0", "d1", "d2")):
+        assert results[idx].output == f"done-{call_id}"
+    # Calls actually overlapped — sequential execution would peak at 1.
+    assert peak_concurrent >= 2
+    # Tool-call events are recorded in input order before fanning out so
+    # the in-flight stream matches the model's emitted order.
+    tool_call_event_ids = [
+        getattr(event, "data", {}).get("call_id")
+        for event in events
+        if getattr(event, "type", None) == "tool_call"
+    ]
+    assert tool_call_event_ids == ["d0", "d1", "d2"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_delegate_batches_skip_single_call() -> None:
+    """A single delegate call should bypass the gather path."""
+
+    agent_loop = _post_deliverable_loop()
+    invoked = []
+
+    async def fake_handle_orchestration_tool(*args, **kwargs):
+        invoked.append(args)
+        return ToolResult(output="ok")
+
+    async def noop_flush(*args, **kwargs):
+        return None
+
+    agent_loop._handle_orchestration_tool = fake_handle_orchestration_tool  # type: ignore[assignment]
+    agent_loop._flush_events_incremental = noop_flush  # type: ignore[assignment]
+
+    ctx = _post_deliverable_ctx()
+    ctx.tool_registry = ToolRegistry()
+    results = await agent_loop._precompute_parallel_delegate_batches(
+        ctx,
+        [ToolCall(call_id="d0", name="delegate", arguments={"task": "solo"})],
+        events_to_record=[],
+    )
+
+    assert results == {}
+    assert invoked == []  # Sequential path handles the lone delegate.

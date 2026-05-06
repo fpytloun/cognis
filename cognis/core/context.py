@@ -761,6 +761,7 @@ class ContextAssembler:
             ),
             model_info=model_info,
             owner_email=session.user_email,
+            pruned_call_ids=self._resolve_pruned_call_ids(session),
         )
         messages.extend(history_messages)
 
@@ -1126,6 +1127,7 @@ class ContextAssembler:
             ),
             model_info=model_info,
             owner_email=session.user_email,
+            pruned_call_ids=self._resolve_pruned_call_ids(session),
         )
         messages.extend(history_messages)
 
@@ -1772,18 +1774,46 @@ class ContextAssembler:
             tool_schema_tokens += self.llm.count_tokens(schemas, resolved_model)
         return system_prompt_tokens, tool_schema_tokens
 
+    def _resolve_pruned_call_ids(self, session: SessionModel) -> set[str] | None:
+        """Return the session's pruned tool-result call ids, if any.
+
+        The set is registered by ``AgentLoop._prune_tool_outputs_after_step``
+        once a step's tail of tool output exceeds OpenCode's
+        ``PRUNE_PROTECT`` budget. Returning ``None`` keeps the legacy
+        full-output rendering path on sessions that have not been pruned.
+        """
+
+        cache = self.session_cache
+        if cache is None or not hasattr(cache, "get_entry"):
+            return None
+        try:
+            entry = cache.get_entry(session.session_id)
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        pruned = getattr(entry, "pruned_tool_call_ids", None)
+        if not pruned:
+            return None
+        return set(pruned)
+
     async def _events_to_messages(
         self,
         events: list[Any],
         *,
         model_info: Any | None,
         owner_email: str | None,
+        pruned_call_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         hydrated_events = await self._hydrate_history_attachment_urls(
             events,
             owner_email=owner_email,
         )
-        return events_to_messages(hydrated_events, model_info=model_info)
+        return events_to_messages(
+            hydrated_events,
+            model_info=model_info,
+            pruned_call_ids=pruned_call_ids,
+        )
 
     async def _hydrate_history_attachment_urls(
         self,
@@ -1990,6 +2020,7 @@ def events_to_messages(
     events: list[Any],
     *,
     model_info: Any | None = None,
+    pruned_call_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert session events to LLM message dicts.
 
@@ -2004,6 +2035,11 @@ def events_to_messages(
     events become ``role: "tool"`` messages with matching ``tool_call_id``.
     When an ``assistant_message`` immediately precedes tool calls (same
     LLM response), the tool_calls array is merged onto that message.
+
+    ``pruned_call_ids`` is an optional set of tool-call ids whose result
+    content should render as a clearance marker instead of the full
+    output. Pruning is honoured per-call but never overrides
+    ``protect_from_pruning`` on the underlying event.
     """
     messages: list[dict[str, Any]] = []
     # Buffer for consecutive tool_call events (flushed on non-tool_call)
@@ -2123,11 +2159,26 @@ def events_to_messages(
             call_id = event_data.get("call_id", "")
             if isinstance(output, str) and call_id in open_tool_call_ids:
                 open_tool_call_ids.remove(call_id)
+                # Honor controller-side prune markers: an earlier
+                # post-step prune may have flagged this call_id for
+                # clearance to keep the context budget healthy. The
+                # full output is still recoverable via read_tool_output.
+                rendered_output = output
+                pruned_view = False
+                if (
+                    pruned_call_ids
+                    and call_id in pruned_call_ids
+                    and not bool(event_data.get("protect_from_pruning"))
+                ):
+                    from cognis.core.tool_output_prune import cleared_tool_result_marker
+
+                    rendered_output = cleared_tool_result_marker(call_id)
+                    pruned_view = True
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": output,
+                        "content": rendered_output,
                         "_tool_name": event_data.get("name"),
                         "_tool_is_error": bool(event_data.get("is_error")),
                         "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
@@ -2135,6 +2186,7 @@ def events_to_messages(
                         "_recovery_call_id": event_data.get("recovery_call_id"),
                         "_source_call_id": event_data.get("source_call_id"),
                         "_output_size": event_data.get("output_size"),
+                        "_pruned_view": pruned_view,
                     }
                 )
         elif event_type == "delegation":

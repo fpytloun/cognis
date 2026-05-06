@@ -1641,12 +1641,14 @@ class ToolRouter:
                 return self.llm.count_tokens(text, _model)
 
             max_tokens = max(256, max_size // 4)
+        anchor_names = _extract_output_anchor_names(result.metadata, raw_output)
         output, was_truncated = middle_truncate(
             raw_output,
             max_size,
             call_id=call_id,
             token_counter=token_counter,
             max_tokens=max_tokens,
+            anchors=anchor_names,
         )
         wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{output}\n</tool_result>'
         metadata = dict(result.metadata or {})
@@ -1659,6 +1661,50 @@ class ToolRouter:
         # The agent loop reads this to save the full output to disk.
         metadata["_raw_output"] = raw_output
         return result.model_copy(update={"output": wrapped, "metadata": metadata})
+
+
+def _extract_output_anchor_names(
+    metadata: dict[str, Any] | None,
+    raw_output: str,
+) -> list[str]:
+    """Return anchor names available for a tool result, if any.
+
+    The router prefers anchors a tool emitted explicitly via
+    ``metadata.output_anchors``. As a fallback it parses inline
+    ``[[anchor]]`` markers out of the raw output (the same convention the
+    tool output store uses on save) so models still get real anchor names
+    in the truncation marker even when the producing tool didn't surface
+    them in metadata.
+    """
+
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: object) -> None:
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped and stripped not in seen:
+                names.append(stripped)
+                seen.add(stripped)
+
+    if metadata is not None:
+        raw_anchors = metadata.get("output_anchors")
+        if isinstance(raw_anchors, list):
+            for entry in raw_anchors:
+                if isinstance(entry, dict):
+                    _add(entry.get("anchor") or entry.get("name"))
+                else:
+                    _add(entry)
+
+    if not names and raw_output:
+        # Cheap inline scan; mirrors tool_output_store._parse_inline_anchors
+        # without importing it (avoids a cycle).
+        for line in raw_output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[[") and stripped.endswith("]]") and len(stripped) > 4:
+                _add(stripped[2:-2])
+
+    return names
 
 
 def _guardrails_session_id(session: SessionModel) -> str:

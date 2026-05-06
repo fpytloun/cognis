@@ -10,11 +10,16 @@ result stays under an approximate token ceiling instead of only a char ceiling.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 # Minimum size below which middle-truncation is pointless — just
 # return the full text.  The marker itself takes ~120-200 chars.
 _MIN_TRUNCATION_SIZE = 500
+
+# How many real anchors to enumerate inline in the truncation marker.
+# More than this gets noisy and bloats the marker; the model can call
+# ``list_tool_output_anchors`` for the full set.
+_MAX_INLINE_ANCHORS = 5
 
 
 def middle_truncate(
@@ -25,6 +30,7 @@ def middle_truncate(
     head_ratio: float = 0.5,
     token_counter: Callable[[str], int] | None = None,
     max_tokens: int | None = None,
+    anchors: Sequence[str] | None = None,
 ) -> tuple[str, bool]:
     """Truncate *text* preserving head and tail, removing the middle.
 
@@ -33,6 +39,10 @@ def middle_truncate(
     *head_ratio* controls the split between head and tail (default 50/50).
     If *call_id* is provided, the truncation marker tells the LLM how to
     recover the full output via ``read_tool_output``.
+    *anchors* is an optional sequence of real anchor names discovered for
+    this output; up to ``_MAX_INLINE_ANCHORS`` of them are listed inline so
+    the model can recall a specific section without first calling
+    ``list_tool_output_anchors``.
     """
 
     if len(text) <= max_chars or max_chars < _MIN_TRUNCATION_SIZE:
@@ -51,9 +61,16 @@ def middle_truncate(
                 token_counter=token_counter,
                 call_id=call_id,
                 head_ratio=head_ratio,
+                anchors=anchors,
             )
 
-    return _middle_truncate_chars(text, max_chars, call_id=call_id, head_ratio=head_ratio)
+    return _middle_truncate_chars(
+        text,
+        max_chars,
+        call_id=call_id,
+        head_ratio=head_ratio,
+        anchors=anchors,
+    )
 
 
 def _middle_truncate_chars(
@@ -62,11 +79,12 @@ def _middle_truncate_chars(
     *,
     call_id: str | None = None,
     head_ratio: float = 0.5,
+    anchors: Sequence[str] | None = None,
 ) -> tuple[str, bool]:
     """Char-budget middle truncation helper."""
 
     # Reserve space for the marker line
-    marker = _build_marker(len(text), call_id)
+    marker = _build_marker(len(text), call_id, anchors=anchors)
     available = max_chars - len(marker)
     if available < 100:
         # Not enough room for meaningful head+tail — fall back to head-only
@@ -86,13 +104,20 @@ def _middle_truncate_by_tokens(
     token_counter: Callable[[str], int],
     call_id: str | None,
     head_ratio: float,
+    anchors: Sequence[str] | None = None,
 ) -> tuple[str, bool]:
     """Approximate token-budget truncation using iterative char scaling."""
 
     try:
         total_tokens = max(1, token_counter(text))
     except Exception:
-        return _middle_truncate_chars(text, max_chars, call_id=call_id, head_ratio=head_ratio)
+        return _middle_truncate_chars(
+            text,
+            max_chars,
+            call_id=call_id,
+            head_ratio=head_ratio,
+            anchors=anchors,
+        )
 
     scaled_chars = int(len(text) * (max_tokens / total_tokens))
     candidate_chars = min(max_chars, max(_MIN_TRUNCATION_SIZE, scaled_chars))
@@ -101,6 +126,7 @@ def _middle_truncate_by_tokens(
         candidate_chars,
         call_id=call_id,
         head_ratio=head_ratio,
+        anchors=anchors,
     )
 
     for _ in range(4):
@@ -117,20 +143,39 @@ def _middle_truncate_by_tokens(
             candidate_chars,
             call_id=call_id,
             head_ratio=head_ratio,
+            anchors=anchors,
         )
 
     return truncated, True
 
 
-def _build_marker(total_chars: int, call_id: str | None) -> str:
+def _build_marker(
+    total_chars: int,
+    call_id: str | None,
+    *,
+    anchors: Sequence[str] | None = None,
+) -> str:
     parts = [f"\n\n... [middle truncated: {total_chars:,} chars total"]
     if call_id:
+        # Pick a concrete anchor example: prefer a real one if any were
+        # detected for this output, otherwise fall back to the generic
+        # "result:1" placeholder so the model still sees the call shape.
+        anchor_names = [name for name in (anchors or []) if isinstance(name, str) and name.strip()]
+        example_anchor = anchor_names[0] if anchor_names else "result:1"
         parts.append(
             ", use "
             f"list_tool_output_anchors(call_id='{call_id}'), "
-            f"read_tool_output_anchor(call_id='{call_id}', anchor='result:1'), "
+            f"read_tool_output_anchor(call_id='{call_id}', anchor='{example_anchor}'), "
             f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword'), "
             f"or read_tool_output(call_id='{call_id}')"
         )
+        if anchor_names:
+            preview = anchor_names[:_MAX_INLINE_ANCHORS]
+            suffix = (
+                ""
+                if len(anchor_names) <= _MAX_INLINE_ANCHORS
+                else f", +{len(anchor_names) - _MAX_INLINE_ANCHORS} more"
+            )
+            parts.append(f". Available anchors: {', '.join(preview)}{suffix}")
     parts.append("] ...\n\n")
     return "".join(parts)

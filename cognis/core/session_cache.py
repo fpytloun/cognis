@@ -135,6 +135,16 @@ class CachedSessionState:
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
     activated_skill_tool_ids: set[str] = field(default_factory=set)
     skill_tool_classifications: dict[str, list[str]] = field(default_factory=dict)
+    # Per-session memo of resolved tool classification results.
+    # Keyed by ``inventory_fingerprint`` (sha1 of sorted stable_tool_ids);
+    # value is the list of classified ToolDefinitions for that exact
+    # inventory.  Invalidated on skill mutation (via
+    # ``skill_epoch_stale``) or explicitly by callers.
+    classified_inventory: dict[str, list[Any]] = field(default_factory=dict)
+    # Tool call ids whose result content has been pruned from the
+    # in-context view (the LLM sees a clearance marker; the tool output
+    # store retains the original for ``read_tool_output`` recovery).
+    pruned_tool_call_ids: set[str] = field(default_factory=set)
     discovered_tool_handles: dict[str, DiscoveredToolHandle] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
@@ -194,7 +204,9 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "reasoning_effort_override": entry.reasoning_effort_override,
             "discovered_tool_handles": [
                 _serialize_discovered_tool_handle(item)
-                for item in sorted(entry.discovered_tool_handles.values(), key=lambda item: item.tool_id)
+                for item in sorted(
+                    entry.discovered_tool_handles.values(), key=lambda item: item.tool_id
+                )
             ],
             "project_contexts": [
                 {
@@ -354,7 +366,9 @@ def _discovered_tool_handle_from_raw(raw: dict[str, Any]) -> DiscoveredToolHandl
             raw.get("permission_scope") if isinstance(raw.get("permission_scope"), str) else None
         ),
         confidence=float(confidence) if isinstance(confidence, int | float) else None,
-        discovered_at=raw.get("discovered_at") if isinstance(raw.get("discovered_at"), str) else None,
+        discovered_at=raw.get("discovered_at")
+        if isinstance(raw.get("discovered_at"), str)
+        else None,
         last_used_at=raw.get("last_used_at") if isinstance(raw.get("last_used_at"), str) else None,
     )
 
@@ -919,6 +933,54 @@ class SessionCache:
         if entry is None:
             return
         entry.skill_tool_classifications[cache_key] = list(tool_ids)
+
+    def get_classified_inventory(
+        self, session_id: str, inventory_fingerprint: str
+    ) -> list[Any] | None:
+        """Return cached classified inventory if present for the fingerprint."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return None
+        cached = entry.classified_inventory.get(inventory_fingerprint)
+        return list(cached) if cached is not None else None
+
+    def set_classified_inventory(
+        self, session_id: str, inventory_fingerprint: str, classified: list[Any]
+    ) -> None:
+        """Memoize a classified inventory for this session and fingerprint."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        # Keep only the latest fingerprint to bound memo size — the inventory
+        # can only change shape on skill load/unload, so older fingerprints
+        # are immediately stale anyway.
+        entry.classified_inventory = {inventory_fingerprint: list(classified)}
+
+    def invalidate_classified_inventory(self, session_id: str) -> None:
+        """Drop any cached classification results for this session."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        entry.classified_inventory.clear()
+
+    def add_pruned_tool_call_ids(self, session_id: str, call_ids: set[str]) -> None:
+        """Mark tool call ids whose results should render as cleared markers."""
+
+        if not call_ids:
+            return
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        entry.pruned_tool_call_ids.update(call_ids)
+
+    def is_tool_result_pruned(self, session_id: str, call_id: str) -> bool:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return False
+        return call_id in entry.pruned_tool_call_ids
 
     def note_context_reserve_clamp(self, session_id: str) -> bool:
         """Return ``True`` the first time a session clamps output reserve."""

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from cognis.core.tool_router import ToolRoute, ToolRouter
+from cognis.core.tool_router import ToolRoute, ToolRouter, _extract_output_anchor_names
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError
 from cognis.models.session import SessionModel
@@ -310,6 +310,34 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     assert guardrails.mcp_calls == 1
     assert guardrails.last_mcp_call == ("github", "search")
     assert 'trust="untrusted"' in result.output
+
+
+def test_extract_output_anchor_names_prefers_metadata() -> None:
+    metadata = {
+        "output_anchors": [
+            {"anchor": "error:1", "label": "first error"},
+            {"name": "summary"},
+            "result:1",
+        ]
+    }
+    raw_output = "[[stale]]\nsome content\n"
+
+    names = _extract_output_anchor_names(metadata, raw_output)
+
+    # Metadata-supplied anchors win over inline scan, in order, deduped.
+    assert names == ["error:1", "summary", "result:1"]
+
+
+def test_extract_output_anchor_names_falls_back_to_inline_scan() -> None:
+    raw_output = "header\n[[result:1]]\nbody\n[[result:2]]\nmore\n[[result:1]]\n"
+
+    names = _extract_output_anchor_names({}, raw_output)
+
+    assert names == ["result:1", "result:2"]
+
+
+def test_extract_output_anchor_names_handles_missing_metadata() -> None:
+    assert _extract_output_anchor_names(None, "no anchors here") == []
 
 
 def test_decision_cache_key_buckets_read_only_by_tool_name() -> None:

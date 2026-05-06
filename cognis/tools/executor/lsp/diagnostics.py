@@ -53,7 +53,18 @@ def format_diagnostics_for_llm(
         overflow = len(edited_diags) - MAX_DIAGNOSTICS_PER_FILE
         if overflow > 0:
             section += f"\n  ({overflow} more diagnostic(s) omitted)"
-        parts.append(f"LSP diagnostics for this file:\n{section}")
+        # Lead with a count summary so the model can decide at a glance
+        # whether to act on diagnostics before continuing.
+        error_count = sum(1 for d in edited_diags if d.severity is DiagnosticSeverity.ERROR)
+        warning_count = sum(1 for d in edited_diags if d.severity is DiagnosticSeverity.WARNING)
+        summary_bits: list[str] = []
+        if error_count:
+            summary_bits.append(f"{error_count} error{'s' if error_count != 1 else ''}")
+        if warning_count:
+            summary_bits.append(f"{warning_count} warning{'s' if warning_count != 1 else ''}")
+        summary_bits.append("fix before proceeding" if error_count else "review")
+        header = f"LSP diagnostics for this file ({', '.join(summary_bits)}):"
+        parts.append(f"{header}\n{section}")
         total_chars += len(parts[-1])
 
     # Diagnostics for other files

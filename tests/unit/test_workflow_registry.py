@@ -138,12 +138,14 @@ def test_research_plan_step_uses_generic_evaluator_prompt() -> None:
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
     assert "Expected deliverables and format" in plan_step.prompt
+    # Push the model toward delegation for non-trivial exploration so plan
+    # steps don't burn the parent context on broad reads/greps.
+    assert "delegate" in plan_step.prompt
+    assert "system:explore" in plan_step.prompt
 
 
 def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
-    plan_step = next(
-        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "plan"
-    )
+    plan_step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "plan")
 
     assert SOFTWARE_DEVELOPMENT_WORKFLOW.interaction.mode == "step_requests"
     assert plan_step.allow_questions is True
@@ -156,6 +158,8 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
     assert "read-only planning step" in plan_step.prompt
     assert "do not edit files" in plan_step.prompt
     assert "Later workflow steps handle implementation" in plan_step.prompt
+    assert "delegate" in plan_step.prompt
+    assert "system:explore" in plan_step.prompt
 
 
 def test_creative_workflow_can_ask_brief_clarifications() -> None:

@@ -808,6 +808,20 @@ def _append_interrupted_tool_results(ctx: StepContext, events: list[SessionEvent
     return repaired
 
 
+def _inventory_fingerprint(tools: list[ToolDefinition]) -> str:
+    """Return a stable fingerprint for a tool inventory.
+
+    The classification memo is keyed by this fingerprint. It changes only
+    when tools are added or removed (e.g. on skill load/unload), so a hit
+    means the classification result we cached previously is still valid.
+    """
+
+    if not tools:
+        return "empty"
+    payload = "\n".join(sorted(stable_tool_id(tool) for tool in tools))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
+
+
 def _controller_tool_definition(tool_name: str) -> ToolDefinition:
     return ToolDefinition(
         name=tool_name,
@@ -1719,6 +1733,11 @@ class StepContext:
     remember_assistant_event_seq: int | None = None
     turn_id: str | None = None
     consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
+    # True after a successful write_deliverable until step_complete is called
+    # or a follow-up reminder has been emitted twice.  Used to nudge models
+    # that wrote the artifact and forgot to finalize the step.
+    post_deliverable_pending: bool = False
+    post_deliverable_reminders_sent: int = 0
 
 
 @dataclass(slots=True)
@@ -2687,6 +2706,14 @@ class AgentLoop:
                     messages.append(workflow_step_reminder)
                 workflow_step_reminder_added = True
 
+            # Post-deliverable nudge: if the model wrote the deliverable,
+            # marked all todos terminal, and stopped calling tools without
+            # invoking step_complete, prepend a strong system reminder so
+            # the next assistant turn finalizes the step.  Capped at 2
+            # emissions to avoid an infinite reminder loop on a stuck
+            # model.
+            self._maybe_inject_post_deliverable_reminder(ctx, messages)
+
             # Resolve model and reasoning effort for this turn.
             # Chain: session override → workflow step default → agent config → provider default.
             model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
@@ -2795,15 +2822,34 @@ class AgentLoop:
                     allow_tool_search=allow_tool_search,
                 )
             if registry is not None:
-                if self._session_factory is not None:
+                inventory_tools = registry.list_tools()
+                inventory_fingerprint = _inventory_fingerprint(inventory_tools)
+                cached_classified = (
+                    self.session_cache.get_classified_inventory(
+                        ctx.session.session_id, inventory_fingerprint
+                    )
+                    if hasattr(self.session_cache, "get_classified_inventory")
+                    else None
+                )
+                if cached_classified is not None:
+                    classified_inventory = cached_classified
+                elif self._session_factory is not None:
                     classified_inventory = await resolve_tool_classifications(
-                        registry.list_tools(),
+                        inventory_tools,
                         session_factory=self._session_factory,
                         owner_email=ctx.agent.owner_email,
                         queue=self._tool_classification_queue,
                     )
                 else:
-                    classified_inventory = classify_tool_definitions_sync(registry.list_tools())
+                    classified_inventory = classify_tool_definitions_sync(inventory_tools)
+                if cached_classified is None and hasattr(
+                    self.session_cache, "set_classified_inventory"
+                ):
+                    self.session_cache.set_classified_inventory(
+                        ctx.session.session_id,
+                        inventory_fingerprint,
+                        classified_inventory,
+                    )
                 ctx.classified_tool_definitions = {
                     stable_tool_id(tool): tool for tool in classified_inventory
                 }
@@ -3555,6 +3601,19 @@ class AgentLoop:
             post_tool_system_messages: list[dict[str, Any]] = []
             loaded_project_contexts_this_cycle: dict[str, ProjectContextEntry] = {}
             queued_project_context_hashes: set[str] = set()
+            # Pre-compute parallel delegate batches so that multiple
+            # delegate calls in one assistant turn fan out via
+            # asyncio.gather. ``parallel_delegate_results[index]`` holds
+            # the precomputed ToolResult for indices that were absorbed
+            # into a batch by an earlier index in the same run.
+            parallel_delegate_results = await self._precompute_parallel_delegate_batches(
+                ctx,
+                tool_calls,
+                events_to_record=events_to_record,
+                on_token=on_token,
+                on_tool_call=on_tool_call,
+                on_tool_result=on_tool_result,
+            )
             for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
                 tool_id = _tool_id_for_call(tc.name, registry)
@@ -4068,6 +4127,15 @@ class AgentLoop:
                     )
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
+                    # Arm the post-deliverable reminder. The next LLM cycle
+                    # will inject a strong system message if the model has
+                    # also marked all todos terminal but not yet called
+                    # step_complete. This is a nudge; the explicit
+                    # step_complete call is still required so the model can
+                    # provide outcome, summary, and notification mode.
+                    if ctx.policy.require_step_complete:
+                        ctx.post_deliverable_pending = True
+                        ctx.post_deliverable_reminders_sent = 0
                     continue
 
                 if tc.name == STEP_COMPLETE:
@@ -5142,22 +5210,30 @@ class AgentLoop:
                     continue
 
                 elif is_orchestration_tool(tc.name):
-                    # Orchestration tool — intercept as controller directive
-                    _append_tool_call_event(events_to_record, tc, tool_id)
-                    await self._flush_events_incremental(
-                        ctx,
-                        events_to_record,
-                        reason=f"tool_call:{tc.name}",
-                        on_token=on_token,
-                    )
-                    orch_result = await self._handle_orchestration_tool(
-                        tc,
-                        ctx=ctx,
-                        events_to_record=events_to_record,
-                        on_token=on_token,
-                        on_tool_call=on_tool_call,
-                        on_tool_result=on_tool_result,
-                    )
+                    # Orchestration tool — intercept as controller directive.
+                    # Multiple consecutive delegate calls may have been
+                    # executed in parallel up-front; in that case the
+                    # tool_call event is already recorded and we just
+                    # surface the precomputed result.
+                    precomputed_orch = parallel_delegate_results.get(tc_index)
+                    if precomputed_orch is not None:
+                        orch_result = precomputed_orch
+                    else:
+                        _append_tool_call_event(events_to_record, tc, tool_id)
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason=f"tool_call:{tc.name}",
+                            on_token=on_token,
+                        )
+                        orch_result = await self._handle_orchestration_tool(
+                            tc,
+                            ctx=ctx,
+                            events_to_record=events_to_record,
+                            on_token=on_token,
+                            on_tool_call=on_tool_call,
+                            on_tool_result=on_tool_result,
+                        )
                     await self._save_tool_output_if_available(tc.call_id, orch_result)
                     messages.append(
                         {
@@ -5406,6 +5482,19 @@ class AgentLoop:
 
         ctx.pending_events = None
         ctx.pending_tool_calls.clear()
+
+        # Post-step prune: walk back over recent tool results and mark
+        # the older ones for clearance from the in-context view. The
+        # tool output store keeps originals recoverable via
+        # read_tool_output. This runs in the background so an empty or
+        # transient cache failure cannot delay the user-visible step
+        # completion.
+        import contextlib as _contextlib  # local import keeps top-of-file lean
+
+        with _contextlib.suppress(RuntimeError):
+            # ``RuntimeError`` is raised when no event loop is running
+            # (rare; e.g. a synchronous test harness). Silent best-effort.
+            asyncio.create_task(self._prune_tool_outputs_after_step(ctx))
         return step_output
 
     # ------------------------------------------------------------------
@@ -5584,6 +5673,109 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # Orchestration tool dispatch
     # ------------------------------------------------------------------
+
+    # Default fanout cap for parallel delegate calls in a single turn.
+    # Mirrors OpenCode's "up to 3 explore agents in parallel" guidance —
+    # high enough to deliver real wall-clock speedups, low enough to
+    # avoid resource contention on the controller and child executors.
+    _DELEGATE_PARALLEL_DEFAULT_MAX = 3
+
+    async def _precompute_parallel_delegate_batches(
+        self,
+        ctx: StepContext,
+        tool_calls: list[ToolCall],
+        *,
+        events_to_record: list[SessionEvent],
+        on_token: TokenCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
+    ) -> dict[int, ToolResult]:
+        """Run consecutive ``delegate`` tool calls in parallel.
+
+        When the model emits multiple ``delegate`` calls in a single
+        assistant turn (e.g. fanning out to ``system:explore`` for a
+        broad investigation), executing them sequentially defeats the
+        whole point. This helper finds runs of consecutive delegate
+        calls and runs each run via ``asyncio.gather``. Tool-call
+        events are appended to the in-flight batch in input order; tool
+        results land in the returned mapping keyed by index for the
+        outer for-loop to surface.
+
+        Single delegate calls (the common case) are left to the
+        sequential path so we don't pay gather overhead unnecessarily.
+        """
+
+        results: dict[int, ToolResult] = {}
+        i = 0
+        n = len(tool_calls)
+        max_concurrency = max(
+            1,
+            int(getattr(ctx, "_delegate_parallel_max", 0)) or self._DELEGATE_PARALLEL_DEFAULT_MAX,
+        )
+        while i < n:
+            tc = tool_calls[i]
+            if tc.name != "delegate":
+                i += 1
+                continue
+            # Find the contiguous run of delegate calls starting at i.
+            run_end = i + 1
+            while run_end < n and tool_calls[run_end].name == "delegate":
+                run_end += 1
+            run = tool_calls[i:run_end]
+            if len(run) <= 1:
+                i = run_end
+                continue
+
+            self._raise_if_cancelled(ctx)
+
+            # Record tool_call events for the whole batch before
+            # spawning so the in-flight stream of events stays ordered.
+            for child_tc in run:
+                child_tool_id = _tool_id_for_call(child_tc.name, ctx.tool_registry)
+                _append_tool_call_event(events_to_record, child_tc, child_tool_id)
+            await self._flush_events_incremental(
+                ctx,
+                events_to_record,
+                reason="tool_call:delegate_batch",
+                on_token=on_token,
+            )
+
+            # Cap concurrency so a single turn cannot fan out
+            # arbitrarily many child sessions at once.
+            semaphore = asyncio.Semaphore(max_concurrency)
+
+            async def _bounded(
+                child_tc: ToolCall, sem: asyncio.Semaphore = semaphore
+            ) -> ToolResult:
+                async with sem:
+                    try:
+                        return await self._handle_orchestration_tool(
+                            child_tc,
+                            ctx=ctx,
+                            events_to_record=events_to_record,
+                            on_token=on_token,
+                            on_tool_call=on_tool_call,
+                            on_tool_result=on_tool_result,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        # Convert to a structured error so siblings still
+                        # complete; the outer loop surfaces it via the
+                        # normal tool_result path.
+                        return ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "message": f"delegate failed: {exc!s}",
+                                }
+                            ),
+                            is_error=True,
+                        )
+
+            gathered = await asyncio.gather(*(_bounded(child) for child in run))
+            for offset, child_result in enumerate(gathered):
+                results[i + offset] = child_result
+            i = run_end
+        return results
 
     async def _handle_orchestration_tool(
         self,
@@ -6681,6 +6873,118 @@ class AgentLoop:
         if task_agent_type == "secondary" and current_agent_type == "primary":
             return await registry.is_secondary_bound(current_agent_id, task_agent_id)
         return False
+
+    async def _prune_tool_outputs_after_step(self, ctx: StepContext) -> None:
+        """Mark older tool-result call ids for clearance in the in-context view.
+
+        Mirrors OpenCode's post-loop ``prune``: walks back from the most
+        recent events, keeps the last few user turns intact, accumulates
+        tool output tokens, and once the tail exceeds ``PRUNE_PROTECT``
+        tokens registers the older call ids on the session cache so
+        future context assembly substitutes a clearance marker. The tool
+        output store is unchanged — the model can recover any pruned
+        result via ``read_tool_output(call_id=...)``.
+        """
+
+        from cognis.core.tool_output_prune import (
+            PRUNE_MINIMUM,
+            PRUNE_PROTECT,
+            PruneCandidate,
+            select_prune_call_ids,
+        )
+
+        cache_get_events = getattr(self.session_cache, "get_events_since_compaction", None)
+        cache_add_pruned = getattr(self.session_cache, "add_pruned_tool_call_ids", None)
+        if not callable(cache_get_events) or not callable(cache_add_pruned):
+            return
+
+        try:
+            cached_events = cache_get_events(ctx.session.session_id)
+        except Exception:
+            return
+        if not cached_events:
+            return
+
+        candidates: list[PruneCandidate] = []
+        total_tool_tokens = 0
+        token_counter = self._build_token_counter_for_pruning(ctx)
+        for event in cached_events:
+            event_type = getattr(event, "type", None) or (
+                event.get("type") if isinstance(event, dict) else None
+            )
+            data = getattr(event, "data", None) or (
+                event.get("data", {}) if isinstance(event, dict) else {}
+            )
+            if not isinstance(data, dict):
+                continue
+            if event_type == "user_message":
+                candidates.append(PruneCandidate("", "", "", is_user_turn=True))
+                continue
+            if event_type != "tool_result":
+                continue
+            call_id = str(data.get("call_id") or "")
+            if not call_id:
+                continue
+            output = str(data.get("result") or data.get("output") or "")
+            if not output:
+                continue
+            tool_name = str(data.get("name") or "")
+            candidates.append(PruneCandidate(call_id=call_id, tool_name=tool_name, output=output))
+            try:
+                total_tool_tokens += token_counter(output)
+            except Exception:
+                total_tool_tokens += max(1, len(output) // 4)
+
+        # Below the minimum we don't bother — the gain is too small to
+        # justify cluttering the context with clearance markers.
+        if total_tool_tokens < PRUNE_MINIMUM:
+            return
+
+        prune_ids = select_prune_call_ids(
+            candidates,
+            token_counter=token_counter,
+            protect_tokens=PRUNE_PROTECT,
+        )
+        if not prune_ids:
+            return
+        try:
+            cache_add_pruned(ctx.session.session_id, prune_ids)
+        except Exception:
+            logger.debug(
+                "tool output prune: failed to record cleared call ids",
+                extra={"extra_data": {"session_id": ctx.session.session_id}},
+                exc_info=True,
+            )
+            return
+        logger.info(
+            "tool output prune: cleared older results from context view",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "pruned_count": len(prune_ids),
+                    "total_tool_tokens": total_tool_tokens,
+                }
+            },
+        )
+
+    def _build_token_counter_for_pruning(self, ctx: StepContext) -> Callable[[str], int]:
+        """Return a token counter that prefers the live LLM provider when available."""
+
+        llm = getattr(self.providers, "llm", None)
+        model = ctx.current_model
+        if llm is not None and model:
+            count_tokens = getattr(llm, "count_tokens", None)
+            if callable(count_tokens):
+                resolved_model: str = model
+
+                def _llm_counter(text: str) -> int:
+                    try:
+                        return int(count_tokens(text, resolved_model))
+                    except Exception:
+                        return max(1, len(text) // 4)
+
+                return _llm_counter
+        return lambda text: max(1, len(text) // 4)
 
     async def _save_tool_output_if_available(self, call_id: str, result: ToolResult) -> None:
         """Persist full tool output and anchors when metadata provides them."""
@@ -8674,6 +8978,12 @@ class AgentLoop:
         if result.metadata:
             self._merge_promoted_tool_ids(promoted_tool_ids, result.metadata)
             self._apply_skill_attachment_metadata(ctx, result.metadata)
+            if result.metadata.get("skill_epoch_stale") and hasattr(
+                self.session_cache, "invalidate_classified_inventory"
+            ):
+                # Skill mutation changed the runtime tool inventory; the
+                # next cycle must reclassify rather than reuse the memo.
+                self.session_cache.invalidate_classified_inventory(ctx.session.session_id)
             activation_notice = await self._apply_skill_activation(
                 ctx,
                 metadata=result.metadata,
@@ -9924,6 +10234,53 @@ class AgentLoop:
             "\nRequired completion:\n" + "\n".join(completion_lines) + "\n</workflow_step_reminder>"
         )
         return {"role": "system", "content": content, "_workflow_step_reminder": True}
+
+    _MAX_POST_DELIVERABLE_REMINDERS = 2
+
+    def _maybe_inject_post_deliverable_reminder(
+        self, ctx: StepContext, messages: list[dict[str, Any]]
+    ) -> None:
+        """Append a strong system reminder when the model wrote the deliverable but stopped.
+
+        Fires only when:
+        - ``write_deliverable`` succeeded earlier in this step (the
+          handler set ``ctx.post_deliverable_pending``);
+        - the policy still requires ``step_complete``;
+        - every todo is in a terminal state (so we are not nagging
+          mid-work);
+        - we have not already emitted the cap of two reminders.
+        """
+
+        if not ctx.post_deliverable_pending:
+            return
+        if not ctx.policy.require_step_complete:
+            ctx.post_deliverable_pending = False
+            return
+        if ctx.post_deliverable_reminders_sent >= self._MAX_POST_DELIVERABLE_REMINDERS:
+            return
+        if self._get_incomplete_todos(ctx):
+            # Todos are still pending — let the existing finalization
+            # instruction handle it; the post-deliverable reminder is
+            # specifically for the "wrote artifact, marked todos done,
+            # then stopped" pattern.
+            return
+
+        ctx.post_deliverable_reminders_sent += 1
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "<post_deliverable_reminder>\n"
+                    "You wrote the deliverable and every todo is terminal. "
+                    "Call step_complete now with summary, outputs (any structured "
+                    "values the workflow expects), claims, and an outcome — "
+                    "this finalizes the step and triggers delivery. Do not "
+                    "start new exploration or restate the deliverable.\n"
+                    "</post_deliverable_reminder>"
+                ),
+                "_post_deliverable_reminder": True,
+            }
+        )
 
     def _build_step_prompt(self, ctx: StepContext) -> str:
         """Build the step objective prompt.

@@ -238,8 +238,14 @@ async def test_session_cache_hydrates_full_history_after_restart_append() -> Non
 
     assert refreshed.initialized is True
     assert guardrails.calls == [0]
-    assert [event.seq for event in cache.get_events_since_compaction(session.session_id)] == [3, 4, 5]
-    assert [event.data["content"] for event in cache.get_events_since_compaction(session.session_id)] == [
+    assert [event.seq for event in cache.get_events_since_compaction(session.session_id)] == [
+        3,
+        4,
+        5,
+    ]
+    assert [
+        event.data["content"] for event in cache.get_events_since_compaction(session.session_id)
+    ] == [
         "before",
         "previous reply",
         "continued after restart",
@@ -453,3 +459,34 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
         "cache_read_input_tokens": 900,
         "cache_creation_input_tokens": 124,
     }
+
+
+@pytest.mark.asyncio
+async def test_classified_inventory_memo_round_trip() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-memo")
+    await cache.refresh(session)
+
+    assert cache.get_classified_inventory(session.session_id, "fp1") is None
+
+    cache.set_classified_inventory(session.session_id, "fp1", ["a", "b"])
+    assert cache.get_classified_inventory(session.session_id, "fp1") == ["a", "b"]
+
+    # Different fingerprint must miss; the memo bounds itself to the
+    # latest fingerprint to prevent unbounded growth from rotating
+    # inventories within the same session.
+    cache.set_classified_inventory(session.session_id, "fp2", ["c"])
+    assert cache.get_classified_inventory(session.session_id, "fp1") is None
+    assert cache.get_classified_inventory(session.session_id, "fp2") == ["c"]
+
+
+@pytest.mark.asyncio
+async def test_invalidate_classified_inventory_clears_memo() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-memo")
+    await cache.refresh(session)
+
+    cache.set_classified_inventory(session.session_id, "fp1", ["a"])
+    cache.invalidate_classified_inventory(session.session_id)
+
+    assert cache.get_classified_inventory(session.session_id, "fp1") is None

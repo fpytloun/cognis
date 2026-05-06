@@ -95,9 +95,24 @@ class TestFormatDiagnosticsForLlm:
             ]
         }
         result = format_diagnostics_for_llm(diags, "/src/foo.py")
-        assert "LSP diagnostics for this file:" in result
+        assert "LSP diagnostics for this file" in result
+        assert "2 errors" in result
+        assert "fix before proceeding" in result
         assert "error 1" in result
         assert "error 2" in result
+
+    def test_header_uses_review_when_only_warnings(self) -> None:
+        diags = {
+            "/src/foo.py": [
+                _diag(severity=DiagnosticSeverity.WARNING, message="warn 1"),
+            ]
+        }
+        result = format_diagnostics_for_llm(diags, "/src/foo.py")
+        assert "1 warning" in result
+        assert "review" in result
+        # Warning-only output must not push the model to "fix" — the
+        # severity rules differ.
+        assert "fix before proceeding" not in result
 
     def test_warnings_included(self) -> None:
         diags = {
@@ -114,7 +129,7 @@ class TestFormatDiagnosticsForLlm:
             "/src/bar.py": [_diag(message="error in bar")],
         }
         result = format_diagnostics_for_llm(diags, "/src/foo.py")
-        assert "LSP diagnostics for this file:" in result
+        assert "LSP diagnostics for this file" in result
         assert "error in foo" in result
         assert "LSP diagnostics in other files:" in result
         assert "error in bar" in result
@@ -133,7 +148,7 @@ class TestFormatDiagnosticsForLlm:
             diags[f"/src/file{i}.py"] = [_diag(message=f"error in file{i}")]
 
         result = format_diagnostics_for_llm(diags, "/src/main.py")
-        assert "LSP diagnostics for this file:" in result
+        assert "LSP diagnostics for this file" in result
 
     def test_errors_sorted_before_warnings(self) -> None:
         """Errors should appear before warnings."""

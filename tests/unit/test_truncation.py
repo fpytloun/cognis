@@ -94,3 +94,36 @@ def test_very_small_max_chars_falls_back_to_head() -> None:
     # Below _MIN_TRUNCATION_SIZE, returns unchanged
     assert result == text
     assert was_truncated is False
+
+
+def test_marker_lists_real_anchors_when_provided() -> None:
+    text = "x" * 5000
+    result, was_truncated = middle_truncate(
+        text,
+        800,
+        call_id="call_xyz",
+        anchors=["error:1", "result:1", "summary"],
+    )
+    assert was_truncated is True
+    # Example anchor in the recall hint should be the first real anchor
+    assert "anchor='error:1'" in result
+    # Real anchor list should be enumerated in the marker
+    assert "Available anchors: error:1, result:1, summary" in result
+
+
+def test_marker_caps_inline_anchor_list() -> None:
+    text = "x" * 5000
+    anchors = [f"section:{i}" for i in range(10)]
+    result, _ = middle_truncate(text, 800, call_id="call_xyz", anchors=anchors)
+    assert "section:0" in result
+    assert "section:4" in result
+    assert "+5 more" in result
+    # Anchors past the cap should not be inlined
+    assert "section:9" not in result.split("Available anchors:")[1]
+
+
+def test_marker_falls_back_to_placeholder_when_no_anchors() -> None:
+    text = "x" * 5000
+    result, _ = middle_truncate(text, 800, call_id="call_xyz", anchors=[])
+    assert "anchor='result:1'" in result
+    assert "Available anchors:" not in result
