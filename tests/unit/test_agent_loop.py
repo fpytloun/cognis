@@ -12,6 +12,7 @@ import pytest
 from cognis.core.agent_loop import (
     CHAT_POLICY,
     DELEGATION_POLICY,
+    SECONDARY_AGENT_DELEGATION_POLICY,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
@@ -3366,6 +3367,98 @@ async def test_workflow_backed_delegation_can_write_parent_deliverable(
     assert output.deliverable_id == "dlv-child"
     assert captured["owner_step_run_id"] == "sr-parent"
     assert captured["content"] == "Final clean briefing text."
+
+
+def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
+    """User-managed secondary agents must receive SECONDARY_AGENT_DELEGATION_POLICY,
+    not DELEGATION_POLICY.  The gate is agent_type=='secondary', not is_system."""
+    # User-defined secondary agent (not is_system)
+    user_secondary = AgentDefinition(
+        agent_id="custom-reviewer",
+        owner_email="user@example.com",
+        name="My Reviewer",
+        agent_type="secondary",
+        is_system=False,
+    )
+    ctx_secondary = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt=""),
+        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=user_secondary,
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+    )
+    # step_complete must NOT be required for secondary agent delegations
+    assert not ctx_secondary.policy.require_step_complete
+    # Memory must be skipped for secondary agent delegations
+    assert ctx_secondary.policy.skip_memory
+
+    # A shipped system agent is also secondary — same policy applies
+    system_explore = AgentDefinition(
+        agent_id="system:explore",
+        owner_email="system@cognis.local",
+        name="Explore",
+        agent_type="secondary",
+        is_system=True,
+    )
+    ctx_system = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt=""),
+        session=SimpleNamespace(session_id="child2", intaris_session_id="child2"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=system_explore,
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+    )
+    assert not ctx_system.policy.require_step_complete
+    assert ctx_system.policy.skip_memory
+
+    # A primary agent delegation keeps the full policy
+    primary_agent = AgentDefinition(
+        agent_id="riker",
+        owner_email="user@example.com",
+        name="Riker",
+        agent_type="primary",
+        is_system=False,
+    )
+    ctx_primary = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt=""),
+        session=SimpleNamespace(session_id="child3", intaris_session_id="child3"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=primary_agent,
+        policy=DELEGATION_POLICY,
+    )
+    assert ctx_primary.policy.require_step_complete
+    assert not ctx_primary.policy.skip_memory
+
+
+def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() -> None:
+    """_build_step_prompt for a secondary-agent delegation emits the slim
+    completion hint, not the heavy write_deliverable/step_complete block."""
+    loop = object.__new__(AgentLoop)
+    user_secondary = AgentDefinition(
+        agent_id="custom-reviewer",
+        owner_email="user@example.com",
+        name="My Reviewer",
+        agent_type="secondary",
+        is_system=False,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="delegation",
+            type="run",
+            prompt="Review the changes in this PR.",
+            require_deliverable=False,
+        ),
+        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=user_secondary,
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+        user_message="Review the changes in this PR.",
+    )
+    prompt = loop._build_step_prompt(ctx)
+    # Must use the slim completion hint
+    assert "write your findings as a final assistant message" in prompt
+    # Must NOT contain the heavy deliverable contract
+    assert "write_deliverable with the canonical user-facing artifact" not in prompt
+    assert "Required Completion Actions" not in prompt
 
 
 def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> None:

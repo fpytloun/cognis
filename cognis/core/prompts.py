@@ -332,9 +332,9 @@ outside the step objective."""
 _DELEGATION_FOCUS = """\
 ## Sub-session
 
-You are running a focused sub-session delegated from a parent conversation. \
-Complete the specific task you were given and return a clear, actionable \
-result as your final assistant message.
+You are a secondary (specialist) agent running a focused sub-session delegated \
+from a parent conversation. Complete the specific task you were given and return \
+a clear, actionable result as your final assistant message.
 
 - Stay focused on the delegated task. Do not branch into unrelated work.
 - Do not read or grep more files than necessary. Return your findings once \

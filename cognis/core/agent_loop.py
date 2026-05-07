@@ -1463,16 +1463,19 @@ DELEGATION_POLICY = ExecutionPolicy(
     event_flush_strategy="incremental",
 )
 
-# Policy for system-agent delegations: step_complete is available (optional)
-# but NOT required. The sub-session may return via a normal assistant message,
-# matching the OpenCode task sub-agent contract. write_deliverable is still
-# available when a deliverable_step_run_id is set (opt-in from parent step).
-SYSTEM_AGENT_DELEGATION_POLICY = ExecutionPolicy(
+# Policy for secondary-agent delegations (both shipped system agents and
+# user-managed secondary agents): step_complete is available but NOT required.
+# The sub-session may return via a normal assistant message, matching the
+# OpenCode task sub-agent contract. write_deliverable is still available when a
+# deliverable_step_run_id is set (opt-in from the parent step).
+# Secondary agents are lightweight specialists — no identity, no memory,
+# no project instructions, lower tool-call budget.
+SECONDARY_AGENT_DELEGATION_POLICY = ExecutionPolicy(
     require_step_complete=False,
     step_complete_available=True,
     enable_auto_compaction=False,
     event_flush_strategy="incremental",
-    skip_memory=True,  # No Mnemory recall/remember for system agents
+    skip_memory=True,  # No Mnemory recall/remember for secondary agents
 )
 
 SECONDARY_POLICY = ExecutionPolicy(
@@ -2195,14 +2198,16 @@ class AgentLoop:
                 prompt=task_description,
                 require_deliverable=False,
             )
-            # System agents (system:explore, system:research, …) run with a
-            # slim policy: step_complete is optional, memory is skipped, and
-            # project instructions are skipped (controlled via agent.is_system
-            # in context assembly).  User-agent delegations keep the full
-            # DELEGATION_POLICY so they behave like before.
+            # Secondary agents (both shipped system agents such as system:explore
+            # and user-managed secondary agents) run with a slim policy:
+            # step_complete is optional, memory is skipped, and project
+            # instructions are skipped.  Primary agent delegations (self-
+            # delegation and user-defined primary-to-primary) keep the full
+            # DELEGATION_POLICY so they retain identity, memory, and the
+            # write_deliverable / step_complete requirement.
             child_policy = (
-                SYSTEM_AGENT_DELEGATION_POLICY
-                if resolved_agent.is_system
+                SECONDARY_AGENT_DELEGATION_POLICY
+                if resolved_agent.agent_type == "secondary"
                 else DELEGATION_POLICY
             )
             child_ctx = StepContext(
@@ -2582,34 +2587,26 @@ class AgentLoop:
         """Core step execution loop."""
         # Budget selection:
         # 1. Per-agent explicit override in agent.execution.max_tool_calls.
-        # 2. System-agent delegations default to a lower cap and force a text
-        #    summary when reached (instead of emitting a generic failure).
+        # 2. Secondary-agent delegations (shipped system agents and user-managed
+        #    secondary agents) default to a lower cap and force a text summary
+        #    when reached (instead of emitting a generic failure).
         # 3. All other steps use DEFAULT_MAX_TOOL_CALLS.
-        _is_delegation = ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY
+        _is_delegation = ctx.policy is SECONDARY_AGENT_DELEGATION_POLICY
         if ctx.agent.execution and "max_tool_calls" in ctx.agent.execution:
             max_tool_calls = int(ctx.agent.execution["max_tool_calls"])
         elif _is_delegation:
-            # Exploration-only system agents (no write tools) get a tighter cap.
+            # Shipped exploration-only agents get a tighter cap.  Any secondary
+            # agent can opt into a different budget via
+            # agent.execution.delegation_max_tool_calls.
             _explore_ids = {"system:explore", "system:code-review", "system:architect"}
-            max_tool_calls = (
-                int(
-                    ctx.agent.execution.get(
-                        "delegation_max_tool_calls", DELEGATION_EXPLORE_MAX_TOOL_CALLS
-                    )
-                )
+            _default = (
+                DELEGATION_EXPLORE_MAX_TOOL_CALLS
                 if ctx.agent.agent_id in _explore_ids
-                else int(
-                    ctx.agent.execution.get(
-                        "delegation_max_tool_calls", DELEGATION_DEFAULT_MAX_TOOL_CALLS
-                    )
-                )
-                if ctx.agent.execution
-                else (
-                    DELEGATION_EXPLORE_MAX_TOOL_CALLS
-                    if ctx.agent.agent_id in _explore_ids
-                    else DELEGATION_DEFAULT_MAX_TOOL_CALLS
-                )
+                else DELEGATION_DEFAULT_MAX_TOOL_CALLS
             )
+            max_tool_calls = int(
+                ctx.agent.execution.get("delegation_max_tool_calls", _default)
+            ) if ctx.agent.execution else _default
         else:
             max_tool_calls = DEFAULT_MAX_TOOL_CALLS
         # Whether we are in "force summary" mode: tools stripped, one LLM turn
@@ -2786,7 +2783,7 @@ class AgentLoop:
         # ---------------------------------------------------------------
         # Step 3: Assemble context (reads Intaris history + memory)
         # ---------------------------------------------------------------
-        # Skip project context probing for system-agent delegations — they run
+        # Skip project context probing for secondary-agent delegations — they run
         # with a slim prompt and do not need the parent project's AGENTS.md.
         if not ctx.policy.skip_memory:
             await self._ensure_known_project_context_loaded(ctx)
@@ -2794,7 +2791,7 @@ class AgentLoop:
         # Derive prompt context from execution policy
         if ctx.policy is WORKFLOW_POLICY:
             _prompt_ctx = PromptContext.TASK_STEP
-        elif ctx.policy is DELEGATION_POLICY or ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY:
+        elif ctx.policy is DELEGATION_POLICY or ctx.policy is SECONDARY_AGENT_DELEGATION_POLICY:
             _prompt_ctx = PromptContext.DELEGATION
         elif ctx.follow_up is not None and ctx.follow_up.mode is FollowUpMode.INTEGRATE:
             _prompt_ctx = PromptContext.FOLLOW_UP_INTEGRATE
@@ -2830,7 +2827,7 @@ class AgentLoop:
                 executor_environment=ctx.executor_environment,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
-                # System-agent delegations skip project instructions (AGENTS.md).
+                # Secondary-agent delegations skip project instructions (AGENTS.md).
                 # They run with a slim prompt; the project context is the caller's
                 # concern, not the sub-session's.
                 include_project_context=(
@@ -4055,7 +4052,7 @@ class AgentLoop:
                     )
                     loaded_project_context = None
                     force_project_context_retry = False
-                    # System-agent delegations skip dynamic project context probing
+                    # Secondary-agent delegations skip dynamic project context probing
                     # (AGENTS.md injection) — they run without project instructions.
                     if not ctx.policy.skip_memory:
                         loaded_project_context = (
@@ -6347,9 +6344,10 @@ class AgentLoop:
             # can show a live tool-call counter and last-tool name on the card.
             _child_tool_call_count = 0
             _child_session_id = child_session.session_id
+            _explore_agent_ids = {"system:explore", "system:code-review", "system:architect"}
             _child_max_tool_calls = (
                 DELEGATION_EXPLORE_MAX_TOOL_CALLS
-                if child_session.agent_id in {"system:explore", "system:code-review", "system:architect"}
+                if child_session.agent_id in _explore_agent_ids
                 else DELEGATION_DEFAULT_MAX_TOOL_CALLS
             )
             _event_bus = self.event_bus
@@ -9013,8 +9011,8 @@ class AgentLoop:
         if not self._workflow_todos_are_terminal(ctx):
             return None
 
-        # System-agent delegations: todos terminal → nudge to write result text.
-        if ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY:
+        # Secondary-agent delegations: todos terminal → nudge to write result text.
+        if ctx.policy is SECONDARY_AGENT_DELEGATION_POLICY:
             return {
                 "required_action": "write_result",
                 "message": (
