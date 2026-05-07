@@ -38,6 +38,8 @@
   let conversations = $state<Conversation[]>([]);
   let showCreateModal = $state(false);
   let expandedDoneGroups = $state<Set<string>>(new Set());
+  let showEmptyDesktopColumns = $state(false);
+  let expandedDesktopColumns = $state<Set<TaskBoardColumnId>>(new Set());
 
   // Multi-select
   let selectedIds = $state<Set<string>>(new Set());
@@ -255,6 +257,25 @@
 
   function tasksForColumn(columnId: TaskBoardColumnId): Task[] {
     return filteredTasks.filter((task) => boardColumnForStatus(task.status) === columnId);
+  }
+
+  function taskCountForColumn(columnId: TaskBoardColumnId): number {
+    return tasksForColumn(columnId).length;
+  }
+
+  function isDesktopColumnCollapsed(columnId: TaskBoardColumnId): boolean {
+    if (showEmptyDesktopColumns || taskCountForColumn(columnId) > 0 || expandedDesktopColumns.has(columnId)) {
+      return false;
+    }
+    return !(dragState && isDragTransitionValid(dragState.column, columnId));
+  }
+
+  function desktopBoardGridTemplate(): string {
+    return TASK_BOARD_COLUMNS.map((column) => (isDesktopColumnCollapsed(column.id) ? '3.25rem' : 'minmax(15rem, 1fr)')).join(' ');
+  }
+
+  function expandDesktopColumn(columnId: TaskBoardColumnId): void {
+    expandedDesktopColumns = new Set([...expandedDesktopColumns, columnId]);
   }
 
   // ---------------------------------------------------------------------------
@@ -777,9 +798,48 @@
 
     <!-- Desktop kanban board (lg+) -->
     <div class="hidden lg:block">
+      <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <p class="text-sm text-slate-400">Empty columns collapse to keep active work in view.</p>
+        <label class="inline-flex items-center gap-2 rounded-full border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm text-slate-300">
+          <input type="checkbox" bind:checked={showEmptyDesktopColumns} class="h-4 w-4 rounded border-slate-700 bg-slate-950 text-sky-500 focus:ring-sky-500" />
+          Show empty columns
+        </label>
+      </div>
       <div class="overflow-x-auto">
-        <div class="grid min-w-[1200px] gap-4 lg:grid-cols-5">
+        <div class="grid gap-4" style={`grid-template-columns: ${desktopBoardGridTemplate()};`}>
         {#each TASK_BOARD_COLUMNS as column}
+          {@const columnTaskCount = taskCountForColumn(column.id)}
+          {@const columnCollapsed = isDesktopColumnCollapsed(column.id)}
+          {#if columnCollapsed}
+            <section
+              class="flex min-h-[600px] rounded-3xl border border-slate-800/80 bg-slate-900/60 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : ''}"
+              ondragover={(event: DragEvent) => {
+                if (dragState && isDragTransitionValid(dragState.column, column.id)) {
+                  event.preventDefault();
+                  dropTargetColumn = column.id;
+                }
+              }}
+              ondragleave={(event: DragEvent) => {
+                const target = event.currentTarget as HTMLElement;
+                if (!target.contains(event.relatedTarget as Node)) {
+                  if (dropTargetColumn === column.id) dropTargetColumn = null;
+                }
+              }}
+              ondrop={() => handleColumnDrop(column.id)}
+              aria-label={`${column.label}, empty`}
+            >
+              <button
+                type="button"
+                class="flex h-full w-full flex-col items-center gap-3 px-2 py-4 text-slate-400 transition hover:text-white"
+                onclick={() => expandDesktopColumn(column.id)}
+                aria-label={`Expand ${column.label} column`}
+                aria-expanded="false"
+              >
+                <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-1 text-xs font-semibold text-slate-300">{columnTaskCount}</span>
+                <span class="[writing-mode:vertical-rl] rotate-180 text-sm font-semibold tracking-wide">{column.label}</span>
+              </button>
+            </section>
+          {:else}
           <section
             class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
             ondragover={(event: DragEvent) => {
@@ -800,7 +860,7 @@
             <div class="mb-3 flex items-center justify-between gap-2">
               <div>
                 <p class="text-sm font-semibold text-white">{column.label}</p>
-                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{tasksForColumn(column.id).length} items</p>
+                <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{columnTaskCount} items</p>
               </div>
             </div>
 
@@ -876,6 +936,7 @@
               {/if}
             </div>
           </section>
+          {/if}
         {/each}
         </div>
       </div>
