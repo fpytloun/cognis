@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cleanSearchSnippet, findLocalChatMatches, resultLabel, type ChatSearchResult } from '$lib/chat-search';
+import { cleanSearchSnippet, findLocalChatMatches, mergeSearchResultsByTarget, resultLabel, type ChatSearchResult } from '$lib/chat-search';
 import type { TimelineItem } from '$lib/chat';
 
 describe('chat search helpers', () => {
@@ -34,6 +34,7 @@ describe('chat search helpers', () => {
   it('uses generic labels for server hits', () => {
     const result = {
       source: 'server',
+      targetId: 'msg-1',
       server: {
         conversation_id: 'conv-1',
         conversation_title: 'Conversation',
@@ -66,5 +67,46 @@ describe('chat search helpers', () => {
   it('removes role prefixes from server snippets', () => {
     expect(cleanSearchSnippet('User message: matched <mark>phrase</mark>')).toBe('matched phrase');
     expect(cleanSearchSnippet('Assistant message: matched phrase')).toBe('matched phrase');
+  });
+
+  it('deduplicates search hits by target message', () => {
+    const server = {
+      source: 'server',
+      targetId: 'msg-1',
+      server: {
+        conversation_id: 'conv-1',
+        conversation_title: 'Conversation',
+        agent_id: 'agent-1',
+        project_id: null,
+        status: 'active',
+        session_id: 'sess-1',
+        intaris_session_id: 'int-1',
+        kind_rank: 0,
+        match: {
+          session_id: 'int-1',
+          kind: 'reasoning',
+          ref_id: '123',
+          role: null,
+          ts: null,
+          snippet: 'matched phrase',
+          score: 0.9,
+          score_breakdown: {},
+          agent_id: null,
+          session_title: null,
+          session_intention: null
+        }
+      }
+    } satisfies ChatSearchResult;
+    const local = {
+      source: 'local',
+      targetId: 'msg-1',
+      local: {
+        id: 'msg-1',
+        label: 'User message',
+        snippet: 'matched phrase'
+      }
+    } satisfies ChatSearchResult;
+
+    expect(mergeSearchResultsByTarget([server, local])).toEqual([local]);
   });
 });

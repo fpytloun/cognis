@@ -8,8 +8,8 @@ export interface LocalChatMatch {
 }
 
 export type ChatSearchResult =
-  | { source: 'local'; local: LocalChatMatch }
-  | { source: 'server'; server: ConversationFlatSearchMatch };
+  | { source: 'local'; local: LocalChatMatch; targetId: string }
+  | { source: 'server'; server: ConversationFlatSearchMatch; targetId: string };
 
 export function stripMarks(value: string): string {
   return value.replace(/<\/?mark>/g, '');
@@ -27,6 +27,29 @@ export function resultLabel(result: ChatSearchResult): string {
 export function resultSnippet(result: ChatSearchResult): string {
   if (result.source === 'local') return result.local.snippet;
   return cleanSearchSnippet(result.server.match.snippet);
+}
+
+function resultScore(result: ChatSearchResult): number {
+  if (result.source === 'local') return Number.POSITIVE_INFINITY;
+  return result.server.match.score;
+}
+
+function shouldReplaceResult(current: ChatSearchResult, next: ChatSearchResult): boolean {
+  if (current.source !== 'local' && next.source === 'local') return true;
+  if (current.source === 'local' && next.source !== 'local') return false;
+  return resultScore(next) > resultScore(current);
+}
+
+export function mergeSearchResultsByTarget(results: ChatSearchResult[]): ChatSearchResult[] {
+  const byTarget = new Map<string, ChatSearchResult>();
+  for (const result of results) {
+    if (!result.targetId) continue;
+    const current = byTarget.get(result.targetId);
+    if (!current || shouldReplaceResult(current, result)) {
+      byTarget.set(result.targetId, result);
+    }
+  }
+  return [...byTarget.values()];
 }
 
 export function findLocalChatMatches(items: TimelineItem[], query: string): LocalChatMatch[] {

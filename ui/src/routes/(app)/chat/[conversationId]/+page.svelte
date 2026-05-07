@@ -83,6 +83,7 @@ import X from 'lucide-svelte/icons/x';
   import {
     cleanSearchSnippet,
     findLocalChatMatches,
+    mergeSearchResultsByTarget,
     type ChatSearchResult,
     type LocalChatMatch
   } from '$lib/chat-search';
@@ -131,6 +132,7 @@ import X from 'lucide-svelte/icons/x';
   let seededChatSearchSession = $state<string | null>(null);
   let seededChatSearchRef = $state<string | null>(null);
   let lastSeededSearchKey = '';
+  let lastChatSearchConversationId = '';
   let agents = $state<Agent[]>([]);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
@@ -949,10 +951,10 @@ import X from 'lucide-svelte/icons/x';
     });
   }
 
-  function scrollToNearestTimestamp(timestamp: string | null): void {
-    if (!timestamp) return;
+  function nearestMessageIdForTimestamp(timestamp: string | null): string | null {
+    if (!timestamp) return null;
     const targetTime = Date.parse(timestamp);
-    if (!Number.isFinite(targetTime)) return;
+    if (!Number.isFinite(targetTime)) return null;
     let best: { id: string; delta: number } | null = null;
     for (const item of timeline) {
       if (item.kind !== 'message' || !item.timestamp) continue;
@@ -961,18 +963,19 @@ import X from 'lucide-svelte/icons/x';
       const delta = Math.abs(value - targetTime);
       if (best === null || delta < best.delta) best = { id: item.id, delta };
     }
-    if (best) scrollToTimelineItem(best.id);
+    return best?.id ?? null;
+  }
+
+  function scrollToNearestTimestamp(timestamp: string | null): void {
+    const targetId = nearestMessageIdForTimestamp(timestamp);
+    if (targetId) scrollToTimelineItem(targetId);
   }
 
   function selectChatSearchResult(index: number): void {
     if (chatSearchResults.length === 0) return;
     chatSearchSelectedIndex = (index + chatSearchResults.length) % chatSearchResults.length;
     const result = chatSearchResults[chatSearchSelectedIndex];
-    if (result.source === 'local') {
-      scrollToTimelineItem(localResultId(result.local));
-      return;
-    }
-    scrollToNearestTimestamp(result.server.match.ts);
+    scrollToTimelineItem(result.targetId);
   }
 
   async function runChatSearch(): Promise<void> {
@@ -981,32 +984,50 @@ import X from 'lucide-svelte/icons/x';
       chatSearchResults = [];
       return;
     }
-    const local = findLocalChatMatches(timeline, q).map((match) => ({ source: 'local' as const, local: match }));
+    const conversationId = currentConversation.conversation_id;
+    const local = findLocalChatMatches(timeline, q).map((match) => ({
+      source: 'local' as const,
+      local: match,
+      targetId: localResultId(match)
+    }));
     chatSearchLoading = true;
     try {
       const response = searchEnabled
-        ? await api.search.conversation(currentConversation.conversation_id, {
+        ? await api.search.conversation(conversationId, {
             q,
             kinds: ['reasoning', 'intention', 'summary'],
             limit: 50
           })
         : { matches: [] };
-      chatSearchResults = [
+      const server = response.matches.map((match) => ({
+        source: 'server' as const,
+        server: match,
+        targetId: nearestMessageIdForTimestamp(match.match.ts) ?? `${match.intaris_session_id}:${match.match.ref_id ?? match.match.ts ?? match.match.snippet}`
+      }));
+      const rawResults = [
         ...local,
-        ...response.matches.map((match) => ({ source: 'server' as const, server: match }))
+        ...server
       ];
+      chatSearchResults = mergeSearchResultsByTarget(rawResults);
       let seededIndex = -1;
       if (seededChatSearchSession && seededChatSearchRef) {
-        seededIndex = chatSearchResults.findIndex((result) => result.source === 'server' && (
+        const seededRaw = rawResults.find((result) => result.source === 'server' && (
           result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
         ) && result.server.match.ref_id === seededChatSearchRef);
+        seededIndex = seededRaw
+          ? chatSearchResults.findIndex((result) => result.targetId === seededRaw.targetId)
+          : -1;
       }
       if (seededChatSearchSession && seededIndex < 0) {
-        seededIndex = chatSearchResults.findIndex((result) => result.source === 'server' && (
+        const seededRaw = rawResults.find((result) => result.source === 'server' && (
           result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
         ));
+        seededIndex = seededRaw
+          ? chatSearchResults.findIndex((result) => result.targetId === seededRaw.targetId)
+          : -1;
       }
       chatSearchSelectedIndex = seededIndex >= 0 ? seededIndex : 0;
+      lastChatSearchConversationId = conversationId;
       if (chatSearchResults.length > 0) selectChatSearchResult(chatSearchSelectedIndex);
     } catch (err) {
       addToast(err instanceof Error ? err.message : 'Conversation search failed', 'error');
@@ -2961,6 +2982,8 @@ import X from 'lucide-svelte/icons/x';
         event.preventDefault();
         chatSearchOpen = false;
         chatSearchResults = [];
+        seededChatSearchSession = null;
+        seededChatSearchRef = null;
       }
     };
     window.addEventListener('keydown', handleKeydown);
@@ -2986,6 +3009,17 @@ import X from 'lucide-svelte/icons/x';
     void runChatSearch();
   });
 
+  $effect(() => {
+    const conversationId = currentConversation?.conversation_id ?? '';
+    if (!chatSearchOpen || !chatSearchQuery.trim() || !conversationId) return;
+    if (conversationSubloadsLoading) return;
+    if (lastChatSearchConversationId && conversationId !== lastChatSearchConversationId) {
+      chatSearchResults = [];
+      chatSearchSelectedIndex = 0;
+      void runChatSearch();
+    }
+  });
+
   let visibleConversationList = $derived.by(() => {
     let list = conversations;
     const query = conversationSearch.trim().toLowerCase();
@@ -2996,6 +3030,8 @@ import X from 'lucide-svelte/icons/x';
   });
 
   let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
+  let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
+  let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
 
   // Sync composer draft with the active conversation. On conversation
   // switch, save the current draft under the previous key and hydrate
@@ -3301,7 +3337,7 @@ import X from 'lucide-svelte/icons/x';
                     >
                       <AgentAvatar name={agent?.display_name ?? agent?.name ?? result.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8 shrink-0" />
                       <span class="min-w-0 flex-1">
-                        <span class="block break-words text-sm font-medium text-white lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal">{searchResultConversationTitle(result)}</span>
+                        <span class="block break-words text-sm font-medium text-white">{searchResultConversationTitle(result)}</span>
                         <span class="mt-0.5 flex items-center gap-2">
                           <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? result.agent_id}</span>
                           {#if result.match_count > 1}
@@ -3384,7 +3420,7 @@ import X from 'lucide-svelte/icons/x';
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
-                  <p class="break-words text-sm lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
+                  <p class="break-words text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
                   <div class="mt-0.5 flex items-center gap-2">
                     <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
                     {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}
@@ -3913,8 +3949,15 @@ import X from 'lucide-svelte/icons/x';
             {:else}
               {#each displayedTimeline as item (item.id)}
                 {#if item.kind === 'message'}
-                  <div data-message-id={item.id} class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
+                  {@const isSearchMatched = chatSearchOpen && chatSearchMatchedMessageIds.has(item.id)}
+                  {@const isSelectedSearchMatch = isSearchMatched && selectedChatSearchTargetId === item.id}
+                  <div data-message-id={item.id} class={`flex min-w-0 rounded-[1.7rem] transition ${item.role === 'user' ? 'justify-end' : 'justify-start'} ${isSelectedSearchMatch ? 'ring-2 ring-yellow-300/80 ring-offset-2 ring-offset-slate-950' : isSearchMatched ? 'ring-1 ring-yellow-300/35 ring-offset-1 ring-offset-slate-950' : ''}`}>
+                    <ChatMessage
+                      {item}
+                      agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
+                      searchQuery={chatSearchQuery}
+                      searchActive={isSearchMatched}
+                    />
                   </div>
                 {:else if item.kind === 'thinking'}
                   <div><ThinkingBlock item={item as ThinkingTimelineItem} /></div>

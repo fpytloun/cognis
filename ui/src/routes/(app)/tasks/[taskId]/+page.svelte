@@ -2396,7 +2396,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
           <div class="mt-4 space-y-3">
             {#each task?.dependencies ?? [] as dependency}
               <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
-                <button class="min-w-0 truncate text-left text-sm text-slate-200 hover:text-white" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
+                <button class="min-w-0 break-words text-left text-sm text-slate-200 hover:text-white" onclick={() => goto(`/tasks/${dependency.depends_on}`)} type="button">{allTasks.find((candidate) => candidate.task_id === dependency.depends_on)?.title ?? dependency.depends_on}</button>
                 {#if isEditable}
                   <Button size="sm" variant="danger" onclick={() => removeDependency(dependency.depends_on)}>Remove</Button>
                 {/if}

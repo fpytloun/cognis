@@ -16,7 +16,13 @@
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import type { Agent } from '$lib/types/api';
 
-  let { item, agent = null, compact = false } = $props<{
+  let {
+    item,
+    agent = null,
+    compact = false,
+    searchQuery = '',
+    searchActive = false
+  } = $props<{
     item: MessageTimelineItem;
     agent?: Agent | null;
     /**
@@ -27,6 +33,8 @@
      * styled chat view.
      */
     compact?: boolean;
+    searchQuery?: string;
+    searchActive?: boolean;
   }>();
 
   const agentName = $derived(
@@ -146,6 +154,80 @@
       return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="sr-only">Copied code block</span>';
     }
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span class="sr-only">Copy code block</span>';
+  }
+
+  function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function clearSearchHighlights(node: HTMLElement): void {
+    for (const mark of Array.from(node.querySelectorAll<HTMLElement>('mark[data-chat-search-highlight="1"]'))) {
+      mark.replaceWith(document.createTextNode(mark.textContent ?? ''));
+    }
+    node.normalize();
+  }
+
+  function shouldSkipHighlightNode(node: Node): boolean {
+    const parent = node.parentElement;
+    return !parent || Boolean(parent.closest('pre, code, button, a, input, textarea, mark'));
+  }
+
+  function applySearchHighlights(node: HTMLElement, query: string): void {
+    clearSearchHighlights(node);
+    const q = query.trim();
+    if (!q) return;
+
+    const regex = new RegExp(escapeRegExp(q), 'gi');
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+      acceptNode(textNode) {
+        if (shouldSkipHighlightNode(textNode)) return NodeFilter.FILTER_REJECT;
+        const text = textNode.textContent ?? '';
+        regex.lastIndex = 0;
+        return regex.test(text) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      }
+    });
+    const textNodes: Text[] = [];
+    while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
+
+    for (const textNode of textNodes) {
+      const text = textNode.textContent ?? '';
+      regex.lastIndex = 0;
+      let lastIndex = 0;
+      let match: RegExpExecArray | null;
+      const fragment = document.createDocumentFragment();
+      while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+          fragment.append(document.createTextNode(text.slice(lastIndex, match.index)));
+        }
+        const mark = document.createElement('mark');
+        mark.dataset.chatSearchHighlight = '1';
+        mark.className = 'chat-search-mark';
+        mark.textContent = match[0];
+        fragment.append(mark);
+        lastIndex = match.index + match[0].length;
+      }
+      if (lastIndex < text.length) fragment.append(document.createTextNode(text.slice(lastIndex)));
+      textNode.replaceWith(fragment);
+    }
+  }
+
+  function highlightSearch(
+    node: HTMLElement,
+    params: { query: string; active: boolean }
+  ): { update: (next: { query: string; active: boolean }) => void; destroy: () => void } {
+    const sync = (next: { query: string; active: boolean }): void => {
+      if (next.active) applySearchHighlights(node, next.query);
+      else clearSearchHighlights(node);
+    };
+    sync(params);
+    return {
+      update(next) {
+        sync(next);
+      },
+      destroy() {
+        clearSearchHighlights(node);
+      }
+    };
   }
 
   /**
@@ -301,9 +383,9 @@
     {/if}
     <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
       {#if item.html}
-        <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
+        <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
       {:else}
-        <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+        <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
       {/if}
 
       {#if item.attachments && item.attachments.length > 0}
@@ -363,9 +445,9 @@
 {:else}
   <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
     {#if item.html}
-      <div use:addCodeCopyButtons={item.html} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
+      <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
     {:else}
-      <p class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
+      <p use:highlightSearch={{ query: searchQuery, active: searchActive }} class="whitespace-pre-wrap break-words text-sm leading-6 [overflow-wrap:anywhere]">{item.content}</p>
     {/if}
 
     {#if item.attachments && item.attachments.length > 0}
@@ -381,3 +463,12 @@
     </div>
   </article>
 {/if}
+
+<style>
+  :global(.chat-search-mark) {
+    border-radius: 0.25rem;
+    background: rgba(250, 204, 21, 0.45);
+    color: inherit;
+    padding: 0 0.08em;
+  }
+</style>

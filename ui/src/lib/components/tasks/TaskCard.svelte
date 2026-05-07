@@ -36,7 +36,7 @@
   <div class="flex items-start justify-between gap-2">
     <a
       href="/tasks/{task.task_id}"
-      class="min-w-0 break-words text-sm font-medium text-white hover:text-sky-300 hover:underline xl:line-clamp-2 xl:group-hover:line-clamp-none xl:group-focus-within:line-clamp-none"
+      class="min-w-0 break-words text-sm font-medium text-white hover:text-sky-300 hover:underline"
       onclick={(e) => e.stopPropagation()}
     >
       {task.title}
