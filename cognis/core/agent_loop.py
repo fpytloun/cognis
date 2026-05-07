@@ -2150,6 +2150,9 @@ class AgentLoop:
                 agent_owner_email=resolved_agent.owner_email,
                 agent_type=resolved_agent.agent_type,
                 session_id=child_session.session_id,
+                conversation_id=getattr(conversation, "conversation_id", None)
+                if conversation is not None
+                else None,
                 parent_session_id=getattr(child_session, "parent_session_id", None),
                 delegation_mode=getattr(child_session, "delegation_mode", None),
                 workflow_step=False,
@@ -4271,9 +4274,7 @@ class AgentLoop:
                             on_token=on_token,
                         )
                         if on_tool_result:
-                            await on_tool_result(
-                                tc.call_id, tc.name, err_content, True, None, None
-                            )
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
                     from cognis.core.executor_switching import perform_executor_switch
@@ -5144,9 +5145,7 @@ class AgentLoop:
                             continue
                         created_credential_id = resolution.data.get("credential_id")
                         credential_granted = False
-                        if tc.name == REQUEST_CREDENTIAL and isinstance(
-                            created_credential_id, str
-                        ):
+                        if tc.name == REQUEST_CREDENTIAL and isinstance(created_credential_id, str):
                             grant_credential_to_agent_definition(ctx.agent, created_credential_id)
                             async with self.session_manager.session_factory() as db_session:
                                 credential_granted = await grant_credential_to_agent(
@@ -9064,9 +9063,7 @@ class AgentLoop:
             raw_target = tc.arguments.get("target_executor")
             if isinstance(raw_target, str) and raw_target.strip():
                 target_executor_id = raw_target.strip()
-            sanitized_arguments = {
-                k: v for k, v in tc.arguments.items() if k != "target_executor"
-            }
+            sanitized_arguments = {k: v for k, v in tc.arguments.items() if k != "target_executor"}
             tc = tc.model_copy(update={"arguments": sanitized_arguments})
 
         # Defensive: reject target_executor on non-executor tools so the
@@ -9289,9 +9286,7 @@ class AgentLoop:
             # document_generate, artifact_publish on a freshly-created file) to be
             # promoted to the assistant message bubble.
             seen_ids: set[str] = {
-                str(a.artifact_id)
-                for a in ctx.user_attachments
-                if getattr(a, "artifact_id", None)
+                str(a.artifact_id) for a in ctx.user_attachments if getattr(a, "artifact_id", None)
             }
             seen_ids.update(
                 str(a.get("artifact_id", ""))
@@ -10441,6 +10436,7 @@ class AgentLoop:
             "agent_owner_email": ctx.agent.owner_email,
             "agent_type": ctx.agent.agent_type,
             "session_id": ctx.session.session_id,
+            "conversation_id": ctx.conversation.conversation_id,
             "parent_session_id": getattr(ctx.session, "parent_session_id", None),
             "delegation_mode": getattr(ctx.session, "delegation_mode", None),
             "workflow_step": bool(ctx.task_id or ctx.step_run_id),
@@ -10586,9 +10582,7 @@ class AgentLoop:
         )
         return {"role": "system", "content": content, "_workflow_step_reminder": True}
 
-    def _build_non_primary_active_reminder(
-        self, ctx: StepContext
-    ) -> dict[str, Any] | None:
+    def _build_non_primary_active_reminder(self, ctx: StepContext) -> dict[str, Any] | None:
         """Stage 36: remind the agent it is on a non-primary executor.
 
         Returns ``None`` when the active executor is a primary, when the
@@ -10935,9 +10929,7 @@ class AgentLoop:
         # usable avoids offering a no-op tool to the LLM.
         pool = getattr(ctx, "executor_pool", None)
         if pool is not None:
-            usable_ids = sorted(
-                t.executor_id for t in pool.all if t.usable and t.executor_id
-            )
+            usable_ids = sorted(t.executor_id for t in pool.all if t.usable and t.executor_id)
             if len(usable_ids) >= 2:
                 import copy as _copy
 

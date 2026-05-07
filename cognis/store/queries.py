@@ -1587,6 +1587,32 @@ async def list_conversation_sessions(session: AsyncSession, conversation_id: str
     return list(result.scalars().all())
 
 
+async def list_conversation_intaris_session_ids(
+    session: AsyncSession, conversation_id: str
+) -> list[str]:
+    """Return Intaris session identifiers for all sessions in one conversation."""
+
+    rows = await list_conversation_sessions(session, conversation_id)
+    return [row.intaris_session_id or row.session_id for row in rows]
+
+
+async def list_sessions_by_intaris_session_ids(
+    session: AsyncSession,
+    session_ids: list[str],
+) -> list[Session]:
+    """Resolve Intaris search session IDs back to Cognis session rows."""
+
+    ids = [item for item in dict.fromkeys(session_ids) if item]
+    if not ids:
+        return []
+    result = await session.execute(
+        select(Session)
+        .where(sa.or_(Session.intaris_session_id.in_(ids), Session.session_id.in_(ids)))
+        .order_by(Session.started_at, Session.session_id)
+    )
+    return list(result.scalars().all())
+
+
 async def get_root_session_chain(
     session: AsyncSession,
     conversation_id: str,
@@ -5063,9 +5089,7 @@ async def insert_tts_cache_entry(
     size_bytes: int,
 ) -> TtsCacheRow:
     """Insert (or replace) a TTS cache row."""
-    existing = await get_tts_cache_entry(
-        session, message_id=message_id, voice=voice, model=model
-    )
+    existing = await get_tts_cache_entry(session, message_id=message_id, voice=voice, model=model)
     if existing is not None:
         existing.artifact_id = artifact_id
         existing.artifact_filename = artifact_filename
@@ -5103,9 +5127,7 @@ async def delete_expired_tts_cache_entries(
     returns the cache metadata so the artifact store can clean up the
     underlying blobs.
     """
-    result = await session.execute(
-        select(TtsCacheRow).where(TtsCacheRow.created_at < older_than)
-    )
+    result = await session.execute(select(TtsCacheRow).where(TtsCacheRow.created_at < older_than))
     rows = list(result.scalars().all())
     for row in rows:
         await session.delete(row)

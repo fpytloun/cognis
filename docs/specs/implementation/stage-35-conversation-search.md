@@ -27,8 +27,9 @@ reviewable phases:
 6. **Cognis provider + proxy routes** — `IntarisProvider.search`,
    `search_sessions`, `search_health`; circuit breaker family `search`;
    `cognis/api/routes/search.py` (`/health`, `/conversations`,
-   `/conversation/{id}`); admin reindex proxy; `conversation_id` in
-   `runtime_metadata` + `RuntimeAccessContext`.
+   `/conversation/{id}`); `conversation_id` in `runtime_metadata` +
+   `RuntimeAccessContext`. Cognis reindex proxy is deferred; operators use
+   Intaris admin/API for backfills.
 7. **Cognis UI surfaces** — `ChatSearchBar.svelte` with Cmd+F + magnifier
    + client-first/server-fallback search; sidebar promote-to-search with
    explicit submit; settings card surfacing search health.
@@ -66,15 +67,16 @@ stable.
 - `event_search_index`, `event_search_embeddings`, `search_outbox`,
   `search_state` tables with Alembic migrations and bootstrap
   `_ensure_*` helpers.
-- Tier 1 lexical backends: Postgres `tsvector` (with optional
-  `unaccent`) + `pg_trgm`; SQLite FTS5 with `trigram remove_diacritics 2`.
+- Tier 1 lexical backends: Postgres `tsvector` generated columns over
+  canonical tables (with immutable `unaccent` wrapper when available) plus
+  `pg_trgm`; SQLite canonical-table `LIKE` over `intaris_fold` normalized
+  text.
 - Tier 2 vector backends: `pgvector` and `qdrant`. Qdrant URL setting
   accepts both server URL and local-mode path.
 - Outbox-backed indexer worker with synchronous Tier 1 + asynchronous
   Tier 2; circuit breaker on embedding provider; backoff/retry.
-- Live indexing hooks on event append (filtered to `user_message` /
-  `assistant_message`), session intention/title update, session and
-  agent summary insert. Tombstones on session purge.
+- Live indexing/backfill hooks for canonical `reasoning`, `intention`, and
+  `summary` rows. Raw user/assistant messages are not Intaris search kinds.
 - Query orchestrator with mode resolution, RRF fusion, snippet
   generation, opaque cursor pagination.
 - `POST /api/v1/search`, `POST /api/v1/search/sessions`,
@@ -97,8 +99,7 @@ stable.
   with new circuit breaker family `search` (fail-soft).
 - `cognis/api/routes/search.py` with `/health` (cached 30s),
   `/conversations` (proxy + join), `/conversation/{id}` (in-conversation
-  fallback). Admin reindex proxy at `/api/v1/system/search/reindex` and
-  `/api/v1/system/search/reindex/{job_id}`.
+  fallback). Admin reindex proxy is deferred.
 - `conversation_id` propagated through `RuntimeAccessContext` and
   `runtime_metadata` so tool handlers can read the current conversation
   without a DB hop.
@@ -367,8 +368,7 @@ Tests:
 Provider:
 
 - `cognis/providers/guardrails/intaris.py` — add `search`,
-  `search_sessions`, `search_health`, `trigger_reindex`,
-  `get_reindex_status` methods. Wrap with retry helper. Add a new
+  `search_sessions`, `search_health` methods. Wrap with retry helper. Add a new
   circuit breaker family `"search"` with **fail-soft** behavior (returns
   empty results + warning, never raises into the chat path).
 - `cognis/providers/guardrails/protocol.py` — extend Protocol with the
@@ -380,7 +380,7 @@ Routes:
   - `GET /api/v1/search/health` — proxies to Intaris with a 30 s in-
     process cache.
   - `POST /api/v1/search/conversations` — body
-    `{q, filters: {agent_id?, project_id?, status?, kinds?, from_ts?, to_ts?}, mode?, limit?, cursor?}`.
+    `{q, filters: {agent_id?, project_id?, status?, from_ts?, to_ts?}, kinds?, mode?, limit?, cursor?}`.
     Forwards to Intaris `search_sessions`, joins to Cognis
     `conversations` (resolves `intaris_session_id → conversation_id`,
     drops non-owned, applies `project_id`/`status` filters), returns
@@ -388,10 +388,8 @@ Routes:
   - `POST /api/v1/search/conversation/{conversation_id}` — verifies
     ownership, walks lineage, forwards to Intaris `search` with
     `session_ids=[...]`, returns the flat match list.
-  - `POST /api/v1/system/search/reindex` (admin) — proxy to Intaris
+  - Reindex proxy is deferred. Use Intaris operations UI/API for manual
     reindex.
-  - `GET /api/v1/system/search/reindex/{job_id}` (admin) — poll
-    progress.
 
 Lineage walker:
 
@@ -463,8 +461,10 @@ Chat page:
     reduce `visibleStartIndex` to include it before scrolling.
   - Server fallback: when local matches are zero AND `history_truncated`
     is true (or the user clicks "Search server"), call
-    `POST /api/v1/search/conversation/{id}`. Map returned `event_seq`s
-    to timeline IDs; load older history if needed before scrolling.
+    `POST /api/v1/search/conversation/{id}`. Display all returned matching
+    parts. Prioritize `reasoning` hits for nearest-message/time navigation,
+    use `intention` as session/section context, and show `summary` as the
+    lowest-priority fallback.
 
 Sidebar:
 
@@ -476,8 +476,9 @@ Sidebar:
     conversation list. Each result row: title + agent chip + snippet
     (with `<mark>`) + match seq + last-message-at.
   - Clicking a result navigates to the conversation, opens
-    `ChatSearchBar` pre-seeded with the same query, and scrolls to the
-    matching seq.
+    `ChatSearchBar` pre-seeded with the same query, runs in-conversation
+    search immediately, and renders all matching parts. The clicked result is
+    selected as the initial match when available.
   - When `/search/health` reports disabled, the input falls back to the
     original client-side title filter and shows a "Content search
     disabled" hint.
@@ -497,7 +498,7 @@ Settings card:
   System surfacing `/api/v1/search/health`: enabled flag, backends in
   use, embedding model, last index timestamp, queue depth, backfill
   status with progress bar, "Reindex" button (admin only, calls
-  `/api/v1/system/search/reindex`).
+  Intaris search health. Manual reindex remains in Intaris operations UI/API.
 
 Tests:
 

@@ -34,6 +34,11 @@ from cognis.api.models import (
     TaskResponse,
     WorkflowResponse,
 )
+from cognis.models.search import (
+    ConversationFlatSearchResponse,
+    ConversationSearchResponse,
+    SearchHealth,
+)
 
 UI_API_TYPES = Path(__file__).resolve().parents[2] / "ui" / "src" / "lib" / "types" / "api.ts"
 
@@ -59,6 +64,9 @@ _MODELS_TO_CHECK = (
     ("Skill", SkillResponse),
     ("SkillVersion", SkillVersionResponse),
     ("Workflow", WorkflowResponse),
+    ("SearchHealth", SearchHealth),
+    ("ConversationSearchResponse", ConversationSearchResponse),
+    ("ConversationFlatSearchResponse", ConversationFlatSearchResponse),
 )
 
 
@@ -135,6 +143,9 @@ def test_ui_interface_covers_api_model_fields(interface_name: str, model_cls: ty
         "Skill": set(),
         "SkillVersion": set(),
         "Workflow": set(),
+        "SearchHealth": set(),
+        "ConversationSearchResponse": set(),
+        "ConversationFlatSearchResponse": set(),
     }.get(interface_name, set())
     missing -= allowed_missing
 

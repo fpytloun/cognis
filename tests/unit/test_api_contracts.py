@@ -46,6 +46,14 @@ from cognis.api.models import (
 from cognis.api.routes.push import PushSubscriptionStatusResponse
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
 from cognis.core.management import _normalize_pause_context, _normalize_pause_options
+from cognis.models.search import (
+    ConversationFlatSearchMatch,
+    ConversationFlatSearchResponse,
+    ConversationSearchMatch,
+    ConversationSearchResponse,
+    SearchMatch,
+    SearchSessionMatch,
+)
 
 
 def test_task_requests_normalize_empty_optional_ids() -> None:
@@ -213,6 +221,46 @@ def test_session_events_response_round_trips_active_thinking() -> None:
 
     assert response.active_thinking[0].message_id == "sr-1"
     assert response.active_thinking[0].blocks[0].content == "Considering options for the task"
+
+
+def test_search_responses_round_trip_current_intaris_shape() -> None:
+    match = SearchMatch(
+        session_id="intaris-1",
+        kind="reasoning",
+        ref_id="audit-1",
+        snippet="matched <mark>reasoning</mark>",
+        score=0.9,
+    )
+    session_match = SearchSessionMatch(
+        session_id="intaris-1",
+        match_count=1,
+        top_match=match,
+    )
+    conversation_match = ConversationSearchMatch(
+        conversation_id="conv-1",
+        agent_id="agent-1",
+        status="active",
+        session_id="sess-1",
+        intaris_session_id="intaris-1",
+        match_count=session_match.match_count,
+        top_match=session_match.top_match,
+        kind_rank=0,
+    )
+    flat_match = ConversationFlatSearchMatch(
+        conversation_id="conv-1",
+        agent_id="agent-1",
+        status="active",
+        session_id="sess-1",
+        intaris_session_id="intaris-1",
+        match=match,
+        kind_rank=0,
+    )
+
+    assert (
+        ConversationSearchResponse(matches=[conversation_match]).matches[0].top_match.ref_id
+        == "audit-1"
+    )
+    assert ConversationFlatSearchResponse(matches=[flat_match]).matches[0].match.kind == "reasoning"
 
 
 def test_push_subscription_status_response_round_trip() -> None:
@@ -512,12 +560,8 @@ class TestModelRoutingContracts:
         response = ModelRoutingResponse()
 
         assert response.default == ModelRoutingEntry(model=None, reasoning_effort=None)
-        assert response.image_generation == ModelRoutingEntry(
-            model=None, reasoning_effort=None
-        )
-        assert response.attachment_analysis == ModelRoutingEntry(
-            model=None, reasoning_effort=None
-        )
+        assert response.image_generation == ModelRoutingEntry(model=None, reasoning_effort=None)
+        assert response.attachment_analysis == ModelRoutingEntry(model=None, reasoning_effort=None)
 
     def test_model_routing_preserves_nested_entry_shape(self) -> None:
         response = ModelRoutingResponse(

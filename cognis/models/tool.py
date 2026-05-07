@@ -82,6 +82,7 @@ AUTO_PROFILE_GROUPS: tuple[str, ...] = (
     "office",
     "personal",
     "communication",
+    "conversations",
 )
 
 RESERVED_PROFILE_GROUPS: tuple[str, ...] = ("memory", "system")
@@ -104,6 +105,8 @@ def tool_profile_group(tool: ToolDefinition) -> str:
         return "browser"
     if tool.category == "memory":
         return "memory"
+    if tool.category == "conversations":
+        return "conversations"
     if tool.category in {
         "system",
         "context",

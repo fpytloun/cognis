@@ -44,6 +44,10 @@ from cognis.runtime_context import (
 )
 from cognis.tools.builtin.agent_management import agent_management_tools
 from cognis.tools.builtin.artifact_tools import artifact_tools
+from cognis.tools.builtin.conversations import (
+    build_conversation_tool_handlers,
+    conversation_tools,
+)
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
 from cognis.tools.builtin.memory import memory_tools
@@ -303,16 +307,12 @@ async def _resolve_eligible_executor_config(
         list_executors,
     )
 
-    async def _persist_initial_active_executor(
-        session: Any, executor_id: str
-    ) -> None:
+    async def _persist_initial_active_executor(session: Any, executor_id: str) -> None:
         """Idempotently persist the initial active executor on conversation+task."""
 
         try:
             if isinstance(conversation_id, str) and conversation_id:
-                await initialize_conversation_active_executor(
-                    session, conversation_id, executor_id
-                )
+                await initialize_conversation_active_executor(session, conversation_id, executor_id)
             if isinstance(task_id, str) and task_id:
                 await initialize_task_active_executor(session, task_id, executor_id)
             commit = getattr(session, "commit", None)
@@ -499,6 +499,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *workflow_tools(),
         *memory_tools(),
         *agent_management_tools(),
+        *conversation_tools(),
         *project_tools(),
         *task_continuation_tools(),
         *tool_output_tools(),
@@ -591,10 +592,14 @@ def select_static_tools(
     return selected
 
 
-def _build_handler_map(session_factory: Any, status_provider: Any) -> dict[str, Any]:
+def _build_handler_map(
+    session_factory: Any, status_provider: Any, guardrails_provider: Any | None = None
+) -> dict[str, Any]:
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
     handlers.update(build_system_tool_handlers(session_factory, status_provider))
+    if guardrails_provider is not None:
+        handlers.update(build_conversation_tool_handlers(session_factory, guardrails_provider))
     handlers.update(build_project_tool_handlers(session_factory))
     handlers.update(build_task_continuation_tool_handlers(session_factory))
     handlers.update(build_datetime_tool_handlers())
@@ -784,16 +789,12 @@ def build_step_runtime_factory(
         # so downstream code can route per-call to other assigned executors.
         from cognis.core.executor_pool import resolve_executor_pool
 
-        executor_owner_email_for_pool = executor_config.get(
-            "executor_owner_email", user_email
-        )
+        executor_owner_email_for_pool = executor_config.get("executor_owner_email", user_email)
         try:
             executor_pool_obj = await resolve_executor_pool(
                 session_factory=session_factory,
                 agent_execution=(
-                    executor_agent.execution
-                    if isinstance(executor_agent.execution, dict)
-                    else {}
+                    executor_agent.execution if isinstance(executor_agent.execution, dict) else {}
                 ),
                 user_email=user_email,
                 executor_owner_email=executor_owner_email_for_pool,
@@ -1046,6 +1047,7 @@ def build_step_runtime_factory(
                     handler_map = _build_handler_map(
                         session_factory,
                         getattr(providers.executor, "status_provider", None),
+                        getattr(providers, "guardrails", None),
                     )
                     remote_registry = _build_remote_runtime_registry(
                         merge_result.tools,

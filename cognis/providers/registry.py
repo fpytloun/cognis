@@ -57,8 +57,13 @@ def build_provider_registry(
         session_factory, str(config.secrets_key_path)
     )
 
+    guardrails_provider = IntarisProvider(config.intaris_url, auth_provider)
+
     # Build executor sub-providers
-    in_process = InProcessExecutorProvider(session_factory=session_factory)
+    in_process = InProcessExecutorProvider(
+        session_factory=session_factory,
+        guardrails_provider=guardrails_provider,
+    )
     ws_provider = WebSocketExecutorProvider()
     subprocess_provider = SubprocessExecutorProvider(
         ws_provider=ws_provider,
@@ -83,7 +88,7 @@ def build_provider_registry(
 
     registry = ProviderRegistry(
         memory=MnemoryProvider(config.mnemory_url, auth_provider),
-        guardrails=IntarisProvider(config.intaris_url, auth_provider),
+        guardrails=guardrails_provider,
         executor=composite_executor,
         secrets=secrets_provider,
         credentials=credentials_provider,

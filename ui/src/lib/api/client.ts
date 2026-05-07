@@ -16,6 +16,8 @@ import type {
   ApiKeyMetadata,
   BootstrapStatusResponse,
   Conversation,
+  ConversationFlatSearchResponse,
+  ConversationSearchResponse,
   CursorPage,
   Escalation,
   ExecutorConfig,
@@ -27,6 +29,9 @@ import type {
   ExecutorUpdateRequest,
   ExchangeTokenResponse,
   HealthResponse,
+  SearchHealth,
+  SearchKind,
+  SearchMode,
   IntarisMCPServer,
   IntarisSessionDetail,
   LLMProvider,
@@ -309,6 +314,45 @@ export const api = {
 
     diagnostics(): Promise<SystemDiagnostics> {
       return request<SystemDiagnostics>('/api/v1/system/diagnostics');
+    }
+  },
+
+  search: {
+    health(): Promise<SearchHealth> {
+      return request<SearchHealth>('/api/v1/search/health');
+    },
+
+    conversations(payload: {
+      q: string;
+      filters?: {
+        agent_id?: string | null;
+        project_id?: string | null;
+        status?: 'active' | 'archived' | 'all';
+        from_ts?: string | null;
+        to_ts?: string | null;
+      };
+      kinds?: SearchKind[] | null;
+      mode?: SearchMode;
+      limit?: number;
+      cursor?: string | null;
+    }): Promise<ConversationSearchResponse> {
+      return request<ConversationSearchResponse>('/api/v1/search/conversations', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    conversation(conversationId: string, payload: {
+      q: string;
+      kinds?: SearchKind[] | null;
+      mode?: SearchMode;
+      limit?: number;
+      cursor?: string | null;
+    }): Promise<ConversationFlatSearchResponse> {
+      return request<ConversationFlatSearchResponse>(`/api/v1/search/conversation/${encodeURIComponent(conversationId)}`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
     }
   },
 

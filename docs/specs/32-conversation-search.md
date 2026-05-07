@@ -8,10 +8,16 @@ chat sidebar, and three LLM-facing tools (`list_conversations`,
 `search_conversations`, `read_conversation_messages`) so agents can navigate
 prior dialogue.
 
-The bulk of the work is in **Intaris**: a new search subsystem with a
-mandatory lexical index (Postgres FTS / SQLite FTS5) and an optional
-embedding-backed semantic layer (pgvector or Qdrant). Cognis is a thin
-proxy plus chat UI surfaces.
+The bulk of the work is in **Intaris**: a search subsystem over canonical
+Intaris tables with a mandatory lexical tier and an optional embedding-backed
+semantic layer (pgvector or Qdrant). Cognis is a thin proxy plus chat UI
+surfaces.
+
+Current Intaris implementation note: searchable kinds are exactly
+`reasoning`, `intention`, and `summary`. Reasoning is the most granular kind
+and is treated by Cognis as the primary anchor for locating matching parts of a
+conversation; intention is session/section-level context; summary is a
+low-priority fallback.
 
 Related specs: [`05-integrations.md`](05-integrations.md),
 [`06-tool-system.md`](06-tool-system.md), [`09-ui-ux.md`](09-ui-ux.md),
@@ -53,13 +59,10 @@ ownership). The Cognis DB is never asked to full-text search event content.
 
 ### 2. Two-tier search inside Intaris
 
-- **Tier 1 — Lexical** is mandatory and language-agnostic. Postgres uses
-  `tsvector` with the `simple` config plus `pg_trgm` for substring/fuzzy
-  fallback. SQLite uses an FTS5 contentless table with the `trigram`
-  tokenizer and `remove_diacritics 2` to produce diacritic-folded matches
-  in any Unicode-friendly language. No language detection, no per-language
-  analyzers — the trigram/simple baseline is deterministic and works on
-  Czech, German, Japanese, code identifiers, IDs, and partial words alike.
+- **Tier 1 — Lexical** is mandatory and language-agnostic. Postgres queries
+  canonical Intaris tables with `tsvector` generated columns and `pg_trgm`
+  fallback. SQLite uses case-folded canonical-table `LIKE` matching with the
+  `intaris_fold` UDF. No event/message search index is duplicated in Cognis.
 - **Tier 2 — Vector** is optional and improves recall on paraphrase and
   multilingual queries. Backends: `pgvector` (when Intaris runs on
   Postgres) or `qdrant` (URL-mode for shared deployments, local-mode path
@@ -186,15 +189,28 @@ quote prior content reliably.
 
 ### Indexed content
 
+Current implementation indexes/searches three high-signal Intaris-owned
+content families:
+
+| Kind | Source | UI Use |
+|------|--------|--------|
+| `reasoning` | Intaris audit reasoning/checkpoint rows | Highest priority; most granular; used to point to a matching part of a conversation and nearest message/time anchor. |
+| `intention` | Distinct session intentions from Intaris audit data | Medium priority; represents session or section intent. |
+| `summary` | Session and agent summaries | Lowest priority; fallback context when reasoning/intention do not match. |
+
+Tool calls, tool results, evaluations, delegations, lifecycle events,
+checkpoints outside reasoning rows, and raw user/assistant messages are not
+indexed for content search. Exact text find over loaded chat messages remains a
+Cognis UI client-side feature.
+
+Historical design notes below used event-level message kinds; those are no
+longer part of the accepted Intaris API.
+
 | Source | Trigger | `kind`            | Notes |
 |--------|---------|-------------------|-------|
-| Event append (type=`user_message`) | event store hook | `user_message`         | `text` = `event.data.content` |
-| Event append (type=`assistant_message`) | event store hook | `assistant_message` | `text` = `event.data.content` |
-| Session intention update | reasoning endpoint | `intention` | upsert `(session_id, "intention")` |
-| Session title update | reasoning endpoint | `title` | upsert `(session_id, "title")` |
-| `session_summaries` insert (`window`) | summary writer | `summary_window` | `text` = summary text |
-| `session_summaries` insert (`compacted`) | summary writer | `summary_compacted` | |
-| `agent_summaries` insert | summary writer | `agent_summary` | |
+| Intaris audit reasoning/checkpoint rows | audit writer/backfill | `reasoning` | Most granular result kind. |
+| Distinct session intentions | audit writer/backfill | `intention` | Deduped per `(session_id, intention)`. |
+| Session/agent summaries | summary writer/backfill | `summary` | Low-priority fallback context. |
 
 Tool calls, tool results, evaluations, delegations, lifecycle events,
 checkpoints, and reasoning records are **not** indexed.
@@ -376,14 +392,16 @@ POST /api/v1/search
   "matches": [
     {
       "session_id": "ses_123",
-      "event_seq": 42,
-      "kind": "assistant_message",
-      "role": "assistant",
+      "ref_id": "12345",
+      "kind": "reasoning",
+      "role": null,
       "ts": "2026-04-12T10:30:00Z",
       "snippet": "...the <mark>rocket</mark> launched at dawn...",
       "score": 0.83,
       "score_breakdown": {"lexical": 0.7, "vector": 0.92},
-      "agent_id": "aria"
+      "agent_id": "aria",
+      "session_title": "Launch planning",
+      "session_intention": "Plan the release"
     }
   ],
   "next_cursor": "...",
@@ -405,9 +423,9 @@ scoring event. Used by the Cognis sidebar for the "Search results" group.
 `POST /api/v1/search/conversations` does the following per request:
 
 1. Authenticate caller, derive `user_email`.
-2. Forward to `Intaris.search_sessions(...)` (or `search()` when the
-   caller asked for flat matches) with caller's structural filters
-   (`agent_id`, `kind`, time range).
+2. Forward to `Intaris.search_sessions(...)` with caller's structural filters
+   (`agent_id`, `kinds`, time range). Cognis never forwards a body-supplied
+   `user_id`.
 3. Join Intaris session matches with Cognis `sessions` (resolve
    `intaris_session_id → conversation_id`) and `conversations`
    (ownership, title, project_id, status).
@@ -415,15 +433,21 @@ scoring event. Used by the Cognis sidebar for the "Search results" group.
    defense in depth — Intaris already scopes to `user_id`.
 5. Apply Cognis-only filters (`project_id`, `status`).
 6. Return `{matches: [...with conversation_id, conversation_title,
-   agent_id, project_id, snippet, ...], next_cursor}`.
+   agent_id, project_id, top_match, kind_rank, ...], next_cursor}`. Cognis
+   ranks result kinds as `reasoning` > `intention` > `summary` for UI
+   navigation because reasoning is the closest available proxy for an exact
+   message-level match.
 
 `POST /api/v1/search/conversation/{conversation_id}` is the in-conversation
-server fallback. The handler walks the conversation's session lineage
-(root + compaction children + sub-sessions) and forwards to Intaris with
-`session_ids=[...]` filter, returning the flat match list.
+server fallback. The handler walks the conversation's Cognis sessions and
+forwards to Intaris with `session_ids=[...]`, returning flat matches joined
+with Cognis session metadata. The UI displays all matching parts; reasoning
+hits are used first for nearest-message/time anchoring, intention hits are
+session/section anchors, and summary hits are fallback cards.
 
-`GET /api/v1/search/health` is a thin proxy with a 30s cache so the UI
-can poll without hammering Intaris.
+`GET /api/v1/search/health` is a thin proxy with a 30s cache so the UI can
+poll without hammering Intaris. Cognis does not expose a reindex proxy in the
+initial implementation; operators use Intaris admin/API for reindexing.
 
 ## LLM Tools
 
@@ -473,7 +497,7 @@ uses the existing `list_conversations` query helper.
       "q":          {"type": "string"},
       "agent_id":   {"type": "string"},
       "project_id": {"type": "string"},
-      "kinds":      {"type": "array", "items": {"type": "string"}},
+      "kinds":      {"type": "array", "items": {"enum": ["reasoning", "intention", "summary"]}},
       "from_ts":    {"type": "string"},
       "to_ts":      {"type": "string"},
       "mode":       {"type": "string", "enum": ["lexical", "vector", "hybrid"]},
@@ -486,10 +510,9 @@ uses the existing `list_conversations` query helper.
 ```
 
 Returns `{matches: [{conversation_id, conversation_title, agent_id,
-session_id, event_seq, kind, role, ts, snippet, score}], next_cursor,
-backend}`. Returns `{"error": "search_disabled", ...}` when Intaris reports
-search disabled — the LLM should treat this as a permanent capability
-absence, not a transient failure.
+session_id, ref_id, kind, ts, snippet, score}], next_cursor, backend}`.
+Reasoning matches are listed before intention and summary when scores are
+otherwise comparable.
 
 ### `read_conversation_messages`
 

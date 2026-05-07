@@ -17,6 +17,7 @@ class RuntimeAccessContext:
     agent_owner_email: str | None = None
     agent_type: str = "primary"
     session_id: str | None = None
+    conversation_id: str | None = None
     parent_session_id: str | None = None
     delegation_mode: str | None = None
     workflow_step: bool = False

@@ -11,6 +11,13 @@ import httpx
 
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
+from cognis.models.search import (
+    SearchHealth,
+    SearchRequest,
+    SearchResponse,
+    SearchSessionsRequest,
+    SearchSessionsResponse,
+)
 from cognis.models.session import (
     EventAppendResult,
     EventReadResult,
@@ -60,6 +67,7 @@ class IntarisProvider:
         self.session_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.events_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.mcp_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.search_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
     async def _call_with_retry(
         self,
@@ -672,6 +680,93 @@ class IntarisProvider:
             logger.warning("intaris: list_mcp_tools failed", exc_info=True)
             return []
 
+    async def search_health(self, user_email: str | None = None) -> SearchHealth:
+        """Return Intaris search health, treating missing search routes as disabled."""
+
+        try:
+
+            async def _do() -> SearchHealth:
+                response = await self.client.get(
+                    "/api/v1/search/health",
+                    headers=self._headers(user_email=user_email or current_user_email.get()),
+                    timeout=5.0,
+                )
+                if response.status_code == 404:
+                    return SearchHealth(enabled=False, notes=["search_disabled"])
+                response.raise_for_status()
+                return SearchHealth.model_validate(response.json())
+
+            return await self._call_with_retry(
+                _do,
+                max_retries=1,
+                base_delay=0.5,
+                operation="intaris search_health",
+                breaker=self.search_breaker,
+            )
+        except Exception:
+            logger.warning("intaris: search_health failed", exc_info=True)
+            return SearchHealth(enabled=False, notes=["search_unavailable"])
+
+    async def search(
+        self, request: SearchRequest, *, user_email: str | None = None
+    ) -> SearchResponse:
+        """Run flat Intaris search with fail-soft semantics."""
+
+        try:
+
+            async def _do() -> SearchResponse:
+                response = await self.client.post(
+                    "/api/v1/search",
+                    json=request.model_dump(mode="json", exclude_none=True),
+                    headers=self._headers(user_email=user_email or current_user_email.get()),
+                    timeout=15.0,
+                )
+                if response.status_code == 404:
+                    return SearchResponse()
+                response.raise_for_status()
+                return SearchResponse.model_validate(response.json())
+
+            return await self._call_with_retry(
+                _do,
+                max_retries=1,
+                base_delay=0.5,
+                operation="intaris search",
+                breaker=self.search_breaker,
+            )
+        except Exception:
+            logger.warning("intaris: search failed", exc_info=True)
+            return SearchResponse()
+
+    async def search_sessions(
+        self, request: SearchSessionsRequest, *, user_email: str | None = None
+    ) -> SearchSessionsResponse:
+        """Run aggregated Intaris search with fail-soft semantics."""
+
+        try:
+
+            async def _do() -> SearchSessionsResponse:
+                response = await self.client.post(
+                    "/api/v1/search/sessions",
+                    json=request.model_dump(mode="json", exclude_none=True),
+                    headers=self._headers(user_email=user_email or current_user_email.get()),
+                    timeout=15.0,
+                )
+                if response.status_code == 404:
+                    return SearchSessionsResponse()
+                response.raise_for_status()
+                return SearchSessionsResponse.model_validate(response.json())
+
+            return await self._call_with_retry(
+                _do,
+                max_retries=1,
+                base_delay=0.5,
+                operation="intaris search_sessions",
+                breaker=self.search_breaker,
+            )
+        except Exception:
+            logger.warning("intaris: search_sessions failed", exc_info=True)
+            return SearchSessionsResponse()
+
     async def health(self) -> ProviderHealth:
         start = perf_counter()
         try:
@@ -688,6 +783,7 @@ class IntarisProvider:
                         "session_circuit_state": self.session_breaker.state,
                         "events_circuit_state": self.events_breaker.state,
                         "mcp_circuit_state": self.mcp_breaker.state,
+                        "search_circuit_state": self.search_breaker.state,
                     },
                 )
         except Exception as exc:
@@ -701,6 +797,7 @@ class IntarisProvider:
                     "session_circuit_state": self.session_breaker.state,
                     "events_circuit_state": self.events_breaker.state,
                     "mcp_circuit_state": self.mcp_breaker.state,
+                    "search_circuit_state": self.search_breaker.state,
                 },
             )
         return ProviderHealth(
@@ -712,5 +809,6 @@ class IntarisProvider:
                 "session_circuit_state": self.session_breaker.state,
                 "events_circuit_state": self.events_breaker.state,
                 "mcp_circuit_state": self.mcp_breaker.state,
+                "search_circuit_state": self.search_breaker.state,
             },
         )

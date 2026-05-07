@@ -32,6 +32,7 @@ from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
 from cognis.api.routes.schedules import router as schedules_router
+from cognis.api.routes.search import router as search_router
 from cognis.api.routes.secrets import router as secrets_router
 from cognis.api.routes.sessions import router as sessions_router
 from cognis.api.routes.settings import router as settings_router
@@ -684,6 +685,7 @@ def create_app() -> FastAPI:
     app.include_router(schedules_router)
     app.include_router(workflows_router)
     app.include_router(secrets_router)
+    app.include_router(search_router)
     app.include_router(tools_router)
     app.include_router(skills_router)
     app.include_router(executors_router)

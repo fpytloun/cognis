@@ -26,6 +26,7 @@ import X from 'lucide-svelte/icons/x';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
+  import ChatSearchBar from '$lib/components/ChatSearchBar.svelte';
   import CompactionCard from '$lib/components/CompactionCard.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
@@ -80,6 +81,11 @@ import X from 'lucide-svelte/icons/x';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
   import {
+    findLocalChatMatches,
+    type ChatSearchResult,
+    type LocalChatMatch
+  } from '$lib/chat-search';
+  import {
     annotateStepRequestInputWithNotification,
     applyActiveStreamSnapshots,
     applyActiveThinkingSnapshots,
@@ -94,7 +100,7 @@ import X from 'lucide-svelte/icons/x';
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
-  import type { ActiveThinkingSnapshot, Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -109,6 +115,17 @@ import X from 'lucide-svelte/icons/x';
   let conversationCursor: string | null = null;
   let conversationsHasMore = $state(false);
   let conversationSearch = $state('');
+  let conversationSearchResults = $state<ConversationSearchMatch[]>([]);
+  let conversationSearchLoading = $state(false);
+  let conversationSearchSubmitted = $state('');
+  let searchEnabled = $state(true);
+  let chatSearchOpen = $state(false);
+  let chatSearchQuery = $state('');
+  let chatSearchLoading = $state(false);
+  let chatSearchResults = $state<ChatSearchResult[]>([]);
+  let chatSearchSelectedIndex = $state(0);
+  let seededChatSearchRan = $state(false);
+  let seededChatSearchSession = $state<string | null>(null);
   let agents = $state<Agent[]>([]);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
@@ -779,6 +796,137 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationAgent(conversation: Conversation): Agent | undefined {
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
+  }
+
+  function searchResultConversationTitle(result: ConversationSearchMatch): string {
+    return result.conversation_title?.trim() || result.title?.trim() || 'Untitled conversation';
+  }
+
+  function searchResultSnippet(result: ConversationSearchMatch): string {
+    return result.top_match.snippet.replace(/<\/?mark>/g, '');
+  }
+
+  function localResultId(result: LocalChatMatch): string {
+    return result.id;
+  }
+
+  async function refreshSearchHealth(): Promise<void> {
+    try {
+      const health = await api.search.health();
+      searchEnabled = health.enabled;
+    } catch {
+      searchEnabled = false;
+    }
+  }
+
+  async function submitConversationSearch(): Promise<void> {
+    const q = conversationSearch.trim();
+    conversationSearchSubmitted = q;
+    conversationSearchResults = [];
+    if (!q || !searchEnabled) return;
+    conversationSearchLoading = true;
+    try {
+      const response = await api.search.conversations({
+        q,
+        filters: {
+          agent_id: selectedAgentId !== 'all' ? selectedAgentId : null,
+          status: selectedConversationStatus,
+        },
+        kinds: ['reasoning', 'intention', 'summary'],
+        limit: 25
+      });
+      conversationSearchResults = response.matches;
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Search failed', 'error');
+    } finally {
+      conversationSearchLoading = false;
+    }
+  }
+
+  async function openConversationSearchResult(result: ConversationSearchMatch): Promise<void> {
+    const q = conversationSearchSubmitted || conversationSearch.trim();
+    const url = `/chat/${result.conversation_id}${q ? `?search=${encodeURIComponent(q)}&searchSession=${encodeURIComponent(result.intaris_session_id)}` : ''}`;
+    closeMobileList();
+    await goto(url);
+  }
+
+  function scrollToTimelineItem(id: string): void {
+    const fullIndex = timeline.findIndex((item) => item.id === id);
+    if (fullIndex >= 0 && fullIndex < visibleStartIndex) {
+      visibleStartIndex = Math.max(0, fullIndex - 5);
+    }
+    void tick().then(() => {
+      const node = timelineEl?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
+      node?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
+  function scrollToNearestTimestamp(timestamp: string | null): void {
+    if (!timestamp) return;
+    const targetTime = Date.parse(timestamp);
+    if (!Number.isFinite(targetTime)) return;
+    let best: { id: string; delta: number } | null = null;
+    for (const item of timeline) {
+      if (item.kind !== 'message' || !item.timestamp) continue;
+      const value = Date.parse(item.timestamp);
+      if (!Number.isFinite(value)) continue;
+      const delta = Math.abs(value - targetTime);
+      if (best === null || delta < best.delta) best = { id: item.id, delta };
+    }
+    if (best) scrollToTimelineItem(best.id);
+  }
+
+  function selectChatSearchResult(index: number): void {
+    if (chatSearchResults.length === 0) return;
+    chatSearchSelectedIndex = (index + chatSearchResults.length) % chatSearchResults.length;
+    const result = chatSearchResults[chatSearchSelectedIndex];
+    if (result.source === 'local') {
+      scrollToTimelineItem(localResultId(result.local));
+      return;
+    }
+    scrollToNearestTimestamp(result.server.match.ts);
+  }
+
+  async function runChatSearch(): Promise<void> {
+    const q = chatSearchQuery.trim();
+    if (!q || !currentConversation) {
+      chatSearchResults = [];
+      return;
+    }
+    const local = findLocalChatMatches(timeline, q).map((match) => ({ source: 'local' as const, local: match }));
+    chatSearchLoading = true;
+    try {
+      const response = searchEnabled
+        ? await api.search.conversation(currentConversation.conversation_id, {
+            q,
+            kinds: ['reasoning', 'intention', 'summary'],
+            limit: 50
+          })
+        : { matches: [] };
+      chatSearchResults = [
+        ...local,
+        ...response.matches.map((match) => ({ source: 'server' as const, server: match }))
+      ];
+      const seededIndex = seededChatSearchSession
+        ? chatSearchResults.findIndex((result) => result.source === 'server' && (
+            result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
+          ))
+        : -1;
+      chatSearchSelectedIndex = seededIndex >= 0 ? seededIndex : 0;
+      if (chatSearchResults.length > 0) selectChatSearchResult(chatSearchSelectedIndex);
+    } catch (err) {
+      addToast(err instanceof Error ? err.message : 'Conversation search failed', 'error');
+      chatSearchResults = local;
+    } finally {
+      chatSearchLoading = false;
+    }
+  }
+
+  function openChatSearch(seed = ''): void {
+    chatSearchOpen = true;
+    if (seed) chatSearchQuery = seed;
+    seededChatSearchRan = true;
+    void tick().then(() => void runChatSearch());
   }
 
   // Display name of the current conversation's agent for composer placeholders
@@ -2695,10 +2843,51 @@ import X from 'lucide-svelte/icons/x';
     };
   });
 
+  $effect(() => {
+    const handleKeydown = (event: KeyboardEvent): void => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+        const target = event.target as HTMLElement | null;
+        if (
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement ||
+          target instanceof HTMLSelectElement ||
+          target?.isContentEditable
+        ) {
+          return;
+        }
+        event.preventDefault();
+        openChatSearch();
+      }
+      if (event.key === 'Escape' && chatSearchOpen) {
+        event.preventDefault();
+        chatSearchOpen = false;
+        chatSearchResults = [];
+      }
+    };
+    window.addEventListener('keydown', handleKeydown);
+    return () => window.removeEventListener('keydown', handleKeydown);
+  });
+
+  $effect(() => {
+    if (conversationSearchSubmitted && conversationSearch.trim() !== conversationSearchSubmitted) {
+      conversationSearchSubmitted = '';
+      conversationSearchResults = [];
+    }
+  });
+
+  $effect(() => {
+    if (!chatSearchOpen || seededChatSearchRan || !chatSearchQuery.trim() || !currentConversation) {
+      return;
+    }
+    if (conversationSubloadsLoading) return;
+    seededChatSearchRan = true;
+    void runChatSearch();
+  });
+
   let visibleConversationList = $derived.by(() => {
     let list = conversations;
     const query = conversationSearch.trim().toLowerCase();
-    if (query) {
+    if (query && (!searchEnabled || !conversationSearchSubmitted)) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
     }
     return sortConversationsByActivity(list);
@@ -2770,8 +2959,16 @@ import X from 'lucide-svelte/icons/x';
     window.addEventListener('online', onlineHandler);
     startNotificationRefreshPolling();
     void reconcileChatNotifications();
+    void refreshSearchHealth();
 
     void initialize();
+    const seededSearch = page.url.searchParams.get('search');
+    if (seededSearch) {
+      chatSearchOpen = true;
+      chatSearchQuery = seededSearch;
+      seededChatSearchSession = page.url.searchParams.get('searchSession');
+      seededChatSearchRan = false;
+    }
 
     // Same-tab tap on the Chat tab:
     //   * Mobile: open the conversation list drawer so the user can
@@ -2938,10 +3135,22 @@ import X from 'lucide-svelte/icons/x';
           >+ New</button>
         </div>
 
-        <div class="relative">
+        <form class="relative" onsubmit={(event) => { event.preventDefault(); void submitConversationSearch(); }}>
           <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
-          <Input bind:value={conversationSearch} class="pl-9" placeholder="Filter by title" />
-        </div>
+          <Input
+            bind:value={conversationSearch}
+            class="pl-9 pr-16"
+            placeholder={searchEnabled ? 'Search conversations' : 'Filter by title'}
+          />
+          <button
+            class="absolute right-2 top-1.5 rounded-lg px-2 py-1 text-xs font-medium text-sky-400 transition hover:bg-slate-800 hover:text-sky-300 disabled:text-slate-600"
+            type="submit"
+            disabled={!searchEnabled || !conversationSearch.trim() || conversationSearchLoading}
+          >{conversationSearchLoading ? '...' : 'Go'}</button>
+        </form>
+        {#if !searchEnabled}
+          <p class="text-xs text-slate-500">Content search disabled; filtering loaded titles only.</p>
+        {/if}
 
         <div class="grid grid-cols-2 gap-2">
           <Button
@@ -2960,6 +3169,29 @@ import X from 'lucide-svelte/icons/x';
       <!-- Scrollable middle: conversation list -->
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
         <div class="space-y-1">
+          {#if conversationSearchSubmitted && conversationSearchResults.length > 0}
+            <div class="mb-3 space-y-1">
+              <p class="px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500">Search results</p>
+              {#each conversationSearchResults as result}
+                <button
+                  class="group w-full rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5 text-left transition hover:border-sky-500/40 hover:bg-slate-900"
+                  type="button"
+                  onclick={() => void openConversationSearchResult(result)}
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <p class="min-w-0 truncate text-sm font-medium text-white">{searchResultConversationTitle(result)}</p>
+                    <span class="shrink-0 rounded-full border border-slate-700 px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-slate-500">{result.top_match.kind}</span>
+                  </div>
+                  <p class="mt-1 line-clamp-2 text-xs leading-5 text-slate-400">{searchResultSnippet(result)}</p>
+                </button>
+              {/each}
+            </div>
+          {:else if conversationSearchSubmitted && !conversationSearchLoading && searchEnabled}
+            <p class="mb-3 rounded-2xl border border-dashed border-slate-700 px-4 py-4 text-center text-sm text-slate-400">
+              No content matches found.
+            </p>
+          {/if}
+
           {#if visibleConversationList.length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
               No conversations found.
@@ -3181,6 +3413,16 @@ import X from 'lucide-svelte/icons/x';
           <div class="flex items-center gap-2">
             <button
               class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
+              onclick={() => openChatSearch()}
+              type="button"
+              title="Search conversation"
+              aria-label="Search conversation"
+              disabled={!currentConversation}
+            >
+              <Search class="h-4 w-4" />
+            </button>
+            <button
+              class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
               onclick={() => { conversationModeOpen = true; }}
               type="button"
               title="Conversation mode"
@@ -3216,6 +3458,21 @@ import X from 'lucide-svelte/icons/x';
           </div>
         </div>
       </div>
+
+      {#if chatSearchOpen}
+        <ChatSearchBar
+          bind:query={chatSearchQuery}
+          results={chatSearchResults}
+          selectedIndex={chatSearchSelectedIndex}
+          loading={chatSearchLoading}
+          disabled={!currentConversation}
+          onSubmit={runChatSearch}
+          onClose={() => { chatSearchOpen = false; chatSearchResults = []; }}
+          onNext={() => selectChatSearchResult(chatSearchSelectedIndex + 1)}
+          onPrevious={() => selectChatSearchResult(chatSearchSelectedIndex - 1)}
+          onSelect={selectChatSearchResult}
+        />
+      {/if}
 
       <!--
         Expanded session details panel. Sits directly below the header
@@ -3490,7 +3747,7 @@ import X from 'lucide-svelte/icons/x';
             {:else}
               {#each displayedTimeline as item (item.id)}
                 {#if item.kind === 'message'}
-                  <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div data-message-id={item.id} class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <ChatMessage {item} agent={currentConversation ? conversationAgent(currentConversation) ?? null : null} />
                   </div>
                 {:else if item.kind === 'thinking'}

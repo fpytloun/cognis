@@ -245,6 +245,98 @@ export interface MessageHistoryResponse {
   truncation_reason?: string | null;
 }
 
+export type SearchKind = 'reasoning' | 'intention' | 'summary';
+export type SearchMode = 'auto' | 'lexical' | 'vector' | 'hybrid';
+
+export interface SearchBackends {
+  lexical: string;
+  vector: string;
+  mode_used: string;
+}
+
+export interface SearchMatch {
+  session_id: string;
+  kind: SearchKind | string;
+  ref_id: string | null;
+  role: string | null;
+  ts: string | null;
+  snippet: string;
+  score: number;
+  score_breakdown: Record<string, number>;
+  agent_id: string | null;
+  session_title: string | null;
+  session_intention: string | null;
+}
+
+export interface SearchLexicalCapabilities {
+  backend: string;
+  unaccent: boolean;
+  pg_trgm: boolean;
+  kinds: string[];
+}
+
+export interface SearchVectorState {
+  provider: string;
+  model: string | null;
+  dim: number | null;
+  sparse_model: string | null;
+  queue_depth: number;
+  last_index_at: string | null;
+  backfill_status: string;
+  backfill_total: number | null;
+  backfill_processed: number | null;
+  backfill_job_id: string | null;
+}
+
+export interface SearchHealth {
+  enabled: boolean;
+  lexical: SearchLexicalCapabilities;
+  vector: SearchVectorState;
+  notes: string[];
+}
+
+export interface ConversationSearchMatch {
+  conversation_id: string;
+  conversation_title: string | null;
+  agent_id: string;
+  project_id: string | null;
+  status: string;
+  session_id: string;
+  intaris_session_id: string;
+  title: string | null;
+  intention: string | null;
+  last_activity_at: string | null;
+  match_count: number;
+  top_match: SearchMatch;
+  kind_rank: number;
+}
+
+export interface ConversationSearchResponse {
+  matches: ConversationSearchMatch[];
+  next_cursor: string | null;
+  total_estimated: number | null;
+  backend: SearchBackends;
+}
+
+export interface ConversationFlatSearchMatch {
+  conversation_id: string;
+  conversation_title: string | null;
+  agent_id: string;
+  project_id: string | null;
+  status: string;
+  session_id: string;
+  intaris_session_id: string;
+  match: SearchMatch;
+  kind_rank: number;
+}
+
+export interface ConversationFlatSearchResponse {
+  matches: ConversationFlatSearchMatch[];
+  next_cursor: string | null;
+  total_estimated: number | null;
+  backend: SearchBackends;
+}
+
 export interface Session {
   session_id: string;
   conversation_id: string;

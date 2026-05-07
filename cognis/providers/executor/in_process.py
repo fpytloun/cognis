@@ -23,6 +23,7 @@ from cognis.models.tool import (
     ToolResult,
 )
 from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.tools.builtin.conversations import build_conversation_tool_handlers
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
 from cognis.tools.executor.browser.handlers import build_manager_from_config
@@ -178,9 +179,11 @@ class InProcessExecutorProvider:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         status_provider: StatusProvider | None = None,
+        guardrails_provider: Any | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.status_provider = status_provider
+        self.guardrails_provider = guardrails_provider
         self._active: dict[str, _ExecutorRuntime] = {}
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 
@@ -196,6 +199,10 @@ class InProcessExecutorProvider:
             metadata=dict(config.metadata),
         )
         system_handlers = build_system_tool_handlers(self.session_factory, self.status_provider)
+        if self.guardrails_provider is not None:
+            system_handlers.update(
+                build_conversation_tool_handlers(self.session_factory, self.guardrails_provider)
+            )
         task_continuation_handlers = build_task_continuation_tool_handlers(self.session_factory)
         system_handlers.update(task_continuation_handlers)
         native_handlers = executor_tool_handlers()

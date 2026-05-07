@@ -189,6 +189,7 @@ class WorkflowEngine:
             agent_owner_email=agent.owner_email,
             agent_type=agent.agent_type,
             session_id=getattr(session, "session_id", None),
+            conversation_id=conversation.conversation_id,
             parent_session_id=getattr(session, "parent_session_id", None),
             delegation_mode=getattr(session, "delegation_mode", None),
             workflow_step=False,
@@ -868,6 +869,9 @@ class WorkflowEngine:
                 agent_owner_email=agent.owner_email,
                 agent_type=agent.agent_type,
                 session_id=session.session_id,
+                conversation_id=getattr(conversation, "conversation_id", None)
+                if conversation is not None
+                else None,
                 parent_session_id=session.parent_session_id,
                 delegation_mode=session.delegation_mode,
                 workflow_step=True,
@@ -2752,9 +2756,7 @@ class WorkflowEngine:
 
                 task_row = await get_task(db_session, task.task_id)
                 if task_row is not None:
-                    task_active_executor_id = getattr(
-                        task_row, "active_executor_id", None
-                    )
+                    task_active_executor_id = getattr(task_row, "active_executor_id", None)
         except Exception:
             logger.debug(
                 "stage36: failed to read task.active_executor_id",

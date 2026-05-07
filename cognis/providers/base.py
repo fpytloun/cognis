@@ -15,6 +15,13 @@ from cognis.models.config import (
     TextToSpeechResult,
     TokenUsage,
 )
+from cognis.models.search import (
+    SearchHealth,
+    SearchRequest,
+    SearchResponse,
+    SearchSessionsRequest,
+    SearchSessionsResponse,
+)
 from cognis.models.session import (
     EventAppendResult,
     EventReadResult,
@@ -172,6 +179,13 @@ class GuardrailsProvider(Protocol):
     ) -> ToolResult: ...
     async def list_mcp_servers(self, enabled_only: bool = True) -> list[dict[str, Any]]: ...
     async def list_mcp_tools(self) -> list[dict[str, Any]]: ...
+    async def search_health(self, user_email: str | None = None) -> SearchHealth: ...
+    async def search(
+        self, request: SearchRequest, *, user_email: str | None = None
+    ) -> SearchResponse: ...
+    async def search_sessions(
+        self, request: SearchSessionsRequest, *, user_email: str | None = None
+    ) -> SearchSessionsResponse: ...
     async def update_session_status(
         self,
         session_id: str,

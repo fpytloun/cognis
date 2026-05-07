@@ -1576,6 +1576,9 @@ class ToolRouter:
             else None,
             agent_type=str(raw.get("agent_type") or "primary"),
             session_id=raw.get("session_id") if isinstance(raw.get("session_id"), str) else None,
+            conversation_id=raw.get("conversation_id")
+            if isinstance(raw.get("conversation_id"), str)
+            else None,
             parent_session_id=raw.get("parent_session_id")
             if isinstance(raw.get("parent_session_id"), str)
             else None,
