@@ -21,10 +21,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from prometheus_client import Counter, Gauge
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
+from sqlalchemy.orm import aliased
 
 from cognis.logging import get_logger
-from cognis.store.models import Conversation, StepRun, Task
+from cognis.store.models import Conversation, StepRun, Task, TaskDependency
 from cognis.store.models import Session as SessionRow
 
 logger = get_logger(__name__)
@@ -68,6 +69,10 @@ INVARIANTS: tuple[tuple[str, str], ...] = (
     (
         "non_terminal_step_runs_under_terminal_task",
         "StepRun rows in non-terminal status whose parent task is terminal.",
+    ),
+    (
+        "queued_tasks_ready_to_run",
+        "Queued tasks with all required dependencies satisfied.",
     ),
     (
         "conversations_with_terminal_active_session",
@@ -131,6 +136,8 @@ async def reconcile_invariants(session: Any) -> list[InvariantReport]:
 async def _count_violations(session: Any, category: str) -> int:
     if category == "non_terminal_step_runs_under_terminal_task":
         return await _count_orphaned_step_runs(session)
+    if category == "queued_tasks_ready_to_run":
+        return await _count_queued_tasks_ready_to_run(session)
     if category == "conversations_with_terminal_active_session":
         return await _count_conversations_with_terminal_active_session(session)
     if category == "conversations_with_missing_active_session":
@@ -141,6 +148,8 @@ async def _count_violations(session: Any, category: str) -> int:
 async def _reconcile_category(session: Any, category: str, *, now: datetime) -> int:
     if category == "non_terminal_step_runs_under_terminal_task":
         return await _reconcile_orphaned_step_runs(session, now=now)
+    if category == "queued_tasks_ready_to_run":
+        return await _reconcile_queued_tasks_ready_to_run(session)
     if category == "conversations_with_terminal_active_session":
         return await _reconcile_conversations_with_terminal_active_session(session)
     if category == "conversations_with_missing_active_session":
@@ -166,6 +175,49 @@ async def _reconcile_orphaned_step_runs(session: Any, *, now: datetime) -> int:
     from cognis.store.queries import fail_orphaned_running_step_runs
 
     count = await fail_orphaned_running_step_runs(session, now)
+    if count:
+        await session.commit()
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Task queue invariants
+# ---------------------------------------------------------------------------
+
+
+def _unmet_required_dependency_exists() -> Any:
+    dependency_task = aliased(Task)
+    return exists(
+        select(TaskDependency.task_id)
+        .join(dependency_task, dependency_task.task_id == TaskDependency.depends_on)
+        .where(
+            TaskDependency.task_id == Task.task_id,
+            TaskDependency.required.is_(True),
+            dependency_task.status != "completed",
+        )
+    )
+
+
+async def _count_queued_tasks_ready_to_run(session: Any) -> int:
+    stmt = select(Task.task_id).where(
+        Task.status == "queued",
+        ~_unmet_required_dependency_exists(),
+    )
+    result = await session.execute(stmt)
+    return len(result.scalars().all())
+
+
+async def _reconcile_queued_tasks_ready_to_run(session: Any) -> int:
+    stmt = (
+        update(Task)
+        .where(
+            Task.status == "queued",
+            ~_unmet_required_dependency_exists(),
+        )
+        .values(status="ready")
+    )
+    result = await session.execute(stmt)
+    count = int(getattr(result, "rowcount", 0) or 0)
     if count:
         await session.commit()
     return count

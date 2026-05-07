@@ -9,7 +9,13 @@ import pytest
 from cognis.core.invariants import check_invariants, reconcile_invariants
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
-from cognis.store.queries import create_step_run, create_task, update_step_run
+from cognis.store.queries import (
+    add_task_dependency,
+    create_step_run,
+    create_task,
+    get_task,
+    update_step_run,
+)
 
 
 async def _bootstrap_db(tmp_path: object) -> tuple[object, object]:
@@ -164,6 +170,89 @@ async def test_reconcile_invariants_covers_paused_and_evaluating_step_runs(
         )
         assert orphans.reconciled_count == 2
         assert orphans.current_count == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_invariants_promotes_unblocked_queued_task(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Restarted task",
+                status="queued",
+                task_id="task_queued_restart",
+            )
+            await create_step_run(
+                session,
+                task_id="task_queued_restart",
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr_failed_restart",
+            )
+            await update_step_run(session, "sr_failed_restart", status="running")
+            await update_step_run(session, "sr_failed_restart", status="failed")
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(session)
+        ready_tasks = next(r for r in reports if r.category == "queued_tasks_ready_to_run")
+        assert ready_tasks.reconciled_count == 1
+        assert ready_tasks.current_count == 0
+
+        async with factory() as session:
+            task = await get_task(session, "task_queued_restart")
+            assert task is not None and task.status == "ready"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_invariants_keeps_blocked_queued_task_queued(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Dependency",
+                status="failed",
+                task_id="task_dependency_failed",
+            )
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Blocked task",
+                status="queued",
+                task_id="task_queued_blocked",
+            )
+            await add_task_dependency(
+                session,
+                "task_queued_blocked",
+                "task_dependency_failed",
+                required=True,
+            )
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(session)
+        ready_tasks = next(r for r in reports if r.category == "queued_tasks_ready_to_run")
+        assert ready_tasks.reconciled_count == 0
+
+        async with factory() as session:
+            task = await get_task(session, "task_queued_blocked")
+            assert task is not None and task.status == "queued"
     finally:
         await engine.dispose()
 
