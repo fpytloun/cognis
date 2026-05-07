@@ -6,6 +6,7 @@ import pytest
 
 from cognis.core import conversation_search as cs
 from cognis.models.search import MIN_DISPLAY_SCORE, SearchMatch, SearchSessionMatch, kind_rank
+from cognis.settings_schema import validate_setting_value
 
 
 def test_search_kind_priority_matches_ui_navigation_semantics() -> None:
@@ -13,7 +14,17 @@ def test_search_kind_priority_matches_ui_navigation_semantics() -> None:
 
 
 def test_search_display_threshold_prefers_precision_over_recall() -> None:
-    assert MIN_DISPLAY_SCORE >= 0.3
+    assert MIN_DISPLAY_SCORE == 0.2
+
+
+def test_search_display_threshold_setting_validates_range() -> None:
+    validate_setting_value("search.display_min_score", 0.0)
+    validate_setting_value("search.display_min_score", 0.5)
+    validate_setting_value("search.display_min_score", 1.0)
+    with pytest.raises(ValueError):
+        validate_setting_value("search.display_min_score", -0.01)
+    with pytest.raises(ValueError):
+        validate_setting_value("search.display_min_score", 1.01)
 
 
 @pytest.mark.asyncio
@@ -233,6 +244,93 @@ async def test_join_session_matches_filters_score_deleted_and_context(
     assert [item.intaris_session_id for item in joined] == ["int-web"]
 
 
+@pytest.mark.asyncio
+async def test_join_session_matches_preserves_low_score_exact_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        SimpleNamespace(
+            session_id="sess-marked",
+            intaris_session_id="int-marked",
+            conversation_id="conv-1",
+            started_at=None,
+        ),
+        SimpleNamespace(
+            session_id="sess-plain",
+            intaris_session_id="int-plain",
+            conversation_id="conv-1",
+            started_at=None,
+        ),
+        SimpleNamespace(
+            session_id="sess-fuzzy",
+            intaris_session_id="int-fuzzy",
+            conversation_id="conv-1",
+            started_at=None,
+        ),
+    ]
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        user_email="alice@example.com",
+        title="Owned",
+        agent_id="agent-1",
+        project_id=None,
+        status="active",
+        context_type="web",
+    )
+
+    async def fake_list_sessions(_db: object, ids: list[str]) -> list[object]:
+        return [row for row in rows if row.intaris_session_id in ids]
+
+    async def fake_get_conversation(_db: object, conversation_id: str) -> object | None:
+        return conversation if conversation_id == "conv-1" else None
+
+    monkeypatch.setattr(cs, "list_sessions_by_intaris_session_ids", fake_list_sessions)
+    monkeypatch.setattr(cs, "get_conversation", fake_get_conversation)
+
+    matches = [
+        SearchSessionMatch(
+            session_id="int-marked",
+            match_count=1,
+            top_match=SearchMatch(
+                session_id="int-marked",
+                kind="reasoning",
+                snippet="Investigated <mark>FaultLine</mark> behavior",
+                score=0.01,
+            ),
+        ),
+        SearchSessionMatch(
+            session_id="int-plain",
+            match_count=1,
+            top_match=SearchMatch(
+                session_id="int-plain",
+                kind="reasoning",
+                snippet="Investigated FaultLine behavior",
+                score=0.01,
+            ),
+        ),
+        SearchSessionMatch(
+            session_id="int-fuzzy",
+            match_count=1,
+            top_match=SearchMatch(
+                session_id="int-fuzzy",
+                kind="reasoning",
+                snippet="Investigated related behavior",
+                score=0.01,
+            ),
+        ),
+    ]
+
+    joined = await cs.join_session_matches(
+        object(),
+        user_email="alice@example.com",
+        matches=matches,
+        min_score=0.35,
+        query='"FaultLine"',
+    )
+
+    assert [item.intaris_session_id for item in joined] == ["int-marked", "int-plain"]
+
+
 def test_attach_extra_matches_skips_top_match_duplicates_and_low_scores() -> None:
     row = cs.ConversationSearchMatch(
         conversation_id="conv-1",
@@ -287,6 +385,48 @@ def test_attach_extra_matches_skips_top_match_duplicates_and_low_scores() -> Non
     assert [match.ref_id for match in row.extra_matches] == ["extra-2", "extra-1"]
 
 
+def test_attach_extra_matches_preserves_low_score_exact_hits() -> None:
+    row = cs.ConversationSearchMatch(
+        conversation_id="conv-1",
+        agent_id="agent-1",
+        status="active",
+        session_id="sess-1",
+        intaris_session_id="int-1",
+        match_count=3,
+        top_match=SearchMatch(
+            session_id="int-1",
+            kind="reasoning",
+            ref_id="top",
+            snippet="top",
+            score=0.9,
+        ),
+    )
+
+    cs.attach_extra_matches(
+        [row],
+        [
+            SearchMatch(
+                session_id="int-1",
+                kind="summary",
+                ref_id="exact",
+                snippet="PDF export was discussed",
+                score=0.01,
+            ),
+            SearchMatch(
+                session_id="int-1",
+                kind="summary",
+                ref_id="fuzzy",
+                snippet="document export was discussed",
+                score=0.01,
+            ),
+        ],
+        min_score=0.35,
+        query="pdf",
+    )
+
+    assert [match.ref_id for match in row.extra_matches] == ["exact"]
+
+
 def test_attach_extra_matches_deduplicates_matches_without_ref_ids() -> None:
     row = cs.ConversationSearchMatch(
         conversation_id="conv-1",
@@ -325,3 +465,58 @@ def test_attach_extra_matches_deduplicates_matches_without_ref_ids() -> None:
     )
 
     assert [match.snippet for match in row.extra_matches] == ["different snippet"]
+
+
+@pytest.mark.asyncio
+async def test_join_flat_matches_preserves_low_score_exact_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_row = SimpleNamespace(
+        session_id="sess-1",
+        intaris_session_id="int-1",
+        conversation_id="conv-1",
+        started_at=None,
+    )
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        user_email="alice@example.com",
+        title="Owned",
+        agent_id="agent-1",
+        project_id=None,
+        status="active",
+    )
+
+    async def fake_list_sessions(_db: object, ids: list[str]) -> list[object]:
+        return [session_row] if "int-1" in ids else []
+
+    async def fake_get_conversation(_db: object, conversation_id: str) -> object | None:
+        return conversation if conversation_id == "conv-1" else None
+
+    monkeypatch.setattr(cs, "list_sessions_by_intaris_session_ids", fake_list_sessions)
+    monkeypatch.setattr(cs, "get_conversation", fake_get_conversation)
+
+    joined = await cs.join_flat_matches(
+        object(),
+        user_email="alice@example.com",
+        conversation_id="conv-1",
+        matches=[
+            SearchMatch(
+                session_id="int-1",
+                kind="reasoning",
+                ref_id="exact",
+                snippet="Generated <mark>PDF</mark> artifact",
+                score=0.01,
+            ),
+            SearchMatch(
+                session_id="int-1",
+                kind="reasoning",
+                ref_id="fuzzy",
+                snippet="Generated artifact",
+                score=0.01,
+            ),
+        ],
+        min_score=0.35,
+        query="pdf",
+    )
+
+    assert [item.match.ref_id for item in joined] == ["exact"]

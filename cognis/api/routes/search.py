@@ -25,6 +25,7 @@ from cognis.models.search import (
 )
 from cognis.store.queries import (
     get_conversation,
+    get_setting_value,
     list_conversation_intaris_session_ids,
 )
 
@@ -56,6 +57,12 @@ def _intaris_filters(filters: Any) -> SearchRequestFilters:
     )
 
 
+async def _display_min_score(request: Request) -> float:
+    async with request.app.state.session_factory() as session:
+        raw = await get_setting_value(session, "search.display_min_score", 0.2)
+    return float(raw)
+
+
 @router.get("/health", response_model=SearchHealth)
 async def search_health(request: Request) -> SearchHealth:
     user = require_current_user(request)
@@ -77,6 +84,7 @@ async def search_conversations(
     user = require_current_user(request)
     if not payload.q.strip():
         raise api_exception(400, "validation_error", "Search query cannot be empty")
+    display_min_score = await _display_min_score(request)
 
     intaris_limit = min(
         _SESSION_SEARCH_MAX_LIMIT,
@@ -102,6 +110,8 @@ async def search_conversations(
             project_id=payload.filters.project_id,
             status=payload.filters.status,
             context_type=payload.filters.context_type,
+            min_score=display_min_score,
+            query=payload.q,
         )
         truncated_after_join = len(matches) > payload.limit
         matches = matches[: payload.limit]
@@ -134,6 +144,8 @@ async def search_conversations(
                 matches,
                 flat.matches,
                 per_session_limit=_EXTRA_MATCHES_PER_SESSION,
+                min_score=display_min_score,
+                query=payload.q,
             )
         except Exception:
             logger.warning("search: extra_matches fetch failed", exc_info=True)
@@ -155,6 +167,7 @@ async def search_conversation(
     user = require_current_user(request)
     if not payload.q.strip():
         raise api_exception(400, "validation_error", "Search query cannot be empty")
+    display_min_score = await _display_min_score(request)
 
     async with request.app.state.session_factory() as session:
         conversation = await get_conversation(session, conversation_id)
@@ -188,6 +201,8 @@ async def search_conversation(
             user_email=user.email,
             conversation_id=conversation_id,
             matches=result.matches,
+            min_score=display_min_score,
+            query=payload.q,
         )
     return ConversationFlatSearchResponse(
         matches=matches,

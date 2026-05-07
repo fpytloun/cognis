@@ -15,7 +15,7 @@ KIND_PRIORITY: dict[str, int] = {"reasoning": 0, "intention": 1, "summary": 2}
 # Cognis presentation-layer floor for search match scores. Intaris remains
 # authoritative on ranking; this constant only hides matches Cognis judges
 # too weak to surface in the UI or to LLM tools.
-MIN_DISPLAY_SCORE: float = 0.35
+MIN_DISPLAY_SCORE: float = 0.2
 
 
 class SearchRequestFilters(BaseModel):

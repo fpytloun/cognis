@@ -48,6 +48,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_queued_messages": ("session", 5),
     "session.escalation_timeout_seconds": ("session", 300),
     "session.cache_max_entries": ("session", 200),
+    "search.display_min_score": ("search", 0.2),
     "evaluator.timeout_ms": ("evaluator", 180000),
     "decision_engine.inline_max_length": ("decision_engine", 200),
     "security.non_bypassable_tools": (

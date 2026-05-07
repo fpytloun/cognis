@@ -12,6 +12,7 @@ from cognis.models.search import SearchRequestFilters, SearchSessionsRequest
 from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource
 from cognis.store.queries import (
     get_conversation,
+    get_setting_value,
     list_conversation_sessions,
     list_conversations,
 )
@@ -182,6 +183,9 @@ def build_conversation_tool_handlers(
             user_email=user_email,
         )
         async with session_factory() as session:
+            display_min_score = float(
+                await get_setting_value(session, "search.display_min_score", 0.2)
+            )
             matches = await join_session_matches(
                 session,
                 user_email=user_email,
@@ -189,6 +193,8 @@ def build_conversation_tool_handlers(
                 project_id=arguments.get("project_id"),
                 status="all",
                 context_type=arguments.get("context_type"),
+                min_score=display_min_score,
+                query=q,
             )
         truncated_after_join = len(matches) > limit
         matches = matches[:limit]

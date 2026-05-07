@@ -36,6 +36,10 @@ _ENUM_KEYS: dict[str, set[str]] = {
     "web.browser_fetch.wait_until": {"commit", "domcontentloaded", "load", "networkidle"},
 }
 
+_FLOAT_RANGE_KEYS: dict[str, tuple[float, float]] = {
+    "search.display_min_score": (0.0, 1.0),
+}
+
 
 def known_setting_keys() -> set[str]:
     return set(DEFAULT_SETTINGS)
@@ -73,6 +77,10 @@ def validate_setting_value(key: str, value: Any) -> None:
     if isinstance(expected, float):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"Setting {key} must be a number")
+        if key in _FLOAT_RANGE_KEYS:
+            minimum, maximum = _FLOAT_RANGE_KEYS[key]
+            if not minimum <= float(value) <= maximum:
+                raise ValueError(f"Setting {key} must be between {minimum} and {maximum}")
         return
     if isinstance(expected, str):
         if not isinstance(value, str):
