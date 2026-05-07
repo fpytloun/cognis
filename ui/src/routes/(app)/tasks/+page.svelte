@@ -40,6 +40,7 @@
   let expandedDoneGroups = $state<Set<string>>(new Set());
   let showEmptyDesktopColumns = $state(false);
   let expandedDesktopColumns = $state<Set<TaskBoardColumnId>>(new Set());
+  let collapsedDesktopColumns = $state<Set<TaskBoardColumnId>>(new Set());
 
   // Multi-select
   let selectedIds = $state<Set<string>>(new Set());
@@ -264,10 +265,16 @@
   }
 
   function isDesktopColumnCollapsed(columnId: TaskBoardColumnId): boolean {
-    if (showEmptyDesktopColumns || taskCountForColumn(columnId) > 0 || expandedDesktopColumns.has(columnId)) {
+    if (dragState && isDragTransitionValid(dragState.column, columnId)) {
       return false;
     }
-    return !(dragState && isDragTransitionValid(dragState.column, columnId));
+    if (taskCountForColumn(columnId) > 0) {
+      return false;
+    }
+    if (collapsedDesktopColumns.has(columnId)) {
+      return true;
+    }
+    return !(showEmptyDesktopColumns || expandedDesktopColumns.has(columnId));
   }
 
   function desktopBoardGridTemplate(): string {
@@ -276,6 +283,17 @@
 
   function expandDesktopColumn(columnId: TaskBoardColumnId): void {
     expandedDesktopColumns = new Set([...expandedDesktopColumns, columnId]);
+    const nextCollapsed = new Set(collapsedDesktopColumns);
+    nextCollapsed.delete(columnId);
+    collapsedDesktopColumns = nextCollapsed;
+  }
+
+  function collapseDesktopColumn(columnId: TaskBoardColumnId): void {
+    if (taskCountForColumn(columnId) > 0) return;
+    const nextExpanded = new Set(expandedDesktopColumns);
+    nextExpanded.delete(columnId);
+    expandedDesktopColumns = nextExpanded;
+    collapsedDesktopColumns = new Set([...collapsedDesktopColumns, columnId]);
   }
 
   // ---------------------------------------------------------------------------
@@ -859,7 +877,18 @@
           >
             <div class="mb-3 flex items-center justify-between gap-2">
               <div>
-                <p class="text-sm font-semibold text-white">{column.label}</p>
+                {#if columnTaskCount === 0}
+                  <button
+                    type="button"
+                    class="text-left text-sm font-semibold text-white transition hover:text-sky-300"
+                    onclick={() => collapseDesktopColumn(column.id)}
+                    aria-label={`Collapse ${column.label} column`}
+                  >
+                    {column.label}
+                  </button>
+                {:else}
+                  <p class="text-sm font-semibold text-white">{column.label}</p>
+                {/if}
                 <p class="text-xs uppercase tracking-[0.2em] text-slate-500">{columnTaskCount} items</p>
               </div>
             </div>
