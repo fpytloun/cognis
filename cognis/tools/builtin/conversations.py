@@ -18,6 +18,8 @@ from cognis.store.queries import (
 from cognis.tools.registry import ToolExecutionContext
 
 _SOURCE = ToolSource(type="builtin")
+_SEARCH_SESSIONS_OVERFETCH_FACTOR = 3
+_SEARCH_SESSIONS_MAX_LIMIT = 100
 
 
 def _tool(
@@ -56,6 +58,10 @@ SEARCH_CONVERSATIONS_TOOL = _tool(
         "q": {"type": "string"},
         "agent_id": {"type": "string"},
         "project_id": {"type": "string"},
+        "context_type": {
+            "type": "string",
+            "description": "Restrict to a single conversation channel/context (e.g. 'web', 'signal').",
+        },
         "kinds": {
             "type": "array",
             "items": {"type": "string", "enum": ["reasoning", "intention", "summary"]},
@@ -158,6 +164,7 @@ def build_conversation_tool_handlers(
         health = await intaris.search_health(user_email=user_email)
         if not health.enabled:
             return {"error": "search_disabled", "matches": [], "notes": health.notes}
+        limit = min(max(int(arguments.get("limit") or 20), 1), 50)
         filters = SearchRequestFilters(
             agent_id=arguments.get("agent_id"),
             from_ts=arguments.get("from_ts"),
@@ -169,7 +176,7 @@ def build_conversation_tool_handlers(
                 filters=filters,
                 kinds=arguments.get("kinds"),
                 mode=str(arguments.get("mode") or "auto"),
-                limit=min(max(int(arguments.get("limit") or 20), 1), 50),
+                limit=min(_SEARCH_SESSIONS_MAX_LIMIT, limit * _SEARCH_SESSIONS_OVERFETCH_FACTOR),
                 cursor=arguments.get("cursor"),
             ),
             user_email=user_email,
@@ -181,10 +188,13 @@ def build_conversation_tool_handlers(
                 matches=result.sessions,
                 project_id=arguments.get("project_id"),
                 status="all",
+                context_type=arguments.get("context_type"),
             )
+        truncated_after_join = len(matches) > limit
+        matches = matches[:limit]
         return {
             "matches": [match.model_dump(mode="json") for match in matches],
-            "next_cursor": result.next_cursor,
+            "next_cursor": None if truncated_after_join else result.next_cursor,
             "backend": result.backend.model_dump(mode="json"),
         }
 

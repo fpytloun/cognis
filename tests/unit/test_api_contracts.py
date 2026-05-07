@@ -244,6 +244,15 @@ def test_search_responses_round_trip_current_intaris_shape() -> None:
         intaris_session_id="intaris-1",
         match_count=session_match.match_count,
         top_match=session_match.top_match,
+        extra_matches=[
+            SearchMatch(
+                session_id="intaris-1",
+                kind="intention",
+                ref_id="audit-2",
+                snippet="related <mark>intention</mark>",
+                score=0.7,
+            )
+        ],
         kind_rank=0,
     )
     flat_match = ConversationFlatSearchMatch(
@@ -259,6 +268,12 @@ def test_search_responses_round_trip_current_intaris_shape() -> None:
     assert (
         ConversationSearchResponse(matches=[conversation_match]).matches[0].top_match.ref_id
         == "audit-1"
+    )
+    assert (
+        ConversationSearchResponse(matches=[conversation_match]).matches[0]
+        .extra_matches[0]
+        .ref_id
+        == "audit-2"
     )
     assert ConversationFlatSearchResponse(matches=[flat_match]).matches[0].match.kind == "reasoning"
 

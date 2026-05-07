@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findLocalChatMatches, resultLabel, stripMarks, type ChatSearchResult } from '$lib/chat-search';
+import { cleanSearchSnippet, findLocalChatMatches, resultLabel, type ChatSearchResult } from '$lib/chat-search';
 import type { TimelineItem } from '$lib/chat';
 
 describe('chat search helpers', () => {
@@ -31,7 +31,7 @@ describe('chat search helpers', () => {
     expect(matches[0]?.label).toBe('User message');
   });
 
-  it('labels reasoning server hits as the precise result kind', () => {
+  it('uses generic labels for server hits', () => {
     const result = {
       source: 'server',
       server: {
@@ -59,7 +59,12 @@ describe('chat search helpers', () => {
       }
     } satisfies ChatSearchResult;
 
-    expect(resultLabel(result)).toBe('Reasoning');
-    expect(stripMarks(result.server.match.snippet)).toBe('matched phrase');
+    expect(resultLabel(result)).toBe('Search match');
+    expect(cleanSearchSnippet(result.server.match.snippet)).toBe('matched phrase');
+  });
+
+  it('removes role prefixes from server snippets', () => {
+    expect(cleanSearchSnippet('User message: matched <mark>phrase</mark>')).toBe('matched phrase');
+    expect(cleanSearchSnippet('Assistant message: matched phrase')).toBe('matched phrase');
   });
 });

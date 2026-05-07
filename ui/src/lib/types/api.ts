@@ -308,6 +308,7 @@ export interface ConversationSearchMatch {
   last_activity_at: string | null;
   match_count: number;
   top_match: SearchMatch;
+  extra_matches: SearchMatch[];
   kind_rank: number;
 }
 

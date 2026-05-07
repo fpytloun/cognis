@@ -8,7 +8,12 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from cognis.api.common import api_exception, require_current_user
-from cognis.core.conversation_search import join_flat_matches, join_session_matches
+from cognis.core.conversation_search import (
+    attach_extra_matches,
+    join_flat_matches,
+    join_session_matches,
+)
+from cognis.logging import get_logger
 from cognis.models.search import (
     ConversationFlatSearchResponse,
     ConversationSearchRequest,
@@ -23,9 +28,17 @@ from cognis.store.queries import (
     list_conversation_intaris_session_ids,
 )
 
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
 
 _HEALTH_TTL_SECONDS = 30.0
+# Bounded fan-out for the supplemental flat search used to populate
+# `extra_matches` on aggregated session results.
+_EXTRA_MATCHES_PER_SESSION = 4
+_EXTRA_MATCHES_TOTAL_LIMIT = 50
+_SESSION_SEARCH_OVERFETCH_FACTOR = 3
+_SESSION_SEARCH_MAX_LIMIT = 100
 _health_cache: dict[str, tuple[float, SearchHealth]] = {}
 
 
@@ -65,12 +78,16 @@ async def search_conversations(
     if not payload.q.strip():
         raise api_exception(400, "validation_error", "Search query cannot be empty")
 
+    intaris_limit = min(
+        _SESSION_SEARCH_MAX_LIMIT,
+        payload.limit * _SESSION_SEARCH_OVERFETCH_FACTOR,
+    )
     intaris_request = SearchSessionsRequest(
         q=payload.q,
         filters=_intaris_filters(payload.filters),
         kinds=payload.kinds,
         mode=payload.mode,
-        limit=payload.limit,
+        limit=intaris_limit,
         cursor=payload.cursor,
     )
     result = await request.app.state.providers.guardrails.search_sessions(
@@ -84,10 +101,46 @@ async def search_conversations(
             matches=result.sessions,
             project_id=payload.filters.project_id,
             status=payload.filters.status,
+            context_type=payload.filters.context_type,
         )
+        truncated_after_join = len(matches) > payload.limit
+        matches = matches[: payload.limit]
+
+    # Supplemental flat search: only run for conversations whose Intaris
+    # session reported multiple matches, so the UI can expand to see them.
+    multi_match_session_ids = [
+        row.intaris_session_id for row in matches if row.match_count > 1
+    ]
+    if multi_match_session_ids:
+        flat_filters = _intaris_filters(payload.filters)
+        flat_filters.session_id = None
+        flat_filters.session_ids = multi_match_session_ids
+        flat_limit = min(
+            _EXTRA_MATCHES_TOTAL_LIMIT,
+            len(multi_match_session_ids) * (_EXTRA_MATCHES_PER_SESSION + 1),
+        )
+        try:
+            flat = await request.app.state.providers.guardrails.search(
+                SearchRequest(
+                    q=payload.q,
+                    filters=flat_filters,
+                    kinds=payload.kinds,
+                    mode=payload.mode,
+                    limit=flat_limit,
+                ),
+                user_email=user.email,
+            )
+            attach_extra_matches(
+                matches,
+                flat.matches,
+                per_session_limit=_EXTRA_MATCHES_PER_SESSION,
+            )
+        except Exception:
+            logger.warning("search: extra_matches fetch failed", exc_info=True)
+
     return ConversationSearchResponse(
         matches=matches,
-        next_cursor=result.next_cursor,
+        next_cursor=None if truncated_after_join else result.next_cursor,
         total_estimated=result.total_estimated,
         backend=result.backend,
     )

@@ -12,6 +12,11 @@ SearchMode = Literal["auto", "lexical", "vector", "hybrid"]
 SEARCH_KINDS: tuple[str, ...] = ("reasoning", "intention", "summary")
 KIND_PRIORITY: dict[str, int] = {"reasoning": 0, "intention": 1, "summary": 2}
 
+# Cognis presentation-layer floor for search match scores. Intaris remains
+# authoritative on ranking; this constant only hides matches Cognis judges
+# too weak to surface in the UI or to LLM tools.
+MIN_DISPLAY_SCORE: float = 0.35
+
 
 class SearchRequestFilters(BaseModel):
     """Structural filters accepted by Intaris search."""
@@ -28,6 +33,7 @@ class ConversationSearchFilters(SearchRequestFilters):
 
     project_id: str | None = None
     status: Literal["active", "archived", "all"] = "active"
+    context_type: str | None = None
 
 
 class SearchRequest(BaseModel):
@@ -148,6 +154,7 @@ class ConversationSearchMatch(BaseModel):
     last_activity_at: str | None = None
     match_count: int = 1
     top_match: SearchMatch
+    extra_matches: list[SearchMatch] = Field(default_factory=list)
     kind_rank: int = 99
 
 

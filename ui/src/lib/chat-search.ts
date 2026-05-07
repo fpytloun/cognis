@@ -11,24 +11,22 @@ export type ChatSearchResult =
   | { source: 'local'; local: LocalChatMatch }
   | { source: 'server'; server: ConversationFlatSearchMatch };
 
-const KIND_LABELS: Record<string, string> = {
-  reasoning: 'Reasoning',
-  intention: 'Intention',
-  summary: 'Summary'
-};
-
 export function stripMarks(value: string): string {
   return value.replace(/<\/?mark>/g, '');
 }
 
+export function cleanSearchSnippet(value: string): string {
+  return stripMarks(value).replace(/^(user|assistant|system)\s+message:\s*/i, '');
+}
+
 export function resultLabel(result: ChatSearchResult): string {
   if (result.source === 'local') return result.local.label;
-  return KIND_LABELS[result.server.match.kind] ?? result.server.match.kind;
+  return 'Search match';
 }
 
 export function resultSnippet(result: ChatSearchResult): string {
   if (result.source === 'local') return result.local.snippet;
-  return stripMarks(result.server.match.snippet);
+  return cleanSearchSnippet(result.server.match.snippet);
 }
 
 export function findLocalChatMatches(items: TimelineItem[], query: string): LocalChatMatch[] {

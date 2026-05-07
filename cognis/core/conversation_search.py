@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.models.search import (
+    MIN_DISPLAY_SCORE,
     ConversationFlatSearchMatch,
     ConversationSearchMatch,
     SearchMatch,
@@ -30,6 +31,14 @@ def _index_sessions(rows: Iterable[Session]) -> dict[str, Session]:
     return index
 
 
+def _same_search_match(left: SearchMatch, right: SearchMatch) -> bool:
+    if left.kind != right.kind:
+        return False
+    if left.ref_id is not None or right.ref_id is not None:
+        return left.ref_id == right.ref_id
+    return left.ts == right.ts and left.snippet == right.snippet
+
+
 async def join_session_matches(
     db: AsyncSession,
     *,
@@ -37,8 +46,16 @@ async def join_session_matches(
     matches: list[SearchSessionMatch],
     project_id: str | None = None,
     status: str = "active",
+    context_type: str | None = None,
+    min_score: float = MIN_DISPLAY_SCORE,
 ) -> list[ConversationSearchMatch]:
-    """Join Intaris aggregated session matches with owned Cognis conversations."""
+    """Join Intaris aggregated session matches with owned Cognis conversations.
+
+    Drops sub-threshold scores, soft-deleted conversations, and conversations
+    whose Cognis-owned metadata does not match the caller's filters
+    (``project_id``, ``status``, ``context_type``). Cognis is authoritative on
+    those fields; Intaris does not know them.
+    """
 
     session_rows = await list_sessions_by_intaris_session_ids(db, [m.session_id for m in matches])
     session_by_id = _index_sessions(session_rows)
@@ -46,6 +63,8 @@ async def join_session_matches(
     output: list[ConversationSearchMatch] = []
 
     for match in matches:
+        if match.top_match.score < min_score:
+            continue
         session_row = session_by_id.get(match.session_id)
         if session_row is None:
             continue
@@ -66,6 +85,8 @@ async def join_session_matches(
         if status == "archived" and conversation.status != "archived":
             continue
         if status not in {"active", "archived", "all"}:
+            continue
+        if context_type is not None and getattr(conversation, "context_type", None) != context_type:
             continue
         output.append(
             ConversationSearchMatch(
@@ -88,22 +109,67 @@ async def join_session_matches(
     return output
 
 
+def attach_extra_matches(
+    aggregated: list[ConversationSearchMatch],
+    flat_matches: list[SearchMatch],
+    *,
+    per_session_limit: int = 4,
+    min_score: float = MIN_DISPLAY_SCORE,
+) -> None:
+    """Attach supplemental hits from a flat search to aggregated session rows.
+
+    Each session row already carries its highest-ranked ``top_match``. The
+    follow-up flat search returns more granular matches across the same
+    Intaris session ids; everything except the row's own top match is folded
+    into ``extra_matches`` until the per-session cap is hit. Mutates
+    ``aggregated`` in-place; safe when ``flat_matches`` is empty.
+    """
+
+    if not aggregated or not flat_matches:
+        return
+    by_session: dict[str, ConversationSearchMatch] = {
+        row.intaris_session_id: row for row in aggregated
+    }
+    for match in flat_matches:
+        if match.score < min_score:
+            continue
+        target = by_session.get(match.session_id)
+        if target is None:
+            continue
+        if target.match_count <= 1:
+            continue
+        if _same_search_match(match, target.top_match):
+            continue
+        if any(_same_search_match(existing, match) for existing in target.extra_matches):
+            continue
+        if len(target.extra_matches) >= per_session_limit:
+            continue
+        target.extra_matches.append(match)
+    for row in aggregated:
+        row.extra_matches.sort(key=lambda m: (kind_rank(m.kind), -m.score))
+
+
 async def join_flat_matches(
     db: AsyncSession,
     *,
     user_email: str,
     conversation_id: str,
     matches: list[SearchMatch],
+    min_score: float = MIN_DISPLAY_SCORE,
 ) -> list[ConversationFlatSearchMatch]:
     """Join flat Intaris matches for one conversation with Cognis session rows."""
 
     conversation = await get_conversation(db, conversation_id)
     if conversation is None or conversation.user_email != user_email:
         return []
+    if conversation.status == "deleted":
+        return []
     session_rows = await list_sessions_by_intaris_session_ids(db, [m.session_id for m in matches])
     session_by_id = _index_sessions(session_rows)
     output: list[ConversationFlatSearchMatch] = []
     for match in matches:
+        if match.score < min_score:
+            continue
         session_row = session_by_id.get(match.session_id)
         if session_row is None or session_row.conversation_id != conversation_id:
             continue

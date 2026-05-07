@@ -81,6 +81,7 @@ import X from 'lucide-svelte/icons/x';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
   import {
+    cleanSearchSnippet,
     findLocalChatMatches,
     type ChatSearchResult,
     type LocalChatMatch
@@ -118,6 +119,8 @@ import X from 'lucide-svelte/icons/x';
   let conversationSearchResults = $state<ConversationSearchMatch[]>([]);
   let conversationSearchLoading = $state(false);
   let conversationSearchSubmitted = $state('');
+  let conversationSearchError = $state('');
+  let expandedSearchSessionIds = $state<string[]>([]);
   let searchEnabled = $state(true);
   let chatSearchOpen = $state(false);
   let chatSearchQuery = $state('');
@@ -126,6 +129,8 @@ import X from 'lucide-svelte/icons/x';
   let chatSearchSelectedIndex = $state(0);
   let seededChatSearchRan = $state(false);
   let seededChatSearchSession = $state<string | null>(null);
+  let seededChatSearchRef = $state<string | null>(null);
+  let lastSeededSearchKey = '';
   let agents = $state<Agent[]>([]);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
@@ -798,12 +803,81 @@ import X from 'lucide-svelte/icons/x';
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
   }
 
+  function searchResultAgent(result: ConversationSearchMatch): Agent | undefined {
+    return agents.find((agent) => agent.agent_id === result.agent_id);
+  }
+
   function searchResultConversationTitle(result: ConversationSearchMatch): string {
     return result.conversation_title?.trim() || result.title?.trim() || 'Untitled conversation';
   }
 
   function searchResultSnippet(result: ConversationSearchMatch): string {
-    return result.top_match.snippet.replace(/<\/?mark>/g, '');
+    return searchMatchSnippet(result.top_match);
+  }
+
+  function searchMatchSnippet(match: ConversationSearchMatch['top_match']): string {
+    return cleanSearchSnippet(match.snippet);
+  }
+
+  function searchMatchScore(match: ConversationSearchMatch['top_match']): string {
+    return `${Math.round(Math.max(0, Math.min(1, match.score)) * 100)}%`;
+  }
+
+  function searchMatchTime(match: ConversationSearchMatch['top_match']): string | null {
+    if (!match.ts) return null;
+    const value = Date.parse(match.ts);
+    if (!Number.isFinite(value)) return null;
+    return new Intl.DateTimeFormat(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(value);
+  }
+
+  function clearConversationSearch(): void {
+    conversationSearch = '';
+    conversationSearchSubmitted = '';
+    conversationSearchError = '';
+    conversationSearchResults = [];
+    expandedSearchSessionIds = [];
+  }
+
+  function resetConversationSearchResults(): void {
+    conversationSearchSubmitted = '';
+    conversationSearchError = '';
+    conversationSearchResults = [];
+    expandedSearchSessionIds = [];
+  }
+
+  function toggleSearchResultExpanded(sessionId: string): void {
+    expandedSearchSessionIds = expandedSearchSessionIds.includes(sessionId)
+      ? expandedSearchSessionIds.filter((item) => item !== sessionId)
+      : [...expandedSearchSessionIds, sessionId];
+  }
+
+  function searchResultExpanded(sessionId: string): boolean {
+    return expandedSearchSessionIds.includes(sessionId);
+  }
+
+  function syncSeededSearchFromUrl(): void {
+    const seed = page.url.searchParams.get('search')?.trim() ?? '';
+    const session = page.url.searchParams.get('searchSession');
+    const ref = page.url.searchParams.get('searchRef');
+    const key = `${conversationIdFromRoute() ?? ''}|${seed}|${session ?? ''}|${ref ?? ''}`;
+    if (!seed) {
+      seededChatSearchSession = null;
+      seededChatSearchRef = null;
+      lastSeededSearchKey = '';
+      return;
+    }
+    if (key === lastSeededSearchKey) return;
+    lastSeededSearchKey = key;
+    chatSearchOpen = true;
+    chatSearchQuery = seed;
+    seededChatSearchSession = session;
+    seededChatSearchRef = ref;
+    seededChatSearchRan = false;
   }
 
   function localResultId(result: LocalChatMatch): string {
@@ -822,7 +896,9 @@ import X from 'lucide-svelte/icons/x';
   async function submitConversationSearch(): Promise<void> {
     const q = conversationSearch.trim();
     conversationSearchSubmitted = q;
+    conversationSearchError = '';
     conversationSearchResults = [];
+    expandedSearchSessionIds = [];
     if (!q || !searchEnabled) return;
     conversationSearchLoading = true;
     try {
@@ -831,21 +907,33 @@ import X from 'lucide-svelte/icons/x';
         filters: {
           agent_id: selectedAgentId !== 'all' ? selectedAgentId : null,
           status: selectedConversationStatus,
+          context_type: selectedChannel !== 'all' ? selectedChannel : null,
         },
         kinds: ['reasoning', 'intention', 'summary'],
         limit: 25
       });
       conversationSearchResults = response.matches;
     } catch (err) {
-      addToast(err instanceof Error ? err.message : 'Search failed', 'error');
+      conversationSearchError = err instanceof Error ? err.message : 'Search failed';
+      addToast(conversationSearchError, 'error');
     } finally {
       conversationSearchLoading = false;
     }
   }
 
-  async function openConversationSearchResult(result: ConversationSearchMatch): Promise<void> {
+  async function openConversationSearchResult(
+    result: ConversationSearchMatch,
+    match: ConversationSearchMatch['top_match'] | null = result.top_match
+  ): Promise<void> {
     const q = conversationSearchSubmitted || conversationSearch.trim();
-    const url = `/chat/${result.conversation_id}${q ? `?search=${encodeURIComponent(q)}&searchSession=${encodeURIComponent(result.intaris_session_id)}` : ''}`;
+    const params = new URLSearchParams();
+    if (q) {
+      params.set('search', q);
+      params.set('searchSession', result.intaris_session_id);
+      if (match?.ref_id) params.set('searchRef', match.ref_id);
+    }
+    const query = params.toString();
+    const url = `/chat/${result.conversation_id}${query ? `?${query}` : ''}`;
     closeMobileList();
     await goto(url);
   }
@@ -907,11 +995,17 @@ import X from 'lucide-svelte/icons/x';
         ...local,
         ...response.matches.map((match) => ({ source: 'server' as const, server: match }))
       ];
-      const seededIndex = seededChatSearchSession
-        ? chatSearchResults.findIndex((result) => result.source === 'server' && (
-            result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
-          ))
-        : -1;
+      let seededIndex = -1;
+      if (seededChatSearchSession && seededChatSearchRef) {
+        seededIndex = chatSearchResults.findIndex((result) => result.source === 'server' && (
+          result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
+        ) && result.server.match.ref_id === seededChatSearchRef);
+      }
+      if (seededChatSearchSession && seededIndex < 0) {
+        seededIndex = chatSearchResults.findIndex((result) => result.source === 'server' && (
+          result.server.intaris_session_id === seededChatSearchSession || result.server.session_id === seededChatSearchSession
+        ));
+      }
       chatSearchSelectedIndex = seededIndex >= 0 ? seededIndex : 0;
       if (chatSearchResults.length > 0) selectChatSearchResult(chatSearchSelectedIndex);
     } catch (err) {
@@ -924,6 +1018,8 @@ import X from 'lucide-svelte/icons/x';
 
   function openChatSearch(seed = ''): void {
     chatSearchOpen = true;
+    seededChatSearchSession = null;
+    seededChatSearchRef = null;
     if (seed) chatSearchQuery = seed;
     seededChatSearchRan = true;
     void tick().then(() => void runChatSearch());
@@ -1232,6 +1328,7 @@ import X from 'lucide-svelte/icons/x';
   async function persistSelectedChannel(): Promise<void> {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, selectedChannel);
+    resetConversationSearchResults();
     await loadConversationPage(true);
   }
 
@@ -1899,6 +1996,7 @@ import X from 'lucide-svelte/icons/x';
   async function setConversationStatusFilter(status: 'active' | 'archived'): Promise<void> {
     if (selectedConversationStatus === status) return;
     selectedConversationStatus = status;
+    resetConversationSearchResults();
     await refreshAvailableChannelTypes();
     await loadConversationPage(true);
   }
@@ -2682,6 +2780,7 @@ import X from 'lucide-svelte/icons/x';
       selectedAgentId = next;
     }
     persistSelectedAgent();
+    resetConversationSearchResults();
     await refreshAvailableChannelTypes();
     await loadConversationPage(true);
   }
@@ -2870,9 +2969,12 @@ import X from 'lucide-svelte/icons/x';
 
   $effect(() => {
     if (conversationSearchSubmitted && conversationSearch.trim() !== conversationSearchSubmitted) {
-      conversationSearchSubmitted = '';
-      conversationSearchResults = [];
+      resetConversationSearchResults();
     }
+  });
+
+  $effect(() => {
+    syncSeededSearchFromUrl();
   });
 
   $effect(() => {
@@ -2962,14 +3064,6 @@ import X from 'lucide-svelte/icons/x';
     void refreshSearchHealth();
 
     void initialize();
-    const seededSearch = page.url.searchParams.get('search');
-    if (seededSearch) {
-      chatSearchOpen = true;
-      chatSearchQuery = seededSearch;
-      seededChatSearchSession = page.url.searchParams.get('searchSession');
-      seededChatSearchRan = false;
-    }
-
     // Same-tab tap on the Chat tab:
     //   * Mobile: open the conversation list drawer so the user can
     //     switch conversations or start a new one without retyping.
@@ -3139,14 +3233,27 @@ import X from 'lucide-svelte/icons/x';
           <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-slate-500" />
           <Input
             bind:value={conversationSearch}
-            class="pl-9 pr-16"
+            class="pl-9 pr-20"
             placeholder={searchEnabled ? 'Search conversations' : 'Filter by title'}
           />
+          {#if conversationSearch}
+            <button
+              aria-label="Clear search"
+              class="absolute right-10 top-1.5 rounded-lg p-1 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200"
+              type="button"
+              onclick={clearConversationSearch}
+            >
+              <X class="h-4 w-4" />
+            </button>
+          {/if}
           <button
-            class="absolute right-2 top-1.5 rounded-lg px-2 py-1 text-xs font-medium text-sky-400 transition hover:bg-slate-800 hover:text-sky-300 disabled:text-slate-600"
+            aria-label="Search conversations"
+            class="absolute right-2 top-1.5 rounded-lg p-1 text-sky-400 transition hover:bg-slate-800 hover:text-sky-300 disabled:text-slate-600"
             type="submit"
             disabled={!searchEnabled || !conversationSearch.trim() || conversationSearchLoading}
-          >{conversationSearchLoading ? '...' : 'Go'}</button>
+          >
+            <Search class={`h-4 w-4 ${conversationSearchLoading ? 'animate-pulse' : ''}`} />
+          </button>
         </form>
         {#if !searchEnabled}
           <p class="text-xs text-slate-500">Content search disabled; filtering loaded titles only.</p>
@@ -3169,21 +3276,78 @@ import X from 'lucide-svelte/icons/x';
       <!-- Scrollable middle: conversation list -->
       <div class="min-h-0 flex-1 overflow-y-auto px-4 py-2">
         <div class="space-y-1">
-          {#if conversationSearchSubmitted && conversationSearchResults.length > 0}
+          {#if conversationSearchSubmitted && conversationSearchLoading && searchEnabled}
+            <p class="mb-3 rounded-2xl border border-slate-800 px-4 py-4 text-center text-sm text-slate-400">
+              Searching conversation history...
+            </p>
+          {:else if conversationSearchSubmitted && conversationSearchError && searchEnabled}
+            <p class="mb-3 rounded-2xl border border-rose-900/50 bg-rose-950/30 px-4 py-4 text-center text-sm text-rose-200">
+              {conversationSearchError}
+            </p>
+          {:else if conversationSearchSubmitted && conversationSearchResults.length > 0}
             <div class="mb-3 space-y-1">
               <p class="px-2 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500">Search results</p>
               {#each conversationSearchResults as result}
-                <button
-                  class="group w-full rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5 text-left transition hover:border-sky-500/40 hover:bg-slate-900"
-                  type="button"
-                  onclick={() => void openConversationSearchResult(result)}
-                >
-                  <div class="flex items-center justify-between gap-2">
-                    <p class="min-w-0 truncate text-sm font-medium text-white">{searchResultConversationTitle(result)}</p>
-                    <span class="shrink-0 rounded-full border border-slate-700 px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-slate-500">{result.top_match.kind}</span>
+                {@const agent = searchResultAgent(result)}
+                {@const canExpand = result.match_count > 1 && result.extra_matches.length > 0}
+                {@const expanded = searchResultExpanded(result.intaris_session_id)}
+                {@const resultTime = searchMatchTime(result.top_match)}
+                <div class="rounded-xl transition hover:bg-slate-900/60">
+                  <div class="group flex items-start gap-3 rounded-xl px-3 py-2.5 text-left text-slate-200 transition hover:bg-slate-900/60">
+                    <button
+                      class="flex min-w-0 flex-1 items-start gap-3 text-left"
+                      type="button"
+                      onclick={() => void openConversationSearchResult(result)}
+                    >
+                      <AgentAvatar name={agent?.display_name ?? agent?.name ?? result.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8 shrink-0" />
+                      <span class="min-w-0 flex-1">
+                        <span class="block break-words text-sm font-medium text-white lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal">{searchResultConversationTitle(result)}</span>
+                        <span class="mt-0.5 flex items-center gap-2">
+                          <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? result.agent_id}</span>
+                          {#if result.match_count > 1}
+                            <span class="shrink-0 text-[10px] font-medium text-slate-500">{result.match_count} matches</span>
+                          {/if}
+                          {#if resultTime}
+                            <span class="shrink-0 text-[10px] text-slate-500">{resultTime}</span>
+                          {/if}
+                          <span class="shrink-0 text-[10px] text-slate-500">{searchMatchScore(result.top_match)}</span>
+                        </span>
+                        <span class="mt-1 line-clamp-2 text-xs leading-5 text-slate-400">{searchResultSnippet(result)}</span>
+                      </span>
+                    </button>
+                    {#if canExpand}
+                      <button
+                        aria-label={expanded ? 'Collapse matches' : 'Expand matches'}
+                        class="mt-1 shrink-0 rounded-lg p-1 text-slate-500 transition hover:bg-slate-800 hover:text-slate-200"
+                        type="button"
+                        onclick={() => toggleSearchResultExpanded(result.intaris_session_id)}
+                      >
+                        {#if expanded}
+                          <ChevronUp class="h-4 w-4" />
+                        {:else}
+                          <ChevronDown class="h-4 w-4" />
+                        {/if}
+                      </button>
+                    {/if}
                   </div>
-                  <p class="mt-1 line-clamp-2 text-xs leading-5 text-slate-400">{searchResultSnippet(result)}</p>
-                </button>
+                  {#if expanded}
+                    <div class="ml-11 mr-3 mb-2 space-y-1 border-l border-slate-800 pl-2">
+                      {#each result.extra_matches as match}
+                        {@const matchTime = searchMatchTime(match)}
+                        <button
+                          class="block w-full rounded-lg px-2 py-1.5 text-left text-xs leading-5 text-slate-400 transition hover:bg-slate-800/70 hover:text-slate-200"
+                          type="button"
+                          onclick={() => void openConversationSearchResult(result, match)}
+                        >
+                          <span class="mb-0.5 block text-[10px] text-slate-500">
+                            {#if matchTime}{matchTime} · {/if}{searchMatchScore(match)}
+                          </span>
+                          <span>{searchMatchSnippet(match)}</span>
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
               {/each}
             </div>
           {:else if conversationSearchSubmitted && !conversationSearchLoading && searchEnabled}
@@ -3192,7 +3356,9 @@ import X from 'lucide-svelte/icons/x';
             </p>
           {/if}
 
-          {#if visibleConversationList.length === 0}
+          {#if conversationSearchSubmitted && searchEnabled}
+            <!-- Content search replaces the normal list; empty state is handled above. -->
+          {:else if visibleConversationList.length === 0}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
               No conversations found.
             </p>
@@ -3467,7 +3633,7 @@ import X from 'lucide-svelte/icons/x';
           loading={chatSearchLoading}
           disabled={!currentConversation}
           onSubmit={runChatSearch}
-          onClose={() => { chatSearchOpen = false; chatSearchResults = []; }}
+          onClose={() => { chatSearchOpen = false; chatSearchResults = []; seededChatSearchSession = null; seededChatSearchRef = null; }}
           onNext={() => selectChatSearchResult(chatSearchSelectedIndex + 1)}
           onPrevious={() => selectChatSearchResult(chatSearchSelectedIndex - 1)}
           onSelect={selectChatSearchResult}

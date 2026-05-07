@@ -328,6 +328,7 @@ export const api = {
         agent_id?: string | null;
         project_id?: string | null;
         status?: 'active' | 'archived' | 'all';
+        context_type?: string | null;
         from_ts?: string | null;
         to_ts?: string | null;
       };
