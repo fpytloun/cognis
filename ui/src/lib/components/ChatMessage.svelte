@@ -21,7 +21,8 @@
     agent = null,
     compact = false,
     searchQuery = '',
-    searchActive = false
+    searchActive = false,
+    searchSelected = false
   } = $props<{
     item: MessageTimelineItem;
     agent?: Agent | null;
@@ -35,6 +36,7 @@
     compact?: boolean;
     searchQuery?: string;
     searchActive?: boolean;
+    searchSelected?: boolean;
   }>();
 
   const agentName = $derived(
@@ -90,6 +92,12 @@
     return item.role === 'user'
       ? 'prose-user prose-headings:text-slate-50 prose-p:text-slate-50 prose-strong:text-white prose-code:text-sky-100 prose-code:before:content-none prose-code:after:content-none prose-a:text-sky-100 prose-a:underline'
       : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
+  }
+
+  function searchRingClass(): string {
+    if (searchSelected) return 'ring-2 ring-yellow-300/80 ring-offset-2 ring-offset-slate-950';
+    if (searchActive) return 'ring-1 ring-yellow-300/35 ring-offset-1 ring-offset-slate-950';
+    return '';
   }
 
   async function copyMessage(): Promise<void> {
@@ -381,7 +389,7 @@
         {/if}
       </div>
     {/if}
-    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
+    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${searchRingClass()}`}>
       {#if item.html}
         <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
       {:else}
@@ -443,7 +451,7 @@
     </article>
   </div>
 {:else}
-  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()}`}>
+  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${searchRingClass()}`}>
     {#if item.html}
       <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
     {:else}

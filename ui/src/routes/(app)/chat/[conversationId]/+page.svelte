@@ -3974,12 +3974,13 @@ import X from 'lucide-svelte/icons/x';
                 {#if item.kind === 'message'}
                   {@const isSearchMatched = chatSearchOpen && chatSearchMatchedMessageIds.has(item.id)}
                   {@const isSelectedSearchMatch = isSearchMatched && selectedChatSearchTargetId === item.id}
-                  <div data-message-id={item.id} class={`flex min-w-0 rounded-[1.7rem] transition ${item.role === 'user' ? 'justify-end' : 'justify-start'} ${isSelectedSearchMatch ? 'ring-2 ring-yellow-300/80 ring-offset-2 ring-offset-slate-950' : isSearchMatched ? 'ring-1 ring-yellow-300/35 ring-offset-1 ring-offset-slate-950' : ''}`}>
+                  <div data-message-id={item.id} class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     <ChatMessage
                       {item}
                       agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
                       searchQuery={chatSearchQuery}
                       searchActive={isSearchMatched}
+                      searchSelected={isSelectedSearchMatch}
                     />
                   </div>
                 {:else if item.kind === 'thinking'}
