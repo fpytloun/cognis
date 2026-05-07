@@ -452,7 +452,7 @@ initial implementation; operators use Intaris admin/API for reindexing.
 ## LLM Tools
 
 All three are router-handled (Pattern B), `read_only=True`,
-`profile_group="research"`, and run through guardrails.
+`profile_group="conversations"`, and run through guardrails.
 
 They live in `cognis/tools/builtin/conversations.py` and are wired from
 `api/runtime_support.py::static_tool_definitions()` and
@@ -500,7 +500,8 @@ uses the existing `list_conversations` query helper.
       "kinds":      {"type": "array", "items": {"enum": ["reasoning", "intention", "summary"]}},
       "from_ts":    {"type": "string"},
       "to_ts":      {"type": "string"},
-      "mode":       {"type": "string", "enum": ["lexical", "vector", "hybrid"]},
+      "context_type":{"type": "string"},
+      "mode":       {"type": "string", "enum": ["auto", "lexical", "vector", "hybrid"]},
       "limit":      {"type": "integer", "default": 20, "maximum": 50},
       "cursor":     {"type": "string"}
     },
@@ -510,16 +511,16 @@ uses the existing `list_conversations` query helper.
 ```
 
 Returns `{matches: [{conversation_id, conversation_title, agent_id,
-session_id, ref_id, kind, ts, snippet, score}], next_cursor, backend}`.
-Reasoning matches are listed before intention and summary when scores are
-otherwise comparable.
+session_id, intaris_session_id, top_match, extra_matches, kind_rank}],
+next_cursor, total_estimated, backend}`. Reasoning matches are listed before
+intention and summary when scores are otherwise comparable.
 
 ### `read_conversation_messages`
 
 ```jsonc
 {
   "name": "read_conversation_messages",
-  "description": "Read user/assistant/summary events from a conversation, with anchor-based pagination across its session lineage.",
+  "description": "Read user/assistant events from a conversation, with anchor-based pagination across its session lineage.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -550,7 +551,7 @@ otherwise comparable.
       },
       "cursor": {"type": "string"},
       "limit":  {"type": "integer", "default": 50, "maximum": 200},
-      "kinds":  {"type": "array", "items": {"type": "string"}},
+      "kinds":  {"type": "array", "items": {"enum": ["user_message", "assistant_message"]}},
       "include_content_truncation": {"type": "boolean", "default": true}
     }
   }
@@ -586,10 +587,9 @@ Returns:
 
 Mechanics:
 
-- The handler resolves the lineage from the Cognis `sessions` table
-  (root + chronological children) and orchestrates parallel
-  `read_events` calls to Intaris with `after_seq`, `min_position`, and
-  `max_position` filters, merging results by timestamp.
+- The handler resolves the lineage from the Cognis `sessions` table in
+  chronological order and orchestrates bounded `read_events` calls to Intaris
+  with `after_seq` or `last_n`, depending on the anchor direction.
 - `cursor` overrides `anchor`. Cursors are opaque base64 JSON
   `{"sid": "...", "seq": N, "dir": "f|b"}`.
 - `next_cursor` is null when there are no more events forward;
