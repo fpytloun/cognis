@@ -56,6 +56,14 @@ def normalized_audio_filename(filename: str, default_stem: str = "attachment") -
     return default_stem
 
 
+def normalize_audio_mime_type(mime_type: str | None) -> str:
+    """Return a lower-case audio MIME type without parameters."""
+
+    if not isinstance(mime_type, str):
+        return ""
+    return mime_type.split(";", 1)[0].strip().lower()
+
+
 def stt_supported_audio_mime_types(
     *,
     model: str | None = None,
@@ -83,7 +91,7 @@ def _stt_passthrough_target(
         if supported
         else STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES
     )
-    normalized = supported_map.get(mime_type.lower())
+    normalized = supported_map.get(normalize_audio_mime_type(mime_type))
     if normalized is None:
         return None
     normalized_mime, extension = normalized
@@ -142,10 +150,9 @@ async def transcode_audio_for_stt(
                     }
                 },
             )
-            detail = stderr.decode(errors="replace").strip()
             raise RuntimeError(
                 "I couldn't transcribe that voice message because its audio format could not be "
-                f"converted with ffmpeg. {detail[:200]}"
+                "converted. The recording may be corrupted, empty, or unsupported."
             )
         return output_path.read_bytes(), _STT_TRANSCODE_TARGET_MIME, "voice-input.wav"
 

@@ -306,6 +306,7 @@ export function notifyIfHidden(
   conversationId: string,
   activeConversationId: string | null,
 ): void {
+  if (activeConversationId && conversationId === activeConversationId) return;
   if (!shouldNotifyWhenUnfocused()) return;
   if (hasEnabledWebPush()) return;
   showNotification(title, body, conversationId);

@@ -764,6 +764,20 @@ import X from 'lucide-svelte/icons/x';
     return page.params.conversationId ?? '';
   }
 
+  function syncServiceWorkerActiveConversation(active = true): void {
+    if (typeof navigator === 'undefined' || !navigator.serviceWorker?.controller) return;
+    const conversationId = currentConversation?.conversation_id ?? conversationIdFromRoute();
+    const focused = typeof document !== 'undefined'
+      && document.visibilityState === 'visible'
+      && document.hasFocus();
+    const shouldMarkActive = active && Boolean(conversationId) && (focused || conversationModeOpen);
+    navigator.serviceWorker.controller.postMessage({
+      type: 'ACTIVE_CONVERSATION',
+      conversation_id: shouldMarkActive ? conversationId : null,
+      active: shouldMarkActive,
+    });
+  }
+
   function isMobileViewport(): boolean {
     return typeof window !== 'undefined' && window.innerWidth < 1024;
   }
@@ -2905,6 +2919,12 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
+    currentConversation?.conversation_id;
+    conversationModeOpen;
+    syncServiceWorkerActiveConversation();
+  });
+
+  $effect(() => {
     if ((!timelineContentEl && !footerChromeEl) || typeof ResizeObserver === 'undefined') {
       return;
     }
@@ -3076,6 +3096,7 @@ import X from 'lucide-svelte/icons/x';
       }
     });
     visibilityHandler = () => {
+      syncServiceWorkerActiveConversation();
       if (!document.hidden) {
         scheduleForegroundReconcile();
         void refreshEscalations();
@@ -3083,6 +3104,7 @@ import X from 'lucide-svelte/icons/x';
       }
     };
     focusHandler = () => {
+      syncServiceWorkerActiveConversation();
       scheduleForegroundReconcile();
     };
     pageShowHandler = () => {
@@ -3148,6 +3170,7 @@ import X from 'lucide-svelte/icons/x';
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);
       }
+      syncServiceWorkerActiveConversation(false);
       stopSubSessionPolling();
     };
   });
@@ -4410,6 +4433,10 @@ import X from 'lucide-svelte/icons/x';
   }}
   subscribeMessageComplete={(handler) => {
     return wsClient.subscribe((event) => {
+      if (event.type === 'error') {
+        handler();
+        return;
+      }
       if (event.type === 'message_complete' && currentConversation && event.conversation_id === currentConversation.conversation_id) {
         handler();
       }

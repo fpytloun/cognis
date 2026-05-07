@@ -1330,7 +1330,7 @@ export const api = {
   },
 
   stt: {
-    async transcribe(file: Blob, opts: { filename?: string; language?: string; prompt?: string } = {}): Promise<SttTranscribeResponse> {
+    async transcribe(file: Blob, opts: { filename?: string; language?: string; prompt?: string; signal?: AbortSignal } = {}): Promise<SttTranscribeResponse> {
       const form = new FormData();
       form.append('file', file, opts.filename ?? 'voice-input.webm');
       if (opts.language) form.append('language', opts.language);
@@ -1338,7 +1338,8 @@ export const api = {
       const response = await fetch('/api/v1/stt/transcribe', {
         method: 'POST',
         body: form,
-        credentials: 'include'
+        credentials: 'include',
+        signal: opts.signal
       });
       if (!response.ok) {
         let detail = 'Transcription failed';

@@ -25,6 +25,9 @@ export class AudioQueue {
   private idleCallbacks: Array<() => void> = [];
   private playingCallbacks: Array<(playing: boolean) => void> = [];
   private playbackErrorCallbacks: Array<() => void> = [];
+  private playbackTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  private static readonly PLAYBACK_TIMEOUT_MS = 60_000;
 
   private readonly silentDataUrl =
     'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
@@ -52,6 +55,7 @@ export class AudioQueue {
       this.current.onerror = null;
       this.current.src = '';
     }
+    this.clearPlaybackTimeout();
     this.current = null;
     if (this.playing) {
       this.playing = false;
@@ -144,6 +148,22 @@ export class AudioQueue {
     }
   }
 
+  private clearPlaybackTimeout(): void {
+    if (this.playbackTimeout !== null) {
+      clearTimeout(this.playbackTimeout);
+      this.playbackTimeout = null;
+    }
+  }
+
+  private finishCurrent(audio: HTMLAudioElement): void {
+    this.clearPlaybackTimeout();
+    if (this.current === audio) {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.src = '';
+    }
+  }
+
   private ensureAudio(): HTMLAudioElement {
     if (this.current) return this.current;
     const audio = new Audio();
@@ -172,18 +192,20 @@ export class AudioQueue {
       this.notifyPlaying(true);
     }
     audio.onended = () => {
-      if (this.current === audio) {
-        audio.src = '';
-      }
+      this.finishCurrent(audio);
       void this.playNext();
     };
     audio.onerror = () => {
-      if (this.current === audio) {
-        audio.src = '';
-      }
+      this.finishCurrent(audio);
       this.notifyPlaybackError();
       void this.playNext();
     };
+    this.clearPlaybackTimeout();
+    this.playbackTimeout = setTimeout(() => {
+      this.finishCurrent(audio);
+      this.notifyPlaybackError();
+      void this.playNext();
+    }, AudioQueue.PLAYBACK_TIMEOUT_MS);
     audio.src = entry.url;
     try {
       await audio.play();
@@ -191,9 +213,7 @@ export class AudioQueue {
       // Autoplay was blocked or playback failed. Drop this sentence and keep
       // draining so conversation mode never gets wedged in Speaking.
       this.unlocked = false;
-      if (this.current === audio) {
-        audio.src = '';
-      }
+      this.finishCurrent(audio);
       if (this.playing) {
         this.playing = false;
         this.notifyPlaying(false);

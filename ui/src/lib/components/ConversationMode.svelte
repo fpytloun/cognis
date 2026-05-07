@@ -69,9 +69,6 @@
   let voiceLevel = $state(0);
   let listeningHint = $state('');
   let missedUtterance = $state('');
-  let pushToTalkActive = $state(false);
-  let pushToTalkStopPending = false;
-  let suppressPushToTalkClick = false;
 
   let queue: AudioQueue | null = null;
   let recorder: MediaRecorder | null = null;
@@ -121,6 +118,7 @@
   let playbackNeedsGesture = $state(false);
   let playbackErrorNotified = false;
   let retryNotified = false;
+  let assistantTurnWatchdog: ReturnType<typeof setTimeout> | null = null;
 
   const VAD_FRAME_MS = 100;
   const VAD_RMS_THRESHOLD = 0.018;
@@ -136,6 +134,8 @@
   // same ceiling.
   const TTS_SENTENCE_TIMEOUT_MS = 15_000;
   const TTS_MAX_ATTEMPTS = 2;
+  const STT_TIMEOUT_MS = 30_000;
+  const ASSISTANT_TURN_WATCHDOG_MS = 120_000;
 
   function clearVad(): void {
     if (vadHandle !== null) {
@@ -155,6 +155,27 @@
       clearTimeout(missedRestartTimer);
       missedRestartTimer = null;
     }
+  }
+
+  function clearAssistantTurnWatchdog(): void {
+    if (assistantTurnWatchdog !== null) {
+      clearTimeout(assistantTurnWatchdog);
+      assistantTurnWatchdog = null;
+    }
+  }
+
+  function armAssistantTurnWatchdog(): void {
+    clearAssistantTurnWatchdog();
+    assistantTurnWatchdog = setTimeout(() => {
+      assistantTurnWatchdog = null;
+      if (disposed) return;
+      assistantTurnActive = false;
+      pendingSentenceSyntheses = 0;
+      queue?.clear();
+      playbackNeedsGesture = false;
+      addToast('Voice conversation timed out waiting for the assistant. Listening again.', 'warning', 4_000);
+      maybeStartListening();
+    }, ASSISTANT_TURN_WATCHDOG_MS);
   }
 
   function sentenceCacheMessageId(messageId: string, sentenceIndex: number): string {
@@ -346,11 +367,7 @@
     missedUtterance = '';
     voiceLevel = 0;
     const vadAvailable = typeof AudioContext !== 'undefined';
-    if (!vadAvailable && !pushToTalkActive) {
-      modeState = 'idle';
-      listeningHint = 'Hold Push to talk to record.';
-      return;
-    }
+    if (!vadAvailable) listeningHint = 'Tap the orb when you finish speaking.';
     chunks = [];
     speakingDetected = false;
     lastVoiceAt = 0;
@@ -425,20 +442,13 @@
     };
     nextRecorder.start();
 
-    if (pushToTalkStopPending) {
-      pushToTalkStopPending = false;
-      speakingDetected = true;
-      endUtterance();
-      return;
-    }
-
     // Set up energy-based VAD on the same stream.
     if (disposed || generation !== listeningGeneration || !open) {
       teardownAudio();
       return;
     }
     if (!vadAvailable) {
-      listeningHint = 'Release Push to talk when done.';
+      listeningHint = 'Tap the orb when you finish speaking.';
       return;
     }
     try {
@@ -448,14 +458,7 @@
       const source = audioContext.createMediaStreamSource(nextStream);
       source.connect(analyser);
     } catch {
-      addToast('Voice activity detection is not available. Use push-to-talk.', 'warning', 4_000);
-      if (pushToTalkActive) {
-        listeningHint = 'Release Push to talk when done.';
-      } else {
-        teardownAudio();
-        modeState = 'idle';
-        listeningHint = 'Hold Push to talk to record.';
-      }
+      listeningHint = 'Tap the orb when you finish speaking.';
       return;
     }
     const buffer = new Float32Array(analyser.fftSize);
@@ -482,7 +485,7 @@
       }
       voiceLevel = normalizeVoiceLevel(rms, vadThreshold);
       if (!speakingDetected && now - utteranceStartedAt > VAD_HINT_MS) {
-        listeningHint = 'Speak when ready, or hold Push to talk.';
+        listeningHint = 'Speak when ready, or tap the orb when done.';
       }
       if (speechStartedAt > 0 && now - speechStartedAt > MAX_UTTERANCE_MS) {
         endUtterance();
@@ -532,6 +535,13 @@
     }
   }
 
+  function finishListeningTurn(): void {
+    if (!recorder || modeState !== 'listening') return;
+    haptic.light();
+    speakingDetected = true;
+    endUtterance();
+  }
+
   async function onUtterance(blob: Blob, ext: string): Promise<void> {
     if (disposed) return;
     if (blob.size === 0) {
@@ -543,7 +553,11 @@
     voiceLevel = 0;
     try {
       const filename = `voice-${Date.now()}.${ext}`;
-      const result = await api.stt.transcribe(blob, { filename });
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), STT_TIMEOUT_MS);
+      const result = await api.stt.transcribe(blob, { filename, signal: controller.signal }).finally(() => {
+        window.clearTimeout(timeout);
+      });
       if (disposed) return;
       const text = result.text.trim();
       if (!text) {
@@ -559,13 +573,21 @@
       haptic.success();
       transcript = [...transcript, { role: 'user', text }];
       assistantTurnActive = true;
+      armAssistantTurnWatchdog();
       submitText(text);
     } catch (err) {
       if (disposed) return;
       const message = err instanceof Error ? err.message : 'Transcription failed';
-      addToast(message, 'error', 4_000, 'Voice transcription failed');
-      haptic.error();
-      void startListening();
+      const aborted = err instanceof DOMException && err.name === 'AbortError';
+      missedUtterance = aborted || message === 'The operation was aborted.'
+        ? "I didn't catch that."
+        : message;
+      haptic.warning();
+      clearMissedRestartTimer();
+      missedRestartTimer = window.setTimeout(() => {
+        missedRestartTimer = null;
+        if (!disposed) void startListening();
+      }, 650);
     }
   }
 
@@ -623,6 +645,7 @@
 
   function handleMessageComplete(): void {
     if (disposed) return;
+    clearAssistantTurnWatchdog();
     assistantTurnActive = false;
     // Queue may still be playing the last sentence; the idle callback
     // re-arms the mic when playback drains.
@@ -678,9 +701,6 @@
     disposed = true;
     playbackNeedsGesture = false;
     assistantTurnActive = false;
-    pushToTalkActive = false;
-    pushToTalkStopPending = false;
-    suppressPushToTalkClick = false;
     listeningHint = '';
     missedUtterance = '';
     voiceLevel = 0;
@@ -689,6 +709,7 @@
     activeSentenceKeys.clear();
     ignoredTtsMessageIds.clear();
     clearMissedRestartTimer();
+    clearAssistantTurnWatchdog();
     for (const controller of pendingTtsControllers) {
       try {
         controller.abort();
@@ -785,91 +806,13 @@
     queue?.clear();
     pendingSentenceSyntheses = 0;
     assistantTurnActive = false;
+    clearAssistantTurnWatchdog();
     playbackNeedsGesture = false;
     if (audioMessageId) ignoredTtsMessageIds.add(audioMessageId);
     resetAudioOrdering(null);
     sendDisableTts();
     sendEnableTts(selectedVoice());
     if (relisten) maybeStartListening();
-  }
-
-  function handlePushToTalkDown(event: PointerEvent): void {
-    if (!open || disposed || event.pointerType === 'mouse') return;
-    suppressPushToTalkClick = true;
-    haptic.medium();
-    try {
-      (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-    } catch {
-      // ignore
-    }
-    if (muted) muted = false;
-    if (assistantTurnActive || pendingSentenceSyntheses > 0 || queue?.isPlaying()) {
-      interruptAssistant(false);
-    }
-    pushToTalkActive = true;
-    pushToTalkStopPending = false;
-    if (!recorder) {
-      void startListening();
-    }
-  }
-
-  function handlePushToTalkUp(event: PointerEvent): void {
-    if (!pushToTalkActive) return;
-    pushToTalkActive = false;
-    try {
-      (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
-    } catch {
-      // ignore
-    }
-    haptic.light();
-    if (recorder) {
-      speakingDetected = true;
-      endUtterance();
-    } else {
-      pushToTalkStopPending = true;
-    }
-    window.setTimeout(() => {
-      suppressPushToTalkClick = false;
-    }, 450);
-  }
-
-  function handlePushToTalkCancel(event: PointerEvent): void {
-    if (!pushToTalkActive) return;
-    pushToTalkActive = false;
-    pushToTalkStopPending = false;
-    suppressPushToTalkClick = true;
-    try {
-      (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
-    } catch {
-      // ignore
-    }
-    teardownAudio();
-    window.setTimeout(() => {
-      suppressPushToTalkClick = false;
-      if (!disposed) maybeStartListening();
-    }, 450);
-  }
-
-  function handlePushToTalkClick(event: MouseEvent): void {
-    if (suppressPushToTalkClick) {
-      event.preventDefault();
-      return;
-    }
-    if (pushToTalkActive || recorder) {
-      pushToTalkActive = false;
-      if (recorder) {
-        speakingDetected = true;
-        endUtterance();
-      }
-      return;
-    }
-    haptic.medium();
-    if (muted) muted = false;
-    if (assistantTurnActive || pendingSentenceSyntheses > 0 || queue?.isPlaying()) {
-      interruptAssistant(false);
-    }
-    pushToTalkActive = true;
-    void startListening();
   }
 
   $effect(() => {
@@ -902,7 +845,7 @@
       case 'speaking':
         return pendingSentenceSyntheses > 0 ? 'Preparing audio…' : 'Speaking…';
       default:
-        return 'Connecting…';
+        return 'Connecting...';
     }
   }
 
@@ -957,10 +900,11 @@
         <button
           type="button"
           class="relative h-56 w-56 rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:h-72 sm:w-72"
-          aria-label={playbackNeedsGesture ? 'Enable audio playback' : modeState === 'speaking' ? 'Interrupt assistant and listen' : 'Voice conversation status'}
+          aria-label={playbackNeedsGesture ? 'Enable audio playback' : modeState === 'speaking' ? 'Interrupt assistant and listen' : modeState === 'listening' ? 'Finish speaking' : 'Voice conversation status'}
           onclick={() => {
             if (playbackNeedsGesture) void unlockPlayback();
             else if (modeState === 'speaking') interruptAssistant();
+            else if (modeState === 'listening') finishListeningTurn();
           }}
         >
           <span
@@ -992,7 +936,7 @@
             {:else if modeState === 'speaking'}
               Tap the orb to interrupt and speak.
             {:else if modeState === 'listening'}
-              Voice stays local until transcription submits text.
+              Tap the orb when you finish speaking.
             {:else}
               Keep this screen open for hands-free replies.
             {/if}
@@ -1001,18 +945,7 @@
       </div>
 
       <div class="w-full space-y-3">
-        <div class="grid grid-cols-[1fr_auto] gap-3">
-          <button
-            type="button"
-            class={`inline-flex min-h-[56px] items-center justify-center rounded-2xl border px-4 text-base font-semibold transition ${pushToTalkActive ? 'border-sky-300 bg-sky-400 text-slate-950' : 'border-sky-500/40 bg-sky-500/15 text-sky-100 hover:bg-sky-500/25'}`}
-            onpointerdown={handlePushToTalkDown}
-            onpointerup={handlePushToTalkUp}
-            onpointercancel={handlePushToTalkCancel}
-            onclick={handlePushToTalkClick}
-          >
-            <Mic class="mr-2 h-5 w-5" />
-            {pushToTalkActive ? 'Release to send' : 'Hold to talk'}
-          </button>
+        <div class="grid grid-cols-1 gap-3">
           <Button variant="secondary" type="button" class="min-h-[56px] px-4" onclick={toggleMute} aria-pressed={muted}>
           {#if muted}
             <Mic class="h-5 w-5 sm:mr-2" />

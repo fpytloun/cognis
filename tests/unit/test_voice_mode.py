@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from cognis.audio.preprocessing import (
     STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES,
+    normalize_audio_mime_type,
     normalized_audio_filename,
     stt_supported_audio_mime_types,
 )
@@ -232,6 +233,12 @@ def test_agent_llm_config_voice_persists() -> None:
 def test_normalized_audio_filename_falls_back() -> None:
     assert normalized_audio_filename("foo.mp3") == "foo.mp3"
     assert normalized_audio_filename("") == "attachment"
+
+
+def test_normalize_audio_mime_type_strips_parameters() -> None:
+    assert normalize_audio_mime_type("audio/webm;codecs=opus") == "audio/webm"
+    assert normalize_audio_mime_type(" Audio/MP4 ") == "audio/mp4"
+    assert normalize_audio_mime_type(None) == ""
 
 
 def test_stt_supported_audio_mime_types_uses_default_when_unset() -> None:

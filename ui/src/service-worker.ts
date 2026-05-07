@@ -64,12 +64,6 @@ sw.addEventListener('activate', (event) => {
   );
 });
 
-sw.addEventListener('message', (event) => {
-  if (event.data?.type === 'SKIP_WAITING') {
-    void sw.skipWaiting();
-  }
-});
-
 type WebPushPayload = {
   title?: string;
   body?: string;
@@ -79,6 +73,29 @@ type WebPushPayload = {
   conversation_id?: string;
   icon?: unknown;
 };
+
+type ActiveConversationMessage = {
+  type?: string;
+  conversation_id?: string | null;
+  active?: boolean;
+};
+
+const activeConversationByClient = new Map<string, string>();
+
+sw.addEventListener('message', (event) => {
+  if (event.data?.type === 'SKIP_WAITING') {
+    void sw.skipWaiting();
+    return;
+  }
+  const data = event.data as ActiveConversationMessage | undefined;
+  if (data?.type === 'ACTIVE_CONVERSATION') {
+    const sourceId = (event.source as Client | null | undefined)?.id;
+    if (!sourceId) return;
+    const conversationId = typeof data.conversation_id === 'string' ? data.conversation_id.trim() : '';
+    if (data.active && conversationId) activeConversationByClient.set(sourceId, conversationId);
+    else activeConversationByClient.delete(sourceId);
+  }
+});
 
 function parsePushPayload(event: PushEvent): WebPushPayload {
   if (!event.data) return {};
@@ -219,7 +236,9 @@ async function hasForegroundClientFor(target: URL, conversationId: string | unde
     const windowClient = client as WindowClient;
     try {
       const url = new URL(windowClient.url);
-      if (url.origin !== sw.location.origin || !isForegroundClient(windowClient)) return false;
+      if (url.origin !== sw.location.origin) return false;
+      if (conversationId && activeConversationByClient.get(windowClient.id) === conversationId) return true;
+      if (!isForegroundClient(windowClient)) return false;
       return url.pathname === target.pathname
         || (targetConversationPath !== null && url.pathname === targetConversationPath);
     } catch {
