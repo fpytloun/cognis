@@ -250,6 +250,10 @@ export interface DelegationTimelineItem {
   status: 'started' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   result: string | null;
   timestamp: string | null;
+  /** Live progress fields (present while running) */
+  toolCallCount?: number;
+  maxToolCalls?: number;
+  lastTool?: string;
 }
 
 const terminalDelegationStatuses = new Set<DelegationTimelineItem['status']>([
@@ -294,6 +298,10 @@ function mergeDelegationItem(
     status: keepExistingTerminal ? existing.status : incoming.status,
     result: keepExistingTerminal ? existing.result : incoming.result ?? existing.result,
     timestamp: keepExistingTerminal ? existing.timestamp : incoming.timestamp ?? existing.timestamp,
+    // Preserve live progress fields from whichever side has them
+    toolCallCount: incoming.toolCallCount ?? existing.toolCallCount,
+    maxToolCalls: incoming.maxToolCalls ?? existing.maxToolCalls,
+    lastTool: incoming.lastTool ?? existing.lastTool,
   };
 }
 
@@ -1788,7 +1796,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       taskLabel: delegationTaskLabel('task' in event ? event.task : null),
       status: event.type === 'delegation_started' ? 'started' : 'running',
       result: progressText,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      toolCallCount: 'tool_call_count' in event ? (event as typeof event & { tool_call_count?: number }).tool_call_count : undefined,
+      maxToolCalls: 'max_tool_calls' in event ? (event as typeof event & { max_tool_calls?: number }).max_tool_calls : undefined,
+      lastTool: 'last_tool' in event ? (event as typeof event & { last_tool?: string }).last_tool : undefined,
     };
     if (index >= 0) {
       next[index] = mergeDelegationItem(existing, delegation);

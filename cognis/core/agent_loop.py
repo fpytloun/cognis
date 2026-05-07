@@ -297,6 +297,10 @@ def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
 
     if instruction.get("required_action") == "write_deliverable_then_step_complete":
         return _FINALIZATION_TOOLS
+    if instruction.get("required_action") == "write_result":
+        # System-agent delegation: only allow step_todo_write and step_complete.
+        # No executor tools — model must write assistant text, not more tool calls.
+        return frozenset({STEP_TODO_WRITE, STEP_COMPLETE})
     return frozenset({STEP_TODO_WRITE, STEP_COMPLETE})
 
 
@@ -308,6 +312,12 @@ ToolResultCallback = Callable[..., Coroutine[Any, Any, None]]
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
 DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
+# Lower tool-call cap for system-agent delegations so a stuck exploration loop
+# is forced to produce a text summary instead of running until cancellation.
+# Can be overridden per agent via agent.execution.delegation_max_tool_calls.
+DELEGATION_DEFAULT_MAX_TOOL_CALLS = 40
+# Cap for read-only exploration agents (system:explore, system:code-review, …)
+DELEGATION_EXPLORE_MAX_TOOL_CALLS = 30
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_STREAM_MAX_RETRIES = 3
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
@@ -1453,6 +1463,18 @@ DELEGATION_POLICY = ExecutionPolicy(
     event_flush_strategy="incremental",
 )
 
+# Policy for system-agent delegations: step_complete is available (optional)
+# but NOT required. The sub-session may return via a normal assistant message,
+# matching the OpenCode task sub-agent contract. write_deliverable is still
+# available when a deliverable_step_run_id is set (opt-in from parent step).
+SYSTEM_AGENT_DELEGATION_POLICY = ExecutionPolicy(
+    require_step_complete=False,
+    step_complete_available=True,
+    enable_auto_compaction=False,
+    event_flush_strategy="incremental",
+    skip_memory=True,  # No Mnemory recall/remember for system agents
+)
+
 SECONDARY_POLICY = ExecutionPolicy(
     require_step_complete=True,
     step_complete_available=True,
@@ -2173,13 +2195,23 @@ class AgentLoop:
                 prompt=task_description,
                 require_deliverable=False,
             )
+            # System agents (system:explore, system:research, …) run with a
+            # slim policy: step_complete is optional, memory is skipped, and
+            # project instructions are skipped (controlled via agent.is_system
+            # in context assembly).  User-agent delegations keep the full
+            # DELEGATION_POLICY so they behave like before.
+            child_policy = (
+                SYSTEM_AGENT_DELEGATION_POLICY
+                if resolved_agent.is_system
+                else DELEGATION_POLICY
+            )
             child_ctx = StepContext(
                 step_definition=child_step,
                 session=child_session,
                 conversation=conversation,
                 agent=resolved_agent,
                 executor_agent=child_executor_agent,
-                policy=DELEGATION_POLICY,
+                policy=child_policy,
                 user_message=task_description,
                 system_initiated=True,
                 interaction_mode="explicit_gates",
@@ -2213,6 +2245,12 @@ class AgentLoop:
                 if output is None or output.error is not None:
                     error_text = output.error if output and output.error else "no step output"
                     raise RuntimeError(f"Delegation step failed: {error_text}")
+                # For system-agent delegations (require_step_complete=False) the
+                # sub-session may finish via normal assistant text instead of
+                # step_complete. StepOutput.content holds the last assistant message;
+                # StepOutput.summary is auto-generated from the first 500 chars. Both
+                # are non-empty when the model wrote a useful response — this is the
+                # OpenCode-style task result contract.
                 result_summary = output.summary if output and output.summary else "Completed."
                 result_content = output.content if output and output.content else ""
                 deliverable_data: dict[str, Any] = {}
@@ -2294,6 +2332,69 @@ class AgentLoop:
                         }
                     },
                 )
+        except asyncio.CancelledError:
+            # Parent task was cancelled while waiting on a sync child session.
+            # Mark the child cancelled so the DB row is not left active.
+            logger.info(
+                "delegation: child session cancelled (parent cancellation)",
+                extra={
+                    "extra_data": {
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_intaris_session_id,
+                    }
+                },
+            )
+            try:
+                await self.session_manager.mark_cancelled(
+                    child_session_id,
+                    result_summary="Cancelled (parent task cancelled)",
+                )
+            except Exception:
+                logger.warning("delegation: failed to mark child session cancelled", exc_info=True)
+
+            try:
+                await self.providers.guardrails.record_events(
+                    session_id=parent_intaris_session_id,
+                    events=with_session_events_turn_id(
+                        [
+                            SessionEvent(
+                                type="delegation",
+                                data={
+                                    "status": "cancelled",
+                                    "child_session_id": child_session_id,
+                                    "mode": "delegate",
+                                    "task": task_description,
+                                    "agent_id": child_session.agent_id,
+                                },
+                            )
+                        ],
+                        None,
+                    ),
+                    idempotency_key=(
+                        f"{parent_intaris_session_id}:delegation_cancelled_{child_session_id}"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "delegation: failed to record cancellation in parent session",
+                    exc_info=True,
+                )
+
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_FAILED,
+                    data={
+                        "conversation_id": conversation_id,
+                        "child_session_id": child_session_id,
+                        "parent_session_id": parent_intaris_session_id,
+                        "agent_id": child_session.agent_id,
+                        "task": task_description,
+                        "reason": "Cancelled",
+                    },
+                )
+            )
+            DELEGATIONS_TOTAL.labels(status="cancelled").inc()
+            raise  # Re-raise so the parent coroutine also gets cancelled
         except Exception:
             logger.exception(
                 "delegation: child session failed",
@@ -2479,9 +2580,41 @@ class AgentLoop:
         on_tool_result: ToolResultCallback | None = None,
     ) -> StepOutput | None:
         """Core step execution loop."""
-        max_tool_calls = DEFAULT_MAX_TOOL_CALLS
-        if ctx.agent.execution:
-            max_tool_calls = ctx.agent.execution.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+        # Budget selection:
+        # 1. Per-agent explicit override in agent.execution.max_tool_calls.
+        # 2. System-agent delegations default to a lower cap and force a text
+        #    summary when reached (instead of emitting a generic failure).
+        # 3. All other steps use DEFAULT_MAX_TOOL_CALLS.
+        _is_delegation = ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY
+        if ctx.agent.execution and "max_tool_calls" in ctx.agent.execution:
+            max_tool_calls = int(ctx.agent.execution["max_tool_calls"])
+        elif _is_delegation:
+            # Exploration-only system agents (no write tools) get a tighter cap.
+            _explore_ids = {"system:explore", "system:code-review", "system:architect"}
+            max_tool_calls = (
+                int(
+                    ctx.agent.execution.get(
+                        "delegation_max_tool_calls", DELEGATION_EXPLORE_MAX_TOOL_CALLS
+                    )
+                )
+                if ctx.agent.agent_id in _explore_ids
+                else int(
+                    ctx.agent.execution.get(
+                        "delegation_max_tool_calls", DELEGATION_DEFAULT_MAX_TOOL_CALLS
+                    )
+                )
+                if ctx.agent.execution
+                else (
+                    DELEGATION_EXPLORE_MAX_TOOL_CALLS
+                    if ctx.agent.agent_id in _explore_ids
+                    else DELEGATION_DEFAULT_MAX_TOOL_CALLS
+                )
+            )
+        else:
+            max_tool_calls = DEFAULT_MAX_TOOL_CALLS
+        # Whether we are in "force summary" mode: tools stripped, one LLM turn
+        # to produce a final text result.
+        _force_summary_mode = False
 
         tool_call_count = 0
         todo_reprompt_count = 0
@@ -2653,12 +2786,15 @@ class AgentLoop:
         # ---------------------------------------------------------------
         # Step 3: Assemble context (reads Intaris history + memory)
         # ---------------------------------------------------------------
-        await self._ensure_known_project_context_loaded(ctx)
+        # Skip project context probing for system-agent delegations — they run
+        # with a slim prompt and do not need the parent project's AGENTS.md.
+        if not ctx.policy.skip_memory:
+            await self._ensure_known_project_context_loaded(ctx)
 
         # Derive prompt context from execution policy
         if ctx.policy is WORKFLOW_POLICY:
             _prompt_ctx = PromptContext.TASK_STEP
-        elif ctx.policy is DELEGATION_POLICY:
+        elif ctx.policy is DELEGATION_POLICY or ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY:
             _prompt_ctx = PromptContext.DELEGATION
         elif ctx.follow_up is not None and ctx.follow_up.mode is FollowUpMode.INTEGRATE:
             _prompt_ctx = PromptContext.FOLLOW_UP_INTEGRATE
@@ -2694,8 +2830,12 @@ class AgentLoop:
                 executor_environment=ctx.executor_environment,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
+                # System-agent delegations skip project instructions (AGENTS.md).
+                # They run with a slim prompt; the project context is the caller's
+                # concern, not the sub-session's.
                 include_project_context=(
-                    ctx.workspace_root_explicit or ctx.working_directory_explicit
+                    not ctx.policy.skip_memory
+                    and (ctx.workspace_root_explicit or ctx.working_directory_explicit)
                 ),
                 executor_pool=getattr(ctx, "executor_pool", None),
                 active_executor_id=(
@@ -3182,12 +3322,15 @@ class AgentLoop:
                 },
             )
             try:
+                # In force-summary mode (delegation budget exhausted) strip all
+                # executor tools so the model can only write a text response.
+                _effective_tools = [] if _force_summary_mode else exposure.tools
                 stream = self.providers.llm.stream_generate(
                     model_messages,
                     model=model_for_llm,
                     task_type="default",
                     provider_id=provider_for_llm,
-                    tools=exposure.tools,
+                    tools=_effective_tools,
                     cache_breakpoint_index=cache_breakpoint,
                     **llm_kwargs,
                 )
@@ -3912,10 +4055,15 @@ class AgentLoop:
                     )
                     loaded_project_context = None
                     force_project_context_retry = False
-                    loaded_project_context = await self._maybe_load_project_context_before_tool(
-                        ctx,
-                        tc=tc,
-                    )
+                    # System-agent delegations skip dynamic project context probing
+                    # (AGENTS.md injection) — they run without project instructions.
+                    if not ctx.policy.skip_memory:
+                        loaded_project_context = (
+                            await self._maybe_load_project_context_before_tool(
+                                ctx,
+                                tc=tc,
+                            )
+                        )
                     if loaded_project_context is None and not can_continue_after_context:
                         loaded_project_context = self._project_context_loaded_for_tool_target(
                             ctx,
@@ -5629,17 +5777,18 @@ class AgentLoop:
                 )
                 break
 
-            # Enforce the ceiling silently. Budget reminders in the prompt led
-            # models to self-report failure for a controller-imposed limit,
-            # which then failed whole workflows. Preserve partial work and let
-            # the evaluator judge whether it is sufficient or needs revision.
-            if tool_call_count >= max_tool_calls:
+            # Enforce the tool-call ceiling.
+            # For system-agent delegations: strip tools and inject a force-summary
+            # message so the model produces a final text result instead of failing.
+            # For workflow steps: preserve partial work silently for evaluation.
+            if tool_call_count >= max_tool_calls and not _force_summary_mode:
                 logger.warning(
                     "Tool call limit reached",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
                             "count": tool_call_count,
+                            "is_delegation": _is_delegation,
                         }
                     },
                 )
@@ -5654,15 +5803,40 @@ class AgentLoop:
                         },
                     )
                 )
-                step_output = StepOutput(
-                    summary=(
-                        "Stopped after reaching the tool-call ceiling. "
-                        "Partial work was preserved for evaluation."
-                    ),
-                    content="\n\n".join(assistant_content_parts),
-                    attachments=list(collected_attachments),
+                await self._flush_events_incremental(
+                    ctx, events_to_record, reason="tool_call_ceiling_reached", on_token=on_token
                 )
-                break
+                if _is_delegation:
+                    # Force-summary mode: strip all tools from the next LLM turn
+                    # and inject a one-shot instruction to write a text summary.
+                    _force_summary_mode = True
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "TOOL BUDGET REACHED — no further tools are available.\n\n"
+                                "Write your final result now as a complete assistant message. "
+                                "Summarise what you found, include file paths and line "
+                                "references where relevant, and note any gaps. "
+                                "Do not call any tools."
+                            ),
+                            "_force_summary": True,
+                        }
+                    )
+                    # Continue the loop — next LLM call will have tools=[] injected
+                    # via the exposure path (controller tools still visible but no
+                    # executor tools). The model will then write text and stop.
+                    continue
+                else:
+                    step_output = StepOutput(
+                        summary=(
+                            "Stopped after reaching the tool-call ceiling. "
+                            "Partial work was preserved for evaluation."
+                        ),
+                        content="\n\n".join(assistant_content_parts),
+                        attachments=list(collected_attachments),
+                    )
+                    break
 
         # Finalize step — pass assistant_content_parts so Mnemory remember
         # works even when events were already flushed incrementally.
@@ -6167,6 +6341,44 @@ class AgentLoop:
             # tool calls should only be visible in the sub-session view, not
             # leak into the parent conversation timeline.
             DELEGATIONS_TOTAL.labels(status="sync_started").inc()
+
+            # Build a progress-publishing on_tool_result callback.
+            # Emits DELEGATION_PROGRESS after each child tool result so the UI
+            # can show a live tool-call counter and last-tool name on the card.
+            _child_tool_call_count = 0
+            _child_session_id = child_session.session_id
+            _child_max_tool_calls = (
+                DELEGATION_EXPLORE_MAX_TOOL_CALLS
+                if child_session.agent_id in {"system:explore", "system:code-review", "system:architect"}
+                else DELEGATION_DEFAULT_MAX_TOOL_CALLS
+            )
+            _event_bus = self.event_bus
+            _conv_id = ctx.conversation.conversation_id
+
+            async def _child_progress_callback(
+                call_id: str,
+                tool_name: str,
+                result: str,
+                is_error: bool,
+                attachments: Any,
+                file_diffs: Any,
+            ) -> None:
+                nonlocal _child_tool_call_count
+                _child_tool_call_count += 1
+                if _child_tool_call_count % 3 == 0 or _child_tool_call_count == 1:
+                    await _event_bus.publish(
+                        Event(
+                            type=EventType.DELEGATION_PROGRESS,
+                            data={
+                                "conversation_id": _conv_id,
+                                "child_session_id": _child_session_id,
+                                "tool_call_count": _child_tool_call_count,
+                                "max_tool_calls": _child_max_tool_calls,
+                                "last_tool": tool_name,
+                            },
+                        )
+                    )
+
             output = await self._run_child_session(
                 child_session=child_session,
                 conversation=ctx.conversation,
@@ -6174,6 +6386,7 @@ class AgentLoop:
                 task_description=task_description,
                 parent_intaris_session_id=parent_intaris_id,
                 deliverable_step_run_id=ctx.step_run_id,
+                on_tool_result=_child_progress_callback,
             )
             if output:
                 if ctx.step_run_id is not None and output.deliverable_id is not None:
@@ -8791,12 +9004,29 @@ class AgentLoop:
         )
 
     async def _finalization_instruction(self, ctx: StepContext) -> dict[str, str] | None:
-        """Return controller-specific finalization guidance once todos are terminal."""
+        """Return controller-specific finalization guidance once todos are terminal.
+
+        For workflow steps (require_step_complete=True) this enforces step_complete.
+        For system-agent delegations (require_step_complete=False) this nudges the
+        model to write its result text instead of continuing to call tools.
+        """
+        if not self._workflow_todos_are_terminal(ctx):
+            return None
+
+        # System-agent delegations: todos terminal → nudge to write result text.
+        if ctx.policy is SYSTEM_AGENT_DELEGATION_POLICY:
+            return {
+                "required_action": "write_result",
+                "message": (
+                    "All todos are complete. Write your final result now as an "
+                    "assistant message. Do not call more tools."
+                ),
+                "reminder": "Todos are terminal — write your final result text now.",
+            }
 
         if (
             not ctx.policy.require_step_complete
             or not (ctx.task_id or ctx.step_run_id)
-            or not self._workflow_todos_are_terminal(ctx)
         ):
             return None
         if ctx.step_definition.require_deliverable and self._deliverable_owner_step_run_id(ctx):
@@ -10771,7 +11001,19 @@ class AgentLoop:
                 f"instruction:\n\n{operator_instruction}"
             )
 
-        if self._deliverable_owner_step_run_id(ctx) is not None:
+        # For system-agent delegations (require_step_complete=False) we do NOT
+        # emit the heavy completion-actions block — the delegation focus system
+        # instruction already tells the agent to write a final text message.
+        # For workflow steps and user-agent delegations we keep the full contract.
+        if not ctx.policy.require_step_complete:
+            # Slim completion hint: write your result as assistant text. Done.
+            parts.append(
+                "\n\n## Completion\n\n"
+                "When done, write your findings as a final assistant message. "
+                "That text is returned to the caller. "
+                "Optionally call `step_complete` for a structured summary or outcome."
+            )
+        elif self._deliverable_owner_step_run_id(ctx) is not None:
             parts.append(
                 "\n\n## Required Completion Actions\n\n"
                 "When you have completed the current step objective, call write_deliverable with the "

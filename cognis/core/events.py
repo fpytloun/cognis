@@ -77,6 +77,7 @@ class EventType(StrEnum):
 
     # Delegation (sub-session lifecycle)
     DELEGATION_STARTED = "delegation_started"
+    DELEGATION_PROGRESS = "delegation_progress"
     DELEGATION_COMPLETED = "delegation_completed"
     DELEGATION_FAILED = "delegation_failed"
 

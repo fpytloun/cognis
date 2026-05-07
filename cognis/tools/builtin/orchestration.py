@@ -67,19 +67,29 @@ ORCHESTRATION_TOOL_NAMES = (
 DELEGATE_TOOL = ToolDefinition(
     name="delegate",
     description=(
-        "Delegate work to a sub-session. For non-trivial codebase exploration, "
-        "prefer delegating to `system:explore` rather than reading and grepping "
-        "many files directly — the sub-session returns a focused report and "
-        "keeps your context small for synthesis. The sub-session runs a focused "
-        "task and returns a result. By default (wait=false) the sub-session runs in "
-        "the background while the main chat stays responsive — you will receive "
-        "a follow-up with the result. Set wait=true to block until the sub-session "
-        "completes and receive its output directly as the tool result. Use wait=true "
-        "when you need results from one or more parallel sub-sessions before "
-        "continuing (e.g. joining parallel research). Use wait=false (default) for "
-        "anything that may take more than a few seconds — prefer async behavior "
-        "to keep the chat responsive. Optionally specify agent_id for specialist "
-        "delegation."
+        "Delegate work to a focused sub-session and receive the result.\n\n"
+        "## When to use which agent\n\n"
+        "ALWAYS specify agent_id for non-trivial exploration, research, or "
+        "specialist work. The sub-session runs with a slim prompt tailored to "
+        "its role, keeping your context small for synthesis.\n\n"
+        "- `system:explore` — codebase exploration: tracing, 'where is X', "
+        "reading many files, understanding structure. Use this instead of "
+        "reading/grepping directly whenever more than 2-3 files are involved.\n"
+        "- `system:research` — external research, multi-source comparison, "
+        "web synthesis.\n"
+        "- `system:code-review` — findings-first review of a diff or file set.\n"
+        "- `system:architect` — architecture critique, design review, risk "
+        "analysis.\n"
+        "- `system:implement` — focused implementation that does not need the "
+        "current agent's personality or memories.\n\n"
+        "Omit agent_id (or pass your own agent_id) only when the work genuinely "
+        "requires your personality, tone, recalled memories, or conversational "
+        "continuity with the user.\n\n"
+        "## Wait behavior\n\n"
+        "Use wait=true when you need the result before continuing (e.g. joining "
+        "parallel explorations). Multiple wait=true calls in one turn execute in "
+        "parallel. Use wait=false (default) for background work — you will receive "
+        "a follow-up when the sub-session finishes."
     ),
     parameters={
         "type": "object",
@@ -91,7 +101,11 @@ DELEGATE_TOOL = ToolDefinition(
             "agent_id": {
                 "type": "string",
                 "description": (
-                    "Optional agent ID for specialist delegation. Omit to use the current agent."
+                    "Agent ID for specialist delegation. Use system:explore for codebase "
+                    "exploration, system:research for web research, system:code-review for "
+                    "code review, system:architect for architecture review, system:implement "
+                    "for focused implementation. Omit only when the work requires your own "
+                    "personality, memories, or conversational continuity."
                 ),
             },
             "context": {
@@ -106,9 +120,10 @@ DELEGATE_TOOL = ToolDefinition(
                 "type": "boolean",
                 "description": (
                     "When true, blocks until the sub-session completes and returns "
-                    "its output directly. When false (default), the sub-session runs "
-                    "in the background. Prefer false for anything longer than a few "
-                    "seconds."
+                    "its output directly as the tool result. Multiple wait=true calls "
+                    "in one turn run in parallel. When false (default), the sub-session "
+                    "runs in the background and you receive a follow-up. Use true when "
+                    "you need the result before continuing."
                 ),
                 "default": False,
             },

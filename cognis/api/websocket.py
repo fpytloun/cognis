@@ -2035,6 +2035,15 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "agent_id": event.data.get("agent_id"),
             "task": event.data.get("task"),
         }
+    if event.type == EventType.DELEGATION_PROGRESS:
+        return {
+            "type": "delegation_progress",
+            "conversation_id": conversation_id,
+            "child_session_id": event.data.get("child_session_id"),
+            "tool_call_count": event.data.get("tool_call_count"),
+            "max_tool_calls": event.data.get("max_tool_calls"),
+            "last_tool": event.data.get("last_tool"),
+        }
     if event.type == EventType.DELEGATION_COMPLETED:
         return {
             "type": "delegation_completed",

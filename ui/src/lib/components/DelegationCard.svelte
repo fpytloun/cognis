@@ -42,8 +42,26 @@
   {#if item.status === 'started' || item.status === 'running'}
     <div class="mt-3 flex items-center gap-2 text-xs opacity-75">
       <span class="h-2 w-2 animate-pulse rounded-full bg-current"></span>
-      <span>{item.result ?? 'Working...'}</span>
+      <span class="flex-1">{item.result ?? 'Working...'}</span>
     </div>
+    {#if item.toolCallCount !== undefined}
+      <div class="mt-1.5 flex items-center gap-2 text-xs opacity-60">
+        {#if item.maxToolCalls !== undefined}
+          <span>{item.toolCallCount}/{item.maxToolCalls} tool calls</span>
+          <div class="h-1 flex-1 overflow-hidden rounded-full bg-current/20">
+            <div
+              class="h-full rounded-full bg-current transition-all duration-500"
+              style="width: {Math.min((item.toolCallCount / item.maxToolCalls) * 100, 100)}%"
+            ></div>
+          </div>
+        {:else}
+          <span>{item.toolCallCount} tool calls</span>
+        {/if}
+        {#if item.lastTool}
+          <span class="font-mono opacity-80">{item.lastTool}</span>
+        {/if}
+      </div>
+    {/if}
   {:else if item.result}
     <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
   {/if}

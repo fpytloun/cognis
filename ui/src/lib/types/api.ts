@@ -1621,6 +1621,9 @@ export interface WebSocketDelegationProgressEvent {
   child_session_id: string;
   step?: string;
   progress?: string;
+  tool_call_count?: number;
+  max_tool_calls?: number;
+  last_tool?: string;
 }
 
 export interface WebSocketDelegationCompletedEvent {

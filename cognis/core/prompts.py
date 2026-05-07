@@ -187,34 +187,34 @@ calls to investigate, prefer delegation instead. Inline exploration \
 across many files burns context budget that should be available for \
 synthesis.
 
-### Delegate with current agent
-Use `delegate` without `agent_id` when the work should preserve the \
-current agent's identity.
+### Delegate to a system agent (default for specialist work)
+Use a system agent whenever the work does not require your personality, \
+tone, or recalled memories. System-agent sub-sessions run with a slim \
+prompt and constrained tools — they return faster, use less context, and \
+let you stay focused on synthesis.
 
-Choose this when the work depends on the current agent's:
+Always specify `agent_id`:
+- `system:explore` for any non-trivial codebase exploration, tracing, \
+  or "where is X implemented" questions. Anything requiring more than \
+  2-3 file reads should go here. \
+  Call shape: `delegate(agent_id='system:explore', wait=True, task='...')`. \
+  Run multiple calls in parallel for broad explorations.
+- `system:research` for external research or multi-source comparison. \
+  Call shape: `delegate(agent_id='system:research', wait=True, task='...')`.
+- `system:code-review` for findings-first code review.
+- `system:architect` for architecture critique and design review.
+- `system:implement` for focused implementation work.
+
+### Delegate with current agent
+Use `delegate` without `agent_id` (or with your own `agent_id`) only \
+when the work genuinely requires the current agent's:
 - personality, tone, or behavioral rules
 - recalled memories or user-specific preferences
 - established project context from the current conversation
 - ownership of an ongoing implementation or debugging thread
 
-### Delegate to a system agent
-Prefer specialist system agents for any non-trivial exploration, \
-research, review, or architecture work. The sub-session returns a \
-focused report so this conversation stays small and on-topic. \
-Identity preservation is only relevant when the work depends on this \
-agent's personality, tone, or memories — for generic investigative \
-work, default to delegation.
-
-Use:
-- `system:explore` for any non-trivial codebase exploration, tracing, \
-  or "where is X implemented" questions. Run multiple \
-  `delegate(wait=true)` calls in parallel for broad explorations and \
-  synthesize the joined results.
-- `system:research` for external research or multi-source comparison
-- `system:code-review` for findings-first code review
-- `system:architect` for architecture critique and design review
-- `system:implement` for focused implementation work that does not need \
-  the current agent's identity
+For generic investigative or research work, always default to a \
+specialist system agent.
 
 ### Task
 Use `create_task` for substantial multi-step work that should run as \
@@ -297,10 +297,12 @@ current throughout the step.
 your work in real time. The deliverable (if required) is the canonical \
 user-facing artifact, but assistant text alongside tool calls is the way \
 to keep the user in the loop while the step runs.
-- For non-trivial codebase exploration in this step, prefer `delegate` to \
-`system:explore` over reading many files directly. The sub-session returns \
-a focused report and keeps your context budget free for synthesis. Run \
-multiple `delegate(wait=true)` calls in parallel for broad explorations.
+- For non-trivial codebase exploration in this step use \
+`delegate(agent_id='system:explore', wait=True, task='...')` rather than \
+reading many files directly. The sub-session runs with a slim read-only \
+prompt and returns a focused report, keeping your context budget free for \
+synthesis. Run multiple `delegate(wait=True)` calls in one turn for \
+parallel broad explorations.
 - When finished, write normal final/progress text as appropriate. If the step \
  requires a deliverable, call `write_deliverable` with the canonical \
  user-facing artifact before `step_complete`. Then call `step_complete` with \
@@ -332,21 +334,20 @@ _DELEGATION_FOCUS = """\
 
 You are running a focused sub-session delegated from a parent conversation. \
 Complete the specific task you were given and return a clear, actionable \
-result.
+result as your final assistant message.
 
 - Stay focused on the delegated task. Do not branch into unrelated work.
-- For non-trivial work, make a short execution plan, create step todos \
-before substantial work, and keep them updated as you proceed.
-- If you need input from the caller to continue, use `step_request_input` \
-when available rather than guessing or stopping early.
-- Write a comprehensive result when done, then call `step_complete` with \
-  a summary and include an `outcome` if the delegated work properly concluded \
-  with rejection or failure. Respect the completion delivery policy and use \
-  `notification.mode="silent"` only when it is explicitly allowed and nothing \
-  user-actionable happened. Use `notification.mode="direct"` for ready-to-read \
-  outputs like daily briefs, summaries, or digests when they should go straight \
-  to the resolved target channel. Do not finish until remaining todos are \
-  `done` or `cancelled`.
+- Do not read or grep more files than necessary. Return your findings once \
+you have enough to answer the task — do not keep exploring indefinitely.
+- When done, write a comprehensive final assistant message with your \
+findings, file references, and conclusions. This text IS the result \
+returned to the caller.
+- Optionally call `step_complete` if you want to supply a structured \
+summary or outcome. It is not required — your final text is sufficient.
+- Optionally call `write_deliverable` only for complex artifacts (long \
+reports, generated files) that benefit from structured delivery.
+- Do not continue calling tools once you have enough to write the result. \
+If all todos are terminal and nothing remains, write the result now.
 - Delegate further only if the task genuinely requires it — prefer doing \
 the work directly."""
 
