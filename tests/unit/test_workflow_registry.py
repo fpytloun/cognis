@@ -75,6 +75,9 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert implement_step.reasoning_effort == "medium"
     assert implement_step.input is not None
     assert implement_step.input.type == "summary"
+    assert "smallest correct change" in implement_step.prompt
+    assert "fix the issue and rerun" in implement_step.prompt
+    assert "unrelated pre-existing reason" in implement_step.prompt
     assert update_docs_step.agent_override == "system:implement"
     assert update_docs_step.input is not None
     assert update_docs_step.input.type == "summary"
@@ -132,16 +135,29 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
 
 def test_research_plan_step_uses_generic_evaluator_prompt() -> None:
     plan_step = next(step for step in RESEARCH_WORKFLOW.steps if step.name == "plan")
+    research_step = next(step for step in RESEARCH_WORKFLOW.steps if step.name == "research")
+    synthesize_step = next(step for step in RESEARCH_WORKFLOW.steps if step.name == "synthesize")
 
     assert RESEARCH_WORKFLOW.interaction.mode == "step_requests"
     assert plan_step.allow_questions is True
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
     assert "Expected deliverables and format" in plan_step.prompt
+    assert "Appropriate depth: light, standard, or deep" in plan_step.prompt
+    assert "Media/artifact strategy" in plan_step.prompt
+    assert plan_step.metadata_contract is not None
+    metadata_fields = {field.name for field in plan_step.metadata_contract.fields}
+    assert "research_depth" in metadata_fields
+    assert "media_strategy" in metadata_fields
     # Push the model toward delegation for non-trivial exploration so plan
     # steps don't burn the parent context on broad reads/greps.
     assert "delegate" in plan_step.prompt
     assert "system:explore" in plan_step.prompt
+    assert research_step.reasoning_effort == "medium"
+    assert "do not stop after the first useful result" in research_step.prompt
+    assert "media/artifact references" in research_step.prompt
+    assert "inline diagrams" in synthesize_step.prompt
+    assert "Mermaid" in synthesize_step.prompt
 
 
 def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:

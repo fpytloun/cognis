@@ -33,6 +33,8 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
     ]
     assert skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
     assert "Make the smallest correct change" in agent.system_prompt
+    assert "fix\n  the issue and rerun" in agent.system_prompt
+    assert "unrelated pre-existing reason" in agent.system_prompt
     assert "Do not delegate further" in agent.system_prompt
 
 
@@ -52,6 +54,8 @@ def test_system_research_agent_has_expanded_web_tools() -> None:
     ]
     assert "Separate repo-local findings from external findings" in agent.system_prompt
     assert "web_research" in agent.system_prompt
+    assert "Adapt depth to the request" in agent.system_prompt
+    assert "Relevant media, diagrams, or artifacts" in agent.system_prompt
 
 
 def test_system_review_agents_use_pragmatic_prompts() -> None:

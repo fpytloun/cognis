@@ -135,12 +135,18 @@ RESEARCH_WORKFLOW = Workflow(
                 "Create a research plan for this task. Identify:\n"
                 "- Key questions to answer\n"
                 "- Sources and methodology (web search, codebase, documentation)\n"
+                "- Appropriate depth: light, standard, or deep\n"
+                "- Media/artifact strategy: none, cite existing media, collect artifacts, or diagram\n"
                 "- Expected deliverables and format\n\n"
                 "For non-trivial codebase exploration prefer `delegate` to "
                 "`system:explore`; for external research prefer "
                 "`delegate(agent_id='system:research')`. Run multiple "
                 "`delegate(wait=true)` calls in parallel for broad "
-                "investigations and synthesize the joined results.\n\n"
+                "investigations and synthesize the joined results. Adapt breadth "
+                "and depth to the user's request: keep light research concise, "
+                "but for explicitly deep research or high-risk/complex topics, "
+                "plan multiple query angles, primary-source checks, freshness "
+                "checks, and contradiction analysis.\n\n"
                 "If the task's intent, success criteria, scope, source preferences, or output format "
                 "are ambiguous enough that proceeding would require a large assumption, ask one "
                 "targeted clarification with step_request_input before finalizing the plan. Do not "
@@ -158,6 +164,8 @@ RESEARCH_WORKFLOW = Workflow(
                     StepCompletionMetadataField(
                         name="source_strategy", type="array", required=False
                     ),
+                    StepCompletionMetadataField(name="research_depth", type="string", required=True),
+                    StepCompletionMetadataField(name="media_strategy", type="string", required=False),
                     StepCompletionMetadataField(name="open_questions", type="array", required=True),
                 ]
             ),
@@ -190,13 +198,23 @@ RESEARCH_WORKFLOW = Workflow(
             name="research",
             type="run",
             agent_override="system:research",
-            reasoning_effort="low",
+            reasoning_effort="medium",
             step_profile_id="system:research",
             prompt=(
-                "Execute the research plan. Gather information from available "
-                "sources. Cross-reference findings for accuracy. Note any gaps "
-                "or conflicting information. Write a deliverable that preserves "
-                "the gathered evidence and conclusions."
+                "Execute the research plan at the planned depth. For light research, "
+                "answer efficiently from a small set of high-quality sources. For "
+                "standard research, compare several credible sources and fetch the "
+                "most relevant pages directly. For deep research, run multiple "
+                "independent search angles, prefer primary and official sources, "
+                "verify important claims with direct fetches, check publication or "
+                "update dates when available, and do not stop after the first useful "
+                "result. Cross-reference findings for accuracy, identify consensus "
+                "and disagreements, and note gaps, stale evidence, or missing proof. "
+                "When relevant, capture media candidates, diagrams, tables, PDFs, "
+                "screenshots, or other artifacts by source URL or artifact ID. Write "
+                "a deliverable that preserves the gathered evidence, source URLs, "
+                "dates when available, confidence, media/artifact references, and "
+                "conclusions."
             ),
             input=StepInputConfig(type="last", source="plan"),
             completion=CompletionConfig(evaluate=True, max_attempts=5),
@@ -213,7 +231,15 @@ RESEARCH_WORKFLOW = Workflow(
                 "- Key findings and insights\n"
                 "- Areas of consensus and disagreement\n"
                 "- Actionable recommendations\n"
-                "- Gaps in available information"
+                "- Gaps in available information\n"
+                "- Source notes with URLs, dates when available, and confidence\n"
+                "- Relevant media, artifacts, or inline diagrams when they clarify the subject\n\n"
+                "Use concise markdown for light research. For deeper research, include "
+                "enough structure for the reader to audit the evidence. Use Mermaid "
+                "or simple markdown diagrams only when they clarify relationships, "
+                "timelines, architectures, taxonomies, or comparisons. Reference "
+                "artifact IDs or source URLs for media rather than embedding opaque "
+                "unattributed content."
             ),
             input=StepInputConfig(type="last", source=["plan", "research"]),
             completion=CompletionConfig(evaluate=True),
@@ -350,10 +376,18 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             reasoning_effort="medium",
             step_profile_id="system:coding",
             prompt=(
-                "Implement the approved plan. Follow the plan step by step. "
-                "After implementation, run relevant tests and linters to "
-                "verify correctness. The deliverable should summarize the concrete "
-                "changes made and the validation that was run."
+                "Implement the approved plan. Follow the plan step by step while "
+                "preferring the smallest correct change that satisfies the task. "
+                "Inspect project instructions, package/build files, or existing "
+                "test patterns to identify the relevant verification commands. "
+                "After implementation, run the narrowest relevant tests, linters, "
+                "type checks, or builds that prove correctness when feasible. If "
+                "verification fails because of your change, fix the issue and rerun "
+                "the relevant check. If verification cannot be run or fails for an "
+                "unrelated pre-existing reason, report the blocker clearly with the "
+                "command and evidence. The deliverable should summarize the concrete "
+                "changes made, the validation that was run, any fixes made after "
+                "failed checks, and remaining risks."
             ),
             input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
             completion=CompletionConfig(evaluate=True, max_attempts=3),
