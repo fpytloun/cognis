@@ -21,17 +21,21 @@
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { ActiveThinkingSnapshot, Escalation, MessageEvent } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, Escalation, MessageEvent } from '$lib/types/api';
 
   let {
     conversationId,
     sessionId,
     stepName = '',
+    agent = null,
+    onViewSession,
     onclose
   } = $props<{
     conversationId: string;
     sessionId: string;
     stepName?: string;
+    agent?: Agent | null;
+    onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
     onclose: () => void;
   }>();
 
@@ -341,14 +345,14 @@
             {#each timeline as item (item.id)}
             {#if item.kind === 'message'}
               <div class={`flex ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <ChatMessage {item} compact />
+                <ChatMessage {item} {agent} compact />
               </div>
             {:else if item.kind === 'thinking'}
               <ThinkingBlock item={item as ThinkingTimelineItem} compact />
             {:else if item.kind === 'tool_call'}
               <ToolCallBlock {item} />
             {:else if item.kind === 'delegation'}
-              <DelegationCard {item} />
+              <DelegationCard {item} {onViewSession} />
             {:else if item.kind === 'notice'}
               <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
                 <p class="font-medium">{item.title}</p>

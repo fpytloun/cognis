@@ -1274,6 +1274,106 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     assert cleanup_called is True
 
 
+@pytest.mark.asyncio
+async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch) -> None:
+    completed: list[str] = []
+    failed: list[tuple[str, str | None]] = []
+    published: list[object] = []
+    recorded_events: list[object] = []
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del agent, user_email, executor_agent
+
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _SessionManager:
+        def session_factory(self) -> _SessionContextManager:
+            return _SessionContextManager()
+
+        async def mark_completed(self, session_id: str, **_: object) -> None:
+            completed.append(session_id)
+
+        async def mark_failed(self, session_id: str, result_summary: str | None = None) -> None:
+            failed.append((session_id, result_summary))
+
+    class _Guardrails:
+        async def record_events(self, **kwargs: object) -> None:
+            recorded_events.extend(kwargs.get("events", []))
+
+    class _EventBus:
+        async def publish(self, event: object) -> None:
+            published.append(event)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_SessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
+        return StepOutput(
+            summary="Step failed: IntegrityError",
+            error="IntegrityError: duplicate key",
+            session_id=ctx.session.session_id,
+            intaris_session_id=ctx.session.intaris_session_id,
+            completed_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+
+    output = await agent_loop._run_child_session(
+        child_session=SimpleNamespace(
+            session_id="child",
+            user_email="user@example.com",
+            agent_id="agent-a",
+            intaris_session_id="child",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-a",
+            owner_email="user@example.com",
+            name="Agent A",
+        ),
+        task_description="Do the thing",
+        parent_intaris_session_id="parent-intaris",
+    )
+
+    assert output is None
+    assert completed == []
+    assert failed == [("child", "Delegation failed")]
+    assert len(published) == 1
+    assert any(
+        getattr(event, "type", None) == "delegation"
+        and getattr(event, "data", {}).get("status") == "failed"
+        for event in recorded_events
+    )
+
+
 class _ReminderStop(RuntimeError):
     pass
 

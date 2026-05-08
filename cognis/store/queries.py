@@ -3883,6 +3883,67 @@ async def upsert_tool_classification(
 ) -> ToolClassificationRow:
     """Create or update persisted tool classification state."""
 
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name in {"postgresql", "sqlite"}:
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+
+        now = _utcnow()
+        insert_values: dict[str, Any] = {
+            "classification_id": f"tc_{uuid.uuid4().hex}",
+            "scope_key": scope_key,
+            "owner_email": owner_email,
+            "tool_id": tool_id,
+            "source_type": source_type,
+            "fingerprint": fingerprint,
+            "tool_payload": tool_payload,
+            "status": status,
+            "category": category,
+            "capabilities": capabilities,
+            "classification_source": classification_source,
+            "classification_confidence": classification_confidence,
+            "attempts": attempts or 0,
+            "next_retry_at": next_retry_at,
+            "last_attempt_at": last_attempt_at,
+            "last_error": last_error,
+            "updated_at": now,
+        }
+        update_values: dict[str, Any] = {
+            "owner_email": owner_email,
+            "source_type": source_type,
+            "fingerprint": fingerprint,
+            "tool_payload": tool_payload,
+            "status": status,
+            "category": category,
+            "capabilities": capabilities,
+            "classification_source": classification_source,
+            "classification_confidence": classification_confidence,
+            "last_error": last_error,
+            "updated_at": now,
+        }
+        if attempts is not None:
+            update_values["attempts"] = attempts
+        if next_retry_at is not None or status == "ready":
+            update_values["next_retry_at"] = next_retry_at
+        if last_attempt_at is not None or status == "pending":
+            update_values["last_attempt_at"] = last_attempt_at
+
+        stmt = (
+            insert(ToolClassificationRow)
+            .values(**insert_values)
+            .on_conflict_do_update(
+                index_elements=["scope_key", "tool_id"],
+                set_=update_values,
+            )
+            .returning(ToolClassificationRow)
+        )
+        result = await session.execute(stmt)
+        row = result.scalar_one()
+        await session.flush()
+        return row
+
     result = await session.execute(
         select(ToolClassificationRow).where(
             ToolClassificationRow.scope_key == scope_key,

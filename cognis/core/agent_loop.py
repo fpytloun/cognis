@@ -2210,6 +2210,9 @@ class AgentLoop:
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )
+                if output is None or output.error is not None:
+                    error_text = output.error if output and output.error else "no step output"
+                    raise RuntimeError(f"Delegation step failed: {error_text}")
                 result_summary = output.summary if output and output.summary else "Completed."
                 result_content = output.content if output and output.content else ""
                 deliverable_data: dict[str, Any] = {}
@@ -2346,6 +2349,7 @@ class AgentLoop:
                 )
             )
             DELEGATIONS_TOTAL.labels(status="failed").inc()
+            output = None
         finally:
             if child_runtime is not None:
                 await child_runtime.cleanup()

@@ -45,7 +45,7 @@ import Target from 'lucide-svelte/icons/target';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
-import type { Agent, Conversation, Deliverable, Escalation, Notification, Project, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type { Agent, Conversation, Deliverable, Escalation, Notification, Project, Session, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -78,7 +78,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   let visibilityHandler: (() => void) | null = null;
 
   // Session logs drawer
-  let sessionDrawer = $state<{ conversationId: string; sessionId: string; stepName: string } | null>(null);
+  let sessionDrawer = $state<{ conversationId: string; sessionId: string; stepName: string; agent: Agent | null } | null>(null);
 
   let editForm = $state({
     title: '',
@@ -580,7 +580,26 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     sessionDrawer = {
       conversationId,
       sessionId,
-      stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`
+      stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`,
+      agent: agentFor(stepRun.agent_id)
+    };
+  }
+
+  async function openSessionLogsById(sessionId: string): Promise<void> {
+    const conversationId = sessionDrawer?.conversationId;
+    if (!conversationId) return;
+    let sessionRow: Session | null = null;
+    try {
+      const sessions = await api.conversations.sessions(conversationId);
+      sessionRow = sessions.find((candidate) => candidate.session_id === sessionId) ?? null;
+    } catch {
+      // The log endpoint will still report a useful error if the session is inaccessible.
+    }
+    sessionDrawer = {
+      conversationId,
+      sessionId,
+      stepName: sessionRow?.delegation_task ?? sessionRow?.agent_id ?? sessionId,
+      agent: agentFor(sessionRow?.agent_id ?? null)
     };
   }
 
@@ -2466,6 +2485,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
       conversationId={sessionDrawer.conversationId}
       sessionId={sessionDrawer.sessionId}
       stepName={sessionDrawer.stepName}
+      agent={sessionDrawer.agent}
+      onViewSession={openSessionLogsById}
       onclose={() => (sessionDrawer = null)}
     />
   {/if}

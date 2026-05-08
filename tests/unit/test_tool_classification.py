@@ -466,6 +466,45 @@ async def test_tool_classification_queue_does_not_reset_running_rows_on_reenqueu
 
 
 @pytest.mark.asyncio
+async def test_tool_classification_upsert_is_concurrency_safe(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    tool = _dynamic_tool()
+
+    async def _upsert(status: str) -> None:
+        async with session_factory() as session:
+            await upsert_tool_classification(
+                session,
+                scope_key="__global__",
+                owner_email=None,
+                tool_id=stable_tool_id(tool),
+                source_type=tool.source.type,
+                fingerprint=tool_fingerprint(tool),
+                tool_payload=tool.model_dump(mode="json"),
+                status=status,
+                attempts=0,
+            )
+            await session.commit()
+
+    await asyncio.gather(_upsert("pending"), _upsert("pending"))
+
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                sa.select(ToolClassificationRow).where(
+                    ToolClassificationRow.scope_key == "__global__",
+                    ToolClassificationRow.tool_id == stable_tool_id(tool),
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "pending"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_tool_classification_queue_refreshes_pending_rows_when_fingerprint_changes(tmp_path):
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
     await run_schema_bootstrap(engine)

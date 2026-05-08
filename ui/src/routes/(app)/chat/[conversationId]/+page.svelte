@@ -4390,7 +4390,7 @@ import X from 'lucide-svelte/icons/x';
                 {:else if item.kind === 'tool_call'}
                   <ToolCallBlock {item} />
                 {:else if item.kind === 'delegation'}
-                  <DelegationCard {item} />
+                  <DelegationCard {item} onViewSession={handleViewSession} />
                 {:else if item.kind === 'workflow_composed'}
                   <WorkflowComposedCard {item} />
                 {:else if item.kind === 'system_message'}
