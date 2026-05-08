@@ -2018,7 +2018,7 @@ class _DelegationDeliverableThenLimitLLM:
                                     "function": {
                                         "name": "write_deliverable",
                                         "arguments": (
-                                            '{"content":"Deliverable output from delegated run.",' 
+                                            '{"content":"Deliverable output from delegated run.",'
                                             '"outputs":{"source":"deliverable"}}'
                                         ),
                                     },
@@ -2043,6 +2043,107 @@ class _DelegationDeliverableThenLimitLLM:
                 }
             ]
         }
+
+
+class _DelegationMultiToolThenSummaryLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.tools_by_call: list[object] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+        del messages
+        self.calls += 1
+        self.tools_by_call.append(kwargs.get("tools"))
+        if self.calls == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_probe_1",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": '{"command":"pwd"}',
+                                    },
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_probe_2",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": '{"command":"ls"}',
+                                    },
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        yield {"choices": [{"delta": {"content": "Final delegated summary."}}]}
+
+
+class _DelegationOpenTodosThenMaxStepsLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_open_todos",
+                                    "function": {
+                                        "name": "step_todo_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "todos": [
+                                                    {
+                                                        "content": "Inspect the repository",
+                                                        "status": "in_progress",
+                                                    },
+                                                    {
+                                                        "content": "Summarize findings",
+                                                        "status": "pending",
+                                                    },
+                                                ]
+                                            }
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        yield {"choices": [{"delta": {"content": "Maximum steps reached summary."}}]}
 
 
 class _NoopRememberQueue:
@@ -3831,7 +3932,7 @@ async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_t
             owner_email="system",
             name="Explore",
             agent_type="secondary",
-            execution={"max_tool_calls": 1},
+            execution={"steps": 2},
             is_system=True,
         ),
         policy=SECONDARY_AGENT_DELEGATION_POLICY,
@@ -3847,6 +3948,110 @@ async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_t
     assert output.deliverable_id == "dlv-limit"
     assert output.content == "Deliverable output from delegated run."
     assert output.outputs == {"source": "deliverable"}
+
+
+@pytest.mark.asyncio
+async def test_secondary_delegation_steps_count_llm_turns_not_tool_calls() -> None:
+    fake_llm = _DelegationMultiToolThenSummaryLLM()
+
+    class _ToolRouter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def execute(self, tool_call: ToolCall, *args: object) -> ToolResult:
+            del args
+            self.calls.append(tool_call.call_id)
+            return ToolResult(output="ok", is_error=False)
+
+    tool_router = _ToolRouter()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=tool_router,
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
+        session=SimpleNamespace(
+            session_id="child-steps",
+            intaris_session_id="child-steps",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="system:explore",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            execution={"steps": 2},
+            is_system=True,
+        ),
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+        user_message="Investigate.",
+        system_initiated=True,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Final delegated summary."
+    assert fake_llm.calls == 2
+    assert fake_llm.tools_by_call[1] == []
+
+
+@pytest.mark.asyncio
+async def test_secondary_delegation_max_steps_cancels_open_todos() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(
+            llm=_DelegationOpenTodosThenMaxStepsLLM(),
+            guardrails=_NoopGuardrails(),
+        ),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
+        session=SimpleNamespace(
+            session_id="child-todos",
+            intaris_session_id="child-todos",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="system:explore",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            execution={"steps": 2},
+            is_system=True,
+        ),
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+        user_message="Investigate.",
+        system_initiated=True,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Maximum steps reached summary."
+    assert [todo["status"] for todo in ctx.todos] == ["cancelled", "cancelled"]
 
 
 @pytest.mark.asyncio

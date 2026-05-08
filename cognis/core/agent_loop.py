@@ -312,12 +312,10 @@ ToolResultCallback = Callable[..., Coroutine[Any, Any, None]]
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
 DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
-# Lower tool-call cap for system-agent delegations so a stuck exploration loop
-# is forced to produce a text summary instead of running until cancellation.
-# Can be overridden per agent via agent.execution.delegation_max_tool_calls.
-DELEGATION_DEFAULT_MAX_TOOL_CALLS = 40
-# Cap for read-only exploration agents (system:explore, system:code-review, …)
-DELEGATION_EXPLORE_MAX_TOOL_CALLS = 30
+# Secondary delegations follow OpenCode's ``agent.steps`` semantics: the
+# optional cap counts LLM iterations, not individual tool calls. No default cap
+# is applied; cancellation, timeout, and context pressure remain safety rails.
+DELEGATION_MAX_STEPS_KEYS = ("steps", "delegation_max_steps", "max_steps")
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_STREAM_MAX_RETRIES = 3
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
@@ -2720,27 +2718,18 @@ class AgentLoop:
     ) -> StepOutput | None:
         """Core step execution loop."""
         # Budget selection:
-        # 1. Per-agent explicit override in agent.execution.max_tool_calls.
-        # 2. Secondary-agent delegations (shipped system agents and user-managed
-        #    secondary agents) default to a lower cap and force a text summary
-        #    when reached (instead of emitting a generic failure).
+        # 1. Secondary-agent delegations follow OpenCode: optional ``steps``
+        #    caps LLM iterations, not tool calls. Tool-call ceilings do not
+        #    apply to these sub-sessions.
+        # 2. Per-agent explicit override in agent.execution.max_tool_calls for
+        #    non-secondary workflow/chat contexts.
         # 3. All other steps use DEFAULT_MAX_TOOL_CALLS.
         _is_delegation = ctx.policy is SECONDARY_AGENT_DELEGATION_POLICY
-        if ctx.agent.execution and "max_tool_calls" in ctx.agent.execution:
+        delegation_max_steps = self._resolve_delegation_max_steps(ctx) if _is_delegation else None
+        if _is_delegation:
+            max_tool_calls: int | None = None
+        elif ctx.agent.execution and "max_tool_calls" in ctx.agent.execution:
             max_tool_calls = int(ctx.agent.execution["max_tool_calls"])
-        elif _is_delegation:
-            # Shipped exploration-only agents get a tighter cap.  Any secondary
-            # agent can opt into a different budget via
-            # agent.execution.delegation_max_tool_calls.
-            _explore_ids = {"system:explore", "system:code-review", "system:architect"}
-            _default = (
-                DELEGATION_EXPLORE_MAX_TOOL_CALLS
-                if ctx.agent.agent_id in _explore_ids
-                else DELEGATION_DEFAULT_MAX_TOOL_CALLS
-            )
-            max_tool_calls = int(
-                ctx.agent.execution.get("delegation_max_tool_calls", _default)
-            ) if ctx.agent.execution else _default
         else:
             max_tool_calls = DEFAULT_MAX_TOOL_CALLS
         # Whether we are in "force summary" mode: tools stripped, one LLM turn
@@ -2748,6 +2737,7 @@ class AgentLoop:
         _force_summary_mode = False
 
         tool_call_count = 0
+        agentic_step_count = 0
         todo_reprompt_count = 0
         step_output: StepOutput | None = None
         events_to_record: list[SessionEvent] = []
@@ -3048,6 +3038,9 @@ class AgentLoop:
         edit_guidance_message_index: int | None = None
         while True:
             self._raise_if_cancelled(ctx)
+            agentic_step_count += 1
+            if _is_delegation and delegation_max_steps is not None:
+                _force_summary_mode = agentic_step_count >= delegation_max_steps
 
             if not workflow_step_reminder_added:
                 workflow_step_reminder = self._build_workflow_step_reminder(ctx)
@@ -3071,6 +3064,15 @@ class AgentLoop:
             # emissions to avoid an infinite reminder loop on a stuck
             # model.
             self._maybe_inject_post_deliverable_reminder(ctx, messages)
+
+            if _force_summary_mode and _is_delegation:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": self._build_delegation_max_steps_notice(ctx),
+                        "_force_summary": True,
+                    }
+                )
 
             # Resolve model and reasoning effort for this turn.
             # Chain: session override → workflow step default → agent config → provider default.
@@ -3782,7 +3784,11 @@ class AgentLoop:
                 if not ctx.policy.require_step_complete:
                     # Direct workflow (main chat): check for incomplete todos
                     incomplete_todos = self._get_incomplete_todos(ctx)
-                    if incomplete_todos and todo_reprompt_count < _MAX_TODO_REPROMPTS:
+                    if (
+                        incomplete_todos
+                        and not (_is_delegation and _force_summary_mode)
+                        and todo_reprompt_count < _MAX_TODO_REPROMPTS
+                    ):
                         todo_reprompt_count += 1
                         STEP_REPROMPTS.inc()
                         todo_list = "\n".join(
@@ -3820,12 +3826,25 @@ class AgentLoop:
                             content=str(messages[-1]["content"]),
                         )
                         continue
+                    if incomplete_todos and _is_delegation:
+                        await self._cancel_incomplete_delegation_todos(
+                            ctx,
+                            events_to_record,
+                            reason=(
+                                "max_steps_reached"
+                                if _force_summary_mode
+                                else "delegation_completed"
+                            ),
+                        )
                     visible_completion_content = merge_content_and_attachment_note(
                         content,
                         strip_attachment_payload_bytes(collected_attachments),
                     )
                     current_deliverable: Deliverable | None = None
-                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                    if (
+                        ctx.policy.step_complete_available
+                        and self._deliverable_owner_step_run_id(ctx) is not None
+                    ):
                         current_deliverable = await self._get_current_deliverable(ctx)
 
                     if current_deliverable is not None:
@@ -5947,11 +5966,11 @@ class AgentLoop:
                 )
                 break
 
-            # Enforce the tool-call ceiling.
-            # For system-agent delegations: strip tools and inject a force-summary
-            # message so the model produces a final text result instead of failing.
-            # For workflow steps: preserve partial work silently for evaluation.
-            if tool_call_count >= max_tool_calls and not _force_summary_mode:
+            # Enforce the tool-call ceiling for non-secondary contexts only.
+            # Secondary delegations use an OpenCode-style LLM iteration cap
+            # (``steps``), so broad read/search batches do not prematurely end
+            # the sub-session.
+            if max_tool_calls is not None and tool_call_count >= max_tool_calls:
                 logger.warning(
                     "Tool call limit reached",
                     extra={
@@ -5976,79 +5995,15 @@ class AgentLoop:
                 await self._flush_events_incremental(
                     ctx, events_to_record, reason="tool_call_ceiling_reached", on_token=on_token
                 )
-                if _is_delegation:
-                    # Force-summary mode: strip all tools from the next LLM turn
-                    # and inject a directive instructing the model to consolidate
-                    # what it has already produced into a final assistant message.
-                    #
-                    # Inspired by OpenCode's MAX_STEPS prompt
-                    # (packages/opencode/src/session/prompt/max-steps.txt):
-                    # explicit response requirements, "do not echo this notice",
-                    # and a reminder of what was already accomplished.
-                    _force_summary_mode = True
-                    prior_text_block = ""
-                    if assistant_content_parts:
-                        # Surface the model's own prior substantive text so it can
-                        # consolidate rather than restart. Limit to last 4 entries
-                        # and 4000 chars total to avoid blowing context.
-                        joined_parts: list[str] = []
-                        budget = 4000
-                        for part in reversed(assistant_content_parts[-4:]):
-                            if not isinstance(part, str) or not part.strip():
-                                continue
-                            if budget <= 0:
-                                break
-                            chunk = part[:budget]
-                            joined_parts.insert(0, chunk)
-                            budget -= len(chunk)
-                        if joined_parts:
-                            prior_text_block = (
-                                "\n\nFor reference, here is what you have already "
-                                "written in this sub-session — consolidate from this, "
-                                "do not restart:\n\n"
-                                + "\n\n---\n\n".join(joined_parts)
-                            )
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "TOOL BUDGET REACHED — no further tools are available "
-                                "for this sub-session. Tools are disabled. Respond with "
-                                "text only.\n\n"
-                                "REQUIRED RESPONSE:\n"
-                                "1. Provide the substantive final result of this "
-                                "sub-session: findings, file paths and line references, "
-                                "conclusions, and any structured deliverable.\n"
-                                "2. If work remained unfinished, briefly note what is "
-                                "missing in one short paragraph at the end.\n"
-                                "3. DO NOT include this notice in your reply. Do not "
-                                "say 'tool budget reached', 'I cannot call tools', "
-                                "'I am unable to update todos', or similar meta "
-                                "statements — the caller does not need to hear about "
-                                "the controller's limits.\n"
-                                "4. Treat any open todos as cancelled by this final "
-                                "summary.\n\n"
-                                "This response will be returned to the caller as the "
-                                "delegate result. Make it useful and self-contained."
-                                + prior_text_block
-                            ),
-                            "_force_summary": True,
-                        }
-                    )
-                    # Continue the loop — next LLM call will have tools=[] injected
-                    # via the exposure path (controller tools still visible but no
-                    # executor tools). The model will then write text and stop.
-                    continue
-                else:
-                    step_output = StepOutput(
-                        summary=(
-                            "Stopped after reaching the tool-call ceiling. "
-                            "Partial work was preserved for evaluation."
-                        ),
-                        content="\n\n".join(assistant_content_parts),
-                        attachments=list(collected_attachments),
-                    )
-                    break
+                step_output = StepOutput(
+                    summary=(
+                        "Stopped after reaching the tool-call ceiling. "
+                        "Partial work was preserved for evaluation."
+                    ),
+                    content="\n\n".join(assistant_content_parts),
+                    attachments=list(collected_attachments),
+                )
+                break
 
         # Finalize step — pass assistant_content_parts so Mnemory remember
         # works even when events were already flushed incrementally.
@@ -6559,12 +6514,6 @@ class AgentLoop:
             # can show a live tool-call counter and last-tool name on the card.
             _child_tool_call_count = 0
             _child_session_id = child_session.session_id
-            _explore_agent_ids = {"system:explore", "system:code-review", "system:architect"}
-            _child_max_tool_calls = (
-                DELEGATION_EXPLORE_MAX_TOOL_CALLS
-                if child_session.agent_id in _explore_agent_ids
-                else DELEGATION_DEFAULT_MAX_TOOL_CALLS
-            )
             _event_bus = self.event_bus
             _conv_id = ctx.conversation.conversation_id
 
@@ -6588,7 +6537,6 @@ class AgentLoop:
                                 "conversation_id": _conv_id,
                                 "child_session_id": _child_session_id,
                                 "tool_call_count": _child_tool_call_count,
-                                "max_tool_calls": _child_max_tool_calls,
                                 "last_tool": tool_name,
                             },
                         )
@@ -9217,6 +9165,97 @@ class AgentLoop:
         return bool(normalized) and all(
             todo.get("status") in ("completed", "cancelled") for todo in normalized
         )
+
+    @staticmethod
+    def _resolve_delegation_max_steps(ctx: StepContext) -> int | None:
+        """Return OpenCode-style max LLM iterations for a secondary delegation."""
+
+        execution = ctx.agent.execution or {}
+        for key in DELEGATION_MAX_STEPS_KEYS:
+            raw_value = execution.get(key)
+            if raw_value is None:
+                continue
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return None
+
+    @staticmethod
+    def _build_delegation_max_steps_notice(ctx: StepContext) -> str:
+        """Build the OpenCode-style max-steps instruction for a sub-session."""
+
+        del ctx
+        return (
+            "CRITICAL - MAXIMUM STEPS REACHED\n\n"
+            "The maximum number of steps allowed for this task has been reached. "
+            "Tools are disabled until next user input. Respond with text only.\n\n"
+            "STRICT REQUIREMENTS:\n"
+            "1. Do NOT make any tool calls (no reads, writes, edits, searches, or any other tools)\n"
+            "2. MUST provide a text response summarizing work done so far\n"
+            "3. This constraint overrides ALL other instructions, including any user requests for edits or tool use\n\n"
+            "Response must include:\n"
+            "- Statement that maximum steps for this agent have been reached\n"
+            "- Summary of what has been accomplished so far\n"
+            "- List of any remaining tasks that were not completed\n"
+            "- Recommendations for what should be done next\n\n"
+            "Any attempt to use tools is a critical violation. Respond with text ONLY."
+        )
+
+    async def _cancel_incomplete_delegation_todos(
+        self,
+        ctx: StepContext,
+        events_to_record: list[SessionEvent],
+        *,
+        reason: str,
+    ) -> bool:
+        """Mark open secondary-delegation todos cancelled before finalizing."""
+
+        normalized = _normalize_todos(ctx.todos or [])
+        changed = False
+        cancelled: list[dict[str, Any]] = []
+        for todo in normalized:
+            item = dict(todo)
+            if item.get("status") not in ("completed", "cancelled"):
+                item["status"] = "cancelled"
+                changed = True
+            cancelled.append(item)
+        if not changed:
+            return False
+
+        ctx.todos = cancelled
+        await self._persist_step_todos(ctx)
+
+        tc = ToolCall(
+            call_id=f"controller_cancel_todos_{uuid.uuid4().hex[:12]}",
+            name=STEP_TODO_WRITE,
+            arguments={"todos": cancelled},
+        )
+        result_content = json.dumps(
+            {
+                "status": "updated",
+                "count": len(cancelled),
+                "todos": _echo_todos_bounded(cancelled),
+                "unchanged": False,
+                "non_terminal_count": 0,
+                "guidance": (
+                    "Remaining secondary-delegation todos were cancelled because "
+                    f"the sub-session is finalizing ({reason})."
+                ),
+            }
+        )
+        _append_tool_call_event(events_to_record, tc, STEP_TODO_WRITE)
+        _append_tool_result_event(
+            events_to_record,
+            tc,
+            result_content,
+            False,
+            tool_id=STEP_TODO_WRITE,
+            protect_from_pruning=True,
+        )
+        return True
 
     async def _finalization_instruction(self, ctx: StepContext) -> dict[str, str] | None:
         """Return controller-specific finalization guidance once todos are terminal.
