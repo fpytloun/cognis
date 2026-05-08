@@ -19,8 +19,26 @@ Depending on what the agent is doing, the conversation can display:
 - reasoning or progress blocks
 - tool call indicators and results
 - delegation status cards for background work
-- queued-message indicators when you send another message during an active turn
+- queued messages when you send another message during an active turn
 - reconnection status for the WebSocket session
+
+## Queued messages
+
+If you send a message while the agent is still processing the previous turn,
+Cognis queues the new message instead of interrupting the active turn. The chat
+workspace shows each pending queued message before it runs.
+
+From the queued-message panel you can:
+
+- review the exact message text waiting to run
+- edit the queued text before Cognis starts processing it
+- delete a queued message to cancel it
+
+Queued attachment changes are handled by deleting the queued message and sending
+a replacement, because attachments are already uploaded and referenced by the
+time a message enters the queue. If you keep a queued message with attachments,
+Cognis preserves the prepared attachment context and uses it when the queued
+turn runs later.
 
 ## Approvals and escalations
 

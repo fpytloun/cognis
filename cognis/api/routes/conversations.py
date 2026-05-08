@@ -23,10 +23,13 @@ from cognis.api.models import (
     ConversationUpdateRequest,
     CursorPage,
     MessageHistoryResponse,
+    QueuedMessageResponse,
+    QueuedMessagesResponse,
     SendMessageRequest,
     SendMessageResponse,
     SessionEventsResponse,
     SessionResponse,
+    UpdateQueuedMessageRequest,
 )
 from cognis.api.serializers import (
     conversation_to_response,
@@ -59,6 +62,29 @@ def _require_visible_conversation(request: Request, row: Any) -> Any:
         raise api_exception(404, "not_found", "Conversation not found")
     require_resource_owner(request, row.user_email)
     return row
+
+
+async def _require_mutable_conversation(request: Request, conversation_id: str) -> Any:
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+    if row is None or row.status == "deleted":
+        raise api_exception(404, "not_found", "Conversation not found")
+    require_resource_owner(request, row.user_email)
+    if row.status == "archived":
+        raise api_exception(409, "conflict", "Conversation is not active")
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, row.agent_id)
+    if agent is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    await check_agent_access(request, agent, required="use")
+    return user
+
+
+def _queued_messages_response(messages: list[dict[str, Any]]) -> QueuedMessagesResponse:
+    items = [QueuedMessageResponse.model_validate(item) for item in messages]
+    return QueuedMessagesResponse(messages=items, queued_count=len(items))
 
 
 async def _hydrate_event_attachments(
@@ -487,6 +513,43 @@ async def conversation_messages(
     )
 
 
+@router.get("/{conversation_id}/queue", response_model=QueuedMessagesResponse)
+async def get_queued_messages(request: Request, conversation_id: str) -> QueuedMessagesResponse:
+    await _require_mutable_conversation(request, conversation_id)
+    return _queued_messages_response(
+        request.app.state.turn_scheduler.queued_messages(conversation_id)
+    )
+
+
+@router.patch("/{conversation_id}/queue/{queue_id}", response_model=QueuedMessageResponse)
+async def update_queued_message(
+    request: Request,
+    conversation_id: str,
+    queue_id: str,
+    payload: UpdateQueuedMessageRequest,
+) -> QueuedMessageResponse:
+    await _require_mutable_conversation(request, conversation_id)
+    updated = await request.app.state.turn_scheduler.update_queued_message(
+        conversation_id,
+        queue_id,
+        content=payload.content.strip(),
+    )
+    if updated is None:
+        raise api_exception(404, "not_found", "Queued message not found")
+    return QueuedMessageResponse.model_validate(updated)
+
+
+@router.delete("/{conversation_id}/queue/{queue_id}", status_code=204)
+async def delete_queued_message(request: Request, conversation_id: str, queue_id: str) -> Response:
+    await _require_mutable_conversation(request, conversation_id)
+    cancelled = await request.app.state.turn_scheduler.cancel_queued_message(
+        conversation_id, queue_id
+    )
+    if not cancelled:
+        raise api_exception(404, "not_found", "Queued message not found")
+    return Response(status_code=204)
+
+
 @router.post("/{conversation_id}/messages")
 async def send_message(
     request: Request,
@@ -546,6 +609,7 @@ async def send_message(
             user_email=user.email,
             attachments=[item.model_dump(mode="json") for item in payload.attachments],
             turn_observers=[observer],
+            client_message_id=payload.client_message_id,
         )
         if error is not None:
             raise _turn_error_to_http(error)
@@ -585,6 +649,7 @@ async def send_message(
             payload.content,
             user_email=user.email,
             attachments=[item.model_dump(mode="json") for item in payload.attachments],
+            client_message_id=payload.client_message_id,
         )
         if error is not None:
             raise _turn_error_to_http(error)

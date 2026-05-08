@@ -121,8 +121,14 @@ Escalation timeout shown as countdown. Auto-denied on timeout.
 ### Message Queuing Indicator
 When the user types while a turn processes:
 ```
-[Processing...] Your message is queued (1 pending)
+[Processing...] 2 queued messages
+1. Follow-up question                 [Edit] [Delete]
+2. Add the deployment angle too       [Edit] [Delete]
 ```
+
+Queued messages remain visible until they are processed, deleted, or the queue
+updates from the server. Editing is limited to queued text; attachment changes
+use delete-and-recreate so the upload/reference lifecycle stays explicit.
 
 ### Session Compaction Cards
 When a session is compacted (automatic or manual `/compact`), an inline

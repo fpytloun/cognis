@@ -121,6 +121,8 @@ export interface MessageTimelineItem {
   streaming?: boolean;
   attachments?: AttachmentRef[];
   optimistic?: boolean;
+  clientMessageId?: string | null;
+  queueId?: string | null;
   streamChunkCount?: number;
   streamContentOffset?: number;
 }
@@ -311,6 +313,8 @@ function createMessageItem(
   optimistic = false,
   turnId: string | null = null,
   streamChunkCount = streaming && content ? 1 : 0,
+  clientMessageId: string | null = null,
+  queueId: string | null = null,
 ): MessageTimelineItem {
   return {
     id,
@@ -325,6 +329,8 @@ function createMessageItem(
     streaming,
     attachments,
     optimistic,
+    clientMessageId,
+    queueId,
     streamChunkCount,
     streamContentOffset: content.length,
   };
@@ -361,6 +367,19 @@ function findOptimisticUserMessageIndex(
   if (item.content !== content) return -1;
   if (!sameAttachmentIds(item.attachments, attachments)) return -1;
   return index;
+}
+
+function findUserMessageByCorrelationIndex(
+  items: TimelineItem[],
+  clientMessageId?: string | null,
+  queueId?: string | null,
+): number {
+  if (!clientMessageId && !queueId) return -1;
+  return items.findIndex((item) => (
+    item.kind === 'message'
+    && item.role === 'user'
+    && ((clientMessageId && item.clientMessageId === clientMessageId) || (queueId && item.queueId === queueId))
+  ));
 }
 
 function normalizeEventAttachments(value: unknown): AttachmentRef[] {
@@ -1111,7 +1130,12 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
   return items;
 }
 
-export function appendOptimisticUserMessage(items: TimelineItem[], content: string, attachments: AttachmentRef[] = []): TimelineItem[] {
+export function appendOptimisticUserMessage(
+  items: TimelineItem[],
+  content: string,
+  attachments: AttachmentRef[] = [],
+  clientMessageId: string | null = null,
+): TimelineItem[] {
   return [
     ...items,
     createMessageItem(
@@ -1123,9 +1147,29 @@ export function appendOptimisticUserMessage(items: TimelineItem[], content: stri
       undefined,
       false,
       attachments,
-      true
+      true,
+      undefined,
+      undefined,
+      clientMessageId
     )
   ];
+}
+
+export function removeQueuedOptimisticUserMessage(
+  items: TimelineItem[],
+  queueId?: string | null,
+  clientMessageId?: string | null,
+  content?: string,
+  attachments: AttachmentRef[] = [],
+): TimelineItem[] {
+  const correlatedIndex = findUserMessageByCorrelationIndex(items, clientMessageId, queueId);
+  const fallbackIndex = correlatedIndex >= 0
+    ? correlatedIndex
+    : findOptimisticUserMessageIndex(items, content ?? '', attachments);
+  if (fallbackIndex < 0) return items;
+  const item = items[fallbackIndex];
+  if (item?.kind !== 'message' || item.role !== 'user' || !item.optimistic) return items;
+  return items.filter((_, index) => index !== fallbackIndex);
 }
 
 /** Tool status values we treat as "still running, waiting for resolution". */
@@ -1227,20 +1271,25 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'user_message') {
     const attachments = normalizeEventAttachments(event.attachments);
     const turnId = normalizeEventTurnId(event.turn_id);
-    const optimisticIndex = findOptimisticUserMessageIndex(next, event.content, attachments);
+    const correlatedIndex = findUserMessageByCorrelationIndex(next, event.client_message_id, event.queue_id);
+    const optimisticIndex = correlatedIndex >= 0 ? correlatedIndex : findOptimisticUserMessageIndex(next, event.content, attachments);
     if (optimisticIndex >= 0 && next[optimisticIndex]?.kind === 'message') {
       const existing = next[optimisticIndex] as MessageTimelineItem;
       next[optimisticIndex] = {
         ...existing,
+        content: event.content,
+        html: renderMarkdown(event.content),
         attachments,
         turnId,
+        clientMessageId: event.client_message_id ?? existing.clientMessageId,
+        queueId: event.queue_id ?? existing.queueId,
         optimistic: false
       };
       return next;
     }
     const itemId = `user-msg:${Date.now()}:${next.length}`;
     next.push(
-      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null, undefined, false, attachments, false, turnId)
+      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null, undefined, false, attachments, false, turnId, undefined, event.client_message_id ?? null, event.queue_id ?? null)
     );
     return next;
   }

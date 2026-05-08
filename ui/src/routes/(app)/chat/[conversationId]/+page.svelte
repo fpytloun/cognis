@@ -79,13 +79,14 @@ import X from 'lucide-svelte/icons/x';
     appendOptimisticUserMessage,
     findPendingStepRequestInputCall,
     latestTodoSnapshot,
+    removeQueuedOptimisticUserMessage,
     optimisticallyResolveStepRequestInput,
     normalizeHistory,
     type ThinkingTimelineItem,
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
-  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, Session } from '$lib/types/api';
+  import type { Agent, AttachmentRef, ContextUsage, Conversation, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -158,6 +159,10 @@ import X from 'lucide-svelte/icons/x';
   // previously opted into Enter-to-send keep their choice via localStorage.
   let enterToSend = $state(false);
   let queuedCount = $state(0);
+  let queuedMessages = $state<QueuedMessage[]>([]);
+  let queueBusyId = $state<string | null>(null);
+  let queueEditingId = $state<string | null>(null);
+  let queueEditContent = $state('');
   let timeline = $state<TimelineItem[]>([]);
 
   let visibleStartIndex = $state(0);
@@ -224,6 +229,79 @@ import X from 'lucide-svelte/icons/x';
 
   function closeHeaderInfo(): void {
     headerInfoOpen = false;
+  }
+
+  function applyQueuedMessageSnapshot(messages: QueuedMessage[], count = messages.length): void {
+    queuedMessages = messages;
+    queuedCount = count;
+    for (const queued of messages) {
+      timeline = removeQueuedOptimisticUserMessage(
+        timeline,
+        queued.queue_id,
+        queued.client_message_id,
+        queued.content,
+        queued.attachments
+      );
+    }
+  }
+
+  async function refreshQueuedMessages(conversationId = currentConversation?.conversation_id ?? ''): Promise<void> {
+    if (!conversationId) return;
+    try {
+      const response = await api.conversations.getQueue(conversationId);
+      if (conversationId !== currentConversation?.conversation_id) return;
+      applyQueuedMessageSnapshot(response.messages, response.queued_count);
+    } catch {
+      // Queue state is best-effort and will recover on the next websocket event.
+    }
+  }
+
+  async function deleteQueuedMessage(queueId: string): Promise<void> {
+    if (!currentConversation) return;
+    const previous = queuedMessages;
+    const queued = queuedMessages.find((item) => item.queue_id === queueId);
+    const previousTimeline = timeline;
+    queueBusyId = queueId;
+    queuedMessages = queuedMessages.filter((item) => item.queue_id !== queueId);
+    queuedCount = queuedMessages.length;
+    if (queued) {
+      timeline = removeQueuedOptimisticUserMessage(
+        timeline,
+        queued.queue_id,
+        queued.client_message_id,
+        queued.content,
+        queued.attachments
+      );
+    }
+    try {
+      await api.conversations.deleteQueuedMessage(currentConversation.conversation_id, queueId);
+    } catch (caughtError) {
+      queuedMessages = previous;
+      queuedCount = previous.length;
+      timeline = previousTimeline;
+      addToast(asApiError(caughtError).message, 'error');
+      await refreshQueuedMessages();
+    } finally {
+      queueBusyId = null;
+    }
+  }
+
+  async function saveQueuedMessage(queueId: string): Promise<void> {
+    if (!currentConversation) return;
+    const content = queueEditContent.trim();
+    if (!content) return;
+    queueBusyId = queueId;
+    try {
+      const updated = await api.conversations.updateQueuedMessage(currentConversation.conversation_id, queueId, content);
+      queuedMessages = queuedMessages.map((item) => item.queue_id === queueId ? updated : item);
+      queueEditingId = null;
+      queueEditContent = '';
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error');
+      await refreshQueuedMessages();
+    } finally {
+      queueBusyId = null;
+    }
   }
   let contextUsage = $state<ContextUsage | null>(null);
   let subSessionInfoOpen = $state(false);
@@ -1399,6 +1477,8 @@ import X from 'lucide-svelte/icons/x';
       persistLastOpenedConversation(conversation);
       mergeConversationList([conversation]);
       queuedCount = 0;
+      queuedMessages = [];
+      void refreshQueuedMessages(conversationId);
       turnInProgress = false;
       awaitingAssistantStart = false;
       pendingDirectQuestion = null;
@@ -1785,8 +1865,12 @@ import X from 'lucide-svelte/icons/x';
     // not append a separate user bubble — the tool call block will show the
     // user's answer inline as the resolution. Adding a bubble too would
     // duplicate the content and leave the tool call block stuck as pending.
+    const clientMessageId = (!isSlashCommand && !isStepInputReply)
+      ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
+      : null;
+
     if (!isSlashCommand && !isStepInputReply) {
-      timeline = appendOptimisticUserMessage(timeline, content, composerAttachments);
+      timeline = appendOptimisticUserMessage(timeline, content, composerAttachments, clientMessageId);
     }
     if (!isSlashCommand) {
       lastSubmittedMessage = content;
@@ -1859,7 +1943,7 @@ import X from 'lucide-svelte/icons/x';
     syncVisibleWindow();
     userScrolledUp = false;
     scrollToBottom();
-    wsClient.sendMessage(currentConversation.conversation_id, outboundContent, attachments);
+    wsClient.sendMessage(currentConversation.conversation_id, outboundContent, attachments, clientMessageId);
   }
 
   async function uploadFiles(files: File[]): Promise<void> {
@@ -2078,8 +2162,13 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
-    if (event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled') {
+    if (event.type === 'queued_messages_updated' || event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled') {
       queuedCount = event.queued_count ?? 0;
+      if ('messages' in event && Array.isArray(event.messages)) {
+        applyQueuedMessageSnapshot(event.messages, event.queued_count ?? event.messages.length);
+      } else if (queuedCount === 0) {
+        queuedMessages = [];
+      }
     }
 
     if (event.type === 'turn_started' || event.type === 'queued') {
@@ -3134,9 +3223,41 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         {#if queuedCount > 0}
-          <p class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
-            {queuedCount} additional message{queuedCount === 1 ? '' : 's'} queued for this conversation.
-          </p>
+          <div class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-3 text-sm text-sky-100">
+            <p class="font-medium">Current turn is still running; queued messages below will run next.</p>
+            {#if queuedMessages.length > 0}
+              <div class="mt-3 space-y-2">
+                {#each queuedMessages as queued (queued.queue_id)}
+                  <div class="rounded-xl border border-sky-300/20 bg-slate-950/40 p-3">
+                    <div class="flex flex-wrap items-start justify-between gap-2">
+                      <div class="min-w-0 flex-1">
+                        <p class="text-xs uppercase tracking-wide text-sky-200/70">Queued #{queued.position}</p>
+                        {#if queueEditingId === queued.queue_id}
+                          <textarea class="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100" bind:value={queueEditContent} rows="3"></textarea>
+                        {:else}
+                          <p class="mt-1 whitespace-pre-wrap break-words text-slate-100">{queued.content}</p>
+                        {/if}
+                        {#if queued.attachments?.length}
+                          <p class="mt-2 text-xs text-sky-100/70">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
+                        {/if}
+                      </div>
+                      <div class="flex shrink-0 gap-2">
+                        {#if queueEditingId === queued.queue_id}
+                          <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} onclick={() => void saveQueuedMessage(queued.queue_id)}>Save</Button>
+                          <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} onclick={() => { queueEditingId = null; queueEditContent = ''; }}>Cancel</Button>
+                        {:else}
+                          <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} onclick={() => { queueEditingId = queued.queue_id; queueEditContent = queued.content; }}>Edit</Button>
+                          <Button size="sm" variant="danger" disabled={queueBusyId === queued.queue_id} onclick={() => void deleteQueuedMessage(queued.queue_id)}>Delete</Button>
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <p class="mt-1 text-sky-100/80">{queuedCount} queued message{queuedCount === 1 ? '' : 's'} waiting. Details are syncing…</p>
+            {/if}
+          </div>
         {/if}
 
         {#if error}

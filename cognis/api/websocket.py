@@ -257,6 +257,9 @@ class WebSocketTurnObserver:
         await self._manager.send_to_conversation(conversation_id, payload)
 
     async def on_turn_complete(self, result: TurnResult) -> None:
+        queued_messages = self._manager.app.state.turn_scheduler.queued_messages(
+            result.conversation_id
+        )
         payload: dict[str, Any] = {
             "type": "message_complete",
             "conversation_id": result.conversation_id,
@@ -267,7 +270,8 @@ class WebSocketTurnObserver:
             "seq": result.last_seq,
             "token_usage": None,
             "context_usage": result.context_usage,
-            "queued_count": 0,
+            "queued_count": len(queued_messages),
+            "messages": queued_messages,
             "attachments": strip_attachment_payload_bytes(result.attachments or []),
         }
         if result.delegated:
@@ -370,6 +374,19 @@ class WebSocketTurnObserver:
             },
         )
 
+    async def on_queued_messages(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        await self._manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "queued_messages_updated",
+                "conversation_id": conversation_id,
+                "queued_count": len(messages),
+                "messages": messages,
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # WebSocketConnectionManager — thin transport layer
@@ -437,6 +454,23 @@ class WebSocketConnectionManager:
             turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
             if turn_scheduler is not None:
                 turn_scheduler.add_observer(conversation_id, self._observer)
+
+    async def send_queue_snapshot(
+        self, connection: AuthenticatedWebSocket, conversation_id: str
+    ) -> None:
+        """Send the current in-memory queue state to a subscribed client."""
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if turn_scheduler is None:
+            return
+        messages = turn_scheduler.queued_messages(conversation_id)
+        await connection.send_json(
+            {
+                "type": "queued_messages_updated",
+                "conversation_id": conversation_id,
+                "queued_count": len(messages),
+                "messages": messages,
+            }
+        )
 
     def _unsubscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Unsubscribe a connection from a conversation."""
@@ -571,6 +605,7 @@ class WebSocketConnectionManager:
                 await db_session.commit()
 
         self.subscribe(connection, conversation_id)
+        await self.send_queue_snapshot(connection, conversation_id)
 
         if session_row is None:
             return
@@ -655,7 +690,9 @@ class WebSocketConnectionManager:
                     attachments = await hydrate_attachment_refs(
                         artifact_session,
                         artifact_store,
-                        data.get("attachments") if isinstance(data.get("attachments"), list) else [],
+                        data.get("attachments")
+                        if isinstance(data.get("attachments"), list)
+                        else [],
                         owner_email=connection.user_email,
                         conversation_id=conversation_id,
                         session_id=session.session_id,
@@ -970,6 +1007,14 @@ async def handle_websocket(websocket: WebSocket) -> None:
                 await _handle_message(websocket.app, manager, connection, message)
                 continue
 
+            if message_type == "cancel_queued_message":
+                await _handle_cancel_queued_message(websocket.app, manager, connection, message)
+                continue
+
+            if message_type == "update_queued_message":
+                await _handle_update_queued_message(websocket.app, manager, connection, message)
+                continue
+
             if message_type == "cancel":
                 await _handle_cancel(websocket.app, manager, connection, message)
                 continue
@@ -1034,6 +1079,9 @@ async def _handle_message(
     conversation_id = message.get("conversation_id")
     content = message.get("content")
     attachments = message.get("attachments")
+    client_message_id = message.get("client_message_id")
+    if not isinstance(client_message_id, str) or len(client_message_id) > 128:
+        client_message_id = None
     if not isinstance(attachments, list):
         attachments = []
     if len(attachments) > 20:
@@ -1057,8 +1105,12 @@ async def _handle_message(
         )
         return
 
-    # Subscribe to conversation events
+    if not await _authorize_conversation_frame(app, manager, connection, conversation_id):
+        return
+
+    # Subscribe only after authorization, because queue snapshots include user content.
     manager.subscribe(connection, conversation_id)
+    await manager.send_queue_snapshot(connection, conversation_id)
 
     # Try slash command dispatch first
     command_dispatcher = getattr(app.state, "command_dispatcher", None)
@@ -1080,14 +1132,6 @@ async def _handle_message(
                     recoverable=False,
                 )
                 return
-            if not _can_access_owner(connection, conversation_row.user_email):
-                await manager.send_error(
-                    connection,
-                    code="forbidden",
-                    message="Conversation access denied",
-                    recoverable=False,
-                )
-                return
             agent_row = await get_agent(db_session, conversation_row.agent_id)
             if agent_row is None:
                 await manager.send_error(
@@ -1106,7 +1150,9 @@ async def _handle_message(
 
         # Try command dispatch
         if session_model is not None:
-            has_active = turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
+            has_active = (
+                turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
+            )
             has_busy = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
             cmd_result = await command_dispatcher.dispatch(
                 content,
@@ -1128,6 +1174,7 @@ async def _handle_message(
             content,
             user_email=connection.user_email,
             attachments=[item for item in attachments if isinstance(item, dict)],
+            client_message_id=client_message_id,
         )
         if error is not None:
             await manager.send_to_conversation(
@@ -1212,6 +1259,117 @@ async def _handle_cancel(
                 "conversation_id": conversation_id,
                 "text": "No active turn to cancel.",
             },
+        )
+
+
+async def _handle_cancel_queued_message(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    message: dict[str, Any],
+) -> None:
+    """Handle a targeted queued-message cancellation frame."""
+    conversation_id = message.get("conversation_id")
+    queue_id = message.get("queue_id")
+    if not isinstance(conversation_id, str) or not isinstance(queue_id, str):
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="conversation_id and queue_id are required",
+            recoverable=True,
+        )
+        return
+    if len(queue_id) > 128:
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="queue_id is too long",
+            recoverable=True,
+        )
+        return
+
+    if not await _authorize_conversation_frame(
+        app, manager, connection, conversation_id, require_mutation=True
+    ):
+        return
+    turn_scheduler = getattr(app.state, "turn_scheduler", None)
+    if turn_scheduler is None:
+        await manager.send_error(
+            connection,
+            code="internal_error",
+            message="Turn scheduler not available",
+            recoverable=False,
+        )
+        return
+
+    cancelled = await turn_scheduler.cancel_queued_message(conversation_id, queue_id)
+    if not cancelled:
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="Queued message not found",
+            recoverable=True,
+        )
+
+
+async def _handle_update_queued_message(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    message: dict[str, Any],
+) -> None:
+    """Handle a targeted queued-message text update frame."""
+    conversation_id = message.get("conversation_id")
+    queue_id = message.get("queue_id")
+    content = message.get("content")
+    if not isinstance(conversation_id, str) or not isinstance(queue_id, str):
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="conversation_id and queue_id are required",
+            recoverable=True,
+        )
+        return
+    if not isinstance(content, str) or not content.strip():
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="content is required",
+            recoverable=True,
+        )
+        return
+    if len(queue_id) > 128 or len(content) > 100_000:
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="Queued message update is too large",
+            recoverable=True,
+        )
+        return
+
+    if not await _authorize_conversation_frame(
+        app, manager, connection, conversation_id, require_mutation=True
+    ):
+        return
+    turn_scheduler = getattr(app.state, "turn_scheduler", None)
+    if turn_scheduler is None:
+        await manager.send_error(
+            connection,
+            code="internal_error",
+            message="Turn scheduler not available",
+            recoverable=False,
+        )
+        return
+
+    updated = await turn_scheduler.update_queued_message(
+        conversation_id, queue_id, content=content.strip()
+    )
+    if updated is None:
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="Queued message not found",
+            recoverable=True,
         )
 
 
@@ -1923,6 +2081,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "content": event.data.get("content", ""),
             "attachments": event.data.get("attachments", []),
             "turn_id": event.data.get("turn_id"),
+            "queue_id": event.data.get("queue_id"),
+            "client_message_id": event.data.get("client_message_id"),
         }
     return None
 
@@ -1934,6 +2094,45 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
 
 def _can_access_owner(connection: AuthenticatedWebSocket, owner_email: str) -> bool:
     return connection.role == "admin" or connection.user_email == owner_email
+
+
+async def _authorize_conversation_frame(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    conversation_id: str,
+    *,
+    require_mutation: bool = False,
+) -> bool:
+    from cognis.store.queries import get_conversation
+
+    async with app.state.session_factory() as db_session:
+        conversation_row = await get_conversation(db_session, conversation_id)
+    if conversation_row is None:
+        await manager.send_error(
+            connection,
+            code="not_found",
+            message="Conversation not found",
+            recoverable=False,
+        )
+        return False
+    if not _can_access_owner(connection, conversation_row.user_email):
+        await manager.send_error(
+            connection,
+            code="forbidden",
+            message="Conversation access denied",
+            recoverable=False,
+        )
+        return False
+    if require_mutation and connection.role == "viewer":
+        await manager.send_error(
+            connection,
+            code="forbidden",
+            message="Viewer accounts are read-only",
+            recoverable=False,
+        )
+        return False
+    return True
 
 
 async def _load_task_for_user(

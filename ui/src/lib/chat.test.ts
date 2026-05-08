@@ -8,7 +8,9 @@ import {
   findPendingStepRequestInputCall,
   latestTodoSnapshot,
   normalizeHistory,
+  removeQueuedOptimisticUserMessage,
   optimisticallyResolveStepRequestInput,
+  type MessageTimelineItem,
   type ThinkingTimelineItem,
   type ToolCallTimelineItem
 } from '$lib/chat';
@@ -67,6 +69,54 @@ describe('chat timeline helpers', () => {
         }
       ]
     });
+  });
+
+  it('settles queued optimistic user messages by client id without duplicating', () => {
+    const initial = appendOptimisticUserMessage([], 'queued hello', [], 'cmsg_test');
+
+    const settled = applyWebSocketEvent(initial, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'queued hello edited',
+      client_message_id: 'cmsg_test',
+      queue_id: 'qmsg_test',
+      attachments: []
+    });
+
+    expect(settled).toHaveLength(1);
+    expect(settled[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      content: 'queued hello edited',
+      optimistic: false,
+      clientMessageId: 'cmsg_test',
+      queueId: 'qmsg_test'
+    });
+
+    const duplicate = applyWebSocketEvent(settled, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'queued hello edited',
+      client_message_id: 'cmsg_test',
+      queue_id: 'qmsg_test',
+      attachments: []
+    });
+
+    expect(duplicate).toHaveLength(1);
+  });
+
+  it('removes a deleted queued optimistic user message by stable id', () => {
+    const timeline = appendOptimisticUserMessage([], 'queued text', [], 'client-queued-1');
+    const removed = removeQueuedOptimisticUserMessage(
+      timeline,
+      null,
+      'client-queued-1',
+      'queued text',
+      []
+    );
+    expect(removed).toHaveLength(0);
   });
 
   it('handles workflow failure payloads that omit conversation_id', () => {

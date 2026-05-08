@@ -156,17 +156,27 @@ class CognisWebSocketClient {
     });
   }
 
-  sendMessage(conversationId: string, content: string, attachments: AttachmentRef[] = []): void {
+  sendMessage(conversationId: string, content: string, attachments: AttachmentRef[] = [], clientMessageId: string | null = null): string {
+    const resolvedClientMessageId = clientMessageId ?? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
     // Only subscribe if not already subscribed — avoids sending a redundant
     // reconnect frame before every message which triggers session_recovered.
     if (!this.subscriptions.has(conversationId)) {
       this.subscribeConversation(conversationId, 0);
     }
-    this.sendRaw({ type: 'message', conversation_id: conversationId, content, attachments });
+    this.sendRaw({ type: 'message', conversation_id: conversationId, content, attachments, client_message_id: resolvedClientMessageId });
+    return resolvedClientMessageId;
   }
 
   cancelTurn(conversationId: string): void {
     this.sendRaw({ type: 'cancel', conversation_id: conversationId });
+  }
+
+  cancelQueuedMessage(conversationId: string, queueId: string): void {
+    this.sendRaw({ type: 'cancel_queued_message', conversation_id: conversationId, queue_id: queueId });
+  }
+
+  updateQueuedMessage(conversationId: string, queueId: string, content: string): void {
+    this.sendRaw({ type: 'update_queued_message', conversation_id: conversationId, queue_id: queueId, content });
   }
 
   resolveEscalation(callId: string, decision: string, note?: string): void {

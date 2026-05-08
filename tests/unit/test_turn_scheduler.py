@@ -36,6 +36,7 @@ class _RecordingObserver:
         self.system_messages: list[str] = []
         self.completed: list[str] = []
         self.queued: list[int] = []
+        self.queued_messages: list[list[dict[str, object]]] = []
 
     async def on_token(
         self,
@@ -100,6 +101,11 @@ class _RecordingObserver:
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         self.queued.append(queued_count)
+
+    async def on_queued_messages(
+        self, conversation_id: str, messages: list[dict[str, object]]
+    ) -> None:
+        self.queued_messages.append(messages)
 
 
 @pytest.mark.asyncio
@@ -504,6 +510,277 @@ async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
     assert second is None
     scheduler._notify_observers_system_message.assert_awaited_once()
     assert len(scheduler._queued_messages["conv-1"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_queued_messages_include_stable_metadata() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(1))
+    scheduler._queued_messages["conv-1"].extend(
+        [
+            _QueuedMessage(
+                queue_id="qmsg_one",
+                content="metadata one",
+                user_email="user@example.com",
+                client_message_id="client-one",
+            ),
+            _QueuedMessage(
+                queue_id="qmsg_two",
+                content="metadata two",
+                user_email="user@example.com",
+                client_message_id="client-two",
+            ),
+        ]
+    )
+
+    queued = scheduler.queued_messages("conv-1")
+    assert [item["queue_id"] for item in queued] == ["qmsg_one", "qmsg_two"]
+    assert [item["client_message_id"] for item in queued] == ["client-one", "client-two"]
+    assert [item["position"] for item in queued] == [1, 2]
+
+    scheduler._active_turns["conv-1"].cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scheduler._active_turns["conv-1"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_client_message_id_is_not_enqueued_twice() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            content="already queued",
+            user_email="user@example.com",
+            client_message_id="client-dup",
+        )
+    )
+
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        status="active",
+    )
+    session = SimpleNamespace(status=SessionStatus.ACTIVE)
+    agent = SimpleNamespace()
+    scheduler._load_conversation_runtime = AsyncMock(
+        return_value=(conversation, session, agent, False)
+    )  # type: ignore[method-assign]
+    scheduler._build_attachment_support_messages = AsyncMock(return_value=(None, None))  # type: ignore[method-assign]
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(1))
+
+    error = await scheduler.submit_turn(
+        "conv-1",
+        "duplicate content",
+        user_email="user@example.com",
+        client_message_id="client-dup",
+    )
+
+    assert error is None
+    queued = scheduler.queued_messages("conv-1")
+    assert len(queued) == 1
+    assert queued[0]["content"] == "already queued"
+
+    scheduler._active_turns["conv-1"].cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scheduler._active_turns["conv-1"]
+
+
+@pytest.mark.asyncio
+async def test_update_queued_message_edits_text_before_processing() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            content="original text",
+            user_email="user@example.com",
+            client_message_id="client-edit-1",
+        )
+    )
+    queue_id = str(scheduler.queued_messages("conv-1")[0]["queue_id"])
+
+    updated = await scheduler.update_queued_message("conv-1", queue_id, content="edited text")
+
+    assert updated is not None
+    assert updated["content"] == "edited text"
+    queued = scheduler.queued_messages("conv-1")
+    assert queued[0]["content"] == "edited text"
+    assert queued[0]["client_message_id"] == "client-edit-1"
+
+
+@pytest.mark.asyncio
+async def test_queued_message_cancel_removes_item_before_follow_up_cleanup() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def _cleanup(_: str, __: str) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    scheduler._clear_follow_up_pending = _cleanup  # type: ignore[method-assign]
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            queue_id="qmsg_cancel",
+            content="cancel me",
+            user_email="user@example.com",
+            follow_up=SimpleNamespace(follow_up_id="fup_1"),
+        )
+    )
+
+    cancel_task = asyncio.create_task(scheduler.cancel_queued_message("conv-1", "qmsg_cancel"))
+    await cleanup_started.wait()
+    assert scheduler.queued_messages("conv-1") == []
+    release_cleanup.set()
+    assert await cancel_task is True
+
+
+@pytest.mark.asyncio
+async def test_drained_queued_message_preserves_prepared_attachment_context() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(run_direct_turn=AsyncMock()),
+        decision_engine=SimpleNamespace(decide=AsyncMock(return_value=None)),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=1)),
+            get_context_usage=lambda _session_id: None,
+            get_entry=lambda _session_id: None,
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    attachment = AttachmentRef(
+        artifact_id="art_queued",
+        kind=ArtifactKind.PDF,
+        filename="queued.pdf",
+        mime_type="application/pdf",
+        size_bytes=1024,
+    )
+    queued = _QueuedMessage(
+        queue_id="qmsg_attachment",
+        content="use queued attachment",
+        user_email="user@example.com",
+        attachments=[attachment.model_dump(mode="json")],
+        attachment_notice="prepared attachment notice",
+        attachment_context="prepared attachment context",
+    )
+    scheduler._queued_messages["conv-1"].append(queued)
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        status="active",
+        title="Conversation",
+    )
+    session = SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE)
+    agent = SimpleNamespace(agent_id="agent-1", owner_email="owner@example.com")
+    scheduler._load_conversation_runtime = AsyncMock(
+        return_value=(conversation, session, agent, False)
+    )  # type: ignore[method-assign]
+    scheduler._build_attachment_support_messages = AsyncMock(
+        return_value=("rebuilt notice", "rebuilt context")
+    )  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = AsyncMock(return_value=([attachment], None))  # type: ignore[method-assign]
+    scheduler._workflow_engine.run_direct_turn.return_value = SimpleNamespace(
+        content="done",
+        attachments=[],
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_error = AsyncMock()  # type: ignore[method-assign]
+    scheduler._event_bus.publish = AsyncMock()  # type: ignore[method-assign]
+    scheduler._launch_turn = MagicMock()  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=conversation,
+        session=session,
+        agent=agent,
+        content="active turn",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=asyncio.Event(),
+        turn_control=_TurnControl(),
+    )
+    launch_call = scheduler._launch_turn.call_args
+    assert launch_call is not None
+    assert launch_call.kwargs["content"] == "use queued attachment"
+    assert launch_call.kwargs["attachment_notice"] == "prepared attachment notice"
+    assert launch_call.kwargs["attachment_context"] == "prepared attachment context"
+    assert launch_call.kwargs["attachments"] == [attachment]
+    scheduler._build_attachment_support_messages.assert_not_awaited()
 
 
 @pytest.mark.asyncio
