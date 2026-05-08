@@ -2280,6 +2280,14 @@ class AgentLoop:
                         "deliverable_format": output.deliverable_format,
                         "deliverable_title": output.deliverable_title,
                     }
+                elif output:
+                    # The sync delegate tool returns StepOutput.content directly.
+                    # For secondary delegations, replace stale tail text with the
+                    # OpenCode-style selected child assistant output.
+                    output.content = result_content
+                    if self._looks_like_meta_complaint(result_summary):
+                        result_summary = compact_snippet(result_content, max_chars=500)
+                        output.summary = result_summary or "Completed."
 
                 # Update child session status — guarded
                 try:

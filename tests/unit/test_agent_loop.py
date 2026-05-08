@@ -1278,6 +1278,107 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_child_session_returns_selected_assistant_output_without_deliverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    substantive = (
+        "Final delegated findings: cognis/core/agent_loop.py:6602 returned the stale "
+        "StepOutput content instead of the selected child assistant message. Use the "
+        "selected result content for no-deliverable sync delegations."
+    )
+    stale_tail = (
+        "Already provided the final findings above. No additional user-facing information "
+        "remains; the remaining todo state is stale."
+    )
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del agent, user_email, executor_agent
+
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    class _Guardrails:
+        async def record_events(self, **_: object) -> None:
+            return None
+
+        async def read_events(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=[
+                    {"seq": 1, "type": "assistant_message", "data": {"content": substantive}},
+                    {"seq": 2, "type": "assistant_message", "data": {"content": stale_tail}},
+                ],
+                last_seq=2,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    class _EventBus:
+        async def publish(self, _: object) -> None:
+            return None
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
+        del ctx
+        return StepOutput(
+            summary=stale_tail,
+            content=stale_tail,
+            outputs={},
+            claims=[],
+            session_id="child",
+            intaris_session_id="child",
+            completed_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+
+    output = await agent_loop._run_child_session(
+        child_session=SimpleNamespace(
+            session_id="child",
+            user_email="user@example.com",
+            agent_id="system:explore",
+            intaris_session_id="child",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            is_system=True,
+        ),
+        task_description="Investigate",
+        parent_intaris_session_id="parent-intaris",
+    )
+
+    assert output is not None
+    assert output.deliverable_id is None
+    assert output.content == substantive
+    assert output.summary == substantive[:500]
+
+
+@pytest.mark.asyncio
 async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch) -> None:
     completed: list[str] = []
     failed: list[tuple[str, str | None]] = []
