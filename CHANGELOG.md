@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-05-08
+
+### Added
+
+- Voice mode with TTS, web STT, conversation playback, mobile recording flows, sentence-buffered audio, and per-agent/system voice routing.
+- Cognis conversation search with local and server-backed matching, search highlighting, in-conversation navigation, and conversation search tools.
+- Multi-executor agent support, workflow same-executor routing, executor configuration UI/API matrix, and non-expiring revokable remote executor tokens.
+- Chat continuation forks, queued web messages, active turn indicators, file diff display for tool edits, and richer push notifications.
+- Browser attachment and interaction tools, iframe payment input improvements, and ChatGPT subscription OAuth provider support.
+
+### Changed
+
+- Made coding and research workflows more review-driven, with clearer revision loop prompts, stronger finalization boundaries, and reduced planning/tool overhead.
+- Improved delegation contracts and task session logs, including slim system-agent sub-sessions and parallel delegation reliability updates.
+- Refined PWA/mobile viewport handling, safe-area behavior, notification routing, task board column collapse, and settings/provider mobile layouts.
+- Optimized context assembly and agent-loop latency by replaying history attachments natively, pruning post-step state, and parallelizing safe classified tools.
+
+### Fixed
+
+- Hardened queued chat sends, attachment-only message deduplication, assistant event `turn_id` persistence, PDF attachments, and stale escalation prompt expiry.
+- Stabilized voice playback, microphone teardown, mobile keep-awake behavior, TTS caching, and conversation-mode text suppression.
+- Fixed delegated result extraction, delegated deliverable prioritization, sub-session turn limits, and delegation failure handling.
+- Improved workflow routing, retry output preservation, automatic workflow selection, provider JSON fallback, and native `apply_patch` replay safeguards.
+- Fixed conversation search scoring and exact-match preservation, task recovery after restart, schedule definition exposure, recall payload limits, and uploaded filename sanitization.
+
+### Documentation
+
+- Added and completed voice mode, conversation search, and multi-executor implementation specifications.
+
 ## [0.4.0] - 2026-04-29
 
 ### Added
