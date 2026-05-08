@@ -860,6 +860,8 @@ class WebSocketConnectionManager:
                                 "type": "delegation_completed",
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
+                                "agent_id": data.get("agent_id"),
+                                "task": data.get("task"),
                                 "result": data.get("result_summary"),
                                 "turn_id": data.get("turn_id"),
                             }
@@ -870,6 +872,8 @@ class WebSocketConnectionManager:
                                 "type": "delegation_failed",
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
+                                "agent_id": data.get("agent_id"),
+                                "task": data.get("task"),
                                 "reason": data.get("error"),
                                 "turn_id": data.get("turn_id"),
                             }
@@ -2036,6 +2040,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "type": "delegation_completed",
             "conversation_id": conversation_id,
             "child_session_id": event.data.get("child_session_id"),
+            "agent_id": event.data.get("agent_id"),
+            "task": event.data.get("task"),
             "result": event.data.get("result_summary"),
         }
     if event.type == EventType.DELEGATION_FAILED:
@@ -2043,6 +2049,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "type": "delegation_failed",
             "conversation_id": conversation_id,
             "child_session_id": event.data.get("child_session_id"),
+            "agent_id": event.data.get("agent_id"),
+            "task": event.data.get("task"),
             "reason": event.data.get("reason"),
         }
     if event.type == EventType.SESSION_RECOVERED:

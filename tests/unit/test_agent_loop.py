@@ -33,6 +33,7 @@ from cognis.core.project_context import ProjectContextEntry
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
 from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.deliverable import Deliverable
 from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
 from cognis.models.tool import (
     Permission,
@@ -3301,6 +3302,70 @@ def test_delegation_schema_exposes_write_deliverable_for_workflow_backed_child()
     tools = loop._build_controller_tool_schemas(ctx)
 
     assert any(tool["function"]["name"] == "write_deliverable" for tool in tools)
+
+
+@pytest.mark.asyncio
+async def test_workflow_backed_delegation_can_write_parent_deliverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FinalAssistantContentLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    captured: dict[str, object] = {}
+
+    async def _write_deliverable(ctx: StepContext, **kwargs: object) -> Deliverable:
+        captured["owner_step_run_id"] = agent_loop._deliverable_owner_step_run_id(ctx)
+        captured.update(kwargs)
+        deliverable = Deliverable(
+            deliverable_id="dlv-child",
+            step_run_id="sr-parent",
+            version=1,
+            content=str(kwargs["content"]),
+            format="markdown",
+            title="Delegated result",
+            outputs={},
+        )
+        return agent_loop._cache_deliverable(ctx, deliverable)
+
+    monkeypatch.setattr(agent_loop, "_write_step_deliverable", _write_deliverable)
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="delegation",
+            type="run",
+            prompt="Investigate the issue.",
+            require_deliverable=False,
+        ),
+        session=SimpleNamespace(
+            session_id="child-1",
+            intaris_session_id="child-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=DELEGATION_POLICY,
+        user_message="Investigate the issue.",
+        deliverable_step_run_id="sr-parent",
+        system_initiated=True,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.deliverable_id == "dlv-child"
+    assert captured["owner_step_run_id"] == "sr-parent"
+    assert captured["content"] == "Final clean briefing text."
 
 
 def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> None:

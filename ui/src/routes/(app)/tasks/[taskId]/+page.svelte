@@ -77,8 +77,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   let durationTimer: ReturnType<typeof setInterval> | null = null;
   let visibilityHandler: (() => void) | null = null;
 
+  type SessionDrawerState = {
+    conversationId: string;
+    sessionId: string;
+    stepName: string;
+    agent: Agent | null;
+  };
+
   // Session logs drawer
-  let sessionDrawer = $state<{ conversationId: string; sessionId: string; stepName: string; agent: Agent | null } | null>(null);
+  let sessionDrawer = $state<SessionDrawerState | null>(null);
+  let sessionDrawerBackStack = $state<SessionDrawerState[]>([]);
 
   let editForm = $state({
     title: '',
@@ -577,6 +585,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
       ) ?? conversations.find((c) => c.context?.ref === task!.task_id);
       conversationId = conv?.conversation_id ?? sessionId;
     }
+    sessionDrawerBackStack = [];
     sessionDrawer = {
       conversationId,
       sessionId,
@@ -586,8 +595,10 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   }
 
   async function openSessionLogsById(sessionId: string): Promise<void> {
-    const conversationId = sessionDrawer?.conversationId;
+    const currentDrawer = sessionDrawer;
+    const conversationId = currentDrawer?.conversationId;
     if (!conversationId) return;
+    if (currentDrawer?.sessionId === sessionId) return;
     let sessionRow: Session | null = null;
     try {
       const sessions = await api.conversations.sessions(conversationId);
@@ -595,12 +606,27 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     } catch {
       // The log endpoint will still report a useful error if the session is inaccessible.
     }
+    if (currentDrawer) {
+      sessionDrawerBackStack = [...sessionDrawerBackStack, currentDrawer];
+    }
     sessionDrawer = {
       conversationId,
       sessionId,
       stepName: sessionRow?.delegation_task ?? sessionRow?.agent_id ?? sessionId,
       agent: agentFor(sessionRow?.agent_id ?? null)
     };
+  }
+
+  function goBackSessionLogs(): void {
+    const previous = sessionDrawerBackStack[sessionDrawerBackStack.length - 1];
+    if (!previous) return;
+    sessionDrawerBackStack = sessionDrawerBackStack.slice(0, -1);
+    sessionDrawer = previous;
+  }
+
+  function closeSessionLogs(): void {
+    sessionDrawer = null;
+    sessionDrawerBackStack = [];
   }
 
   function pickAttemptForStep(stepName: string): StepRun | null {
@@ -2481,14 +2507,18 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
 
   <!-- Session logs drawer -->
   {#if sessionDrawer}
-    <SessionLogsDrawer
-      conversationId={sessionDrawer.conversationId}
-      sessionId={sessionDrawer.sessionId}
-      stepName={sessionDrawer.stepName}
-      agent={sessionDrawer.agent}
-      onViewSession={openSessionLogsById}
-      onclose={() => (sessionDrawer = null)}
-    />
+    {#key `${sessionDrawer.conversationId}:${sessionDrawer.sessionId}`}
+      <SessionLogsDrawer
+        conversationId={sessionDrawer.conversationId}
+        sessionId={sessionDrawer.sessionId}
+        stepName={sessionDrawer.stepName}
+        agent={sessionDrawer.agent}
+        backLabel={sessionDrawerBackStack[sessionDrawerBackStack.length - 1]?.stepName ?? 'Parent session'}
+        onBack={sessionDrawerBackStack.length > 0 ? goBackSessionLogs : undefined}
+        onViewSession={openSessionLogsById}
+        onclose={closeSessionLogs}
+      />
+    {/key}
   {/if}
 {:else}
   <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error || 'Task not found.'}</p>

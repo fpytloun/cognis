@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
+  import ArrowLeft from 'lucide-svelte/icons/arrow-left';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
 
@@ -28,6 +29,8 @@
     sessionId,
     stepName = '',
     agent = null,
+    backLabel = 'Parent session',
+    onBack,
     onViewSession,
     onclose
   } = $props<{
@@ -35,6 +38,8 @@
     sessionId: string;
     stepName?: string;
     agent?: Agent | null;
+    backLabel?: string;
+    onBack?: (() => void) | undefined;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
     onclose: () => void;
   }>();
@@ -295,11 +300,19 @@
 <div class="app-viewport-overlay z-[90] flex justify-end overflow-hidden bg-black/60" onclick={handleBackdropClick} role="presentation">
   <aside class="ml-auto flex h-full min-h-0 w-full max-w-2xl flex-col overflow-hidden border-l border-slate-700 bg-slate-900 shadow-2xl animate-slide-in-right">
     <div class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
-      <div class="min-w-0">
-        <p class="text-xs uppercase tracking-widest text-slate-500">Session logs</p>
-        <h3 class="truncate text-sm font-semibold text-white">{stepName || sessionId}</h3>
-        <div class="mt-2">
-          <LiveDots inline={true} size="sm" tone={userScrolledUp ? 'slate' : 'sky'} label={userScrolledUp ? 'Live follow paused' : 'Following latest'} />
+      <div class="flex min-w-0 items-center gap-3">
+        {#if onBack}
+          <Button size="sm" variant="ghost" class="shrink-0" onclick={onBack} title={`Back to ${backLabel}`}>
+            <ArrowLeft class="mr-1.5 h-3.5 w-3.5" />
+            Back
+          </Button>
+        {/if}
+        <div class="min-w-0">
+          <p class="text-xs uppercase tracking-widest text-slate-500">{onBack ? 'Sub-session logs' : 'Session logs'}</p>
+          <h3 class="truncate text-sm font-semibold text-white">{stepName || sessionId}</h3>
+          <div class="mt-2">
+            <LiveDots inline={true} size="sm" tone={userScrolledUp ? 'slate' : 'sky'} label={userScrolledUp ? 'Live follow paused' : 'Following latest'} />
+          </div>
         </div>
       </div>
       <div class="flex shrink-0 items-center gap-2">

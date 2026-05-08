@@ -1627,6 +1627,8 @@ export interface WebSocketDelegationCompletedEvent {
   type: 'delegation_completed';
   conversation_id?: string;
   child_session_id: string;
+  agent_id?: string;
+  task?: string;
   result?: string;
 }
 
@@ -1634,6 +1636,8 @@ export interface WebSocketDelegationFailedEvent {
   type: 'delegation_failed';
   conversation_id?: string;
   child_session_id: string;
+  agent_id?: string;
+  task?: string;
   reason?: string;
 }
 

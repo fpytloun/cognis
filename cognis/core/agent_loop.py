@@ -2249,6 +2249,8 @@ class AgentLoop:
                                         "status": "completed",
                                         "child_session_id": child_session_id,
                                         "mode": "delegate",
+                                        "task": task_description,
+                                        "agent_id": child_session.agent_id,
                                         "result_summary": result_summary,
                                         "result_content": result_content,
                                         **deliverable_data,
@@ -2276,6 +2278,8 @@ class AgentLoop:
                             "conversation_id": conversation_id,
                             "child_session_id": child_session_id,
                             "parent_session_id": parent_intaris_session_id,
+                            "agent_id": child_session.agent_id,
+                            "task": task_description,
                             "result_summary": result_summary,
                         },
                     )
@@ -2320,6 +2324,8 @@ class AgentLoop:
                                     "status": "failed",
                                     "child_session_id": child_session_id,
                                     "mode": "delegate",
+                                    "task": task_description,
+                                    "agent_id": child_session.agent_id,
                                     "error": "Delegation execution failed",
                                 },
                             )
@@ -2344,6 +2350,8 @@ class AgentLoop:
                         "conversation_id": conversation_id,
                         "child_session_id": child_session_id,
                         "parent_session_id": parent_intaris_session_id,
+                        "agent_id": child_session.agent_id,
+                        "task": task_description,
                         "reason": "Delegation execution failed",
                     },
                 )
@@ -4086,12 +4094,15 @@ class AgentLoop:
                     target = tc.arguments.get("target")
                     outputs = tc.arguments.get("outputs")
 
-                    if ctx.step_run_id is None:
+                    if self._deliverable_owner_step_run_id(ctx) is None:
                         err_content = json.dumps(
                             {
                                 "status": "rejected",
                                 "reason": "not_in_workflow",
-                                "message": "write_deliverable is only available inside workflow steps.",
+                                "message": (
+                                    "write_deliverable is only available inside workflow steps "
+                                    "or workflow-backed delegated sessions."
+                                ),
                             }
                         )
                         messages.append(
@@ -6104,19 +6115,35 @@ class AgentLoop:
 
         parent_intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
 
-        # Record delegation started event
-        events_to_record.append(
-            SessionEvent(
-                type="delegation",
-                data={
-                    "mode": "delegate",
-                    "call_id": tc.call_id,
-                    "task": task_description,
-                    "child_session_id": child_session.session_id,
-                    "wait": wait,
-                },
-            )
+        # Persist the started event immediately. Synchronous delegations can run
+        # for minutes; buffering this in the parent batch makes completion arrive
+        # first and causes stale history to regress completed cards to "started".
+        started_event = SessionEvent(
+            type="delegation",
+            data={
+                "status": "started",
+                "mode": "delegate",
+                "call_id": tc.call_id,
+                "task": task_description,
+                "agent_id": child_session.agent_id,
+                "child_session_id": child_session.session_id,
+                "wait": wait,
+            },
         )
+        try:
+            await self._record_events_strict(
+                ctx,
+                [started_event],
+                reason=f"delegation_started:{child_session.session_id}",
+                on_token=on_token,
+            )
+        except Exception:
+            logger.warning(
+                "delegation: failed to record started event immediately",
+                extra={"extra_data": {"child_session_id": child_session.session_id}},
+                exc_info=True,
+            )
+            events_to_record.append(started_event)
 
         await self.event_bus.publish(
             Event(

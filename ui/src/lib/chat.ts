@@ -252,6 +252,51 @@ export interface DelegationTimelineItem {
   timestamp: string | null;
 }
 
+const terminalDelegationStatuses = new Set<DelegationTimelineItem['status']>([
+  'completed',
+  'failed',
+  'cancelled'
+]);
+
+function normalizeDelegationStatus(value: unknown): DelegationTimelineItem['status'] {
+  return value === 'running' || value === 'paused' || value === 'completed' || value === 'failed' || value === 'cancelled'
+    ? value
+    : 'started';
+}
+
+function isGenericDelegationLabel(value: string | null | undefined): boolean {
+  if (!value) return true;
+  return ['Background task', 'Sub-session', 'Delegation'].includes(value);
+}
+
+function delegationTaskLabel(value: unknown, fallback = 'Background task'): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+}
+
+function mergeDelegationItem(
+  existing: DelegationTimelineItem | null,
+  incoming: DelegationTimelineItem
+): DelegationTimelineItem {
+  if (!existing) return incoming;
+  const existingTerminal = terminalDelegationStatuses.has(existing.status);
+  const incomingTerminal = terminalDelegationStatuses.has(incoming.status);
+  const keepExistingTerminal = existingTerminal && !incomingTerminal;
+  const taskLabel = !isGenericDelegationLabel(incoming.taskLabel)
+    ? incoming.taskLabel
+    : !isGenericDelegationLabel(existing.taskLabel)
+      ? existing.taskLabel
+      : incoming.taskLabel;
+
+  return {
+    ...existing,
+    ...incoming,
+    taskLabel,
+    status: keepExistingTerminal ? existing.status : incoming.status,
+    result: keepExistingTerminal ? existing.result : incoming.result ?? existing.result,
+    timestamp: keepExistingTerminal ? existing.timestamp : incoming.timestamp ?? existing.timestamp,
+  };
+}
+
 export interface WorkflowComposedTimelineItem {
   id: string;
   kind: 'workflow_composed';
@@ -913,47 +958,32 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     if (event.type === 'delegation') {
       const childSessionId = String(event.data.child_session_id ?? event.data.call_id ?? `del-${eid}`);
       const itemId = `delegation:${childSessionId}`;
-      const delegationStatus = typeof event.data.status === 'string' ? event.data.status : 'started';
-      const rawTask = event.data.task;
-      const taskDesc = typeof rawTask === 'string' && rawTask.trim() ? rawTask.trim() : 'Background task';
-
-      if (delegationStatus === 'completed' || delegationStatus === 'failed') {
-        // Completion/failure event — update existing card or create new one
-        const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-        const result = delegationStatus === 'completed'
-          ? (typeof event.data.result_summary === 'string' ? event.data.result_summary : null)
-          : (typeof event.data.error === 'string' ? event.data.error : 'Failed');
-        if (existingIdx >= 0) {
-          const existing = items[existingIdx] as DelegationTimelineItem;
-          items[existingIdx] = { ...existing, status: delegationStatus, result };
-        } else {
-          items.push({
-            id: itemId,
-            kind: 'delegation',
-            taskId: childSessionId,
-            taskLabel: taskDesc,
-            status: delegationStatus,
-            result,
-            timestamp: event.timestamp
-          });
-        }
+      const status = normalizeDelegationStatus(event.data.status);
+      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
+      const existing = existingIdx >= 0 ? (items[existingIdx] as DelegationTimelineItem) : null;
+      const fallbackLabel = childSessionId.startsWith('sess_') ? 'Sub-session' : 'Background task';
+      const result = status === 'completed'
+        ? (typeof event.data.result_summary === 'string'
+          ? event.data.result_summary
+          : typeof event.data.result_content === 'string'
+            ? event.data.result_content
+            : null)
+        : status === 'failed'
+          ? (typeof event.data.error === 'string' ? event.data.error : 'Failed')
+          : null;
+      const incoming: DelegationTimelineItem = {
+        id: itemId,
+        kind: 'delegation',
+        taskId: childSessionId,
+        taskLabel: delegationTaskLabel(event.data.task, fallbackLabel),
+        status,
+        result,
+        timestamp: event.timestamp
+      };
+      if (existingIdx >= 0) {
+        items[existingIdx] = mergeDelegationItem(existing, incoming);
       } else {
-        // Initial delegation event (started/running) — update existing or create new
-        const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-        if (existingIdx >= 0) {
-          const existing = items[existingIdx] as DelegationTimelineItem;
-          items[existingIdx] = { ...existing, status: delegationStatus as DelegationTimelineItem['status'] };
-        } else {
-          items.push({
-            id: itemId,
-            kind: 'delegation',
-            taskId: childSessionId,
-            taskLabel: taskDesc,
-            status: 'started',
-            result: null,
-            timestamp: event.timestamp
-          });
-        }
+        items.push(incoming);
       }
       continue;
     }
@@ -1018,36 +1048,6 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         tone: 'warning',
         timestamp: event.timestamp
       });
-      continue;
-    }
-
-    // Delegation events from Intaris use type="delegation" with data.status
-    // (started, completed, failed). These are the actual recorded events.
-    if (event.type === 'delegation') {
-      const childSessionId = String(event.data?.child_session_id ?? eid);
-      const itemId = `delegation:${childSessionId}`;
-      const existingIdx = items.findIndex((i) => i.id === itemId && i.kind === 'delegation');
-      const dataStatus = String(event.data?.status ?? 'started');
-      const statusMap: Record<string, DelegationTimelineItem['status']> = {
-        started: 'started',
-        completed: 'completed',
-        failed: 'failed',
-      };
-      const delegation: DelegationTimelineItem = {
-        id: itemId,
-        kind: 'delegation',
-        taskId: childSessionId,
-        taskLabel: String(event.data?.task ?? event.data?.description ?? 'Sub-session'),
-        status: statusMap[dataStatus] ?? 'started',
-        result: typeof event.data?.result_summary === 'string' ? event.data.result_summary : (typeof event.data?.result_content === 'string' ? event.data.result_content : null),
-        timestamp: event.timestamp
-      };
-      if (existingIdx >= 0) {
-        const existing = items[existingIdx] as DelegationTimelineItem;
-        items[existingIdx] = { ...existing, ...delegation, taskLabel: existing.taskLabel || delegation.taskLabel };
-      } else {
-        items.push(delegation);
-      }
       continue;
     }
 
@@ -1776,6 +1776,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const taskId = event.child_session_id;
     const itemId = `delegation:${taskId}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'delegation');
+    const existing = index >= 0 ? (next[index] as DelegationTimelineItem) : null;
     const progressText =
       event.type === 'delegation_progress' && 'progress' in event && typeof event.progress === 'string'
         ? event.progress
@@ -1784,13 +1785,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       id: itemId,
       kind: 'delegation',
       taskId,
-      taskLabel: 'task' in event && typeof event.task === 'string' ? event.task : 'Background task',
+      taskLabel: delegationTaskLabel('task' in event ? event.task : null),
       status: event.type === 'delegation_started' ? 'started' : 'running',
       result: progressText,
       timestamp: new Date().toISOString()
     };
     if (index >= 0) {
-      next[index] = { ...(next[index] as DelegationTimelineItem), ...delegation };
+      next[index] = mergeDelegationItem(existing, delegation);
       return next;
     }
     next.push(delegation);
@@ -1809,13 +1810,13 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       id: itemId,
       kind: 'delegation',
       taskId,
-      taskLabel: existing?.taskLabel ?? 'Background task',
+      taskLabel: delegationTaskLabel('task' in event ? event.task : null, existing?.taskLabel ?? 'Background task'),
       status,
       result: typeof result === 'string' ? result : null,
       timestamp: new Date().toISOString()
     };
     if (index >= 0) {
-      next[index] = { ...existing!, ...delegation, taskLabel: existing!.taskLabel };
+      next[index] = mergeDelegationItem(existing, delegation);
       return next;
     }
     next.push(delegation);
