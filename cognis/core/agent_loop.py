@@ -6356,11 +6356,13 @@ class AgentLoop:
             async def _child_progress_callback(
                 call_id: str,
                 tool_name: str,
-                result: str,
-                is_error: bool,
-                attachments: Any,
-                file_diffs: Any,
+                *_rest: Any,
+                **_kw: Any,
             ) -> None:
+                # The on_tool_result callback signature varies across call sites
+                # (5-8 positional args plus optional kwargs).  We only need
+                # call_id and tool_name for progress reporting, so accept the rest
+                # via *args/**kwargs to stay tolerant of signature drift.
                 nonlocal _child_tool_call_count
                 _child_tool_call_count += 1
                 if _child_tool_call_count % 3 == 0 or _child_tool_call_count == 1:

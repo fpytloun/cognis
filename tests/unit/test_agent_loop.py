@@ -6,6 +6,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -3459,6 +3460,95 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
     # Must NOT contain the heavy deliverable contract
     assert "write_deliverable with the canonical user-facing artifact" not in prompt
     assert "Required Completion Actions" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delegation progress callback inside _handle_delegate must accept the
+    canonical on_tool_result signature, which can have anywhere from 5 to 8
+    positional args plus optional kwargs.  Regression for a runtime crash:
+    'takes 6 positional arguments but 8 were given'."""
+    from types import SimpleNamespace as NS
+
+    # Capture the on_tool_result callback that _handle_delegate passes into
+    # _run_child_session.
+    captured_callback: list[Any] = []
+
+    async def _fake_run_child_session(*args: Any, **kwargs: Any) -> StepOutput:
+        cb = kwargs.get("on_tool_result")
+        captured_callback.append(cb)
+        return StepOutput(summary="ok", content="result")
+
+    async def _fake_handle_delegate_tool_call(*args: Any, **kwargs: Any):
+        return ToolResult(output=json.dumps({"status": "started"})), NS(
+            session_id="child-1",
+            agent_id="system:explore",
+        )
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    monkeypatch.setattr(
+        "cognis.core.agent_loop.handle_delegate_tool_call",
+        _fake_handle_delegate_tool_call,
+    )
+    monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
+    # Avoid network/persistence for the started event recording
+    async def _noop_record(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _noop_record)
+
+    primary_agent = AgentDefinition(
+        agent_id="riker",
+        owner_email="user@example.com",
+        name="Riker",
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="riker",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=primary_agent,
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    await agent_loop._handle_delegate(
+        ToolCall(
+            call_id="call-1",
+            name="delegate",
+            arguments={"task": "Investigate.", "agent_id": "system:explore", "wait": True},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert captured_callback, "_run_child_session was not called with on_tool_result"
+    cb = captured_callback[0]
+    # Must accept the longest call shape (8 args: call_id, tool_name, output,
+    # is_error, duration_ms, eval_meta, attachments, file_diffs)
+    await cb("c1", "read", "<out>", False, 12, {"decision": "allow"}, None, None)
+    # And the shorter shape (6 args)
+    await cb("c2", "grep", "<out>", False, None, None)
+    # And the medium shape (7 args)
+    await cb("c3", "bash", "<out>", False, 5, {"decision": "allow"}, None)
 
 
 def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> None:
