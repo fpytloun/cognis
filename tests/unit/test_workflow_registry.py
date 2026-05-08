@@ -76,6 +76,8 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert implement_step.input is not None
     assert implement_step.input.type == "summary"
     assert "smallest correct change" in implement_step.prompt
+    assert "continue from that existing work instead of restarting from scratch" in implement_step.prompt
+    assert "preserve valid prior changes" in implement_step.prompt
     assert "worktree, and branch setup" in implement_step.prompt
     assert "fix the issue and rerun" in implement_step.prompt
     assert "unrelated pre-existing reason" in implement_step.prompt
@@ -131,6 +133,9 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     assert (
         "changes are acceptable, complete the step normally with success" in code_review_step.prompt
     )
+    assert "use the prior review history" in code_review_step.prompt
+    assert "focus on the new or changed diff since the last review" in code_review_step.prompt
+    assert "Do not re-report findings that are already fixed or unchanged" in code_review_step.prompt
     assert "Put the outcome only in step_complete" in code_review_step.prompt
     assert code_review_step.completion is not None
     assert code_review_step.completion.evaluate is False

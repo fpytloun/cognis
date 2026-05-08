@@ -389,6 +389,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Implement the approved plan. Follow the plan step by step while "
                 "preferring the smallest correct change that satisfies the task. "
+                "If Revision Context or prior implementation history is present, "
+                "continue from that existing work instead of restarting from scratch; "
+                "apply the requested fixes, preserve valid prior changes, and only "
+                "re-check details that are missing, stale, or needed for the fix. "
                 "Before editing, carry out the planned environment, workspace, "
                 "worktree, and branch setup that belongs to implementation. If project "
                 "instructions require a worktree or branch strategy, use it unless it is "
@@ -436,6 +440,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Review all changes made during implementation. If the review is complete "
                 "and the changes are acceptable, complete the step normally with success. "
+                "If this is a repeated review, use the prior review history, verify that "
+                "previously requested fixes were addressed, and focus on the new or changed "
+                "diff since the last review. Do not re-report findings that are already "
+                "fixed or unchanged unless they still block approval. "
                 "If the review is complete but fixes are required before approval, report that via "
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
                 "review itself could not be completed, use outcome.status='failed'. Put "
