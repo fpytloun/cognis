@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import json
 import re
 import shutil
@@ -106,6 +107,7 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
     pattern = arguments.get("pattern", "")
     search_path = arguments.get("path")
     include = arguments.get("include")
+    include_patterns = _normalize_include_patterns(include)
 
     if not pattern:
         return ToolResult(output="No pattern provided.", is_error=True)
@@ -122,7 +124,7 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
 
     if base.is_file():
         if _RG_PATH is not None:
-            rg_result = await _grep_with_rg(base.parent, str(pattern), None, target=base)
+            rg_result = await _grep_with_rg(base.parent, str(pattern), [], target=base)
             if rg_result is not None:
                 return rg_result
         return await _grep_file_with_python(base, str(pattern))
@@ -131,11 +133,11 @@ async def handle_grep(arguments: dict[str, Any], context: ToolExecutionContext) 
         return ToolResult(output=f"Not a directory or file: {search_path}", is_error=True)
 
     if _RG_PATH is not None:
-        rg_result = await _grep_with_rg(base, str(pattern), str(include) if include else None)
+        rg_result = await _grep_with_rg(base, str(pattern), include_patterns)
         if rg_result is not None:
             return rg_result
 
-    return await _grep_with_python(base, str(pattern), str(include) if include else None)
+    return await _grep_with_python(base, str(pattern), include_patterns)
 
 
 async def _glob_with_fd(base: Path, pattern: str) -> ToolResult | None:
@@ -194,7 +196,7 @@ def _format_glob_results(base: Path, matches: list[Path]) -> ToolResult:
 async def _grep_with_rg(
     base: Path,
     pattern: str,
-    include: str | None,
+    include_patterns: list[str],
     *,
     target: Path | None = None,
 ) -> ToolResult | None:
@@ -208,7 +210,7 @@ async def _grep_with_rg(
         "--max-count",
         str(_MAX_MATCHES),
     ]
-    if include:
+    for include in include_patterns:
         command.extend(["--glob", include])
     for skip_dir in sorted(_SKIP_DIRS):
         command.extend(["--glob", f"!**/{skip_dir}/**"])
@@ -258,15 +260,16 @@ async def _grep_with_rg(
     return _format_grep_results(base, results, total_matches)
 
 
-async def _grep_with_python(base: Path, pattern: str, include: str | None) -> ToolResult:
+async def _grep_with_python(base: Path, pattern: str, include_patterns: list[str]) -> ToolResult:
     regex = re.compile(pattern)
-    file_pattern = f"**/{include}" if include else "**/*"
     results: dict[str, list[tuple[int, str]]] = {}
     total_matches = 0
 
     try:
-        for file_path in base.glob(file_pattern):
+        for file_path in base.glob("**/*"):
             if not file_path.is_file() or _should_skip(file_path):
+                continue
+            if include_patterns and not _matches_any_include(base, file_path, include_patterns):
                 continue
             file_matches = _grep_python_file_matches(file_path, regex)
             total_matches += len(file_matches)
@@ -278,6 +281,81 @@ async def _grep_with_python(base: Path, pattern: str, include: str | None) -> To
         return ToolResult(output=f"Search error: {exc}", is_error=True)
 
     return _format_grep_results(base, results, total_matches)
+
+
+def _normalize_include_patterns(include: Any) -> list[str]:
+    """Return include globs, accepting either brace syntax or comma lists."""
+    if include is None:
+        return []
+    return [part for part in _split_top_level_commas(str(include)) if part]
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    brace_depth = 0
+
+    for char in value:
+        if char == "{":
+            brace_depth += 1
+        elif char == "}" and brace_depth > 0:
+            brace_depth -= 1
+
+        if char == "," and brace_depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(char)
+
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _matches_any_include(base: Path, file_path: Path, include_patterns: list[str]) -> bool:
+    try:
+        rel = file_path.relative_to(base).as_posix()
+    except ValueError:
+        rel = file_path.as_posix()
+    name = file_path.name
+
+    for pattern in include_patterns:
+        for expanded in _expand_brace_pattern(pattern):
+            if "/" in expanded:
+                if fnmatch.fnmatch(rel, expanded):
+                    return True
+            elif fnmatch.fnmatch(name, expanded):
+                return True
+    return False
+
+
+def _expand_brace_pattern(pattern: str) -> list[str]:
+    start = pattern.find("{")
+    if start == -1:
+        return [pattern]
+
+    depth = 0
+    end = -1
+    for index, char in enumerate(pattern[start:], start=start):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    if end == -1:
+        return [pattern]
+
+    prefix = pattern[:start]
+    suffix = pattern[end + 1 :]
+    expanded: list[str] = []
+    for option in _split_top_level_commas(pattern[start + 1 : end]):
+        expanded.extend(_expand_brace_pattern(f"{prefix}{option}{suffix}"))
+    return expanded or [pattern]
 
 
 async def _grep_file_with_python(file_path: Path, pattern: str) -> ToolResult:

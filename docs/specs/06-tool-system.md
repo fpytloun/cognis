@@ -252,7 +252,10 @@ grep_tool = ToolDefinition(
         "properties": {
             "pattern": {"type": "string", "description": "Regex pattern to search for"},
             "path": {"type": "string", "description": "Directory to search in"},
-            "include": {"type": "string", "description": "File pattern filter (e.g. '*.py')"},
+            "include": {
+                "type": "string",
+                "description": "File pattern filter; use brace syntax or comma-separated globs for multiple patterns (e.g. '*.py', '*.{ts,tsx}', '*.ts,*.svelte')",
+            },
         },
         "required": ["pattern"],
     },

@@ -364,7 +364,7 @@ GREP_TOOL = ToolDefinition(
             },
             "include": {
                 "type": "string",
-                "description": "Optional file pattern filter when path is a directory (e.g. '*.py', '*.{ts,tsx}').",
+                "description": "Optional file pattern filter when path is a directory. Use brace syntax or comma-separated globs for multiple patterns (e.g. '*.py', '*.{ts,tsx}', '*.ts,*.svelte').",
             },
         },
         "required": ["pattern"],

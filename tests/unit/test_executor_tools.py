@@ -1380,6 +1380,48 @@ class TestGrepTool:
         assert "other.ts" not in result.output
 
     @pytest.mark.asyncio()
+    async def test_grep_accepts_comma_separated_include_patterns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        (tmp_path / "a.ts").write_text("needle\n")
+        (tmp_path / "b.svelte").write_text("needle\n")
+        (tmp_path / "c.py").write_text("needle\n")
+
+        result = await handle_grep(
+            {"pattern": "needle", "path": str(tmp_path), "include": "*.ts,*.svelte"},
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        assert "a.ts" in result.output
+        assert "b.svelte" in result.output
+        assert "c.py" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_keeps_brace_include_patterns_together(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        (tmp_path / "a.ts").write_text("needle\n")
+        (tmp_path / "b.svelte").write_text("needle\n")
+        (tmp_path / "c.py").write_text("needle\n")
+
+        result = await handle_grep(
+            {"pattern": "needle", "path": str(tmp_path), "include": "*.{ts,svelte}"},
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        assert "a.ts" in result.output
+        assert "b.svelte" in result.output
+        assert "c.py" not in result.output
+
+    @pytest.mark.asyncio()
     async def test_grep_rg_uses_end_of_options_separator(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1408,6 +1450,37 @@ class TestGrepTool:
         separator_index = captured.index("--")
         assert captured[separator_index + 1] == pattern
         assert captured[separator_index + 2] == str(tmp_path)
+
+    @pytest.mark.asyncio()
+    async def test_grep_rg_uses_multiple_globs_for_comma_separated_include(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        captured: list[str] = []
+
+        class _Process:
+            returncode = 1
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return (b"", b"")
+
+        async def _fake_exec(*args: str, **_: object) -> _Process:
+            captured.extend(args)
+            return _Process()
+
+        monkeypatch.setattr(search_module, "_RG_PATH", "/usr/bin/rg")
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+        result = await handle_grep(
+            {"pattern": "needle", "path": str(tmp_path), "include": "*.ts,*.svelte"},
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        glob_indexes = [index for index, value in enumerate(captured) if value == "--glob"]
+        assert captured[glob_indexes[0] + 1] == "*.ts"
+        assert captured[glob_indexes[1] + 1] == "*.svelte"
 
 
 class TestBashTool:
