@@ -76,8 +76,11 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert implement_step.input is not None
     assert implement_step.input.type == "summary"
     assert "smallest correct change" in implement_step.prompt
+    assert "worktree, and branch setup" in implement_step.prompt
     assert "fix the issue and rerun" in implement_step.prompt
     assert "unrelated pre-existing reason" in implement_step.prompt
+    assert implement_step.completion is not None
+    assert implement_step.completion.evaluate is False
     assert update_docs_step.agent_override == "system:implement"
     assert update_docs_step.input is not None
     assert update_docs_step.input.type == "summary"
@@ -107,10 +110,13 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     assert architect_step.input is not None
     assert architect_step.input.type == "full"
     assert "do not block on nitpicks" in architect_step.prompt
+    assert "worktree/branch/PR handling" in architect_step.prompt
     assert (
         "plan is sound and ready, complete the step normally with success" in architect_step.prompt
     )
     assert "Put the outcome only in step_complete" in architect_step.prompt
+    assert architect_step.completion is not None
+    assert architect_step.completion.evaluate is False
     assert code_review_step.outcome_routes == [
         OutcomeRoute(
             status="rejected",
@@ -126,7 +132,13 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
         "changes are acceptable, complete the step normally with success" in code_review_step.prompt
     )
     assert "Put the outcome only in step_complete" in code_review_step.prompt
+    assert code_review_step.completion is not None
+    assert code_review_step.completion.evaluate is False
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+    assert commit_step.completion is not None
+    assert commit_step.completion.evaluate is False
+    assert "Push and open a pull request only" in commit_step.prompt
+    assert "publishing was not requested" in commit_step.prompt
 
     for step_name in ("plan", "implement", "update_docs", "remember"):
         step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == step_name)
@@ -170,12 +182,34 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
             assert step.allow_questions is False
     assert plan_step.completion is not None
     assert plan_step.completion.evaluator_prompt is None
+    assert plan_step.completion.evaluate is False
     assert "Files to create/modify (with rationale)" in plan_step.prompt
+    assert "Environment and workspace setup" in plan_step.prompt
+    assert "Worktree, branch, and repository strategy" in plan_step.prompt
+    assert "Commit, push, and pull request strategy" in plan_step.prompt
     assert "read-only planning step" in plan_step.prompt
     assert "do not edit files" in plan_step.prompt
     assert "Later workflow steps handle implementation" in plan_step.prompt
+    assert plan_step.metadata_contract is not None
+    metadata_fields = {field.name for field in plan_step.metadata_contract.fields}
+    assert "lifecycle_strategy" in metadata_fields
     assert "delegate" in plan_step.prompt
     assert "system:explore" in plan_step.prompt
+
+
+def test_software_development_workflow_uses_review_steps_instead_of_evaluator() -> None:
+    evaluated_by_review = {
+        "plan",
+        "architect_review",
+        "implement",
+        "code_review",
+        "final_summary",
+    }
+
+    for step_name in evaluated_by_review:
+        step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == step_name)
+        assert step.completion is not None
+        assert step.completion.evaluate is False
 
 
 def test_creative_workflow_can_ask_brief_clarifications() -> None:

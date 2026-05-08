@@ -287,11 +287,16 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "workflow steps handle implementation, verification, commit, and PR "
                 "work.\n\n"
                 "Then produce a detailed implementation plan covering:\n"
+                "- Environment and workspace setup needed before editing\n"
+                "- Worktree, branch, and repository strategy\n"
                 "- Files to create/modify (with rationale)\n"
                 "- Specific changes per file\n"
                 "- Edge cases and error handling\n"
                 "- Testing strategy\n"
-                "- Migration or compatibility concerns\n\n"
+                "- Documentation impact\n"
+                "- Commit, push, and pull request strategy when task or project instructions require them\n"
+                "- Migration, rollback, or compatibility concerns\n"
+                "- Which later workflow step owns each lifecycle action\n\n"
                 "If user intent, acceptance criteria, UX/API tradeoffs, migration policy, "
                 "compatibility expectations, or implementation scope are ambiguous enough that "
                 "proceeding would require a large assumption, ask one targeted clarification with "
@@ -307,12 +312,15 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                         name="risk", type="string", required=True, enum=["low", "medium", "high"]
                     ),
                     StepCompletionMetadataField(name="decisions", type="array", required=True),
+                    StepCompletionMetadataField(
+                        name="lifecycle_strategy", type="object", required=True
+                    ),
                     StepCompletionMetadataField(name="open_questions", type="array", required=True),
                 ]
             ),
             input=StepInputConfig(type="null"),
             completion=CompletionConfig(
-                evaluate=True,
+                evaluate=False,
                 max_attempts=5,
             ),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
@@ -328,8 +336,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Review this implementation plan as a proportional architecture and "
                 "risk check. Focus on missing security, reliability, testability, "
-                "data, dependency, and failure-mode considerations. Catch important "
-                "omissions and overengineering, but do not block on nitpicks. If the "
+                "data, dependency, environment, workspace, commit, and publishing "
+                "considerations. Catch important lifecycle omissions such as missing "
+                "worktree/branch/PR handling when task or project instructions require "
+                "them, but do not block on nitpicks. If the "
                 "plan is sound and ready, complete the step normally with success. If the "
                 "review is complete and the plan needs revision, report that via "
                 "step_complete.outcome.status='rejected' with a concise reason. If the "
@@ -338,7 +348,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "written review. The deliverable should be the actual review output."
             ),
             input=StepInputConfig(type="full", source="plan"),
-            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            completion=CompletionConfig(evaluate=False, max_attempts=3),
             outcome_routes=[
                 OutcomeRoute(
                     status="rejected",
@@ -379,6 +389,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Implement the approved plan. Follow the plan step by step while "
                 "preferring the smallest correct change that satisfies the task. "
+                "Before editing, carry out the planned environment, workspace, "
+                "worktree, and branch setup that belongs to implementation. If project "
+                "instructions require a worktree or branch strategy, use it unless it is "
+                "unsafe or blocked, and report any blocker clearly. "
                 "Inspect project instructions, package/build files, or existing "
                 "test patterns to identify the relevant verification commands. "
                 "After implementation, run the narrowest relevant tests, linters, "
@@ -391,7 +405,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "failed checks, and remaining risks."
             ),
             input=StepInputConfig(type="summary", source=["plan", "architect_review"]),
-            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            completion=CompletionConfig(evaluate=False, max_attempts=3),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -432,7 +446,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 type="summary",
                 source=["plan", "implement", "update_docs"],
             ),
-            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            completion=CompletionConfig(evaluate=False, max_attempts=3),
             outcome_routes=[
                 OutcomeRoute(
                     status="rejected",
@@ -451,11 +465,16 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             reasoning_effort="low",
             step_profile_id="system:coding",
             prompt=(
-                "Create a conventional commit for all changes. If the commit cannot be "
-                "created due to an operational problem such as missing git identity or a "
-                "hook failure, report that via step_complete.outcome.status='failed' with "
-                "a concise reason instead of pretending success. Write a short deliverable "
-                "summarizing the commit result and commit message."
+                "Create a conventional commit for all changes. Follow the approved plan's "
+                "commit, push, and pull request strategy. Push and open a pull request only "
+                "when task or project instructions explicitly require it; otherwise do not "
+                "push and state that publishing was not requested. If commit, push, or PR "
+                "creation cannot be completed due to an operational problem such as missing "
+                "git identity, missing remote, missing authentication, unavailable GitHub "
+                "CLI, or a hook failure, report that via step_complete.outcome.status='failed' "
+                "with a concise reason instead of pretending success. Write a short "
+                "deliverable summarizing the commit result, commit message, and any publish "
+                "or PR result."
             ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
@@ -488,7 +507,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             prompt=(
                 "Produce the final user-facing implementation report for this workflow. "
                 "Synthesize the approved plan, implementation summary, documentation status, "
-                "code review findings, commit result, and memory summary into one polished "
+                "code review findings, commit/publish result, and memory summary into one polished "
                 "deliverable. Focus on: what changed, what was verified, any remaining risks, "
                 "and any important follow-up notes."
             ),
@@ -504,7 +523,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     "remember",
                 ],
             ),
-            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            completion=CompletionConfig(evaluate=False, max_attempts=3),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),

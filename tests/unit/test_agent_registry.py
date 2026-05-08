@@ -74,6 +74,14 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
     assert "### Must Fix" in review.system_prompt
 
 
+def test_system_committer_allows_explicit_publish_only() -> None:
+    agent = SYSTEM_AGENTS["system:committer"]
+
+    assert "Push only when task or project instructions explicitly require publishing" in agent.system_prompt
+    assert "Open a pull request only when task or project instructions explicitly require" in agent.system_prompt
+    assert "NEVER push" not in agent.system_prompt
+
+
 def test_system_agents_seed_reasoning_and_override_capabilities() -> None:
     implement = SYSTEM_AGENTS["system:implement"]
     explore = SYSTEM_AGENTS["system:explore"]
