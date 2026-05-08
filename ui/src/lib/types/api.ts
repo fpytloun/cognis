@@ -1353,6 +1353,7 @@ export interface WebSocketMessageCompleteEvent {
   token_usage: Record<string, unknown> | null;
   context_usage: ContextUsage | null;
   queued_count: number;
+  messages?: QueuedMessage[];
   attachments?: AttachmentRef[];
 }
 
@@ -1552,6 +1553,29 @@ export interface WebSocketQueuedEvent {
   type: 'queued';
   conversation_id?: string;
   queued_count: number;
+  messages?: QueuedMessage[];
+}
+
+export interface QueuedMessage {
+  queue_id: string;
+  client_message_id?: string | null;
+  content: string;
+  attachments: AttachmentRef[];
+  created_at?: string | null;
+  updated_at?: string | null;
+  position: number;
+}
+
+export interface QueuedMessagesResponse {
+  messages: QueuedMessage[];
+  queued_count: number;
+}
+
+export interface WebSocketQueuedMessagesUpdatedEvent {
+  type: 'queued_messages_updated';
+  conversation_id?: string;
+  queued_count: number;
+  messages: QueuedMessage[];
 }
 
 export interface WebSocketReconnectedEvent {
@@ -1704,6 +1728,8 @@ export interface WebSocketUserMessageEvent {
   turn_id?: string | null;
   content: string;
   attachments?: AttachmentRef[];
+  queue_id?: string | null;
+  client_message_id?: string | null;
 }
 
 export type CognisWebSocketEvent =
@@ -1747,6 +1773,7 @@ export type CognisWebSocketEvent =
   | WebSocketConversationCreatedEvent
   | WebSocketUserMessageEvent
   | WebSocketQueuedEvent
+  | WebSocketQueuedMessagesUpdatedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent
   | WebSocketErrorEvent

@@ -81,6 +81,9 @@ DELETE /api/v1/conversations/:id                          → Delete
 DELETE /api/v1/conversations/:id/purge                    → Purge metadata (+ Intaris cascade)
 POST   /api/v1/conversations/:id/messages                 → Send a chat message (SSE or 202)
 GET    /api/v1/conversations/:id/messages                 → Get history (from Intaris events)
+GET    /api/v1/conversations/:id/queue                    → List pending queued user messages
+PATCH  /api/v1/conversations/:id/queue/:queue_id          → Edit pending queued message content
+DELETE /api/v1/conversations/:id/queue/:queue_id          → Cancel pending queued message
 GET    /api/v1/conversations/:id/sessions                 → List sessions
 GET    /api/v1/conversations/:id/delegations              → Active delegations
 GET    /api/v1/conversations/:id/sessions/:sid/events     → Session event stream
@@ -165,7 +168,7 @@ pairing code in the web UI.
 POST /api/v1/conversations/conv_abc/messages
 Content-Type: application/json
 Accept: text/event-stream
-{ "content": "What is the weather?" }
+{ "content": "What is the weather?", "client_message_id": "web_01HV..." }
 
 → 200 OK (SSE stream)
 event: token
@@ -212,6 +215,60 @@ POST /api/v1/conversations/conv_abc/messages
 
 Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
 `session_suspended` (409), `rate_limited` / `queue_full` (429).
+
+#### Queued Messages
+
+When a user sends another message while a turn is still processing, Cognis keeps
+that input in the conversation's in-memory pending queue. The queue API exposes
+the exact pending messages so clients can render, edit, or cancel them before the
+scheduler starts processing them.
+
+```http
+GET /api/v1/conversations/conv_abc/queue
+
+→ 200 OK
+{
+  "queued_count": 2,
+  "messages": [
+    {
+      "queue_id": "qmsg_01HV...",
+      "client_message_id": "web_01HV...",
+      "content": "Follow-up question",
+      "attachments": [],
+      "created_at": "2026-03-27T10:30:03Z",
+      "updated_at": "2026-03-27T10:30:03Z",
+      "position": 1
+    }
+  ]
+}
+```
+
+`queue_id` is the server-owned identifier for queue mutation. `client_message_id`
+is an optional caller-provided correlation ID used by web clients to reconcile an
+optimistic pending bubble with the persisted user-message event when the queued
+turn starts.
+
+```http
+PATCH /api/v1/conversations/conv_abc/queue/qmsg_01HV...
+{ "content": "Edited follow-up question" }
+
+→ 200 OK
+{ "queue_id": "qmsg_01HV...", "content": "Edited follow-up question", ... }
+```
+
+```http
+DELETE /api/v1/conversations/conv_abc/queue/qmsg_01HV...
+
+→ 204 No Content
+```
+
+Editing only changes message text. Queued attachments are immutable; clients
+should offer delete-and-recreate when the user needs to change attachments.
+Mutation endpoints return `404 not_found` if the queued message was already
+removed or popped for processing. Queue mutation uses the same conversation
+authorization as message sends: owners can edit or cancel pending queue entries,
+while read-only viewers can inspect queue state but receive `403 forbidden` for
+queue mutation attempts.
 
 ### Agents
 
@@ -502,8 +559,10 @@ Connections that do not send a valid auth message within the timeout are closed.
 
 ### Client → Server
 ```typescript
-{type: "message", conversation_id, content}       // User message
+{type: "message", conversation_id, content, client_message_id?}  // User message
 {type: "cancel", conversation_id, session_id?}     // Cancel
+{type: "cancel_queued_message", conversation_id, queue_id}  // Cancel pending queued message
+{type: "update_queued_message", conversation_id, queue_id, content}  // Edit pending queued text
 {type: "resolve_escalation", call_id, decision, note?}
 {type: "gate_response", task_id, step_name, action, feedback?}  // Respond to workflow gate
 {type: "step_response", task_id?, notification_id?, step_name?, response}  // Respond to step_request_input
@@ -514,11 +573,15 @@ Connections that do not send a valid auth message within the timeout are closed.
 The web client sends a heartbeat `ping` roughly every 30 seconds after the
 socket authenticates so stalled connections are detected proactively.
 
+Conversation-scoped frames are authorized before subscribing the socket or
+delivering queue snapshots. Queue edit/cancel frames require mutation access;
+read-only viewers receive `forbidden` and cannot change pending messages.
+
 ### Server → Client
 ```typescript
 // Streaming
 {type: "chunk", conversation_id, session_id, message_id, content, index}
-{type: "message_complete", conversation_id, message_id, seq, token_usage, queued_count}
+{type: "message_complete", conversation_id, message_id, seq, token_usage, queued_count, messages?}
 // Thinking (reasoning-capable models only)
 {type: "assistant_thinking_chunk", conversation_id, session_id, message_id, block_id, delta, title?, complete}
 {type: "assistant_thinking_block", conversation_id, session_id, message_id, block_id, title?, complete}
@@ -531,6 +594,8 @@ socket authenticates so stalled connections are detected proactively.
 
 // Conversation metadata
 {type: "conversation_updated", conversation_id, title?}
+{type: "queued", conversation_id, queued_count}
+{type: "queued_messages_updated", conversation_id, queued_count, messages}
 
 // Delegations (sub-session lifecycle)
 {type: "delegation_started", conversation_id, parent_session_id,

@@ -272,6 +272,22 @@ class SSETurnObserver:
             }
         )
 
+    async def on_queued_messages(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        if conversation_id != self._conversation_id or self._done:
+            return
+        await self._queue.put(
+            {
+                "event": "queued_messages_updated",
+                "data": {
+                    "conversation_id": conversation_id,
+                    "queued_count": len(messages),
+                    "messages": messages,
+                },
+            }
+        )
+
     # ------------------------------------------------------------------
     # SSE event generator
     # ------------------------------------------------------------------

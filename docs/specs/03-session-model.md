@@ -640,23 +640,21 @@ conversation marked `archived`.
 
 If a user sends messages while a turn is processing:
 
-1. Messages queued (max `max_queued_messages`, default 5)
+1. Messages queued with stable `queue_id` metadata and optional
+   `client_message_id` correlation (max `max_queued_messages`, default 5)
 2. Beyond limit → reject with error
 3. Control commands (`/cancel`, `/stop`, `/status`) bypass queue, processed
    immediately on a separate channel
-4. When current turn completes, all queued messages merged into a single user
-    message and processed as one turn. Format:
-    ```
-    [Queued messages (N messages while previous turn was processing)]
-
-    [1] message one content
-
-    [2] message two content
-    ```
-    Each message includes its index. The LLM sees them as a batch from the
-    same user. Individual messages are preserved in the Intaris event stream
-    as separate `user_message` events for audit fidelity.
-5. `queued_message_count` included in `message_complete` WebSocket event
+4. While pending, clients can list queued messages and may edit queued text or
+   delete a queued item before the scheduler pops it for processing. Attachment
+   changes require delete-and-recreate because uploaded attachment references
+   are immutable once queued.
+5. When the current turn completes, queued messages are popped in order and each
+   one is processed exactly once as its own follow-up turn. Each processed
+   queued input is preserved in the Intaris event stream as a `user_message`
+   event for audit fidelity.
+6. `queued_count` and `queued_messages_updated` WebSocket events keep clients in
+   sync with the pending queue.
 
 ### Escalation Timeout
 

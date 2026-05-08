@@ -205,6 +205,8 @@ class _QueuedMessage:
 
     content: str
     user_email: str
+    queue_id: str = field(default_factory=lambda: f"qmsg_{uuid.uuid4().hex}")
+    client_message_id: str | None = None
     attachments: list[dict[str, Any]] | None = None
     attachment_notice: str | None = None
     attachment_context: str | None = None
@@ -215,6 +217,19 @@ class _QueuedMessage:
     follow_up: FollowUpMetadata | None = None
     outbound_attachments: list[dict[str, Any]] | None = None
     turn_observers: tuple[TurnObserver, ...] = ()
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
+
+    def snapshot(self, position: int) -> dict[str, Any]:
+        return {
+            "queue_id": self.queue_id,
+            "client_message_id": self.client_message_id,
+            "content": self.content,
+            "attachments": strip_attachment_payload_bytes(self.attachments or []),
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "position": position,
+        }
 
 
 @dataclass(slots=True)
@@ -307,6 +322,10 @@ class TurnObserver(Protocol):
     async def on_system_message(self, conversation_id: str, text: str) -> None: ...
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None: ...
+
+    async def on_queued_messages(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +503,10 @@ class TurnScheduler:
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+        client_message_id: str | None = None,
+        queued_message_id: str | None = None,
+        prepared_attachment_notice: str | None = None,
+        prepared_attachment_context: str | None = None,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
 
@@ -533,11 +556,15 @@ class TurnScheduler:
                 recoverable=False,
             )
 
-        attachment_notice, attachment_context = await self._build_attachment_support_messages(
-            session=session,
-            agent=agent,
-            attachments=normalized_attachments,
-        )
+        if prepared_attachment_notice is None and prepared_attachment_context is None:
+            attachment_notice, attachment_context = await self._build_attachment_support_messages(
+                session=session,
+                agent=agent,
+                attachments=normalized_attachments,
+            )
+        else:
+            attachment_notice = prepared_attachment_notice
+            attachment_context = prepared_attachment_context
 
         # Conversation state check
         if conversation.status in {"archived", "deleted"}:
@@ -568,11 +595,19 @@ class TurnScheduler:
                 conversation_id=conversation_id,
             )
             if pending_esc is not None:
+                queue = self._queued_messages[conversation_id]
+                if client_message_id and any(
+                    queued.client_message_id == client_message_id for queued in queue
+                ):
+                    await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
+                    return None
                 # Queue the message behind the escalation
-                self._queued_messages[conversation_id].append(
+                queue.append(
                     _QueuedMessage(
+                        queue_id=self._new_queue_id(),
                         content=effective_content,
                         user_email=user_email,
+                        client_message_id=client_message_id,
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
                         ],
@@ -586,6 +621,7 @@ class TurnScheduler:
                         turn_observers=tuple(turn_observers or ()),
                     )
                 )
+                await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
                 last_notified_pause_id = self._escalation_notice_pause_ids.get(conversation_id)
                 if last_notified_pause_id != pending_esc.pause_id:
                     self._escalation_notice_pause_ids[conversation_id] = pending_esc.pause_id
@@ -633,6 +669,11 @@ class TurnScheduler:
         active = self._active_turns.get(conversation_id)
         if active is not None and not active.done():
             queue = self._queued_messages[conversation_id]
+            if client_message_id and any(
+                queued.client_message_id == client_message_id for queued in queue
+            ):
+                await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
+                return None
             if len(queue) >= MAX_QUEUED_MESSAGES:
                 return TurnError(
                     code="queue_full",
@@ -641,8 +682,10 @@ class TurnScheduler:
                 )
             queue.append(
                 _QueuedMessage(
+                    queue_id=self._new_queue_id(),
                     content=effective_content,
                     user_email=user_email,
+                    client_message_id=client_message_id,
                     attachments=[item.model_dump(mode="json") for item in normalized_attachments],
                     attachment_notice=attachment_notice,
                     attachment_context=attachment_context,
@@ -655,10 +698,7 @@ class TurnScheduler:
                     turn_observers=tuple(turn_observers or ()),
                 )
             )
-            # Notify observers that the message was queued
-            for observer in self._iter_observers(conversation_id, turn_observers=turn_observers):
-                with contextlib.suppress(Exception):
-                    await observer.on_queued(conversation_id, len(queue))
+            await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
             return None
 
         if session.status == SessionStatus.IDLE:
@@ -697,6 +737,8 @@ class TurnScheduler:
             delivery_fallback_text=delivery_fallback_text,
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             turn_observers=tuple(turn_observers or ()),
+            client_message_id=client_message_id,
+            queue_id=queued_message_id,
         )
         return None
 
@@ -713,6 +755,8 @@ class TurnScheduler:
                         conversation_id, queued.follow_up.follow_up_id
                     )
             queue.clear()
+        if cleared_queue:
+            await self._notify_queue_updated(conversation_id)
         if control is None:
             return cleared_queue
         if isinstance(control, asyncio.Event):
@@ -755,6 +799,79 @@ class TurnScheduler:
         """Return the number of queued messages for a conversation."""
         return len(self._queued_messages.get(conversation_id, []))
 
+    def queued_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Return safe metadata for pending queued messages."""
+        return [
+            queued.snapshot(position=index + 1)
+            for index, queued in enumerate(self._queued_messages.get(conversation_id, []))
+        ]
+
+    async def cancel_queued_message(self, conversation_id: str, queue_id: str) -> bool:
+        queue = self._queued_messages.get(conversation_id)
+        if not queue:
+            return False
+        for index, queued in enumerate(queue):
+            if queued.queue_id != queue_id:
+                continue
+            del queue[index]
+            await self._notify_queue_updated(conversation_id)
+            if queued.follow_up is not None:
+                await self._clear_follow_up_pending(conversation_id, queued.follow_up.follow_up_id)
+            return True
+        return False
+
+    async def update_queued_message(
+        self, conversation_id: str, queue_id: str, *, content: str
+    ) -> dict[str, Any] | None:
+        queue = self._queued_messages.get(conversation_id)
+        if not queue:
+            return None
+        for index, queued in enumerate(queue):
+            if queued.queue_id != queue_id:
+                continue
+            queued.content = content
+            queued.updated_at = _utcnow()
+            snapshot = queued.snapshot(position=index + 1)
+            await self._notify_queue_updated(conversation_id)
+            return snapshot
+        return None
+
+    @staticmethod
+    def _new_queue_id() -> str:
+        return f"qmsg_{uuid.uuid4().hex}"
+
+    async def _notify_queue_updated(
+        self,
+        conversation_id: str,
+        *,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
+    ) -> None:
+        messages = self.queued_messages(conversation_id)
+        observers = self._iter_observers(conversation_id, turn_observers=turn_observers)
+        await asyncio.gather(
+            *(
+                self._call_observer(
+                    conversation_id,
+                    observer,
+                    observer.on_queued,
+                    conversation_id,
+                    len(messages),
+                )
+                for observer in observers
+            ),
+            *(
+                self._call_observer(
+                    conversation_id,
+                    observer,
+                    observer.on_queued_messages,
+                    conversation_id,
+                    messages,
+                )
+                for observer in observers
+                if callable(getattr(observer, "on_queued_messages", None))
+            ),
+        )
+
     async def _consume_queued_batch_for_active_turn(
         self,
         conversation_id: str,
@@ -792,6 +909,8 @@ class TurnScheduler:
                 control.absorbed_delivery_fallback_text = queued.delivery_fallback_text
             payloads.append(
                 {
+                    "queue_id": queued.queue_id,
+                    "client_message_id": queued.client_message_id,
                     "content": queued.content,
                     "attachments": list(queued.attachments or []),
                     "attachment_notice": queued.attachment_notice,
@@ -815,6 +934,8 @@ class TurnScheduler:
                             "session_id": self._turn_sessions.get(conversation_id),
                             "content": queued.content,
                             "attachments": strip_attachment_payload_bytes(queued.attachments or []),
+                            "queue_id": queued.queue_id,
+                            "client_message_id": queued.client_message_id,
                         },
                     )
                 )
@@ -830,13 +951,7 @@ class TurnScheduler:
                 }
             },
         )
-        await self._notify_observers(
-            conversation_id,
-            "on_queued",
-            conversation_id,
-            self.queued_count(conversation_id),
-            turn_observers=control.turn_observers,
-        )
+        await self._notify_queue_updated(conversation_id, turn_observers=control.turn_observers)
         return payloads
 
     def _queued_message_is_absorbable(self, queued: _QueuedMessage) -> bool:
@@ -1185,7 +1300,10 @@ class TurnScheduler:
                 model_info.supports_audio_input or model_info.supports_file_input
             ):
                 continue
-            if attachment.kind in {ArtifactKind.FILE, ArtifactKind.VIDEO} and model_info.supports_file_input:
+            if (
+                attachment.kind in {ArtifactKind.FILE, ArtifactKind.VIDEO}
+                and model_info.supports_file_input
+            ):
                 continue
             if attachment.kind == ArtifactKind.PDF:
                 extracted = await self._extract_pdf_text(attachment)
@@ -1295,6 +1413,8 @@ class TurnScheduler:
         delivery_fallback_text: str | None = None,
         bootstrap_wait_for_intention: bool = False,
         turn_observers: tuple[TurnObserver, ...] = (),
+        client_message_id: str | None = None,
+        queue_id: str | None = None,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
@@ -1322,6 +1442,8 @@ class TurnScheduler:
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 cancel_event=control.cancel_event,
                 turn_control=control,
+                client_message_id=client_message_id,
+                queue_id=queue_id,
             )
         )
 
@@ -1346,6 +1468,8 @@ class TurnScheduler:
         cancel_event: asyncio.Event,
         turn_control: _TurnControl | None = None,
         turn_observers: tuple[TurnObserver, ...] = (),
+        client_message_id: str | None = None,
+        queue_id: str | None = None,
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
@@ -1417,6 +1541,8 @@ class TurnScheduler:
                             "attachments": [
                                 item.model_dump(mode="json") for item in (attachments or [])
                             ],
+                            "client_message_id": client_message_id,
+                            "queue_id": queue_id,
                         },
                     )
                 )
@@ -1683,6 +1809,13 @@ class TurnScheduler:
                         delivery_id=queued.delivery_id,
                         delivery_fallback_text=queued.delivery_fallback_text,
                         turn_observers=queued.turn_observers,
+                        client_message_id=queued.client_message_id,
+                        queued_message_id=queued.queue_id,
+                        prepared_attachment_notice=queued.attachment_notice,
+                        prepared_attachment_context=queued.attachment_context,
+                    )
+                    await self._notify_queue_updated(
+                        conversation_id, turn_observers=queued.turn_observers
                     )
                     if error is not None and queued.follow_up is not None:
                         await self._clear_follow_up_pending(

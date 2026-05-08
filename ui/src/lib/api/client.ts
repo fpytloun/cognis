@@ -36,6 +36,8 @@ import type {
   MCPServer,
   MCPServerUpdateRequest,
   MessageHistoryResponse,
+  QueuedMessage,
+  QueuedMessagesResponse,
   Notification,
   PushSubscriptionPayload,
   PushSubscriptionResponse,
@@ -303,6 +305,23 @@ export const api = {
   },
 
   conversations: {
+    getQueue(conversationId: string): Promise<QueuedMessagesResponse> {
+      return request<QueuedMessagesResponse>(`/api/v1/conversations/${conversationId}/queue`);
+    },
+
+    updateQueuedMessage(conversationId: string, queueId: string, content: string): Promise<QueuedMessage> {
+      return request<QueuedMessage>(`/api/v1/conversations/${conversationId}/queue/${queueId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ content })
+      });
+    },
+
+    deleteQueuedMessage(conversationId: string, queueId: string): Promise<void> {
+      return request<void>(`/api/v1/conversations/${conversationId}/queue/${queueId}`, {
+        method: 'DELETE'
+      });
+    },
+
     list(
       cursor: string | null = null,
       filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}

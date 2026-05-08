@@ -19,6 +19,9 @@ import pytest
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketTurnObserver,
+    _handle_cancel_queued_message,
+    _handle_message,
+    _handle_update_queued_message,
     _workflow_composed_payload,
 )
 from cognis.core.turn_scheduler import (
@@ -27,6 +30,7 @@ from cognis.core.turn_scheduler import (
     classify_turn_error,
 )
 from cognis.models.config import ProviderHealth
+from cognis.store.queries import create_agent, create_conversation, create_user
 
 # ---------------------------------------------------------------------------
 # Helpers — fake providers for classify_turn_error
@@ -46,6 +50,49 @@ class _FakeRaisingProvider:
 
     async def health(self) -> ProviderHealth:
         raise RuntimeError("provider health check exploded")
+
+
+class _RecordingManager:
+    def __init__(self) -> None:
+        self.errors: list[dict[str, object]] = []
+        self.snapshots: list[str] = []
+        self.subscriptions: list[str] = []
+
+    async def send_error(self, _: object, **kwargs: object) -> None:
+        self.errors.append(kwargs)
+
+    def subscribe(self, _: object, conversation_id: str) -> None:
+        self.subscriptions.append(conversation_id)
+
+    async def send_queue_snapshot(self, _: object, conversation_id: str) -> None:
+        self.snapshots.append(conversation_id)
+
+
+async def _seed_conversation(app: Any, *, owner: str = "owner@example.com") -> str:
+    async with app.state.session_factory() as session:
+        await create_user(
+            session,
+            email=owner,
+            name="Owner",
+            password_hash=app.state.password_hasher.hash("password123"),
+            role="user",
+        )
+        await create_agent(
+            session,
+            agent_id="agent-queue-auth",
+            owner_email=owner,
+            name="Agent",
+            status="active",
+        )
+        conversation = await create_conversation(
+            session,
+            user_email=owner,
+            agent_id="agent-queue-auth",
+            context_type="web",
+            title="Conversation",
+        )
+        await session.commit()
+        return conversation.conversation_id
 
 
 @dataclass
@@ -366,6 +413,75 @@ def test_workflow_composed_payload_supports_lifecycle_backed_replay() -> None:
         "lifecycle": "persistent",
         "steps": ["collect_gmail", "synthesize_summary"],
     }
+
+
+@pytest.mark.asyncio
+async def test_ws_message_does_not_send_queue_snapshot_before_authorization(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        conversation_id = await _seed_conversation(client.app, owner="owner@example.com")
+        manager = _RecordingManager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-queue-auth",
+            websocket=AsyncMock(),
+            user_email="intruder@example.com",
+            role="user",
+        )
+
+        await _handle_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {"type": "message", "conversation_id": conversation_id, "content": "hello"},
+        )
+
+        assert manager.errors[-1]["code"] == "forbidden"
+        assert manager.subscriptions == []
+        assert manager.snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_ws_viewer_cannot_cancel_or_update_queued_messages(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        conversation_id = await _seed_conversation(client.app, owner="viewer@example.com")
+        turn_scheduler = AsyncMock()
+        client.app.state.turn_scheduler = turn_scheduler
+        manager = _RecordingManager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-viewer-queue",
+            websocket=AsyncMock(),
+            user_email="viewer@example.com",
+            role="viewer",
+        )
+
+        await _handle_cancel_queued_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {
+                "type": "cancel_queued_message",
+                "conversation_id": conversation_id,
+                "queue_id": "q-1",
+            },
+        )
+        await _handle_update_queued_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {
+                "type": "update_queued_message",
+                "conversation_id": conversation_id,
+                "queue_id": "q-1",
+                "content": "edited",
+            },
+        )
+
+        assert [error["code"] for error in manager.errors] == ["forbidden", "forbidden"]
+        turn_scheduler.cancel_queued_message.assert_not_awaited()
+        turn_scheduler.update_queued_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

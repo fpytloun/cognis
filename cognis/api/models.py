@@ -1441,6 +1441,7 @@ class SendMessageRequest(BaseModel):
 
     content: str = Field(default="", max_length=100_000)
     attachments: list[AttachmentRef] = Field(default_factory=list, max_length=20)
+    client_message_id: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def _validate_not_empty(self) -> SendMessageRequest:
@@ -1453,6 +1454,31 @@ class SendMessageResponse(BaseModel):
     """Response for fire-and-forget message submission (202 Accepted)."""
 
     status: Literal["accepted", "queued"] = "accepted"
+
+
+class QueuedMessageResponse(BaseModel):
+    queue_id: str
+    client_message_id: str | None = None
+    content: str
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: str | None = None
+    updated_at: str | None = None
+    position: int
+
+
+class QueuedMessagesResponse(BaseModel):
+    messages: list[QueuedMessageResponse]
+    queued_count: int
+
+
+class UpdateQueuedMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100_000)
+
+    @model_validator(mode="after")
+    def _validate_not_blank(self) -> UpdateQueuedMessageRequest:
+        if not self.content.strip():
+            raise ValueError("content is required")
+        return self
 
 
 class EscalationResolveRequest(BaseModel):
