@@ -2499,6 +2499,11 @@ class AgentLoop:
         "i am unable to",
         "no further tools",
         "maximum steps",
+        "already provided the final findings",
+        "no additional user-facing information",
+        "remaining todo state is stale",
+        "todo state is stale",
+        "already delivered",
     )
     _META_COMPLAINT_MAX_LEN = 600
 
@@ -3811,6 +3816,45 @@ class AgentLoop:
                         content,
                         strip_attachment_payload_bytes(collected_attachments),
                     )
+                    current_deliverable: Deliverable | None = None
+                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                        current_deliverable = await self._get_current_deliverable(ctx)
+
+                    if current_deliverable is not None:
+                        summary = visible_completion_content.strip()
+                        if not summary:
+                            summary = (
+                                current_deliverable.title.strip()
+                                if isinstance(current_deliverable.title, str)
+                                and current_deliverable.title.strip()
+                                else compact_snippet(
+                                    current_deliverable.content.strip(),
+                                    max_chars=500,
+                                )
+                            )
+                        if not summary:
+                            summary = "Step completed with delegated deliverable."
+                        step_output = StepOutput(
+                            summary=summary[:500],
+                            content=current_deliverable.content,
+                            outputs=(
+                                dict(current_deliverable.outputs)
+                                if isinstance(current_deliverable.outputs, dict)
+                                else {}
+                            ),
+                            claims=[],
+                            deliverable_id=current_deliverable.deliverable_id,
+                            deliverable_version=current_deliverable.version,
+                            deliverable_format=current_deliverable.format,
+                            deliverable_title=current_deliverable.title,
+                            attachments=list(collected_attachments),
+                            session_id=ctx.session.session_id,
+                            intaris_session_id=ctx.session.intaris_session_id
+                            or ctx.session.session_id,
+                            completed_at=datetime.now(UTC),
+                        )
+                        break
+
                     summary = visible_completion_content.strip()
                     if not summary:
                         if (

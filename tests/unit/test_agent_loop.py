@@ -1890,6 +1890,60 @@ class _ToolCallCeilingLLM:
         return
 
 
+class _DelegationDeliverableThenLimitLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_write_before_limit",
+                                    "function": {
+                                        "name": "write_deliverable",
+                                        "arguments": (
+                                            '{"content":"Deliverable output from delegated run.",' 
+                                            '"outputs":{"source":"deliverable"}}'
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "content": (
+                            "Already provided the final findings above. "
+                            "No additional user-facing information remains; "
+                            "the remaining todo state is stale."
+                        )
+                    }
+                }
+            ]
+        }
+
+
 class _NoopRememberQueue:
     async def enqueue(self, _: object) -> None:
         return None
@@ -3610,6 +3664,10 @@ def test_looks_like_meta_complaint_detects_known_patterns() -> None:
     assert AgentLoop._looks_like_meta_complaint(
         "Tool budget reached. Tools are disabled."
     )
+    assert AgentLoop._looks_like_meta_complaint(
+        "Already provided the final findings above. No additional user-facing information remains; "
+        "the remaining todo state is stale."
+    )
     assert AgentLoop._looks_like_meta_complaint("")
     # Substantive technical text is NOT a meta-complaint
     assert not AgentLoop._looks_like_meta_complaint(
@@ -3621,6 +3679,73 @@ def test_looks_like_meta_complaint_detects_known_patterns() -> None:
     # they probably embed the phrase in a substantive context.
     long_text = "The user reported that 'tool budget' messages are unhelpful. " * 30
     assert not AgentLoop._looks_like_meta_complaint(long_text)
+
+
+@pytest.mark.asyncio
+async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(
+            llm=_DelegationDeliverableThenLimitLLM(),
+            guardrails=_NoopGuardrails(),
+        ),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    async def _write_deliverable(ctx: StepContext, **kwargs: object) -> Deliverable:
+        deliverable = Deliverable(
+            deliverable_id="dlv-limit",
+            step_run_id="sr-parent",
+            version=1,
+            content=str(kwargs["content"]),
+            format="markdown",
+            title="Delegated deliverable",
+            outputs=dict(kwargs.get("outputs") or {}),
+        )
+        return agent_loop._cache_deliverable(ctx, deliverable)
+
+    monkeypatch.setattr(agent_loop, "_write_step_deliverable", _write_deliverable)
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
+        session=SimpleNamespace(
+            session_id="child-limit",
+            intaris_session_id="child-limit",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="system:explore",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            execution={"max_tool_calls": 1},
+            is_system=True,
+        ),
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+        user_message="Investigate.",
+        deliverable_step_run_id="sr-parent",
+        system_initiated=True,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.deliverable_id == "dlv-limit"
+    assert output.content == "Deliverable output from delegated run."
+    assert output.outputs == {"source": "deliverable"}
 
 
 @pytest.mark.asyncio
