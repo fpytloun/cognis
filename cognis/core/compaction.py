@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from prometheus_client import Counter
@@ -27,6 +28,9 @@ ROTATION_TOTAL = Counter(
     "Total session rotations after compaction",
     ["trigger"],
 )
+
+_TOOL_CALL_ARGUMENT_MAX_CHARS = 1_000
+_TOOL_RESULT_MAX_CHARS = 2_000
 
 
 class CompactionResult(BaseModel):
@@ -130,6 +134,7 @@ class CompactionStrategy:
             summary = extract_text_from_response(response).strip()
             if not summary:
                 raise ValueError("LLM compaction returned empty summary")
+            summary = _append_recoverable_tool_output_handles(summary, older_events)
         except Exception:
             logger.warning(
                 "LLM compaction failed, falling back to mechanical",
@@ -243,19 +248,25 @@ def _format_events_for_compaction(events: list[Any]) -> str:
         elif etype == "tool_call":
             name = data.get("name", "unknown")
             args = data.get("arguments", "")
-            # Truncate large arguments for the compaction prompt
-            if isinstance(args, str) and len(args) > 500:
-                args = args[:500] + "..."
-            payload = f"{name}({args})"
+            args_text = _stringify_compaction_value(args)
+            args_text = _truncate_compaction_text(
+                args_text,
+                _TOOL_CALL_ARGUMENT_MAX_CHARS,
+            )
+            metadata = _tool_event_metadata(data)
+            payload = f"{name}{metadata} args={args_text}"
         elif etype == "tool_result":
             name = data.get("name", "")
             result = data.get("result") or data.get("output", "")
             is_error = data.get("is_error", False)
-            prefix = f"[ERROR] {name}: " if is_error else f"{name}: "
-            # Truncate large results for the compaction prompt
-            if isinstance(result, str) and len(result) > 1000:
-                result = result[:1000] + "..."
-            payload = prefix + str(result)
+            prefix = f"[ERROR] {name}" if is_error else str(name)
+            recovery_hint = _tool_result_recovery_hint(data)
+            result_text = _truncate_compaction_text(
+                _stringify_compaction_value(result),
+                _TOOL_RESULT_MAX_CHARS,
+                recovery_hint=recovery_hint,
+            )
+            payload = f"{prefix}{_tool_event_metadata(data)}: {result_text}"
         elif etype == "delegation":
             status = data.get("status", "")
             mode = data.get("mode", "")
@@ -269,6 +280,96 @@ def _format_events_for_compaction(events: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _stringify_compaction_value(value: Any) -> str:
+    """Return a stable text representation for compaction prompts."""
+
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _truncate_compaction_text(
+    text: str,
+    max_chars: int,
+    *,
+    recovery_hint: str | None = None,
+) -> str:
+    """Truncate text for compaction while preserving recovery instructions."""
+
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = f"[truncated for compaction: omitted {omitted:,} chars"
+    if recovery_hint:
+        marker += f"; {recovery_hint}"
+    marker += "]"
+    return text[:max_chars].rstrip() + "\n" + marker
+
+
+def _tool_event_metadata(data: dict[str, Any]) -> str:
+    """Return compact tool metadata that helps summaries retain recovery handles."""
+
+    fields: list[str] = []
+    for key in ("call_id", "recovery_call_id", "source_call_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            fields.append(f"{key}={value!r}")
+    output_size = data.get("output_size")
+    if isinstance(output_size, int) and output_size > 0:
+        fields.append(f"output_size={output_size}")
+    if data.get("has_full_output") is True:
+        fields.append("has_full_output=true")
+    return "" if not fields else " " + " ".join(fields)
+
+
+def _tool_result_recovery_hint(data: dict[str, Any]) -> str | None:
+    """Return concrete recovery calls for a saved tool result, if available."""
+
+    recovery_call_id = data.get("recovery_call_id")
+    call_id = recovery_call_id
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = data.get("call_id") if data.get("has_full_output") is True else None
+    if not isinstance(call_id, str) or not call_id.strip():
+        return None
+    quoted = repr(call_id)
+    return (
+        f"recover with read_tool_output(call_id={quoted}) or "
+        f"search_tool_output(call_id={quoted}, pattern='keyword')"
+    )
+
+
+def _recoverable_tool_output_lines(events: list[Any]) -> list[str]:
+    """Return deterministic recoverable tool-output handle lines."""
+
+    lines: list[str] = []
+    for event in events:
+        if event.type != "tool_result":
+            continue
+        hint = _tool_result_recovery_hint(event.data)
+        if not hint:
+            continue
+        name = event.data.get("name") or "tool"
+        lines.append(f"- [{event.seq}] {name}: {hint}")
+    return lines
+
+
+def _append_recoverable_tool_output_handles(summary: str, events: list[Any]) -> str:
+    """Ensure LLM compaction cannot drop saved tool-output recovery handles."""
+
+    lines = _recoverable_tool_output_lines(events)
+    if not lines:
+        return summary
+    block_lines = ["Recoverable tool outputs before compaction:"]
+    block_lines.extend(lines)
+    block = "\n".join(block_lines)
+    if block in summary:
+        return summary
+    return summary.rstrip() + "\n\n" + block
+
+
 def _mechanical_summary(events: list[Any]) -> str:
     type_counts: dict[str, int] = {}
     recent_user_requests: list[str] = []
@@ -278,6 +379,7 @@ def _mechanical_summary(events: list[Any]) -> str:
             content = event.data.get("content")
             if isinstance(content, str) and content.strip():
                 recent_user_requests.append(content.strip().replace("\n", " ")[:120])
+    recoverable_tool_outputs = _recoverable_tool_output_lines(events)
     summary_lines = ["Older conversation summary (mechanical fallback):"]
     summary_lines.extend(
         f"- {event_type}: {count}" for event_type, count in sorted(type_counts.items())
@@ -285,4 +387,7 @@ def _mechanical_summary(events: list[Any]) -> str:
     if recent_user_requests:
         summary_lines.append("Recent preserved requests before compaction:")
         summary_lines.extend(f"- {request}" for request in recent_user_requests[-5:])
+    if recoverable_tool_outputs:
+        summary_lines.append("Recoverable tool outputs before compaction:")
+        summary_lines.extend(recoverable_tool_outputs)
     return "\n".join(summary_lines)

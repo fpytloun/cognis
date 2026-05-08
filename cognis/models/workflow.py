@@ -402,6 +402,7 @@ class WorkflowState(BaseModel):
     status: Literal["running", "paused", "completed", "failed", "cancelled"] = "running"
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
+    last_retry_reason: Literal["execution_failed", "evaluation_rejected"] | None = None
     last_revision_context: str | None = None  # Full reviewer output for backward revisions
     last_operator_instruction: str | None = None  # One-shot human instruction for next step
     pending_pause_type: (
@@ -409,6 +410,15 @@ class WorkflowState(BaseModel):
     ) = None
     pending_pause_payload: dict[str, Any] | None = None
     current_step_status: Literal["running", "paused"] | None = None
+
+    @field_validator("last_retry_reason", mode="before")
+    @classmethod
+    def _normalize_last_retry_reason(cls, value: Any) -> str | None:
+        """Ignore stale persisted retry reasons from older controller versions."""
+
+        if value in {"execution_failed", "evaluation_rejected"}:
+            return str(value)
+        return None
 
     def get_source_intaris_session_id(self, step_name: str) -> str:
         """Resolve the Intaris session ID from a completed source step.

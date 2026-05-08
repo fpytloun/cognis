@@ -27,7 +27,11 @@ from cognis.core.attachment_utils import (
     attachment_placeholder_text as _attachment_placeholder_text,
 )
 from cognis.core.context_budget import resolve_context_budget
-from cognis.core.context_projection import project_messages
+from cognis.core.context_projection import (
+    build_compacted_tool_result_placeholder,
+    clear_large_tool_call_arguments,
+    project_messages,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
     FollowUpMetadata,
@@ -2022,7 +2026,15 @@ class ContextAssembler:
                 pruned_messages.pop(recalled_index)
                 continue
 
-            # Priority 2: Drop oldest non-protected messages (history).
+            # Priority 2: Compact old tool outputs to recoverable placeholders.
+            # This keeps call_id handles visible before we resort to dropping
+            # complete tool-call groups under hard context pressure.
+            compacted_messages = _compact_oldest_droppable_tool_group(pruned_messages)
+            if compacted_messages is not None:
+                pruned_messages = compacted_messages
+                continue
+
+            # Priority 3: Drop oldest non-protected messages (history).
             # Tool call groups (assistant message with tool_calls + matching
             # tool role responses) must be dropped atomically to avoid
             # orphaned tool_calls that LLM providers reject.
@@ -2539,6 +2551,63 @@ def _format_search_results(search_results: Any) -> str | None:
         prefix = f"- ({score:.2f}) " if isinstance(score, (int, float)) else "- "
         lines.append(prefix + memory.strip())
     return "\n".join(lines) if lines else None
+
+
+def _compact_oldest_droppable_tool_group(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Compact the oldest unprotected tool group instead of dropping it outright."""
+
+    last_idx = len(messages) - 1
+    for index, message in enumerate(messages):
+        if index == last_idx:
+            continue
+        if _is_protected_context_message(message) or message.get("_follow_up_context"):
+            continue
+        if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
+            continue
+        call_ids = {
+            tc.get("id") or tc.get("call_id", "")
+            for tc in message["tool_calls"]
+            if isinstance(tc, dict)
+        } - {""}
+        if not call_ids:
+            continue
+
+        result_indices: list[int] = []
+        for follow_index in range(index + 1, last_idx):
+            follow = messages[follow_index]
+            if follow.get("role") == "tool" and follow.get("tool_call_id") in call_ids:
+                result_indices.append(follow_index)
+                continue
+            if follow.get("role") == "tool":
+                continue
+            break
+        if not result_indices:
+            continue
+
+        compacted = list(messages)
+        compacted[index] = clear_large_tool_call_arguments(message)
+        changed = compacted[index] != message
+        for result_index in result_indices:
+            tool_message = messages[result_index]
+            if tool_message.get("_protected_tool_output") or tool_message.get("_projected_compacted"):
+                continue
+            content = tool_message.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            placeholder = build_compacted_tool_result_placeholder(tool_message)
+            if len(placeholder) >= len(content):
+                continue
+            compacted[result_index] = {
+                **tool_message,
+                "content": placeholder,
+                "_projected_compacted": True,
+            }
+            changed = True
+        if changed:
+            return compacted
+    return None
 
 
 def _find_oldest_droppable_group(

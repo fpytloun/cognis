@@ -608,6 +608,7 @@ class WorkflowEngine:
                 state.pending_pause_type = None
                 state.pending_pause_payload = None
                 state.last_evaluation_feedback = None
+                state.last_retry_reason = None
                 state.last_revision_context = None
                 state.last_operator_instruction = None
                 state.current_step_index += 1
@@ -1502,6 +1503,7 @@ class WorkflowEngine:
         if evaluation:
             await self._record_evaluation_feedback(task, step_def, state, evaluation)
 
+        state.last_retry_reason = reason
         state.loop_iterations[attempt_key] = current_attempts + 1
         logger.info(
             "Step retry",
@@ -1534,6 +1536,7 @@ class WorkflowEngine:
         route = self._resolve_outcome_route(step_def, outcome_status)
         if route is None:
             state.last_evaluation_feedback = None
+            state.last_retry_reason = None
             state.last_revision_context = None
             state.last_operator_instruction = None
             return "continue"
@@ -1553,6 +1556,7 @@ class WorkflowEngine:
 
         if action == "continue":
             state.last_evaluation_feedback = None
+            state.last_retry_reason = None
             state.last_revision_context = None
             state.last_operator_instruction = None
             return "continue"
@@ -1588,6 +1592,7 @@ class WorkflowEngine:
             )
             if gate_result == "continue":
                 state.last_evaluation_feedback = None
+                state.last_retry_reason = None
                 state.last_revision_context = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)
@@ -1918,6 +1923,7 @@ class WorkflowEngine:
             )
             if result == "continue":
                 state.last_evaluation_feedback = None
+                state.last_retry_reason = None
                 state.last_revision_context = None
                 state.current_step_index += 1
                 await self._persist_workflow_state(task)

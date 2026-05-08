@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.core.compaction import CompactionStrategy, _format_events_for_compaction
+from cognis.core.compaction import (
+    CompactionStrategy,
+    _format_events_for_compaction,
+    _mechanical_summary,
+)
 from cognis.core.session_cache import CachedEvent, CachedSessionState
 from cognis.models.session import EventAppendResult, SessionModel
 
@@ -102,6 +106,42 @@ async def test_compaction_records_summary_and_updates_cache() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_compaction_appends_recoverable_tool_handles() -> None:
+    cache = _Cache()
+    cache.entry.events = [
+        CachedEvent(seq=1, type="user_message", data={"content": "inspect files"}),
+        CachedEvent(
+            seq=2,
+            type="tool_result",
+            data={
+                "call_id": "tool-call-3",
+                "recovery_call_id": "tool-call-3",
+                "name": "read",
+                "result": "file contents",
+                "has_full_output": True,
+            },
+        ),
+        CachedEvent(seq=3, type="user_message", data={"content": "continue"}),
+    ]
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=1,
+    )
+
+    result = await strategy.compact(_session())
+
+    assert result.compacted is True
+    assert cache.applied
+    summary, _seq = cache.applied[0]
+    assert summary.startswith("summary text")
+    assert "Recoverable tool outputs before compaction:" in summary
+    assert "read_tool_output(call_id='tool-call-3')" in summary
+
+
+@pytest.mark.asyncio
 async def test_compaction_write_failure_leaves_cache_unchanged() -> None:
     cache = _Cache()
     strategy = CompactionStrategy(
@@ -141,6 +181,57 @@ def test_compaction_formats_attachment_notes() -> None:
 
     assert "report.pdf (pdf)" in formatted
     assert "diagram.png (image)" in formatted
+
+
+def test_compaction_formats_tool_results_with_recovery_metadata() -> None:
+    events = [
+        CachedEvent(
+            seq=7,
+            type="tool_result",
+            data={
+                "call_id": "tool-call-1",
+                "recovery_call_id": "tool-call-1",
+                "name": "read",
+                "result": "x" * 2500,
+                "output_size": 2500,
+                "has_full_output": True,
+            },
+        )
+    ]
+
+    formatted = _format_events_for_compaction(events)
+
+    assert "call_id='tool-call-1'" in formatted
+    assert "recovery_call_id='tool-call-1'" in formatted
+    assert "output_size=2500" in formatted
+    assert "has_full_output=true" in formatted
+    assert "read_tool_output(call_id='tool-call-1')" in formatted
+    assert "search_tool_output(call_id='tool-call-1', pattern='keyword')" in formatted
+    assert "truncated for compaction: omitted 500 chars" in formatted
+
+
+def test_mechanical_summary_keeps_recoverable_tool_handles() -> None:
+    events = []
+    for index in range(12):
+        events.append(
+            CachedEvent(
+                seq=index + 1,
+                type="tool_result",
+                data={
+                    "call_id": f"tool-call-{index}",
+                    "recovery_call_id": f"tool-call-{index}",
+                    "name": "grep",
+                    "result": "many matches",
+                    "has_full_output": True,
+                },
+            )
+        )
+
+    summary = _mechanical_summary(events)
+
+    assert "Recoverable tool outputs before compaction:" in summary
+    assert "grep: recover with read_tool_output(call_id='tool-call-0')" in summary
+    assert "grep: recover with read_tool_output(call_id='tool-call-11')" in summary
 
 
 @pytest.mark.asyncio

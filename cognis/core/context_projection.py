@@ -51,10 +51,22 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
             f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
             "No saved output handle is available.]"
         )
+    recovery_hint = _tool_output_recovery_hint(recovery_call_id)
     return (
         "[Tool output omitted from prompt. "
         f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
-        f"Recover with call_id '{recovery_call_id}' only if a specific missing detail is needed.]"
+        f"{recovery_hint} Only recover if a specific missing detail is needed.]"
+    )
+
+
+def _tool_output_recovery_hint(call_id: str) -> str:
+    """Return concrete recovery calls for a saved tool output."""
+
+    quoted = repr(call_id)
+    return (
+        f"Recover with call_id {quoted}: read_tool_output(call_id={quoted}), "
+        f"search_tool_output(call_id={quoted}, pattern='error|timeout|keyword'), "
+        f"or list_tool_output_anchors(call_id={quoted})."
     )
 
 

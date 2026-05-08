@@ -39,6 +39,12 @@ def test_workflow_state_default() -> None:
     assert state.status == "running"
 
 
+def test_workflow_state_ignores_unknown_retry_reason() -> None:
+    state = WorkflowState.model_validate({"last_retry_reason": "legacy_reason"})
+
+    assert state.last_retry_reason is None
+
+
 def test_workflow_state_step_advance() -> None:
     state = WorkflowState()
     state.current_step_index += 1

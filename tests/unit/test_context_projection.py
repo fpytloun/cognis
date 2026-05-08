@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cognis.core.context import _compact_oldest_droppable_tool_group
 from cognis.core.context_projection import project_messages
 from cognis.core.pruning import prune_tool_outputs
 
@@ -52,7 +53,9 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
     assert "Tool output omitted from prompt." in str(result.messages[1]["content"])
     assert "call_id 'call-1'" in str(result.messages[1]["content"])
     assert "Recover with" in str(result.messages[1]["content"])
-    assert "list_tool_output_anchors" not in str(result.messages[1]["content"])
+    assert "read_tool_output(call_id='call-1')" in str(result.messages[1]["content"])
+    assert "search_tool_output(call_id='call-1'" in str(result.messages[1]["content"])
+    assert "list_tool_output_anchors(call_id='call-1')" in str(result.messages[1]["content"])
     assistant_args = result.messages[0]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(assistant_args, str)
     assert "Arguments cleared -" in assistant_args
@@ -80,7 +83,8 @@ def test_project_messages_uses_helper_recovery_call_id_for_helper_results() -> N
     assert "call_id 'helper-call'" in placeholder
     assert "source call_id 'source-call'" in placeholder
     assert "anchor='result:1'" not in placeholder
-    assert "list_tool_output_anchors" not in placeholder
+    assert "read_tool_output(call_id='helper-call')" in placeholder
+    assert "list_tool_output_anchors(call_id='helper-call')" in placeholder
 
 
 def test_project_messages_preserves_recent_groups_until_byte_budget_is_hit() -> None:
@@ -227,6 +231,54 @@ def test_project_messages_preserves_latest_system_workflow_turn() -> None:
 
     assert "Tool output omitted from prompt." in str(result.messages[2]["content"])
     assert result.messages[6]["content"] == "Todoist actual agenda from system workflow turn"
+
+
+def test_project_messages_preserves_workflow_outputs_before_retry_system_directive() -> None:
+    messages: list[dict[str, object]] = [{"role": "user", "content": "## Workflow Task\n\nReview"}]
+    for index in range(12):
+        call_id = f"call-{index}"
+        messages.extend(
+            [
+                _assistant_tool_call(call_id, "read", {"path": f"file_{index}.py"}),
+                _tool_result(
+                    call_id,
+                    f"prior attempt evidence {index}" * 200,
+                    tool_name="read",
+                    recovery_call_id=call_id,
+                ),
+            ]
+        )
+    messages.append(
+        {
+            "role": "system",
+            "content": "The previous attempt ended before producing a final response.",
+        }
+    )
+
+    result = project_messages(messages, preserve_recent_completed_tool_groups=0)
+
+    assert all(
+        "Tool output omitted from prompt." not in str(message.get("content", ""))
+        for message in result.messages
+    )
+    assert "prior attempt evidence 0" in str(result.messages[2]["content"])
+    assert "prior attempt evidence 11" in str(result.messages[-2]["content"])
+
+
+def test_context_pressure_compacts_tool_group_before_drop() -> None:
+    messages = [
+        _assistant_tool_call("call-1", "read", {"path": "large.py"}),
+        _tool_result("call-1", "large output" * 1000, tool_name="read", recovery_call_id="call-1"),
+        {"role": "system", "content": "The previous attempt ended before producing output."},
+    ]
+
+    compacted = _compact_oldest_droppable_tool_group(messages)
+
+    assert compacted is not None
+    assert compacted[0]["role"] == "assistant"
+    assert compacted[1]["tool_call_id"] == "call-1"
+    assert "Tool output omitted from prompt." in str(compacted[1]["content"])
+    assert "read_tool_output(call_id='call-1')" in str(compacted[1]["content"])
 
 
 def test_prune_tool_outputs_preserves_latest_turn_recovered_evidence() -> None:

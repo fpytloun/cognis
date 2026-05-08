@@ -2768,7 +2768,34 @@ class AgentLoop:
                 #
                 # Instead, send only a revision directive.  If the Intaris
                 # recording of evaluation feedback failed, deliver it inline.
-                if ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
+                retry_reason = getattr(ctx.workflow_state, "last_retry_reason", None)
+                deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
+                if retry_reason == "execution_failed":
+                    fallback_feedback = getattr(ctx.workflow_state, "last_evaluation_feedback", None)
+                    feedback_instruction = (
+                        "The following reviewer feedback still applies:\n\n"
+                        f"{fallback_feedback}\n\n"
+                        if isinstance(fallback_feedback, str) and fallback_feedback.strip()
+                        else ""
+                    )
+                    completion_instruction = (
+                        "When done, write_deliverable with the completed artifact and then "
+                        "call step_complete."
+                        if deliverable_step_run_id is not None
+                        else "When done, return the completed result as a normal assistant "
+                        "message and then call step_complete."
+                    )
+                    effective_user_message = (
+                        "The previous attempt ended before producing a final response. "
+                        "Its recorded tool calls and results are still in the session "
+                        "history. Continue from that evidence; do not restart the step "
+                        "or re-read files unless the needed detail is unavailable. If a "
+                        "prior tool result is truncated or cleared, prefer "
+                        "read_tool_output/search_tool_output with the recorded call_id. "
+                        f"{feedback_instruction}"
+                        f"{completion_instruction}"
+                    )
+                elif ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
                     if self._deliverable_owner_step_run_id(ctx) is not None:
                         effective_user_message = (
                             "The evaluator has reviewed your previous attempt and "
@@ -2787,11 +2814,10 @@ class AgentLoop:
                             "When done, return the updated result as a normal assistant "
                             "message and then call step_complete."
                         )
-                    ctx.workflow_state.last_evaluation_feedback = None
                 else:
                     # Feedback was recorded to Intaris — it's already in the
                     # session history.  Send a minimal revision directive.
-                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                    if deliverable_step_run_id is not None:
                         effective_user_message = (
                             "The evaluator has reviewed your previous attempt and "
                             "requested revisions. Review the evaluation feedback "
@@ -2942,7 +2968,9 @@ class AgentLoop:
                 user_attachments=[item.model_dump(mode="json") for item in ctx.user_attachments],
                 attachment_notice=ctx.attachment_notice,
                 attachment_context=ctx.attachment_context,
-                user_message_role="system" if ctx.system_initiated else "user",
+                user_message_role=(
+                    "system" if ctx.system_initiated or ctx.is_retry else "user"
+                ),
                 prior_context=ctx.prior_context,
                 follow_up=ctx.follow_up,
                 routing_reminder=routing_reminder,
