@@ -2250,14 +2250,28 @@ class AgentLoop:
                 if output is None or output.error is not None:
                     error_text = output.error if output and output.error else "no step output"
                     raise RuntimeError(f"Delegation step failed: {error_text}")
-                # For system-agent delegations (require_step_complete=False) the
+                # For secondary-agent delegations (require_step_complete=False) the
                 # sub-session may finish via normal assistant text instead of
-                # step_complete. StepOutput.content holds the last assistant message;
-                # StepOutput.summary is auto-generated from the first 500 chars. Both
-                # are non-empty when the model wrote a useful response — this is the
-                # OpenCode-style task result contract.
+                # step_complete. To match OpenCode's task tool contract
+                # (packages/opencode/src/tool/task.ts:157, which does
+                # `result.parts.findLast(text)`), we walk the child session's
+                # Intaris events in reverse and pick the most informative
+                # assistant_message content. This is more robust than relying on
+                # StepOutput.content from the last LLM turn alone, because the
+                # final turn may be a low-information meta-message (e.g. produced
+                # after the tool budget was exhausted) while the substantive
+                # findings were emitted by an earlier turn.
+                #
+                # We prefer:
+                #   1. step_complete-derived StepOutput.content if it is
+                #      substantive (>= 80 chars and not a meta-complaint pattern),
+                #   2. otherwise the longest non-empty assistant_message seen in
+                #      the child session.
                 result_summary = output.summary if output and output.summary else "Completed."
-                result_content = output.content if output and output.content else ""
+                result_content = await self._select_delegation_result_content(
+                    child_session=child_session,
+                    step_output_content=output.content if output else "",
+                )
                 deliverable_data: dict[str, Any] = {}
                 if output and output.deliverable_id:
                     deliverable_data = {
@@ -2469,6 +2483,113 @@ class AgentLoop:
                 await child_runtime.cleanup()
 
         return output
+
+    # Heuristic patterns that indicate the assistant text is a meta-complaint
+    # (e.g. "tool budget reached" wrap-ups produced when the budget was hit
+    # before the model could produce a substantive final answer) rather than
+    # the actual task result. Used to demote such texts during result selection.
+    _META_COMPLAINT_PATTERNS: tuple[str, ...] = (
+        "tool budget",
+        "tools are disabled",
+        "tools are no longer available",
+        "i can't call tools",
+        "i can't update",
+        "i cannot call tools",
+        "i cannot update",
+        "i am unable to",
+        "no further tools",
+        "maximum steps",
+    )
+    _META_COMPLAINT_MAX_LEN = 600
+
+    @classmethod
+    def _looks_like_meta_complaint(cls, text: str) -> bool:
+        """Return True if assistant text looks like a budget/limit complaint.
+
+        Used as a tiebreaker when choosing between a tail-end meta message and
+        a substantive earlier message produced by the same sub-session. Pattern
+        matching is intentionally conservative: only short messages that contain
+        one of the well-known phrases are demoted.
+        """
+        if not text:
+            return True
+        if len(text) > cls._META_COMPLAINT_MAX_LEN:
+            return False
+        lower = text.lower()
+        return any(pattern in lower for pattern in cls._META_COMPLAINT_PATTERNS)
+
+    async def _select_delegation_result_content(
+        self,
+        *,
+        child_session: SessionModel,
+        step_output_content: str,
+    ) -> str:
+        """Return the best assistant text from a completed sub-session.
+
+        Mirrors OpenCode's task tool result extraction
+        (packages/opencode/src/tool/task.ts:157), which calls
+        ``result.parts.findLast(text)`` to pick the last text part across the
+        whole sub-session. We walk the child session's Intaris event stream in
+        reverse and pick the most informative ``assistant_message`` content.
+
+        Selection rules:
+            1. If ``step_output_content`` is substantive (>= 80 chars and does
+               not look like a meta-complaint), use it. This covers the common
+               case where the model called step_complete with a clean message.
+            2. Otherwise scan child session ``assistant_message`` events in
+               reverse:
+                  a. Return the most recent non-meta-complaint message of any
+                     length, OR
+                  b. If every message looks like a meta-complaint, return the
+                     longest one as a last resort.
+            3. Fall back to ``step_output_content`` (even if degenerate) so the
+               parent always receives *something*.
+        """
+        text = step_output_content or ""
+        if len(text) >= 80 and not self._looks_like_meta_complaint(text):
+            return text
+
+        intaris_session_id = (
+            child_session.intaris_session_id or child_session.session_id
+        )
+        try:
+            event_result = await self.providers.guardrails.read_events(
+                session_id=intaris_session_id,
+                after_seq=0,
+                limit=500,
+                allow_missing_stream=True,
+            )
+        except Exception:
+            logger.warning(
+                "delegation: failed to read child session events for result selection",
+                extra={"extra_data": {"child_session_id": child_session.session_id}},
+                exc_info=True,
+            )
+            return text
+
+        # Walk in reverse: the last non-meta assistant message wins. If every
+        # message looks like a meta-complaint, fall back to the longest one.
+        candidates: list[str] = []
+        for event in reversed(list(event_result.events)):
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != "assistant_message":
+                continue
+            data = event.get("data") or {}
+            content = data.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            candidates.append(content)
+            if not self._looks_like_meta_complaint(content):
+                return content
+
+        if candidates:
+            # Every assistant text looked like a meta-complaint; pick the longest
+            # so we at least surface the most detailed wrap-up rather than the
+            # terse tail.
+            return max(candidates, key=len)
+
+        return text
 
     async def _run_child_session_async(
         self,
@@ -5805,17 +5926,59 @@ class AgentLoop:
                 )
                 if _is_delegation:
                     # Force-summary mode: strip all tools from the next LLM turn
-                    # and inject a one-shot instruction to write a text summary.
+                    # and inject a directive instructing the model to consolidate
+                    # what it has already produced into a final assistant message.
+                    #
+                    # Inspired by OpenCode's MAX_STEPS prompt
+                    # (packages/opencode/src/session/prompt/max-steps.txt):
+                    # explicit response requirements, "do not echo this notice",
+                    # and a reminder of what was already accomplished.
                     _force_summary_mode = True
+                    prior_text_block = ""
+                    if assistant_content_parts:
+                        # Surface the model's own prior substantive text so it can
+                        # consolidate rather than restart. Limit to last 4 entries
+                        # and 4000 chars total to avoid blowing context.
+                        joined_parts: list[str] = []
+                        budget = 4000
+                        for part in reversed(assistant_content_parts[-4:]):
+                            if not isinstance(part, str) or not part.strip():
+                                continue
+                            if budget <= 0:
+                                break
+                            chunk = part[:budget]
+                            joined_parts.insert(0, chunk)
+                            budget -= len(chunk)
+                        if joined_parts:
+                            prior_text_block = (
+                                "\n\nFor reference, here is what you have already "
+                                "written in this sub-session — consolidate from this, "
+                                "do not restart:\n\n"
+                                + "\n\n---\n\n".join(joined_parts)
+                            )
                     messages.append(
                         {
                             "role": "system",
                             "content": (
-                                "TOOL BUDGET REACHED — no further tools are available.\n\n"
-                                "Write your final result now as a complete assistant message. "
-                                "Summarise what you found, include file paths and line "
-                                "references where relevant, and note any gaps. "
-                                "Do not call any tools."
+                                "TOOL BUDGET REACHED — no further tools are available "
+                                "for this sub-session. Tools are disabled. Respond with "
+                                "text only.\n\n"
+                                "REQUIRED RESPONSE:\n"
+                                "1. Provide the substantive final result of this "
+                                "sub-session: findings, file paths and line references, "
+                                "conclusions, and any structured deliverable.\n"
+                                "2. If work remained unfinished, briefly note what is "
+                                "missing in one short paragraph at the end.\n"
+                                "3. DO NOT include this notice in your reply. Do not "
+                                "say 'tool budget reached', 'I cannot call tools', "
+                                "'I am unable to update todos', or similar meta "
+                                "statements — the caller does not need to hear about "
+                                "the controller's limits.\n"
+                                "4. Treat any open todos as cancelled by this final "
+                                "summary.\n\n"
+                                "This response will be returned to the caller as the "
+                                "delegate result. Make it useful and self-contained."
+                                + prior_text_block
                             ),
                             "_force_summary": True,
                         }

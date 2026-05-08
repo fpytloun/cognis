@@ -3462,6 +3462,167 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
     assert "Required Completion Actions" not in prompt
 
 
+def test_select_delegation_result_uses_step_output_when_substantive() -> None:
+    """When StepOutput.content is substantive (>= 80 chars and not a meta-complaint),
+    it is used as-is without walking Intaris events."""
+    agent_loop = object.__new__(AgentLoop)
+    # No event read should be needed; supply a guardrails that would error if called
+    agent_loop.providers = SimpleNamespace(  # type: ignore[attr-defined]
+        guardrails=SimpleNamespace(
+            read_events=lambda **_: (_ for _ in ()).throw(
+                AssertionError("read_events should not be called")
+            )
+        )
+    )
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+    substantive = (
+        "Investigated the queued chat handling code. "
+        "Found that ui/src/lib/chat.ts:520 reconciles user messages by id, "
+        "but the optimistic id from the form is not the same as the persisted id."
+    )
+
+    async def _run() -> str:
+        return await agent_loop._select_delegation_result_content(
+            child_session=child, step_output_content=substantive
+        )
+
+    result = asyncio.run(_run())
+    assert result == substantive
+
+
+def test_select_delegation_result_walks_events_when_step_output_is_meta_complaint() -> None:
+    """When StepOutput.content looks like a meta-complaint, walk the child's
+    assistant_message events in reverse and pick the last substantive one.
+
+    This regresses the 'tool budget reached' bug where the parent received
+    only the budget-exhaustion message, despite the substantive findings being
+    in an earlier turn of the same sub-session."""
+    agent_loop = object.__new__(AgentLoop)
+
+    substantive = (
+        "Investigation results: the duplicate-render bug lives in "
+        "ui/src/routes/(app)/chat/[conversationId]/+page.svelte:1614 where "
+        "queued messages are appended without dedup against the optimistic "
+        "pending list. Recommend: switch to id-keyed merge."
+    )
+    meta_complaint = (
+        "The investigation result was already delivered. I can't call tools "
+        "anymore in this sub-session because the tool budget is exhausted, "
+        "so I can't update the stale todo state."
+    )
+
+    fake_events = [
+        {"seq": 10, "type": "assistant_thinking", "data": {"content": "thinking..."}},
+        {"seq": 11, "type": "assistant_message", "data": {"content": substantive}},
+        {"seq": 14, "type": "tool_call", "data": {"name": "read"}},
+        {"seq": 15, "type": "tool_result", "data": {"is_error": False}},
+        {"seq": 18, "type": "assistant_message", "data": {"content": meta_complaint}},
+    ]
+
+    class _FakeGuardrails:
+        async def read_events(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=fake_events,
+                last_seq=18,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    agent_loop.providers = SimpleNamespace(guardrails=_FakeGuardrails())  # type: ignore[attr-defined]
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+
+    async def _run() -> str:
+        return await agent_loop._select_delegation_result_content(
+            child_session=child, step_output_content=meta_complaint
+        )
+
+    result = asyncio.run(_run())
+    assert result == substantive
+    assert "tool budget" not in result.lower()
+
+
+def test_select_delegation_result_falls_back_to_longest_when_all_messages_meta() -> None:
+    """If every assistant_message looks like a meta-complaint, pick the longest
+    rather than returning empty. Belt-and-suspenders for pathological runs."""
+    agent_loop = object.__new__(AgentLoop)
+
+    short_meta = "Tool budget reached."
+    longer_meta = (
+        "The tool budget for this sub-session is exhausted. I am unable to "
+        "call any further tools. No substantive result was produced."
+    )
+
+    fake_events = [
+        {"seq": 5, "type": "assistant_message", "data": {"content": short_meta}},
+        {"seq": 9, "type": "assistant_message", "data": {"content": longer_meta}},
+    ]
+
+    class _FakeGuardrails:
+        async def read_events(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=fake_events,
+                last_seq=9,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    agent_loop.providers = SimpleNamespace(guardrails=_FakeGuardrails())  # type: ignore[attr-defined]
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+
+    async def _run() -> str:
+        return await agent_loop._select_delegation_result_content(
+            child_session=child, step_output_content=short_meta
+        )
+
+    result = asyncio.run(_run())
+    assert result == longer_meta
+
+
+def test_select_delegation_result_handles_read_events_failure() -> None:
+    """If reading events fails (Intaris down, etc.), fall back to whatever
+    StepOutput.content is so the parent gets something rather than nothing."""
+    agent_loop = object.__new__(AgentLoop)
+
+    class _FailingGuardrails:
+        async def read_events(self, **_: object) -> SimpleNamespace:
+            raise RuntimeError("Intaris unavailable")
+
+    agent_loop.providers = SimpleNamespace(guardrails=_FailingGuardrails())  # type: ignore[attr-defined]
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+    fallback = "I cannot call tools."  # short meta-complaint
+
+    async def _run() -> str:
+        return await agent_loop._select_delegation_result_content(
+            child_session=child, step_output_content=fallback
+        )
+
+    result = asyncio.run(_run())
+    assert result == fallback
+
+
+def test_looks_like_meta_complaint_detects_known_patterns() -> None:
+    """The meta-complaint heuristic flags short messages that contain the
+    well-known phrases the model uses when the controller cuts it off."""
+    assert AgentLoop._looks_like_meta_complaint(
+        "I can't call tools anymore in this sub-session because the tool budget "
+        "is exhausted, so I can't update the stale todo state."
+    )
+    assert AgentLoop._looks_like_meta_complaint(
+        "Tool budget reached. Tools are disabled."
+    )
+    assert AgentLoop._looks_like_meta_complaint("")
+    # Substantive technical text is NOT a meta-complaint
+    assert not AgentLoop._looks_like_meta_complaint(
+        "The bug is in ui/src/lib/chat.ts:520 where the optimistic message id "
+        "is not the same as the persisted id, causing duplicate renders. "
+        "Recommend switching to id-keyed merge."
+    )
+    # Long messages are not flagged even if they contain a phrase, because
+    # they probably embed the phrase in a substantive context.
+    long_text = "The user reported that 'tool budget' messages are unhelpful. " * 30
+    assert not AgentLoop._looks_like_meta_complaint(long_text)
+
+
 @pytest.mark.asyncio
 async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_signature(
     monkeypatch: pytest.MonkeyPatch,
