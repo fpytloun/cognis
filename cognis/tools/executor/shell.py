@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import re
 import shutil
@@ -19,6 +20,9 @@ from cognis.tools.registry import ToolExecutionContext
 
 _DEFAULT_TIMEOUT_MS = 120_000
 _DEFAULT_BACKGROUND_TIMEOUT_MS = 5_000
+_MAX_FOREGROUND_TIMEOUT_MS = 3_600_000
+_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS = 5
+_PROCESS_KILL_WAIT_SECONDS = 5
 _SHELL_OVERRIDE_ENV = "COGNIS_EXECUTOR_SHELL"
 SHELL_MANAGER_KEY = "shell_session_manager"
 _MAX_BACKGROUND_OUTPUT_CHARS = 200_000
@@ -300,8 +304,34 @@ async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
             process.kill()
     except ProcessLookupError:
         return
-    with contextlib.suppress(ProcessLookupError):
-        await process.wait()
+    with contextlib.suppress(ProcessLookupError, TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=_PROCESS_KILL_WAIT_SECONDS)
+
+
+async def _cleanup_process_tree(process: asyncio.subprocess.Process) -> None:
+    cleanup_task = asyncio.create_task(_kill_process_tree(process))
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(
+            asyncio.shield(cleanup_task), timeout=_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS
+        )
+
+
+def _parse_timeout(timeout_ms: Any, *, run_in_background: bool) -> tuple[int | None, str | None]:
+    try:
+        if isinstance(timeout_ms, bool):
+            raise TypeError
+        parsed_timeout_ms = int(timeout_ms)
+    except (TypeError, ValueError):
+        return None, "Timeout must be an integer number of milliseconds."
+
+    if not run_in_background and parsed_timeout_ms > _MAX_FOREGROUND_TIMEOUT_MS:
+        return (
+            None,
+            f"Foreground bash timeout may not exceed {_MAX_FOREGROUND_TIMEOUT_MS} ms. "
+            "Use run_in_background=true for longer-running commands.",
+        )
+
+    return max(1, math.ceil(parsed_timeout_ms / 1000)), None
 
 
 def _command_metadata(command: str, cwd: str, *, ok: bool, exit_code: int | None) -> dict[str, Any]:
@@ -328,7 +358,10 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     if blocked_message is not None:
         return ToolResult(output=blocked_message, is_error=True)
 
-    timeout_seconds = max(1, int(timeout_ms) // 1000)
+    timeout_seconds, timeout_error = _parse_timeout(timeout_ms, run_in_background=run_in_background)
+    if timeout_error is not None:
+        return ToolResult(output=timeout_error, is_error=True)
+    assert timeout_seconds is not None
 
     try:
         resolved_cwd = str(resolve_path(workdir, context=context, default_to_home=True))
@@ -392,8 +425,22 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
     except TimeoutError:
-        await _kill_process_tree(process)
-        return ToolResult(output=f"Command timed out after {timeout_seconds}s.", is_error=True)
+        await _cleanup_process_tree(process)
+        return ToolResult(
+            output=f"Command timed out after {timeout_seconds}s; process cleanup requested.",
+            is_error=True,
+            metadata={
+                "status": "timed_out",
+                "timeout_seconds": timeout_seconds,
+                "process_cleanup": "killed",
+                "commands": [
+                    _command_metadata(command, resolved_cwd, ok=False, exit_code=process.returncode)
+                ],
+            },
+        )
+    except asyncio.CancelledError:
+        await _cleanup_process_tree(process)
+        raise
 
     stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
     stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""

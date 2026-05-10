@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from cognis.models.tool import ExecutorHandle
 from cognis.tools.executor import filesystem as filesystem_module
 from cognis.tools.executor.definitions import (
     ALL_EXECUTOR_TOOLS,
+    BASH_TOOL,
     executor_tool_definitions,
     executor_tool_handlers,
 )
@@ -808,11 +810,7 @@ class TestApplyPatchTool:
         target = tmp_path / "nested" / "new.txt"
 
         result = await handle_apply_patch(
-            {
-                "patchText": (
-                    f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** End Patch\n"
-                )
-            },
+            {"patchText": (f"*** Begin Patch\n*** Add File: {target}\n+hello\n*** End Patch\n")},
             _context(),
         )
 
@@ -1186,7 +1184,9 @@ class TestApplyPatchTool:
         assert target.read_text() == "hi"
 
     @pytest.mark.asyncio()
-    async def test_apply_patch_no_newline_marker_can_add_final_newline(self, tmp_path: Path) -> None:
+    async def test_apply_patch_no_newline_marker_can_add_final_newline(
+        self, tmp_path: Path
+    ) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello")
         context = _context()
@@ -1648,6 +1648,153 @@ class TestBashTool:
         assert result.is_error
         assert "parsed by the shell" in result.output
         assert "Quote literal paths" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_timeout_cleans_up_process(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        class _Process:
+            returncode: int | None = None
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                raise TimeoutError
+
+        process = _Process()
+        cleaned: list[_Process] = []
+
+        async def _fake_create_process(**_: object) -> _Process:
+            return process
+
+        async def _fake_kill_process_tree(killed_process: _Process) -> None:
+            killed_process.returncode = -9
+            cleaned.append(killed_process)
+
+        monkeypatch.setattr(shell_module, "_create_process", _fake_create_process)
+        monkeypatch.setattr(shell_module, "_kill_process_tree", _fake_kill_process_tree)
+
+        result = await handle_bash(
+            {"command": "sleep 60", "timeout": 1, "workdir": str(tmp_path)}, _DUMMY_CONTEXT
+        )
+
+        assert result.is_error
+        assert "timed out" in result.output
+        assert cleaned == [process]
+        assert result.metadata is not None
+        assert result.metadata["status"] == "timed_out"
+        assert result.metadata["process_cleanup"] == "killed"
+        assert result.metadata["timeout_seconds"] == 1
+
+    @pytest.mark.asyncio()
+    async def test_bash_cancellation_cleans_up_process(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        class _Process:
+            returncode: int | None = None
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                await asyncio.Event().wait()
+                return b"", b""
+
+        process = _Process()
+        cleaned = asyncio.Event()
+
+        async def _fake_create_process(**_: object) -> _Process:
+            return process
+
+        async def _fake_kill_process_tree(killed_process: _Process) -> None:
+            assert killed_process is process
+            killed_process.returncode = -9
+            cleaned.set()
+
+        monkeypatch.setattr(shell_module, "_create_process", _fake_create_process)
+        monkeypatch.setattr(shell_module, "_kill_process_tree", _fake_kill_process_tree)
+
+        task = asyncio.create_task(
+            handle_bash(
+                {"command": "sleep 60", "timeout": 60000, "workdir": str(tmp_path)},
+                _DUMMY_CONTEXT,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleaned.is_set()
+
+    @pytest.mark.asyncio()
+    async def test_bash_rejects_invalid_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        async def _fail_create_process(**_: object) -> object:
+            raise AssertionError("process should not be created")
+
+        monkeypatch.setattr(shell_module, "_create_process", _fail_create_process)
+
+        result = await handle_bash({"command": "echo hello", "timeout": "soon"}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        assert "Timeout must be an integer" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_rejects_foreground_timeout_above_max(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        async def _fail_create_process(**_: object) -> object:
+            raise AssertionError("process should not be created")
+
+        monkeypatch.setattr(shell_module, "_create_process", _fail_create_process)
+
+        result = await handle_bash({"command": "sleep 1", "timeout": 3_600_001}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        assert "may not exceed 3600000 ms" in result.output
+        assert "run_in_background=true" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_bash_timeout_uses_ceiling_seconds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        observed_timeout: list[float | None] = []
+
+        class _Process:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"ok", b""
+
+        async def _fake_create_process(**_: object) -> _Process:
+            return _Process()
+
+        async def _fake_wait_for(awaitable: Any, *, timeout: float | None = None) -> Any:
+            observed_timeout.append(timeout)
+            return await awaitable
+
+        monkeypatch.setattr(shell_module, "_create_process", _fake_create_process)
+        monkeypatch.setattr(shell_module.asyncio, "wait_for", _fake_wait_for)
+
+        result = await handle_bash(
+            {"command": "echo ok", "timeout": 2500, "workdir": str(tmp_path)}, _DUMMY_CONTEXT
+        )
+
+        assert not result.is_error
+        assert observed_timeout == [3]
+
+    def test_bash_tool_timeout_allows_max_foreground_cleanup(self) -> None:
+        from cognis.tools.executor import shell as shell_module
+
+        max_foreground_timeout_ms = getattr(shell_module, "_MAX_FOREGROUND_TIMEOUT_MS")
+        cleanup_grace_seconds = getattr(shell_module, "_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS")
+        max_timeout_seconds = math.ceil(max_foreground_timeout_ms / 1000)
+        assert BASH_TOOL.timeout_seconds >= max_timeout_seconds + cleanup_grace_seconds
 
     @pytest.mark.asyncio()
     async def test_bash_defaults_to_home_when_workdir_omitted(

@@ -398,7 +398,10 @@ BASH_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Brief description of what this command does",
             },
-            "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in milliseconds. Foreground commands default to 120000 ms and may run up to 3600000 ms; use run_in_background=true for longer operations. For background commands, this only controls the initial preview wait.",
+            },
             "workdir": {
                 "type": "string",
                 "description": "Working directory for the command. Use ~ for home directory. Defaults to the executor home directory if omitted.",
@@ -409,7 +412,7 @@ BASH_TOOL = ToolDefinition(
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "Start the command in the background and return a shell_id for later polling.",
+                "description": "Start the command in the background and return a shell_id for later polling. Background commands continue until completion, bash_kill, or executor cleanup.",
             },
         },
         "required": ["command"],
@@ -418,7 +421,7 @@ BASH_TOOL = ToolDefinition(
     category="shell",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=120,
+    timeout_seconds=3605,
 )
 
 BASH_OUTPUT_TOOL = ToolDefinition(
