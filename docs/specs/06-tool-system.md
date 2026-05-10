@@ -280,6 +280,7 @@ bash_tool = ToolDefinition(
             "description": {"type": "string", "description": "Brief description of what this does"},
             "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
             "workdir": {"type": "string", "description": "Working directory"},
+            "run_in_background": {"type": "boolean", "description": "Return a shell_id for managed polling"},
             "target_executor": {"type": "string", "description": "Optional assigned executor ID for this call"},
         },
         "required": ["command"],
@@ -288,9 +289,22 @@ bash_tool = ToolDefinition(
     category="shell",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=120,
+    timeout_seconds=3605,
 )
 ```
+
+Foreground `bash` commands default to a 120,000 ms timeout and may request up to
+3,600,000 ms. When a foreground command times out or the tool call is cancelled,
+the executor requests cleanup of the command process group where supported before
+returning or propagating cancellation; Windows cleanup is limited to the shell
+process unless the platform provides stronger process-tree support.
+
+Use `run_in_background=true` for long-running builds, deployments, and watchers.
+Background commands return a managed `shell_id`; use `bash_output` to poll output
+and `bash_kill` to stop them. For background commands, `timeout` only controls
+the initial preview wait and does not limit process lifetime. Prefer these
+managed controls over process-name polling such as `pgrep`, which can match
+wrappers or the polling command itself.
 
 ### Multi-Executor Targeting
 
