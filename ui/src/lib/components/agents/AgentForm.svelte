@@ -494,10 +494,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         </Card>
       {/if}
 
-      <!-- System prompt -->
+      <!-- Editable identity instructions -->
       <Card class="p-5">
         <div class="mb-3 flex items-center justify-between gap-3">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">System prompt</p>
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Agent instructions</p>
           {#if !readonly && !isSystemAsset}
             <Button size="sm" variant="secondary" type="button" onclick={resetSystemPrompt}>Reset to default</Button>
           {:else if isSystemAsset}
@@ -506,8 +506,8 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <span class="text-xs text-slate-500">Read-only because this agent is shared with you.</span>
           {/if}
         </div>
-        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}.&#10;&#10;Be helpful, direct, and concise." disabled={readonly}></textarea>
-        <p class="mt-2 text-xs text-slate-400">The agent's base instructions. Memory context and tool descriptions are injected separately at runtime.</p>
+        <textarea bind:value={form.systemPrompt} class="min-h-[180px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="You are {'{'}name{'}'}, a capable general-purpose AI assistant.&#10;&#10;Optimize for correctness, usefulness, and actionability over verbosity." disabled={readonly}></textarea>
+        <p class="mt-2 text-xs text-slate-400">Defines this agent's identity, communication style, and domain-specific behavior. Cognis runtime rules, tool policy, memory context, workflow instructions, and safety constraints are injected separately and cannot be overridden here.</p>
       </Card>
 
       <!-- Tools & Permissions -->
@@ -988,7 +988,8 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     <div class="space-y-5">
       {#if form.agentType === 'primary'}
         <Card class="p-5">
-          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Runtime identity preview</p>
+          <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Editable identity preview</p>
+          <p class="mt-2 text-sm text-slate-300">This preview shows only the editable identity block. Runtime instructions, memory, tools, skills, and workflow context are added separately.</p>
           <pre class="mt-4 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm leading-6 text-slate-200">{buildSystemPromptPreview(form)}</pre>
         </Card>
       {:else}
