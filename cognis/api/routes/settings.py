@@ -10,8 +10,9 @@ from typing import Any
 from fastapi import APIRouter, Request
 from sqlalchemy import select
 
-from cognis.api.common import api_exception, require_admin
+from cognis.api.common import api_exception, require_admin, require_current_user
 from cognis.api.models import (
+    CodexUsageResponse,
     CursorPage,
     EnrichModelsPreviewRequest,
     EnrichModelsRequest,
@@ -20,6 +21,7 @@ from cognis.api.models import (
     LLMProviderResponse,
     LLMProviderTestResponse,
     LLMProviderUpdateRequest,
+    ModelRoutingEntry,
     ModelRoutingResponse,
     ModelRoutingUpdateRequest,
     SettingResponse,
@@ -51,6 +53,7 @@ from cognis.store.queries import (
     delete_setting,
     get_llm_provider,
     get_setting,
+    get_visible_llm_provider,
     list_llm_providers,
     list_model_routing,
     list_settings,
@@ -61,6 +64,7 @@ from cognis.store.queries import (
 
 router = APIRouter(tags=["settings"])
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
+SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
 _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "default",
     "classifier",
@@ -70,6 +74,7 @@ _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "text_to_speech",
     "image_generation",
     "attachment_analysis",
+    "embedding",
 )
 _TEXT_ROUTING_TASK_TYPES = frozenset({"default", "classifier", "compaction", "evaluator"})
 _STEP_PROFILE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9:_-]{1,80}$")
@@ -169,6 +174,8 @@ def _route_model_is_eligible(
             or getattr(model_info, "supports_audio_input", False)
             or getattr(model_info, "supports_file_input", False)
         )
+    if task_type == "embedding":
+        return bool(getattr(model_info, "supports_embedding", False))
     return True
 
 
@@ -181,6 +188,10 @@ def _routing_entry_from_row(task_type: str, row: Any | None) -> dict[str, str | 
         if reasoning_effort == "default":
             reasoning_effort = None
     return {"model": getattr(row, "model", None), "reasoning_effort": reasoning_effort}
+
+
+def _routing_entry_model(task_type: str, row: Any | None) -> ModelRoutingEntry:
+    return ModelRoutingEntry(**_routing_entry_from_row(task_type, row))
 
 
 def _apply_last_test_metadata(
@@ -196,11 +207,59 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
     if not isinstance(config, dict):
         return
     preset = str(config.get("preset") or "").strip().lower()
+    codex_transport = config.get("codex_transport")
+    if codex_transport is not None:
+        value = str(codex_transport).strip().lower()
+        if value not in {"litellm", "direct"}:
+            raise api_exception(
+                400,
+                "validation_error",
+                "codex_transport must be either 'litellm' or 'direct'",
+            )
+        if value == "direct" and preset != "chatgpt":
+            raise api_exception(
+                400,
+                "validation_error",
+                "Direct Codex transport is only supported for ChatGPT providers",
+            )
     if preset == "chatgpt" and location == "executor":
         raise api_exception(
             400,
             "validation_error",
             "ChatGPT OAuth providers must use controller execution location",
+        )
+    if location != "executor":
+        return
+    executor_id = config.get("executor_id")
+    has_executor_id = isinstance(executor_id, str) and bool(executor_id.strip())
+    executor_labels = config.get("executor_labels")
+    valid_executor_labels = False
+    if isinstance(executor_labels, dict):
+        valid_executor_labels = bool(executor_labels) and all(
+            isinstance(key, str)
+            and bool(key.strip())
+            and isinstance(value, str)
+            and bool(value.strip())
+            for key, value in executor_labels.items()
+        )
+        if executor_labels and not valid_executor_labels:
+            raise api_exception(
+                400,
+                "validation_error",
+                "Executor-routed provider executor_labels must contain only non-empty string keys and values",
+            )
+    has_executor_labels = valid_executor_labels
+    if has_executor_id and has_executor_labels:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Executor-routed providers must choose either executor_id or executor_labels, not both",
+        )
+    if not has_executor_id and not has_executor_labels:
+        raise api_exception(
+            400,
+            "validation_error",
+            "Executor-routed providers must specify executor_id or executor_labels",
         )
 
 
@@ -544,20 +603,69 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
 
 @router.get("/api/v1/llm-providers", response_model=CursorPage[LLMProviderResponse])
 async def llm_provider_list(request: Request) -> CursorPage[LLMProviderResponse]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_llm_providers(session)
+        rows = await list_llm_providers(
+            session, acting_user_email=user.email, include_inactive=True
+        )
     items = [_apply_last_test_metadata(request, llm_provider_to_response(row)) for row in rows]
     return CursorPage(items=items, cursor=None, has_more=False)
 
 
+def _provider_owner_for_create(user: Any, config: dict[str, Any]) -> str:
+    scope = str(config.get("scope") or config.get("owner_scope") or "").strip().lower()
+    if user.role == "admin" and scope in {"system", "shared"}:
+        return SYSTEM_USER_EMAIL
+    return user.email
+
+
+def _provider_owner_for_update(
+    request: Request, existing_owner_email: str, owner_scope: str | None
+) -> str:
+    normalized_scope = str(owner_scope or "").strip().lower()
+    if not normalized_scope:
+        return existing_owner_email
+    if normalized_scope in {"system", "shared"}:
+        require_admin(request)
+        return SYSTEM_USER_EMAIL
+    if normalized_scope == "user":
+        user = require_current_user(request)
+        return user.email
+    raise api_exception(
+        422, "validation_error", f"Unsupported provider owner_scope {owner_scope!r}"
+    )
+
+
+def _require_provider_manager(request: Request, provider_owner_email: str) -> Any:
+    if provider_owner_email == SYSTEM_USER_EMAIL:
+        return require_admin(request)
+    user = require_current_user(request)
+    if user.email != provider_owner_email:
+        raise api_exception(403, "forbidden", "Resource access denied")
+    return user
+
+
+async def _require_visible_provider_manager(
+    request: Request, provider_id: str
+) -> tuple[Any, Any, str]:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        provider = await get_visible_llm_provider(session, provider_id, user.email)
+    if provider is None:
+        raise api_exception(404, "not_found", "LLM provider not found")
+    owner_email = provider.owner_email or SYSTEM_USER_EMAIL
+    manager = _require_provider_manager(request, owner_email)
+    return provider, manager, owner_email
+
+
 @router.post("/api/v1/llm-providers", response_model=LLMProviderResponse)
 async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> LLMProviderResponse:
-    require_admin(request)
+    user = require_current_user(request)
     from cognis.api.common import slugify
 
     _validate_llm_provider_payload(payload.location, payload.config)
     provider_id = payload.provider_id or slugify(payload.display_name)
+    owner_email = _provider_owner_for_create(user, payload.config)
     async with request.app.state.session_factory() as session:
         existing = await get_llm_provider(session, provider_id)
         if existing is not None:
@@ -568,6 +676,7 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
             display_name=payload.display_name,
             location=payload.location,
             backend=payload.backend,
+            owner_email=owner_email,
             config=payload.config,
             status=payload.status,
         )
@@ -578,9 +687,9 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
 
 @router.get("/api/v1/llm-providers/{provider_id}", response_model=LLMProviderResponse)
 async def llm_provider_detail(request: Request, provider_id: str) -> LLMProviderResponse:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_llm_provider(session, provider_id)
+        row = await get_visible_llm_provider(session, provider_id, user.email)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
     return _apply_last_test_metadata(request, llm_provider_to_response(row))
@@ -592,14 +701,20 @@ async def llm_provider_update(
     provider_id: str,
     payload: LLMProviderUpdateRequest,
 ) -> LLMProviderResponse:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        existing = await get_llm_provider(session, provider_id)
+        existing = await get_visible_llm_provider(session, provider_id, user.email)
         if existing is None:
             raise api_exception(404, "not_found", "LLM provider not found")
+        owner_email = existing.owner_email or SYSTEM_USER_EMAIL
+        _require_provider_manager(request, owner_email)
+        next_owner_email = _provider_owner_for_update(request, owner_email, payload.owner_scope)
+        next_config = dict(payload.config or existing.config or {})
+        if payload.owner_scope is not None:
+            next_config["scope"] = "system" if next_owner_email == SYSTEM_USER_EMAIL else "user"
         _validate_llm_provider_payload(
             payload.location if payload.location is not None else existing.location,
-            payload.config if payload.config is not None else dict(existing.config or {}),
+            next_config,
         )
         ok = await update_llm_provider(
             session,
@@ -607,7 +722,8 @@ async def llm_provider_update(
             display_name=payload.display_name,
             location=payload.location,
             backend=payload.backend,
-            config=payload.config,
+            owner_email=next_owner_email,
+            config=next_config,
             status=payload.status,
         )
         if not ok:
@@ -635,8 +751,13 @@ async def llm_provider_update(
 
 @router.delete("/api/v1/llm-providers/{provider_id}", response_model=dict)
 async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, bool]:
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
+        existing = await get_visible_llm_provider(session, provider_id, user.email)
+        if existing is None:
+            raise api_exception(404, "not_found", "LLM provider not found")
+        owner_email = existing.owner_email or SYSTEM_USER_EMAIL
+        _require_provider_manager(request, owner_email)
         ok = await delete_llm_provider(session, provider_id)
         await session.commit()
     return {"ok": ok}
@@ -645,17 +766,22 @@ async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, b
 @router.post("/api/v1/llm-providers/{provider_id}/set-default")
 async def llm_provider_set_default(request: Request, provider_id: str) -> dict[str, Any]:
     """Mark a provider as the default. Clears any existing default."""
-    require_admin(request)
+    user = require_current_user(request)
     from cognis.store.models import LLMProvider as LLMProviderRow
 
     async with request.app.state.session_factory() as session:
-        target = await get_llm_provider(session, provider_id)
+        target = await get_visible_llm_provider(session, provider_id, user.email)
         if target is None:
             raise api_exception(404, "not_found", "LLM provider not found")
+        _require_provider_manager(request, target.owner_email or SYSTEM_USER_EMAIL)
         # Clear existing defaults
         from sqlalchemy import update
 
-        await session.execute(update(LLMProviderRow).values(is_default=False))
+        await session.execute(
+            update(LLMProviderRow)
+            .where(LLMProviderRow.owner_email == target.owner_email)
+            .values(is_default=False)
+        )
         target.is_default = True
         await session.commit()
     return {"ok": True, "provider_id": provider_id}
@@ -663,7 +789,7 @@ async def llm_provider_set_default(request: Request, provider_id: str) -> dict[s
 
 @router.post("/api/v1/llm-providers/{provider_id}/test", response_model=LLMProviderTestResponse)
 async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTestResponse:
-    require_admin(request)
+    user = require_current_user(request)
     cooldowns: dict[str, float] = request.app.state.provider_test_cooldowns
     last_started_at = cooldowns.get(provider_id)
     if (
@@ -672,9 +798,10 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
     ):
         raise api_exception(429, "rate_limited", "Provider test cooldown is still active")
     async with request.app.state.session_factory() as session:
-        row = await get_llm_provider(session, provider_id)
+        row = await get_visible_llm_provider(session, provider_id, user.email)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
+    _require_provider_manager(request, row.owner_email or SYSTEM_USER_EMAIL)
     cooldowns[provider_id] = monotonic()
     try:
         result = await request.app.state.providers.llm.test_provider(
@@ -695,7 +822,7 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
 async def llm_provider_chatgpt_oauth_start(
     request: Request, provider_id: str
 ) -> LLMProviderOAuthStatusResponse:
-    require_admin(request)
+    await _require_visible_provider_manager(request, provider_id)
     try:
         status = await request.app.state.providers.llm.start_chatgpt_oauth(provider_id)
     except ValueError as exc:
@@ -712,7 +839,7 @@ async def llm_provider_chatgpt_oauth_start(
 async def llm_provider_chatgpt_oauth_status(
     request: Request, provider_id: str
 ) -> LLMProviderOAuthStatusResponse:
-    require_admin(request)
+    await _require_visible_provider_manager(request, provider_id)
     try:
         status = await request.app.state.providers.llm.get_chatgpt_oauth_status(provider_id)
     except ValueError as exc:
@@ -728,12 +855,26 @@ async def llm_provider_chatgpt_oauth_status(
     response_model=dict,
 )
 async def llm_provider_chatgpt_oauth_clear(request: Request, provider_id: str) -> dict[str, bool]:
-    require_admin(request)
+    await _require_visible_provider_manager(request, provider_id)
     try:
         ok = await request.app.state.providers.llm.clear_chatgpt_oauth(provider_id)
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
     return {"ok": ok}
+
+
+@router.get("/api/v1/llm-providers/{provider_id}/codex/usage", response_model=CodexUsageResponse)
+async def llm_provider_codex_usage(request: Request, provider_id: str) -> CodexUsageResponse:
+    require_admin(request)
+    try:
+        usage = await request.app.state.providers.llm.get_codex_usage(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(
+            502, "provider_error", f"Failed to fetch Codex usage: {exc!s}"[:300]
+        ) from exc
+    return CodexUsageResponse(provider_id=provider_id, **usage)
 
 
 @router.post("/api/v1/llm-providers/discover-models-preview")
@@ -766,11 +907,12 @@ async def llm_provider_discover_models_preview(request: Request) -> dict[str, An
 @router.post("/api/v1/llm-providers/{provider_id}/discover-models")
 async def llm_provider_discover_models(request: Request, provider_id: str) -> dict[str, Any]:
     """Query a saved provider for available models."""
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_llm_provider(session, provider_id)
+        row = await get_visible_llm_provider(session, provider_id, user.email)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
+    _require_provider_manager(request, row.owner_email or SYSTEM_USER_EMAIL)
     try:
         models = await request.app.state.providers.llm.discover_models(provider_id)
     except Exception as exc:
@@ -787,11 +929,12 @@ async def llm_provider_enrich_models(
     request: Request, provider_id: str, payload: EnrichModelsRequest
 ) -> dict[str, Any]:
     """Enrich model IDs with metadata from a saved provider."""
-    require_admin(request)
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_llm_provider(session, provider_id)
+        row = await get_visible_llm_provider(session, provider_id, user.email)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
+    _require_provider_manager(request, row.owner_email or SYSTEM_USER_EMAIL)
 
     llm = request.app.state.providers.llm
     models: list[dict[str, Any]] = []
@@ -848,25 +991,22 @@ async def llm_provider_enrich_models_preview(
 async def model_routing_get(request: Request) -> ModelRoutingResponse:
     require_admin(request)
     async with request.app.state.session_factory() as session:
-        rows = await list_model_routing(session)
+        rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)
     route_by_task = {row.task_type: row for row in rows}
     return ModelRoutingResponse(
-        default=_routing_entry_from_row("default", route_by_task.get("default")),
-        classifier=_routing_entry_from_row("classifier", route_by_task.get("classifier")),
-        compaction=_routing_entry_from_row("compaction", route_by_task.get("compaction")),
-        evaluator=_routing_entry_from_row("evaluator", route_by_task.get("evaluator")),
-        speech_to_text=_routing_entry_from_row(
-            "speech_to_text", route_by_task.get("speech_to_text")
-        ),
-        text_to_speech=_routing_entry_from_row(
-            "text_to_speech", route_by_task.get("text_to_speech")
-        ),
-        image_generation=_routing_entry_from_row(
+        default=_routing_entry_model("default", route_by_task.get("default")),
+        classifier=_routing_entry_model("classifier", route_by_task.get("classifier")),
+        compaction=_routing_entry_model("compaction", route_by_task.get("compaction")),
+        evaluator=_routing_entry_model("evaluator", route_by_task.get("evaluator")),
+        speech_to_text=_routing_entry_model("speech_to_text", route_by_task.get("speech_to_text")),
+        text_to_speech=_routing_entry_model("text_to_speech", route_by_task.get("text_to_speech")),
+        image_generation=_routing_entry_model(
             "image_generation", route_by_task.get("image_generation")
         ),
-        attachment_analysis=_routing_entry_from_row(
+        attachment_analysis=_routing_entry_model(
             "attachment_analysis", route_by_task.get("attachment_analysis")
         ),
+        embedding=_routing_entry_model("embedding", route_by_task.get("embedding")),
     )
 
 
@@ -891,8 +1031,35 @@ async def model_routing_put(
             continue
 
         normalized_model = entry.model.strip()
-        resolved_provider_id = await llm.find_provider_for_model(normalized_model)
-        model_info = await llm.get_model_info(normalized_model, provider_id=resolved_provider_id)
+        if normalized_model == SAME_SESSION_MODEL_SENTINEL:
+            if task_type != "compaction":
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    f"{task_type} cannot use the same-session model sentinel",
+                )
+            if entry.reasoning_effort not in {None, "", "default"}:
+                raise api_exception(
+                    422,
+                    "validation_error",
+                    "compaction reasoning_effort cannot be set when using the same-session model",
+                )
+            prepared_updates[task_type] = (normalized_model, None, None)
+            continue
+        resolved_provider_id = await llm.find_provider_for_model(
+            normalized_model, acting_user_email=SYSTEM_USER_EMAIL
+        )
+        if resolved_provider_id is None:
+            raise api_exception(
+                422,
+                "validation_error",
+                f"{task_type} model {normalized_model!r} is not present in configured providers",
+            )
+        model_info = await llm.get_model_info(
+            normalized_model,
+            provider_id=resolved_provider_id,
+            acting_user_email=SYSTEM_USER_EMAIL,
+        )
         if not _route_model_is_eligible(
             task_type,
             model_id=normalized_model,
@@ -930,22 +1097,23 @@ async def model_routing_put(
                     f"{task_type} reasoning_effort {normalized_effort!r} is not supported by model {normalized_model!r}",
                 )
             config = {"reasoning_effort": normalized_effort}
-        prepared_updates[task_type] = (normalized_model, resolved_provider_id, config)
+        prepared_updates[task_type] = (normalized_model, None, config)
 
     async with request.app.state.session_factory() as session:
-        existing_rows = await list_model_routing(session)
+        existing_rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)
         for row in existing_rows:
             if row.task_type not in _ROUTING_TASK_TYPES:
-                await delete_model_routing(session, row.task_type)
+                await delete_model_routing(session, row.task_type, owner_email=SYSTEM_USER_EMAIL)
         for task_type, (normalized_model, resolved_provider_id, config) in prepared_updates.items():
             if normalized_model is None:
-                await delete_model_routing(session, task_type)
+                await delete_model_routing(session, task_type, owner_email=SYSTEM_USER_EMAIL)
                 continue
             await upsert_model_routing(
                 session,
                 task_type=task_type,
                 provider_id=resolved_provider_id,
                 model=normalized_model,
+                owner_email=SYSTEM_USER_EMAIL,
                 config=config,
             )
         await session.commit()

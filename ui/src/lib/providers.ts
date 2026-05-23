@@ -4,6 +4,8 @@ import { defaultModelEntry } from '$lib/types/api';
 
 export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt';
 export type AuthMode = 'env' | 'secret' | 'oauth' | 'none';
+export type ProviderOwnerScope = 'user' | 'system';
+export type CodexTransport = 'litellm' | 'direct';
 
 export interface AdvancedSetting {
   key: string;
@@ -14,10 +16,12 @@ export interface ProviderFormState {
   provider_id: string;
   display_name: string;
   location: string;
+  executor_id: string;
   executor_selector: string;
   backend: string;
   status: string;
   preset: ProviderPreset;
+  owner_scope: ProviderOwnerScope;
   base_url: string;
   default_model: string;
   models: ModelEntry[];
@@ -25,6 +29,7 @@ export interface ProviderFormState {
   auth_env_var: string;
   auth_secret_name: string;
   auth_secret_value: string;
+  codex_transport: CodexTransport;
   use_responses_api: boolean;
   advanced_settings: AdvancedSetting[];
   discovered_models: ModelEntry[];
@@ -34,6 +39,7 @@ export interface ProviderModelOption {
   value: string;
   label: string;
   providerId: string;
+  preferred: boolean;
 }
 
 /** Default env var names by preset. */
@@ -56,15 +62,17 @@ export const PRESET_LABELS: Record<ProviderPreset, string> = {
 
 /** Config keys that are handled by structured form fields. */
 const KNOWN_CONFIG_KEYS = new Set([
-  'preset', 'default_model', 'models', 'auth_config', 'use_responses_api',
-  'base_url', 'api_base', 'executor_labels'
+  'preset', 'default_model', 'models', 'auth_config', 'codex_transport', 'use_responses_api',
+  'base_url', 'api_base', 'executor_id', 'executor_labels', 'executor_backend', 'scope', 'owner_scope'
 ]);
+
+const DEFAULT_CODEX_TRANSPORT: CodexTransport = 'direct';
 
 /** All known ModelEntry keys (including optional ones that defaultModelEntry omits). */
 const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
-  'model_id', 'display_name', 'context_window', 'max_output_tokens',
+  'model_id', 'display_name', 'context_window', 'max_input_tokens', 'max_context_window', 'max_output_tokens',
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
-  'supports_pdf_input', 'supports_file_input', 'supports_reasoning', 'reasoning_efforts',
+  'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
   'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
   'supports_responses_api', 'supports_extended_thinking', 'supports_image_generation',
@@ -189,6 +197,7 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
     provider_id: provider?.provider_id ?? '',
     display_name: provider?.display_name ?? '',
     location: preset === 'chatgpt' ? 'controller' : (provider?.location ?? 'controller'),
+    executor_id: typeof config.executor_id === 'string' ? config.executor_id : '',
     executor_selector:
       typeof config.executor_labels === 'object' && config.executor_labels !== null && !Array.isArray(config.executor_labels)
         ? Object.entries(config.executor_labels as Record<string, unknown>)
@@ -198,6 +207,11 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
     backend: provider?.backend ?? 'litellm',
     status: provider?.status ?? 'active',
     preset,
+    owner_scope: !provider
+      ? 'user'
+      : provider.owner_email === 'system@cognis.local' || !provider.owner_email
+        ? 'system'
+        : 'user',
     base_url:
       typeof config.base_url === 'string'
         ? config.base_url
@@ -214,6 +228,10 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
     auth_env_var: authInfo.auth_env_var || defaultEnvVar,
     auth_secret_name: authInfo.auth_secret_name || `${preset}_api_key`,
     auth_secret_value: '',
+    codex_transport:
+      config.codex_transport === 'litellm' || config.codex_transport === 'direct'
+        ? config.codex_transport
+        : DEFAULT_CODEX_TRANSPORT,
     use_responses_api: config.use_responses_api !== false,
     advanced_settings: extractAdvancedSettings(config),
     discovered_models: []
@@ -224,18 +242,44 @@ export function deriveProviderId(displayName: string): string {
   return slugify(displayName);
 }
 
+export function providerRequiresExecutorLocation(_preset: ProviderPreset): boolean {
+  return false;
+}
+
+export function providerExecutorTargetError(form: ProviderFormState): string | null {
+  if (form.location !== 'executor') {
+    return null;
+  }
+  const hasExecutorId = form.executor_id.trim().length > 0;
+  const hasExecutorSelector = parseExecutorSelector(form.executor_selector) !== null;
+  if (hasExecutorId && hasExecutorSelector) {
+    return 'Choose either one executor or a label selector, not both.';
+  }
+  if (!hasExecutorId && !hasExecutorSelector) {
+    return 'Choose an executor or enter at least one executor label selector.';
+  }
+  return null;
+}
+
+function parseExecutorSelector(raw: string): Record<string, string> | null {
+  const entries = raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [key, ...rest] = entry.split('=');
+      return [key.trim(), rest.join('=').trim()] as const;
+    })
+    .filter(([key, value]) => key && value);
+  if (entries.length === 0) {
+    return null;
+  }
+  return Object.fromEntries(entries);
+}
+
 export function providerFormToPayload(form: ProviderFormState): Record<string, unknown> {
-  const executorLabels = Object.fromEntries(
-    form.executor_selector
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean)
-      .map((entry) => {
-        const [key, ...rest] = entry.split('=');
-        return [key.trim(), rest.join('=').trim()];
-      })
-      .filter(([key, value]) => key && value)
-  );
+  const executorLabels = parseExecutorSelector(form.executor_selector);
+  const executorId = form.executor_id.trim();
 
   // Serialize models with full properties (only non-default values)
   const serializedModels = form.models.map(serializeModelEntry);
@@ -269,11 +313,14 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
     status: form.status,
     config: {
       preset: form.preset,
+      scope: form.owner_scope,
       default_model: form.default_model,
       models: serializedModels,
       auth_config: authConfig,
+      ...(form.preset === 'chatgpt' ? { codex_transport: form.codex_transport } : {}),
       use_responses_api: form.use_responses_api,
-      ...(form.location === 'executor' && Object.keys(executorLabels).length > 0
+      ...(form.location === 'executor' && executorId ? { executor_id: executorId } : {}),
+      ...(form.location === 'executor' && !executorId && executorLabels
         ? { executor_labels: executorLabels }
         : {}),
       ...(form.base_url ? { base_url: form.base_url, api_base: form.base_url } : {}),
@@ -282,25 +329,53 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
   };
 }
 
+export function providerFormToUpdatePayload(form: ProviderFormState): Record<string, unknown> {
+  const payload = providerFormToPayload(form);
+  return {
+    display_name: payload.display_name,
+    location: payload.location,
+    backend: payload.backend,
+    owner_scope: form.owner_scope,
+    config: payload.config,
+    status: payload.status
+  };
+}
+
 export function collectModelOptions(providers: LLMProvider[]): ProviderModelOption[] {
-  const options: ProviderModelOption[] = [];
-  const seen = new Set<string>();
+  const options = new Map<string, ProviderModelOption>();
+
+  const currentDefaultProviderId =
+    providers.find((provider) => provider.is_default)?.provider_id ??
+    providers.find((provider) => provider.provider_id === 'default')?.provider_id ??
+    null;
 
   const pushOption = (provider: LLMProvider, value: string): void => {
     const normalized = value.trim();
     if (!normalized) {
       return;
     }
-    const key = `${provider.provider_id}:${normalized}`;
-    if (seen.has(key)) {
+    const preferred = provider.provider_id === currentDefaultProviderId;
+    const existing = options.get(normalized);
+    if (!existing) {
+      options.set(normalized, {
+        value: normalized,
+        label: preferred
+          ? `${normalized} · ${provider.display_name} (preferred)`
+          : `${normalized} · ${provider.display_name}`,
+        providerId: provider.provider_id,
+        preferred
+      });
       return;
     }
-    seen.add(key);
-    options.push({
-      value: normalized,
-      label: `${normalized} · ${provider.display_name}`,
-      providerId: provider.provider_id
-    });
+
+    if (preferred && !existing.preferred) {
+      options.set(normalized, {
+        value: normalized,
+        label: `${normalized} · ${provider.display_name} (preferred)`,
+        providerId: provider.provider_id,
+        preferred: true
+      });
+    }
   };
 
   for (const provider of providers) {
@@ -313,7 +388,7 @@ export function collectModelOptions(providers: LLMProvider[]): ProviderModelOpti
       pushOption(provider, value);
     }
   }
-  return options.sort((left, right) => left.label.localeCompare(right.label));
+  return Array.from(options.values()).sort((left, right) => left.label.localeCompare(right.label));
 }
 
 /** Whether the preset needs authentication credentials. */
@@ -323,7 +398,7 @@ export function presetNeedsAuth(preset: ProviderPreset): boolean {
 
 /** Whether the preset allows configuring base URL. */
 export function presetHasBaseUrl(preset: ProviderPreset): boolean {
-  return preset === 'openai_compatible' || preset === 'ollama' || preset === 'litellm_proxy';
+  return preset === 'openai_compatible' || preset === 'anthropic' || preset === 'ollama' || preset === 'litellm_proxy';
 }
 
 /** Format a token count for display (e.g. 1048576 → "~1M", 128000 → "128k"). */

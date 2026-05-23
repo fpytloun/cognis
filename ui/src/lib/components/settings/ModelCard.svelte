@@ -14,6 +14,9 @@
   let metaLine = $derived.by(() => {
     const parts: string[] = [];
     parts.push(`${formatTokenCount(model.context_window)} ctx`);
+    if (model.max_input_tokens && model.max_input_tokens !== model.context_window) {
+      parts.push(`${formatTokenCount(model.max_input_tokens)} in`);
+    }
     parts.push(`${formatTokenCount(model.max_output_tokens)} out`);
     if (model.input_cost_per_mtok != null && model.output_cost_per_mtok != null) {
       parts.push(`$${model.input_cost_per_mtok}/$${model.output_cost_per_mtok} per Mtok`);

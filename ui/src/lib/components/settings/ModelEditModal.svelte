@@ -35,9 +35,11 @@
   // but Input bind:value rejects undefined.
   let inputCost = $state('');
   let outputCost = $state('');
+  let maxInputTokens = $state('');
 
   $effect(() => {
     draft = cloneModel(model);
+    maxInputTokens = String(model.max_input_tokens ?? '');
     inputCost = String(model.input_cost_per_mtok ?? '');
     outputCost = String(model.output_cost_per_mtok ?? '');
   });
@@ -64,8 +66,11 @@
 
   function handleSave(): void {
     const result = { ...draft };
+    const maxInput = parseInt(maxInputTokens, 10);
     const ic = parseFloat(inputCost);
     const oc = parseFloat(outputCost);
+    result.max_input_tokens = Number.isFinite(maxInput) && maxInput > 0 ? maxInput : undefined;
+    result.max_context_window = result.context_window;
     result.input_cost_per_mtok = Number.isFinite(ic) ? ic : undefined;
     result.output_cost_per_mtok = Number.isFinite(oc) ? oc : undefined;
     onsave(result);
@@ -98,10 +103,14 @@
       <!-- Limits section -->
       <div class="space-y-3">
         <h3 class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Limits</h3>
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div class="space-y-1">
-            <label for="model-context" class="text-sm font-medium text-slate-200">Context window</label>
+            <label for="model-context" class="text-sm font-medium text-slate-200">Total context</label>
             <Input id="model-context" type="number" bind:value={draft.context_window} />
+          </div>
+          <div class="space-y-1">
+            <label for="model-input" class="text-sm font-medium text-slate-200">Max input</label>
+            <Input id="model-input" type="number" bind:value={maxInputTokens} placeholder="same as total" />
           </div>
           <div class="space-y-1">
             <label for="model-output" class="text-sm font-medium text-slate-200">Max output</label>

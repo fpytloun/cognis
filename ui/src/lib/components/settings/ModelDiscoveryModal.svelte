@@ -52,6 +52,9 @@
   function formatMeta(model: ModelEntry): string {
     const parts: string[] = [];
     parts.push(`${formatTokenCount(model.context_window)} ctx`);
+    if (model.max_input_tokens && model.max_input_tokens !== model.context_window) {
+      parts.push(`${formatTokenCount(model.max_input_tokens)} in`);
+    }
     parts.push(`${formatTokenCount(model.max_output_tokens)} out`);
     if (model.input_cost_per_mtok != null && model.output_cost_per_mtok != null) {
       parts.push(`$${model.input_cost_per_mtok}/$${model.output_cost_per_mtok}`);
@@ -107,6 +110,12 @@
                 <span class="ml-2 text-xs text-slate-500">(already configured)</span>
               {:else}
                 <span class="ml-2 text-xs text-slate-400">{formatMeta(entry)}</span>
+              {/if}
+              {#if entry.source || entry.confidence}
+                <div class="mt-1 flex flex-wrap gap-1 text-[10px] uppercase tracking-[0.18em] text-slate-500">
+                  {#if entry.source}<span>{entry.source}</span>{/if}
+                  {#if entry.confidence}<span>{entry.confidence}</span>{/if}
+                </div>
               {/if}
             </div>
           </button>

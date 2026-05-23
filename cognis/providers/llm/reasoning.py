@@ -105,9 +105,7 @@ def enrich_model_entry(
     if supports_reasoning and (not isinstance(existing_efforts, list) or not existing_efforts):
         try:
             preview_source = {
-                key: value
-                for key, value in entry.items()
-                if key in ModelInfo.model_fields
+                key: value for key, value in entry.items() if key in ModelInfo.model_fields
             }
             preview_source.setdefault("model_id", model_id)
             model_info = ModelInfo.model_validate(preview_source)
@@ -205,8 +203,16 @@ def build_reasoning_profile(
             native_efforts=("none", "low", "medium", "high", "max"),
         )
 
-    if family in {"groq", "generic"}:
-        available = ("default", "low", "medium", "high")
+    if family == "generic":
+        available = ("default", "none", "low", "medium", "high")
+        return ReasoningProfile(
+            family=family,
+            supports_reasoning=True,
+            available_efforts=available,
+            native_efforts=("none", "low", "medium", "high"),
+        )
+    if family == "groq":
+        available = ("default", "none", "low", "medium", "high")
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
@@ -262,7 +268,11 @@ def apply_reasoning_config(
             if key in result:
                 result.pop(key, None)
                 stripped_params.append(key)
-        if profile.family == "openai" and "max_tokens" in result and "max_completion_tokens" not in result:
+        if (
+            profile.family == "openai"
+            and "max_tokens" in result
+            and "max_completion_tokens" not in result
+        ):
             result["max_completion_tokens"] = result.pop("max_tokens")
             translated_max_tokens = True
         else:
@@ -270,7 +280,9 @@ def apply_reasoning_config(
     else:
         translated_max_tokens = False
 
-    requested = normalize_reasoning_effort(_coerce_reasoning_value(result.pop("reasoning_effort", None)))
+    requested = normalize_reasoning_effort(
+        _coerce_reasoning_value(result.pop("reasoning_effort", None))
+    )
     if requested is None:
         if profile.family == "anthropic":
             result = _enforce_anthropic_thinking_budget(result)
@@ -374,7 +386,11 @@ def _normalize_model_name(model_name: str) -> str:
 
 def _candidate_model_names(model_id: str, model_info: ModelInfo | None) -> list[str]:
     candidates = [model_id]
-    if model_info is not None and isinstance(model_info.display_name, str) and model_info.display_name:
+    if (
+        model_info is not None
+        and isinstance(model_info.display_name, str)
+        and model_info.display_name
+    ):
         candidates.append(model_info.display_name)
     return candidates
 
@@ -446,11 +462,17 @@ def _looks_like_gpt5_candidate(model_name: str) -> bool:
 
 
 def _supports_openai_none(model_id: str, model_info: ModelInfo | None) -> bool:
-    return any(_looks_like_gpt5_candidate(candidate) for candidate in _candidate_model_names(model_id, model_info))
+    return any(
+        _looks_like_gpt5_candidate(candidate)
+        for candidate in _candidate_model_names(model_id, model_info)
+    )
 
 
 def _supports_openai_xhigh(model_id: str, model_info: ModelInfo | None) -> bool:
-    return any(_looks_like_gpt5_candidate(candidate) for candidate in _candidate_model_names(model_id, model_info))
+    return any(
+        _looks_like_gpt5_candidate(candidate)
+        for candidate in _candidate_model_names(model_id, model_info)
+    )
 
 
 def _family_from_provider_preset(provider_preset: str) -> str | None:
@@ -543,6 +565,9 @@ def _apply_resolved_effort(
         request_kwargs["thinking_config"] = {"thinking_budget": budget}
         return resolved
     if profile.family in {"groq", "generic"}:
+        if resolved == "none" and resolved not in profile.native_efforts:
+            request_kwargs.pop("reasoning_effort", None)
+            return None
         mapped = "high" if resolved in {"xhigh", "max"} else resolved
         request_kwargs["reasoning_effort"] = mapped
         return mapped

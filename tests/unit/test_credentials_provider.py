@@ -64,10 +64,23 @@ async def test_credentials_provider_roundtrip_and_resolution(
     assert record.field_names == ["password", "username"]
     assert record.metadata["origin"] == "https://github.com"
 
+    claude_profile = await provider.upsert_credential(
+        credential_id="claude-profile-claude-code",
+        user_email="user@example.com",
+        kind="claude_code_profile",
+        label="Claude Code Profile",
+        payload={"profile": {"oauth_token": "profile-token"}},
+        metadata={"domain": "github.com", "source": "claude_agent_sdk_writeback"},
+    )
+    assert claude_profile.kind == "claude_code_profile"
+    assert claude_profile.field_names == ["profile"]
+
     rows = await provider.list_credentials("user@example.com")
     rows_by_id = {row.credential_id: row for row in rows}
     assert rows_by_id["github_work"].field_names == ["password", "username"]
     assert rows_by_id["github_work_2"].field_names == ["token"]
+    assert rows_by_id["claude-profile-claude-code"].kind == "claude_code_profile"
+    assert rows_by_id["claude-profile-claude-code"].field_names == ["profile"]
 
     resolved = await provider.resolve_ref(
         "$credential:github_work.password",

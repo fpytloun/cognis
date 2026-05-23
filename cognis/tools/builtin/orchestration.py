@@ -89,7 +89,9 @@ DELEGATE_TOOL = ToolDefinition(
         "Use wait=true when you need the result before continuing (e.g. joining "
         "parallel explorations). Multiple wait=true calls in one turn execute in "
         "parallel. Use wait=false (default) for background work — you will receive "
-        "a follow-up when the sub-session finishes."
+        "a follow-up when the sub-session finishes. Completed results may include "
+        "result_anchors for individual assistant messages; use tool-output anchor "
+        "tools with the delegate call ID to inspect sections when available."
     ),
     parameters={
         "type": "object",
@@ -139,7 +141,8 @@ LIST_SUBSESSIONS_TOOL = ToolDefinition(
     name="list_subsessions",
     description=(
         "List child sub-sessions of the current session. Shows status, agent, "
-        "task description, and result summary for each. Use to check on "
+        "task description, and result summary for each, keeping full result "
+        "content out of the compact list. Use to check on "
         "background delegations."
     ),
     parameters={
@@ -162,8 +165,9 @@ GET_SUBSESSION_TOOL = ToolDefinition(
     name="get_subsession",
     description=(
         "Get detailed status and output of a child sub-session. Returns the "
-        "sub-session's current status, task description, result summary, and "
-        "any output produced so far."
+        "sub-session's current status, task description, result summary, durable "
+        "result_content for completed children, and result_anchors for assistant "
+        "message sections when available."
     ),
     parameters={
         "type": "object",
@@ -213,8 +217,12 @@ CREATE_TASK_TOOL = ToolDefinition(
         "evaluation, and review. Use for substantial work: implementing features, "
         "deep research, multi-step analysis. The task runs independently — you "
         "define it and the result is delivered to the conversation when complete. "
-        "Tasks can spawn their own sub-sessions internally. Do not assign a project "
-        "unless an exact project name, source path prefix, or remote URL match exists."
+        "Tasks can spawn their own sub-sessions internally. The task owner agent is "
+        "the durable main agent for visibility, gates, logs, and delivery; workflow "
+        "steps may still run on system specialist agents. Do not pass system:* "
+        "specialist IDs such as system:implement here — use those with delegate() "
+        "or as workflow step overrides. Do not assign a project unless an exact "
+        "project name, source path prefix, or remote URL match exists."
     ),
     parameters={
         "type": "object",
@@ -229,7 +237,12 @@ CREATE_TASK_TOOL = ToolDefinition(
             },
             "agent_id": {
                 "type": "string",
-                "description": "Optional agent ID. Omit to use the current agent.",
+                "description": (
+                    "Optional durable workflow owner agent ID. Omit for normal workflow "
+                    "tasks to use the current/main agent. Do not pass system:* specialist "
+                    "agents such as system:implement; those execute delegated work or "
+                    "workflow steps, but should not own persistent tasks."
+                ),
             },
             "workflow_id": {
                 "type": "string",
@@ -241,6 +254,16 @@ CREATE_TASK_TOOL = ToolDefinition(
             "project_id": {
                 "type": "string",
                 "description": "Optional project ID. Only use when there is an exact project match.",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["draft", "queued"],
+                "description": "Use draft to create without starting; queued (default) starts normally.",
+                "default": "queued",
+            },
+            "draft": {
+                "type": "boolean",
+                "description": "When true, create the task without enqueueing it.",
             },
             "priority": {
                 "type": "integer",
@@ -719,7 +742,10 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
         "adapting an existing workflow, and immediately create a task or schedule from it. "
         "Use this rarely: only when the work needs custom multi-step structure, strict "
         "deliverables, or an adapted reusable workflow. For ordinary timed or recurring "
-        "tasks, use manage_schedules instead."
+        "tasks, use manage_schedules instead. When creating a task, omit agent_id for "
+        "normal workflow ownership by the current/main agent; system:* specialist "
+        "agents should execute workflow steps or delegated sub-sessions, not own the "
+        "persistent task."
     ),
     parameters={
         "type": "object",
@@ -794,7 +820,12 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
             "persist": {"type": "boolean", "default": False},
             "agent_id": {
                 "type": "string",
-                "description": "Optional agent override. Omit to use the current agent.",
+                "description": (
+                    "Optional durable task owner override. Omit for normal workflow "
+                    "tasks to use the current/main agent. Do not pass system:* "
+                    "specialist agents such as system:implement; those execute "
+                    "delegated work or workflow steps, but should not own persistent tasks."
+                ),
             },
             "priority": {"type": "integer", "default": 0},
         },
@@ -904,6 +935,8 @@ async def handle_delegate_tool_call(
     agent: Any | None = None,
     agent_registry: Any | None = None,
     wait: bool | None = None,
+    workspace_root: str | None = None,
+    working_directory: str | None = None,
 ) -> tuple[ToolResult, SessionModel | None]:
     """Handle the delegate tool call — creates a child session.
 
@@ -971,6 +1004,8 @@ async def handle_delegate_tool_call(
                 agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 expected_output=args.get("expected_output"),
+                workspace_root=workspace_root,
+                working_directory=working_directory,
             )
             return (
                 ToolResult(

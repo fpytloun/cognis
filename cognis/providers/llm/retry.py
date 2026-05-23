@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal
 
 from cognis.logging import get_logger
 from cognis.providers.retry import compute_delay
@@ -21,6 +23,119 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 1.0  # seconds
 DEFAULT_MAX_DELAY = 30.0  # seconds
 DEFAULT_JITTER = True
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Retry timing configuration for LLM operations."""
+
+    stage: Literal["pre_stream", "mid_stream"]
+    max_retries: int
+    base_delay: float = DEFAULT_BASE_DELAY
+    max_delay: float = DEFAULT_MAX_DELAY
+    jitter: bool = DEFAULT_JITTER
+
+
+DEFAULT_PRE_STREAM_RETRY_POLICY = RetryPolicy("pre_stream", DEFAULT_MAX_RETRIES)
+DEFAULT_MID_STREAM_RETRY_POLICY = RetryPolicy("mid_stream", 3, 1.0, 15.0)
+
+
+def compute_retry_delay(policy: RetryPolicy, attempt: int) -> float:
+    """Compute the delay for a retry attempt using the shared retry formula."""
+
+    return compute_delay(attempt, policy.base_delay, policy.max_delay, policy.jitter)
+
+
+_CONTEXT_OVERFLOW_SIGNATURES: tuple[tuple[str, str], ...] = (
+    ("context_length_exceeded", "context_length_exceeded"),
+    ("model_context_window_exceeded", "model_context_window_exceeded"),
+    ("exceeds the context window", "exceeds_context_window"),
+    ("exceeded the context window", "exceeds_context_window"),
+    ("context window exceeded", "context_window_exceeded"),
+    ("maximum context length", "maximum_context_length"),
+    ("max context length", "maximum_context_length"),
+    ("prompt is too long", "prompt_too_long"),
+    ("input is too long", "input_too_long"),
+    ("tokens exceed", "tokens_exceed_limit"),
+    ("token limit exceeded", "token_limit_exceeded"),
+)
+
+_CONTEXT_TERMS = ("context", "token", "tokens", "prompt", "input length", "input is")
+_GENERIC_SIZE_TERMS = (
+    "request too large",
+    "request entity too large",
+    "status code: 413",
+    "http 413",
+)
+
+
+class LLMContextOverflowError(RuntimeError):
+    """Raised when a provider rejects a request for exceeding context limits."""
+
+    def __init__(
+        self,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        reason: str = "context_overflow",
+        original_message: str = "",
+    ) -> None:
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.reason = reason
+        self.original_message = original_message
+        super().__init__(
+            "LLM context overflow"
+            f" provider={provider_id or 'unknown'!r}"
+            f" model={model_id or 'unknown'!r}"
+            f" reason={reason}"
+        )
+
+
+def context_overflow_reason(exc: BaseException | str) -> str | None:
+    """Return a stable reason when an error indicates provider context overflow."""
+
+    if isinstance(exc, LLMContextOverflowError):
+        return exc.reason
+    message = str(exc).lower()
+    if not message:
+        return None
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    if body is not None:
+        message = f"{message} {body!s}".lower()
+        code = getattr(body, "code", None)
+        if code:
+            message = f"{message} {code!s}".lower()
+        if isinstance(body, dict):
+            body_code = body.get("code") or body.get("type")
+            if body_code:
+                message = f"{message} {body_code!s}".lower()
+            nested_error = body.get("error")
+            if nested_error is not None:
+                message = f"{message} {nested_error!s}".lower()
+                if isinstance(nested_error, dict):
+                    nested_code = nested_error.get("code") or nested_error.get("type")
+                    if nested_code:
+                        message = f"{message} {nested_code!s}".lower()
+    for signature, reason in _CONTEXT_OVERFLOW_SIGNATURES:
+        if signature in message:
+            return reason
+    if "too many tokens" in message and any(
+        marker in message for marker in ("context", "prompt", "input", "request", "maximum")
+    ):
+        return "too_many_tokens"
+    if (status == 413 or any(term in message for term in _GENERIC_SIZE_TERMS)) and any(
+        term in message for term in _CONTEXT_TERMS
+    ):
+        return "request_entity_too_large"
+    return None
+
+
+def is_context_overflow_error(exc: BaseException | str) -> bool:
+    """Return True when *exc* is a provider context-window overflow."""
+
+    return context_overflow_reason(exc) is not None
 
 
 def is_retryable_error(exc: Exception) -> bool:
@@ -52,6 +167,15 @@ def is_retryable_error(exc: Exception) -> bool:
         "ContentPolicyViolationError",
     }
     if exc_name in non_retryable_names:
+        return False
+
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status in {429, 500, 502, 503, 504}:
+        return True
+    if status in {400, 401, 403, 404, 422}:
         return False
 
     retryable_names = {

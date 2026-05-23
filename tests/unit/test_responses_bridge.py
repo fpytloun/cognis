@@ -1,15 +1,96 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel, field_serializer
 
 from cognis.core.agent_loop import StreamAccumulator
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
+    response_model_dump,
     responses_request_kwargs,
     responses_stream_to_chat_chunks,
     responses_to_chat_response,
     split_messages_for_responses,
+    split_system_messages_for_responses,
 )
+
+
+class _WarningModel(BaseModel):
+    usage: dict[str, int]
+
+    @field_serializer("usage")
+    def _warn_usage(self, value: dict[str, int]) -> dict[str, int]:
+        import warnings
+
+        warnings.warn(
+            "PydanticSerializationUnexpectedValue(Expected `ResponseAPIUsage`)",
+            UserWarning,
+            stacklevel=2,
+        )
+        return value
+
+
+def test_response_model_dump_disables_pydantic_warnings_when_supported() -> None:
+    class ResponseLike:
+        def __init__(self) -> None:
+            self.seen_warnings: bool | None = None
+
+        def model_dump(self, *, warnings: bool = True) -> dict[str, object]:
+            self.seen_warnings = warnings
+            return {"usage": {"completion_tokens": 1}}
+
+    response = ResponseLike()
+
+    assert response_model_dump(response) == {"usage": {"completion_tokens": 1}}
+    assert response.seen_warnings is False
+
+
+def test_response_model_dump_suppresses_pydantic_usage_warning() -> None:
+    response = _WarningModel(usage={"completion_tokens": 1})
+
+    assert response_model_dump(response) == {"usage": {"completion_tokens": 1}}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_emits_provider_liveness_for_status_events() -> None:
+    async def _stream():
+        yield {"type": "response.created"}
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert chunks == [
+        {
+            "provider_event": "responses",
+            "provider_event_type": "response.created",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_failed_event_includes_safe_error_details() -> None:
+    async def _stream():
+        yield {
+            "type": "response.failed",
+            "response": {"id": "resp_123", "status": "failed"},
+            "error": {
+                "type": "server_error",
+                "code": "internal_error",
+                "message": "Something went wrong",
+                "details": "x" * 600,
+            },
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk["mid_stream_failure"] is True
+    assert chunk["error"] == "Something went wrong"
+    assert chunk["response_error"]["category"] == "provider_5xx"
+    assert chunk["response_error"]["response_id"] == "resp_123"
+    assert chunk["response_error"]["response_status"] == "failed"
+    assert chunk["response_error"]["code"] == "internal_error"
+    assert "<truncated" in chunk["response_error"]["details"]["details"]
 
 
 def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
@@ -52,6 +133,40 @@ def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
             ],
         }
     ]
+
+
+def test_messages_to_responses_input_keeps_call_id_on_function_call_items() -> None:
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+    )
+
+    assert result == [
+        {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_drops_orphan_tool_output() -> None:
+    result = messages_to_responses_input(
+        [
+            {"role": "assistant", "content": "saved work"},
+            {"role": "tool", "tool_call_id": "call_missing", "content": "ok"},
+        ],
+    )
+
+    assert result == [{"role": "assistant", "content": "saved work"}]
 
 
 def test_messages_to_responses_input_preserves_system_role() -> None:
@@ -185,6 +300,35 @@ def test_split_messages_for_responses_returns_none_without_breakpoint() -> None:
 
     assert instructions is None
     assert tail == messages
+
+
+def test_split_system_messages_for_responses_extracts_leading_system_prefix() -> None:
+    messages = [
+        {"role": "system", "content": "Persona"},
+        {"role": "system", "content": [{"type": "text", "text": "Project"}]},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    instructions, tail = split_system_messages_for_responses(messages)
+
+    assert instructions == "Persona\n\nProject"
+    assert tail == [{"role": "user", "content": "Hi"}]
+
+
+def test_split_system_messages_for_responses_preserves_later_system_messages() -> None:
+    messages = [
+        {"role": "system", "content": "Persona"},
+        {"role": "user", "content": "Hi"},
+        {"role": "system", "content": "Late system note"},
+    ]
+
+    instructions, tail = split_system_messages_for_responses(messages)
+
+    assert instructions == "Persona"
+    assert tail == [
+        {"role": "user", "content": "Hi"},
+        {"role": "system", "content": "Late system note"},
+    ]
 
 
 def test_split_messages_for_responses_refuses_non_system_prefix() -> None:
@@ -467,6 +611,12 @@ def test_responses_request_kwargs_maps_reasoning_effort_to_reasoning_summary_aut
     assert result["reasoning"] == {"effort": "low", "summary": "auto"}
 
 
+def test_responses_request_kwargs_omits_disabled_reasoning_summary() -> None:
+    result = responses_request_kwargs({"reasoning_effort": "low"}, default_reasoning_summary="none")
+
+    assert result["reasoning"] == {"effort": "low"}
+
+
 def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None:
     result = responses_request_kwargs(
         {"reasoning_effort": "medium", "reasoning": {"summary": "detailed"}}
@@ -475,12 +625,43 @@ def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None
     assert result["reasoning"] == {"effort": "medium", "summary": "detailed"}
 
 
-def test_responses_request_kwargs_passes_through_native_apply_patch_tool() -> None:
+def test_responses_request_kwargs_applies_default_text_verbosity() -> None:
+    result = responses_request_kwargs({}, default_text_verbosity="low")
+
+    assert result["text"] == {"verbosity": "low"}
+
+
+def test_responses_request_kwargs_preserves_explicit_text_verbosity() -> None:
+    result = responses_request_kwargs(
+        {"text": {"verbosity": "high", "format": {"type": "text"}}},
+        default_text_verbosity="low",
+    )
+
+    assert result["text"] == {"verbosity": "high", "format": {"type": "text"}}
+
+
+def test_responses_request_kwargs_defaults_apply_patch_to_freeform_tool() -> None:
     result = responses_request_kwargs(
         {"tools": [{"type": "apply_patch"}, {"type": "function", "function": {"name": "read"}}]}
     )
 
-    assert result["tools"][0] == {"type": "apply_patch"}
+    assert result["tools"][0]["type"] == "custom"
+    assert result["tools"][0]["name"] == "apply_patch"
+    assert result["tools"][0]["format"]["type"] == "grammar"
+
+
+def test_responses_request_kwargs_maps_freeform_apply_patch_to_custom_tool() -> None:
+    result = responses_request_kwargs(
+        {
+            "cognis_openai_apply_patch_tool_type": "freeform",
+            "tools": [{"type": "apply_patch"}],
+        }
+    )
+
+    assert result["tools"][0]["type"] == "custom"
+    assert result["tools"][0]["name"] == "apply_patch"
+    assert result["tools"][0]["format"]["type"] == "grammar"
+    assert "Begin Patch" in result["tools"][0]["format"]["definition"]
 
 
 def test_responses_to_chat_response_prefers_input_output_usage_fields() -> None:
@@ -750,6 +931,33 @@ async def test_responses_stream_to_chat_chunks_emits_apply_patch_call() -> None:
     assert calls[0].arguments == {
         "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"}
     }
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_custom_apply_patch_call() -> None:
+    patch_text = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n"
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch_text,
+                "call_id": "call_patch",
+            },
+        }
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "apply_patch"
+    assert calls[0].call_id == "call_patch"
+    assert calls[0].arguments == {"patchText": patch_text}
 
 
 @pytest.mark.asyncio

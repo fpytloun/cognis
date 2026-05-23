@@ -17,16 +17,22 @@ class InferenceRouter:
 
     def __init__(self, ws_provider: WebSocketExecutorProvider) -> None:
         self._ws_provider = ws_provider
+        self.last_backend_metadata: dict[str, Any] | None = None
 
     async def route_stream(
         self,
         *,
         messages: list[dict[str, Any]],
         model: str,
+        executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
         request_kwargs: dict[str, Any] | None = None,
+        backend: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        conn = await self._find_executor(executor_labels)
+        conn = await self._find_executor(executor_id, executor_labels)
+        self.last_backend_metadata = None
         if conn is None:
             yield {"error": "No executor matches the provider selector", "mid_stream_failure": True}
             return
@@ -37,11 +43,16 @@ class InferenceRouter:
                 messages=messages,
                 model=model,
                 request_kwargs=request_kwargs or {},
+                backend=backend,
+                provider_id=provider_id,
+                owner_email=owner_email,
             ):
                 if chunk.get("error"):
                     yield {"error": chunk["error"], "mid_stream_failure": True}
                     return
                 if chunk.get("done"):
+                    metadata = chunk.get("backend_metadata")
+                    self.last_backend_metadata = metadata if isinstance(metadata, dict) else None
                     yield {
                         "choices": [
                             {"delta": {}, "finish_reason": chunk.get("finish_reason", "stop")}
@@ -71,8 +82,12 @@ class InferenceRouter:
         *,
         messages: list[dict[str, Any]],
         model: str,
+        executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
         request_kwargs: dict[str, Any] | None = None,
+        backend: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -82,11 +97,16 @@ class InferenceRouter:
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         response_status = "completed"
+        backend_metadata: dict[str, Any] | None = None
         async for chunk in self.route_stream(
             messages=messages,
             model=model,
+            executor_id=executor_id,
             executor_labels=executor_labels,
             request_kwargs=request_kwargs,
+            backend=backend,
+            provider_id=provider_id,
+            owner_email=owner_email,
         ):
             if chunk.get("mid_stream_failure"):
                 raise RuntimeError(chunk.get("error", "Inference failed"))
@@ -108,6 +128,10 @@ class InferenceRouter:
                 usage = chunk["usage"]
             if chunk.get("response_status"):
                 response_status = str(chunk["response_status"])
+            metadata = chunk.get("backend_metadata")
+            if isinstance(metadata, dict):
+                backend_metadata = metadata
+        self.last_backend_metadata = backend_metadata
         return {
             "choices": [
                 {
@@ -132,6 +156,7 @@ class InferenceRouter:
         prompt: str,
         model: str,
         strategy: str = "aimage_generation",
+        executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
         n: int = 1,
         size: str | None = None,
@@ -141,7 +166,7 @@ class InferenceRouter:
         request_kwargs: dict[str, Any] | None = None,
     ) -> ImageGenerationResult:
         """Route image generation through a matching executor."""
-        conn = await self._find_executor(executor_labels)
+        conn = await self._find_executor(executor_id, executor_labels)
         if conn is None:
             raise RuntimeError("No executor matches the provider selector for image generation")
 
@@ -173,13 +198,14 @@ class InferenceRouter:
         filename: str,
         model: str,
         provider_preset: str | None = None,
+        executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
         supported_audio_mime_types: list[str] | None = None,
         request_kwargs: dict[str, Any] | None = None,
         prompt: str | None = None,
         language: str | None = None,
     ) -> SpeechToTextResult:
-        conn = await self._find_executor(executor_labels)
+        conn = await self._find_executor(executor_id, executor_labels)
         if conn is None:
             raise RuntimeError("No executor matches the provider selector for speech-to-text")
 
@@ -211,13 +237,14 @@ class InferenceRouter:
         voice: str,
         model: str,
         provider_preset: str | None = None,
+        executor_id: str | None = None,
         executor_labels: dict[str, str] | None = None,
         response_format: str = "mp3",
         speed: float = 1.0,
         request_kwargs: dict[str, Any] | None = None,
         low_latency: bool = False,
     ) -> TextToSpeechResult:
-        conn = await self._find_executor(executor_labels)
+        conn = await self._find_executor(executor_id, executor_labels)
         if conn is None:
             raise RuntimeError("No executor matches the provider selector for text-to-speech")
 
@@ -258,11 +285,17 @@ class InferenceRouter:
             ),
         )
 
-    async def _find_executor(self, executor_labels: dict[str, str] | None) -> Any | None:
+    async def _find_executor(
+        self, executor_id: str | None, executor_labels: dict[str, str] | None
+    ) -> Any | None:
         active = await self._ws_provider.list_active()
         for handle in active:
+            if executor_id and handle.executor_id != executor_id:
+                continue
             metadata = handle.metadata or {}
-            if not bool(metadata.get("shared")) and not is_shared_owner_email(metadata.get("owner_email")):
+            if not bool(metadata.get("shared")) and not is_shared_owner_email(
+                metadata.get("owner_email")
+            ):
                 continue
             labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
             if executor_labels and not labels_match(labels, executor_labels):

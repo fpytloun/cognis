@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,12 +17,26 @@ from typing import Any
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.config import ModelInfo
+from cognis.providers.llm.errors import classify_response_failure
 
 RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
+RESPONSES_TOOL_CALL_TYPES = frozenset({"function_call", "apply_patch_call", "custom_tool_call"})
 
 logger = get_logger(__name__)
 
 _NATIVE_APPLY_PATCH_OPERATION_TYPES = {"create_file", "update_file", "delete_file"}
+APPLY_PATCH_FREEFORM_LARK_GRAMMAR = """start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" NEWLINE
+end_patch: "*** End Patch" NEWLINE?
+hunk: add_file | delete_file | update_file
+add_file: "*** Add File: " PATH NEWLINE add_line+
+delete_file: "*** Delete File: " PATH NEWLINE
+update_file: "*** Update File: " PATH NEWLINE change_line*
+add_line: "+" /[^\n]*/ NEWLINE
+change_line: /[^\n]*/ NEWLINE
+PATH: /[^\n]+/
+%import common.NEWLINE
+"""
 
 
 @dataclass(slots=True)
@@ -108,6 +123,34 @@ def split_messages_for_responses(
     return instructions, tail_slice
 
 
+def split_system_messages_for_responses(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Move leading system messages into Responses ``instructions``.
+
+    This is the conservative non-cache variant used for providers that require
+    top-level instructions but do not need an immutable cache breakpoint.  Only
+    the contiguous leading system prefix is moved; any later system messages are
+    left in the input tail to preserve transcript order.
+    """
+
+    instructions_parts: list[str] = []
+    tail_start = 0
+    for entry in messages:
+        if not isinstance(entry, dict) or entry.get("role") != "system":
+            break
+        content = entry.get("content")
+        text = _extract_text_content(content)
+        if text:
+            instructions_parts.append(text)
+        tail_start += 1
+
+    if not instructions_parts:
+        return None, messages
+
+    return "\n\n".join(instructions_parts), messages[tail_start:]
+
+
 def _extract_text_content(content: Any) -> str:
     """Extract plain text from a message content field (string or blocks)."""
 
@@ -130,6 +173,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
 
     items: list[dict[str, Any]] = []
     native_apply_patch_call_ids: set[str] = set()
+    function_call_ids: set[str] = set()
     for index, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
@@ -152,9 +196,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 )
                 function_name = str(function.get("name", "unknown_tool"))
                 arguments = str(function.get("arguments", "{}"))
-                native_operation = _extract_native_apply_patch_operation(
-                    function_name, arguments
-                )
+                native_operation = _extract_native_apply_patch_operation(function_name, arguments)
                 if native_operation is not None:
                     native_apply_patch_call_ids.add(call_id)
                     items.append(
@@ -174,6 +216,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "arguments": arguments,
                     }
                 )
+                function_call_ids.add(call_id)
             continue
         if role == "tool":
             call_id = message.get("tool_call_id")
@@ -194,7 +237,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
-            else:
+            elif normalized_call_id in function_call_ids:
                 items.append(
                     {
                         "type": "function_call_output",
@@ -202,12 +245,24 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
+            else:
+                logger.warning(
+                    "Dropping orphan tool output for Responses API",
+                    extra={
+                        "extra_data": {
+                            "message_index": index,
+                            "tool_call_id": normalized_call_id,
+                        }
+                    },
+                )
             continue
         items.append({"role": role, "content": _normalize_message_content(content)})
     return items
 
 
-def _extract_native_apply_patch_operation(function_name: str, arguments: str) -> dict[str, Any] | None:
+def _extract_native_apply_patch_operation(
+    function_name: str, arguments: str
+) -> dict[str, Any] | None:
     if function_name != "apply_patch":
         return None
     try:
@@ -241,11 +296,19 @@ def _normalize_native_apply_patch_operation(operation: Any) -> dict[str, Any] | 
     return normalized
 
 
-def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+def responses_request_kwargs(
+    request_kwargs: dict[str, Any],
+    *,
+    default_reasoning_summary: str | None = "auto",
+    default_text_verbosity: str | None = None,
+) -> dict[str, Any]:
     """Translate chat-completions-style kwargs into Responses-compatible kwargs."""
 
     filtered = dict(request_kwargs)
     filtered.pop("cognis_llm_api", None)
+    apply_patch_tool_type = (
+        str(filtered.pop("cognis_openai_apply_patch_tool_type", "") or "").strip().lower()
+    )
     reasoning_effort = filtered.pop("reasoning_effort", None)
     response_format = filtered.pop("response_format", None)
     if response_format is not None and "text" not in filtered and "text_format" not in filtered:
@@ -261,15 +324,26 @@ def responses_request_kwargs(request_kwargs: dict[str, Any]) -> dict[str, Any]:
     if isinstance(reasoning_effort, str) and reasoning_effort.strip():
         normalized_reasoning["effort"] = reasoning_effort.strip()
     if normalized_reasoning and "summary" not in normalized_reasoning:
-        # GPT-5 reasoning summaries are opt-in on the Responses API. Enable them
-        # by default whenever a reasoning request is being made so user-visible
-        # assistant_thinking blocks can be emitted and persisted.
-        normalized_reasoning["summary"] = "auto"
+        summary_default = (default_reasoning_summary or "auto").strip().lower()
+        if summary_default and summary_default != "none":
+            # Reasoning summaries are opt-in on the Responses API. Enable them
+            # only when model/provider metadata says the model supports them.
+            normalized_reasoning["summary"] = summary_default
     if normalized_reasoning:
         filtered["reasoning"] = normalized_reasoning
+    verbosity_default = (default_text_verbosity or "").strip().lower()
+    if verbosity_default and "text" not in filtered and "text_format" not in filtered:
+        filtered["text"] = {"verbosity": verbosity_default}
+    elif verbosity_default and isinstance(filtered.get("text"), dict):
+        text = dict(filtered["text"])
+        text.setdefault("verbosity", verbosity_default)
+        filtered["text"] = text
     tools = filtered.get("tools")
     if isinstance(tools, list):
-        filtered["tools"] = [_tool_to_responses_tool(tool) for tool in tools]
+        filtered["tools"] = [
+            _tool_to_responses_tool(tool, apply_patch_tool_type=apply_patch_tool_type)
+            for tool in tools
+        ]
     return filtered
 
 
@@ -287,7 +361,7 @@ def normalize_tool_call_id(
 
 
 def _is_responses_tool_call_item(item: dict[str, Any]) -> bool:
-    return str(item.get("type")) in {"function_call", "apply_patch_call"}
+    return str(item.get("type")) in {"function_call", "apply_patch_call", "custom_tool_call"}
 
 
 def _tool_call_item_name(item: dict[str, Any]) -> str:
@@ -300,6 +374,16 @@ def _tool_call_item_arguments(item: dict[str, Any]) -> str:
     if str(item.get("type")) == "apply_patch_call":
         operation = _normalize_native_apply_patch_operation(item.get("operation"))
         return json.dumps({"operation": operation}) if operation is not None else ""
+    if str(item.get("type")) == "custom_tool_call":
+        if _tool_call_item_name(item) == "apply_patch":
+            patch_text = item.get("input")
+            return json.dumps({"patchText": patch_text if isinstance(patch_text, str) else ""})
+        raw_input = item.get("input")
+        if isinstance(raw_input, str):
+            return json.dumps({"input": raw_input})
+        if raw_input is not None:
+            return json.dumps({"input": raw_input})
+        return "{}"
     return str(item.get("arguments") or "")
 
 
@@ -307,7 +391,7 @@ def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a Responses API payload into chat-completions-like shape."""
 
     envelope = _extract_response_envelope(payload)
-    normalized: dict[str, Any] = {
+    return {
         "choices": [
             {
                 "message": {
@@ -324,7 +408,6 @@ def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
         "usage": envelope.usage,
         "response_status": envelope.status,
     }
-    return normalized
 
 
 async def responses_stream_to_chat_chunks(
@@ -340,18 +423,28 @@ async def responses_stream_to_chat_chunks(
             if not event_type:
                 event_type = _detect_synthetic_event_type(event, raw_event)
             state.note_event(event_type)
+            provider_liveness_chunk: dict[str, Any] = {
+                "provider_event": "responses",
+                "provider_event_type": event_type or "unknown",
+            }
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str) and delta:
                     state.note_text_emitted("content", delta)
-                    yield {"choices": [{"delta": {"content": delta}}]}
+                    provider_liveness_chunk["choices"] = [{"delta": {"content": delta}}]
+                    yield provider_liveness_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type == "response.output_text.done":
                 text = event.get("text")
                 if isinstance(text, str) and text:
                     final_text_chunk = state.final_text_delta(text, field="content")
                     if final_text_chunk is not None:
+                        final_text_chunk.update(provider_liveness_chunk)
                         yield final_text_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type in {"response.content_part.added", "response.content_part.done"}:
                 part = event.get("part")
@@ -359,7 +452,10 @@ async def responses_stream_to_chat_chunks(
                 if part_text:
                     part_chunk = state.final_text_delta(part_text, field="content")
                     if part_chunk is not None:
+                        part_chunk.update(provider_liveness_chunk)
                         yield part_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type in {
                 "response.reasoning_text.delta",
@@ -371,7 +467,10 @@ async def responses_stream_to_chat_chunks(
                 if part_text:
                     reasoning_chunk = state.final_text_delta(part_text, field="reasoning_content")
                     if reasoning_chunk is not None:
+                        reasoning_chunk.update(provider_liveness_chunk)
                         yield reasoning_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type in {
                 "response.reasoning_summary_text.delta",
@@ -385,6 +484,7 @@ async def responses_stream_to_chat_chunks(
                 if part_text:
                     reasoning_chunk = state.final_text_delta(part_text, field="reasoning")
                     if reasoning_chunk is not None:
+                        reasoning_chunk.update(provider_liveness_chunk)
                         yield reasoning_chunk
                 # Emit part boundary markers so the agent loop can detect
                 # block transitions for assistant_thinking event recording.
@@ -394,6 +494,7 @@ async def responses_stream_to_chat_chunks(
                         _extract_text_value(part.get("title")) if isinstance(part, dict) else None
                     )
                     yield {
+                        **provider_liveness_chunk,
                         "choices": [
                             {
                                 "delta": {
@@ -404,11 +505,12 @@ async def responses_stream_to_chat_chunks(
                                     }
                                 }
                             }
-                        ]
+                        ],
                     }
                     state.reasoning_part_count += 1
                 elif event_type == "response.reasoning_summary_part.done":
                     yield {
+                        **provider_liveness_chunk,
                         "choices": [
                             {
                                 "delta": {
@@ -419,8 +521,13 @@ async def responses_stream_to_chat_chunks(
                                     }
                                 }
                             }
-                        ]
+                        ],
                     }
+                if not part_text and event_type not in {
+                    "response.reasoning_summary_part.added",
+                    "response.reasoning_summary_part.done",
+                }:
+                    yield provider_liveness_chunk
                 continue
             if event_type in {"response.refusal.delta", "response.refusal.done"}:
                 refusal_text = _extract_text_value(
@@ -429,7 +536,10 @@ async def responses_stream_to_chat_chunks(
                 if refusal_text:
                     refusal_chunk = state.final_text_delta(refusal_text, field="refusal")
                     if refusal_chunk is not None:
+                        refusal_chunk.update(provider_liveness_chunk)
                         yield refusal_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type == "response.output_item.added":
                 item = _get_output_item(event)
@@ -438,15 +548,20 @@ async def responses_stream_to_chat_chunks(
                 _, is_new = state.register_item(item)
                 message_chunk = state.message_delta(item, emit_initial=is_new)
                 if message_chunk is not None:
+                    message_chunk.update(provider_liveness_chunk)
                     yield message_chunk
                 initial_chunk = state.initial_tool_delta(item, emit_name=True)
                 if initial_chunk is not None:
+                    initial_chunk.update(provider_liveness_chunk)
                     yield initial_chunk
                 continue
             if event_type == "response.function_call_arguments.delta":
                 chunk = state.arguments_delta(event)
                 if chunk is not None:
+                    chunk.update(provider_liveness_chunk)
                     yield chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type == "response.function_call_arguments.done":
                 item = _get_output_item(event)
@@ -454,10 +569,14 @@ async def responses_stream_to_chat_chunks(
                     state.register_item(item)
                     initial_chunk = state.initial_tool_delta(item, emit_name=True)
                     if initial_chunk is not None:
+                        initial_chunk.update(provider_liveness_chunk)
                         yield initial_chunk
                     final_chunk = state.finalize_item(item)
                     if final_chunk is not None:
+                        final_chunk.update(provider_liveness_chunk)
                         yield final_chunk
+                else:
+                    yield provider_liveness_chunk
                 continue
             if event_type == "response.output_item.done":
                 item = _get_output_item(event)
@@ -466,22 +585,28 @@ async def responses_stream_to_chat_chunks(
                 state.register_item(item)
                 message_chunk = state.finalize_message_item(item)
                 if message_chunk is not None:
+                    message_chunk.update(provider_liveness_chunk)
                     yield message_chunk
                 initial_chunk = state.initial_tool_delta(item, emit_name=True)
                 if initial_chunk is not None:
+                    initial_chunk.update(provider_liveness_chunk)
                     yield initial_chunk
                 final_chunk = state.finalize_item(item)
                 if final_chunk is not None:
+                    final_chunk.update(provider_liveness_chunk)
                     yield final_chunk
                 continue
             if event_type in {"response.completed", "response.completed.synthetic"}:
                 response_payload = _to_dict(event.get("response") or event)
                 for fallback_chunk in state.final_message_fallback(response_payload):
+                    fallback_chunk.update(provider_liveness_chunk)
                     yield fallback_chunk
                 for fallback_chunk in state.final_tool_fallback(response_payload):
+                    fallback_chunk.update(provider_liveness_chunk)
                     yield fallback_chunk
                 state.completed_seen = True
                 yield {
+                    **provider_liveness_chunk,
                     "choices": [
                         {"delta": {}, "finish_reason": _extract_finish_reason(response_payload)}
                     ],
@@ -491,12 +616,21 @@ async def responses_stream_to_chat_chunks(
                 }
                 continue
             if event_type == "response.failed":
-                error = event.get("error") or {}
-                message = error.get("message") if isinstance(error, dict) else str(error)
+                failure_details = _response_failure_details(event)
+                failure_payload = classify_response_failure(failure_details)
+                message = failure_details.get("message")
+                logger.warning(
+                    "Responses stream failed event",
+                    extra={"extra_data": failure_details},
+                )
                 yield {
+                    **provider_liveness_chunk,
                     "error": str(message or "Responses stream failed"),
+                    "response_error": failure_payload,
                     "mid_stream_failure": True,
                 }
+                continue
+            yield provider_liveness_chunk
     finally:
         logger.debug(
             "Responses bridge stream summary",
@@ -510,6 +644,35 @@ async def responses_stream_to_chat_chunks(
                 }
             },
         )
+
+
+def _truncate_response_failure_value(value: Any, *, max_chars: int = 500) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...<truncated {len(text) - max_chars} chars>"
+
+
+def _response_failure_details(event: dict[str, Any]) -> dict[str, Any]:
+    error = event.get("error") or {}
+    response = event.get("response") or {}
+    if not isinstance(error, dict):
+        error = {"message": str(error)}
+    if not isinstance(response, dict):
+        response = {}
+    details: dict[str, Any] = {
+        "event_type": event.get("type") or "response.failed",
+        "response_id": response.get("id") or event.get("response_id") or event.get("id"),
+        "response_status": response.get("status") or event.get("status"),
+    }
+    for key in ("type", "code", "message", "param"):
+        if key in error:
+            details[key] = _truncate_response_failure_value(error.get(key))
+    if "details" in error:
+        details["details"] = _truncate_response_failure_value(error.get("details"))
+    return {key: value for key, value in details.items() if value not in (None, "")}
 
 
 class _ResponsesStreamState:
@@ -577,6 +740,7 @@ class _ResponsesStreamState:
         state = {
             "state_key": item_key,
             "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_key),
+            "item_type": str(item.get("type") or ""),
             "name": _tool_call_item_name(item),
             "name_emitted": False,
             "arguments": _tool_call_item_arguments(item),
@@ -832,7 +996,7 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
             if refusal_text:
                 refusal_parts.append(refusal_text)
             continue
-        if item_type in {"function_call", "apply_patch_call"}:
+        if item_type in {"function_call", "apply_patch_call", "custom_tool_call"}:
             envelope.tool_calls.append(
                 {
                     "id": normalize_tool_call_id(item.get("call_id"), item.get("id"), index),
@@ -840,6 +1004,30 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
                     "function": {
                         "name": _tool_call_item_name(item),
                         "arguments": _tool_call_item_arguments(item) or "{}",
+                    },
+                }
+            )
+
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        for index, tool_call in enumerate(message.get("tool_calls") or []):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function") or {}
+            if not isinstance(function, dict):
+                function = {}
+            fallback_id = normalize_tool_call_id(tool_call.get("id"), None, index)
+            envelope.tool_calls.append(
+                {
+                    "id": fallback_id,
+                    "type": "function",
+                    "function": {
+                        "name": str(function.get("name") or "unknown_tool"),
+                        "arguments": str(function.get("arguments") or "{}"),
                     },
                 }
             )
@@ -1044,24 +1232,30 @@ def _get_output_item(event: dict[str, Any]) -> dict[str, Any] | None:
     return item if isinstance(item, dict) else None
 
 
-def _to_dict(value: Any) -> dict[str, Any]:
+def response_model_dump(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     if hasattr(value, "model_dump"):
-        import warnings
-
         with warnings.catch_warnings():
             # LiteLLM's model_construct() can leave the ``usage`` field as a
             # raw dict instead of a ``ResponseAPIUsage`` instance, which
             # triggers a harmless Pydantic serialisation warning on
             # ``model_dump()``.  Suppress it here — the dict is still valid.
             warnings.filterwarnings("ignore", message=".*Pydantic serializer.*")
-            dumped = value.model_dump()
+            warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
+            try:
+                dumped = value.model_dump(warnings=False)
+            except TypeError:
+                dumped = value.model_dump()
         if isinstance(dumped, dict):
             return dumped
     if hasattr(value, "__dict__"):
         return dict(value.__dict__)
     return {}
+
+
+def _to_dict(value: Any) -> dict[str, Any]:
+    return response_model_dump(value)
 
 
 def _detect_synthetic_event_type(event: dict[str, Any], raw_event: Any) -> str:
@@ -1105,9 +1299,11 @@ def _normalize_event_type(event_type: str) -> str:
     return event_type
 
 
-def _tool_to_responses_tool(tool: Any) -> dict[str, Any]:
+def _tool_to_responses_tool(tool: Any, *, apply_patch_tool_type: str = "") -> dict[str, Any]:
     if isinstance(tool, dict):
         if tool.get("type") == "apply_patch":
+            if apply_patch_tool_type in {"", "freeform"}:
+                return _freeform_apply_patch_tool()
             return {"type": "apply_patch"}
         function = tool.get("function") if isinstance(tool.get("function"), dict) else None
         if function is not None:
@@ -1125,3 +1321,19 @@ def _tool_to_responses_tool(tool: Any) -> dict[str, Any]:
                 converted["strict"] = bool(function.get("strict"))
             return converted
     return dict(tool) if isinstance(tool, dict) else {"type": "function", "name": str(tool)}
+
+
+def _freeform_apply_patch_tool() -> dict[str, Any]:
+    return {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": (
+            "Apply patch to files. Use the apply_patch envelope exactly. "
+            "This is a FREEFORM tool, so do not wrap the patch in JSON."
+        ),
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": APPLY_PATCH_FREEFORM_LARK_GRAMMAR,
+        },
+    }

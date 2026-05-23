@@ -59,6 +59,7 @@ class LLMProviderConfig(BaseModel):
     api_base: str | None = None
     api_key_secret: str | None = None
     executor_labels: dict[str, str] | None = None
+    executor_backend: str | None = None
     models: list[ModelInfo] = Field(default_factory=list)
     default_model: str | None = None
     default_voice: str | None = None  # Provider-level fallback voice for TTS
@@ -71,6 +72,8 @@ class ModelInfo(BaseModel):
     model_id: str
     display_name: str | None = None
     context_window: int = 250000
+    max_input_tokens: int | None = None
+    max_context_window: int | None = None
     max_output_tokens: int = 16384
     supports_tools: bool = True
     supports_streaming: bool = True
@@ -80,6 +83,10 @@ class ModelInfo(BaseModel):
     supports_file_input: bool = False
     supports_reasoning: bool = False
     reasoning_efforts: list[str] = Field(default_factory=list)
+    reasoning_summary_format: str | None = None
+    default_reasoning_summary: str | None = None
+    supports_verbosity: bool = False
+    default_verbosity: str | None = None
     supports_prompt_caching: bool = False
     supports_tool_search: bool = False
     supports_defer_loading: bool = False
@@ -88,7 +95,9 @@ class ModelInfo(BaseModel):
     supports_openai_namespace_tools: bool = False
     supports_openai_allowed_tools: bool = False
     supports_openai_apply_patch: bool = False
+    openai_apply_patch_tool_type: str | None = None
     supports_image_generation: bool = False
+    supports_embedding: bool = False
     supported_audio_mime_types: list[str] = Field(default_factory=list)
     supported_openai_params: list[str] = Field(default_factory=list)
     max_tools: int | None = None

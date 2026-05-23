@@ -12,6 +12,8 @@ _POSITIVE_INT_KEYS = {
     "session.step_timeout_seconds",
     "session.llm_stream_idle_timeout_seconds",
     "session.llm_stream_max_retries",
+    "session.max_active_turns_per_user",
+    "session.max_queued_messages",
     "evaluator.timeout_ms",
     "web.concurrency.global_cap",
     "web.concurrency.per_host_cap",
