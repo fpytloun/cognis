@@ -15,7 +15,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -26,6 +26,7 @@
   let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
+  let knowledgebases = $state<KnowledgebaseModel[]>([]);
   let skills = $state<Skill[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let form: AgentFormState = $state(createEmptyAgentForm());
@@ -55,11 +56,10 @@
       // These are non-critical — load gracefully
       try { secrets = await api.secrets.list(); } catch { secrets = []; }
       try { credentials = await api.credentials.list(); } catch { credentials = []; }
+      try { knowledgebases = await api.knowledgebases.list(); } catch { knowledgebases = []; }
       try { skills = await api.skills.list(); } catch { skills = []; }
       try { executors = await api.executor.list(); } catch { executors = []; }
-      if (auth.getSnapshot().user?.role === 'admin') {
-        try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
-      }
+      try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
       try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
 
       // Update form with system workflows pre-selected
@@ -137,6 +137,6 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent creator</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">Create agent</h1>
     </div>
-    <AgentForm mode="create" {form} {tools} {workflows} {providers} {executors} {secrets} {credentials} {skills} {intarisMcpServers} {saving} {error} onSave={saveAgent} />
+    <AgentForm mode="create" {form} {tools} {workflows} {providers} {executors} {secrets} {credentials} {knowledgebases} {skills} {intarisMcpServers} {saving} {error} onSave={saveAgent} />
   </section>
 {/if}

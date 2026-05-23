@@ -18,6 +18,7 @@ import type {
   Conversation,
   ConversationFlatSearchResponse,
   ConversationSearchResponse,
+  ConversationTitleSuggestion,
   CursorPage,
   Escalation,
   ExecutorConfig,
@@ -34,8 +35,10 @@ import type {
   SearchMode,
   IntarisMCPServer,
   IntarisSessionDetail,
+  KnowledgebaseModel,
   LLMProvider,
   LLMProviderOAuthStatus,
+  CodexUsage,
   ModelEntry,
   MCPServerConfigResponse,
   MCPServerCreateRequest,
@@ -79,6 +82,7 @@ import type {
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
+  ToolOutputPageResponse,
   ToolDefinitionSummary,
   TtsSynthesizeRequest,
   TtsSynthesizeResponse,
@@ -327,7 +331,7 @@ export const api = {
       filters?: {
         agent_id?: string | null;
         project_id?: string | null;
-        status?: 'active' | 'archived' | 'all';
+        status?: 'active' | 'starred' | 'archived' | 'all';
         context_type?: string | null;
         from_ts?: string | null;
         to_ts?: string | null;
@@ -407,6 +411,10 @@ export const api = {
       return request<Conversation>(`/api/v1/conversations/${conversationId}`);
     },
 
+    titleSuggestion(conversationId: string): Promise<ConversationTitleSuggestion> {
+      return request<ConversationTitleSuggestion>(`/api/v1/conversations/${conversationId}/title-suggestion`);
+    },
+
     update(conversationId: string, payload: Record<string, unknown>): Promise<Conversation> {
       return request<Conversation>(`/api/v1/conversations/${conversationId}`, {
         method: 'PATCH',
@@ -428,6 +436,21 @@ export const api = {
     messages(conversationId: string, afterSeq = 0, limit = 200): Promise<MessageHistoryResponse> {
       return request<MessageHistoryResponse>(
         `/api/v1/conversations/${conversationId}/messages${encodeQuery({ after_seq: afterSeq, limit })}`
+      );
+    },
+
+    toolOutputPage(
+      conversationId: string,
+      callId: string,
+      params: { sessionId?: string | null; offset?: number; limit?: number; latest?: boolean } = {}
+    ): Promise<ToolOutputPageResponse> {
+      return request<ToolOutputPageResponse>(
+        `/api/v1/conversations/${conversationId}/tool-outputs/${encodeURIComponent(callId)}${encodeQuery({
+          session_id: params.sessionId,
+          offset: params.offset,
+          limit: params.limit,
+          latest: params.latest
+        })}`
       );
     },
 
@@ -637,6 +660,12 @@ export const api = {
 
     signedUrl(artifactId: string, ttlSeconds = 3600): Promise<{ artifact_id: string; url: string; expires_at: string | null }> {
       return request<{ artifact_id: string; url: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds })}`);
+    }
+  },
+
+  knowledgebases: {
+    list(): Promise<KnowledgebaseModel[]> {
+      return request<KnowledgebaseModel[]>('/api/v1/knowledgebases/');
     }
   },
 
@@ -1299,11 +1328,16 @@ export const api = {
       return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt/status`);
     },
 
+    codexUsage(providerId: string): Promise<CodexUsage> {
+      return request<CodexUsage>(`/api/v1/llm-providers/${providerId}/codex/usage`);
+    },
+
     clearChatgptOAuth(providerId: string): Promise<{ ok: boolean }> {
       return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt`, {
         method: 'DELETE'
       });
-    }
+    },
+
   },
 
   modelRouting: {

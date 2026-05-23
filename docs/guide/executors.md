@@ -217,6 +217,13 @@ slow ad/analytics requests do not block extraction indefinitely. Explicit
 `browser_open` sessions use the executor browser idle timeout, which defaults to
 30 minutes.
 
+When direct HTTP fetch is blocked and browser fallback is enabled, Cognis now
+tries a headed browser first whenever `web.browser_fetch.headed_fallback_enabled`
+and `browser.headed_allowed` are both enabled. Headless browser fallback is used
+when a headed browser is disabled or unavailable. Explicit `backend = "browser"`
+follows the same preferred-browser rule, so bot-sensitive sites do not see a
+lower-trust headless probe before a headed attempt.
+
 ### Stealth defaults
 
 By default Cognis applies `playwright-stealth` evasions to every new browser
@@ -240,16 +247,18 @@ persistent profile + `channel = "chrome"` remains the most reliable setup.
 
 Three additional behaviour-layer enhancements ship on top of stealth and are
 runtime-agnostic — they apply to both `runtime = "playwright"` and
-`runtime = "patchright"` without any extra configuration. All three default
-ON when stealth is enabled and OFF when it is disabled, with per-executor
-overrides.
+`runtime = "patchright"` without any extra configuration. Cookie-consent
+auto-dismiss defaults ON because it unblocks page content. Humanization and
+fingerprint hardening default ON when stealth is enabled and OFF when it is
+disabled, with per-executor overrides.
 
 **Cookie-consent auto-dismiss** (`auto_consent`). Cognis ships a curated
 CMP-killer that auto-clicks the configured action on common cookie banners
 (OneTrust, Cookiebot, Quantcast, Sourcepoint, Didomi, TrustArc, Iubenda,
 Usercentrics, CookieYes, Borlabs, Osano, Klaro, Termly, Moove GDPR,
-Complianz, CookieLawInfo) plus a heuristic fallback for unknown banners.
-Defaults to `"accept"` (faster page render). Switch to `"reject"` for
+Complianz, CookieLawInfo) plus a multilingual heuristic fallback for unknown
+banners. Defaults to `"accept"` (faster page render), including Patchright
+executors where stealth stacking is disabled. Switch to `"reject"` for
 privacy-first, or `"off"` to disable. Per-host opt-out via
 `auto_consent_disabled_domains`. The script bundle is vendored at
 `cognis/tools/executor/browser/assets/autoconsent.bundle.js`; bump

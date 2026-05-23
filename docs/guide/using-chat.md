@@ -28,9 +28,14 @@ If you send a message while the agent is still processing the previous turn,
 Cognis queues the new message instead of interrupting the active turn. The chat
 workspace shows each pending queued message before it runs.
 
+Queued messages are compact by default so a long follow-up cannot take over the
+chat viewport while the active turn is still running. Each queued row shows a
+single-line preview, status, and the main controls; open the details view when
+you need to review the full text.
+
 From the queued-message panel you can:
 
-- review the exact message text waiting to run
+- expand a queued row to review the exact message text waiting to run
 - edit the queued text before Cognis starts processing it
 - delete a queued message to cancel it
 
@@ -46,6 +51,17 @@ If Intaris escalates a tool call, the chat UI shows an approval prompt. From the
 
 This is how Cognis keeps risky or sensitive actions visible to the user instead of silently executing them.
 
+## Markdown, links, and tool output
+
+Assistant responses render Markdown as they stream. Plain `http://` and
+`https://` URLs are clickable even when the agent did not format them as
+Markdown links. URLs inside inline code or fenced code blocks stay as literal
+text.
+
+Tool results preserve raw output for copying. Filesystem `read` results use
+syntax highlighting when Cognis can infer a language from the file path, while
+JSON-shaped outputs keep the dedicated JSON rendering.
+
 ## Delegation and background work
 
 Some work is better handled through delegated or structured execution instead of one immediate chat turn. When that happens, Cognis can show:
@@ -55,6 +71,16 @@ Some work is better handled through delegated or structured execution instead of
 - final completion or failure updates
 
 The main conversation stays responsive while the sub-session or workflow continues.
+Completed delegated work keeps its recoverable output with the sub-session. If a
+sub-session produced several assistant messages, Cognis keeps them in order and
+labels them as separate sections so the full report is not lost when a later
+cleanup or final status message arrives.
+
+Delegation cards in the parent conversation intentionally show compact metadata
+only: the delegated title or task label, target/used agent, status, duration or
+progress, and the child session link. The full delegated prompt is stored as the
+initial user message inside the child session so the parent timeline stays
+readable without losing auditability.
 
 When background work finishes, Cognis classifies the follow-up before the agent
 responds:
@@ -67,6 +93,21 @@ responds:
 ## Session management and compaction
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
+
+Use `/undo` to remove the last normal user turn and everything the assistant produced after it from the visible timeline. Cognis keeps the underlying Intaris session history for auditability, rebases the same conversation onto a new active session, and reloads the current chat in place without changing the URL or creating a sidebar row. Use `/redo` before sending another normal message to restore the undone session. Sending a new normal message after `/undo` starts a divergent branch and clears redo.
+
+## Long-running turns
+
+Cognis keeps a safety watchdog on long-running turns. If a direct chat turn hits
+that watchdog, Cognis records a visible system notice and may automatically
+continue the same work once it is safe to do so. The continuation reminder tells
+the agent to verify that the work still matches the original request, update
+todos when appropriate, summarize the interrupted state briefly, and continue
+only if more action is needed.
+
+This is a recovery path, not an infinite retry loop. Continuations are bounded by
+the controller's safety budget so repeated timeouts still stop instead of
+running away.
 
 ## First-run readiness
 

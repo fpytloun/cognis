@@ -28,6 +28,7 @@ from cognis.api.routes.credentials import router as credentials_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
+from cognis.api.routes.knowledgebases import router as knowledgebases_router
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
@@ -67,10 +68,14 @@ from cognis.core.tool_router import ToolRouter
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger, setup_logging
+from cognis.models.config import ProviderHealth
 from cognis.providers.auth.jwt import JWTAuthProvider
-from cognis.providers.registry import build_provider_registry
+from cognis.providers.registry import ProviderRegistry, build_provider_registry
 from cognis.security import LoginRateLimiter, RequestRateLimiter, create_password_hasher
 from cognis.ui_assets import SPAMiddleware, resolve_ui_build_dir
+
+STARTUP_HEALTH_ATTEMPTS = 3
+STARTUP_HEALTH_RETRY_DELAY_SECONDS = 0.5
 
 
 def _as_int(value: object, default: int) -> int:
@@ -102,13 +107,59 @@ def _key_fingerprint(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
+async def _check_startup_provider_health(
+    provider: object,
+    *,
+    attempts: int = STARTUP_HEALTH_ATTEMPTS,
+    retry_delay_seconds: float = STARTUP_HEALTH_RETRY_DELAY_SECONDS,
+) -> ProviderHealth:
+    last_health = ProviderHealth(
+        name=provider.__class__.__name__,
+        status="degraded",
+        error="health check was not executed",
+    )
+    bounded_attempts = max(1, attempts)
+    for attempt in range(1, bounded_attempts + 1):
+        try:
+            last_health = await provider.health()  # type: ignore[attr-defined]
+            if not isinstance(last_health, ProviderHealth):
+                last_health = ProviderHealth(
+                    name=provider.__class__.__name__,
+                    status="degraded",
+                    error="health check returned an invalid response",
+                )
+        except Exception as exc:
+            last_health = ProviderHealth(
+                name=provider.__class__.__name__,
+                status="degraded",
+                error=str(exc),
+            )
+        if last_health.status == "healthy":
+            return last_health
+        if attempt < bounded_attempts:
+            await asyncio.sleep(retry_delay_seconds)
+    return last_health
+
+
+def _provider_health_note(health: ProviderHealth) -> str:
+    details = health.details
+    if isinstance(details, dict):
+        status_code = details.get("status_code")
+        if status_code is not None:
+            body = details.get("body")
+            return f" (HTTP {status_code}: {body})" if body else f" (HTTP {status_code})"
+    if health.error:
+        return f" ({health.error})"
+    return ""
+
+
 async def _print_startup_status(
-    config: object, providers: object, ui_build_dir: Path | None
+    config: object, providers: ProviderRegistry, ui_build_dir: Path | None
 ) -> None:
     base_url = _build_user_facing_url(config)
     memory_health, guardrails_health = await asyncio.gather(
-        providers.memory.health(),  # type: ignore[attr-defined]
-        providers.guardrails.health(),  # type: ignore[attr-defined]
+        _check_startup_provider_health(providers.memory),
+        _check_startup_provider_health(providers.guardrails),
     )
 
     if getattr(config, "serve_ui", False) and ui_build_dir is not None:
@@ -124,14 +175,14 @@ async def _print_startup_status(
         sys.stdout.write(f"Mnemory: reachable at {config.mnemory_url}\n")  # type: ignore[attr-defined]
     else:
         sys.stdout.write(
-            f"Mnemory: NOT reachable at {config.mnemory_url} — memory features will be unavailable\n"  # type: ignore[attr-defined]
+            f"Mnemory: NOT reachable at {config.mnemory_url}{_provider_health_note(memory_health)} — memory features will be unavailable\n"  # type: ignore[attr-defined]
         )
 
     if guardrails_health.status == "healthy":
         sys.stdout.write(f"Intaris: reachable at {config.intaris_url}\n")  # type: ignore[attr-defined]
     else:
         sys.stdout.write(
-            f"Intaris: NOT reachable at {config.intaris_url} — guardrail features will be unavailable\n"  # type: ignore[attr-defined]
+            f"Intaris: NOT reachable at {config.intaris_url}{_provider_health_note(guardrails_health)} — guardrail features will be unavailable\n"  # type: ignore[attr-defined]
         )
     sys.stdout.flush()
 
@@ -143,6 +194,22 @@ def create_app() -> FastAPI:
     config = load_config()
     setup_logging(config.log_level, config.log_format)
     ui_build_dir = resolve_ui_build_dir() if config.serve_ui else None
+
+    # Install LiteLLM ChatGPT Responses patches at process startup.
+    # These are idempotent and safe to call unconditionally:
+    # - cache passthrough: re-inserts prompt_cache_key/prompt_cache_retention
+    #   after the upstream whitelist filter strips them.
+    # - suppress default instructions: patches LiteLLM's helper so it stops
+    #   prepending the ~5 KB Codex CLI prompt block to every request,
+    #   eliminating duplicate instructions and hosted-drift warnings. Operators
+    #   can override by setting CHATGPT_DEFAULT_INSTRUCTIONS before startup.
+    from cognis.providers.llm.chatgpt_patches import (
+        install_chatgpt_responses_cache_passthrough,
+        suppress_chatgpt_default_instructions,
+    )
+
+    install_chatgpt_responses_cache_passthrough()
+    suppress_chatgpt_default_instructions()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -241,6 +308,7 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
+        from cognis.core.tool_output_spool import ToolOutputSpool
         from cognis.core.tool_output_store import (
             FilesystemToolOutputBackend,
             S3ToolOutputBackend,
@@ -262,6 +330,7 @@ def create_app() -> FastAPI:
             ttl_hours=config_runtime.tool_output_ttl_hours,
             max_size_mb=config_runtime.tool_output_max_size_mb,
         )
+        tool_output_spool = ToolOutputSpool()
         await tool_output_store.cleanup_expired()
 
         # Artifact store for images and other binary content
@@ -288,13 +357,70 @@ def create_app() -> FastAPI:
         context_assembler.set_artifact_store(artifact_store)
 
         from cognis.core.artifact_maintenance import ArtifactMaintenanceService
-        from cognis.store.queries import get_setting_value
+        from cognis.store.queries import get_model_routing, get_setting_value
 
         artifact_maintenance = ArtifactMaintenanceService(
             session_factory=session_factory,
             artifact_store=artifact_store,
         )
         await artifact_maintenance.start()
+
+        from cognis.knowledgebase.indexer import KnowledgebaseIndexer
+        from cognis.knowledgebase.service import KnowledgebaseService
+        from cognis.knowledgebase.vector import DisabledVectorBackend, QdrantVectorBackend
+
+        kb_notes: list[str] = []
+        if config_runtime.knowledgebase_vector_backend == "qdrant":
+            kb_vector_backend = QdrantVectorBackend(
+                url=config_runtime.knowledgebase_qdrant_url,
+                api_key=config_runtime.knowledgebase_qdrant_api_key,
+                collection=config_runtime.knowledgebase_qdrant_collection,
+            )
+        else:
+            kb_vector_backend = DisabledVectorBackend()
+            kb_notes.append("vector backend disabled")
+        async with session_factory() as kb_session:
+            kb_embedding_route = await get_model_routing(kb_session, "embedding")
+        if kb_embedding_route is None:
+            kb_notes.append("embedding route not configured")
+        kb_backend_health = (
+            await kb_vector_backend.health()
+            if config_runtime.knowledgebase_vector_backend == "qdrant"
+            else {"ok": False}
+        )
+        if config_runtime.knowledgebase_vector_backend == "qdrant" and not kb_backend_health.get(
+            "ok", False
+        ):
+            kb_notes.append(
+                f"vector backend unhealthy: {kb_backend_health.get('reason', 'unknown')}"
+            )
+        knowledgebase_backend_enabled = (
+            config_runtime.knowledgebase_vector_backend == "qdrant"
+            and bool(kb_backend_health.get("ok", False))
+        )
+        knowledgebase_enabled = knowledgebase_backend_enabled and kb_embedding_route is not None
+        knowledgebase_service = KnowledgebaseService(
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+            llm=providers.llm,
+            vector_backend=kb_vector_backend,
+            enabled=knowledgebase_backend_enabled,
+            disabled_notes=kb_notes,
+        )
+        knowledgebase_indexer = KnowledgebaseIndexer(
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+            llm=providers.llm,
+            vector_backend=kb_vector_backend,
+            enabled=knowledgebase_enabled,
+            poll_interval_seconds=config_runtime.knowledgebase_index_poll_interval_seconds,
+            max_artifact_size_bytes=config_runtime.knowledgebase_max_artifact_size_bytes,
+            max_chunks_per_artifact=config_runtime.knowledgebase_max_chunks_per_artifact,
+            chunk_target_tokens=config_runtime.knowledgebase_chunk_target_tokens,
+            chunk_overlap_tokens=config_runtime.knowledgebase_chunk_overlap_tokens,
+            embedding_batch_size=config_runtime.knowledgebase_embedding_batch_size,
+        )
+        await knowledgebase_indexer.start()
 
         tool_router = await ToolRouter.from_session_factory(
             providers.guardrails,
@@ -314,13 +440,16 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             llm=providers.llm,
         )
-        shared_runtime = await build_shared_runtime(providers)
+        shared_runtime = await build_shared_runtime(
+            providers, knowledgebase_enabled=knowledgebase_backend_enabled
+        )
         step_runtime_factory = build_step_runtime_factory(
             providers=providers,
             shared_registry=shared_runtime.tool_registry,
             shared_connection=shared_runtime.executor_connection,
             session_factory=session_factory,
             artifact_store=artifact_store,
+            knowledgebase_service=knowledgebase_service if knowledgebase_backend_enabled else None,
         )
         async with session_factory() as session:
             step_timeout_seconds = await get_setting_value(
@@ -331,7 +460,7 @@ def create_app() -> FastAPI:
             llm_stream_idle_timeout_seconds = await get_setting_value(
                 session,
                 "session.llm_stream_idle_timeout_seconds",
-                60,
+                300,
             )
             llm_stream_max_retries = await get_setting_value(
                 session,
@@ -358,7 +487,7 @@ def create_app() -> FastAPI:
             default_llm_stream_idle_timeout_seconds=(
                 int(llm_stream_idle_timeout_seconds)
                 if isinstance(llm_stream_idle_timeout_seconds, int)
-                else 60
+                else 300
             ),
             default_llm_stream_max_retries=(
                 int(llm_stream_max_retries) if isinstance(llm_stream_max_retries, int) else 3
@@ -437,6 +566,7 @@ def create_app() -> FastAPI:
             artifact_store=artifact_store,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            tool_output_spool=tool_output_spool,
         )
 
         # CommandDispatcher — transport-agnostic slash command handling.
@@ -521,6 +651,9 @@ def create_app() -> FastAPI:
         app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
         app.state.artifact_maintenance = artifact_maintenance
+        app.state.knowledgebase_enabled = knowledgebase_backend_enabled
+        app.state.knowledgebase_service = knowledgebase_service
+        app.state.knowledgebase_indexer = knowledgebase_indexer
         app.state.serve_ui = config_runtime.serve_ui
         app.state.ui_build_dir = str(ui_build_dir) if ui_build_dir is not None else None
         app.state.user_facing_url = _build_user_facing_url(config_runtime)
@@ -555,6 +688,8 @@ def create_app() -> FastAPI:
         app.state.notification_service = notification_service
         app.state.web_push_service = web_push_service
         app.state.turn_scheduler = turn_scheduler
+        app.state.tool_output_store = tool_output_store
+        app.state.tool_output_spool = tool_output_spool
         app.state.command_dispatcher = command_dispatcher
 
         # Channel manager — lifecycle orchestration for channel adapters.
@@ -641,6 +776,7 @@ def create_app() -> FastAPI:
             session_lock_sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await session_lock_sweeper_task
+        await knowledgebase_indexer.stop()
         await artifact_maintenance.stop()
         await channel_delivery.stop()
         await channel_manager.stop_all()
@@ -655,7 +791,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.6.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -679,6 +815,7 @@ def create_app() -> FastAPI:
     app.include_router(credentials_router)
     app.include_router(agents_router)
     app.include_router(images_router)
+    app.include_router(knowledgebases_router)
     app.include_router(sessions_router)
     app.include_router(settings_router)
     app.include_router(tasks_router)

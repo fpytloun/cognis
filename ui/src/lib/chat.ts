@@ -1,6 +1,6 @@
-import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
+import { createMarkdownStreamer, renderMarkdown, stripMarkdown, type MarkdownStreamer } from '$lib/markdown';
 import { normalizeFileDiffs, type FileDiff } from '$lib/diff';
-import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, AttachmentRef, CognisWebSocketEvent, MessageEvent } from '$lib/types/api';
+import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, ActiveToolOutputSnapshot, AttachmentRef, ChatMode, ChatModeSource, CognisWebSocketEvent, MessageEvent, ToolOutputPresentationMetadata } from '$lib/types/api';
 
 /**
  * Per-message markdown streamers. Streaming assistant replies accumulate
@@ -40,6 +40,14 @@ function getThinkingStreamer(blockId: string): MarkdownStreamer {
 
 function streamKey(messageId: string, turnId: string | null): string {
   return `${turnId ?? messageId}:${messageId}`;
+}
+
+function utf16CodeUnits(value: string): number {
+  let units = 0;
+  for (const char of value) {
+    units += char.length;
+  }
+  return units;
 }
 
 function bufferPendingChunk(messageId: string, turnId: string | null, chunk: PendingStreamChunk): void {
@@ -92,6 +100,10 @@ export interface ThinkingBlock {
   html: string;
   source: string;
   complete: boolean;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  durationMs?: number | null;
+  providerBlockIndex?: number | null;
 }
 
 export interface ThinkingTimelineItem {
@@ -126,6 +138,8 @@ export interface MessageTimelineItem {
   queueId?: string | null;
   streamChunkCount?: number;
   streamContentOffset?: number;
+  chatMode?: ChatMode;
+  chatModeSource?: ChatModeSource;
 }
 
 export interface ToolCallEvaluation {
@@ -151,6 +165,20 @@ export interface ToolCallTimelineItem {
   evaluation?: ToolCallEvaluation;
   attachments?: AttachmentRef[];
   fileDiffs?: FileDiff[];
+  streamedOutput?: string;
+  streamChunkCount?: number;
+  streamContentOffset?: number;
+  outputSize?: number;
+  truncated?: boolean;
+  agentVisibleTruncated?: boolean;
+  transportTruncated?: boolean;
+  hasFullOutput?: boolean;
+  recoveryCallId?: string | null;
+  toolOutputArtifactId?: string | null;
+  sessionId?: string | null;
+  liveOutputAvailable?: boolean;
+  anchorsAvailable?: boolean;
+  anchorCount?: number;
   reconstructed?: boolean;
   /**
    * Notification ID backing a pending `step_request_input` tool call.
@@ -177,7 +205,7 @@ function normalizeToolName(name: string): string {
   return name.toLowerCase().replace(/_/g, '');
 }
 
-function parseTodoSnapshot(value: unknown): TodoSnapshotItem[] {
+export function parseTodoSnapshot(value: unknown): TodoSnapshotItem[] {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => {
@@ -207,9 +235,20 @@ function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> |
 export function latestTodoSnapshot(items: TimelineItem[], resetOnUserMessage = false): TodoSnapshotItem[] {
   let lowerBound = 0;
   if (resetOnUserMessage) {
+    let latestToolTurnId: string | null = null;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind === 'tool_call' && typeof item.turnId === 'string' && item.turnId.trim().length > 0) {
+        latestToolTurnId = item.turnId;
+        break;
+      }
+    }
     for (let index = items.length - 1; index >= 0; index -= 1) {
       const item = items[index];
       if (item?.kind === 'message' && item.role === 'user') {
+        if (item.queueId && item.turnId && item.turnId === latestToolTurnId) {
+          continue;
+        }
         lowerBound = index;
         break;
       }
@@ -247,6 +286,8 @@ export interface DelegationTimelineItem {
   kind: 'delegation';
   taskId: string;
   taskLabel: string;
+  agentId: string | null;
+  usedAgentId: string | null;
   status: 'started' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
   result: string | null;
   timestamp: string | null;
@@ -254,6 +295,7 @@ export interface DelegationTimelineItem {
   toolCallCount?: number;
   maxToolCalls?: number;
   lastTool?: string;
+  todos?: TodoSnapshotItem[];
 }
 
 const terminalDelegationStatuses = new Set<DelegationTimelineItem['status']>([
@@ -277,6 +319,16 @@ function delegationTaskLabel(value: unknown, fallback = 'Background task'): stri
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
 }
 
+function delegationEventLabel(data: Record<string, unknown>, fallback = 'Background task'): string {
+  return delegationTaskLabel(data.title ?? data.task_title ?? data.task, fallback);
+}
+
+function delegationPreview(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const stripped = stripMarkdown(value);
+  return stripped ? stripped : null;
+}
+
 function mergeDelegationItem(
   existing: DelegationTimelineItem | null,
   incoming: DelegationTimelineItem
@@ -298,10 +350,13 @@ function mergeDelegationItem(
     status: keepExistingTerminal ? existing.status : incoming.status,
     result: keepExistingTerminal ? existing.result : incoming.result ?? existing.result,
     timestamp: keepExistingTerminal ? existing.timestamp : incoming.timestamp ?? existing.timestamp,
+    agentId: incoming.agentId ?? existing.agentId,
+    usedAgentId: incoming.usedAgentId ?? existing.usedAgentId,
     // Preserve live progress fields from whichever side has them
     toolCallCount: incoming.toolCallCount ?? existing.toolCallCount,
     maxToolCalls: incoming.maxToolCalls ?? existing.maxToolCalls,
     lastTool: incoming.lastTool ?? existing.lastTool,
+    todos: incoming.todos && incoming.todos.length > 0 ? incoming.todos : existing.todos,
   };
 }
 
@@ -330,6 +385,9 @@ export interface SystemMessageTimelineItem {
   id: string;
   kind: 'system_message';
   text: string;
+  noticeId?: string | null;
+  noticeKind?: string | null;
+  noticeScope?: string | null;
   timestamp: string | null;
 }
 
@@ -340,6 +398,12 @@ export interface CompactionTimelineItem {
   summaryPreview: string;
   method: string;
   turnsCompacted: number;
+  trigger?: string;
+  reason?: string;
+  previousUsagePercentage?: number | null;
+  effectiveUsagePercentage?: number | null;
+  hardPressureExceeded?: boolean;
+  usedTimeoutFallback?: boolean;
   timestamp: string | null;
 }
 
@@ -347,11 +411,17 @@ function createSystemMessageItem(
   id: string,
   text: string,
   timestamp: string | null,
+  noticeId: string | null = null,
+  noticeKind: string | null = null,
+  noticeScope: string | null = null,
 ): SystemMessageTimelineItem {
   return {
     id,
     kind: 'system_message',
     text,
+    noticeId,
+    noticeKind,
+    noticeScope,
     timestamp
   };
 }
@@ -466,6 +536,117 @@ function normalizeEventTurnId(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null;
 }
 
+function normalizeIdentifier(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function stableStringHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function userMessageItemId(event: {
+  session_id?: string | null;
+  seq?: number | null;
+  message_id?: string | null;
+  event_id?: string | null;
+  turn_id?: string | null;
+  client_message_id?: string | null;
+  queue_id?: string | null;
+  content: string;
+}): string {
+  const messageId = normalizeIdentifier(event.message_id) ?? normalizeIdentifier(event.event_id);
+  if (messageId) return `user-msg:${messageId}`;
+  const sessionId = normalizeIdentifier(event.session_id);
+  if (sessionId && typeof event.seq === 'number') return `user-msg:${sessionId}:${event.seq}`;
+  const clientMessageId = normalizeIdentifier(event.client_message_id);
+  if (clientMessageId) return `user-msg:client:${clientMessageId}`;
+  const queueId = normalizeIdentifier(event.queue_id);
+  if (queueId) return `user-msg:queue:${queueId}`;
+  const turnId = normalizeIdentifier(event.turn_id);
+  if (sessionId && turnId) return `user-msg:${sessionId}:${turnId}:user`;
+  return `user-msg:fallback:${utf16CodeUnits(event.content)}:${stableStringHash(event.content)}`;
+}
+
+function normalizeChatMode(value: unknown): ChatMode | undefined {
+  return value === 'default' || value === 'plan' || value === 'build' ? value : undefined;
+}
+
+function normalizeChatModeSource(value: unknown): ChatModeSource | undefined {
+  return value === 'one_shot'
+    || value === 'conversation_override'
+    || value === 'agent_default'
+    || value === 'system_default'
+    ? value
+    : undefined;
+}
+
+function chatModeSourceRank(source: ChatModeSource | undefined): number {
+  if (source === 'one_shot' || source === 'conversation_override') return 4;
+  if (source === 'agent_default') return 3;
+  if (source === 'system_default') return 1;
+  return 0;
+}
+
+function modeCandidateRank(chatMode: ChatMode | undefined, source: ChatModeSource | undefined): number {
+  const sourceRank = chatModeSourceRank(source);
+  if (chatMode && chatMode !== 'default') return Math.max(sourceRank, 2);
+  return sourceRank;
+}
+
+function chooseTurnMode(
+  current: { chatMode?: ChatMode; chatModeSource?: ChatModeSource },
+  candidate: { chatMode?: ChatMode; chatModeSource?: ChatModeSource },
+): { chatMode?: ChatMode; chatModeSource?: ChatModeSource } {
+  const currentRank = modeCandidateRank(current.chatMode, current.chatModeSource);
+  const candidateRank = modeCandidateRank(candidate.chatMode, candidate.chatModeSource);
+  return candidateRank >= currentRank ? candidate : current;
+}
+
+function chatModeForTurn(items: TimelineItem[], turnId: string | null): { chatMode?: ChatMode; chatModeSource?: ChatModeSource } {
+  if (!turnId) return {};
+  let mode: { chatMode?: ChatMode; chatModeSource?: ChatModeSource } = {};
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind !== 'message' || item.turnId !== turnId) continue;
+    if (item.chatMode || item.chatModeSource) {
+      mode = chooseTurnMode(mode, { chatMode: item.chatMode, chatModeSource: item.chatModeSource });
+    }
+  }
+  return mode;
+}
+
+function applyChatModeToTurnMessages(
+  items: TimelineItem[],
+  turnId: string | null,
+  chatMode?: ChatMode,
+  chatModeSource?: ChatModeSource,
+): TimelineItem[] {
+  if (!turnId || (!chatMode && !chatModeSource)) return items;
+  let changed = false;
+  const next = items.map((item) => {
+    if (item.kind !== 'message' || item.turnId !== turnId) return item;
+    const selected = chooseTurnMode(
+      { chatMode: item.chatMode, chatModeSource: item.chatModeSource },
+      { chatMode, chatModeSource },
+    );
+    const updatedChatMode = selected.chatMode;
+    const updatedChatModeSource = selected.chatModeSource;
+    if (updatedChatMode === item.chatMode && updatedChatModeSource === item.chatModeSource) return item;
+    changed = true;
+    return {
+      ...item,
+      chatMode: updatedChatMode,
+      chatModeSource: updatedChatModeSource,
+    } satisfies MessageTimelineItem;
+  });
+  return changed ? next : items;
+}
+
 let _noticeCounter = 0;
 
 function createNotice(
@@ -567,6 +748,18 @@ function findOpenPhaseAssistantIndex(items: TimelineItem[], turnId: string | nul
   return -1;
 }
 
+function findMergeableAssistantIndex(
+  items: TimelineItem[],
+  turnId: string | null,
+  messageId: string | undefined,
+): number {
+  const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
+  if (existingIndex < 0 || items[existingIndex]?.kind !== 'message') return -1;
+  const existing = items[existingIndex] as MessageTimelineItem;
+  if (existing.streaming) return existingIndex;
+  return messageId && existing.messageId === messageId ? existingIndex : -1;
+}
+
 function findThinkingItemIndexByBlockId(
   items: TimelineItem[],
   blockId: string,
@@ -577,6 +770,88 @@ function findThinkingItemIndexByBlockId(
       && item.turnId === turnId
       && item.blocks.some((block) => block.block_id === blockId),
   );
+}
+
+function hasDuplicateThinkingBlock(
+  item: ThinkingTimelineItem,
+  block: ThinkingBlock,
+): boolean {
+  return item.blocks.some((existing) =>
+    existing.block_id === block.block_id
+    || (
+      existing.complete
+      && block.complete
+      && existing.content === block.content
+      && existing.title === block.title
+      && existing.source === block.source
+      && (
+        (
+          existing.providerBlockIndex != null
+          && block.providerBlockIndex != null
+          && existing.providerBlockIndex === block.providerBlockIndex
+        )
+        || (
+          existing.startedAt != null
+          && block.startedAt != null
+          && existing.startedAt === block.startedAt
+        )
+        || (
+          existing.completedAt != null
+          && block.completedAt != null
+          && existing.completedAt === block.completedAt
+        )
+      )
+    )
+  );
+}
+
+function mergeThinkingBlock(existing: ThinkingBlock, incoming: ThinkingBlock): ThinkingBlock {
+  const content = incoming.content || existing.content;
+  const html = incoming.html || existing.html;
+  return {
+    ...existing,
+    ...incoming,
+    content,
+    html,
+    title: incoming.title || existing.title,
+    source: incoming.source || existing.source,
+    complete: incoming.complete || existing.complete,
+    startedAt: incoming.startedAt ?? existing.startedAt,
+    completedAt: incoming.completedAt ?? existing.completedAt,
+    durationMs: incoming.durationMs ?? existing.durationMs,
+    providerBlockIndex: incoming.providerBlockIndex ?? existing.providerBlockIndex,
+  };
+}
+
+function upsertThinkingBlockInSegment(
+  items: TimelineItem[],
+  segmentIndex: number,
+  block: ThinkingBlock,
+  turnId: string | null,
+  timestamp: string | null,
+  streaming: boolean,
+  activeTitle: string | null,
+): void {
+  const existing = items[segmentIndex] as ThinkingTimelineItem;
+  const blockIdx = existing.blocks.findIndex((existingBlock) => existingBlock.block_id === block.block_id);
+  let blocks: ThinkingBlock[];
+  if (blockIdx >= 0) {
+    blocks = existing.blocks.map((existingBlock, index) =>
+      index === blockIdx ? mergeThinkingBlock(existingBlock, block) : existingBlock
+    );
+  } else if (hasDuplicateThinkingBlock(existing, block)) {
+    blocks = existing.blocks;
+  } else {
+    blocks = [...existing.blocks, block];
+  }
+  items[segmentIndex] = {
+    ...existing,
+    turnId,
+    timestamp: existing.timestamp ?? timestamp,
+    blocks,
+    streaming: streaming || blocks.some((existingBlock) => !existingBlock.complete),
+    activeTitle,
+  } satisfies ThinkingTimelineItem;
 }
 
 function findOpenPhaseThinkingIndex(items: TimelineItem[], turnId: string | null): number {
@@ -632,6 +907,8 @@ function upsertAssistantTurnMessage(
     messageId,
     attachments,
     turnId,
+    chatMode,
+    chatModeSource,
     streaming = false,
   }: {
     id: string;
@@ -641,11 +918,13 @@ function upsertAssistantTurnMessage(
     messageId: string | undefined;
     attachments: AttachmentRef[];
     turnId: string | null;
+    chatMode?: ChatMode;
+    chatModeSource?: ChatModeSource;
     streaming?: boolean;
   },
 ): void {
-  const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
-  if (existingIndex >= 0 && items[existingIndex]?.kind === 'message') {
+  const existingIndex = findMergeableAssistantIndex(items, turnId, messageId);
+  if (existingIndex >= 0) {
     const existing = items[existingIndex] as MessageTimelineItem;
     const nextContent = existing.content && content ? `${existing.content}\n\n${content}` : existing.content || content;
     const nextAttachments = attachments.length > 0 ? [...(existing.attachments ?? []), ...attachments] : existing.attachments ?? [];
@@ -659,13 +938,16 @@ function upsertAssistantTurnMessage(
       streaming,
       messageId: messageId ?? existing.messageId,
       turnId,
+      chatMode: chatMode ?? existing.chatMode,
+      chatModeSource: chatModeSource ?? existing.chatModeSource,
     } satisfies MessageTimelineItem;
     return;
   }
 
-  items.push(
-    createMessageItem(id, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId),
-  );
+  const item = createMessageItem(id, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId);
+  item.chatMode = chatMode;
+  item.chatModeSource = chatModeSource;
+  items.push(item);
 }
 
 function applyChunkToMessage(
@@ -756,6 +1038,7 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
   if (!content) return items;
 
   const turnId = normalizeEventTurnId(snapshot.turn_id) ?? snapshot.message_id;
+  const turnMode = chatModeForTurn(items, turnId);
   const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
   if (existingIndex >= 0 && items[existingIndex]?.kind === 'message') {
     const existing = items[existingIndex] as MessageTimelineItem;
@@ -780,6 +1063,8 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
       turnId,
       streamChunkCount: snapshot.chunk_count,
       streamContentOffset: snapshot.content_offset,
+      chatMode: existing.chatMode ?? turnMode.chatMode,
+      chatModeSource: existing.chatModeSource ?? turnMode.chatModeSource,
       timestamp: existing.timestamp ?? snapshot.updated_at ?? new Date().toISOString(),
     } satisfies MessageTimelineItem, turnId);
     return next;
@@ -798,10 +1083,90 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
     turnId,
     snapshot.chunk_count,
   );
+  item.chatMode = turnMode.chatMode;
+  item.chatModeSource = turnMode.chatModeSource;
   return [
     ...items,
     applyBufferedChunksToMessage(item, turnId),
   ];
+}
+
+function toolPresentationFields(source: ToolOutputPresentationMetadata | Record<string, unknown>): Partial<ToolCallTimelineItem> {
+  const record = source as Record<string, unknown>;
+  const meta = typeof record.tool_output_presentation === 'object' && record.tool_output_presentation !== null
+    ? record.tool_output_presentation as ToolOutputPresentationMetadata
+    : source as ToolOutputPresentationMetadata;
+  return {
+    outputSize: typeof meta.output_size === 'number' ? meta.output_size : undefined,
+    truncated: Boolean(meta.truncated),
+    agentVisibleTruncated: Boolean(meta.agent_visible_truncated),
+    transportTruncated: Boolean(meta.transport_truncated),
+    hasFullOutput: Boolean(meta.has_full_output),
+    recoveryCallId: typeof meta.recovery_call_id === 'string' ? meta.recovery_call_id : null,
+    toolOutputArtifactId: typeof meta.tool_output_artifact_id === 'string' ? meta.tool_output_artifact_id : null,
+    liveOutputAvailable: Boolean(record.live_output_available || record.output_page_available),
+    anchorsAvailable: Boolean(meta.anchors_available),
+    anchorCount: typeof meta.anchor_count === 'number' ? meta.anchor_count : undefined,
+  };
+}
+
+function mergeToolPresentation(item: ToolCallTimelineItem, source: ToolOutputPresentationMetadata | Record<string, unknown>): ToolCallTimelineItem {
+  const fields = toolPresentationFields(source);
+  return {
+    ...item,
+    ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)),
+  } as ToolCallTimelineItem;
+}
+
+export function applyActiveToolOutputSnapshots(
+  items: TimelineItem[],
+  snapshots: ActiveToolOutputSnapshot[] | undefined | null,
+): TimelineItem[] {
+  if (!snapshots?.length) return items;
+  let next = [...items];
+  for (const snapshot of snapshots) {
+    if (!snapshot.call_id || !snapshot.result) continue;
+    const itemId = `tool:${snapshot.call_id}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    const fields = toolPresentationFields(snapshot);
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      if (existing.status === 'completed' || existing.status === 'failed') continue;
+      next[index] = {
+        ...existing,
+        ...fields,
+        status: snapshot.status || existing.status,
+        streamedOutput: snapshot.result,
+        result: snapshot.result,
+        isError: snapshot.is_error ?? existing.isError,
+        streamChunkCount: snapshot.chunk_count,
+        streamContentOffset: snapshot.content_offset,
+        sessionId: snapshot.session_id,
+        liveOutputAvailable: true,
+        timestamp: existing.timestamp ?? snapshot.updated_at ?? new Date().toISOString(),
+      };
+      continue;
+    }
+    next.push({
+      id: itemId,
+      kind: 'tool_call',
+      callId: snapshot.call_id,
+      toolName: snapshot.tool_name || 'unknown',
+      turnId: normalizeEventTurnId(snapshot.turn_id),
+      status: snapshot.status || 'started',
+      timestamp: snapshot.updated_at ?? new Date().toISOString(),
+      streamedOutput: snapshot.result,
+      result: snapshot.result,
+      isError: snapshot.is_error,
+      streamChunkCount: snapshot.chunk_count,
+      streamContentOffset: snapshot.content_offset,
+      sessionId: snapshot.session_id,
+      reconstructed: true,
+      ...fields,
+      liveOutputAvailable: true,
+    });
+  }
+  return next;
 }
 
 export function applyActiveStreamSnapshots(
@@ -829,6 +1194,10 @@ export function applyActiveThinkingSnapshots(
         html: renderMarkdown(block.content),
         source: block.source || 'summary',
         complete: block.complete,
+        startedAt: block.started_at ?? null,
+        completedAt: block.completed_at ?? null,
+        durationMs: typeof block.duration_ms === 'number' ? block.duration_ms : null,
+        providerBlockIndex: typeof block.provider_block_index === 'number' ? block.provider_block_index : null,
       }) satisfies ThinkingBlock);
     if (blocks.length === 0) continue;
 
@@ -868,7 +1237,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     const sid = typeof event.data.session_id === 'string' ? event.data.session_id : '';
     const eid = sid ? `${sid}:${event.seq}` : `${event.seq}`;
     if (event.type === 'user_message') {
-      items.push(createMessageItem(`event:${eid}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments, false, turnId));
+      const item = createMessageItem(`event:${eid}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments, false, turnId);
+      item.chatMode = normalizeChatMode(event.data.chat_mode);
+      item.chatModeSource = normalizeChatModeSource(event.data.chat_mode_source);
+      items.push(item);
       continue;
     }
 
@@ -882,6 +1254,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           messageId: turnId ?? undefined,
           attachments,
           turnId,
+          chatMode: normalizeChatMode(event.data.chat_mode),
+          chatModeSource: normalizeChatModeSource(event.data.chat_mode_source),
         });
       }
       continue;
@@ -918,6 +1292,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         html: renderMarkdown(blockContent),
         source: typeof event.data.reasoning_source === 'string' ? event.data.reasoning_source : 'summary',
         complete: true,
+        startedAt: typeof event.data.started_at === 'string' ? event.data.started_at : null,
+        completedAt: typeof event.data.completed_at === 'string' ? event.data.completed_at : null,
+        durationMs: typeof event.data.duration_ms === 'number' ? event.data.duration_ms : null,
+        providerBlockIndex: typeof event.data.provider_block_index === 'number' ? event.data.provider_block_index : null,
       };
       const contiguousIndex = findOpenPhaseThinkingIndex(items, turnId);
       if (contiguousIndex >= 0) {
@@ -971,22 +1349,22 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const existing = existingIdx >= 0 ? (items[existingIdx] as DelegationTimelineItem) : null;
       const fallbackLabel = childSessionId.startsWith('sess_') ? 'Sub-session' : 'Background task';
       const result = status === 'completed'
-        ? (typeof event.data.result_summary === 'string'
-          ? event.data.result_summary
-          : typeof event.data.result_content === 'string'
-            ? event.data.result_content
-            : null)
+        ? (delegationPreview(event.data.result_summary) ?? delegationPreview(event.data.result_content))
         : status === 'failed'
-          ? (typeof event.data.error === 'string' ? event.data.error : 'Failed')
+          ? (delegationPreview(event.data.error) ?? 'Failed')
           : null;
+      const todos = parseTodoSnapshot(event.data.todos);
       const incoming: DelegationTimelineItem = {
         id: itemId,
         kind: 'delegation',
         taskId: childSessionId,
-        taskLabel: delegationTaskLabel(event.data.task, fallbackLabel),
+        taskLabel: delegationEventLabel(event.data, fallbackLabel),
+        agentId: typeof event.data.agent_id === 'string' ? event.data.agent_id : null,
+        usedAgentId: typeof event.data.used_agent_id === 'string' ? event.data.used_agent_id : null,
         status,
         result,
-        timestamp: event.timestamp
+        timestamp: event.timestamp,
+        todos: todos.length > 0 ? todos : undefined
       };
       if (existingIdx >= 0) {
         items[existingIdx] = mergeDelegationItem(existing, incoming);
@@ -1007,7 +1385,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const index = toolCallIndexByCallId.get(callId);
       if (index !== undefined && items[index]?.kind === 'tool_call') {
         const existing = items[index] as ToolCallTimelineItem;
-        items[index] = {
+        items[index] = mergeToolPresentation({
           ...existing,
           status: event.data.is_error ? 'failed' : 'completed',
           result: typeof event.data.result === 'string' ? event.data.result : undefined,
@@ -1017,10 +1395,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           attachments: resultAttachments.length > 0 ? resultAttachments : existing.attachments,
           fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
           turnId: existing.turnId ?? turnId,
-        };
+        }, event.data);
       } else {
         toolCallIndexByCallId.set(callId || `tc-${eid}`, items.length);
-        items.push({
+        items.push(mergeToolPresentation({
           id: `tool:${callId || `tc-${eid}`}`,
           kind: 'tool_call',
           callId: callId || `tc-${eid}`,
@@ -1035,7 +1413,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           attachments: resultAttachments.length > 0 ? resultAttachments : undefined,
           fileDiffs: fileDiffs.length > 0 ? fileDiffs : undefined,
           reconstructed: true
-        });
+        }, event.data));
       }
       continue;
     }
@@ -1068,6 +1446,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         kind: 'delegation',
         taskId: String(event.data.task_id ?? 'unknown-task'),
         taskLabel: String(event.data.task_title ?? event.data.task_id ?? 'Background task'),
+        agentId: typeof event.data.agent_id === 'string' ? event.data.agent_id : null,
+        usedAgentId: typeof event.data.used_agent_id === 'string' ? event.data.used_agent_id : null,
         status: 'completed',
         result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
         timestamp: event.timestamp
@@ -1097,6 +1477,14 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       const summary = typeof event.data.summary === 'string' ? event.data.summary : '';
       const method = typeof event.data.method === 'string' ? event.data.method : 'unknown';
       const turnsCompacted = typeof event.data.turns_compacted === 'number' ? event.data.turns_compacted : 0;
+      const previousUsagePercentage =
+        typeof event.data.previous_usage_percentage === 'number'
+          ? event.data.previous_usage_percentage
+          : null;
+      const effectiveUsagePercentage =
+        typeof event.data.effective_usage_percentage === 'number'
+          ? event.data.effective_usage_percentage
+          : null;
       items.push({
         id: `compaction:${eid}`,
         kind: 'compaction',
@@ -1104,6 +1492,12 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         summaryPreview: summary.slice(0, 500),
         method,
         turnsCompacted,
+        trigger: typeof event.data.trigger === 'string' ? event.data.trigger : undefined,
+        reason: typeof event.data.reason === 'string' ? event.data.reason : undefined,
+        previousUsagePercentage,
+        effectiveUsagePercentage,
+        hardPressureExceeded: event.data.hard_pressure_exceeded === true,
+        usedTimeoutFallback: event.data.used_timeout_fallback === true,
         timestamp: event.timestamp
       });
       continue;
@@ -1118,6 +1512,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         kind: 'delegation',
         taskId: String(event.data.task_id ?? 'unknown-task'),
         taskLabel: String(event.data.task_title ?? event.data.task_id ?? 'Background task'),
+        agentId: typeof event.data.agent_id === 'string' ? event.data.agent_id : null,
+        usedAgentId: typeof event.data.used_agent_id === 'string' ? event.data.used_agent_id : null,
         status: event.type === 'task_failed' ? 'failed' : 'cancelled',
         result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
         timestamp: event.timestamp
@@ -1149,6 +1545,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           kind: 'delegation',
           taskId,
           taskLabel: String(event.data.title ?? event.data.task_id ?? 'Background task'),
+          agentId: typeof event.data.agent_id === 'string' ? event.data.agent_id : null,
+          usedAgentId: typeof event.data.used_agent_id === 'string' ? event.data.used_agent_id : null,
           status: statusMap[lifecycleEvent] ?? 'completed',
           result: typeof event.data.result_summary === 'string' ? event.data.result_summary : null,
           timestamp: event.timestamp
@@ -1162,12 +1560,24 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       } else if (lifecycleEvent === 'system_notice') {
         const message = String(event.data?.message ?? '');
         if (message) {
-          items.push({
-            id: `system:${eid}`,
-            kind: 'system_message',
-            text: message,
-            timestamp: event.timestamp
-          });
+          const noticeId = typeof event.data?.notice_id === 'string' ? event.data.notice_id : null;
+          const itemId = noticeId ? `system:${noticeId}` : `system:${eid}`;
+          const systemMessage = createSystemMessageItem(
+            itemId,
+            message,
+            event.timestamp,
+            noticeId,
+            typeof event.data?.kind === 'string' ? event.data.kind : null,
+            typeof event.data?.scope === 'string' ? event.data.scope : null
+          );
+          const existingIdx = items.findIndex(
+            (item) => item.id === itemId && item.kind === 'system_message'
+          );
+          if (existingIdx >= 0) {
+            items[existingIdx] = systemMessage;
+          } else {
+            items.push(systemMessage);
+          }
         }
       }
       continue;
@@ -1208,10 +1618,13 @@ export function appendOptimisticUserMessage(
   attachments: AttachmentRef[] = [],
   clientMessageId: string | null = null,
 ): TimelineItem[] {
+  const localId = clientMessageId
+    ? `local-user:${clientMessageId}`
+    : `local-user:${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
   return [
     ...items,
     createMessageItem(
-      `local-user:${Date.now()}`,
+      localId,
       'user',
       content,
       new Date().toISOString(),
@@ -1343,34 +1756,65 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   if (event.type === 'user_message') {
     const attachments = normalizeEventAttachments(event.attachments);
     const turnId = normalizeEventTurnId(event.turn_id);
+    const stableItemId = userMessageItemId(event);
     const correlatedIndex = findUserMessageByCorrelationIndex(next, event.client_message_id, event.queue_id);
     const optimisticIndex = correlatedIndex >= 0 ? correlatedIndex : findOptimisticUserMessageIndex(next, event.content, attachments);
     if (optimisticIndex >= 0 && next[optimisticIndex]?.kind === 'message') {
       const existing = next[optimisticIndex] as MessageTimelineItem;
+      const chatMode = normalizeChatMode(event.chat_mode);
+      const chatModeSource = normalizeChatModeSource(event.chat_mode_source);
       next[optimisticIndex] = {
         ...existing,
+        id: stableItemId,
         content: event.content,
         html: renderMarkdown(event.content),
+        seq: typeof event.seq === 'number' ? event.seq : existing.seq,
+        timestamp: event.timestamp ?? existing.timestamp,
         attachments,
         turnId,
+        messageId: event.message_id ?? event.event_id ?? existing.messageId,
+        chatMode,
+        chatModeSource,
         clientMessageId: event.client_message_id ?? existing.clientMessageId,
         queueId: event.queue_id ?? existing.queueId,
         optimistic: false
       };
+      return applyChatModeToTurnMessages(next, turnId, chatMode, chatModeSource);
+    }
+    if (next.some((item) => item.kind === 'message' && item.role === 'user' && item.id === stableItemId)) {
       return next;
     }
-    const itemId = `user-msg:${Date.now()}:${next.length}`;
-    next.push(
-      createMessageItem(itemId, 'user', event.content, new Date().toISOString(), null, undefined, false, attachments, false, turnId, undefined, event.client_message_id ?? null, event.queue_id ?? null)
+    const item = createMessageItem(
+      stableItemId,
+      'user',
+      event.content,
+      event.timestamp ?? new Date().toISOString(),
+      typeof event.seq === 'number' ? event.seq : null,
+      event.message_id ?? event.event_id ?? undefined,
+      false,
+      attachments,
+      false,
+      turnId,
+      undefined,
+      event.client_message_id ?? null,
+      event.queue_id ?? null
     );
-    return next;
+    const chatMode = normalizeChatMode(event.chat_mode);
+    const chatModeSource = normalizeChatModeSource(event.chat_mode_source);
+    item.chatMode = chatMode;
+    item.chatModeSource = chatModeSource;
+    next.push(item);
+    return applyChatModeToTurnMessages(next, turnId, chatMode, chatModeSource);
   }
 
   if (event.type === 'chunk') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+    const turnMode = chatModeForTurn(next, turnId);
+    const eventChatMode = normalizeChatMode(event.chat_mode) ?? turnMode.chatMode;
+    const eventChatModeSource = normalizeChatModeSource(event.chat_mode_source) ?? turnMode.chatModeSource;
     const chunkIndex = typeof event.index === 'number' ? event.index : null;
     const contentOffset = typeof event.content_offset === 'number' ? event.content_offset : null;
-    const index = findOpenPhaseAssistantIndex(next, turnId);
+    const index = findMergeableAssistantIndex(next, turnId, event.message_id);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       if (contentOffset !== null && contentOffset > message.content.length) {
@@ -1390,6 +1834,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       next[index] = {
         ...withBuffered,
         turnId,
+        chatMode: withBuffered.chatMode ?? eventChatMode,
+        chatModeSource: withBuffered.chatModeSource ?? eventChatModeSource,
       };
       return next;
     }
@@ -1417,6 +1863,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         turnId,
         chunkIndex !== null ? chunkIndex + 1 : 1,
       );
+    item.chatMode = eventChatMode;
+    item.chatModeSource = eventChatModeSource;
     next.push(applyBufferedChunksToMessage(item, turnId));
     return next;
   }
@@ -1427,8 +1875,11 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'message_complete') {
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+    const turnMode = chatModeForTurn(next, turnId);
+    const eventChatMode = normalizeChatMode(event.chat_mode) ?? turnMode.chatMode;
+    const eventChatModeSource = normalizeChatModeSource(event.chat_mode_source) ?? turnMode.chatModeSource;
     const itemId = `message:${event.message_id}:${next.length}`;
-    const index = findOpenPhaseAssistantIndex(next, turnId);
+    const index = findMergeableAssistantIndex(next, turnId, event.message_id);
     const attachments = normalizeEventAttachments(event.attachments);
     const finalContent = typeof event.content === 'string' ? event.content : null;
     if (index >= 0) {
@@ -1447,6 +1898,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         streaming: false,
         turnId,
         attachments: attachments.length > 0 ? attachments : message.attachments,
+        chatMode: eventChatMode ?? message.chatMode,
+        chatModeSource: eventChatModeSource ?? message.chatModeSource,
         streamChunkCount: undefined,
         streamContentOffset: undefined,
       };
@@ -1463,6 +1916,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         messageId: event.message_id,
         attachments,
         turnId,
+        chatMode: eventChatMode,
+        chatModeSource: eventChatModeSource,
       });
       return next;
     }
@@ -1510,8 +1965,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
             title: event.title ?? 'Thinking',
             content: delta,
             html: streamer.render(delta),
-            source: 'summary',
+            source: event.source ?? 'summary',
             complete: false,
+            startedAt: event.started_at ?? null,
+            completedAt: event.completed_at ?? null,
+            durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : null,
+            providerBlockIndex: typeof event.provider_block_index === 'number' ? event.provider_block_index : null,
           } satisfies ThinkingBlock,
         ];
         next[index] = {
@@ -1529,12 +1988,16 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         title: event.title ?? 'Thinking',
         content: delta,
         html: streamer.render(delta),
-        source: 'summary',
+        source: event.source ?? 'summary',
         complete: false,
+        startedAt: event.started_at ?? null,
+        completedAt: event.completed_at ?? null,
+        durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : null,
+        providerBlockIndex: typeof event.provider_block_index === 'number' ? event.provider_block_index : null,
       } satisfies ThinkingBlock;
       const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
       if (contiguousIndex >= 0) {
-        appendThinkingBlockToSegment(
+        upsertThinkingBlockInSegment(
           next,
           contiguousIndex,
           block,
@@ -1573,15 +2036,20 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         title: event.title ?? 'Thinking',
         content: event.content,
         html,
-        source: 'summary',
+        source: event.source ?? 'summary',
         complete: true,
+        startedAt: event.started_at ?? null,
+        completedAt: event.completed_at ?? null,
+        durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : null,
+        providerBlockIndex: typeof event.provider_block_index === 'number' ? event.provider_block_index : null,
       };
       if (index >= 0) {
         const existing = next[index] as ThinkingTimelineItem;
-        const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId && !b.complete);
-        const blocks =
-          blockIdx >= 0
-            ? existing.blocks.map((b, i) => (i === blockIdx ? block : b))
+        const blockIdx = existing.blocks.findIndex((b) => b.block_id === blockId);
+        const blocks = blockIdx >= 0
+          ? existing.blocks.map((b, i) => (i === blockIdx ? mergeThinkingBlock(b, block) : b))
+          : hasDuplicateThinkingBlock(existing, block)
+            ? existing.blocks
             : [...existing.blocks, block];
         next[index] = {
           ...existing,
@@ -1593,7 +2061,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       } else {
         const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
         if (contiguousIndex >= 0) {
-          appendThinkingBlockToSegment(next, contiguousIndex, block, turnId, new Date().toISOString(), false, null);
+          upsertThinkingBlockInSegment(next, contiguousIndex, block, turnId, new Date().toISOString(), false, null);
         } else {
           insertBeforeOpenPhaseAssistant(next, {
             id: `thinking:${turnId}:${blockId}`,
@@ -1622,6 +2090,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
           html: finalHtml,
           title: event.title ?? block.title,
           complete: true,
+          startedAt: event.started_at ?? block.startedAt,
+          completedAt: event.completed_at ?? block.completedAt,
+          durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : block.durationMs,
+          providerBlockIndex: typeof event.provider_block_index === 'number' ? event.provider_block_index : block.providerBlockIndex,
         };
       }
       next[index] = {
@@ -1637,12 +2109,16 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         title: event.title ?? 'Thinking',
         content: '',
         html: '',
-        source: 'summary',
+        source: event.source ?? 'summary',
         complete: true,
+        startedAt: event.started_at ?? null,
+        completedAt: event.completed_at ?? null,
+        durationMs: typeof event.duration_ms === 'number' ? event.duration_ms : null,
+        providerBlockIndex: typeof event.provider_block_index === 'number' ? event.provider_block_index : null,
       };
       const contiguousIndex = findOpenPhaseThinkingIndex(next, turnId);
       if (contiguousIndex >= 0) {
-        appendThinkingBlockToSegment(next, contiguousIndex, fallbackBlock, turnId, new Date().toISOString(), false, null);
+        upsertThinkingBlockInSegment(next, contiguousIndex, fallbackBlock, turnId, new Date().toISOString(), false, null);
       } else {
         insertBeforeOpenPhaseAssistant(next, {
           id: `thinking:${turnId}:${blockId}`,
@@ -1705,22 +2181,23 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
-      next[index] = {
+      const keepStreamed = Boolean(event.transport_truncated) && (existing.streamedOutput?.length ?? 0) > event.result.length;
+      next[index] = mergeToolPresentation({
         ...existing,
         status: event.is_error ? 'failed' : 'completed',
         timestamp: event.timestamp ?? existing.timestamp,
-        result: event.result,
+        result: keepStreamed ? existing.streamedOutput : event.result,
         isError: event.is_error,
         durationMs: event.duration_ms ?? undefined,
         evaluation,
         attachments: attachments.length > 0 ? attachments : existing.attachments,
         fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
         turnId: existing.turnId ?? turnId,
-      };
+      }, event);
       return next;
     }
     // tool_result arrived before tool_call — create a placeholder
-    next.push({
+    next.push(mergeToolPresentation({
       id: itemId,
       kind: 'tool_call',
       callId: event.call_id,
@@ -1734,6 +2211,71 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       evaluation,
       attachments: attachments.length > 0 ? attachments : undefined,
       fileDiffs: fileDiffs.length > 0 ? fileDiffs : undefined,
+    }, event));
+    return next;
+  }
+
+  if (event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk') {
+    const rawEvent = event as typeof event & {
+      call_id?: string;
+      tool_name?: string;
+      delta?: string;
+      content?: string;
+      text?: string;
+      stream?: string | null;
+      is_error?: boolean;
+      chunk_index?: number;
+      content_offset?: number;
+    };
+    const callId = rawEvent.call_id ?? '';
+    const itemId = `tool:${callId}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    const delta = rawEvent.delta ?? rawEvent.content ?? rawEvent.text ?? '';
+    const isErrorChunk = rawEvent.is_error ?? rawEvent.stream === 'stderr';
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      if (
+        typeof rawEvent.chunk_index === 'number'
+        && typeof existing.streamChunkCount === 'number'
+        && rawEvent.chunk_index < existing.streamChunkCount
+      ) {
+        return next;
+      }
+      if (
+        typeof rawEvent.content_offset === 'number'
+        && typeof existing.streamContentOffset === 'number'
+        && rawEvent.content_offset < existing.streamContentOffset
+      ) {
+        return next;
+      }
+      const streamedOutput = `${existing.streamedOutput ?? ''}${delta}`;
+      next[index] = {
+        ...existing,
+        streamedOutput,
+        result: streamedOutput,
+        isError: isErrorChunk || existing.isError,
+        streamChunkCount: typeof rawEvent.chunk_index === 'number' ? rawEvent.chunk_index + 1 : existing.streamChunkCount,
+        streamContentOffset: typeof rawEvent.content_offset === 'number' ? rawEvent.content_offset + utf16CodeUnits(delta) : existing.streamContentOffset,
+        sessionId: rawEvent.session_id ?? existing.sessionId,
+        liveOutputAvailable: true,
+      };
+      return next;
+    }
+    next.push({
+      id: itemId,
+      kind: 'tool_call',
+      callId,
+      toolName: rawEvent.tool_name ?? 'unknown',
+      turnId: normalizeEventTurnId(event.turn_id),
+      status: 'started',
+      timestamp: event.timestamp ?? new Date().toISOString(),
+      streamedOutput: delta,
+      result: delta,
+      isError: isErrorChunk,
+      streamChunkCount: typeof rawEvent.chunk_index === 'number' ? rawEvent.chunk_index + 1 : undefined,
+      streamContentOffset: typeof rawEvent.content_offset === 'number' ? rawEvent.content_offset + utf16CodeUnits(delta) : undefined,
+      sessionId: rawEvent.session_id,
+      liveOutputAvailable: true,
     });
     return next;
   }
@@ -1794,12 +2336,15 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       kind: 'delegation',
       taskId,
       taskLabel: delegationTaskLabel('task' in event ? event.task : null),
+      agentId: 'agent_id' in event && typeof event.agent_id === 'string' ? event.agent_id : null,
+      usedAgentId: 'used_agent_id' in event && typeof event.used_agent_id === 'string' ? event.used_agent_id : null,
       status: event.type === 'delegation_started' ? 'started' : 'running',
       result: progressText,
       timestamp: new Date().toISOString(),
       toolCallCount: 'tool_call_count' in event ? (event as typeof event & { tool_call_count?: number }).tool_call_count : undefined,
       maxToolCalls: 'max_tool_calls' in event ? (event as typeof event & { max_tool_calls?: number }).max_tool_calls : undefined,
       lastTool: 'last_tool' in event ? (event as typeof event & { last_tool?: string }).last_tool : undefined,
+      todos: parseTodoSnapshot('todos' in event ? event.todos : undefined),
     };
     if (index >= 0) {
       next[index] = mergeDelegationItem(existing, delegation);
@@ -1822,9 +2367,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       kind: 'delegation',
       taskId,
       taskLabel: delegationTaskLabel('task' in event ? event.task : null, existing?.taskLabel ?? 'Background task'),
+      agentId: 'agent_id' in event && typeof event.agent_id === 'string' ? event.agent_id : null,
+      usedAgentId: 'used_agent_id' in event && typeof event.used_agent_id === 'string' ? event.used_agent_id : null,
       status,
-      result: typeof result === 'string' ? result : null,
-      timestamp: new Date().toISOString()
+      result: delegationPreview(result),
+      timestamp: new Date().toISOString(),
+      todos: parseTodoSnapshot('todos' in event ? event.todos : undefined),
     };
     if (index >= 0) {
       next[index] = mergeDelegationItem(existing, delegation);
@@ -1884,8 +2432,10 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       kind: 'delegation',
       taskId,
       taskLabel: existing?.taskLabel ?? 'Background task',
+      agentId: existing?.agentId ?? null,
+      usedAgentId: existing?.usedAgentId ?? null,
       status,
-      result: typeof result === 'string' ? result : null,
+      result: delegationPreview(result),
       timestamp: new Date().toISOString()
     };
     if (index >= 0) {
@@ -1927,6 +2477,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       summaryPreview: event.summary_preview?.slice(0, 500) ?? '',
       method: event.method ?? 'unknown',
       turnsCompacted: event.turns_compacted ?? 0,
+      trigger: event.trigger,
+      reason: event.reason,
+      previousUsagePercentage: event.previous_usage_percentage ?? null,
+      effectiveUsagePercentage: event.effective_usage_percentage ?? null,
+      hardPressureExceeded: event.hard_pressure_exceeded === true,
+      usedTimeoutFallback: event.used_timeout_fallback === true,
       timestamp: new Date().toISOString()
     });
     return next;
@@ -1934,7 +2490,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'system_message') {
     const itemId =
-      typeof event.seq === 'number'
+      typeof event.notice_id === 'string' && event.notice_id.length > 0
+        ? `sysmsg:${event.notice_id}`
+        : typeof event.seq === 'number'
         ? `sysmsg:${event.seq}`
         : `sysmsg:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'system_message');
@@ -1942,6 +2500,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       id: itemId,
       kind: 'system_message' as const,
       text: event.text,
+      noticeId: event.notice_id ?? null,
+      noticeKind: event.kind ?? null,
+      noticeScope: event.scope ?? null,
       timestamp: new Date().toISOString(),
     };
     if (index >= 0) {
@@ -1964,18 +2525,6 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'session_recovered') {
-    const itemId = `session-recovered:${event.session_id}`;
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'system_message');
-    const systemMessage = createSystemMessageItem(
-      itemId,
-      'The controller recovered this conversation after a restart.',
-      new Date().toISOString()
-    );
-    if (index >= 0) {
-      next[index] = systemMessage;
-      return next;
-    }
-    next.push(systemMessage);
     return next;
   }
 

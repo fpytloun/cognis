@@ -117,4 +117,26 @@ describe('ws client heartbeat', () => {
     expect(socket.sent.some((payload) => payload.includes('"type":"step_response"'))).toBe(true);
     wsClient.disconnect();
   });
+
+  it('can replace an advanced replay cursor when resubscribing from cached history', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.subscribeConversation('conv-1', 10, 'sess-1');
+    wsClient.updateConversationSeq('conv-1', 42, 'sess-1');
+    wsClient.subscribeConversation('conv-1', 12, 'sess-1');
+    wsClient.subscribeConversation('conv-1', 12, 'sess-1', { replaceCursor: true });
+
+    const reconnects = socket.sent
+      .map((payload) => JSON.parse(payload) as { type?: string; last_seq?: number })
+      .filter((payload) => payload.type === 'reconnect');
+    expect(reconnects.at(-2)?.last_seq).toBe(42);
+    expect(reconnects.at(-1)?.last_seq).toBe(12);
+    wsClient.disconnect();
+  });
 });

@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-05-23
+
+### Added
+
+- Knowledgebase ingestion and retrieval with artifact-backed sources, native hybrid search, source context reads, per-agent assignments, CRUD tools, token-aware chunking, configurable per-knowledgebase chunking settings, and embedding model routing.
+- Direct Codex transport and native Codex discovery/usage support, plus Claude Agent SDK executor integration, Claude model catalogs, setup flows, provider settings, and Anthropic-compatible base URLs.
+- Plan/build chat modes, starred conversations, separate chat popup windows, same-conversation undo/redo, todo progress indicators, and richer context diagnostics.
+- Background shell status reporting, executor reconnect and routing improvements, project metadata loading for path-scoped agents, and channel context exposure to agents.
+- Paged full tool-output viewing, streamed tool-output snapshot preservation, visible tool select matches, improved browser fetch consent handling, and Reddit JSON fetch fallback.
+
+### Changed
+
+- Reworked context projection and compaction around pressure-aware tool output budgeting, provider-overflow recovery, canonical projection, bounded compaction recursion, and more stable within-turn re-projection.
+- Refined LLM provider behavior by removing Responses continuation dependence, dropping the Claude Code SDK provider, improving ChatGPT/Codex stream caching and idle recovery, and making model/provider routing more explicit.
+- Improved conversation loading and live chat reconciliation with cached switches, authoritative reload boundaries, stable event state, preserved queued messages, and clearer recovery notices.
+- Tightened runtime/delegation recovery with preserved tool runtime metadata, async delegation workspace context, saved child-result salvage, workflow log exposure, and explicit task slash-command routing.
+- Strengthened mobile and UI behavior around keyboard safe areas, history ordering, fixed headers, mode markers, context controls, and sidebar todo visibility.
+
+### Fixed
+
+- Hardened knowledgebase tool exposure, assignment access, structured tool results, Docker dependencies, metadata ingestion, hybrid search, and embedding route ordering.
+- Stabilized direct Codex generate streaming, provider stream diagnostics, idle LLM recovery, recoverable model failures, custom Responses call IDs, and provider credential scoping.
+- Fixed stale projection tool prefixes, compaction session rebuilds, historical tool-output projection caps, tool argument validation, local tool argument rejection, and malformed select aliases.
+- Corrected executor pin expiry, executor switching/rebinding, foreground shell timeout cleanup, LSP initialization/default analysis bounds, and remote provider target validation.
+- Preserved chat timelines, live tails, user message identity, chat filters, activity ordering, attachment handling, markdown rendering, and mobile overlay safe areas.
+
+### Documentation
+
+- Added and updated knowledgebase source-context guidance, long-running bash/background command guidance, task agent ownership notes, additional executor handling, and provider/context diagnostics documentation.
+
 ## [0.5.0] - 2026-05-08
 
 ### Added

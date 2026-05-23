@@ -83,8 +83,7 @@ import X from 'lucide-svelte/icons/x';
 
 {#if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div
-    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
-    style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
     role="region"
     aria-label="Install Cognis as app"
   >
@@ -102,8 +101,7 @@ import X from 'lucide-svelte/icons/x';
 
 {#if shouldShowInstallUi && showIosHint && $displayMode === 'browser'}
   <div
-    class="fixed inset-x-2 bottom-2 z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur lg:bottom-4"
-    style="margin-bottom: max(env(safe-area-inset-bottom), 0.5rem);"
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
     role="region"
     aria-label="Add Cognis to Home Screen"
   >

@@ -254,13 +254,18 @@ import X from 'lucide-svelte/icons/x';
 
   let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
+  let isChatWindowMode = $derived(isChatDetailRoute && $page.url.searchParams.get('window') === '1');
   let showMobileHeader = $derived(!isChatDetailRoute);
-  let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute);
+  let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute && !isChatWindowMode);
+  let hasStatusBanners = $derived(outageBanners().length > 0 || shouldShowGettingStarted());
   let contentShellClass = $derived.by(() => {
-    if (isChatRoute) {
-      return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
+    if (isChatWindowMode) {
+      return 'min-h-0 min-w-0 flex-1 overflow-hidden';
     }
-    return 'min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 lg:px-0 lg:pt-0';
+    if (isChatRoute) {
+      return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader && !hasStatusBanners ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
+    }
+    return `min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 lg:px-0 ${hasStatusBanners ? 'pt-3 lg:pt-4' : 'pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] lg:pt-0'}`;
   });
 
   $effect(() => {
@@ -379,6 +384,7 @@ import X from 'lucide-svelte/icons/x';
   <ShortcutHelp />
   <div class="app-shell-viewport fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
     <div class="mx-auto flex h-full max-w-[1600px] overflow-hidden lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
+      {#if !isChatWindowMode}
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
       >
@@ -523,6 +529,7 @@ import X from 'lucide-svelte/icons/x';
           {/if}
         </div>
       </aside>
+      {/if}
 
       <!--
         The main content container used to wrap everything in a rounded,
@@ -583,43 +590,45 @@ import X from 'lucide-svelte/icons/x';
         </header>
         {/if}
 
-        {#if outageBanners().length > 0}
-          <div class="space-y-3">
-            {#each outageBanners() as banner (banner.id)}
-              <div class={`rounded-2xl border px-4 py-4 text-sm ${banner.variant === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
-                <div class="flex flex-wrap items-center justify-between gap-3">
-                  <div class="flex min-w-0 items-start gap-3">
-                     <banner.icon class="mt-0.5 h-5 w-5 shrink-0" />
-                    <div>
-                      <p class="font-medium">{banner.title}</p>
-                      <p class="mt-1 opacity-90">{banner.description}</p>
+        {#if hasStatusBanners}
+          <div class="space-y-3 px-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 lg:px-0 lg:pt-0">
+            {#if outageBanners().length > 0}
+              {#each outageBanners() as banner (banner.id)}
+                <div class={`rounded-2xl border px-4 py-4 text-sm ${banner.variant === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
+                  <div class="flex flex-wrap items-center justify-between gap-3">
+                    <div class="flex min-w-0 items-start gap-3">
+                       <banner.icon class="mt-0.5 h-5 w-5 shrink-0" />
+                      <div>
+                        <p class="font-medium">{banner.title}</p>
+                        <p class="mt-1 opacity-90">{banner.description}</p>
+                      </div>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                      <Button size="sm" variant="secondary" onclick={() => workspaceHealth.refresh()}>
+                        <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+                        Refresh
+                      </Button>
+                      <Button size="sm" variant="secondary" onclick={() => goto(banner.href)}>
+                        <Settings class="mr-1.5 h-3.5 w-3.5" />
+                        Configure
+                      </Button>
                     </div>
                   </div>
-                  <div class="flex flex-wrap gap-2">
-                    <Button size="sm" variant="secondary" onclick={() => workspaceHealth.refresh()}>
-                      <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
-                      Refresh
-                    </Button>
-                    <Button size="sm" variant="secondary" onclick={() => goto(banner.href)}>
-                      <Settings class="mr-1.5 h-3.5 w-3.5" />
-                      Configure
-                    </Button>
+                </div>
+              {/each}
+            {/if}
+
+            {#if shouldShowGettingStarted()}
+              <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p class="font-medium">Finish first-run setup</p>
+                    <p class="mt-1 text-sky-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
                   </div>
+                  <Button size="sm" onclick={() => goto('/getting-started')}>Open guide</Button>
                 </div>
               </div>
-            {/each}
-          </div>
-        {/if}
-
-        {#if shouldShowGettingStarted()}
-          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p class="font-medium">Finish first-run setup</p>
-                <p class="mt-1 text-sky-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
-              </div>
-              <Button size="sm" onclick={() => goto('/getting-started')}>Open guide</Button>
-            </div>
+            {/if}
           </div>
         {/if}
 
@@ -636,7 +645,7 @@ import X from 'lucide-svelte/icons/x';
           role="presentation"
           use:adaptiveBottomInset={{ disabled: !shouldReserveBottomTabSpace }}
           use:scrollPersist={{ key: $page.url.pathname, disabled: isChatDetailRoute }}
-          use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen }}
+          use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen || isChatWindowMode }}
           use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: !mobileNavOpen }}
         >
             {@render children()}
@@ -717,5 +726,5 @@ import X from 'lucide-svelte/icons/x';
 
   <!-- Mobile bottom tab bar: primary navigation on small screens. Hidden inside
        chat detail views so the composer owns the bottom safe-area. -->
-  <BottomTabBar hidden={isChatDetailRoute} />
+  <BottomTabBar hidden={isChatDetailRoute || isChatWindowMode} />
 {/if}

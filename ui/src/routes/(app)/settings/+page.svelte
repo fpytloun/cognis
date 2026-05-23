@@ -5,7 +5,7 @@ import { onMount, tick } from 'svelte';
   import type { MCPEnvVar } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
-  import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerFormToPayload, type ProviderFormState, type ProviderPreset } from '$lib/providers';
+  import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -54,6 +54,8 @@ import { onMount, tick } from 'svelte';
     HealthResponse,
     LLMProvider,
     LLMProviderOAuthStatus,
+    CodexUsage,
+    CodexUsageWindow,
     ModelRouting,
     ProviderTestResult,
     PushSubscriptionStatusResponse,
@@ -71,7 +73,6 @@ import { onMount, tick } from 'svelte';
   } from '$lib/types/api';
 
   type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
-
   type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
 
   const CREDENTIAL_PAYLOAD_TEMPLATES: Record<CredentialKind, string> = {
@@ -93,7 +94,7 @@ import { onMount, tick } from 'svelte';
   };
 
   const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'notifications', 'web', 'tools', 'executors', 'users', 'system', 'account'];
-  const USER_TABS: SettingsTab[] = ['secrets', 'notifications', 'tools', 'executors', 'account'];
+  const USER_TABS: SettingsTab[] = ['providers', 'secrets', 'notifications', 'tools', 'executors', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
@@ -106,8 +107,9 @@ import { onMount, tick } from 'svelte';
     system: 'system',
     account: 'account'
   };
-  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'text_to_speech', 'image_generation', 'attachment_analysis'] as const;
+  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'text_to_speech', 'image_generation', 'attachment_analysis', 'embedding'] as const;
   const TEXT_ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator'] as const;
+  const SAME_SESSION_MODEL_SENTINEL = '__same_session_model__';
   type RoutingKey = (typeof ROUTING_KEYS)[number];
   type RoutingFormEntry = { model: string; reasoningEffort: string };
   const ROUTING_METADATA: Array<{
@@ -118,12 +120,13 @@ import { onMount, tick } from 'svelte';
   }> = [
     { key: 'default', label: 'default', description: 'Main chat and task execution.', supportsThinking: true },
     { key: 'classifier', label: 'classifier', description: 'Decision engine / fast model.', supportsThinking: true },
-    { key: 'compaction', label: 'compaction', description: 'Context compaction summaries.', supportsThinking: true },
+    { key: 'compaction', label: 'compaction', description: 'Context compaction summaries. Defaults to the same model as the active agent session.', supportsThinking: true },
     { key: 'evaluator', label: 'evaluator', description: 'Workflow step evaluation. Falls back to default if not set.', supportsThinking: true },
     { key: 'speech_to_text', label: 'speech_to_text', description: 'Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.', supportsThinking: false },
     { key: 'text_to_speech', label: 'text_to_speech', description: 'Voice synthesis for the speaker button and conversation mode. Use models like tts-1, tts-1-hd, gpt-4o-mini-tts, eleven_multilingual_v2, or a Piper-compatible HTTP server.', supportsThinking: false },
     { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false },
-    { key: 'attachment_analysis', label: 'attachment_analysis', description: 'Fallback model for artifact_read and binary read analysis when the main chat model lacks image/PDF/file capabilities.', supportsThinking: false }
+    { key: 'attachment_analysis', label: 'attachment_analysis', description: 'Fallback model for artifact_read and binary read analysis when the main chat model lacks image/PDF/file capabilities.', supportsThinking: false },
+    { key: 'embedding', label: 'embedding', description: 'Embedding model route for Knowledgebase indexing and vector search. Use models like text-embedding-3-small, bge, e5, or gte.', supportsThinking: false }
   ];
 
   function emptyRoutingEntry(): RoutingFormEntry {
@@ -139,7 +142,8 @@ import { onMount, tick } from 'svelte';
       speech_to_text: { model: null, reasoning_effort: null },
       text_to_speech: { model: null, reasoning_effort: null },
       image_generation: { model: null, reasoning_effort: null },
-      attachment_analysis: { model: null, reasoning_effort: null }
+      attachment_analysis: { model: null, reasoning_effort: null },
+      embedding: { model: null, reasoning_effort: null }
     };
   }
 
@@ -152,7 +156,8 @@ import { onMount, tick } from 'svelte';
       speech_to_text: emptyRoutingEntry(),
       text_to_speech: emptyRoutingEntry(),
       image_generation: emptyRoutingEntry(),
-      attachment_analysis: emptyRoutingEntry()
+      attachment_analysis: emptyRoutingEntry(),
+      embedding: emptyRoutingEntry()
     };
   }
 
@@ -279,6 +284,8 @@ import { onMount, tick } from 'svelte';
   let providerForm = $state<ProviderFormState>(createProviderForm());
   let providerTestResult = $state<ProviderTestResult | null>(null);
   let providerOAuthStatus = $state<LLMProviderOAuthStatus | null>(null);
+  let providerCodexUsage = $state<CodexUsage | null>(null);
+  let providerCodexUsageError = $state('');
   let showModelDiscovery = $state(false);
   let editingModel = $state<ModelEntry | null>(null);
   let addModelId = $state('');
@@ -449,7 +456,7 @@ import { onMount, tick } from 'svelte';
     return providers.find((provider) => provider.provider_id === selectedProviderId) ?? null;
   }
 
-  function modelOptions(): Array<{ value: string; label: string; providerId: string }> {
+  function modelOptions(): ProviderModelOption[] {
     return collectModelOptions(providers);
   }
 
@@ -470,10 +477,25 @@ import { onMount, tick } from 'svelte';
     );
   }
 
-  function findModelEntry(modelId: string): ModelEntry | null {
+  function preferredProviderIdForModel(modelId: string): string | null {
     const normalized = modelId.trim();
     if (!normalized) {
       return null;
+    }
+    return modelOptions().find((option) => option.value === normalized)?.providerId ?? null;
+  }
+
+  function findModelEntry(modelId: string, providerId: string | null = null): ModelEntry | null {
+    const normalized = modelId.trim();
+    if (!normalized) {
+      return null;
+    }
+    if (providerId) {
+      const provider = providers.find((item) => item.provider_id === providerId);
+      const providerMatch = provider?.models.find((model) => model.model_id === normalized) ?? null;
+      if (providerMatch) {
+        return providerMatch;
+      }
     }
     for (const provider of providers) {
       const match = provider.models.find((model) => model.model_id === normalized);
@@ -482,6 +504,15 @@ import { onMount, tick } from 'svelte';
       }
     }
     return null;
+  }
+
+  function modelSupportsEmbedding(entry: unknown): boolean {
+    return Boolean(
+      entry &&
+        typeof entry === 'object' &&
+        'supports_embedding' in entry &&
+        (entry as { supports_embedding?: boolean }).supports_embedding
+    );
   }
 
   function defaultProviderModelId(): string {
@@ -500,6 +531,9 @@ import { onMount, tick } from 'svelte';
     if (explicitModel) {
       return explicitModel;
     }
+    if (routeKey === 'compaction') {
+      return SAME_SESSION_MODEL_SENTINEL;
+    }
     if (routeKey !== 'default') {
       const inheritedDefaultRouteModel = routingForm.default.model.trim();
       if (inheritedDefaultRouteModel) {
@@ -513,11 +547,15 @@ import { onMount, tick } from 'svelte';
     if (!TEXT_ROUTING_KEYS.includes(routeKey as (typeof TEXT_ROUTING_KEYS)[number])) {
       return [];
     }
-    const modelEntry = findModelEntry(effectiveRouteModelId(routeKey));
+    const modelId = effectiveRouteModelId(routeKey);
+    if (modelId === SAME_SESSION_MODEL_SENTINEL) {
+      return [];
+    }
+    const modelEntry = findModelEntry(modelId, preferredProviderIdForModel(modelId));
     return (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
   }
 
-  function routeModelOptions(routeKey: RoutingKey): Array<{ value: string; label: string; providerId: string }> {
+  function routeModelOptions(routeKey: RoutingKey): ProviderModelOption[] {
     const options = modelOptions();
     if (routeKey === 'image_generation') {
       return options.filter((option) => findModelEntry(option.value)?.supports_image_generation);
@@ -533,6 +571,9 @@ import { onMount, tick } from 'svelte';
         );
       });
     }
+    if (routeKey === 'embedding') {
+      return options.filter((option) => modelSupportsEmbedding(findModelEntry(option.value)));
+    }
     if (routeKey === 'speech_to_text') {
       return options.filter((option) => {
         const entry = findModelEntry(option.value);
@@ -545,6 +586,17 @@ import { onMount, tick } from 'svelte';
         return looksLikeTtsModel(option.value) || looksLikeTtsModel(entry?.display_name ?? '');
       });
     }
+    if (routeKey === 'compaction') {
+      return [
+        {
+          value: SAME_SESSION_MODEL_SENTINEL,
+          label: 'Same model as agent session',
+          providerId: '',
+          preferred: true
+        },
+        ...options
+      ];
+    }
     return options;
   }
 
@@ -554,18 +606,60 @@ import { onMount, tick } from 'svelte';
     if (!available.includes(entry.reasoningEffort)) {
       routingForm[routeKey].reasoningEffort = '';
     }
+    if (effectiveRouteModelId(routeKey) === SAME_SESSION_MODEL_SENTINEL) {
+      routingForm[routeKey].reasoningEffort = '';
+    }
   }
 
   function executorSelectorFor(labels: Record<string, string> | null | undefined): string {
     return Object.entries(labels || {}).map(([k, v]) => `${k}=${v}`).join(', ');
   }
 
+  function selectedProviderExecutorError(): string | null {
+    return providerExecutorTargetError(providerForm);
+  }
+
+  function providerSaveDisabledReason(): string | null {
+    if (busy) return 'Provider save is already in progress.';
+    if (!canManageProvider(selectedProvider())) {
+      return selectedProvider()?.owner_email
+        ? 'You can only edit providers owned by your account.'
+        : 'Shared system providers can only be edited by an admin.';
+    }
+    return selectedProviderExecutorError();
+  }
+
+  function handleProviderLocationChange(): void {
+    if (providerRequiresExecutorLocation(providerForm.preset)) {
+      providerForm.location = 'executor';
+      return;
+    }
+    if (providerForm.location !== 'executor') {
+      providerForm.executor_id = '';
+      providerForm.executor_selector = '';
+    }
+  }
+
+  function handleProviderExecutorIdChange(): void {
+    if (providerForm.executor_id.trim()) {
+      providerForm.executor_selector = '';
+    }
+  }
+
   function routingWarnings(): string[] {
     const knownModels = new Set(modelOptions().map((item) => item.value));
     return ROUTING_KEYS.map((key) => routingForm[key].model)
       .filter(Boolean)
+      .filter((model) => model !== SAME_SESSION_MODEL_SENTINEL)
       .filter((model) => !knownModels.has(model))
       .map((model) => `Model '${model}' is not present in configured providers.`);
+  }
+
+  function codexWindowLabel(window: CodexUsageWindow | null): string {
+    if (!window) return 'unavailable';
+    const duration = window.window_duration_mins ? `${window.window_duration_mins}m window` : 'window';
+    const reset = window.resets_at ? `resets ${new Date(window.resets_at).toLocaleString()}` : 'reset unknown';
+    return `${Math.round(window.used_percent)}% used, ${duration}, ${reset}`;
   }
 
   function diagnosticsEnvBlock(): string {
@@ -597,6 +691,8 @@ import { onMount, tick } from 'svelte';
     providerForm = createProviderForm(provider);
     providerTestResult = provider.last_test;
     providerOAuthStatus = null;
+    providerCodexUsage = null;
+    providerCodexUsageError = '';
   }
 
   async function selectProvider(provider: LLMProvider): Promise<void> {
@@ -616,6 +712,8 @@ import { onMount, tick } from 'svelte';
     providerForm = createProviderForm();
     providerTestResult = null;
     providerOAuthStatus = null;
+    providerCodexUsage = null;
+    providerCodexUsageError = '';
   }
 
   function handleProviderPresetChange(): void {
@@ -624,8 +722,13 @@ import { onMount, tick } from 'svelte';
       providerForm.use_responses_api = true;
       providerForm.base_url = '';
       providerForm.location = 'controller';
+      providerForm.executor_id = '';
+      providerForm.executor_selector = '';
+      providerForm.backend = 'litellm';
     } else if (providerForm.auth_mode === 'oauth') {
       providerForm.auth_mode = providerForm.preset === 'ollama' ? 'none' : 'env';
+      providerForm.codex_transport = 'direct';
+      providerForm.backend = 'litellm';
     }
   }
 
@@ -1061,6 +1164,10 @@ import { onMount, tick } from 'svelte';
       attachment_analysis: {
         model: modelRouting.attachment_analysis.model ?? '',
         reasoningEffort: ''
+      },
+      embedding: {
+        model: modelRouting.embedding?.model ?? '',
+        reasoningEffort: ''
       }
     };
 
@@ -1116,7 +1223,7 @@ import { onMount, tick } from 'svelte';
       stepProfileForms = profileDefs.map(toStepProfileForm);
       await loadUsers();
     } else {
-      providers = [];
+      providers = await api.llmProviders.list().then((page) => page.items).catch(() => []);
       diagnostics = null;
       stepProfileForms = [];
       userList = [];
@@ -1160,6 +1267,15 @@ import { onMount, tick } from 'svelte';
       return isAdmin;
     }
     return !server.owner_email || server.owner_email === currentUserEmail;
+  }
+
+  function canManageProvider(provider: LLMProvider | null): boolean {
+    if (!provider) return true;
+    const ownerEmail = provider.owner_email ?? null;
+    if (!ownerEmail) return isAdmin;
+    if (ownerEmail === 'system@cognis.local') return isAdmin;
+    const currentUserEmail = auth.getSnapshot().user?.email ?? null;
+    return ownerEmail === currentUserEmail || isAdmin;
   }
 
   async function refreshPushStatus(): Promise<void> {
@@ -1265,13 +1381,18 @@ import { onMount, tick } from 'svelte';
       error = 'Display name is required.';
       return;
     }
+    const executorTargetError = providerExecutorTargetError(providerForm);
+    if (executorTargetError) {
+      error = executorTargetError;
+      return;
+    }
     busy = true;
     error = '';
     notice = '';
     try {
       const payload = providerFormToPayload(providerForm);
       if (selectedProviderId) {
-        await api.llmProviders.update(selectedProviderId, payload);
+        await api.llmProviders.update(selectedProviderId, providerFormToUpdatePayload(providerForm));
       } else {
         const created = await api.llmProviders.create(payload);
         selectedProviderId = created.provider_id;
@@ -1338,6 +1459,8 @@ import { onMount, tick } from 'svelte';
     error = '';
     try {
       providerOAuthStatus = await api.llmProviders.startChatgptOAuth(selectedProviderId);
+      providerCodexUsage = null;
+      providerCodexUsageError = '';
       addToast('ChatGPT OAuth started. Enter the device code in your browser.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1353,12 +1476,29 @@ import { onMount, tick } from 'svelte';
     error = '';
     try {
       providerOAuthStatus = await api.llmProviders.chatgptOAuthStatus(selectedProviderId);
+      if (providerOAuthStatus.status !== 'authorized') {
+        providerCodexUsage = null;
+      }
       if (providerOAuthStatus.status === 'authorized') {
         addToast('ChatGPT OAuth is authorized.', 'success');
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to check OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function refreshCodexUsage(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    providerCodexUsageError = '';
+    try {
+      providerCodexUsage = await api.llmProviders.codexUsage(selectedProviderId);
+    } catch (caughtError) {
+      providerCodexUsageError = asApiError(caughtError).message;
+      addToast(providerCodexUsageError, 'error', 4_000, 'Unable to fetch Codex usage');
     } finally {
       busy = false;
     }
@@ -1371,6 +1511,8 @@ import { onMount, tick } from 'svelte';
     try {
       await api.llmProviders.clearChatgptOAuth(selectedProviderId);
       providerOAuthStatus = null;
+      providerCodexUsage = null;
+      providerCodexUsageError = '';
       addToast('ChatGPT OAuth tokens removed.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1384,6 +1526,7 @@ import { onMount, tick } from 'svelte';
     busy = true;
     error = '';
     try {
+      const compactionModel = routingForm.compaction.model || SAME_SESSION_MODEL_SENTINEL;
       modelRouting = await api.modelRouting.update({
         default: {
           model: routingForm.default.model || (routingForm.default.reasoningEffort ? effectiveRouteModelId('default') : '') || null,
@@ -1394,8 +1537,10 @@ import { onMount, tick } from 'svelte';
           reasoning_effort: routingForm.classifier.reasoningEffort || null
         },
         compaction: {
-          model: routingForm.compaction.model || (routingForm.compaction.reasoningEffort ? effectiveRouteModelId('compaction') : '') || null,
-          reasoning_effort: routingForm.compaction.reasoningEffort || null
+          model: compactionModel,
+          reasoning_effort: compactionModel === SAME_SESSION_MODEL_SENTINEL
+            ? null
+            : (routingForm.compaction.reasoningEffort || null)
         },
         evaluator: {
           model: routingForm.evaluator.model || (routingForm.evaluator.reasoningEffort ? effectiveRouteModelId('evaluator') : '') || null,
@@ -1415,6 +1560,10 @@ import { onMount, tick } from 'svelte';
         },
         attachment_analysis: {
           model: routingForm.attachment_analysis.model || null,
+          reasoning_effort: null
+        },
+        embedding: {
+          model: routingForm.embedding.model || null,
           reasoning_effort: null
         }
       });
@@ -2040,23 +2189,22 @@ import { onMount, tick } from 'svelte';
               <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Providers</p>
               <h2 class="mt-1 text-lg font-semibold text-white">LLM providers</h2>
             </div>
-            {#if !isAdmin}
-              <p class="text-sm text-slate-400">Provider management is available to admin users only.</p>
+            {#each providers as provider}
+              <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
+                <div class="flex items-center justify-between gap-3">
+                  <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
+                  <ProviderStatusBadge status={provider.status} />
+                </div>
+                <p class="mt-1 text-xs text-slate-500">{provider.owner_email ? `Owned by ${provider.owner_email}` : 'Shared system provider'}</p>
+                {#if provider.last_test}
+                  <p class="mt-2 text-xs text-slate-400">
+                    {provider.last_test.ok ? `Last test passed (${provider.last_test.model_resolved})` : provider.last_test.error_detail}
+                  </p>
+                {/if}
+              </button>
             {:else}
-              {#each providers as provider}
-                <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
-                  <div class="flex items-center justify-between gap-3">
-                    <span class="font-medium text-slate-100">{provider.is_default ? '⭐ ' : ''}{provider.display_name}</span>
-                    <ProviderStatusBadge status={provider.status} />
-                  </div>
-                  {#if provider.last_test}
-                    <p class="mt-2 text-xs text-slate-400">
-                      {provider.last_test.ok ? `Last test passed (${provider.last_test.model_resolved})` : provider.last_test.error_detail}
-                    </p>
-                  {/if}
-                </button>
-              {/each}
-            {/if}
+              <p class="text-sm text-slate-400">No providers configured yet.</p>
+            {/each}
           </div>
         </Card>
 
@@ -2089,10 +2237,25 @@ import { onMount, tick } from 'svelte';
                 {/each}
               </select>
             </label>
+            {#if isAdmin}
+              <label class="space-y-2 text-sm font-medium text-slate-200">
+                <span>Ownership</span>
+                <select bind:value={providerForm.owner_scope} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-60">
+                  <option value="user">Personal provider</option>
+                  <option value="system">Shared system provider</option>
+                </select>
+                <span class="block text-xs text-slate-400">Personal providers are owned by your account. Shared providers are visible to all users and admin-managed. Admins can change ownership when editing an existing provider.</span>
+              </label>
+            {:else}
+              <div class="space-y-2 text-sm font-medium text-slate-200">
+                <span>Ownership</span>
+                <div class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">Personal provider</div>
+              </div>
+            {/if}
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Execution location</span>
-              <select bind:value={providerForm.location} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="controller">Controller</option>
+              <select bind:value={providerForm.location} onchange={handleProviderLocationChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                <option value="controller" disabled={providerRequiresExecutorLocation(providerForm.preset)}>Controller</option>
                 {#if providerForm.preset !== 'chatgpt'}
                   <option value="executor">Via executor</option>
                 {/if}
@@ -2117,14 +2280,27 @@ import { onMount, tick } from 'svelte';
                 <p class="mt-2 text-sm text-slate-300">This provider stays configured normally, but requests are executed from a matching remote executor instead of the controller.</p>
               </div>
               <label class="space-y-2 text-sm font-medium text-slate-200 block">
-                <span>Executor selector (key=value, comma-separated)</span>
-                <Input bind:value={providerForm.executor_selector} placeholder="location=local, tier=gpu" />
+                <span>Executor</span>
+                <select bind:value={providerForm.executor_id} onchange={handleProviderExecutorIdChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <option value="">Use label selector</option>
+                  {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
+                    <option value={executor.executor_id}>{executor.name} ({executor.executor_id})</option>
+                  {/each}
+                </select>
+                <span class="block text-xs text-slate-400">Choose a concrete executor when this provider depends on executor-local auth or runtime state.</span>
               </label>
+              <label class="space-y-2 text-sm font-medium text-slate-200 block">
+                <span>Executor selector (key=value, comma-separated)</span>
+                <Input bind:value={providerForm.executor_selector} placeholder="location=local, tier=gpu" disabled={Boolean(providerForm.executor_id.trim())} />
+              </label>
+              {#if selectedProviderExecutorError()}
+                <p class="text-xs text-rose-300">{selectedProviderExecutorError()}</p>
+              {/if}
               {#if executorConfigs.length > 0}
                 <div class="flex flex-wrap gap-2">
                   <span class="text-xs text-slate-400 self-center">Use labels from:</span>
                   {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
-                    <Button size="sm" variant="secondary" onclick={() => (providerForm.executor_selector = executorSelectorFor(executor.labels))}>{executor.name}</Button>
+                    <Button size="sm" variant="secondary" onclick={() => { providerForm.executor_id = ''; providerForm.executor_selector = executorSelectorFor(executor.labels); }} disabled={Object.keys(executor.labels || {}).length === 0}>{executor.name}</Button>
                   {/each}
                 </div>
               {/if}
@@ -2166,6 +2342,35 @@ import { onMount, tick } from 'svelte';
                           {/if}
                         </div>
                       {/if}
+                      <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
+                        <div class="flex flex-wrap items-center justify-between gap-2">
+                          <p class="font-medium text-slate-200">Codex usage and limits</p>
+                          <Button size="sm" variant="secondary" onclick={refreshCodexUsage} disabled={busy}>Refresh usage</Button>
+                        </div>
+                        {#if providerCodexUsage}
+                          <div class="mt-2 space-y-1">
+                            <p>Plan: <span class="font-mono text-slate-100">{providerCodexUsage.plan_type ?? 'unknown'}</span></p>
+                            <p>Primary: {codexWindowLabel(providerCodexUsage.primary)}</p>
+                            <p>Secondary: {codexWindowLabel(providerCodexUsage.secondary)}</p>
+                            {#if providerCodexUsage.rate_limit_reached_type}
+                              <p class="text-amber-200">Limit status: {providerCodexUsage.rate_limit_reached_type}</p>
+                            {/if}
+                            {#if providerCodexUsage.credits}
+                              <p>Credits: {providerCodexUsage.credits.unlimited ? 'unlimited' : providerCodexUsage.credits.balance ?? 'available'}</p>
+                            {/if}
+                            {#if providerCodexUsage.usage_url}
+                              <a class="text-sky-300 underline" href={providerCodexUsage.usage_url} target="_blank" rel="noreferrer">Open ChatGPT usage dashboard</a>
+                            {/if}
+                            {#if providerCodexUsage.fetched_at}
+                              <p class="text-slate-500">Fetched {new Date(providerCodexUsage.fetched_at).toLocaleString()}</p>
+                            {/if}
+                          </div>
+                        {:else if providerCodexUsageError}
+                          <p class="mt-2 text-rose-200">{providerCodexUsageError}</p>
+                        {:else}
+                          <p class="mt-2 text-slate-400">Fetches the same Codex usage windows used by the Codex client. Exact remaining messages are not exposed.</p>
+                        {/if}
+                      </div>
                     {:else}
                       <p class="text-xs text-sky-300">Create the provider first, then start the OAuth device flow.</p>
                     {/if}
@@ -2202,8 +2407,8 @@ import { onMount, tick } from 'svelte';
           <!-- Connection -->
           {#if presetHasBaseUrl(providerForm.preset)}
             <label class="block space-y-2 text-sm font-medium text-slate-200">
-              <span>Base URL {#if providerForm.preset !== 'ollama'}<span class="text-rose-300">*</span>{/if}</span>
-              <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : 'https://your-provider.example.com/v1'} />
+              <span>Base URL {#if providerForm.preset !== 'ollama' && providerForm.preset !== 'anthropic'}<span class="text-rose-300">*</span>{/if}</span>
+              <Input bind:value={providerForm.base_url} placeholder={providerForm.preset === 'ollama' ? 'http://localhost:11434' : providerForm.preset === 'anthropic' ? 'https://api.anthropic.com or compatible endpoint' : 'https://your-provider.example.com/v1'} />
             </label>
           {/if}
 
@@ -2213,6 +2418,23 @@ import { onMount, tick } from 'svelte';
               <span class="space-y-1">
                 <span class="block font-medium">Use OpenAI Responses transport when supported</span>
                 <span class="block text-xs text-slate-400">Recommended for `gpt-5*` models. Disable this if your provider or LiteLLM proxy behaves better on the legacy chat-completions path.</span>
+              </span>
+            </label>
+          {/if}
+
+          {#if providerForm.preset === 'chatgpt'}
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
+              <input
+                checked={providerForm.codex_transport === 'direct'}
+                onchange={(event) => {
+                  providerForm.codex_transport = event.currentTarget.checked ? 'direct' : 'litellm';
+                }}
+                type="checkbox"
+                class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300"
+              />
+              <span class="space-y-1">
+                <span class="block font-medium">Use direct Codex transport</span>
+                <span class="block text-xs text-slate-400">Default. Disable only to route Responses requests through LiteLLM. OAuth still uses the encrypted Cognis token store.</span>
               </span>
             </label>
           {/if}
@@ -2302,20 +2524,26 @@ import { onMount, tick } from 'svelte';
             the buttons next to the form they belong to.
           -->
           <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
-            <Button onclick={saveProvider} disabled={!isAdmin || busy}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
+            <Button onclick={saveProvider} disabled={Boolean(providerSaveDisabledReason())}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
             <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
             {#if selectedProviderId}
-              <Button variant="secondary" onclick={() => testProvider(selectedProviderId)} disabled={!isAdmin || busy}>Test provider</Button>
-              <Button variant="secondary" onclick={setDefaultProvider} disabled={!isAdmin || busy}>Set as default</Button>
-              <Button variant="danger" onclick={() => deleteProvider(selectedProviderId)} disabled={!isAdmin || busy}>Delete</Button>
+              <Button variant="secondary" onclick={() => testProvider(selectedProviderId)} disabled={!canManageProvider(selectedProvider()) || busy}>Test provider</Button>
+              <Button variant="secondary" onclick={setDefaultProvider} disabled={!canManageProvider(selectedProvider()) || busy}>Set as default</Button>
+              <Button variant="danger" onclick={() => deleteProvider(selectedProviderId)} disabled={!canManageProvider(selectedProvider()) || busy}>Delete</Button>
             {/if}
           </div>
+          {#if providerSaveDisabledReason()}
+            <p class="text-xs text-amber-200">{providerSaveDisabledReason()}</p>
+          {/if}
 
           {#if providerTestResult}
             <div class={`rounded-2xl border px-4 py-3 text-sm ${providerTestResult.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
               {#if providerTestResult.ok}
                 <p>Resolved model: {providerTestResult.model_resolved}</p>
                 <p class="mt-1">Latency: {providerTestResult.latency_ms} ms</p>
+                {#if providerTestResult.executor_routed}
+                  <p class="mt-1">Executor: {providerTestResult.executor_id || 'selected by labels'} · Backend: {providerTestResult.executor_backend}</p>
+                {/if}
               {:else}
                 <p>{providerTestResult.error_detail}</p>
               {/if}
@@ -2348,13 +2576,17 @@ import { onMount, tick } from 'svelte';
               {#if route.supportsThinking}
                 <div class="space-y-2">
                   <span>Thinking effort</span>
-                  <select bind:value={routingForm[route.key].reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={routeThinkingEffortOptions(route.key).length === 0}>
+                  <select bind:value={routingForm[route.key].reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={routeThinkingEffortOptions(route.key).length === 0 || effectiveRouteModelId(route.key) === SAME_SESSION_MODEL_SENTINEL}>
                     <option value="">Default</option>
                     {#each routeThinkingEffortOptions(route.key) as value}
                       <option value={value}>{thinkingEffortLabel(value)}</option>
                     {/each}
                   </select>
-                  {#if routeThinkingEffortOptions(route.key).length === 0}
+                  {#if effectiveRouteModelId(route.key) === SAME_SESSION_MODEL_SENTINEL}
+                    <span class="block text-xs text-slate-500">
+                      Uses the active agent session's Thinking effort.
+                    </span>
+                  {:else if routeThinkingEffortOptions(route.key).length === 0}
                     <span class="block text-xs text-slate-500">
                       Select or resolve a model first to choose a Thinking effort.
                     </span>

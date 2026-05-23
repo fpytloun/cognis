@@ -117,6 +117,53 @@ function markOutgoingLinks(html: string): string {
   return html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ');
 }
 
+const bareUrlPattern = /https?:\/\/[^\s<]+/gi;
+const trailingUrlPunctuation = new Set(['.', ',', ';', ':', '!', '?', '"', "'"]);
+
+type MarkdownStripReplacement = string | ((substring: string, ...args: string[]) => string);
+
+const markdownStripRules: Array<[RegExp, MarkdownStripReplacement]> = [
+  [/```[\s\S]*?```/g, (match: string) => match.replace(/^```[^\n]*\n?/, '').replace(/\n?```$/, '')],
+  [/~~~[\s\S]*?~~~/g, (match: string) => match.replace(/^~~~[^\n]*\n?/, '').replace(/\n?~~~$/, '')],
+  [/`([^`]+)`/g, '$1'],
+  [/!\[([^\]]*)\]\([^)]*\)/g, '$1'],
+  [/\[([^\]]+)\]\([^)]*\)/g, '$1'],
+  [/(^|\s)#{1,6}\s+/gm, '$1'],
+  [/(^|\n)\s{0,3}>\s?/g, '$1'],
+  [/(^|\n)\s{0,3}(?:[-*+]\s+|\d+[.)]\s+)/g, '$1'],
+  [/([*_~]{1,3})(\S(?:[\s\S]*?\S)?)\1/g, '$2']
+];
+
+function unmatchedClosingUrlChar(value: string, close: ')' | ']' | '}'): boolean {
+  const open = close === ')' ? '(' : close === ']' ? '[' : '{';
+  let depth = 0;
+  for (const char of value) {
+    if (char === open) depth += 1;
+    if (char === close) depth -= 1;
+  }
+  return depth < 0;
+}
+
+function trimBareUrl(rawUrl: string): { url: string; suffix: string } {
+  let url = rawUrl;
+  let suffix = '';
+  while (url.length > 0) {
+    const last = url[url.length - 1];
+    if (trailingUrlPunctuation.has(last)) {
+      suffix = last + suffix;
+      url = url.slice(0, -1);
+      continue;
+    }
+    if ((last === ')' || last === ']' || last === '}') && unmatchedClosingUrlChar(url, last)) {
+      suffix = last + suffix;
+      url = url.slice(0, -1);
+      continue;
+    }
+    break;
+  }
+  return { url, suffix };
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, '&amp;')
@@ -131,6 +178,23 @@ function languageClass(lang: string): string {
   return normalized.replace(/[^a-z0-9_-]/g, '');
 }
 
+function linkifyBareUrls(text: string): string {
+  let cursor = 0;
+  let html = '';
+  for (const match of text.matchAll(bareUrlPattern)) {
+    const rawUrl = match[0];
+    const index = match.index ?? 0;
+    const { url, suffix } = trimBareUrl(rawUrl);
+    if (!url) continue;
+    html += escapeHtml(text.slice(cursor, index));
+    const safeUrl = escapeHtml(url);
+    html += `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeUrl}</a>${escapeHtml(suffix)}`;
+    cursor = index + rawUrl.length;
+  }
+  html += escapeHtml(text.slice(cursor));
+  return html;
+}
+
 function applyOutgoingLinkTargets(html: string): string {
   if (typeof document === 'undefined') return html;
   const template = document.createElement('template');
@@ -141,6 +205,51 @@ function applyOutgoingLinkTargets(html: string): string {
       link.setAttribute('rel', 'noopener noreferrer');
     }
   });
+  return template.innerHTML;
+}
+
+function shouldSkipBareUrlLinkification(node: Node): boolean {
+  const parent = node.parentElement;
+  return !parent || Boolean(parent.closest('a, pre, code, kbd, samp'));
+}
+
+function linkifyBareUrlsInHtml(html: string): string {
+  if (typeof document === 'undefined') return html;
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      if (shouldSkipBareUrlLinkification(node)) return NodeFilter.FILTER_REJECT;
+      return bareUrlPattern.test(node.textContent ?? '') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+    }
+  });
+  const nodes: Text[] = [];
+  while (walker.nextNode()) {
+    nodes.push(walker.currentNode as Text);
+  }
+
+  for (const node of nodes) {
+    const text = node.textContent ?? '';
+    bareUrlPattern.lastIndex = 0;
+    let cursor = 0;
+    const fragment = document.createDocumentFragment();
+    for (const match of text.matchAll(bareUrlPattern)) {
+      const rawUrl = match[0];
+      const index = match.index ?? 0;
+      const { url, suffix } = trimBareUrl(rawUrl);
+      if (!url) continue;
+      fragment.append(document.createTextNode(text.slice(cursor, index)));
+      const link = document.createElement('a');
+      link.href = url;
+      link.textContent = url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      fragment.append(link, document.createTextNode(suffix));
+      cursor = index + rawUrl.length;
+    }
+    fragment.append(document.createTextNode(text.slice(cursor)));
+    node.replaceWith(fragment);
+  }
   return template.innerHTML;
 }
 
@@ -181,7 +290,21 @@ export function sanitizeHtml(html: string): string {
 
 export function renderMarkdown(markdown: string): string {
   const parsed = marked.parse(normalizeEnclosingFence(markdown), { async: false, renderer: createLinkRenderer() });
-  return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+  return applyOutgoingLinkTargets(linkifyBareUrlsInHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : '')));
+}
+
+export function stripMarkdown(markdown: string): string {
+  let text = markdown;
+  for (const [pattern, replacement] of markdownStripRules) {
+    text = typeof replacement === 'string'
+      ? text.replace(pattern, replacement)
+      : text.replace(pattern, replacement);
+  }
+  return text
+    .replace(/\\([\\`*_{}\[\]()#+\-.!|>])/g, '$1')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function createDocsRenderer(): Renderer {
@@ -285,7 +408,7 @@ export function createMarkdownStreamer(): MarkdownStreamer {
 
   function parseSanitize(chunk: string): string {
     const parsed = marked.parse(normalizeEnclosingFence(chunk), { async: false, renderer: createLinkRenderer() });
-    return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+    return applyOutgoingLinkTargets(linkifyBareUrlsInHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : '')));
   }
 
   function render(content: string): string {

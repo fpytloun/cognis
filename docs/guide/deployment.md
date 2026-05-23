@@ -118,6 +118,8 @@ Back up:
 
 - `COGNIS_DATA_DIR`, including JWT keys, secrets key, SQLite database, and artifacts
 - PostgreSQL database if using PostgreSQL instead of SQLite
+- Knowledgebase vector storage, such as the configured Qdrant collection, if
+  the optional Knowledgebase feature is enabled
 - Mnemory storage and vector data
 - Intaris database and event store
 - persistent executor homes if browser profiles or workspaces matter

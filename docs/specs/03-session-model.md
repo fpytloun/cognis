@@ -191,6 +191,7 @@ class Session(BaseModel):
     idle_since: datetime | None
     completion_reason: str | None     # Why session ended: "compacted", "user_reset", etc.
     result: SessionResult | None
+    result_content: str | None        # Durable full completed sub-session output, bounded
 
     # NOTE: intention, last_event_seq, last_compaction_summary, and
     # last_compaction_seq are NOT stored in the DB. They live in the
@@ -274,8 +275,11 @@ Conversation: "Help me refactor the auth system"
     d. Build messages: system prompt + memories + compacted + recent + user msg
 
 4. LLM call (streaming):
-   a. Route to cloud provider or executor (local model)
-   b. Stream tokens to client
+   a. Derive the projection policy for the current model/context budget
+   b. Project the model-facing transcript, retrying `normal` → `pressure` →
+      `critical` modes before any hard context-pressure stop
+   c. Route to cloud provider or executor (local model)
+   d. Stream tokens to client
 
 5. Process LLM response:
    a. Text → stream to client
@@ -288,8 +292,9 @@ Conversation: "Help me refactor the auth system"
     a. Record events to Intaris: user_message, assistant_message, tool calls
     b. Append same events to session cache (L1)
     c. Remember to Mnemory (async, via bounded retry queue)
-    d. Check compaction threshold
-    e. NO Cognis DB write for event seq or compaction — cache is
+    d. Log/cache projection diagnostics and prune-cache hints for future replay
+    e. Check compaction threshold
+    f. NO Cognis DB write for event seq or compaction — cache is
        the only local copy, Intaris is the durable source of truth
 ```
 
@@ -322,52 +327,125 @@ Dynamic allocation (total - static):
 Static budget is recomputed when tools or skills change. This prevents the
 token budget overrun identified in the review.
 
+### Projection and Tool Output Strategy
+
+Projection owns model-facing budget pressure from tool outputs and runtime
+transcript shape. It is intentionally distinct from compaction:
+
+- **Cross-turn projection** is conservative. Historical tool outputs are mostly
+  bounded previews or recoverable placeholders with `call_id`, size, anchor, and
+  recovery metadata.
+- **Within-turn projection** is more generous. Active evidence can borrow a
+  larger burst budget so the agent can finish the current reasoning path without
+  repeatedly recovering the same output.
+- Projection modes are `normal`, `pressure`, and `critical`. The agent loop
+  retries stricter projection before treating context pressure as a hard stop.
+- Projection is not user-visible during normal operation. It is logged and
+  summarized in `/context` and `/info`; compaction remains the visible session
+  lifecycle event.
+
+The projection policy is derived from the model window and effective prompt
+budget. Large context models are treated as safety margin first, not as a reason
+to fill the entire prompt. Initial internal targets:
+
+| Model window | Steady target | Within-turn burst | Cross-turn tool budget | Within-turn tool budget |
+|--------------|---------------|-------------------|------------------------|-------------------------|
+| ~128K | ~90K-95K | ~105K-115K | ~8K-17K tokens | ~25K-45K tokens |
+| ~272K | ~180K | ~225K-245K | ~20K-35K tokens | ~70K-100K tokens |
+| ~400K | ~250K | ~330K-360K | ~30K-45K tokens | ~110K-150K tokens |
+| ~1M | ~300K-320K | ~450K-600K | ~40K-70K tokens | ~180K-250K tokens |
+
+The cache may remember recent projection decisions and prune hints, but cold
+rebuild from Intaris only needs to be semantically close and bounded. It does
+not need to reproduce a prior warm-cache projection byte-for-byte.
+
 ### Compaction Strategy
 
-When context approaches limit (>85% of total budget), compaction triggers
-and creates a new Intaris session within the same conversation. The old
-session is marked completed with ``completion_reason="compacted"``. The
-compaction summary is stored as a ``compaction_summary`` event in the
-old session's Intaris stream and injected as system context in the new
-session.
+Compaction owns durable user/assistant history growth and provider-overflow
+recovery when projection cannot make the prompt safe. When context approaches
+the compaction threshold, compaction creates a new Intaris session within the
+same conversation. The old session is marked completed with
+``completion_reason="compacted"``. The compaction summary is stored as a
+``compaction_summary`` event in the old session's Intaris stream and injected as
+system context in the new session.
 
 Two compaction paths:
 
 - **Manual** (``/compact`` slash command): Compaction runs immediately.
   Session creation is *deferred* until the next user message. The
   ``_load_conversation_runtime()`` function detects the completed/compacted
-  root session and calls ``rotate_session()`` on the next turn.
+  root session and calls ``rotate_session()`` on the next turn, re-fetching
+  the preserved tail events from the old session's Intaris stream via
+  ``tail_start_seq`` stored in the ``compaction_summary`` event data.
 
-- **Automatic** (post-turn in ``_execute_step()``): When
-  ``context_result.recommend_compaction`` is ``True`` after context assembly,
-  ``_auto_compact()`` runs after ``_finalize_step()`` records the turn's
-  events. It compacts, rotates the session immediately, and emits a
-  ``SESSION_COMPACTED`` event for client notification. Bounded to 15 seconds
-  timeout. Only fires for direct chat (``ctx.is_direct``), not workflow steps.
+- **Automatic**: When context assembly or provider-overflow recovery indicates
+  durable context pressure, ``_auto_compact()`` compacts, rotates the session,
+  and emits a ``SESSION_COMPACTED`` event for client notification. LLM
+  compaction has a bounded timeout (300 s); on timeout the mechanical fallback
+  is called directly. On non-timeout failure, ``compact()`` already attempted
+  its own retry and fallback internally, so ``_auto_compact`` returns ``None``
+  cleanly.
 
 Guard: automatic compaction only fires when ``_finalize_step()`` succeeded
 (events recorded). This prevents data loss where the turn's events would be
 lost if compaction rotated away from the session before events were saved.
+
+**Compaction input assembly** uses a three-band strategy:
+
+- **Head band** (20% of token budget): oldest events — captures original goal
+  and task framing.
+- **Middle band** (dropped): events between head and tail, replaced with an
+  explicit omission marker that includes the seq range and a note that tool
+  outputs remain recoverable by ``call_id``.
+- **Tail band** (60% of token budget): newest events — highest signal for
+  resumption.
+- **Headroom** (20%): reserved for the previous-summary wrapper and the
+  recoverable-handles trailer.
+
+Token budget is derived from the compaction model's ``max_input_tokens`` with
+15% headroom, or from the ``session.compaction_max_input_tokens`` setting.
+
+**LLM retry**: ``compact()`` retries once on transient errors (5xx, timeout,
+connection) before falling back to the mechanical sliding-window summary.
+Non-retryable errors (4xx, empty summary) skip the retry.
+
+**Mechanical fallback** (``build_sliding_window_summary``): keeps the last 8
+user messages, 4 assistant finals, and 4 deliverables verbatim, followed by
+event counts and the recoverable-handles block. A prominent warning header
+signals irreversible information loss. This path is a last resort — the
+``cognis_compaction_fallback_used_total`` counter is alert-worthy.
+
+**Fallback toggle**: ``session.compaction_fallback_enabled`` (default ``True``).
+When ``False``, LLM exhaustion returns ``CompactionResult(compacted=False,
+method="llm_failed")`` and the user receives a classified failure notice
+instead of a degraded mechanical summary.
+
+**Recursion bound**: ``_execute_step`` tracks ``ctx.compaction_recursion_depth``
+and caps it at ``session.compaction_max_recursion`` (default 2). Exceeding the
+cap surfaces a ``compaction_recursion_exhausted`` classified failure with a
+user-visible notice to try ``/new``.
+
+**Recoverable-handles block**: capped at 50 entries (ranked by ``output_size``
+desc). A trailer line lists how many additional handles were omitted.
 
 ```python
 class CompactionStrategy:
     async def compact(self, session: Session, *, trigger: str = "manual") -> CompactionResult:
         """
         1. Preserve last N turns uncompacted (default 10)
-        2. Summarize older turns via _system/compaction agent (LLM call)
-        3. Store summary as compaction_summary event in Intaris
-        4. Update session cache: compaction_summary, compaction_seq
-        5. Trim pre-compaction events from cache buffer
+        2. Assemble three-band input (head/middle-drop/tail, token-budgeted)
+        3. Call LLM (system:compaction agent); retry once on transient errors
+        4. Append recoverable-handle block (capped at 50 entries)
+        5. Store summary as compaction_summary event in Intaris
+        6. Update session cache: compaction_summary, compaction_seq
+        7. Trim pre-compaction events from cache buffer
         """
         ...
 
     async def compact_with_fallback(self, session: Session, *, trigger: str = "manual") -> CompactionResult:
         """
-        Tiered fallback for compaction:
-        1. Try LLM compaction (primary)
-        2. Retry with fallback model
-        3. Mechanical fallback: drop oldest turns beyond preserve window,
-           keep only turn metadata (who/what/topic). Log COMPACTION_DEGRADED.
+        Sliding-window mechanical fallback — called directly only on outer timeout.
+        compact() handles its own retry and fallback for non-timeout failures.
         """
         ...
 ```
@@ -579,9 +657,11 @@ lightweight **sub-sessions** that run a single agent loop turn.
 When a child session completes (or fails):
 
 1. Controller updates the child session status in Cognis DB
-2. Controller appends a `delegation_completed` (or `delegation_failed`)
-   event to the **parent** session's Intaris event stream
-   (data={child_session_id, result_summary, ...})
+2. Controller stores durable full result content on the child session and
+   appends a `delegation_completed` (or `delegation_failed`) event to the
+   **parent** session's Intaris event stream
+   (data={child_session_id, result_summary, result_content, result_source,
+   result_truncated, result_anchors, ...})
 3. Controller publishes `DELEGATION_COMPLETED` / `DELEGATION_FAILED`
    event → frontend updates the delegation card
 4. The next time ContextAssembler runs for the parent session, it picks
@@ -591,6 +671,14 @@ When a child session completes (or fails):
 
 This avoids lock contention — Intaris event append is independent of the
 parent's turn processing.
+
+Delegate result content prefers an explicit workflow deliverable when one is
+available. Otherwise Cognis aggregates all child `assistant_message` contents in
+chronological order with stable `[assistant_message:N]` section markers and
+separators, so a short later housekeeping response cannot hide an earlier full
+report. Large delegate results are bounded predictably and marked as truncated.
+The same section markers are exposed as anchors for `list_tool_output_anchors`,
+`read_tool_output_anchor`, and `get_subsession` result recovery.
 
 ## Long-Lived Session Management
 
@@ -641,7 +729,7 @@ conversation marked `archived`.
 If a user sends messages while a turn is processing:
 
 1. Messages queued with stable `queue_id` metadata and optional
-   `client_message_id` correlation (max `max_queued_messages`, default 5)
+   `client_message_id` correlation (max `max_queued_messages`, default 20)
 2. Beyond limit → reject with error
 3. Control commands (`/cancel`, `/stop`, `/status`) bypass queue, processed
    immediately on a separate channel

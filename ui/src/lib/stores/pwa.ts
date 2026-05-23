@@ -110,7 +110,7 @@ export async function promptInstall(): Promise<'accepted' | 'dismissed' | null> 
 
 // --- Display mode (standalone vs browser) ---------------------------------
 
-function detectDisplayMode(): 'standalone' | 'browser' {
+export function detectDisplayMode(): 'standalone' | 'browser' {
   if (typeof window === 'undefined') return 'browser';
   const mq = window.matchMedia?.('(display-mode: standalone)');
   // iOS Safari exposes navigator.standalone instead of display-mode media query.
@@ -132,9 +132,21 @@ export const displayMode = readable<'standalone' | 'browser'>(detectDisplayMode(
 export function isIosSafari(): boolean {
   if (typeof navigator === 'undefined') return false;
   const ua = navigator.userAgent || '';
-  const isIos = /iPad|iPhone|iPod/.test(ua) && !('MSStream' in window);
+  const platform = navigator.platform || '';
+  const maxTouchPoints = navigator.maxTouchPoints || 0;
+  const isIos = (/iPad|iPhone|iPod/.test(ua) || (platform === 'MacIntel' && maxTouchPoints > 1))
+    && (typeof window === 'undefined' || !('MSStream' in window));
   const isSafari = /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua);
   return isIos && isSafari;
+}
+
+export function isIosStandalonePwa(): boolean {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
+  return isIosSafari() && (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
+}
+
+export function canAttemptPwaAuxiliaryWindow(): boolean {
+  return typeof window !== 'undefined' && !isIosStandalonePwa();
 }
 
 // --- Service worker registration ------------------------------------------

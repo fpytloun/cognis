@@ -525,7 +525,16 @@ so the LLM sees an accurate contract.
 
 `_validate_controller_tool_arguments` enforces required fields and type/
 enum constraints. On failure, return synthetic `is_error=True` tool
-result so the model self-corrects (existing convention).
+result with reason `invalid_step_complete_metadata` so the model
+self-corrects (existing convention). Notification-policy validation
+failures remain separate and use reason
+`invalid_step_complete_notification`.
+
+The retry/example payload for a rejected `step_complete` is
+contract-aware: when a step defines a metadata contract, the example
+includes a `metadata` object with all required fields and JSON-type-correct
+placeholder values (for example, an object field is shown as `{}`, not as a
+string).
 
 `StepOutput.metadata` is persisted in `step_runs.output`.
 
@@ -867,8 +876,9 @@ which makes the project's coding workflow the preferred candidate.
    workflows for project tasks in both heuristic and classifier
    selection.
 5. `step_complete` accepts a typed `metadata` object validated against
-   the step's `metadata_contract`. Rejection produces a structured
-   tool error and the model can self-correct.
+   the step's `metadata_contract`. Metadata-contract rejection produces a
+   structured tool error with reason `invalid_step_complete_metadata` and a
+   contract-aware retry example so the model can self-correct.
 6. Conditional gates evaluate the DSL deterministically and skip pause
    creation when no expression is true.
 7. Comments persist independently of attempts. `record_only` never

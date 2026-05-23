@@ -961,7 +961,8 @@ LLM request to maximize cache hits.
 
 | Provider | Type | Min tokens | TTL | Control |
 |----------|------|-----------|-----|---------|
-| OpenAI | Automatic prefix | 1024 | 5-10 min (up to 1h off-peak) | ``prompt_cache_key`` for routing |
+| OpenAI (direct) | Automatic prefix | 1024 | 5-10 min (up to 1h off-peak) | ``prompt_cache_key`` for routing |
+| ChatGPT/Codex OAuth | Automatic prefix | 1024 | 5-10 min | ``prompt_cache_key`` via Cognis patch (see below) |
 | Anthropic | Explicit breakpoints | 1024-2048 | 5 min (refreshed on hit) | ``cache_control`` (up to 4 breakpoints) |
 | Gemini | Implicit + explicit | 1024-4096 | Configurable TTL | ``cache_control`` or ``cachedContents`` API |
 
@@ -988,6 +989,35 @@ LLM request to maximize cache hits.
 - Rollout is controlled by ``COGNIS_OPENAI_RESPONSES_MODE`` with values
   ``auto`` (default), ``on``, or ``off``.  ``auto`` enables the bridge only
   for OpenAI-family models whose ``ModelInfo.supports_responses_api`` is true.
+- **ChatGPT/Codex OAuth caching**: LiteLLM's ChatGPT Responses transform strips
+  ``prompt_cache_key`` and ``prompt_cache_retention`` from outgoing requests and
+  unconditionally prepends a ~5 KB Codex CLI default instructions block.  Cognis
+  installs two process-startup patches (``cognis/providers/llm/chatgpt_patches.py``):
+  (1) a wrapper on ``ChatGPTResponsesAPIConfig.transform_responses_api_request``
+  that re-inserts cache params after the upstream whitelist filter; (2) patches
+  LiteLLM's default-instructions helper so the prepend becomes a no-op.  Both
+  patches are idempotent and respect operator
+  overrides (set ``CHATGPT_DEFAULT_INSTRUCTIONS`` before startup to keep custom
+  framing).  The feature flag ``COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=false``
+  disables cache-key attachment globally; per-provider ``use_prompt_cache_key:
+  false`` disables it for a single provider.  If the backend rejects the cache
+  params with an "Unknown parameter" error, Cognis marks the ``(provider_id,
+  model)`` pair as broken, retries once without the params, and stops attaching
+  them until the runtime capability fallback TTL expires (default one hour).
+- **Structured stream failures**: Responses and Chat Completions streams both
+  normalize mid-stream provider failures into chunks with
+  ``mid_stream_failure=true`` and a ``response_error`` payload. The payload
+  includes a stable ``category`` (for example ``rate_limit``,
+  ``artifact_fetch``, ``idle_timeout_activity``, or
+  ``reasoning_summary_rejected``), a provider code/message, and optional
+  structured recovery fields such as artifact URLs. The agent loop records
+  ``cognis_llm_mid_stream_errors_total{provider_id,model,category}`` and uses
+  category-based recovery rather than parsing provider error strings.
+- **Runtime capability fallback TTLs**: Native OpenAI tool search, JSON mode,
+  prompt-cache parameters, plain-text Responses, and reasoning summaries are
+  treated as runtime capabilities. If a provider rejects one, Cognis marks the
+  provider/model pair as temporarily broken for one hour by default, retries the
+  current request when a safe downgrade exists, and re-probes after expiry.
 - Tool schemas are part of the static token budget in ``ContextAssembler``.
 - The tool exposure layer (see 06-tool-system.md) ensures the ``tools`` array
   is stable across turns by using provider-specific deferred-loading strategies

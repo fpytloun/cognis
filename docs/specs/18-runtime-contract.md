@@ -388,6 +388,8 @@ Required parity targets:
 - `/new`
 - `/reset`
 - `/compact`
+- `/undo`
+- `/redo`
 
 The runtime adapter must define what each command means for that runtime. For
 example, `/compact` may require runtime-session rollover for an external

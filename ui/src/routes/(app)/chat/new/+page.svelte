@@ -6,7 +6,7 @@
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import { api } from '$lib/api/client';
-import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
+  import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
   import type { Agent, HealthResponse } from '$lib/types/api';
 
   let loading = true;
@@ -61,10 +61,6 @@ import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
           memory_labels: {}
         }
       });
-
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, selectedAgentId);
-      }
 
       await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
     } catch (caughtError) {

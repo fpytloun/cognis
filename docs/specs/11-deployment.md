@@ -493,7 +493,8 @@ The SvelteKit UI reads browser-visible environment variables:
 | session | `session.idle_timeout_seconds` | 1800 | 30 min idle → mark idle |
 | session | `session.max_session_age_seconds` | 86400 | 24h max session age |
 | session | `session.max_delegation_depth` | 5 | Max delegation chain depth |
-| session | `session.max_queued_messages` | 5 | Max queued messages per session |
+| session | `session.max_active_turns_per_user` | 20 | Max active non-system turns per user |
+| session | `session.max_queued_messages` | 20 | Max queued messages per session |
 | session | `session.escalation_timeout_seconds` | 300 | 5 min escalation timeout |
 | decision_engine | `decision_engine.inline_max_length` | 200 | Short messages → inline |
 | decision_engine | `decision_engine.classifier_timeout_ms` | 500 | Classifier timeout |

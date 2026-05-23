@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { pastedFilesFromClipboardData, readPastedFilesFromNavigator } from '$lib/clipboard';
+import { pastedFileFingerprint, pastedFilesFromClipboardData, readPastedFilesFromNavigator } from '$lib/clipboard';
 
 function clipboardDataWithFiles(files: File[]): DataTransfer {
   return { files, items: [] } as unknown as DataTransfer;
@@ -28,6 +28,19 @@ describe('clipboard file helpers', () => {
     const result = pastedFilesFromClipboardData(clipboardDataWithItems([file]));
 
     expect(result).toEqual([file]);
+  });
+
+  it('deduplicates pasted screenshots with unstable filenames', () => {
+    const first = new File(['image'], 'image.png', { type: 'image/png', lastModified: 100 });
+    const duplicate = new File(['image'], 'Screenshot 2026-05-20 at 12.00.00.png', {
+      type: 'image/png',
+      lastModified: 200
+    });
+
+    const result = pastedFilesFromClipboardData(clipboardDataWithFiles([first, duplicate]));
+
+    expect(result).toEqual([first]);
+    expect(pastedFileFingerprint(first)).toBe(pastedFileFingerprint(duplicate));
   });
 
   it('assigns a PDF filename to async clipboard blobs', async () => {

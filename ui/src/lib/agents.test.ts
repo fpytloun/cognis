@@ -156,6 +156,7 @@ describe('agent payload mapping', () => {
         tool_permissions: {},
         allowed_secrets: [],
         allowed_credentials: [],
+        allowed_knowledgebases: [],
         can_delegate: true,
         max_delegation_depth: 3
       },
@@ -168,6 +169,8 @@ describe('agent payload mapping', () => {
         available_workflow_ids: [],
         default_workflow_id: 'system:direct',
         workflow_selection_mode: 'automatic',
+        default_chat_mode: 'default',
+        additional_executors: undefined,
         step_agent_overrides: {}
       }
     });
@@ -199,5 +202,29 @@ describe('agent payload mapping', () => {
 
     expect(next.allowedSecrets).toEqual(['legacy_secret']);
     expect(next.allowedCredentials).toEqual(['github_work']);
+  });
+
+  it('round-trips allowed knowledgebases', () => {
+    const form = createEmptyAgentForm();
+    form.agentId = 'agent-1';
+    form.name = 'Agent';
+    form.allowedKnowledgebases = ['kb_docs'];
+
+    const payload = formStateToPayload(form);
+    expect(payload.permissions).toMatchObject({
+      allowed_knowledgebases: ['kb_docs']
+    });
+
+    const next = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: {},
+      permissions: {
+        allowed_knowledgebases: ['kb_docs', 42]
+      }
+    } as never);
+
+    expect(next.allowedKnowledgebases).toEqual(['kb_docs']);
   });
 });

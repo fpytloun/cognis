@@ -456,6 +456,44 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     return [...runtimeSummaryRows(stepRun), ...runtimeDebugRows(stepRun)];
   }
 
+  function gateEvaluation(stepRun: StepRun): Record<string, unknown> | null {
+    const gate = runtimeInfo(stepRun).gate_evaluation;
+    return gate && typeof gate === 'object' ? (gate as Record<string, unknown>) : null;
+  }
+
+  function gateConditionRows(stepRun: StepRun): Array<{
+    expression: string;
+    operator: string;
+    actual: string;
+    expected: string;
+    passed: boolean;
+    error: string;
+  }> {
+    const gate = gateEvaluation(stepRun);
+    const raw = Array.isArray(gate?.conditions) ? gate.conditions : [];
+    return raw
+      .filter((item): item is Record<string, unknown> => item !== null && typeof item === 'object')
+      .map((item) => ({
+        expression: runtimeString(item.expression) || '(empty condition)',
+        operator: runtimeString(item.operator) || 'expression',
+        actual: runtimeString(item.referenced_values) || '{}',
+        expected: runtimeString(item.expected_values) || '{}',
+        passed: item.passed === true,
+        error: runtimeString(item.error)
+      }));
+  }
+
+  function gateSummaryRows(stepRun: StepRun): Array<{ label: string; value: string }> {
+    const gate = gateEvaluation(stepRun);
+    if (!gate) return [];
+    return [
+      { label: 'Passed', value: gate.passed === true ? 'yes' : 'no' },
+      { label: 'Action', value: runtimeString(gate.action_taken) },
+      { label: 'Next', value: runtimeString(gate.next_step) },
+      { label: 'Skipped', value: runtimeString(gate.skipped_steps) }
+    ].filter((row) => row.value !== '');
+  }
+
   function runtimeMissingMessage(stepRun: StepRun): string {
     return stepRun.runtime_info ? '' : 'Runtime not recorded for this attempt.';
   }
@@ -742,20 +780,25 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     return map;
   });
 
-  /** Build step duration map (latest attempt per step) */
+  /** Build step duration map (accumulated across attempts per step) */
   let diagramStepDurations = $derived.by(() => {
     if (!task) return {};
     const map: Record<string, string> = {};
-    // Group by step_name, take the latest attempt
-    const latestByStep = new Map<string, StepRun>();
+    const totals = new Map<string, number>();
     for (const sr of task.step_runs) {
-      const existing = latestByStep.get(sr.step_name);
-      if (!existing || sr.attempt > existing.attempt) {
-        latestByStep.set(sr.step_name, sr);
+      const seconds = sr.duration_seconds;
+      if (typeof seconds === 'number') {
+        totals.set(sr.step_name, (totals.get(sr.step_name) ?? 0) + seconds);
+        continue;
+      }
+      const started = sr.started_at ? Date.parse(sr.started_at) : NaN;
+      const ended = sr.completed_at ? Date.parse(sr.completed_at) : tickNow;
+      if (Number.isFinite(started) && Number.isFinite(ended)) {
+        totals.set(sr.step_name, (totals.get(sr.step_name) ?? 0) + Math.max(0, (ended - started) / 1000));
       }
     }
-    for (const [name, sr] of latestByStep) {
-      const dur = formatDuration(sr.started_at, sr.completed_at, tickNow);
+    for (const [name, seconds] of totals) {
+      const dur = formatDuration(new Date(0).toISOString(), new Date(seconds * 1000).toISOString(), tickNow);
       if (dur) map[name] = dur;
     }
     return map;
@@ -1761,6 +1804,42 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                         <p class="font-medium uppercase tracking-wide text-[11px] text-sky-300">Outcome marker</p>
                         <p class="mt-1">This attempt completed but reported <span class="font-semibold uppercase">{outcomeStatus}</span>{#if outcomeReason}: {outcomeReason}{/if}</p>
                       </div>
+                    {/if}
+
+                    {#if gateEvaluation(attempt)}
+                      <details class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3" open>
+                        <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3">
+                          <span class="text-xs uppercase tracking-[0.25em] text-amber-200">Gate evaluation</span>
+                          <span class="flex flex-wrap items-center gap-2">
+                            {#each gateSummaryRows(attempt) as row}
+                              <span class="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-100">
+                                {row.label}: <span class="font-mono">{row.value}</span>
+                              </span>
+                            {/each}
+                            <ChevronDown class="h-4 w-4 shrink-0 text-amber-200/70" />
+                          </span>
+                        </summary>
+                        {#if gateConditionRows(attempt).length > 0}
+                          <div class="mt-3 space-y-3 text-xs">
+                            {#each gateConditionRows(attempt) as row}
+                              <div class="rounded-xl border border-amber-400/20 bg-slate-950/60 px-3 py-2">
+                                <div class="flex flex-wrap items-center justify-between gap-2">
+                                  <code class="break-all text-amber-100">{row.expression}</code>
+                                  <span class={`rounded-full border px-2 py-0.5 uppercase tracking-wider ${row.passed ? 'border-emerald-400/40 text-emerald-200' : 'border-rose-400/40 text-rose-200'}`}>{row.passed ? 'passed' : 'failed'}</span>
+                                </div>
+                                <dl class="mt-2 grid gap-2 sm:grid-cols-3">
+                                  <div><dt class="text-slate-500">Operator</dt><dd class="mt-1 font-mono text-slate-200">{row.operator}</dd></div>
+                                  <div><dt class="text-slate-500">Actual values</dt><dd class="mt-1 truncate font-mono text-slate-200" title={row.actual}>{row.actual}</dd></div>
+                                  <div><dt class="text-slate-500">Expected / thresholds</dt><dd class="mt-1 truncate font-mono text-slate-200" title={row.expected}>{row.expected}</dd></div>
+                                </dl>
+                                {#if row.error}<p class="mt-2 text-rose-200">{row.error}</p>{/if}
+                              </div>
+                            {/each}
+                          </div>
+                        {:else}
+                          <p class="mt-3 text-sm text-amber-100">No condition expressions were recorded for this gate.</p>
+                        {/if}
+                      </details>
                     {/if}
 
                     {#if stepSpecRows(selectedStepGroup, attempt).length > 0}

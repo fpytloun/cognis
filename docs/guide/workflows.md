@@ -81,7 +81,19 @@ When a task runs with a workflow, Cognis records:
 - step attempts and deliverable versions
 - evaluator decisions
 - pauses for gates or questions
+- gate condition evaluation details, including values, operators, outcomes, and branch/action taken
 - final completion or failure state
+
+Step timing is accumulated across attempts so diagrams and task details show the
+total time spent on a step, not only the latest retry. Latest-attempt duration can
+still appear as secondary metadata when a view needs that distinction.
+
+Like direct chat turns, workflow steps are protected by a long-running turn
+watchdog. A watchdog interruption is recorded as a visible system/log notice and
+may be continued automatically within the controller's retry budget. The resumed
+step is reminded to verify alignment with the original task, update todos when
+appropriate, summarize the interrupted state, and continue only if needed and
+safe.
 
 ### Deliverables by default
 

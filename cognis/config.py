@@ -74,6 +74,18 @@ class CognisConfig:
     artifact_signed_url_ttl_seconds: int
     artifact_signing_secret: str
 
+    # Knowledgebase (optional)
+    knowledgebase_vector_backend: str
+    knowledgebase_qdrant_url: str
+    knowledgebase_qdrant_api_key: str
+    knowledgebase_qdrant_collection: str
+    knowledgebase_index_poll_interval_seconds: float
+    knowledgebase_max_artifact_size_bytes: int
+    knowledgebase_max_chunks_per_artifact: int
+    knowledgebase_chunk_target_tokens: int
+    knowledgebase_chunk_overlap_tokens: int
+    knowledgebase_embedding_batch_size: int
+
     # Production crypto
     require_external_crypto: bool
 
@@ -188,6 +200,40 @@ def load_config() -> CognisConfig:
             os.environ.get("COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS", "3600")
         ),
         artifact_signing_secret=os.environ.get("COGNIS_ARTIFACT_SIGNING_SECRET", ""),
+        knowledgebase_vector_backend=os.environ.get(
+            "COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND", "disabled"
+        )
+        .strip()
+        .lower(),
+        knowledgebase_qdrant_url=os.environ.get(
+            "COGNIS_KNOWLEDGEBASE_QDRANT_URL", "http://localhost:6333"
+        ).strip(),
+        knowledgebase_qdrant_api_key=os.environ.get(
+            "COGNIS_KNOWLEDGEBASE_QDRANT_API_KEY", ""
+        ).strip(),
+        knowledgebase_qdrant_collection=os.environ.get(
+            "COGNIS_KNOWLEDGEBASE_QDRANT_COLLECTION", "cognis_knowledgebase_chunks"
+        ).strip(),
+        knowledgebase_index_poll_interval_seconds=float(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_INDEX_POLL_INTERVAL_SECONDS", "5")
+        ),
+        knowledgebase_max_artifact_size_bytes=int(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_MAX_ARTIFACT_SIZE_MB", "50")
+        )
+        * 1024
+        * 1024,
+        knowledgebase_max_chunks_per_artifact=int(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_MAX_CHUNKS_PER_ARTIFACT", "2000")
+        ),
+        knowledgebase_chunk_target_tokens=int(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_CHUNK_TARGET_TOKENS", "800")
+        ),
+        knowledgebase_chunk_overlap_tokens=int(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_CHUNK_OVERLAP_TOKENS", "100")
+        ),
+        knowledgebase_embedding_batch_size=int(
+            os.environ.get("COGNIS_KNOWLEDGEBASE_EMBEDDING_BATCH_SIZE", "32")
+        ),
         require_external_crypto=os.environ.get("COGNIS_REQUIRE_EXTERNAL_CRYPTO", "false")
         .strip()
         .lower()
@@ -210,7 +256,7 @@ def load_config() -> CognisConfig:
         tool_output_s3_secret_key=os.environ.get("COGNIS_TOOL_OUTPUT_S3_SECRET_KEY", ""),
         tool_output_s3_bucket=os.environ.get("COGNIS_TOOL_OUTPUT_S3_BUCKET", "cognis-tool-outputs"),
         tool_output_s3_region=os.environ.get("COGNIS_TOOL_OUTPUT_S3_REGION", ""),
-        tool_output_ttl_hours=int(os.environ.get("COGNIS_TOOL_OUTPUT_TTL_HOURS", "24")),
+        tool_output_ttl_hours=int(os.environ.get("COGNIS_TOOL_OUTPUT_TTL_HOURS", "168")),
         tool_output_max_size_mb=int(os.environ.get("COGNIS_TOOL_OUTPUT_MAX_SIZE_MB", "500")),
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
@@ -283,6 +329,16 @@ ENV_TEMPLATE = """\
 # COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS=3600
 # COGNIS_ARTIFACT_SIGNING_SECRET=
 
+# Knowledgebase (optional; hidden unless backend and embedding route are configured)
+# COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND=disabled
+# COGNIS_KNOWLEDGEBASE_QDRANT_URL=http://localhost:6333
+# COGNIS_KNOWLEDGEBASE_QDRANT_API_KEY=
+# COGNIS_KNOWLEDGEBASE_QDRANT_COLLECTION=cognis_knowledgebase_chunks
+# COGNIS_KNOWLEDGEBASE_INDEX_POLL_INTERVAL_SECONDS=5
+# COGNIS_KNOWLEDGEBASE_MAX_ARTIFACT_SIZE_MB=50
+# COGNIS_KNOWLEDGEBASE_MAX_CHUNKS_PER_ARTIFACT=2000
+# COGNIS_KNOWLEDGEBASE_EMBEDDING_BATCH_SIZE=32
+
 # Redis (session cache L2 — empty = L1-only)
 # COGNIS_REDIS_URL=redis://localhost:6379/0
 
@@ -293,7 +349,7 @@ ENV_TEMPLATE = """\
 # COGNIS_TOOL_OUTPUT_S3_SECRET_KEY=
 # COGNIS_TOOL_OUTPUT_S3_BUCKET=cognis-tool-outputs
 # COGNIS_TOOL_OUTPUT_S3_REGION=
-# COGNIS_TOOL_OUTPUT_TTL_HOURS=24
+# COGNIS_TOOL_OUTPUT_TTL_HOURS=168
 # COGNIS_TOOL_OUTPUT_MAX_SIZE_MB=500
 
 # Container/CI: auto-create admin on first start

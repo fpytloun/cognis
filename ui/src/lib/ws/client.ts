@@ -20,6 +20,10 @@ interface ConversationSubscription {
   sessionId: string | null;
 }
 
+interface SubscribeConversationOptions {
+  replaceCursor?: boolean;
+}
+
 const initialState: WebSocketState = {
   status: 'idle',
   attempts: 0,
@@ -119,10 +123,16 @@ class CognisWebSocketClient {
     this.state.set(initialState);
   }
 
-  subscribeConversation(conversationId: string, lastSeq = 0, sessionId: string | null = null): void {
+  subscribeConversation(
+    conversationId: string,
+    lastSeq = 0,
+    sessionId: string | null = null,
+    options: SubscribeConversationOptions = {}
+  ): void {
     const previous = this.subscriptions.get(conversationId);
     const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
-    const next: ConversationSubscription = previous && previous.sessionId === normalizedSessionId
+    const shouldReplaceCursor = options.replaceCursor === true;
+    const next: ConversationSubscription = previous && previous.sessionId === normalizedSessionId && !shouldReplaceCursor
       ? { lastSeq: Math.max(previous.lastSeq, lastSeq), sessionId: normalizedSessionId }
       : { lastSeq, sessionId: normalizedSessionId };
     this.subscriptions.set(conversationId, next);

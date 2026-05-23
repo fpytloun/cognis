@@ -19,9 +19,8 @@
    *   Without the lock the user can drag the page underneath, and the
    *   backdrop-blur layer appears to shift / lose its fixed position,
    *   and the toolbar scrolls out of the visible area.
-   * - Toolbar is absolutely positioned inside the fixed viewport with
-   *   safe-area padding so it always lands below the Dynamic Island
-   *   and stays visible regardless of the image's aspect ratio.
+   * - Toolbar is absolutely positioned inside the app-shell-bounded
+   *   fixed viewport so it stays visible regardless of image aspect ratio.
    */
 
   type LightboxImage = {

@@ -132,11 +132,16 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
     }
   ],
   "last_seq": 150,
-  "has_more": true
+  "has_more": true,
+  "active_streams": [],
+  "active_tool_outputs": []
 }
 ```
 
 The controller reads from Intaris event store and formats for the client.
+`active_streams` and `active_tool_outputs` are optional refresh/reconnect
+snapshots for in-flight assistant text and tool output respectively; persisted
+history remains canonical once the turn is recorded.
 
 ### Channels
 
@@ -418,7 +423,7 @@ returned by the REST API.
 
 ```
 GET    /api/v1/tasks                              → List tasks (filterable by status, agent, priority, queue)
-POST   /api/v1/tasks                              → Create task (draft by default, or queued via source_type=chat)
+POST   /api/v1/tasks                              → Create task (draft by default, or queued/ready with explicit start controls)
 GET    /api/v1/tasks/:id                          → Task detail + workflow progress + step runs + dependencies + delivery config + workflow lifecycle metadata
 PATCH  /api/v1/tasks/:id                          → Update (title, description, priority, agent, workflow, delivery)
 DELETE /api/v1/tasks/:id                          → Cancel and remove
@@ -440,9 +445,27 @@ DELETE /api/v1/tasks/:id/dependencies/:dep_id     → Remove dependency
 Task create/update payloads also support:
 - `delivery_mode`
 - `delivery_target`
+- `draft`
+- `start_immediately`
 
 These control where task results/questions are routed back (same conversation,
 specific conversation, latest active for agent, preferred channel, or silent).
+
+Task creation preserves draft behavior by default. `draft=true` or
+`start_immediately=false` stores a task without enqueueing it. Use
+`start_immediately=true` or create with a queued/ready status to submit work
+through the normal queue path.
+
+Step run timing fields distinguish latest-attempt and total time:
+
+- `duration_seconds` / `latest_attempt_duration_seconds` — duration of the most
+  recent attempt when available
+- `accumulated_duration_seconds` — sum of completed attempt durations for the
+  step in task diagrams and detail responses
+
+Gate step metadata can include `gate_evaluation`, a structured object with the
+condition expression, referenced values, expected or threshold values, operator,
+actual result, pass/fail outcome, branch/action taken, and evaluation errors.
 
 Workflow pauses can now include:
 
@@ -589,8 +612,13 @@ read-only viewers receive `forbidden` and cannot change pending messages.
 // Tool calls
 {type: "tool_call", conversation_id, session_id, call_id, tool_name,
  arguments?, status}
+{type: "tool_result_chunk", conversation_id, session_id, call_id, tool_name,
+ delta, stream?, is_error, chunk_index?, content_offset?, live_output_available?}
 {type: "tool_result", conversation_id, session_id, call_id, tool_name,
- result, is_error, duration_ms}
+ result, is_error, duration_ms, output_size?, truncated?,
+ agent_visible_truncated?, has_full_output?, recovery_call_id?,
+ tool_output_artifact_id?, anchors_available?, anchor_count?,
+ transport_truncated?}
 
 // Conversation metadata
 {type: "conversation_updated", conversation_id, title?}
@@ -602,7 +630,8 @@ read-only viewers receive `forbidden` and cannot change pending messages.
  child_session_id, mode, agent_id, task}
 {type: "delegation_progress", conversation_id, child_session_id,
  step, progress, token_usage}
-{type: "delegation_completed", conversation_id, child_session_id, result}
+{type: "delegation_completed", conversation_id, child_session_id, result,
+ result_content?, result_source?, result_truncated?, result_anchors?, result_sections?}
 {type: "delegation_failed", conversation_id, child_session_id, reason}
 
 // Escalations
@@ -626,6 +655,8 @@ read-only viewers receive `forbidden` and cannot change pending messages.
 {type: "session_compacted", conversation_id, session_id, previous_session_id,
  summary_preview, method, turns_compacted}
 {type: "session_reset", conversation_id, session_id, previous_session_id}
+{type: "history_rebased", conversation_id, session_id, previous_session_id,
+ operation, undo_available, redo_available}
 {type: "conversation_created", conversation_id, old_conversation_id}
 {type: "session_recovered", conversation_id, session_id, reason}
 
@@ -663,6 +694,50 @@ Notes:
   A separate `tool_result` event delivers the result after execution completes.
   For direct chat, the controller also emits a second `tool_call` with
   `status: "completed"` alongside `tool_result`.
+- `tool_result.result` is the bounded canonical visible output. Optional
+  truncation/recovery fields are additive metadata; `transport_truncated`
+  means the WS/SSE payload is a smaller middle-truncated preview and clients
+  should not replace a richer streamed buffer with that preview.
+- `tool_result_chunk` carries incremental visible output for tools that stream.
+  `chunk_index` and `content_offset` are optional ordering metadata that allow
+  clients to ignore stale/replayed chunks during reconnect or multi-tab races.
+  `content_offset` is monotonic across bounded active-snapshot truncation and
+  uses UTF-16 code units, matching browser string indexing.
+  `live_output_available` indicates that the generic paged output endpoint can
+  read the running call's bounded live spool.
+- `active_tool_outputs` in history responses contains bounded in-flight tool
+  output snapshots keyed by `conversation_id`, `session_id`, and `call_id` so
+  refresh/reconnect can hydrate running tool cards without loading raw output.
+
+### Paged Tool Output
+
+```http
+GET /api/v1/conversations/{conversation_id}/tool-outputs/{call_id}?session_id={session_id}&offset=0&limit=200&latest=false
+```
+
+Returns a generic page of output for the chat full-output viewer. While a tool
+is running, the endpoint reads the bounded live spool; after completion it reads
+the ToolOutputStore when full output was persisted; otherwise it returns the
+canonical bounded event preview with `recoverable=false`.
+
+```typescript
+{
+  conversation_id, session_id?, call_id,
+  status: "running" | "completed" | string,
+  source: "live_spool" | "stored_output" | "event_preview",
+  content,
+  chunks?: [{index, offset, stream?, text}],
+  offset, limit,
+  next_offset?, prev_offset?,
+  has_more_before, has_more_after,
+  output_size, total_lines?,
+  recoverable, truncated, spool_truncated?
+}
+```
+
+For `live_spool`, offsets are stream content offsets and `latest=true` jumps to
+the newest bounded page. For `stored_output`, offsets follow the existing
+ToolOutputStore line-based paging semantics.
 - `reasoning` events carry LLM thinking/reasoning tokens (Anthropic extended
   thinking, OpenAI reasoning content). Streamed incrementally like `chunk`.
 - `conversation_updated` notifies clients of metadata changes such as
@@ -673,7 +748,12 @@ Notes:
   `delegation_started` fires immediately, `delegation_completed` or
   `delegation_failed` fires when the child session finishes. The child
   session's result is also recorded as an Intaris event in the parent
-  session so the parent agent sees it on the next context assembly.
+  session so the parent agent sees it on the next context assembly. Completion
+  payloads include bounded durable `result_content` plus anchor metadata when
+  recoverable output is available. Cognis prefers explicit deliverable content;
+  otherwise it aggregates child assistant messages chronologically. The child
+  sub-session detail API returns the same `result_content`, `result_anchors`,
+  and bounded `result_sections`; list endpoints may omit those fields to stay compact.
 - On reconnect, the server replays missed events since `last_seq` and
   sends `reconnected` when replay is complete. See
   [09-ui-ux.md](09-ui-ux.md) for the full reconnection protocol.

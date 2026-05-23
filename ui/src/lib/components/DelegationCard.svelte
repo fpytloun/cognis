@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { DelegationTimelineItem } from '$lib/chat';
+  import type { DelegationTimelineItem, TodoSnapshotItem } from '$lib/chat';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import Button from '$lib/components/ui/Button.svelte';
+  import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
 
   let { item, onViewSession } = $props<{
     item: DelegationTimelineItem;
@@ -21,6 +22,13 @@
   let isTaskDelegation = $derived(item.taskId.startsWith('task_') || item.id.startsWith('delegation:task_'));
   let isSessionDelegation = $derived(item.taskId.startsWith('sess_'));
   let cardLabel = $derived(isTaskDelegation ? 'Task' : 'Delegation');
+  let agentLabel = $derived(item.usedAgentId ?? item.agentId ?? null);
+  function activeTodos(todos: TodoSnapshotItem[] | undefined): TodoSnapshotItem[] {
+    return (todos ?? []).filter((todo) => todo.status !== 'cancelled');
+  }
+
+  let visibleTodos = $derived(activeTodos(item.todos));
+  let showTodos = $derived(visibleTodos.length > 0);
 </script>
 
 <article class={`rounded-3xl border px-4 py-4 shadow-card ${toneClass()}`}>
@@ -28,11 +36,20 @@
     <div>
       <p class="text-xs font-medium uppercase tracking-[0.25em] opacity-80">{cardLabel}</p>
       <h3 class="mt-1 text-base font-semibold">{item.taskLabel}</h3>
+      {#if agentLabel}
+        <p class="mt-1 inline-flex max-w-full rounded-full border border-current/20 bg-black/10 px-2 py-0.5 font-mono text-[11px] opacity-85">
+          <span class="mr-1 opacity-70">agent_id</span>
+          <span class="truncate">{agentLabel}</span>
+        </p>
+      {/if}
       <p class="mt-2 text-xs uppercase tracking-[0.2em] opacity-75" title={formatAbsoluteTime(item.timestamp)}>
         {formatRelativeTime(item.timestamp)}
       </p>
     </div>
     <div class="flex items-center gap-2">
+      {#if showTodos}
+        <TodoProgressPopover todos={visibleTodos} label="Delegated todo progress" />
+      {/if}
       <span class="rounded-full border border-current/30 px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em]">
         {item.status}
       </span>
@@ -63,7 +80,7 @@
       </div>
     {/if}
   {:else if item.result}
-    <p class="mt-3 text-sm leading-6 opacity-90">{item.result}</p>
+    <p class="mt-3 line-clamp-5 whitespace-pre-wrap text-sm leading-6 opacity-90">{item.result}</p>
   {/if}
 
   <div class="mt-3 flex justify-end">

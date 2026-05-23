@@ -61,14 +61,25 @@ describe('viewport stores', () => {
     ).toEqual({ height: 874, offsetTop: 0, keyboardOpen: false });
   });
 
-  it('uses visual viewport height and offset while keyboard is open', () => {
+  it('anchors the shell at top and shrinks from the bottom while keyboard is open', () => {
     expect(
       calculateViewportMetrics({
         innerHeight: 874,
         visualViewportHeight: 520,
         visualViewportOffsetTop: 16,
       })
-    ).toEqual({ height: 520, offsetTop: 16, keyboardOpen: true });
+    ).toEqual({ height: 536, offsetTop: 0, keyboardOpen: true });
+  });
+
+  it('ignores stale keyboard-sized visual viewport metrics when no text input is focused', () => {
+    expect(
+      calculateViewportMetrics({
+        innerHeight: 874,
+        visualViewportHeight: 520,
+        visualViewportOffsetTop: 16,
+        keyboardCanBeOpen: false,
+      })
+    ).toEqual({ height: 874, offsetTop: 0, keyboardOpen: false });
   });
 
   it('does not treat visual viewport offset alone as keyboard open', () => {

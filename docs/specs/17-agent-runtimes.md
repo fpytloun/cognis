@@ -291,8 +291,7 @@ Cognis's generic LLM provider configuration.
 Supported auth methods for Cognis-managed Claude runtime:
 
 1. Claude subscription OAuth login
-2. `claude setup-token` long-lived OAuth token
-3. Console/API-key based auth only when explicitly configured
+2. Console/API-key based auth only when explicitly configured
 
 Auth is user-scoped and executor-local. Cognis does not proxy Claude Code
 inference through LiteLLM for `claude_code` runtime sessions.

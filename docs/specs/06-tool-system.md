@@ -306,6 +306,29 @@ the initial preview wait and does not limit process lifetime. Prefer these
 managed controls over process-name polling such as `pgrep`, which can match
 wrappers or the polling command itself.
 
+Agents should provide the optional `description` argument for background bash
+commands. The description is treated as the human-readable job identifier in
+prompt reminders and completion follow-ups, so it should say what the command is
+for rather than restating the raw command.
+
+While background bash jobs are running, the agent loop injects a concise
+`<background_shell_status>` reminder before model calls. The reminder includes
+the shell id, executor id/type, PID when available, description, command summary,
+runtime, idle time, buffered-output size, and output cursor. It shows the three
+most recent running jobs in detail; additional jobs are summarized by count plus
+shell ids and PIDs. If jobs exist on multiple assigned executors, each job keeps
+its executor identity so the agent can route `bash_output` or `bash_kill` to the
+matching executor with `target_executor` when available.
+
+When a background bash command exits normally or with a non-zero status, the
+executor sends a `shell.background_completed` notification to the controller.
+The controller converts this to the same-conversation follow-up path used by
+other asynchronous work, so the agent receives a system-initiated turn with the
+shell id, executor, exit code, description, command summary, runtime, and recent
+output tail. Explicit `bash_kill` and executor cleanup suppress completion
+follow-ups to avoid noisy notifications for intentionally stopped or abandoned
+jobs.
+
 ### Multi-Executor Targeting
 
 Executor-routed tools may include an optional `target_executor` parameter. This
@@ -430,6 +453,19 @@ delegate_tool = ToolDefinition(
 Worker/fork delegation modes remain deferred design concepts. The only
 implemented sub-session orchestration tool today is `delegate`.
 ```
+
+When a delegated child session completes, the `delegate` tool result preserves a
+durable bounded `result_content` value. Cognis prefers explicit workflow
+deliverable content when present; otherwise it aggregates all child
+`assistant_message` contents in chronological order with `[[message:n]]` anchors
+and `--- Assistant message n ---` separators. Tool-result metadata exposes
+`output_anchors`, including per-message anchors, so agents can use
+`list_tool_output_anchors` and `read_tool_output_anchor` to recover one assistant
+message instead of reloading the full delegate output. Anchors are derived from
+the final bounded result content, so truncated-away messages are not advertised
+as readable sections. `list_subsessions` remains compact, while
+`get_subsession` returns the durable result content and bounded per-message
+sections after completion.
 
 These tools submit **requests** to the Decision Engine, which approves,
 modifies, or rejects them. The LLM cannot force delegation.
@@ -1324,48 +1360,80 @@ def _wrap_memory_context(self, recall: RecallResult) -> str:
 This is not a security boundary — the LLM can still be influenced — but it
 makes the trust level explicit in the prompt and enables future filtering.
 
-#### Layer 2: Output Size Limits and Context Management (MVP)
+#### Layer 2: Output Size Limits, Projection, and Context Management
 
-Three-layer context management for tool outputs:
+Tool output management is split between durable storage and model-facing
+projection. Full outputs are recoverable by handle; the prompt receives a
+budgeted view sized for the current model, phase, and pressure mode.
 
 **2a. Per-tool truncation** at execution time:
 - Each executor tool applies its own output cap (shell: 50K, web_fetch: 500K,
   read: 2K lines × 2K chars, grep: 200 files × 500 matches).
-- The tool router's `_sanitize_result()` applies **middle-truncation**
+- The shared tool output presentation layer applies **middle-truncation**
   to `max_result_size` (default 50,000 chars): the head and tail of the
-  output are preserved, the middle is removed. The truncation marker
-  includes the `call_id` so the LLM can recover the full output via
-  `read_tool_output`.
+  output are preserved, the middle is removed. The truncation marker and
+  metadata include recovery details only when full output is available.
+  Anchor recovery instructions are emitted only when anchor metadata exists.
 - Full output (after executor truncation, before context truncation) is
   saved to the **ToolOutputStore** on the controller's local filesystem
   (`{COGNIS_DATA_DIR}/tool-outputs/{call_id}.txt`) with TTL-based cleanup.
+- While a streaming tool is still running, raw chunks are also written to a
+  bounded **live tool-output spool** keyed by conversation/session/call. The
+  spool stores chunk index, offset, stream, and text with byte/chunk limits and
+  an expiry refreshed while the call is active. It exists only for live UI
+  paging and short completion continuity; completed output recovery continues
+  to use the ToolOutputStore as the canonical source.
 
-**2b. Per-turn pruning** after each agent turn:
-- Walks backwards through tool result messages in the LLM context.
-- Protects the most recent ~40K tokens of tool outputs.
-- Replaces older tool results with:
-  `[Tool result cleared — use read_tool_output(call_id='...') to view]`
-- Also clears large tool call arguments (>1K chars serialized) in the
-  pruned zone.
-- This is a view-layer operation — Intaris events and the ToolOutputStore
-  are unaffected.
+**2b. Budgeted projection** before model calls:
+- Projection is invisible to users and logged for operators. It must not emit
+  chat-visible "pruned output" notices during normal operation.
+- The controller derives an internal projection policy from the model context
+  window, effective prompt budget, and pressure mode. Large context windows are
+  used as safety margin first: normal prompts target roughly 90K tokens for
+  128K models, 180K for 272K models, 250K for 400K models, and 300K-320K for
+  1M models unless the active turn needs a burst.
+- Projection separates **cross-turn replay** from **within-turn evidence**:
+  cross-turn tool output is conservative and mostly represented by previews or
+  recoverable placeholders; within-turn tool output may use a much larger burst
+  budget so the agent can finish the current reasoning path without repeatedly
+  re-reading the same output.
+- Projection modes are `normal`, `pressure`, and `critical`. Under pressure,
+  completed same-turn tool results may be replaced with recoverable
+  placeholders, but unresolved tool calls, explicitly protected outputs, and the
+  newest completed same-turn evidence remain protocol-safe.
+- Tool-call arguments above the projection policy threshold are cleared in
+  compacted zones. Intaris events and the ToolOutputStore remain unaffected.
 
-**2c. Exploration tools** for recovering cleared/truncated output:
+**2c. Post-turn cache pruning** after each agent turn:
+- The session cache records which older tool outputs can be represented by
+  placeholders on future replay. This is an optimization and diagnostics input,
+  not the semantic source of truth. Cold rebuild from Intaris must still produce
+  a bounded projection from persisted event metadata.
+- Post-turn pruning is log-only from the user's perspective. `/context` and
+  `/info` expose the last projection policy and token budgets for diagnostics.
+
+**2d. Exploration tools** for recovering cleared/truncated output:
 - `read_tool_output(call_id, offset?, limit?)` — paginated line-by-line
   read from the ToolOutputStore, similar to the file read tool.
 - `search_tool_output(call_id, pattern, context_lines?)` — regex search
   with context lines, similar to grep.
 - These are controller-side built-in tools (read-only, no guardrails
   evaluation needed).
+- The chat UI uses `GET /api/v1/conversations/{conversation_id}/tool-outputs/{call_id}`
+  for generic paged viewing. The endpoint serves live-spool pages while a call
+  is running, stored ToolOutputStore pages after completion, and falls back to
+  the bounded event preview when no recoverable source exists.
 
 **Storage layers:**
 
 | Layer | Content | TTL | Purpose |
 |-------|---------|-----|---------|
-| LLM context | Middle-truncated + pruned | Current turn | What the LLM reasons over |
-| Intaris event | Middle-truncated preview (~50K) | Session lifetime | Compaction, audit, replay |
+| LLM context | Budgeted projection: rich active evidence + placeholders | Current call | What the LLM reasons over |
+| Intaris event | Middle-truncated preview (~50K) + presentation metadata | Session lifetime | Compaction, audit, replay, recovery metadata rehydration |
 | ToolOutputStore | Full executor output | 24h (configurable) | LLM exploration via tools (filesystem or S3 backend) |
-| WebSocket | Head-truncated (10KB) | Ephemeral | UI display |
+| Live tool-output spool | Bounded raw streamed chunks | Short TTL refreshed while running | UI live/full-output drawer paging for running calls |
+| WebSocket/SSE | Middle-truncated transport preview + metadata | Ephemeral | UI display |
+| Active tool output snapshot | Bounded presentation output | Hours | Refresh/reconnect hydration while a tool is running; backed by Redis when available with in-memory fallback |
 
 #### Layer 3: Post-Execution Content Evaluation (Phase 2)
 

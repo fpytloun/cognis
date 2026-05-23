@@ -65,6 +65,7 @@ iOS PWA:
 - **MCP and native tools**: Built-in filesystem, shell, search, LSP, artifact, image, date/time, memory, browser, web, workflow, and system tools, plus MCP tools from controller-managed or executor-attached servers.
 - **Skills**: Versioned instruction, asset, and tool bundles. Agents discover compact skill metadata, load full instructions on demand, and can expose linked or bundled tools through the executor boundary.
 - **Memory**: Mnemory-backed recall and remember for user facts, agent personality, episodic memory, and artifacts.
+- **Knowledgebases**: Optional artifact-backed retrieval over Qdrant native dense+sparse hybrid search, with built-in agent tools for create/attach/index/search/source-context workflows.
 - **Guardrails and approvals**: Intaris evaluates tool calls, escalates sensitive actions, records session content, and keeps an audit trail.
 - **Credentials without prompt leakage**: Secrets are encrypted at rest and referenced through value refs. Agents and LLMs receive references, not raw secret values; executors resolve values only at execution time.
 - **Channels**: Connect agents to external platforms through channel accounts, verified contacts, webhook/gateway adapters, and pairing flows. Signal and iMessage via BlueBubbles have the most complete setup paths today.
@@ -179,6 +180,12 @@ Common variables:
 | `COGNIS_INTARIS_URL` | `http://localhost:8060` | Intaris URL |
 | `DATABASE_URL` | SQLite under `COGNIS_DATA_DIR` | SQLAlchemy database URL |
 | `COGNIS_LOG_LEVEL` | `info` | Logging level |
+
+Optional Knowledgebases can index Cognis artifacts into a vector backend. They
+remain hidden/unavailable unless both `COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND` is
+set to a supported backend such as `qdrant` and model routing has an
+`embedding` route. See [`docs/specs/knowledgebase.md`](docs/specs/knowledgebase.md)
+for the current API/configuration notes.
 
 Auto-generated unless overridden:
 

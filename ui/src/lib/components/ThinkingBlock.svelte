@@ -26,6 +26,38 @@
     return Boolean(block.html?.trim() || block.content?.trim());
   }
 
+  function parseTime(value: string | null | undefined): number | null {
+    if (!value) return null;
+    const parsed = new Date(value).getTime();
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  function formatDurationMs(durationMs: number | null | undefined): string {
+    if (durationMs == null) return '';
+    if (durationMs < 1000) return `${durationMs}ms`;
+    if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+    const totalSeconds = Math.floor(durationMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m ${seconds}s`;
+  }
+
+  function blockDurationMs(block: ThinkingTimelineItem['blocks'][number]): number | null {
+    if (typeof block.durationMs === 'number') return block.durationMs;
+    const start = parseTime(block.startedAt);
+    if (start == null) return null;
+    const end = parseTime(block.completedAt) ?? Date.now();
+    return Math.max(0, end - start);
+  }
+
+  const durationLabel = $derived.by(() => {
+    const durations: number[] = item.blocks
+      .map((block: ThinkingTimelineItem['blocks'][number]) => blockDurationMs(block))
+      .filter((value: number | null): value is number => typeof value === 'number');
+    if (durations.length === 0) return '';
+    return formatDurationMs(durations.reduce((total: number, value: number) => total + value, 0));
+  });
+
   /**
    * Derive the display title shown in the collapsed header.
    * While streaming: use the activeTitle (mutates as the model thinks).
@@ -62,6 +94,9 @@
         Thinking: {headerTitle}
       {/if}
     </span>
+    {#if durationLabel}
+      <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
+    {/if}
     {#if item.streaming}
       <LiveDots inline={true} size="sm" tone="sky" label="Thinking" />
     {:else}
@@ -82,8 +117,12 @@
         {/if}
         <div class="px-3 py-2.5">
           {#if !(i === 0 && displayTitle(block.title) === headerTitle)}
-            <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-cyan-400/60">
-              Thinking: {displayTitle(block.title)}
+            {@const duration = formatDurationMs(blockDurationMs(block))}
+            <p class="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-cyan-400/60">
+              <span>Thinking: {displayTitle(block.title)}</span>
+              {#if duration}
+                <span class="normal-case tracking-normal text-slate-500">{duration}</span>
+              {/if}
             </p>
           {/if}
           <!-- Markdown-rendered thinking content -->

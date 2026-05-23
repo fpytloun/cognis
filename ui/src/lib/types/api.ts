@@ -1,4 +1,6 @@
 export type UserRole = 'admin' | 'user' | 'viewer' | 'service';
+export type ChatMode = 'default' | 'plan' | 'build';
+export type ChatModeSource = 'one_shot' | 'conversation_override' | 'agent_default' | 'system_default';
 
 export type AuthStatus = 'loading' | 'authenticated' | 'anonymous';
 
@@ -73,10 +75,14 @@ export interface ApiKeyCreateResponse extends ApiKeyMetadata {
 export interface ProviderTestResult {
   ok: boolean;
   model_resolved: string | null;
+  model_sent?: string | null;
   latency_ms: number | null;
   error_type: string | null;
   error_detail: string | null;
   tested_at: string | null;
+  executor_routed?: boolean | null;
+  executor_id?: string | null;
+  executor_backend?: string | null;
 }
 
 export interface ApiErrorPayload {
@@ -109,8 +115,14 @@ export interface Conversation {
     agent_id: string;
     project_id: string | null;
     title: string | null;
+    title_source: string;
     context: ConversationContext;
     active_session_id: string | null;
+    active_executor_id: string | null;
+    active_executor_assigned_at: string | null;
+    active_executor_expires_at: string | null;
+    active_executor_source: string | null;
+    starred_at: string | null;
     status: string;
     last_message_at: string | null;
     last_read_at: string | null;
@@ -118,6 +130,14 @@ export interface Conversation {
     has_active_turn: boolean;
     created_at: string | null;
     updated_at: string | null;
+}
+
+export interface ConversationTitleSuggestion {
+  title: string | null;
+  source: string;
+  generated_at: string | null;
+  available: boolean;
+  reason: string | null;
 }
 
 export interface ProjectSource {
@@ -217,12 +237,73 @@ export interface ActiveStreamSnapshot {
   updated_at?: string | null;
 }
 
+export interface ToolOutputPresentationMetadata {
+  output_size?: number;
+  truncated?: boolean;
+  agent_visible_truncated?: boolean;
+  has_full_output?: boolean;
+  recovery_call_id?: string | null;
+  tool_output_artifact_id?: string | null;
+  anchors_available?: boolean;
+  anchor_count?: number;
+  transport_truncated?: boolean;
+  live_output_available?: boolean;
+  output_page_available?: boolean;
+}
+
+export interface ActiveToolOutputSnapshot extends ToolOutputPresentationMetadata {
+  conversation_id: string;
+  session_id: string;
+  call_id: string;
+  tool_name: string;
+  turn_id?: string | null;
+  status: string;
+  result: string;
+  stream?: string | null;
+  is_error?: boolean;
+  chunk_count?: number;
+  content_offset?: number;
+  updated_at?: string | null;
+}
+
+export interface ToolOutputChunk {
+  index: number;
+  offset: number;
+  stream?: string | null;
+  text: string;
+}
+
+export interface ToolOutputPageResponse {
+  conversation_id: string;
+  session_id?: string | null;
+  call_id: string;
+  status: string;
+  source: 'live_spool' | 'stored_output' | 'event_preview' | string;
+  content: string;
+  chunks: ToolOutputChunk[];
+  offset: number;
+  limit: number;
+  next_offset?: number | null;
+  prev_offset?: number | null;
+  has_more_before: boolean;
+  has_more_after: boolean;
+  output_size: number;
+  total_lines?: number | null;
+  recoverable: boolean;
+  truncated: boolean;
+  spool_truncated: boolean;
+}
+
 export interface ActiveThinkingBlockSnapshot {
   block_id: string;
   title: string;
   content: string;
   source: string;
   complete: boolean;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  provider_block_index?: number | null;
 }
 
 export interface ActiveThinkingSnapshot {
@@ -239,6 +320,7 @@ export interface MessageHistoryResponse {
   has_more: boolean;
   has_active_turn: boolean;
   active_streams?: ActiveStreamSnapshot[];
+  active_tool_outputs?: ActiveToolOutputSnapshot[];
   active_session_id?: string | null;
   active_session_last_seq?: number;
   history_truncated?: boolean;
@@ -355,6 +437,9 @@ export interface Session {
   completed_at: string | null;
   completion_reason: string | null;
   result_summary: string | null;
+  result_content: string | null;
+  result_anchors: Record<string, unknown>[] | null;
+  result_sections: Record<string, unknown>[] | null;
   updated_at: string | null;
 }
 
@@ -369,12 +454,15 @@ export interface SessionEventsResponse {
 export interface IntarisSessionDetail {
   session_id: string;
   intaris_session_id: string;
+  title: string | null;
   intention: string | null;
+  summary: string | null;
   status: string;
   total_calls: number;
   approved_count: number;
   denied_count: number;
   escalated_count: number;
+  context_usage?: ContextUsage | null;
 }
 
 export interface Agent {
@@ -426,6 +514,18 @@ export interface AgentGrant {
   revoked_at: string | null;
   note: string | null;
   grantee_overrides: Record<string, unknown> | null;
+}
+
+export interface KnowledgebaseModel {
+  knowledgebase_id: string;
+  name: string;
+  description: string | null;
+  status: string;
+  metadata_schema: Record<string, unknown>;
+  settings: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+  archived_at: string | null;
 }
 
 export interface ToolParameterProperty {
@@ -1057,6 +1157,9 @@ export interface StepRun {
   started_at: string | null;
   completed_at: string | null;
   updated_at: string | null;
+  duration_seconds?: number | null;
+  accumulated_duration_seconds?: number | null;
+  latest_attempt_duration_seconds?: number | null;
 }
 
 export interface WorkflowRun {
@@ -1263,6 +1366,8 @@ export interface ModelEntry {
   model_id: string;
   display_name?: string;
   context_window: number;
+  max_input_tokens?: number | null;
+  max_context_window?: number | null;
   max_output_tokens: number;
   supports_tools: boolean;
   supports_streaming: boolean;
@@ -1270,6 +1375,7 @@ export interface ModelEntry {
   supports_audio_input: boolean;
   supports_pdf_input: boolean;
   supports_file_input: boolean;
+  supports_embedding: boolean;
   supports_reasoning: boolean;
   reasoning_efforts: string[];
   supports_prompt_caching: boolean;
@@ -1287,12 +1393,20 @@ export interface ModelEntry {
   input_cost_per_mtok?: number;
   output_cost_per_mtok?: number;
   tier: string;
+  source?: string;
+  confidence?: string;
+  description?: string;
+  visibility?: string;
+  supported_in_api?: boolean;
+  available_in_plans?: string[];
 }
 
 export function defaultModelEntry(modelId: string): ModelEntry {
   return {
     model_id: modelId,
     context_window: 128000,
+    max_input_tokens: undefined,
+    max_context_window: undefined,
     max_output_tokens: 16384,
     supports_tools: true,
     supports_streaming: true,
@@ -1300,6 +1414,7 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_audio_input: false,
     supports_pdf_input: false,
     supports_file_input: false,
+    supports_embedding: false,
     supports_reasoning: false,
     reasoning_efforts: [],
     supports_prompt_caching: false,
@@ -1322,6 +1437,7 @@ export interface LLMProvider {
   display_name: string;
   location: string;
   backend: string;
+  owner_email?: string | null;
   config: Record<string, unknown>;
   is_default: boolean;
   status: string;
@@ -1340,6 +1456,44 @@ export interface LLMProviderOAuthStatus {
   expires_at: number | null;
 }
 
+export interface CodexUsageWindow {
+  used_percent: number;
+  window_duration_mins: number | null;
+  resets_at: string | null;
+  reset_after_seconds: number | null;
+}
+
+export interface CodexUsageCredits {
+  has_credits: boolean | null;
+  unlimited: boolean | null;
+  balance: string | number | null;
+}
+
+export interface CodexUsageAdditionalLimit {
+  limit_id: string | null;
+  limit_name: string | null;
+  primary: CodexUsageWindow | null;
+  secondary: CodexUsageWindow | null;
+  allowed: boolean | null;
+  limit_reached: boolean | null;
+}
+
+export interface CodexUsage {
+  provider_id: string;
+  ok: boolean;
+  source: string;
+  usage_url: string | null;
+  fetched_at: string | null;
+  plan_type: string | null;
+  primary: CodexUsageWindow | null;
+  secondary: CodexUsageWindow | null;
+  credits: CodexUsageCredits | null;
+  rate_limit_reached_type: string | null;
+  allowed: boolean | null;
+  limit_reached: boolean | null;
+  additional_rate_limits: CodexUsageAdditionalLimit[];
+}
+
 export interface ModelRoutingEntry {
   model: string | null;
   reasoning_effort: string | null;
@@ -1354,6 +1508,7 @@ export interface ModelRouting {
   text_to_speech: ModelRoutingEntry;
   image_generation: ModelRoutingEntry;
   attachment_analysis: ModelRoutingEntry;
+  embedding: ModelRoutingEntry;
 }
 
 export interface TtsSynthesizeRequest {
@@ -1538,6 +1693,8 @@ export interface WebSocketChunkEvent {
   content: string;
   index: number;
   content_offset?: number;
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export interface WebSocketAssistantStreamSnapshotEvent extends ActiveStreamSnapshot {
@@ -1557,9 +1714,36 @@ export interface WebSocketChunkGapEvent {
 export interface ContextUsage {
   prompt_tokens: number;
   max_context_tokens: number;
+  max_input_tokens?: number;
   percentage: number;
   model: string;
   reasoning_effort: string | null;
+  provider_id?: string | null;
+  available_prompt_tokens?: number;
+  effective_prompt_budget?: number;
+  reserve_output_tokens?: number;
+  effective_reserve_output_tokens?: number;
+  loop_pressure_threshold?: number;
+  compaction_threshold?: number | null;
+  projection_policy?: ProjectionPolicyUsage | null;
+}
+
+export interface ProjectionPolicyUsage {
+  phase?: string;
+  pressure_mode?: string;
+  steady_target_tokens?: number;
+  burst_target_tokens?: number;
+  hard_prompt_tokens?: number;
+  cross_turn_tool_budget_tokens?: number;
+  within_turn_tool_budget_tokens?: number;
+  preserved_recent_tool_groups?: number;
+  preserved_recent_tool_tokens?: number;
+  preserved_recent_tool_bytes?: number;
+  max_single_tool_result_chars?: number;
+  max_historical_tool_result_chars?: number;
+  prune_protect_tokens?: number;
+  prune_minimum_savings_tokens?: number;
+  arg_clear_threshold?: number;
 }
 
 export interface WebSocketMessageCompleteEvent {
@@ -1574,7 +1758,10 @@ export interface WebSocketMessageCompleteEvent {
   context_usage: ContextUsage | null;
   queued_count: number;
   messages?: QueuedMessage[];
+  completed_at?: string | null;
   attachments?: AttachmentRef[];
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export interface WebSocketTurnStartedEvent {
@@ -1590,6 +1777,7 @@ export interface WebSocketTurnSettledEvent {
   session_id?: string;
   message_id?: string;
   queued_count?: number;
+  completed_at?: string | null;
 }
 
 export interface WebSocketToolCallEvent {
@@ -1624,6 +1812,7 @@ export interface WebSocketDelegationProgressEvent {
   tool_call_count?: number;
   max_tool_calls?: number;
   last_tool?: string;
+  todos?: Record<string, unknown>[];
 }
 
 export interface WebSocketDelegationCompletedEvent {
@@ -1633,6 +1822,7 @@ export interface WebSocketDelegationCompletedEvent {
   agent_id?: string;
   task?: string;
   result?: string;
+  todos?: Record<string, unknown>[];
 }
 
 export interface WebSocketDelegationFailedEvent {
@@ -1642,6 +1832,7 @@ export interface WebSocketDelegationFailedEvent {
   agent_id?: string;
   task?: string;
   reason?: string;
+  todos?: Record<string, unknown>[];
 }
 
 export interface WebSocketWorkflowStepStartedEvent {
@@ -1825,6 +2016,9 @@ export interface WebSocketConversationUpdatedEvent {
   type: 'conversation_updated';
   conversation_id?: string;
   title?: string;
+  has_active_turn?: boolean;
+  last_message_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface WebSocketToolResultEvent {
@@ -1848,6 +2042,33 @@ export interface WebSocketToolResultEvent {
     path?: string;
     latency_ms?: number;
   };
+  tool_output_presentation?: ToolOutputPresentationMetadata;
+  output_size?: number;
+  truncated?: boolean;
+  agent_visible_truncated?: boolean;
+  has_full_output?: boolean;
+  recovery_call_id?: string | null;
+  tool_output_artifact_id?: string | null;
+  anchors_available?: boolean;
+  anchor_count?: number;
+  transport_truncated?: boolean;
+}
+
+export interface WebSocketToolResultChunkEvent {
+  type: 'tool_result_chunk' | 'tool_output_chunk';
+  conversation_id?: string;
+  session_id?: string;
+  call_id: string;
+  tool_name?: string;
+  delta?: string;
+  content?: string;
+  text?: string;
+  stream?: 'stdout' | 'stderr' | string | null;
+  is_error?: boolean;
+  turn_id?: string | null;
+  chunk_index?: number | null;
+  content_offset?: number | null;
+  timestamp?: string | null;
 }
 
 export interface WebSocketAssistantThinkingChunkEvent {
@@ -1860,6 +2081,11 @@ export interface WebSocketAssistantThinkingChunkEvent {
   delta: string;
   title?: string | null;
   complete: boolean;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  source?: string | null;
+  provider_block_index?: number | null;
 }
 
 export interface WebSocketAssistantThinkingBlockEvent {
@@ -1875,6 +2101,11 @@ export interface WebSocketAssistantThinkingBlockEvent {
   /** Full content — present on replay frames */
   content?: string;
   complete: boolean;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  source?: string | null;
+  provider_block_index?: number | null;
 }
 
 export interface WebSocketErrorEvent {
@@ -1894,8 +2125,13 @@ export interface WebSocketSystemMessageEvent {
   type: 'system_message';
   conversation_id?: string;
   seq?: number;
+  notice_id?: string | null;
+  kind?: string | null;
+  scope?: string | null;
   turn_id?: string | null;
   text: string;
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export interface WebSocketNoticeEvent {
@@ -1935,6 +2171,21 @@ export interface WebSocketSessionCompactedEvent {
   summary_preview: string;
   method: string;
   turns_compacted: number;
+  trigger?: string;
+  reason?: string;
+  tokens_before?: number;
+  tokens_after?: number;
+  prompt_tokens?: number;
+  max_context_tokens?: number;
+  max_input_tokens?: number;
+  available_prompt_tokens?: number;
+  compaction_threshold_prompt_tokens?: number;
+  loop_pressure_threshold_prompt_tokens?: number;
+  compaction_threshold?: number;
+  previous_usage_percentage?: number | null;
+  effective_usage_percentage?: number | null;
+  hard_pressure_exceeded?: boolean;
+  used_timeout_fallback?: boolean;
 }
 
 export interface WebSocketSessionResetEvent {
@@ -1942,6 +2193,17 @@ export interface WebSocketSessionResetEvent {
   conversation_id: string;
   session_id: string;
   previous_session_id: string;
+}
+
+export interface WebSocketHistoryRebasedEvent {
+  type: 'history_rebased';
+  conversation_id: string;
+  session_id: string;
+  previous_session_id?: string | null;
+  operation: 'undo' | 'redo';
+  undo_available?: boolean;
+  redo_available?: boolean;
+  message?: string | null;
 }
 
 export interface WebSocketConversationCreatedEvent {
@@ -1954,11 +2216,17 @@ export interface WebSocketUserMessageEvent {
   type: 'user_message';
   conversation_id?: string;
   session_id?: string;
+  message_id?: string | null;
+  event_id?: string | null;
+  timestamp?: string | null;
+  seq?: number | null;
   turn_id?: string | null;
   content: string;
   attachments?: AttachmentRef[];
   queue_id?: string | null;
   client_message_id?: string | null;
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export type CognisWebSocketEvent =
@@ -1971,6 +2239,7 @@ export type CognisWebSocketEvent =
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
   | WebSocketToolResultEvent
+  | WebSocketToolResultChunkEvent
   | WebSocketAssistantThinkingChunkEvent
   | WebSocketAssistantThinkingBlockEvent
   | WebSocketConversationUpdatedEvent
@@ -1999,6 +2268,7 @@ export type CognisWebSocketEvent =
   | WebSocketEscalationResolvedEvent
   | WebSocketSessionCompactedEvent
   | WebSocketSessionResetEvent
+  | WebSocketHistoryRebasedEvent
   | WebSocketConversationCreatedEvent
   | WebSocketUserMessageEvent
   | WebSocketQueuedEvent

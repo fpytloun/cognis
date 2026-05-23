@@ -1,16 +1,26 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildConversationUrl,
+  CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+  conversationStatusFilterForConversation,
+  distanceFromScrollBottom,
   getNextHistoryAfterSeq,
   getConversationRetryScope,
+  isNearScrollBottom,
+  isForeignSessionTimelineEvent,
   isMissingSessionError,
+  nextChatScrollState,
   isPreSessionChatConversation,
   isRestorableChatConversation,
   shouldAdoptConversationSessionId,
   shouldSuppressPreSessionSocketError,
   isCurrentConversationLoad,
+  parseConversationStatusFilter,
+  setConversationStatusSearchParam,
   nextPollDelayMs,
-  nextConversationLoadId
+  nextConversationLoadId,
+  shouldReconcileAfterReconnect
 } from '$lib/chat-page';
 
 describe('chat page helpers', () => {
@@ -22,6 +32,39 @@ describe('chat page helpers', () => {
     expect(second).toBe(2);
     expect(isCurrentConversationLoad(second, second)).toBe(true);
     expect(isCurrentConversationLoad(first, second)).toBe(false);
+  });
+
+  it('parses conversation status filters with active as the fallback', () => {
+    expect(parseConversationStatusFilter('starred')).toBe('starred');
+    expect(parseConversationStatusFilter('archived')).toBe('archived');
+    expect(parseConversationStatusFilter('active')).toBe('active');
+    expect(parseConversationStatusFilter('unknown')).toBe('active');
+    expect(parseConversationStatusFilter(null)).toBe('active');
+  });
+
+  it('omits active status from conversation URLs and preserves non-default filters', () => {
+    expect(buildConversationUrl('conv-1', 'active')).toBe('/chat/conv-1');
+    expect(buildConversationUrl('conv-1', 'starred')).toBe('/chat/conv-1?status=starred');
+
+    const params = new URLSearchParams({ search: 'needle' });
+    expect(buildConversationUrl('conv-1', 'archived', params)).toBe('/chat/conv-1?search=needle&status=archived');
+  });
+
+  it('updates only the conversation status search parameter', () => {
+    const params = new URLSearchParams({ search: 'needle', status: 'starred' });
+    setConversationStatusSearchParam(params, 'active');
+
+    expect(params.toString()).toBe('search=needle');
+
+    setConversationStatusSearchParam(params, 'archived');
+    expect(params.toString()).toBe('search=needle&status=archived');
+  });
+
+  it('keeps starred filter for starred conversations when switching', () => {
+    expect(conversationStatusFilterForConversation({ status: 'active', starred_at: '2026-01-01T00:00:00Z' }, 'starred')).toBe('starred');
+    expect(conversationStatusFilterForConversation({ status: 'active', starred_at: null }, 'starred')).toBe('active');
+    expect(conversationStatusFilterForConversation({ status: 'archived', starred_at: '2026-01-01T00:00:00Z' }, 'starred')).toBe('starred');
+    expect(conversationStatusFilterForConversation({ status: 'archived', starred_at: null }, 'active')).toBe('archived');
   });
 
   it('scopes retries to failed subloads only', () => {
@@ -38,6 +81,39 @@ describe('chat page helpers', () => {
         historyError: ''
       })
     ).toEqual({ sessions: true, history: false });
+  });
+
+  it('reconciles after reconnect when the backend cursor is ahead', () => {
+    expect(
+      shouldReconcileAfterReconnect({
+        remoteLastSeq: 42,
+        activeSessionLastSeq: 41,
+        remoteHasActiveTurn: true,
+        localTurnInProgress: true
+      })
+    ).toBe(true);
+  });
+
+  it('reconciles after reconnect when a stale local turn remains active', () => {
+    expect(
+      shouldReconcileAfterReconnect({
+        remoteLastSeq: 41,
+        activeSessionLastSeq: 41,
+        remoteHasActiveTurn: false,
+        localTurnInProgress: true
+      })
+    ).toBe(true);
+  });
+
+  it('does not reconcile after reconnect when local state matches the backend', () => {
+    expect(
+      shouldReconcileAfterReconnect({
+        remoteLastSeq: 41,
+        activeSessionLastSeq: 41,
+        remoteHasActiveTurn: false,
+        localTurnInProgress: false
+      })
+    ).toBe(false);
   });
 
   it('advances history pagination with the last returned event seq', () => {
@@ -100,9 +176,33 @@ describe('chat page helpers', () => {
   });
 
   it('only adopts websocket session ids while the conversation has no active root session yet', () => {
+    expect(shouldAdoptConversationSessionId(null, 'turn_started', 'sess_root')).toBe(true);
     expect(shouldAdoptConversationSessionId(null, 'message_complete', 'sess_root')).toBe(true);
     expect(shouldAdoptConversationSessionId(null, 'tool_call', 'sess_child')).toBe(false);
     expect(shouldAdoptConversationSessionId('sess_existing', 'message_complete', 'sess_child')).toBe(false);
+  });
+
+  it('filters child-session timeline events but keeps parent lifecycle events visible', () => {
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'tool_result_chunk',
+      eventSessionId: 'sess_child',
+      rootSessionId: 'sess_root',
+    })).toBe(true);
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'message_complete',
+      eventSessionId: 'sess_child',
+      rootSessionId: 'sess_root',
+    })).toBe(true);
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'delegation_completed',
+      eventSessionId: 'sess_child',
+      rootSessionId: 'sess_root',
+    })).toBe(false);
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'tool_call',
+      eventSessionId: 'sess_root',
+      rootSessionId: 'sess_root',
+    })).toBe(false);
   });
 
   it('suppresses only pre-session websocket not_found errors for missing sessions', () => {
@@ -118,5 +218,50 @@ describe('chat page helpers', () => {
       conversation: { status: 'active', context: { type: 'web' }, active_session_id: null },
       sessionCount: 0,
     })).toBe(false);
+  });
+
+  it('computes scroll distance from the timeline bottom', () => {
+    expect(distanceFromScrollBottom({ scrollHeight: 1000, scrollTop: 760, clientHeight: 200 })).toBe(40);
+    expect(distanceFromScrollBottom({ scrollHeight: 1000, scrollTop: 1100, clientHeight: 200 })).toBe(0);
+    expect(isNearScrollBottom(CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX)).toBe(true);
+    expect(isNearScrollBottom(CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX + 1)).toBe(false);
+  });
+
+  it('pauses live-tail when the user intentionally scrolls upward', () => {
+    expect(nextChatScrollState({
+      currentScrollTop: 700,
+      lastScrollTop: 760,
+      distanceFromBottom: 100,
+      userScrolledUp: false,
+      userScrollIntentUp: true,
+    }).userScrolledUp).toBe(true);
+
+    expect(nextChatScrollState({
+      currentScrollTop: 700,
+      lastScrollTop: 760,
+      distanceFromBottom: 100,
+      userScrolledUp: false,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(true);
+  });
+
+  it('does not pause live-tail for layout expansion alone', () => {
+    expect(nextChatScrollState({
+      currentScrollTop: 760,
+      lastScrollTop: 760,
+      distanceFromBottom: 160,
+      userScrolledUp: false,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(false);
+  });
+
+  it('resumes live-tail when the timeline reaches the bottom threshold', () => {
+    expect(nextChatScrollState({
+      currentScrollTop: 976,
+      lastScrollTop: 760,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(false);
   });
 });

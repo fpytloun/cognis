@@ -6,9 +6,13 @@
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import ToolOutputDrawer from '$lib/components/ToolOutputDrawer.svelte';
   import { addToast } from '$lib/stores/toasts';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
+  import { renderTerminalOutput } from '$lib/syntax/terminal-output';
+  import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
+  import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
@@ -18,11 +22,20 @@
   let rawExpanded = $state(false);
   let evalExpanded = $state(false);
   let autoExpanded = $state(false);
+  let terminalPinned = $state(false);
+  let outputDrawerOpen = $state(false);
+  let terminalTailing = $state(true);
+  let terminalEl = $state<HTMLPreElement | null>(null);
   let copiedBox = $state<'input' | 'output' | null>(null);
+  let bashExpandTimer: number | null = null;
+  let bashCollapseTimer: number | null = null;
+  let bashAutoExpanded = false;
   let copyResetTimer: number | null = null;
   const nowDate = new Date();
 
   const LINES_PER_PAGE = 50;
+  const BASH_AUTO_EXPAND_DELAY_MS = 450;
+  const BASH_AUTO_COLLAPSE_DELAY_MS = 4000;
   const startsExpanded = $derived(['steprequestinput', 'requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, '')));
 
   $effect(() => {
@@ -32,16 +45,91 @@
     }
   });
 
+  $effect(() => {
+    if (isBashTool() && item.status === 'started' && !autoExpanded && bashExpandTimer === null) {
+      clearBashCollapseTimer();
+      bashExpandTimer = window.setTimeout(() => {
+        bashExpandTimer = null;
+        if (isBashTool() && item.status === 'started' && !autoExpanded && !terminalPinned) {
+          expanded = true;
+          autoExpanded = true;
+          bashAutoExpanded = true;
+        }
+      }, BASH_AUTO_EXPAND_DELAY_MS);
+    }
+  });
+
+  $effect(() => {
+    if (isBashTool() && item.status !== 'started') {
+      clearBashExpandTimer();
+      if (
+        bashAutoExpanded &&
+        expanded &&
+        !terminalPinned &&
+        !outputDrawerOpen &&
+        bashCollapseTimer === null
+      ) {
+        bashCollapseTimer = window.setTimeout(() => {
+          bashCollapseTimer = null;
+          if (
+            isBashTool() &&
+            item.status !== 'started' &&
+            bashAutoExpanded &&
+            expanded &&
+            !terminalPinned &&
+            !outputDrawerOpen
+          ) {
+            expanded = false;
+            autoExpanded = false;
+            bashAutoExpanded = false;
+          }
+        }, BASH_AUTO_COLLAPSE_DELAY_MS);
+      }
+    }
+  });
+
+  $effect(() => {
+    if (isBashTool() && terminalEl && terminalTailing) {
+      item.result;
+      terminalEl.scrollTop = terminalEl.scrollHeight;
+    }
+  });
+
   onMount(() => {
     return () => {
       if (copyResetTimer !== null) {
         window.clearTimeout(copyResetTimer);
       }
+      clearBashExpandTimer();
+      clearBashCollapseTimer();
     };
   });
 
   function toggle(): void {
+    if (isBashTool()) {
+      terminalPinned = true;
+      clearBashCollapseTimer();
+    }
     expanded = !expanded;
+  }
+
+  function clearBashExpandTimer(): void {
+    if (bashExpandTimer !== null) {
+      window.clearTimeout(bashExpandTimer);
+      bashExpandTimer = null;
+    }
+  }
+
+  function clearBashCollapseTimer(): void {
+    if (bashCollapseTimer !== null) {
+      window.clearTimeout(bashCollapseTimer);
+      bashCollapseTimer = null;
+    }
+  }
+
+  function pinTerminal(): void {
+    terminalPinned = true;
+    clearBashCollapseTimer();
   }
 
   function truncate(s: string, max = 80): string {
@@ -50,6 +138,37 @@
 
   function normalizedToolName(): string {
     return item.toolName.toLowerCase().replace(/_/g, '');
+  }
+
+  function isBashTool(): boolean {
+    const name = normalizedToolName();
+    return name.includes('bash') || name.includes('shell');
+  }
+
+  function conversationId(): string | null {
+    const match = typeof window !== 'undefined' ? window.location.pathname.match(/\/chat\/([^/]+)/) : null;
+    return match?.[1] ? decodeURIComponent(match[1]) : null;
+  }
+
+  function isApplyPatchTool(): boolean {
+    return normalizedToolName().includes('applypatch');
+  }
+
+  function descriptionText(): string {
+    return typeof item.arguments?.description === 'string' ? item.arguments.description.trim() : '';
+  }
+
+  function patchFiles(): string[] {
+    const patch = item.arguments?.patchText;
+    if (typeof patch !== 'string') return [];
+    const files = new Set<string>();
+    for (const line of patch.split('\n')) {
+      const match = line.match(/^(?:\*\*\* Update File:|\*\*\* Add File:|\*\*\* Delete File:|--- a\/|\+\+\+ b\/)(.+)$/);
+      if (!match) continue;
+      const path = match[1]?.trim();
+      if (path && path !== '/dev/null') files.add(path);
+    }
+    return Array.from(files);
   }
 
   function isStepRequestInput(): boolean {
@@ -66,11 +185,17 @@
 
     // File operations
     if (name.includes('read') || name.includes('write') || name.includes('edit') || name.includes('patch') || name.includes('multiedit') || name === 'listdirectory') {
+      if (isApplyPatchTool()) {
+        const files = patchFiles();
+        if (files.length > 0) return truncate(files.join(', '), 120);
+      }
       if (typeof args.filePath === 'string') return args.filePath;
       if (typeof args.path === 'string') return args.path;
     }
     // Shell
     if (name.includes('bash') || name.includes('shell')) {
+      const description = descriptionText();
+      if (description) return truncate(description, 120);
       if (typeof args.command === 'string') return truncate(args.command);
     }
     // Search
@@ -157,7 +282,8 @@
   }
 
   /** Strip <tool_result> XML wrapper tags injected by the tool router. */
-  function cleanResult(raw: string): string {
+  function cleanResult(raw: string | null | undefined): string {
+    if (raw == null) return '';
     return raw
       .replace(/^<tool_result[^>]*>\n?/, '')
       .replace(/\n?<\/tool_result>\s*$/, '');
@@ -199,6 +325,19 @@
     }
     const paginated = paginatedText(raw, showAll);
     return { html: null, ...paginated };
+  }
+
+  function formatOutput(raw: string, showAll: boolean): {
+    html: string | null;
+    text: string;
+    totalLines: number;
+    hiddenCount: number;
+  } {
+    const json = formatMaybeJson(raw, showAll);
+    if (json.html || item.isError || !isReadToolName(item.toolName)) return json;
+    const language = inferLanguageFromPath(pathFromToolArguments(item.arguments));
+    if (!language) return json;
+    return { ...json, html: highlightToolOutput(json.text, language) };
   }
 
   function borderColor(): string {
@@ -270,6 +409,30 @@
   function stepRequestError(): string {
     const error = parsedToolResult()?.error;
     return typeof error === 'string' ? error : '';
+  }
+
+  function commandText(): string {
+    return typeof item.arguments?.command === 'string' ? item.arguments.command : item.toolName;
+  }
+
+  function terminalTitle(): string {
+    return descriptionText() || commandText();
+  }
+
+  function workingDirectory(): string {
+    const workdir = item.arguments?.workdir;
+    return typeof workdir === 'string' && workdir ? workdir : '~';
+  }
+
+  function terminalPrompt(): string {
+    return `${workingDirectory()} $ ${commandText()}`;
+  }
+
+  function onTerminalScroll(): void {
+    if (!terminalEl) return;
+    const atTail = terminalEl.scrollHeight - terminalEl.scrollTop - terminalEl.clientHeight < 16;
+    terminalTailing = atTail;
+    if (!atTail) pinTerminal();
   }
 </script>
 
@@ -371,7 +534,27 @@
           </div>
         {/if}
 
-        {#if !hasDiffs() || rawExpanded}
+        {#if isBashTool()}
+          {@const outputText = cleanResult(item.result)}
+          <div>
+            <div class={`overflow-hidden rounded-xl border ${item.isError ? 'border-rose-500/30' : 'border-slate-700/70'} bg-[#05070a] shadow-inner`}>
+              <div class="flex items-center justify-between border-b border-white/10 bg-slate-950/90 px-3 py-2 text-[11px] text-slate-400">
+                <span class="truncate font-medium text-slate-300">{terminalTitle()}</span>
+                <span>{item.status === 'started' ? 'live' : item.status}</span>
+              </div>
+              <pre bind:this={terminalEl} onscroll={onTerminalScroll} onpointerdown={pinTerminal} class={`max-h-[50vh] overflow-auto p-3 pr-10 font-mono text-xs leading-5 ${item.isError ? 'text-rose-200' : 'text-emerald-100'}`}><span class="text-sky-300">{terminalPrompt()}</span>{#if outputText}
+{@html renderTerminalOutput(`\n${outputText}`)}{:else if item.status === 'started'}
+Running...{/if}</pre>
+            </div>
+            {#if canOpenToolOutput(item) && conversationId()}
+              <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { pinTerminal(); outputDrawerOpen = true; }}>
+                {toolOutputOpenLabel(item)}
+              </button>
+            {/if}
+          </div>
+        {/if}
+
+        {#if (!hasDiffs() || rawExpanded) && !isBashTool()}
           {#if item.arguments && Object.keys(item.arguments).length > 0}
             {@const inputText = formatArguments()}
             {@const inputData = formatMaybeJson(inputText, inputExpanded)}
@@ -407,35 +590,28 @@
 
           {#if item.result != null}
             {@const outputText = cleanResult(item.result)}
-            {@const outputData = formatMaybeJson(outputText, outputExpanded)}
-            <div>
-              <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
-              <div class="relative">
-                <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
-                <button
-                  class="copy-icon-button absolute right-2 top-2"
-                  onclick={() => void copyBox('output', outputText)}
-                  type="button"
-                  title="Copy output"
-                  aria-label="Copy output"
-                >
-                  {#if copiedBox === 'output'}
-                    <Check class="h-3.5 w-3.5" />
-                  {:else}
-                    <Copy class="h-3.5 w-3.5" />
-                  {/if}
-                </button>
+            {@const outputData = formatOutput(outputText, outputExpanded)}
+            {#if !isBashTool()}
+              <div>
+                <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
+                <div class="relative">
+                  <pre class={`max-h-[40vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if outputData.html}{@html outputData.html}{:else}{outputData.text}{/if}</pre>
+                  <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', outputText)} type="button" title="Copy output" aria-label="Copy output">
+                    {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                  </button>
+                </div>
+                {#if canOpenToolOutput(item) && conversationId()}
+                  <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { outputDrawerOpen = true; }}>
+                    {toolOutputOpenLabel(item)}
+                  </button>
+                {/if}
+                {#if outputData.hiddenCount > 0}
+                  <button class="mt-1 text-xs text-sky-400 hover:text-sky-300" onclick={() => { outputExpanded = !outputExpanded; }} type="button">
+                    {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
+                  </button>
+                {/if}
               </div>
-              {#if outputData.hiddenCount > 0}
-                <button
-                  class="mt-1 text-xs text-sky-400 hover:text-sky-300"
-                  onclick={() => { outputExpanded = !outputExpanded; }}
-                  type="button"
-                >
-                  {outputExpanded ? 'Show less' : `Show all (${outputData.totalLines} lines)`}
-                </button>
-              {/if}
-            </div>
+            {/if}
           {/if}
         {/if}
 
@@ -445,6 +621,38 @@
             <MessageAttachments attachments={item.attachments} />
           </div>
         {/if}
+      {/if}
+
+      {#if isBashTool() && (item.result != null || (item.arguments && Object.keys(item.arguments).length > 0))}
+        {@const rawOutputText = cleanResult(item.result)}
+        {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+        <div>
+          <button
+            class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+            onclick={() => { rawExpanded = !rawExpanded; }}
+            type="button"
+          >
+            <span>{rawExpanded ? '▼' : '▶'}</span>
+            <span>Raw payload</span>
+          </button>
+          {#if rawExpanded}
+            <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+              <div>
+                <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+              </div>
+              <div>
+                <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                <div class="relative">
+                  <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                  <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                    {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </div>
       {/if}
 
       <!-- Evaluation metadata (from Intaris) -->
@@ -489,3 +697,13 @@
     </div>
   {/if}
 </article>
+
+<ToolOutputDrawer
+  open={outputDrawerOpen}
+  conversationId={conversationId()}
+  sessionId={item.sessionId}
+  callId={item.recoveryCallId ?? item.callId}
+  toolName={item.toolName}
+  isTerminal={isBashTool()}
+  onClose={() => { outputDrawerOpen = false; }}
+/>

@@ -40,6 +40,7 @@ export interface AgentFormState {
   behavioralRules: string;
   allowedSecrets: string[];
   allowedCredentials: string[];
+  allowedKnowledgebases: string[];
   canDelegate: boolean;
   maxDelegationDepth: number;
   toolPermissions: Record<string, string>;
@@ -52,6 +53,7 @@ export interface AgentFormState {
   availableWorkflowIds: string[];
   defaultWorkflowId: string;
   workflowSelectionMode: string;
+  defaultChatMode: 'default' | 'plan' | 'build';
   stepAgentOverridesJson: string;
   mcpServers: MCPServerFormState[];
   intarisMcpServers: string[];
@@ -126,6 +128,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     behavioralRules: '',
     allowedSecrets: [],
     allowedCredentials: [],
+    allowedKnowledgebases: [],
     canDelegate: true,
     maxDelegationDepth: 3,
     toolPermissions: {},
@@ -138,6 +141,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     availableWorkflowIds: systemWorkflowIds,
     defaultWorkflowId: 'system:direct',
     workflowSelectionMode: 'automatic',
+    defaultChatMode: 'default',
     stepAgentOverridesJson: '{}',
     mcpServers: [],
     intarisMcpServers: [],
@@ -182,6 +186,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     allowedCredentials: Array.isArray(permissions.allowed_credentials)
       ? (permissions.allowed_credentials as unknown[]).filter((v): v is string => typeof v === 'string')
       : [],
+    allowedKnowledgebases: Array.isArray(permissions.allowed_knowledgebases)
+      ? (permissions.allowed_knowledgebases as unknown[]).filter((v): v is string => typeof v === 'string')
+      : [],
     canDelegate: permissions.can_delegate !== false,
     maxDelegationDepth:
       typeof permissions.max_delegation_depth === 'number' ? permissions.max_delegation_depth : 3,
@@ -206,6 +213,10 @@ export function agentToFormState(agent: Agent): AgentFormState {
       typeof execution.workflow_selection_mode === 'string'
         ? execution.workflow_selection_mode
         : 'automatic',
+    defaultChatMode:
+      execution.default_chat_mode === 'plan' || execution.default_chat_mode === 'build'
+        ? execution.default_chat_mode
+        : 'default',
     executorId: typeof execution.executor_id === 'string' ? execution.executor_id : '',
     executorSelector:
       execution.executor_selector && typeof execution.executor_selector === 'object'
@@ -325,6 +336,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         tool_permissions: toolPermissions,
         allowed_secrets: form.allowedSecrets,
         allowed_credentials: form.allowedCredentials,
+        allowed_knowledgebases: form.allowedKnowledgebases,
         can_delegate: form.canDelegate,
         max_delegation_depth: form.maxDelegationDepth
       },
@@ -413,6 +425,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       available_workflow_ids: form.availableWorkflowIds,
       default_workflow_id: form.defaultWorkflowId || undefined,
       workflow_selection_mode: form.workflowSelectionMode,
+      default_chat_mode: form.defaultChatMode,
       step_agent_overrides: form.stepAgentOverridesJson ? JSON.parse(form.stepAgentOverridesJson) : {}
     }
   };

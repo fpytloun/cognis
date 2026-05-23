@@ -35,6 +35,26 @@ Use this for vLLM, TGI, local gateways, or other services that expose an OpenAI-
 
 Use this when Cognis should call Anthropic directly for chat or routing tasks.
 
+Anthropic-compatible endpoints can also use this preset with a custom base URL.
+This keeps LiteLLM on its Anthropic transport, so Claude-specific options such
+as extended thinking are sent using the Anthropic wire format instead of being
+filtered as unsupported OpenAI-compatible parameters. For example, a Meridian
+endpoint that exposes the Anthropic Messages API should be configured as an
+Anthropic provider with its Meridian base URL, not as an OpenAI Compatible
+provider.
+
+For a local Meridian endpoint, run Meridian on or near the executor, then create
+an **Anthropic** provider with:
+
+- **Location**: `Executor`
+- **Backend**: `litellm` (the default)
+- **Base URL**: the executor-reachable Meridian Anthropic-compatible URL
+- **Model IDs**: add the Meridian-exposed Claude model IDs manually
+
+Cognis still owns the agent loop, memory, Intaris guardrails, tool approval,
+workflow/session state, and audit records. The executor only provides the
+network-local LiteLLM inference call and tool execution boundary.
+
 ### Ollama
 
 Use this for local models exposed through Ollama. Make sure the selected model is already installed and reachable from the Cognis host or executor.
@@ -49,6 +69,12 @@ Use this when Cognis should call LiteLLM's native ChatGPT subscription provider.
 
 The controller remains stateless: LiteLLM's `CHATGPT_TOKEN_DIR` file is only hydrated into a temporary directory for each model call, and refreshed tokens are written back to encrypted database storage. On PostgreSQL, Cognis serializes OAuth token hydration and refresh with a transaction-scoped advisory lock so multiple controller replicas do not refresh the same token concurrently.
 
+## Provider ownership
+
+Providers can be shared or user-owned. Shared providers use the system owner, are visible to all users, and are managed by admins. User-owned providers are visible and manageable only by their owner. Admin role alone does not grant access to another user's user-owned provider.
+
+Default provider/model routing is scoped by owner: shared defaults apply to shared/system-owned providers, while user-owned defaults apply only to that user. Explicit model lookup follows the same visibility rules and caches provider matches per owner scope, so one user's user-owned provider cannot satisfy another user's model request.
+
 ## Provider location and executor routing
 
 Some providers can run on the controller, while others can be routed through an executor. This is useful when:
@@ -57,13 +83,18 @@ Some providers can run on the controller, while others can be routed through an 
 - inference should stay on a user-local machine
 - you want tool execution and model access to share the same remote environment
 
+Executor-routed text providers use the executor-side LiteLLM backend. The
+controller resolves provider configuration, credentials, routing, memory, and
+guardrails; the selected executor performs the outbound model call from its own
+network location.
+
 ## Managing models
 
 Each provider has a list of configured models with their properties, such as context window, output limits, capability flags, and pricing metadata.
 
 ### Discovering models
 
-Click **Discover** to query the provider for available models. For LiteLLM Proxy providers, Cognis fetches enriched metadata from the proxy's `/model/info` endpoint, including context window sizes, capability flags, and pricing metadata. For other providers, models are enriched with LiteLLM's built-in model database.
+Click **Discover** to query the provider for available models. For LiteLLM Proxy providers, Cognis fetches enriched metadata from the proxy's `/model/info` endpoint, including context window sizes, capability flags, and pricing metadata. For other controller-side providers, models are enriched with LiteLLM's built-in model database. For executor-routed providers such as a local Meridian endpoint, add models manually because discovery runs from the controller.
 
 Discovered models appear in a selection modal where you can choose which to add. You can also add models manually by typing a model ID.
 
@@ -102,8 +133,14 @@ Use model routing to choose which provider/model should handle different kinds o
 - workflow evaluation
 - speech to text
 - image generation
+- embeddings for optional Knowledgebase indexing and retrieval
 
-Routing lets you use a cheaper or faster model for simple tasks and keep a stronger model for heavier work. Text routes can also define a default Thinking effort for the selected model.
+Routing lets you use a cheaper or faster model for simple tasks and keep a stronger model for heavier work. Text routes can also define a default Thinking effort for the selected model. Routes are resolved in the acting user's owner scope first and then fall back to shared/system routes when no user-owned route is configured.
+
+The optional Knowledgebase feature is hidden/unavailable until an `embedding`
+route is configured and a supported vector backend is enabled. Use an
+embedding-capable provider/model for this route; Cognis does not hard-code an
+embedding provider.
 
 ## Credentials and secrets
 
@@ -133,21 +170,20 @@ use through the `web_search`, `web_fetch`, `web_crawl`, `web_map`, and
 | `tavily` | tavily.com | tavily.com | Paid. Also unlocks Tavily-native `web_crawl` / `web_map` / `web_research`. |
 | `brave` | api.search.brave.com | — | Paid. Search-only. |
 | `searxng` | self-hosted SearXNG | — | Free; user runs the SearXNG instance. |
-| `browser` | — | Playwright/Patchright headless | Auto-fallback target for Cloudflare/JS-required pages. |
+| `browser` | — | Playwright/Patchright headed when allowed, otherwise headless | Auto-fallback target for Cloudflare/JS-required pages. |
 
 ### Browser fallback
 
 When the direct fetch backend hits a Cloudflare/5xx/connection error and
 `web.fetch_fallback_browser` is enabled (default `true`), the request is
-automatically retried through the executor's headless browser. Browser fetch
-navigation defaults to `wait_until=domcontentloaded`, a 60 second navigation
-timeout, and a short best-effort `networkidle` soft wait.
-
-If `web.browser_fetch.headed_fallback_enabled` is enabled and the executor also
-sets `browser.headed_allowed=true`, Cognis retries once more in headed mode when
-headless fetch fails or extracts an empty/interstitial page. Hard cases
-(Cloudflare managed challenge, Turnstile) can still fail; the agent should treat
-that as a real signal rather than retrying mechanically.
+automatically retried through the executor's browser. If
+`web.browser_fetch.headed_fallback_enabled` is enabled and the executor also sets
+`browser.headed_allowed=true`, Cognis uses headed browser fetch first. Otherwise
+it uses headless browser fetch. Browser fetch navigation defaults to
+`wait_until=domcontentloaded`, a 60 second navigation timeout, and a short
+best-effort `networkidle` soft wait. Hard cases (Cloudflare managed challenge,
+Turnstile) can still fail; the agent should treat that as a real signal rather
+than retrying mechanically.
 
 ### `web_crawl` / `web_map` / `web_research` availability
 

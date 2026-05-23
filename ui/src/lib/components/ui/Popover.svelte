@@ -29,6 +29,7 @@
   let open = $state(false);
   let root = $state<HTMLSpanElement | null>(null);
   let hoverCapable = $state(true);
+  let floatingStyle = $state('');
 
   $effect(() => {
     if (typeof window !== 'undefined') {
@@ -66,6 +67,23 @@
     if (event.key === 'Escape') open = false;
   }
 
+  function updatePosition(): void {
+    if (!root) return;
+    const rect = root.getBoundingClientRect();
+    const maxWidth = placement === 'left' || placement === 'right'
+      ? 'min(16rem, calc(100vw - 2rem))'
+      : 'min(20rem, calc(100vw - 2rem))';
+    if (placement === 'top') {
+      floatingStyle = `position: fixed; left: ${rect.left + rect.width / 2}px; top: ${rect.top - 8}px; transform: translate(-50%, -100%); width: max-content; max-width: ${maxWidth};`;
+    } else if (placement === 'bottom') {
+      floatingStyle = `position: fixed; left: ${rect.left + rect.width / 2}px; top: ${rect.bottom + 8}px; transform: translateX(-50%); width: max-content; max-width: ${maxWidth};`;
+    } else if (placement === 'right') {
+      floatingStyle = `position: fixed; left: ${rect.right + 8}px; top: ${rect.top + rect.height / 2}px; transform: translateY(-50%); width: max-content; max-width: ${maxWidth};`;
+    } else {
+      floatingStyle = `position: fixed; left: ${rect.left - 8}px; top: ${rect.top + rect.height / 2}px; transform: translate(-100%, -50%); width: max-content; max-width: ${maxWidth};`;
+    }
+  }
+
   function onDocumentPointerDown(event: PointerEvent): void {
     if (!open) return;
     if (root && event.target instanceof Node && !root.contains(event.target)) {
@@ -76,8 +94,15 @@
   $effect(() => {
     if (!open) return;
     if (typeof document === 'undefined') return;
+    updatePosition();
     document.addEventListener('pointerdown', onDocumentPointerDown, true);
-    return () => document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+    document.addEventListener('scroll', updatePosition, true);
+    window.addEventListener('resize', updatePosition);
+    return () => {
+      document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+      document.removeEventListener('scroll', updatePosition, true);
+      window.removeEventListener('resize', updatePosition);
+    };
   });
 </script>
 
@@ -95,21 +120,10 @@
 >
   {@render children()}
   {#if open}
-    {@const isHorizontal = placement === 'left' || placement === 'right'}
     <span
       role="tooltip"
-      class={`pointer-events-none absolute z-50 whitespace-normal rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-normal leading-relaxed text-slate-300 shadow-lg ${
-        placement === 'top'
-          ? 'bottom-full left-1/2 mb-2 -translate-x-1/2'
-          : placement === 'bottom'
-          ? 'top-full left-1/2 mt-2 -translate-x-1/2'
-          : placement === 'right'
-          ? 'left-full top-1/2 ml-2 -translate-y-1/2'
-          : 'right-full top-1/2 mr-2 -translate-y-1/2'
-      }`}
-      style={isHorizontal
-        ? 'width: max-content; max-width: min(16rem, calc(100vw - 2rem));'
-        : 'width: max-content; max-width: min(20rem, calc(100vw - 2rem));'}
+      class="pointer-events-none z-[1000] whitespace-normal rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-normal leading-relaxed text-slate-300 shadow-2xl ring-1 ring-black/30"
+      style={floatingStyle}
     >
       {text}
       {#if placement === 'top'}

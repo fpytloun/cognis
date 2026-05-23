@@ -20,7 +20,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     type AdditionalExecutorEntry,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
 
@@ -33,6 +33,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     executors = [],
     secrets = [],
     credentials = [],
+    knowledgebases = [],
     skills = [],
     intarisMcpServers = [],
     secondaryAgents = [],
@@ -53,6 +54,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     executors?: ExecutorConfig[];
     secrets?: SecretMetadata[];
     credentials?: CredentialMetadata[];
+    knowledgebases?: KnowledgebaseModel[];
     skills?: Skill[];
     intarisMcpServers?: IntarisMCPServer[];
     secondaryAgents?: Agent[];
@@ -244,6 +246,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       form.allowedCredentials = form.allowedCredentials.filter((v: string) => v !== credentialId);
     } else {
       form.allowedCredentials = [...form.allowedCredentials, credentialId];
+    }
+  }
+
+  function toggleKnowledgebase(knowledgebaseId: string): void {
+    if (form.allowedKnowledgebases.includes(knowledgebaseId)) {
+      form.allowedKnowledgebases = form.allowedKnowledgebases.filter((v: string) => v !== knowledgebaseId);
+    } else {
+      form.allowedKnowledgebases = [...form.allowedKnowledgebases, knowledgebaseId];
     }
   }
 
@@ -723,6 +733,29 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </div>
         {/if}
 
+        {#if knowledgebases.length > 0}
+          <div class="mt-4">
+            <p class="mb-2 text-sm font-medium text-slate-200">Allowed knowledgebases</p>
+            <div class="grid gap-2 md:grid-cols-2">
+              {#each knowledgebases as kb}
+                <label class="flex items-start gap-2 text-sm text-slate-200">
+                  <input
+                    checked={form.allowedKnowledgebases.includes(kb.knowledgebase_id)}
+                    class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                    type="checkbox"
+                    onchange={() => toggleKnowledgebase(kb.knowledgebase_id)}
+                    disabled={readonly}
+                  />
+                  <span>
+                    <span>{kb.name}</span>
+                    <span class="block font-mono text-xs text-slate-500">{kb.knowledgebase_id}</span>
+                  </span>
+                </label>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
         <!-- Allowed secrets -->
         {#if secrets.length > 0}
           <div class="mt-4">
@@ -958,6 +991,16 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 <option value="always_ask">always_ask</option>
                 <option value="use_default">use_default</option>
               </select>
+            </label>
+
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Default chat mode</span>
+              <select bind:value={form.defaultChatMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={readonly}>
+                <option value="default">default</option>
+                <option value="plan">plan</option>
+                <option value="build">build</option>
+              </select>
+              <span class="block text-xs font-normal text-slate-500">Controls chat behavior before any conversation or one-shot slash override.</span>
             </label>
           </div>
 

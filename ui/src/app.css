@@ -11,18 +11,18 @@
   --app-bottom-inset: 0px;
   --app-bottom-chrome-bg: #07111a;
   /*
-   * iOS PWA standalone reserves a ~34pt strip at the bottom for the
-   * home-indicator gesture and paints it with `theme-color`. Our visible
-   * chrome (bottom tab bar, chat composer) sits at the layout viewport
-   * bottom, which is the top of that reserved strip. Adding any extra
-   * padding-bottom would just stack on top of the unavoidable system
-   * strip and make the gap visibly larger than native apps. Keep the
-   * inset at 0 and let the system strip be the only space below the
-   * controls.
+   * Phones already reserve the iOS home-indicator strip in standalone PWAs, so
+   * adding the safe-area inset again creates a visible bottom gap. Tablet PWAs
+   * opt back in below where their wider chrome needs explicit clearance.
    */
   --app-bottom-control-inset: 0px;
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
+  --app-overlay-gap: 0.75rem;
+  --app-floating-overlay-top: calc(max(var(--app-shell-top-offset, 0px), env(safe-area-inset-top, 0px)) + var(--app-overlay-gap));
+  --app-floating-overlay-bottom: calc(max(var(--app-shell-bottom-offset, 0px), env(safe-area-inset-bottom, 0px)) + var(--app-overlay-gap));
+  --app-floating-overlay-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
+  --app-floating-overlay-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
   --theme-void: #020617;
   --theme-obsidian: #07111a;
   --theme-ink: #122a35;
@@ -30,6 +30,12 @@
   --theme-accent: #38bdf8;
   --theme-accent-strong: #0284c7;
   --theme-accent-soft: #06b6d4;
+}
+
+@media (pointer: coarse) and (min-width: 768px) and (min-height: 768px) {
+  :root {
+    --app-bottom-control-inset: env(safe-area-inset-bottom, 0px);
+  }
 }
 
 html {
@@ -119,6 +125,24 @@ a:hover {
 .json-null { @apply text-cyan-300 italic; }
 .json-punct { @apply text-slate-500; }
 
+/* highlight.js classes for read tool output and markdown code blocks. */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in { @apply text-sky-300; }
+.hljs-string,
+.hljs-attr,
+.hljs-symbol { @apply text-emerald-300; }
+.hljs-number,
+.hljs-literal { @apply text-cyan-300; }
+.hljs-comment { @apply text-slate-500 italic; }
+.hljs-title,
+.hljs-name,
+.hljs-function { @apply text-sky-200; }
+.hljs-variable,
+.hljs-params { @apply text-slate-200; }
+.hljs-punctuation,
+.hljs-operator { @apply text-slate-500; }
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -160,9 +184,46 @@ textarea:focus-visible,
   background: transparent;
 }
 
+.chat-markdown :not(pre) > code {
+  border: 1px solid rgb(51 65 85 / 0.55);
+  border-radius: 0.375rem;
+  background: rgb(15 23 42 / 0.75);
+  padding: 0.08rem 0.28rem;
+  color: rgb(186 230 253);
+}
+
+.chat-markdown strong {
+  color: rgb(248 250 252);
+  font-weight: 700;
+}
+
+.chat-markdown em {
+  color: rgb(226 232 240);
+  font-style: italic;
+}
+
 /* Code blocks inside the outgoing (sky-tinted) bubble use a deeper sky
  * tone so the contrast holds without falling back to a slate slab that
  * would clash with the bubble's blue. */
+.chat-markdown.prose-user :is(p, li, ul, ol, strong, em, blockquote) {
+  color: rgb(248 250 252);
+}
+
+.chat-markdown.prose-user li::marker {
+  color: rgb(248 250 252);
+}
+
+.chat-markdown.prose-user a {
+  color: rgb(224 242 254);
+  text-decoration: underline;
+}
+
+.chat-markdown.prose-user :not(pre) > code {
+  border-color: rgb(125 211 252 / 0.45);
+  background: rgb(8 47 73 / 0.65);
+  color: rgb(240 249 255);
+}
+
 .chat-markdown.prose-user pre {
   background: rgb(8 47 73 / 0.85);
   color: rgb(224 242 254);
@@ -309,6 +370,21 @@ textarea:focus-visible,
   bottom: var(--app-shell-bottom-offset, 0px);
 }
 
+/* Floating overlays clear app chrome when present, otherwise raw safe areas. */
+.app-floating-top-overlay {
+  position: fixed;
+  top: var(--app-floating-overlay-top);
+  left: var(--app-floating-overlay-left);
+  right: var(--app-floating-overlay-right);
+}
+
+.app-floating-bottom-overlay {
+  position: fixed;
+  bottom: var(--app-floating-overlay-bottom);
+  left: var(--app-floating-overlay-left);
+  right: var(--app-floating-overlay-right);
+}
+
 /*
  * Reserve horizontal gestures for the app. iOS PWA standalone mode
  * otherwise routes left/right edge swipes to the system back/forward
@@ -328,8 +404,13 @@ textarea:focus-visible,
     radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.12), transparent 32%),
     radial-gradient(circle at 88% 8%, rgb(6 182 212 / 0.08), transparent 30%),
     linear-gradient(180deg, var(--theme-obsidian) 0%, var(--theme-void) 54%, #0f1719 100%);
-  background-attachment: fixed;
   touch-action: pan-y;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .app-shell-viewport {
+    background-attachment: fixed;
+  }
 }
 
 .app-fullscreen-safe {

@@ -81,11 +81,21 @@ It depends on:
 
 ### API semantics
 
-For both `delegate` and `create_task`:
+For `delegate`:
 
 - `agent_id` omitted / empty / `"auto"` => system-selected agent
 - `agent_id="self"` => current caller agent
 - explicit agent ID => exact target agent
+
+For `create_task`, `agent_id` selects the durable workflow owner, not the
+specialist that executes individual workflow steps:
+
+- `agent_id` omitted / empty / `"auto"` => current/main caller agent unless an
+  explicit user-visible task owner is selected by the controller
+- `agent_id="self"` => current caller agent
+- explicit primary/user agent ID => exact durable task owner
+- `system:*` specialist IDs are invalid as durable task owners; they may execute
+  delegated sub-sessions or workflow steps via workflow step overrides
 
 The API layer must normalize omitted, empty, and `"auto"` to one internal
 representation before routing logic runs.
@@ -112,7 +122,8 @@ This pipeline is used by:
 
 - `delegate` with `self`
 - `delegate` with a specialist or eligible user agent
-- `task` with selected workflow and execution agent
+- `task` with selected workflow and durable owner agent
+- workflow step with specialist execution agent
 
 ## Workflow precedence rules
 

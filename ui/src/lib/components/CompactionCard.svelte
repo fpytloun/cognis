@@ -7,6 +7,14 @@
     item: CompactionTimelineItem;
     onViewPreviousSession?: ((sessionId: string) => void) | undefined;
   }>();
+
+  const usageLabel = $derived(
+    item.effectiveUsagePercentage != null
+      ? `${item.effectiveUsagePercentage.toFixed(1)}% effective`
+      : item.previousUsagePercentage != null
+        ? `${item.previousUsagePercentage.toFixed(1)}% window`
+        : null
+  );
 </script>
 
 <article class="rounded-3xl border border-cyan-500/30 bg-cyan-500/10 px-4 py-4 text-cyan-100 shadow-card">
@@ -17,6 +25,19 @@
         {item.turnsCompacted} {item.turnsCompacted === 1 ? 'turn' : 'turns'} summarized
         <span class="opacity-60">({item.method})</span>
       </p>
+      {#if usageLabel || item.usedTimeoutFallback || item.hardPressureExceeded}
+        <p class="mt-1 text-xs leading-5 opacity-75">
+          {#if usageLabel}
+            Context reached {usageLabel}
+          {/if}
+          {#if item.hardPressureExceeded}
+            {usageLabel ? ' · ' : ''}hard pressure exceeded
+          {/if}
+          {#if item.usedTimeoutFallback}
+            {usageLabel || item.hardPressureExceeded ? ' · ' : ''}fallback used
+          {/if}
+        </p>
+      {/if}
       <p class="mt-2 text-xs uppercase tracking-[0.2em] opacity-75" title={formatAbsoluteTime(item.timestamp)}>
         {formatRelativeTime(item.timestamp)}
       </p>

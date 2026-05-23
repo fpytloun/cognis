@@ -29,6 +29,11 @@ The task board gives you a kanban-style view of work by status. From there you c
 - open task details
 - understand which items are blocked, active, or completed
 
+Tasks created through the UI, API, or agent `create_task` tool can be saved as
+drafts. Draft tasks are durable but are not enqueued or executed until you submit
+them. Creating a queued or ready task still starts through the normal queue path,
+so existing automation can continue to create runnable work directly.
+
 On mobile the board shows a single column at a time and a segmented-control
 selector (Draft / Queued / Running / Paused / Done) so each column fills the
 viewport. Drag-and-drop is desktop only; on mobile, open the task detail and
@@ -48,9 +53,19 @@ The task detail page shows the full workflow run, including:
 
 This view is the best place to understand why a task is waiting, revising, or failing.
 
+When a step runs more than once, the displayed accumulated duration includes all
+attempts. Latest-attempt timing remains available as secondary detail where the
+API/UI needs to distinguish it from total step time.
+
 ## Gates and step questions
 
 Some workflows pause for human input. When that happens, Cognis records the pause and lets you respond from the task flow instead of losing the context in chat.
+
+Gate pauses include evaluated condition details when available: referenced
+values, expected or threshold values, comparison operator, actual result,
+pass/fail outcome, branch or action taken, and any evaluation error. These
+details help operators understand why a workflow paused, skipped, or followed a
+specific branch.
 
 You can also steer a paused task from chat through the main agent. When you do that, Cognis keeps the same task/workflow state and carries any operator instruction into the resumed step.
 

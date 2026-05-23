@@ -13,7 +13,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, AgentGrant, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, AgentGrant, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -25,6 +25,7 @@
   let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
+  let knowledgebases = $state<KnowledgebaseModel[]>([]);
   let skills = $state<Skill[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
@@ -177,11 +178,12 @@
   async function loadAgent(): Promise<void> {
     loading = true;
     try {
-      [agent, workflows, secrets, credentials, skills, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
+      [agent, workflows, secrets, credentials, knowledgebases, skills, intarisMcpServers, secondaryAgents, secondaryBindings] = await Promise.all([
         api.agents.detail(agentIdFromRoute()),
         api.workflows.listAll(),
         api.secrets.list(),
         api.credentials.list().catch(() => []),
+        api.knowledgebases.list().catch(() => []),
         api.skills.list().catch(() => []),
         api.tools.intarisMcpServers().catch(() => []),
         api.agents.listAll({ agent_type: 'secondary' }),
@@ -192,12 +194,10 @@
       } catch {
         executors = [];
       }
-      if (auth.getSnapshot().user?.role === 'admin') {
-        try {
-          providers = (await api.llmProviders.list()).items;
-        } catch {
-          providers = [];
-        }
+      try {
+        providers = (await api.llmProviders.list()).items;
+      } catch {
+        providers = [];
       }
       Object.assign(form, agentToFormState(agent));
       await loadMyShare();
@@ -555,6 +555,7 @@
       {executors}
       {secrets}
       {credentials}
+      {knowledgebases}
       {skills}
       {intarisMcpServers}
       {secondaryAgents}

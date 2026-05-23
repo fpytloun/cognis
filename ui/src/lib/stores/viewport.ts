@@ -40,6 +40,7 @@ export interface ViewportInput {
   innerHeight: number;
   visualViewportHeight?: number;
   visualViewportOffsetTop?: number;
+  keyboardCanBeOpen?: boolean;
 }
 
 export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics {
@@ -55,14 +56,30 @@ export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics 
   // and reacting to it would push the app shell down past the fixed mobile
   // header on non-chat routes (visible "top bounces" regression on Projects,
   // Tasks, Settings when an input gains focus).
-  const keyboardOpen = keyboardOverlap > 80;
-  const height = keyboardOpen ? visualHeight : innerHeight;
-  const offsetTop = keyboardOpen ? visualOffsetTop : 0;
+  const keyboardOpen = keyboardOverlap > 80 && input.keyboardCanBeOpen !== false;
+  // Keep the app shell anchored to the top while the keyboard is open. iOS can
+  // report a positive visualViewport.offsetTop during input focus; applying it
+  // to the fixed shell moves sticky headers. Instead, shrink from the bottom by
+  // using the visual viewport's bottom edge as the shell height.
+  const height = keyboardOpen ? visualOffsetTop + visualHeight : innerHeight;
+  const offsetTop = 0;
   return {
     height: Math.max(0, height),
     offsetTop: Math.max(0, offsetTop),
     keyboardOpen,
   };
+}
+
+function hasFocusedTextInput(): boolean {
+  if (typeof document === 'undefined') {
+    return false;
+  }
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof HTMLElement)) {
+    return false;
+  }
+  const tagName = activeElement.tagName.toLowerCase();
+  return tagName === 'input' || tagName === 'textarea' || activeElement.isContentEditable;
 }
 
 function readViewportMetrics(): ViewportMetrics {
@@ -78,6 +95,7 @@ function readViewportMetrics(): ViewportMetrics {
     innerHeight: window.innerHeight,
     visualViewportHeight: vv?.height,
     visualViewportOffsetTop: vv?.offsetTop,
+    keyboardCanBeOpen: hasFocusedTextInput(),
   });
 }
 
@@ -85,11 +103,11 @@ function syncViewportVariables(metrics = readViewportMetrics()): void {
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
   const root = document.documentElement;
   if (metrics.keyboardOpen) {
-    // Pin the shell to the visible viewport above the keyboard (and any iOS
-    // form-accessory bar, which visualViewport already excludes from its
-    // height).
+    // Keep the shell top fixed and shrink only its bottom edge above the
+    // keyboard/form-accessory bar.
     root.style.setProperty('--app-viewport-height', `${Math.round(metrics.height)}px`);
-    root.style.setProperty('--app-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
+    root.style.setProperty('--app-viewport-offset-top', '0px');
+    root.style.setProperty('--app-bottom-control-inset', '0px');
   } else {
     // Keyboard closed: clear the inline overrides so the shell falls back to
     // the `:root` rule's `100dvh`. On iOS PWA standalone with
@@ -99,6 +117,7 @@ function syncViewportVariables(metrics = readViewportMetrics()): void {
     // and chat composer.
     root.style.removeProperty('--app-viewport-height');
     root.style.removeProperty('--app-viewport-offset-top');
+    root.style.removeProperty('--app-bottom-control-inset');
   }
   root.style.setProperty('--app-bottom-inset', '0px');
   root.dataset.keyboard = metrics.keyboardOpen ? 'open' : 'closed';
@@ -124,14 +143,21 @@ export const viewportMetrics = readable<ViewportMetrics>(
     }, 250);
     scheduledTimers.add(timer);
   };
+  const scheduleVisibleUpdate = () => {
+    if (document.visibilityState === 'hidden') {
+      return;
+    }
+    scheduleUpdate();
+  };
 
   update();
   vv?.addEventListener('resize', update);
   vv?.addEventListener('scroll', update);
   window.addEventListener('resize', update, { passive: true });
   window.addEventListener('orientationchange', scheduleUpdate, { passive: true });
-  window.addEventListener('pageshow', scheduleUpdate);
-  document.addEventListener('visibilitychange', scheduleUpdate);
+  window.addEventListener('pageshow', scheduleVisibleUpdate);
+  window.addEventListener('focus', scheduleVisibleUpdate);
+  document.addEventListener('visibilitychange', scheduleVisibleUpdate);
   window.addEventListener('focusin', scheduleUpdate, true);
   window.addEventListener('focusout', scheduleUpdate, true);
   const firstTimer = window.setTimeout(() => {
@@ -153,14 +179,16 @@ export const viewportMetrics = readable<ViewportMetrics>(
     vv?.removeEventListener('scroll', update);
     window.removeEventListener('resize', update);
     window.removeEventListener('orientationchange', scheduleUpdate);
-    window.removeEventListener('pageshow', scheduleUpdate);
-    document.removeEventListener('visibilitychange', scheduleUpdate);
+    window.removeEventListener('pageshow', scheduleVisibleUpdate);
+    window.removeEventListener('focus', scheduleVisibleUpdate);
+    document.removeEventListener('visibilitychange', scheduleVisibleUpdate);
     window.removeEventListener('focusin', scheduleUpdate, true);
     window.removeEventListener('focusout', scheduleUpdate, true);
     const root = document.documentElement;
     root.style.removeProperty('--app-viewport-height');
     root.style.removeProperty('--app-viewport-offset-top');
     root.style.removeProperty('--app-bottom-inset');
+    root.style.removeProperty('--app-bottom-control-inset');
     delete root.dataset.keyboard;
   };
 });

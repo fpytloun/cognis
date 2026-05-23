@@ -88,9 +88,30 @@
         : 'bg-slate-800/70 text-slate-200 border border-slate-700';
   }
 
+  const agentDefaultChatMode = $derived(
+    agent?.execution?.default_chat_mode === 'plan' || agent?.execution?.default_chat_mode === 'build'
+      ? agent.execution.default_chat_mode
+      : 'default'
+  );
+  const explicitChatMode = $derived(
+    item.chatMode && item.chatMode !== 'default' && item.chatMode !== agentDefaultChatMode ? item.chatMode : undefined
+  );
+
+  function modeBadgeClass(): string {
+    return explicitChatMode === 'build'
+      ? 'border-amber-300/45 bg-amber-300/10 text-amber-100'
+      : 'border-sky-300/30 bg-sky-300/[0.075] text-sky-100';
+  }
+
+  function modeClass(): string {
+    if (explicitChatMode === 'plan') return 'border-l-4 border-l-sky-300/60 bg-sky-300/[0.025]';
+    if (explicitChatMode === 'build') return 'border-l-4 border-l-amber-300/85 bg-amber-300/[0.055]';
+    return '';
+  }
+
   function proseClass(): string {
     return item.role === 'user'
-      ? 'prose-user prose-headings:text-slate-50 prose-p:text-slate-50 prose-strong:text-white prose-code:text-sky-100 prose-code:before:content-none prose-code:after:content-none prose-a:text-sky-100 prose-a:underline'
+      ? 'prose-user'
       : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
   }
 
@@ -389,7 +410,7 @@
         {/if}
       </div>
     {/if}
-    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${searchRingClass()}`}>
+    <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
       {#if item.html}
         <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
       {:else}
@@ -404,6 +425,9 @@
         <div class="flex min-w-0 items-center gap-1.5">
           <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-4 w-4 rounded-md text-[9px]" />
           <span class="truncate font-medium text-slate-200">{agentName}</span>
+          {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
+            <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
+          {/if}
           <span class="text-slate-500">·</span>
           <span class="text-slate-400" title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
         </div>
@@ -451,7 +475,7 @@
     </article>
   </div>
 {:else}
-  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${searchRingClass()}`}>
+  <article class={`overflow-hidden rounded-[1.4rem] px-3 py-2.5 shadow-card transition sm:rounded-3xl sm:px-4 sm:py-3 ${sizeClass()} ${bubbleClass()} ${modeClass()} ${searchRingClass()}`}>
     {#if item.html}
       <div use:addCodeCopyButtons={item.html} use:highlightSearch={{ query: searchQuery, active: searchActive }} class={`chat-markdown prose max-w-none overflow-x-auto break-words prose-pre:overflow-x-auto ${proseClass()}`}>{@html item.html}</div>
     {:else}
@@ -463,6 +487,9 @@
     {/if}
 
     <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5">
+      {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
+        <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
+      {/if}
       <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
       {#if item.streaming}
         <LiveDots inline={true} size="sm" tone="slate" />

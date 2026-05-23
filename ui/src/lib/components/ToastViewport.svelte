@@ -33,8 +33,7 @@ import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
 {#if $toastStore.length > 0}
   <div
     aria-live="polite"
-    class="pointer-events-none fixed z-[80] flex w-[min(22rem,calc(100vw-2rem))] flex-col gap-3"
-    style="top: calc(env(safe-area-inset-top, 0px) + 0.75rem); right: calc(env(safe-area-inset-right, 0px) + 0.75rem);"
+    class="app-floating-top-overlay pointer-events-none z-[80] flex w-auto max-w-[22rem] flex-col gap-3 sm:left-auto sm:w-[22rem]"
   >
     {#each $toastStore as toast (toast.id)}
       {@const config = variantConfig(toast)}

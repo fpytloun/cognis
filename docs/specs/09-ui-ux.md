@@ -49,6 +49,8 @@ Key UI elements:
 ### Streaming Responses
 Tokens stream in real-time via WebSocket. Markdown renders progressively.
 Code blocks get syntax highlighting as they form.
+Bare `http://` and `https://` URLs in assistant text are linkified outside code
+spans/blocks, without rewriting existing Markdown links or unsafe protocols.
 
 ### Delegation Status Cards
 Inline cards showing background work:
@@ -107,6 +109,10 @@ and is not re-fed into the model prompt in subsequent turns.
 [wrench] read_file("src/auth.py")  Approved | 0.3s
 ```
 
+Tool output keeps copyable raw text. JSON-shaped output uses the dedicated JSON
+viewer, diffs keep the file-diff renderer, and filesystem `read` output gets
+path-inferred syntax highlighting when a safe language match is available.
+
 ### Escalation Prompts
 When Intaris escalates:
 ```
@@ -122,13 +128,17 @@ Escalation timeout shown as countdown. Auto-denied on timeout.
 When the user types while a turn processes:
 ```
 [Processing...] 2 queued messages
-1. Follow-up question                 [Edit] [Delete]
-2. Add the deployment angle too       [Edit] [Delete]
+1. Follow-up question...        Waiting   [Details] [Edit] [Delete]
+2. Add the deployment angle...   Waiting   [Details] [Edit] [Delete]
 ```
 
 Queued messages remain visible until they are processed, deleted, or the queue
 updates from the server. Editing is limited to queued text; attachment changes
 use delete-and-recreate so the upload/reference lifecycle stays explicit.
+Each queued message is collapsed to a single compact row by default. The full
+message body is available through an explicit details or edit affordance, and
+expanded content stays height-bounded so long queued text cannot dominate the
+viewport.
 
 ### Session Compaction Cards
 When a session is compacted (automatic or manual `/compact`), an inline
@@ -153,6 +163,8 @@ cancelled), the composer area shows a contextual banner:
 The chat composer accepts slash commands:
 - `/compact` or `/summarize` — Trigger manual compaction of conversation history
 - `/new`, `/reset`, or `/clear` — Start fresh: new conversation (web) or new session (channel-bound)
+- `/undo` — Rebase the same conversation to hide the last normal user turn and all later assistant output; no new conversation is created
+- `/redo` — Restore the undone session if no normal message has diverged from the undo branch
 - `/approve` or `/deny` — Resolve pending escalation prompts
 
 Slash commands are rejected with an error if a turn is currently in progress.

@@ -1,3 +1,5 @@
+const PASTED_IMAGE_NAME_RE = /^(?:image|pasted|screenshot|clipboard).*?\.(?:png|jpe?g|gif|webp|heic|heif)$/i;
+
 function isPdfLike(type: string, name: string): boolean {
   return type.toLowerCase() === 'application/pdf' || name.toLowerCase().endsWith('.pdf');
 }
@@ -14,14 +16,26 @@ function ensureNamedFile(file: File | Blob, filename?: string): File {
   return new File([file], name, { type: file.type || 'application/octet-stream' });
 }
 
+export function pastedFileFingerprint(file: File): string {
+  const type = file.type || 'application/octet-stream';
+  const normalizedName = file.name.trim().toLowerCase();
+  const isPastedImage =
+    type.toLowerCase().startsWith('image/') &&
+    (!normalizedName || PASTED_IMAGE_NAME_RE.test(normalizedName));
+  if (isPastedImage) return `pasted-image:${type}:${file.size}`;
+  return `${normalizedName}:${type}:${file.size}:${file.lastModified}`;
+}
+
 function fileKey(file: File): string {
   return `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
 }
 
 function addUnique(files: File[], seen: Set<string>, file: File): void {
-  const key = fileKey(file);
-  if (seen.has(key)) return;
-  seen.add(key);
+  const keys = new Set([fileKey(file), pastedFileFingerprint(file)]);
+  for (const key of keys) {
+    if (seen.has(key)) return;
+  }
+  for (const key of keys) seen.add(key);
   files.push(file);
 }
 
