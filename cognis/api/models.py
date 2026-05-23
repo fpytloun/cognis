@@ -134,10 +134,14 @@ class ProfileUpdateRequest(BaseModel):
 class ProviderTestResultResponse(BaseModel):
     ok: bool
     model_resolved: str | None = None
+    model_sent: str | None = None
     latency_ms: int | None = None
     error_type: str | None = None
     error_detail: str | None = None
     tested_at: datetime | None = None
+    executor_routed: bool | None = None
+    executor_id: str | None = None
+    executor_backend: str | None = None
 
 
 class LLMProviderTestResponse(ProviderTestResultResponse):
@@ -209,6 +213,7 @@ class ConversationUpdateRequest(BaseModel):
     title: str | None = None
     project_id: str | None = None
     archived: bool | None = None
+    starred_at: datetime | None = None
 
 
 class ConversationResponse(BaseModel):
@@ -217,9 +222,14 @@ class ConversationResponse(BaseModel):
     agent_id: str
     project_id: str | None = None
     title: str | None = None
+    title_source: str = "unset"
     context: ConversationContextModel
     active_session_id: str | None = None
     active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
+    active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
+    starred_at: datetime | None = None
     status: str
     last_message_at: datetime | None = None
     last_read_at: datetime | None = None
@@ -227,6 +237,14 @@ class ConversationResponse(BaseModel):
     has_active_turn: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class ConversationTitleSuggestionResponse(BaseModel):
+    title: str | None = None
+    source: str = "intaris"
+    generated_at: str | None = None
+    available: bool = False
+    reason: str | None = None
 
 
 class MessageEventResponse(BaseModel):
@@ -247,12 +265,68 @@ class ActiveStreamSnapshotResponse(BaseModel):
     updated_at: str | None = None
 
 
+class ActiveToolOutputSnapshotResponse(BaseModel):
+    conversation_id: str
+    session_id: str
+    call_id: str
+    tool_name: str
+    turn_id: str | None = None
+    status: str = "running"
+    result: str = ""
+    stream: str | None = None
+    is_error: bool = False
+    chunk_count: int = 0
+    content_offset: int = 0
+    output_size: int = 0
+    truncated: bool = False
+    agent_visible_truncated: bool = False
+    transport_truncated: bool = False
+    has_full_output: bool = False
+    recovery_call_id: str | None = None
+    tool_output_artifact_id: str | None = None
+    anchors_available: bool = False
+    anchor_count: int = 0
+    updated_at: str | None = None
+
+
+class ToolOutputChunkResponse(BaseModel):
+    index: int
+    offset: int
+    stream: str | None = None
+    text: str
+
+
+class ToolOutputPageResponse(BaseModel):
+    conversation_id: str
+    session_id: str | None = None
+    call_id: str
+    status: str
+    source: str
+    content: str
+    chunks: list[ToolOutputChunkResponse] = Field(default_factory=list)
+    offset: int = 0
+    limit: int = 200
+    next_offset: int | None = None
+    prev_offset: int | None = None
+    has_more_before: bool = False
+    has_more_after: bool = False
+    output_size: int = 0
+    total_lines: int | None = None
+    recoverable: bool = False
+    truncated: bool = False
+    spool_truncated: bool = False
+
+
 class ActiveThinkingBlockResponse(BaseModel):
     block_id: str
     title: str
     content: str
     source: str = "summary"
     complete: bool = False
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    provider_block_index: int | None = None
 
 
 class ActiveThinkingSnapshotResponse(BaseModel):
@@ -272,6 +346,7 @@ class MessageHistoryResponse(BaseModel):
         description="Whether the controller currently has user-visible work running for this conversation.",
     )
     active_streams: list[ActiveStreamSnapshotResponse] = Field(default_factory=list)
+    active_tool_outputs: list[ActiveToolOutputSnapshotResponse] = Field(default_factory=list)
     active_session_id: str | None = Field(
         default=None,
         description="Active session identifier for switching the client from lineage bootstrap to active-session replay.",
@@ -410,6 +485,9 @@ class SessionResponse(BaseModel):
     idle_since: datetime | None = None
     completed_at: datetime | None = None
     result_summary: str | None = None
+    result_content: str | None = None
+    result_anchors: list[dict[str, Any]] | None = None
+    result_sections: list[dict[str, Any]] | None = None
     updated_at: datetime | None = None
 
 
@@ -441,6 +519,19 @@ class AgentRequestBase(BaseModel):
     avatar_image_id: str | None = None
     status: str | None = None
 
+    @field_validator("execution")
+    @classmethod
+    def _validate_execution_default_chat_mode(
+        cls,
+        value: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        raw_mode = value.get("default_chat_mode")
+        if raw_mode is not None and raw_mode not in {"default", "plan", "build"}:
+            raise ValueError("execution.default_chat_mode must be one of: default, plan, build")
+        return value
+
 
 class AgentCreateRequest(AgentRequestBase):
     agent_id: str | None = None  # optional: auto-generated from name
@@ -461,6 +552,19 @@ class AgentUpdateRequest(BaseModel):
     execution: dict[str, Any] | None = None
     avatar_image_id: str | None = None
     status: str | None = None
+
+    @field_validator("execution")
+    @classmethod
+    def _validate_execution_default_chat_mode(
+        cls,
+        value: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        raw_mode = value.get("default_chat_mode")
+        if raw_mode is not None and raw_mode not in {"default", "plan", "build"}:
+            raise ValueError("execution.default_chat_mode must be one of: default, plan, build")
+        return value
 
 
 class AgentResponse(BaseModel):
@@ -569,6 +673,7 @@ class LLMProviderUpdateRequest(BaseModel):
     display_name: str | None = None
     location: str | None = None
     backend: str | None = None
+    owner_scope: str | None = None
     config: dict[str, Any] | None = None
     status: str | None = None
 
@@ -578,6 +683,7 @@ class LLMProviderResponse(BaseModel):
     display_name: str
     location: str
     backend: str
+    owner_email: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     is_default: bool = False
     status: str
@@ -596,6 +702,44 @@ class LLMProviderOAuthStatusResponse(BaseModel):
     expires_at: float | None = None
 
 
+class CodexUsageWindowResponse(BaseModel):
+    used_percent: float
+    window_duration_mins: int | None = None
+    resets_at: str | None = None
+    reset_after_seconds: int | None = None
+
+
+class CodexUsageCreditsResponse(BaseModel):
+    has_credits: bool | None = None
+    unlimited: bool | None = None
+    balance: str | int | float | None = None
+
+
+class CodexUsageAdditionalLimitResponse(BaseModel):
+    limit_id: str | None = None
+    limit_name: str | None = None
+    primary: CodexUsageWindowResponse | None = None
+    secondary: CodexUsageWindowResponse | None = None
+    allowed: bool | None = None
+    limit_reached: bool | None = None
+
+
+class CodexUsageResponse(BaseModel):
+    provider_id: str
+    ok: bool = True
+    source: str = "chatgpt_codex_usage"
+    usage_url: str | None = None
+    fetched_at: str | None = None
+    plan_type: str | None = None
+    primary: CodexUsageWindowResponse | None = None
+    secondary: CodexUsageWindowResponse | None = None
+    credits: CodexUsageCreditsResponse | None = None
+    rate_limit_reached_type: str | None = None
+    allowed: bool | None = None
+    limit_reached: bool | None = None
+    additional_rate_limits: list[CodexUsageAdditionalLimitResponse] = Field(default_factory=list)
+
+
 class ModelRoutingEntry(BaseModel):
     model: str | None = None
     reasoning_effort: str | None = None
@@ -610,6 +754,7 @@ class ModelRoutingResponse(BaseModel):
     text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class ModelRoutingUpdateRequest(BaseModel):
@@ -621,6 +766,7 @@ class ModelRoutingUpdateRequest(BaseModel):
     text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
 
 
 class EnrichModelsRequest(BaseModel):
@@ -669,6 +815,8 @@ class TaskCreateRequest(BaseModel):
     source_type: str = "api"
     source_ref: str | None = None
     status: str = "draft"
+    draft: bool | None = None
+    start_immediately: bool | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
 
@@ -678,6 +826,14 @@ class TaskCreateRequest(BaseModel):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("status")
+    @classmethod
+    def _validate_create_status(cls, value: str) -> str:
+        status = str(value or "draft").strip().lower()
+        if status not in {"draft", "queued", "ready"}:
+            raise ValueError("Task create status must be one of: draft, queued, ready")
+        return status
 
 
 class TaskUpdateRequest(BaseModel):
@@ -888,6 +1044,9 @@ class StepRunResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     updated_at: datetime | None = None
+    duration_seconds: float | None = None
+    accumulated_duration_seconds: float | None = None
+    latest_attempt_duration_seconds: float | None = None
 
 
 class TaskDetailResponse(TaskResponse):
@@ -1312,6 +1471,7 @@ class SkillCreateRequest(BaseModel):
     auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
     assets: list[SkillAssetInput] | None = None
+    agent_id: str | None = None
 
 
 class SkillUpdateRequest(BaseModel):
@@ -1328,6 +1488,7 @@ class SkillUpdateRequest(BaseModel):
     auto_load: bool | None = None
     secret_placeholders: list[str] | None = None
     assets: list[SkillAssetInput] | None = None
+    agent_id: str | None = None
 
 
 class SkillImportRequest(BaseModel):

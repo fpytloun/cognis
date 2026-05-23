@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import Any, Protocol
 
 from cognis.models.agent import AgentDefinition
@@ -26,6 +26,7 @@ from cognis.models.session import (
     EventAppendResult,
     EventReadResult,
     IntarisSession,
+    IntarisSessionSummaries,
     ReasoningReportResult,
     SessionEvent,
 )
@@ -37,6 +38,8 @@ from cognis.models.tool import (
     ToolCall,
     ToolResult,
 )
+
+ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 
 
 class MemoryProvider(Protocol):
@@ -146,6 +149,7 @@ class GuardrailsProvider(Protocol):
     ) -> ReasoningReportResult: ...
     async def checkpoint(self, session_id: str, content: str) -> None: ...
     async def get_session(self, session_id: str) -> IntarisSession: ...
+    async def get_session_summaries(self, session_id: str) -> IntarisSessionSummaries: ...
     async def submit_decision(
         self, call_id: str, decision: str, note: str | None = None
     ) -> None: ...
@@ -176,6 +180,7 @@ class GuardrailsProvider(Protocol):
         server_name: str,
         tool_name: str,
         arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> ToolResult: ...
     async def list_mcp_servers(self, enabled_only: bool = True) -> list[dict[str, Any]]: ...
     async def list_mcp_tools(self) -> list[dict[str, Any]]: ...
@@ -209,7 +214,10 @@ class ExecutorConnection(Protocol):
     async def rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]: ...
     async def list_tools(self) -> list[dict[str, Any]]: ...
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
     ) -> ToolResult: ...
     async def cancel_call(self, call_id: str) -> None: ...
 
@@ -265,14 +273,28 @@ class LLMProvider(Protocol):
         explicit_model: str | None = None,
         task_type: str = "default",
         explicit_provider_id: str | None = None,
+        acting_user_email: str | None = None,
     ) -> str: ...
     async def resolve_model_target(
         self,
         explicit_model: str | None = None,
         task_type: str = "default",
         explicit_provider_id: str | None = None,
+        acting_user_email: str | None = None,
     ) -> tuple[str, str | None]: ...
-    async def get_model_info(self, model_id: str, provider_id: str | None = None) -> ModelInfo: ...
+    async def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+        task_type: str = "embedding",
+        **kwargs: Any,
+    ) -> list[list[float]]: ...
+    async def get_model_info(
+        self,
+        model_id: str,
+        provider_id: str | None = None,
+        acting_user_email: str | None = None,
+    ) -> ModelInfo: ...
     async def transcribe(
         self,
         audio_bytes: bytes,

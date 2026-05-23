@@ -43,6 +43,64 @@ from cognis.providers.llm.reasoning import enrich_model_entry
 logger = get_logger(__name__)
 
 
+def _session_result_anchors(content: str | None) -> list[dict[str, Any]]:
+    if not content:
+        return []
+    lines = content.splitlines()
+    anchors: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line_no, line in enumerate(lines, start=1):
+        if not line.startswith("[[") or not line.endswith("]]"):
+            continue
+        anchor = line[2:-2]
+        if not anchor.startswith("message:"):
+            continue
+        if current is not None:
+            current["end_line"] = line_no - 1
+            anchors.append(current)
+        current = {
+            "anchor": anchor,
+            "label": f"Assistant message {anchor.split(':', 1)[1]}",
+            "kind": "section",
+            "start_line": line_no,
+            "end_line": line_no,
+        }
+    if current is not None:
+        current["end_line"] = len(lines)
+        anchors.append(current)
+    return anchors
+
+
+def _session_result_sections(
+    content: str | None,
+    anchors: list[dict[str, Any]],
+    *,
+    max_chars: int = 12_000,
+) -> list[dict[str, Any]]:
+    if not content or not anchors:
+        return []
+    lines = content.splitlines()
+    sections: list[dict[str, Any]] = []
+    used_chars = 0
+    for anchor in anchors:
+        start = anchor.get("start_line")
+        end = anchor.get("end_line")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        text = "\n".join(lines[max(start - 1, 0) : min(end, len(lines))])
+        remaining = max_chars - used_chars
+        if remaining <= 0:
+            break
+        truncated = len(text) > remaining
+        if truncated:
+            text = text[:remaining].rstrip() + "\n[section truncated]"
+        used_chars += len(text)
+        sections.append({**anchor, "content": text, "truncated": truncated})
+        if truncated:
+            break
+    return sections
+
+
 def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
@@ -55,6 +113,7 @@ def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> Conv
         agent_id=row.agent_id,
         project_id=getattr(row, "project_id", None),
         title=row.title,
+        title_source=getattr(row, "title_source", "unset"),
         context=ConversationContextModel(
             type=row.context_type if hasattr(row, "context_type") else row.context.type,
             ref=row.context_ref if hasattr(row, "context_ref") else row.context.ref,
@@ -67,17 +126,23 @@ def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> Conv
         ),
         active_session_id=getattr(row, "active_session_id", None),
         active_executor_id=getattr(row, "active_executor_id", None),
+        active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
+        active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
+        active_executor_source=getattr(row, "active_executor_source", None),
+        starred_at=getattr(row, "starred_at", None),
         status=row.status,
         last_message_at=last_message_at,
         last_read_at=last_read_at,
         has_unread=has_unread,
-        has_active_turn=has_active_turn,
+        has_active_turn=has_active_turn or bool(getattr(row, "has_active_turn", False)),
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
     )
 
 
-def session_to_response(row: Any) -> SessionResponse:
+def session_to_response(row: Any, *, include_result_content: bool = False) -> SessionResponse:
+    result_content = getattr(row, "result_content", None) if include_result_content else None
+    result_anchors = _session_result_anchors(result_content)
     return SessionResponse(
         session_id=row.session_id,
         conversation_id=row.conversation_id,
@@ -95,6 +160,11 @@ def session_to_response(row: Any) -> SessionResponse:
         idle_since=row.idle_since,
         completed_at=row.completed_at,
         result_summary=row.result_summary,
+        result_content=result_content,
+        result_anchors=result_anchors if include_result_content else None,
+        result_sections=_session_result_sections(result_content, result_anchors)
+        if include_result_content
+        else None,
         updated_at=row.updated_at,
     )
 
@@ -250,6 +320,7 @@ def llm_provider_to_response(row: Any) -> LLMProviderResponse:
         display_name=row.display_name,
         location=row.location,
         backend=row.backend,
+        owner_email=getattr(row, "owner_email", None),
         config=config,
         is_default=getattr(row, "is_default", False),
         status=row.status,
@@ -356,7 +427,9 @@ def step_run_to_response(
     row: Any,
     *,
     deliverables: list[DeliverableResponse] | None = None,
+    accumulated_duration_seconds: float | None = None,
 ) -> StepRunResponse:
+    duration_seconds = _duration_seconds(row.started_at, row.completed_at)
     return StepRunResponse(
         step_run_id=row.step_run_id,
         task_id=row.task_id,
@@ -382,7 +455,23 @@ def step_run_to_response(
         started_at=row.started_at,
         completed_at=row.completed_at,
         updated_at=getattr(row, "updated_at", None),
+        duration_seconds=duration_seconds,
+        latest_attempt_duration_seconds=duration_seconds,
+        accumulated_duration_seconds=(
+            accumulated_duration_seconds
+            if accumulated_duration_seconds is not None
+            else duration_seconds
+        ),
     )
+
+
+def _duration_seconds(started_at: Any, completed_at: Any) -> float | None:
+    if started_at is None or completed_at is None:
+        return None
+    try:
+        return max(0.0, (completed_at - started_at).total_seconds())
+    except Exception:
+        return None
 
 
 def _coerce_dict_or_none(value: Any) -> dict[str, Any] | None:

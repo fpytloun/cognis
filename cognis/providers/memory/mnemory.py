@@ -797,8 +797,16 @@ class MnemoryProvider:
                     latency_ms=latency_ms,
                     circuit_state=self.breaker.state,
                 )
+            body = response.text[:500]
+            return ProviderHealth(
+                name="mnemory",
+                status="degraded",
+                latency_ms=latency_ms,
+                circuit_state=self.breaker.state,
+                error=f"HTTP {response.status_code}",
+                details={"status_code": response.status_code, "body": body},
+            )
         except Exception as exc:
             return ProviderHealth(
                 name="mnemory", status="degraded", error=str(exc), circuit_state=self.breaker.state
             )
-        return ProviderHealth(name="mnemory", status="degraded", circuit_state=self.breaker.state)

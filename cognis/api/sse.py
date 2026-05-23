@@ -142,23 +142,59 @@ class SSETurnObserver:
         attachments: list[dict[str, Any]] | None = None,
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
+        presentation: dict[str, Any] | None = None,
+    ) -> None:
+        if conversation_id != self._conversation_id or self._done:
+            return
+        data = {
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "result": result,
+            "is_error": is_error,
+            "duration_ms": duration_ms,
+            "attachments": strip_attachment_payload_bytes(attachments or []),
+            "file_diffs": file_diffs or [],
+            "turn_id": turn_id,
+        }
+        if presentation:
+            data.update(presentation)
+        await self._queue.put(
+            {
+                "event": "tool_result",
+                "data": data,
+            }
+        )
+
+    async def on_tool_output_chunk(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        delta: str,
+        stream: str | None,
+        turn_id: str | None = None,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
         await self._queue.put(
             {
-                "event": "tool_result",
+                "event": "tool_result_chunk",
                 "data": {
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "call_id": call_id,
                     "tool_name": tool_name,
-                    "result": result,
-                    "is_error": is_error,
-                    "duration_ms": duration_ms,
-                    "attachments": strip_attachment_payload_bytes(attachments or []),
-                    "file_diffs": file_diffs or [],
+                    "delta": delta,
+                    "stream": stream,
+                    "is_error": stream == "stderr",
                     "turn_id": turn_id,
+                    "chunk_index": chunk_index,
+                    "content_offset": content_offset,
                 },
             }
         )
@@ -174,6 +210,11 @@ class SSETurnObserver:
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None:
         if conversation_id != self._conversation_id or self._done:
             return
@@ -190,6 +231,11 @@ class SSETurnObserver:
                         "delta": delta,
                         "title": title,
                         "complete": complete,
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "duration_ms": duration_ms,
+                        "source": source,
+                        "provider_block_index": provider_block_index,
                     },
                 }
             )
@@ -206,6 +252,11 @@ class SSETurnObserver:
                         "title": title,
                         "complete": True,
                         "content": content,
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "duration_ms": duration_ms,
+                        "source": source,
+                        "provider_block_index": provider_block_index,
                     },
                 }
             )

@@ -22,6 +22,7 @@ from cognis.models.session import (
     EventAppendResult,
     EventReadResult,
     IntarisSession,
+    IntarisSessionSummaries,
     ReasoningReportResult,
     SessionEvent,
 )
@@ -169,6 +170,45 @@ class IntarisProvider:
             extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
         )
 
+    async def update_session_policy(
+        self,
+        session_id: str,
+        *,
+        agent_id: str,
+        user_id: str | None = None,
+        details: dict[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
+    ) -> None:
+        logger.info(
+            "intaris: update_session_policy",
+            extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
+        )
+
+        async def _do() -> None:
+            response = await self.client.patch(
+                f"/api/v1/session/{session_id}",
+                json={"details": details or {}, "policy": policy or {}},
+                headers=self._headers(agent_id, user_id),
+            )
+            if not response.is_success:
+                logger.error(
+                    "intaris: update_session_policy failed",
+                    extra={
+                        "extra_data": {
+                            "session_id": session_id,
+                            "status_code": response.status_code,
+                        }
+                    },
+                )
+            response.raise_for_status()
+
+        await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation=f"intaris update_session_policy({session_id})",
+            breaker=self.session_breaker,
+        )
+
     async def evaluate(
         self,
         session_id: str,
@@ -308,6 +348,22 @@ class IntarisProvider:
             breaker=self.session_breaker,
         )
 
+    async def get_session_summaries(self, session_id: str) -> IntarisSessionSummaries:
+        async def _do() -> IntarisSessionSummaries:
+            response = await self.client.get(
+                f"/api/v1/session/{session_id}/summary",
+                headers=self._headers(user_email=current_user_email.get()),
+            )
+            response.raise_for_status()
+            return IntarisSessionSummaries.model_validate(response.json())
+
+        return await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation=f"intaris get_session_summaries({session_id})",
+            breaker=self.session_breaker,
+        )
+
     async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
         async def _do() -> None:
             response = await self.client.post(
@@ -428,13 +484,15 @@ class IntarisProvider:
         last_n: int | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult:
-        params: dict[str, Any] = {"after_seq": after_seq}
-        if limit:
-            params["limit"] = limit
-        if types:
-            params["type"] = ",".join(types)
+        params: dict[str, Any] = {}
         if last_n is not None:
             params["last_n"] = last_n
+        else:
+            params["after_seq"] = after_seq
+            if limit:
+                params["limit"] = limit
+        if types:
+            params["type"] = ",".join(types)
         logger.debug(
             "intaris: read_events",
             extra={
@@ -500,6 +558,7 @@ class IntarisProvider:
         server_name: str,
         tool_name: str,
         arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> ToolResult:
         async def _do() -> ToolResult:
             response = await self.client.post(
@@ -509,6 +568,7 @@ class IntarisProvider:
                     "server": server_name,
                     "tool": tool_name,
                     "arguments": arguments,
+                    "context": context or {},
                 },
                 headers=self._headers(user_email=current_user_email.get()),
                 timeout=60.0,

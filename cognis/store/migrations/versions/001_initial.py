@@ -87,6 +87,7 @@ def upgrade() -> None:
         sa.Column("started_at", sa.TIMESTAMP(timezone=True), nullable=False),
         sa.Column("completed_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("result_summary", sa.Text(), nullable=True),
+        sa.Column("result_content", sa.Text(), nullable=True),
     )
     op.create_table(
         "settings",

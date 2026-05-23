@@ -94,7 +94,7 @@ def test_compaction_triggers_after_threshold_crossed(live_stack: LiveStack, run_
         event = compaction_events[0]
         data = event.get("data", {})
         assert "summary" in data, "Compaction event missing summary"
-        assert data.get("method") in ("llm", "mechanical"), (
+        assert data.get("method") in ("llm", "mechanical", "mechanical_sliding_window"), (
             f"Unexpected method: {data.get('method')}"
         )
 

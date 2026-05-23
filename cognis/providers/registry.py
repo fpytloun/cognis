@@ -17,7 +17,7 @@ from cognis.providers.executor.subprocess import SubprocessExecutorProvider
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
 from cognis.providers.guardrails.intaris import IntarisProvider
 from cognis.providers.llm.inference_router import InferenceRouter
-from cognis.providers.llm.litellm import LiteLLMProvider
+from cognis.providers.llm.service import LLMService
 from cognis.providers.memory.mnemory import MnemoryProvider
 from cognis.providers.secrets.encrypted_db import EncryptedDBSecretsProvider
 
@@ -29,11 +29,11 @@ class ProviderRegistry:
     executor: CompositeExecutorProvider
     secrets: EncryptedDBSecretsProvider
     credentials: EncryptedDBCredentialsProvider
-    llm: LiteLLMProvider
+    llm: LLMService
     auth: JWTAuthProvider
-    # LiteLLMProvider implements both LLMProvider and ImageGenerationProvider.
+    # LLMService implements both LLMProvider and ImageGenerationProvider.
     # This alias provides explicit access via the ImageGenerationProvider protocol.
-    image_generation: LiteLLMProvider | None = None
+    image_generation: LLMService | None = None
 
     async def health(self) -> dict[str, ProviderHealth]:
         return {
@@ -80,10 +80,11 @@ def build_provider_registry(
     # Build inference router (decouples LLM from executor)
     inference_router = InferenceRouter(ws_provider)
 
-    llm_provider = LiteLLMProvider(
+    llm_provider = LLMService(
         session_factory,
         secrets_provider=secrets_provider,
         inference_router=inference_router,
+        credentials_provider=credentials_provider,
     )
 
     registry = ProviderRegistry(
@@ -94,7 +95,7 @@ def build_provider_registry(
         credentials=credentials_provider,
         llm=llm_provider,
         auth=auth_provider,
-        # LiteLLMProvider implements ImageGenerationProvider
+        # LLMService implements ImageGenerationProvider
         image_generation=llm_provider,
     )
     registry._session_factory = session_factory  # type: ignore[attr-defined]
