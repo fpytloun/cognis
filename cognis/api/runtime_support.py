@@ -16,6 +16,10 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
+from cognis.core.executor_pin_lifecycle import (
+    ensure_active_executor_pin,
+    load_executor_pin_lifecycle_settings,
+)
 from cognis.core.executor_policy import (
     ExecutorPolicy,
     is_executor_row_usable,
@@ -373,25 +377,22 @@ async def _resolve_eligible_executor_config(
                 executor_owner_email=executor_owner_email,
                 policy=policy,
             )
-            from cognis.core.executor_pin_lifecycle import (
-                ensure_active_executor_pin,
-                load_executor_pin_lifecycle_settings,
-            )
-
-            settings = await load_executor_pin_lifecycle_settings(session_factory)
-            lifecycle = await ensure_active_executor_pin(
-                session_factory=session_factory,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                pool=pool,
-                active_executor_id=conversation_active_executor_id,
-                active_executor_expires_at=conversation_active_executor_expires_at,
-                ws_provider=getattr(getattr(providers, "executor", None), "websocket", None),
-                retry_seconds=settings["retry_seconds"],
-                retry_interval_seconds=settings["retry_interval_seconds"],
-            )
-            if lifecycle.active_executor_id:
-                conversation_active_executor_id = lifecycle.active_executor_id
+            lifecycle = None
+            if conversation_id or task_id:
+                settings = await load_executor_pin_lifecycle_settings(session_factory)
+                lifecycle = await ensure_active_executor_pin(
+                    session_factory=session_factory,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    pool=pool,
+                    active_executor_id=conversation_active_executor_id,
+                    active_executor_expires_at=conversation_active_executor_expires_at,
+                    ws_provider=getattr(getattr(providers, "executor", None), "websocket", None),
+                    retry_seconds=settings["retry_seconds"],
+                    retry_interval_seconds=settings["retry_interval_seconds"],
+                )
+                if lifecycle.active_executor_id:
+                    conversation_active_executor_id = lifecycle.active_executor_id
             assert isinstance(conversation_active_executor_id, str)
             target = pool.by_id(conversation_active_executor_id)
             if target is None:
@@ -564,7 +565,16 @@ def _management_tools_allowed(
 ) -> bool:
     if agent is None:
         return False
-    if "manage_agents" not in _opted_in_builtin_tools(agent):
+    opted_in = _opted_in_builtin_tools(agent)
+    agent_tools_config = agent.tools if isinstance(getattr(agent, "tools", None), dict) else {}
+    explicit_allow = {
+        str(item) for item in agent_tools_config.get("allow_tools") or [] if isinstance(item, str)
+    }
+    if (
+        "manage_agents" not in opted_in
+        and "manage_agents" not in explicit_allow
+        and "builtin:manage_agents" not in explicit_allow
+    ):
         return False
     if getattr(agent, "agent_type", "primary") == "secondary":
         return False
@@ -585,6 +595,25 @@ def select_static_tools(
     agent_tools_config = agent.tools if isinstance(agent.tools, dict) else {}
     builtin_allow = agent_tools_config.get("builtin_tools")
     allowlist = builtin_allow if isinstance(builtin_allow, list) else None
+    explicit_allow = {
+        str(item) for item in agent_tools_config.get("allow_tools") or [] if isinstance(item, str)
+    }
+    explicit_deny = {
+        str(item) for item in agent_tools_config.get("deny_tools") or [] if isinstance(item, str)
+    }
+    configured_groups = {
+        str(item) for item in agent_tools_config.get("tool_groups") or [] if isinstance(item, str)
+    }
+    group_allow: set[str] = set()
+    if configured_groups:
+        from cognis.core.agent_management import TOOL_GROUP_DEFINITIONS
+
+        group_allow = {
+            tool_id
+            for group in TOOL_GROUP_DEFINITIONS
+            if group.group_id in configured_groups
+            for tool_id in group.tool_ids
+        }
     skill_tool_names = load_skill_tool_names(agent)
     allow_all_builtins = allowlist is None or "*" in allowlist
     delegation_enabled = bool(agent_tools_config.get("delegation_tools", True))
@@ -609,6 +638,8 @@ def select_static_tools(
             if not default_off_allowed:
                 continue
         # Agent-level disable takes precedence
+        if any(tool_matches_identifier(tool, identifier) for identifier in explicit_deny):
+            continue
         if tool.category in disabled_categories or any(
             tool_matches_identifier(tool, identifier) for identifier in disabled_tools
         ):
@@ -624,7 +655,15 @@ def select_static_tools(
             continue
         if (
             allow_all_builtins
-            or (allowlist is not None and tool.name in allowlist)
+            or (
+                allowlist is not None
+                and (
+                    tool.name in allowlist
+                    or any(tool_matches_identifier(tool, identifier) for identifier in allowlist)
+                )
+            )
+            or any(tool_matches_identifier(tool, identifier) for identifier in group_allow)
+            or any(tool_matches_identifier(tool, identifier) for identifier in explicit_allow)
             or tool.name in skill_tool_names
         ):
             selected.append(tool)
@@ -906,15 +945,21 @@ def build_step_runtime_factory(
         # Add dynamic web tool definitions based on available backends
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
+        dynamic_web_tools = web_tool_definitions(
+            web_config["web_available_backends"],
+            default_backend=web_config.get("web_backend"),
+            available_search_backends=web_config.get("web_available_search_backends"),
+            available_fetch_backends=web_config.get("web_available_fetch_backends"),
+            default_search_backend=web_config.get("web_search_backend"),
+            default_fetch_backend=web_config.get("web_fetch_backend"),
+        )
+        allowed_web_tool_names = {
+            tool.name
+            for tool in select_static_tools(tool_agent, access_context=access_context)
+            if tool.category == "web"
+        }
         agent_tools.extend(
-            web_tool_definitions(
-                web_config["web_available_backends"],
-                default_backend=web_config.get("web_backend"),
-                available_search_backends=web_config.get("web_available_search_backends"),
-                available_fetch_backends=web_config.get("web_available_fetch_backends"),
-                default_search_backend=web_config.get("web_search_backend"),
-                default_fetch_backend=web_config.get("web_fetch_backend"),
-            )
+            tool for tool in dynamic_web_tools if tool.name in allowed_web_tool_names
         )
 
         # Resolve discoverable DB-backed skills for this agent and inject:

@@ -31,6 +31,10 @@ from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegi
 from cognis.tools.skills import ResolvedSkillSet
 
 
+async def _executor_pin_lifecycle_settings(_session_factory: object) -> dict[str, int]:
+    return {"retry_seconds": 0, "retry_interval_seconds": 0}
+
+
 def _agent(*, tools: dict[str, object] | None = None) -> AgentDefinition:
     return AgentDefinition(
         agent_id="agent-1",
@@ -125,6 +129,47 @@ def test_manage_agents_opt_in_bypasses_narrow_builtin_allowlist() -> None:
     selected = {tool.name for tool in select_static_tools(agent, access_context=access_context)}
 
     assert "manage_agents" in selected
+
+
+def test_agent_tool_group_allows_knowledgebase_read_tools() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={"builtin_tools": [], "tool_groups": ["knowledgebase_read"]},
+    )
+
+    selected = {
+        tool.name
+        for tool in select_static_tools(agent, knowledgebase_enabled=True)
+        if tool.category == "knowledgebase"
+    }
+
+    assert "knowledgebase_search" in selected
+    assert "knowledgebase_read_source_context" in selected
+    assert "knowledgebase_delete" not in selected
+
+
+def test_agent_tool_deny_overrides_tool_group() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        tools={
+            "builtin_tools": [],
+            "tool_groups": ["knowledgebase_read"],
+            "deny_tools": ["builtin:knowledgebase_status"],
+        },
+    )
+
+    selected = {
+        tool.name
+        for tool in select_static_tools(agent, knowledgebase_enabled=True)
+        if tool.category == "knowledgebase"
+    }
+
+    assert "knowledgebase_status" not in selected
+    assert "knowledgebase_search" in selected
 
 
 def test_manage_agents_hidden_for_shared_grantee_context() -> None:
@@ -1357,6 +1402,76 @@ async def test_direct_in_process_runtime_receives_knowledgebase_handlers(
         await runtime.cleanup()
 
 
+@pytest.mark.asyncio
+async def test_runtime_factory_applies_agent_deny_to_dynamic_web_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(*_: object, **__: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=False)
+
+    async def _eligible_executor_config(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "executor_id": "alice_local",
+            "executor_type": "in_process",
+            "enabled_tools": ["*"],
+            "enabled_tool_groups": ["web"],
+            "config": {},
+            "executor_owner_email": "alice@example.com",
+            "owner_email": "alice@example.com",
+            "selection_source": "explicit",
+            "runtime_state": "active",
+            "desired_config_version": 1,
+            "applied_config_version": 1,
+        }
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "web_available_backends": ["direct"],
+            "web_backend": "direct",
+            "web_available_search_backends": ["direct"],
+            "web_available_fetch_backends": ["direct"],
+            "web_search_backend": "direct",
+            "web_fetch_backend": "direct",
+        }
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    executor = _InProcessExecutorProvider()
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers_with_executor(executor),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+
+    runtime = await factory(
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_id": "alice_local"},
+            tools={"deny_tools": ["builtin:web_search"]},
+        ),
+        user_email="alice@example.com",
+    )
+
+    try:
+        config = executor.spawned_configs[0]
+        tool_names = {tool.name for tool in config.tools}  # type: ignore[attr-defined]
+        assert "web_crawl" in tool_names
+        assert "web_search" not in tool_names
+    finally:
+        await runtime.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # Stage 36: initial active executor pick + conversation-level pin
 # ---------------------------------------------------------------------------
@@ -1423,6 +1538,11 @@ async def test_pinned_active_executor_takes_precedence(
             return _executor_row("exec-add")
         return None
 
+    monkeypatch.setattr(
+        runtime_support,
+        "load_executor_pin_lifecycle_settings",
+        _executor_pin_lifecycle_settings,
+    )
     monkeypatch.setattr(store_queries, "list_executors", _list_executors)
     monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
 
@@ -1460,6 +1580,11 @@ async def test_pinned_unassigned_executor_raises(
             return _executor_row("exec-pri")
         return None
 
+    monkeypatch.setattr(
+        runtime_support,
+        "load_executor_pin_lifecycle_settings",
+        _executor_pin_lifecycle_settings,
+    )
     monkeypatch.setattr(store_queries, "list_executors", _list_executors)
     monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
 

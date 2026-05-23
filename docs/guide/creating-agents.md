@@ -42,23 +42,34 @@ For a first agent, keep personality instructions short and practical. Add more c
 - executor binding (specific executor or label selector)
 - additional executors (optional, agent-only routable — see below)
 - inherited tool categories from the selected executor
-- category and per-tool disable switches
+- explicit tool groups plus granular `allow_tools` / `deny_tools`
+- legacy category and per-tool disable switches
 - per-tool permission policy (`allow`, `evaluate`, `deny`)
+- assigned knowledgebases
 - allowed secrets
 - delegation permission
 - max delegation depth
 
-Agents inherit the tool pool from their selected executor. The effective tool
-set is:
+Agents combine curated tool assignment with runtime availability. The effective
+tool set is:
 
-1. tools enabled on the executor
-2. minus categories or individual tools disabled on the agent
-3. then filtered by per-tool permission policy for guardrails behavior
+1. default/static tools available to the agent runtime
+2. plus tools from explicit `tool_groups`
+3. plus individual `allow_tools`
+4. minus individual `deny_tools` and legacy disabled categories/tools
+5. then filtered by executor/MCP/runtime availability
+6. with `tool_permissions` applied separately for guardrails behavior
 
 If you leave the executor empty, Cognis resolves it from the agent's label
 selector or the system default executor.
 
-This means agent safety is shaped by both executor capabilities and the agent's own restrictions.
+Knowledgebase assignment is separate from tool assignment: `allowed_knowledgebases`
+controls which KBs the agent can access, while knowledgebase tools control what
+the agent can do with those KBs.
+
+Use `manage_agents` tool CRUD actions (`tools_list_available`, `tools_get`,
+`tools_validate`, `tools_set/add/remove`, and `knowledgebases_*`) rather than
+guessing tool IDs or editing raw blobs.
 
 ### Additional executors (Stage 36)
 

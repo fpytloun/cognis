@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-05-23
+
+### Added
+
+- Added explicit CRUD support for agent-specific tool assignments across runtime support, managed-agent tooling, documentation, and tests.
+
+### Fixed
+
+- Preserved the original artifact owner context when reading artifacts through routed tools so shared or delegated reads do not lose access to the source artifact.
+- Allowed repeated idle continuations in the agent loop so silent or continuation-only turns can keep progressing instead of stopping after the first idle continuation.
+
 ## [0.6.0] - 2026-05-23
 
 ### Added

@@ -307,6 +307,10 @@ Use this skill when the user asks the current primary agent to inspect, create, 
 # Safety Rules
 
 - Inspect before mutating. Use `manage_agents` with `action="list"` or `action="get"` before editing an existing agent.
+- For tool changes, prefer the explicit tool CRUD actions over raw settings: call `tools_list_available` or `tools_get`, validate with `tools_validate`, then use `tools_set`, `tools_add`, or `tools_remove`.
+- Prefer curated `tool_groups` for normal access and use `allow_tools` / `deny_tools` only for granular exceptions. Do not invent tool or group IDs.
+- Manage knowledgebase data access separately with `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove`; tool assignment controls what the agent can do, knowledgebase assignment controls which KBs it can access.
+- Do not confuse tool exposure (`tool_groups`, `allow_tools`, `deny_tools`) with guardrail permissions (`tool_permissions`).
 - Never try to manage yourself. If the target agent is the current agent, explain that self-management is not allowed.
 - Only manage agents owned by the current user. Shared agents are use-only and cannot be edited or reshared by grantees.
 - Treat delete as archive-only. Use `action="archive"`; do not promise permanent deletion.
@@ -318,6 +322,8 @@ Use this skill when the user asks the current primary agent to inspect, create, 
 - `list` and `get` for inspection.
 - `create` for new agents. Include full profile fields when the user provided them.
 - `update` for targeted edits to profile, tools, permissions, skills, LLM config, execution, and avatar fields.
+- `tools_list_available`, `tools_get`, `tools_validate`, `tools_set`, `tools_add`, and `tools_remove` for explicit tool assignment CRUD.
+- `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove` for explicit assigned knowledgebase CRUD.
 - `bindings_get` and `bindings_set` for primary-to-secondary agent bindings.
 - `shares_list`, `share_create`, `share_update`, and `share_revoke` for owner-only share management.
 - `sync_personality` after intentional identity/personality changes if synchronization is needed.

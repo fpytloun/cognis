@@ -345,6 +345,7 @@ async def _handle_artifact_read(
     user_email: str | None,
     current_model: str | None,
     current_provider_id: str | None,
+    owner_email: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -361,7 +362,8 @@ async def _handle_artifact_read(
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
-    if row.owner_email and user_email and row.owner_email != user_email:
+    effective_owner_email = owner_email or user_email
+    if row.owner_email and effective_owner_email and row.owner_email != effective_owner_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
 
     try:
@@ -398,7 +400,7 @@ async def _handle_artifact_read(
         session_factory=session_factory,
         current_model=current_model,
         current_provider_id=current_provider_id,
-        owner_email=user_email,
+        owner_email=effective_owner_email,
         text_offset=offset,
         text_limit=limit,
     )

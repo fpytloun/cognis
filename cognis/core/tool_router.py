@@ -560,13 +560,15 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.ARTIFACT:
+            from cognis.runtime_context import current_user_email
+
             result = await handle_artifact_tool(
                 tool_name=tool_call.name,
                 arguments=dict(tool_call.arguments),
                 llm=self.llm,
                 artifact_store=self.artifact_store,
                 session_factory=self._session_factory,
-                user_email=session.user_email,
+                user_email=current_user_email.get() or session.user_email,
                 current_model=(
                     str(tool_call.runtime_metadata.get("resolved_model"))
                     if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)

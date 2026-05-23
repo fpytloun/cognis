@@ -1644,6 +1644,171 @@ async def test_tool_router_handles_artifact_read_with_current_model(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_handles_artifact_read_with_owner_email_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"line one\nline two\n", "text/plain"
+
+    class _Session:
+        async def get(self, model: object, key: str) -> object | None:
+            del model, key
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="txt_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="texts",
+                object_id="txt_1",
+                filename="notes.txt",
+                mime_type="text/plain",
+                kind="file",
+                size_bytes=18,
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=None,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-text",
+            name="artifact_read",
+            arguments={"artifact_id": "txt_1"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert "1: line one" in result.metadata["_raw_output"]
+    assert result.metadata["artifact_id"] == "txt_1"
+
+
+@pytest.mark.asyncio
+async def test_artifact_read_uses_effective_owner_for_attachment_analysis_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    class _Llm:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] | None = None
+
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            if model_id == "no-vision":
+                return SimpleNamespace(
+                    supports_vision=False,
+                    supports_pdf_input=False,
+                    supports_audio_input=False,
+                    supports_file_input=False,
+                )
+            assert model_id == "vision-route"
+            assert provider_id == "route-provider"
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
+            del messages
+            self.kwargs = dict(kwargs)
+            return {"choices": [{"message": {"content": "Analyzed with route."}}]}
+
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    routing_owner_emails: list[str | None] = []
+
+    async def fake_get_model_routing(
+        session: object, task_type: str, owner_email: str | None = None
+    ) -> object | None:
+        del session
+        routing_owner_emails.append(owner_email)
+        assert task_type == "attachment_analysis"
+        if owner_email == "artifact-owner@example.com":
+            return SimpleNamespace(model="vision-route", provider_id="route-provider")
+        return None
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_1",
+                status="attached",
+                owner_email="artifact-owner@example.com",
+                namespace="images",
+                object_id="img_1",
+                filename="image.png",
+                mime_type="image/png",
+                kind="image",
+                size_bytes=8,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        fake_get_model_routing,
+    )
+
+    llm = _Llm()
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "img_1"},
+        llm=llm,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+        user_email="session-user@example.com",
+        current_model="no-vision",
+        owner_email="artifact-owner@example.com",
+    )
+
+    assert result.is_error is False
+    assert result.output == "Analyzed with route."
+    assert routing_owner_emails == ["artifact-owner@example.com"]
+    assert llm.kwargs == {
+        "model": "vision-route",
+        "task_type": "attachment_analysis",
+        "provider_id": "route-provider",
+    }
+
+
+@pytest.mark.asyncio
 async def test_tool_router_postprocesses_binary_read_with_current_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -19,7 +19,12 @@ from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.events import Event, EventType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.tool import stable_tool_id
+from cognis.models.tool import (
+    ToolCapability,
+    stable_tool_id,
+    tool_capabilities,
+    tool_matches_identifier,
+)
 from cognis.store.models import AuditLog, Schedule, Task
 from cognis.store.queries import (
     create_agent,
@@ -31,6 +36,7 @@ from cognis.store.queries import (
     list_agent_grants,
     list_agents,
     list_executors,
+    list_knowledgebases,
     list_llm_providers,
     list_secondary_bindings,
     list_skills,
@@ -42,12 +48,57 @@ from cognis.store.queries import (
     update_agent_grant,
 )
 from cognis.tools.builtin.image import _image_bytes
+from cognis.tools.builtin.knowledgebase import knowledgebase_tools
 
 logger = get_logger(__name__)
 
 
+KNOWLEDGEBASE_READ_TOOL_IDS = (
+    "builtin:knowledgebase_list",
+    "builtin:knowledgebase_get",
+    "builtin:knowledgebase_list_artifacts",
+    "builtin:knowledgebase_list_jobs",
+    "builtin:knowledgebase_status",
+    "builtin:knowledgebase_diagnostics",
+    "builtin:knowledgebase_search",
+    "builtin:knowledgebase_read_source_context",
+)
+
+
 class AgentManagementError(ValueError):
     """Expected user-facing agent-management failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolGroupDefinition:
+    """Curated agent tool assignment preset."""
+
+    group_id: str
+    name: str
+    description: str
+    tool_ids: tuple[str, ...]
+    risk_level: str
+    mutating: bool = False
+    requires_executor: bool = False
+
+
+TOOL_GROUP_DEFINITIONS: tuple[ToolGroupDefinition, ...] = (
+    ToolGroupDefinition(
+        group_id="knowledgebase_read",
+        name="Knowledgebase read/search",
+        description="Read, inspect, search, and cite assigned knowledgebases without mutation.",
+        tool_ids=KNOWLEDGEBASE_READ_TOOL_IDS,
+        risk_level="low",
+    ),
+    ToolGroupDefinition(
+        group_id="knowledgebase_manage",
+        name="Knowledgebase management",
+        description="Full built-in knowledgebase management, including artifact attachment, indexing, and deletion.",
+        tool_ids=tuple(stable_tool_id(tool) for tool in knowledgebase_tools()),
+        risk_level="high",
+        mutating=True,
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -104,6 +155,26 @@ async def handle_agent_management_action(
             return await _settings_schema(deps, actor_email, current_agent_id, arguments)
         if action == "settings_update":
             return await _settings_update(deps, actor_email, current_agent_id, arguments)
+        if action == "tools_list_available":
+            return await _tools_list_available()
+        if action == "tools_get":
+            return await _tools_get(deps, actor_email, current_agent_id, arguments)
+        if action == "tools_validate":
+            return await _tools_validate(deps, actor_email, current_agent_id, arguments)
+        if action in {"tools_set", "tools_add", "tools_remove"}:
+            return await _tools_update(
+                deps, actor_email, current_agent_id, arguments, mode=action.removeprefix("tools_")
+            )
+        if action == "knowledgebases_get":
+            return await _knowledgebases_get(deps, actor_email, current_agent_id, arguments)
+        if action in {"knowledgebases_set", "knowledgebases_add", "knowledgebases_remove"}:
+            return await _knowledgebases_update(
+                deps,
+                actor_email,
+                current_agent_id,
+                arguments,
+                mode=action.removeprefix("knowledgebases_"),
+            )
         if action == "create":
             return await _create_agent(deps, actor_email, arguments)
         if action == "update":
@@ -227,6 +298,144 @@ async def _settings_update(
         "agent_id": row.agent_id,
         "settings": _agent_settings_payload(row),
         "agent": agent_to_response(row).model_dump(mode="json"),
+    }
+
+
+async def _tools_list_available() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "tool_groups": [_tool_group_payload(group) for group in TOOL_GROUP_DEFINITIONS],
+        "tools": [_tool_descriptor(tool) for tool in _available_agent_tool_definitions()],
+    }
+
+
+async def _tools_get(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    return {
+        "status": "ok",
+        "agent_id": row.agent_id,
+        "tools": _agent_tool_assignment_payload(row),
+    }
+
+
+async def _tools_validate(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    proposed = _tool_assignment_from_arguments(arguments, row)
+    validation = _validate_tool_assignment(row, proposed)
+    return {
+        "status": "ok",
+        "agent_id": row.agent_id,
+        **validation,
+        "effective_tools": _effective_assignment_tools(proposed),
+    }
+
+
+async def _tools_update(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    current = _configured_tool_assignment(row)
+    if mode == "set":
+        proposed = _tool_assignment_from_arguments(arguments, row)
+    else:
+        delta = _tool_assignment_from_arguments(arguments, row, default_empty=True)
+        proposed = {
+            key: _apply_assignment_delta(
+                current.get(key, []), delta.get(key, []), remove=mode == "remove"
+            )
+            for key in ("tool_groups", "allow_tools", "deny_tools")
+        }
+    validation = _validate_tool_assignment(row, proposed)
+    if not validation["valid"]:
+        return {
+            "status": "invalid",
+            "agent_id": row.agent_id,
+            **validation,
+            "effective_tools": _effective_assignment_tools(proposed),
+        }
+
+    tools = dict(row.tools) if isinstance(row.tools, dict) else {}
+    tools.update(proposed)
+    async with deps.session_factory() as session:
+        ok = await update_agent(session, row.agent_id, updates={"tools": tools})
+        if not ok:
+            raise AgentManagementError("Agent tools update failed")
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+    await _audit(deps, actor_email, row.agent_id, f"tools_{mode}", "success", arguments)
+    return {
+        "status": "updated",
+        "agent_id": row.agent_id,
+        "tools": _agent_tool_assignment_payload(row),
+    }
+
+
+async def _knowledgebases_get(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    assigned = _assigned_knowledgebase_ids(row)
+    return {
+        "status": "ok",
+        "agent_id": row.agent_id,
+        "assigned_knowledgebases": assigned,
+        "available_knowledgebases": await _available_knowledgebase_options(deps, actor_email),
+    }
+
+
+async def _knowledgebases_update(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    raw_ids = arguments.get("knowledgebase_ids", arguments.get("assigned_knowledgebases"))
+    selected = _validated_string_list(raw_ids, "knowledgebase_ids")
+    valid_ids = {item["id"] for item in await _available_knowledgebase_options(deps, actor_email)}
+    invalid = sorted(item for item in selected if item not in valid_ids)
+    if invalid:
+        raise AgentManagementError(f"Invalid knowledgebase_ids: {', '.join(invalid)}")
+    current = _assigned_knowledgebase_ids(row)
+    if mode == "set":
+        assigned = selected
+    else:
+        assigned = _apply_assignment_delta(current, selected, remove=mode == "remove")
+    permissions = dict(row.permissions) if isinstance(row.permissions, dict) else {}
+    permissions["allowed_knowledgebases"] = assigned
+    async with deps.session_factory() as session:
+        ok = await update_agent(session, row.agent_id, updates={"permissions": permissions})
+        if not ok:
+            raise AgentManagementError("Agent knowledgebase assignment update failed")
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+    await _audit(deps, actor_email, row.agent_id, f"knowledgebases_{mode}", "success", arguments)
+    return {
+        "status": "updated",
+        "agent_id": row.agent_id,
+        "assigned_knowledgebases": _assigned_knowledgebase_ids(row),
     }
 
 
@@ -612,6 +821,7 @@ def _agent_settings_payload(row: Any) -> dict[str, Any]:
     return {
         "tools": tools,
         "tools_state": _tools_state(tools, raw_value=row.tools),
+        "tool_assignment": _agent_tool_assignment_payload(row),
         "skills": skills,
         "enabled_skills": _enabled_skill_ids(skills),
         "permissions": permissions,
@@ -660,6 +870,9 @@ def _tools_state(tools: dict[str, Any] | None, *, raw_value: Any) -> dict[str, A
         "opt_in_builtin_tools": _string_list(tools.get("opt_in_builtin_tools")) if tools else [],
         "disabled_categories": _string_list(tools.get("disabled_categories")) if tools else [],
         "disabled_tools": _string_list(tools.get("disabled_tools")) if tools else [],
+        "tool_groups": _string_list(tools.get("tool_groups")) if tools else [],
+        "allow_tools": _string_list(tools.get("allow_tools")) if tools else [],
+        "deny_tools": _string_list(tools.get("deny_tools")) if tools else [],
         "delegation_tools": tools.get("delegation_tools", True) if tools else True,
         "intaris_mcp_servers": _string_list(tools.get("intaris_mcp_servers")) if tools else [],
         "inline_mcp_servers": _inline_mcp_server_names(tools.get("mcp_servers")) if tools else [],
@@ -685,7 +898,7 @@ async def _agent_settings_schema(
             "category": tool.category,
             "source": tool.source.model_dump(mode="json"),
         }
-        for tool in static_tool_definitions()
+        for tool in static_tool_definitions(knowledgebase_enabled=True)
     ]
     fields: dict[str, Any] = {
         "available_workflow_ids": {
@@ -776,6 +989,29 @@ async def _agent_settings_schema(
             "storage": "tools.disabled_tools",
             "options": tool_options,
         },
+        "tool_groups": {
+            "type": "multi_select",
+            "storage": "tools.tool_groups",
+            "options": [
+                {
+                    "id": group.group_id,
+                    "label": group.name,
+                    "risk_level": group.risk_level,
+                    "mutating": group.mutating,
+                }
+                for group in TOOL_GROUP_DEFINITIONS
+            ],
+        },
+        "allow_tools": {
+            "type": "multi_select",
+            "storage": "tools.allow_tools",
+            "options": tool_options,
+        },
+        "deny_tools": {
+            "type": "multi_select",
+            "storage": "tools.deny_tools",
+            "options": tool_options,
+        },
         "intaris_mcp_servers": {
             "type": "multi_select",
             "storage": "tools.intaris_mcp_servers",
@@ -796,6 +1032,11 @@ async def _agent_settings_schema(
             ],
         },
         "tool_permissions": {"type": "object", "storage": "permissions.tool_permissions"},
+        "allowed_knowledgebases": {
+            "type": "multi_select",
+            "storage": "permissions.allowed_knowledgebases",
+            "options": await _available_knowledgebase_options(deps, actor_email),
+        },
         "allowed_secrets": {"type": "multi_select", "storage": "permissions.allowed_secrets"},
         "allowed_credentials": {
             "type": "multi_select",
@@ -885,6 +1126,9 @@ async def _settings_updates(
             "opt_in_builtin_tools",
             "disabled_categories",
             "disabled_tools",
+            "tool_groups",
+            "allow_tools",
+            "deny_tools",
             "intaris_mcp_servers",
             "mcp_servers",
         }:
@@ -892,6 +1136,7 @@ async def _settings_updates(
             updates["tools"] = tools
         elif field in {
             "tool_permissions",
+            "allowed_knowledgebases",
             "allowed_secrets",
             "allowed_credentials",
             "can_delegate",
@@ -921,10 +1166,14 @@ def _settings_field_names() -> set[str]:
         "opt_in_builtin_tools",
         "disabled_categories",
         "disabled_tools",
+        "tool_groups",
+        "allow_tools",
+        "deny_tools",
         "intaris_mcp_servers",
         "mcp_servers",
         "enabled_skills",
         "tool_permissions",
+        "allowed_knowledgebases",
         "allowed_secrets",
         "allowed_credentials",
         "can_delegate",
@@ -997,6 +1246,11 @@ def _apply_tools_setting(tools: dict[str, Any], field: str, value: Any, row: Any
         ]
     elif field in {"disabled_categories", "disabled_tools", "intaris_mcp_servers"}:
         tools[field] = _validated_string_list(value, field)
+    elif field == "tool_groups":
+        tools[field] = _validated_string_list(value, field, valid=set(_tool_group_map()))
+    elif field in {"allow_tools", "deny_tools"}:
+        valid_tools = set(_available_tool_map())
+        tools[field] = _validated_string_list(value, field, valid=valid_tools)
     elif field == "mcp_servers":
         if not isinstance(value, list):
             raise AgentManagementError("mcp_servers must be a list")
@@ -1006,7 +1260,7 @@ def _apply_tools_setting(tools: dict[str, Any], field: str, value: Any, row: Any
 def _apply_permissions_setting(permissions: dict[str, Any], field: str, value: Any) -> None:
     if field == "tool_permissions":
         permissions[field] = _object(value, field)
-    elif field in {"allowed_secrets", "allowed_credentials"}:
+    elif field in {"allowed_secrets", "allowed_credentials", "allowed_knowledgebases"}:
         permissions[field] = _validated_string_list(value, field)
     elif field == "can_delegate":
         if not isinstance(value, bool):
@@ -1068,6 +1322,200 @@ def _validated_string_list(value: Any, field: str, *, valid: set[str] | None = N
         if invalid:
             raise AgentManagementError(f"Invalid {field}: {', '.join(invalid)}")
     return items
+
+
+def _configured_tool_assignment(row: Any) -> dict[str, list[str]]:
+    tools = row.tools if isinstance(row.tools, dict) else {}
+    return {
+        "tool_groups": _string_list(tools.get("tool_groups")),
+        "allow_tools": _string_list(tools.get("allow_tools")),
+        "deny_tools": _string_list(tools.get("deny_tools")),
+    }
+
+
+def _tool_assignment_from_arguments(
+    arguments: dict[str, Any], row: Any, *, default_empty: bool = False
+) -> dict[str, list[str]]:
+    current = {"tool_groups": [], "allow_tools": [], "deny_tools": []}
+    if not default_empty:
+        current = _configured_tool_assignment(row)
+    raw_tools = arguments.get("tools")
+    if raw_tools is not None:
+        if not isinstance(raw_tools, dict):
+            raise AgentManagementError("tools must be an object")
+        source = raw_tools
+    else:
+        source = arguments
+    return {
+        key: _validated_string_list(source[key], key) if key in source else list(current[key])
+        for key in ("tool_groups", "allow_tools", "deny_tools")
+    }
+
+
+def _agent_tool_assignment_payload(row: Any) -> dict[str, Any]:
+    configured = _configured_tool_assignment(row)
+    validation = _validate_tool_assignment(row, configured)
+    return {
+        "configured": configured,
+        "effective_tools": _effective_assignment_tools(configured),
+        "validation": validation,
+    }
+
+
+def _available_agent_tool_definitions() -> list[Any]:
+    from cognis.api.runtime_support import static_tool_definitions
+
+    return sorted(static_tool_definitions(knowledgebase_enabled=True), key=stable_tool_id)
+
+
+def _available_tool_map() -> dict[str, Any]:
+    tools = _available_agent_tool_definitions()
+    mapping: dict[str, Any] = {}
+    for tool in tools:
+        mapping[stable_tool_id(tool)] = tool
+        mapping.setdefault(tool.name, tool)
+    return mapping
+
+
+def _tool_group_map() -> dict[str, ToolGroupDefinition]:
+    return {group.group_id: group for group in TOOL_GROUP_DEFINITIONS}
+
+
+def _tool_group_payload(group: ToolGroupDefinition) -> dict[str, Any]:
+    return {
+        "id": group.group_id,
+        "name": group.name,
+        "description": group.description,
+        "tools": list(group.tool_ids),
+        "risk_level": group.risk_level,
+        "mutating": group.mutating,
+        "requires_executor": group.requires_executor,
+    }
+
+
+def _tool_descriptor(tool: Any) -> dict[str, Any]:
+    capabilities = sorted(str(capability) for capability in tool_capabilities(tool))
+    group_ids = [
+        group.group_id
+        for group in TOOL_GROUP_DEFINITIONS
+        if any(tool_matches_identifier(tool, identifier) for identifier in group.tool_ids)
+    ]
+    mutating = not tool.read_only or any(
+        capability in tool_capabilities(tool)
+        for capability in {ToolCapability.WRITE, ToolCapability.DESTRUCTIVE}
+    )
+    return {
+        "id": stable_tool_id(tool),
+        "name": tool.name,
+        "description": tool.description,
+        "category": tool.category,
+        "profile_group": tool.profile_group,
+        "source": tool.source.type,
+        "read_only": tool.read_only,
+        "mutating": mutating,
+        "risk_level": tool.risk_level
+        or (
+            "high"
+            if ToolCapability.PRIVILEGED in tool_capabilities(tool)
+            else "medium"
+            if mutating
+            else "low"
+        ),
+        "capabilities": capabilities,
+        "requires_executor": tool.source.type == "executor",
+        "default_off": tool.name == "manage_agents",
+        "group_ids": group_ids,
+    }
+
+
+def _validate_tool_assignment(row: Any, configured: dict[str, list[str]]) -> dict[str, Any]:
+    errors: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    tools = _available_tool_map()
+    groups = _tool_group_map()
+    for group_id in configured["tool_groups"]:
+        if group_id not in groups:
+            errors.append({"field": "tool_groups", "id": group_id, "reason": "Unknown tool group"})
+    for field in ("allow_tools", "deny_tools"):
+        for tool_id in configured[field]:
+            if tool_id not in tools:
+                errors.append({"field": field, "id": tool_id, "reason": "Unknown tool"})
+    overlap = sorted(
+        set(_normalize_tool_identifier(item) for item in configured["allow_tools"])
+        & set(_normalize_tool_identifier(item) for item in configured["deny_tools"])
+    )
+    for tool_id in overlap:
+        errors.append(
+            {"field": "tools", "id": tool_id, "reason": "Tool cannot be both allowed and denied"}
+        )
+    if getattr(row, "agent_type", "primary") == "secondary":
+        for tool_id in _effective_assignment_tools(configured):
+            tool = tools.get(tool_id)
+            if tool and tool.name == "manage_agents":
+                errors.append(
+                    {
+                        "field": "allow_tools",
+                        "id": tool_id,
+                        "reason": "secondary agents cannot manage agents",
+                    }
+                )
+    if any(
+        tool_id.startswith("builtin:knowledgebase_")
+        for tool_id in _effective_assignment_tools(configured)
+    ) and not _assigned_knowledgebase_ids(row):
+        warnings.append(
+            {
+                "field": "allowed_knowledgebases",
+                "reason": "Knowledgebase tools are assigned but no knowledgebases are assigned",
+            }
+        )
+    return {"valid": not errors, "errors": errors, "warnings": warnings}
+
+
+def _effective_assignment_tools(configured: dict[str, list[str]]) -> list[str]:
+    groups = _tool_group_map()
+    selected: list[str] = []
+    for group_id in configured["tool_groups"]:
+        group = groups.get(group_id)
+        if group:
+            selected.extend(group.tool_ids)
+    selected.extend(configured["allow_tools"])
+    denied = set(_normalize_tool_identifier(item) for item in configured["deny_tools"])
+    normalized: list[str] = []
+    for tool_id in selected:
+        stable_id = _normalize_tool_identifier(tool_id)
+        if stable_id not in denied and stable_id not in normalized:
+            normalized.append(stable_id)
+    return normalized
+
+
+def _normalize_tool_identifier(identifier: str) -> str:
+    tool = _available_tool_map().get(identifier)
+    return stable_tool_id(tool) if tool else identifier
+
+
+def _apply_assignment_delta(current: list[str], delta: list[str], *, remove: bool) -> list[str]:
+    if remove:
+        removal = set(delta)
+        return [item for item in current if item not in removal]
+    result = list(current)
+    for item in delta:
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def _assigned_knowledgebase_ids(row: Any) -> list[str]:
+    permissions = row.permissions if isinstance(row.permissions, dict) else {}
+    return _string_list(permissions.get("allowed_knowledgebases"))
+
+
+async def _available_knowledgebase_options(
+    deps: AgentManagementDependencies, actor_email: str
+) -> list[dict[str, Any]]:
+    async with deps.session_factory() as session:
+        rows = await list_knowledgebases(session, owner_email=actor_email)
+    return [{"id": row.knowledgebase_id, "name": row.name, "status": row.status} for row in rows]
 
 
 def _string_list(value: Any) -> list[str]:

@@ -243,9 +243,18 @@ class AgentPermissions(BaseModel):
     allowed_tools: list[str] | None = None   # Legacy allowlist
     denied_tools: list[str] | None = None    # Legacy denylist
     allowed_secrets: list[str] = []
+    allowed_credentials: list[str] = []
+    allowed_knowledgebases: list[str] = []
     max_delegation_depth: int = 5
     can_delegate: bool = True
 ```
+
+Tool exposure is configured on `AgentDefinition.tools` through curated
+`tool_groups` and granular `allow_tools` / `deny_tools`. `tool_permissions`
+does not expose or hide tools; it controls guardrail behavior after a tool is
+available. Knowledgebase access is intentionally separate:
+`allowed_knowledgebases` controls data scope, while knowledgebase tool groups
+control what operations the agent can perform.
 
 ### LLM Configuration
 

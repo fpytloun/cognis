@@ -15,6 +15,7 @@ from cognis.store.queries import (
     create_agent_grant,
     create_conversation,
     create_executor,
+    create_knowledgebase,
     create_skill,
     create_user,
     create_workflow,
@@ -687,5 +688,88 @@ def test_agent_management_settings_update_rejects_invalid_values(
             assert "Invalid default_workflow_id: missing-workflow" in str(exc)
         else:
             raise AssertionError("Expected settings_update to reject an invalid workflow ID")
+
+    asyncio.run(_run())
+
+
+def test_agent_management_tool_assignment_crud_and_validation(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                display_name="Managed Agent",
+                status="active",
+            )
+            kb = await create_knowledgebase(
+                session,
+                owner_email="owner@example.com",
+                name="Docs",
+            )
+            await session.commit()
+
+        available = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "tools_list_available"},
+        )
+        assert "knowledgebase_read" in {group["id"] for group in available["tool_groups"]}
+        assert "builtin:knowledgebase_search" in {tool["id"] for tool in available["tools"]}
+
+        invalid = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "tools_validate",
+                "agent_id": "managed-agent",
+                "tool_groups": ["missing"],
+            },
+        )
+        assert invalid["valid"] is False
+        assert invalid["errors"][0]["reason"] == "Unknown tool group"
+
+        updated = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "tools_set",
+                "agent_id": "managed-agent",
+                "tool_groups": ["knowledgebase_read"],
+                "deny_tools": ["builtin:knowledgebase_status"],
+            },
+        )
+        assert updated["tools"]["configured"]["tool_groups"] == ["knowledgebase_read"]
+        assert "builtin:knowledgebase_search" in updated["tools"]["effective_tools"]
+        assert "builtin:knowledgebase_status" not in updated["tools"]["effective_tools"]
+        assert updated["tools"]["validation"]["warnings"][0]["field"] == "allowed_knowledgebases"
+
+        kb_updated = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "knowledgebases_set",
+                "agent_id": "managed-agent",
+                "knowledgebase_ids": [kb.knowledgebase_id],
+            },
+        )
+        assert kb_updated["assigned_knowledgebases"] == [kb.knowledgebase_id]
+
+        reread = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "knowledgebases_get", "agent_id": "managed-agent"},
+        )
+        assert reread["assigned_knowledgebases"] == [kb.knowledgebase_id]
 
     asyncio.run(_run())

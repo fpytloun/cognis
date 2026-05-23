@@ -1001,6 +1001,7 @@ def _should_auto_continue_after_mid_stream_failure(message: str) -> bool:
 
 
 _MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS = 1
+_IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS = 3
 _IDLE_TIMEOUT_CATEGORIES = {
     MidStreamErrorCategory.IDLE_TIMEOUT_RAW.value,
     MidStreamErrorCategory.IDLE_TIMEOUT_ACTIVITY.value,
@@ -4607,6 +4608,8 @@ class AgentLoop:
         _MAX_OPENAI_TOOL_SEARCH_RETRIES = 1
         model_error_continuation_count = 0
         max_model_error_continuations = _MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS
+        idle_timeout_continuation_count = 0
+        max_idle_timeout_continuations = _IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         promoted_tool_ids = self._get_initial_promoted_tool_ids(ctx)
         activated_tool_ids = self._get_initial_activated_tool_ids(ctx)
@@ -5558,14 +5561,30 @@ class AgentLoop:
                         }
                     },
                 )
+                is_idle_timeout_failure = _is_llm_idle_timeout_error(mid_stream_error)
+                continuation_count = (
+                    idle_timeout_continuation_count
+                    if is_idle_timeout_failure
+                    else model_error_continuation_count
+                )
+                max_continuations = (
+                    max_idle_timeout_continuations
+                    if is_idle_timeout_failure
+                    else max_model_error_continuations
+                )
                 if (
                     _should_continue_after_exhausted_mid_stream_failure(
                         mid_stream_error,
                         mid_stream_error_details,
                     )
-                    and model_error_continuation_count < max_model_error_continuations
+                    and continuation_count < max_continuations
                 ):
-                    model_error_continuation_count += 1
+                    if is_idle_timeout_failure:
+                        idle_timeout_continuation_count += 1
+                        continuation_count = idle_timeout_continuation_count
+                    else:
+                        model_error_continuation_count += 1
+                        continuation_count = model_error_continuation_count
                     reason_class = _mid_stream_reason_class(mid_stream_error_details, "other")
                     continuation_notice = (
                         "Model stream failed after saved work. Cognis preserved the work "
@@ -5591,8 +5610,8 @@ class AgentLoop:
                                     f"{ctx.session.session_id}:{ctx.turn_id or 'none'}:"
                                     "model_recovery:continuation"
                                 ),
-                                "attempt": model_error_continuation_count,
-                                "max_attempts": max_model_error_continuations,
+                                "attempt": continuation_count,
+                                "max_attempts": max_continuations,
                                 "provider_id": current_provider_id,
                                 "model": current_model,
                                 "reason_class": reason_class,

@@ -2249,6 +2249,74 @@ class _ModelErrorThenRecoveredDirectLLM:
         yield {"choices": [{"delta": {"content": "Recovered after model error."}}]}
 
 
+class _AlwaysSilentDirectLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        while True:
+            await asyncio.sleep(60)
+            yield {"choices": []}
+
+
+class _SilentThenContinuationRecoveredDirectLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 3:
+            assert any(
+                message["role"] == "system"
+                and "previous model stream failed" in str(message["content"])
+                for message in messages
+            )
+            yield {"choices": [{"delta": {"content": "Recovered after continuation."}}]}
+            return
+        while True:
+            await asyncio.sleep(60)
+            yield {"choices": []}
+
+
+class _RepeatedIdleThenContinuationRecoveredDirectLLM:
+    def __init__(self, *, idle_failures: int) -> None:
+        self.idle_failures = idle_failures
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) <= self.idle_failures:
+            while True:
+                await asyncio.sleep(60)
+                yield {"choices": []}
+        yield {"choices": [{"delta": {"content": "Recovered after repeated idle."}}]}
+
+
 class _FakeContextAssembler:
     def __init__(self, *, max_context_tokens: int = 0) -> None:
         self.calls: list[dict[str, object]] = []
@@ -4732,7 +4800,7 @@ async def test_direct_idle_timeout_auto_continues_without_llm_call_retry() -> No
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
         default_llm_stream_idle_timeout_seconds=1,
-        default_llm_stream_max_retries=0,
+        default_llm_stream_max_retries=1,
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
@@ -4770,8 +4838,84 @@ async def test_direct_idle_timeout_auto_continues_without_llm_call_retry() -> No
     assert output.content == "Recovered after silence."
     assert len(fake_llm.calls) == 2
     assert any(
+        "previous model stream failed" in str(message["content"]) for message in fake_llm.calls[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_idle_timeout_allows_repeated_auto_continuations() -> None:
+    fake_llm = _RepeatedIdleThenContinuationRecoveredDirectLLM(idle_failures=3)
+    event_bus = _NoopEventBus()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=event_bus,
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-idle-exhausted",
+            intaris_session_id="sess-idle-exhausted",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-idle-exhausted"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-idle-exhausted",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after repeated idle."
+    assert output.content == "Recovered after repeated idle."
+    assert len(fake_llm.calls) == 4
+    assert any(
         message["role"] == "system" and "previous model stream failed" in str(message["content"])
-        for message in fake_llm.calls[1]
+        for message in fake_llm.calls[3]
+    )
+    notices = [
+        getattr(event, "data", {})
+        for event in event_bus.events
+        if getattr(event, "type", None) == EventType.SYSTEM_NOTICE
+    ]
+    recovery_notices = [
+        notice
+        for notice in notices
+        if notice.get("kind") == "model_recovery" and notice.get("scope") == "continuation"
+    ]
+    assert len(recovery_notices) == 3
+    assert [notice.get("attempt") for notice in recovery_notices] == [1, 2, 3]
+    assert all(notice.get("max_attempts") == 3 for notice in recovery_notices)
+    assert not any(notice.get("kind") == "model_retry" for notice in notices)
+    assert all(
+        notice.get("kind") == "model_recovery" and notice.get("scope") == "continuation"
+        for notice in recovery_notices
     )
 
 
