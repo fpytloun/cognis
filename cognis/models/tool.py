@@ -290,6 +290,7 @@ class ExecutorConfig(BaseModel):
 
     executor_id: str
     tools: list[ToolDefinition] = Field(default_factory=list)
+    tool_handlers: dict[str, Any] = Field(default_factory=dict, exclude=True)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     secrets: dict[str, str] = Field(default_factory=dict)
     inference: InferenceConfig | None = None
@@ -333,6 +334,10 @@ class EscalationRecord(BaseModel):
     resolved: bool = False
     reasoning: str | None = None
     risk: str | None = None
+    user_decision: str | None = None
+    user_note: str | None = None
+    resolved_at: str | None = None
+    resolved_by: str | None = None
 
 
 class ExecutorHandle(BaseModel):

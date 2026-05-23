@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.core.workflow_composition import SkillDecompositionResult
-from cognis.store.queries import create_user
+from cognis.store.queries import create_agent, create_user, get_agent
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -68,6 +68,54 @@ def test_skill_create_accepts_attach_to_all_agents(monkeypatch: object, tmp_path
         body = response.json()
         assert body["attach_to_all_agents"] is True
         assert body["auto_load"] is True
+
+
+def test_skill_create_with_agent_id_binds_skill_to_agent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        response = client.post(
+            "/api/v1/skills",
+            headers=headers,
+            json={
+                "name": "Agent Bound Skill",
+                "instructions": "hello",
+                "agent_id": "agent-1",
+            },
+        )
+
+        assert response.status_code == 201
+        skill_id = response.json()["skill_id"]
+
+        async def _load_items() -> list[dict[str, object]]:
+            async with client.app.state.session_factory() as session:
+                agent = await get_agent(session, "agent-1")
+                assert agent is not None
+                return list(agent.skills["items"])
+
+        assert asyncio.run(_load_items()) == [{"skill_id": skill_id, "enabled": True}]
 
 
 def test_system_skill_delete_is_forbidden(monkeypatch: object, tmp_path: Path) -> None:
@@ -157,9 +205,7 @@ def test_reset_system_skill_is_idempotent_when_already_default(
         assert reset.json()["current_version_id"] == original_version
 
 
-def test_skill_update_can_attach_artifact_backed_asset(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_skill_update_can_attach_artifact_backed_asset(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_user(client.app))
         headers = _auth_headers(client.app, email="user@example.com")

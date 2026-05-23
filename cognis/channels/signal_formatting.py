@@ -313,21 +313,27 @@ def _can_use_emphasis_delimiter(text: str, index: int, delimiter_length: int) ->
     next_index = index + delimiter_length
     next_char = text[next_index] if next_index < len(text) else ""
 
-    if delimiter_length == 1 and text[index] == "_":
-        if previous_char.isalnum() and next_char.isalnum():
-            return False
+    if (
+        delimiter_length == 1
+        and text[index] == "_"
+        and previous_char.isalnum()
+        and next_char.isalnum()
+    ):
+        return False
 
-    if delimiter_length == 1 and text[index] == "*":
-        if previous_char.isdigit() and next_char.isdigit():
-            return False
+    if (
+        delimiter_length == 1
+        and text[index] == "*"
+        and previous_char.isdigit()
+        and next_char.isdigit()
+    ):
+        return False
 
     if not next_char:
         return False
     if next_char.isspace():
         return False
-    if previous_char and previous_char.isspace() and next_char in ",.!?:;)]}":
-        return False
-    return True
+    return not (previous_char and previous_char.isspace() and next_char in ",.!?:;)]}")
 
 
 def _find_link_url_end(text: str, start: int) -> int:

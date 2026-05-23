@@ -94,6 +94,8 @@ class _PatchHunk:
     old_text: str
     new_text: str
     old_start: int | None = None
+    change_context: str | None = None
+    is_end_of_file: bool = False
 
 
 @dataclass(slots=True)
@@ -191,6 +193,14 @@ async def _collect_lsp_diagnostics_batch(
         return ""
 
 
+def _should_wait_for_edit_diagnostics(context: ToolExecutionContext, file_paths: list[str]) -> bool:
+    """Return whether edit tools should synchronously wait for diagnostics."""
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None:
+        return False
+    return not (lsp.has_pending_diagnostics(file_paths) or lsp.has_cached_diagnostics(file_paths))
+
+
 def _warm_lsp(context: ToolExecutionContext, file_path: str) -> None:
     """Warm LSP for a file (non-blocking, no wait for diagnostics).
 
@@ -205,6 +215,42 @@ def _warm_lsp(context: ToolExecutionContext, file_path: str) -> None:
             await lsp.touch_file(file_path, wait=False)
 
     asyncio.create_task(_warm())
+
+
+def _warm_lsp_batch(context: ToolExecutionContext, file_paths: list[str]) -> None:
+    """Warm LSP for multiple files without blocking the edit result."""
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None or not file_paths:
+        return
+
+    async def _warm() -> None:
+        await asyncio.gather(
+            *(lsp.touch_file(path, wait=False) for path in file_paths),
+            return_exceptions=True,
+        )
+
+    asyncio.create_task(_warm())
+
+
+def _format_cached_lsp_diagnostics(context: ToolExecutionContext, file_paths: list[str]) -> str:
+    """Return already available diagnostics without touching or waiting on LSP."""
+    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
+    if lsp is None or not file_paths:
+        return ""
+
+    all_diagnostics: dict[str, list[Any]] = {}
+    for path in file_paths:
+        for diag_path, path_diags in lsp.get_diagnostics(path).items():
+            existing = all_diagnostics.get(diag_path, [])
+            existing.extend(path_diags)
+            all_diagnostics[diag_path] = existing
+
+    if not all_diagnostics:
+        return ""
+
+    from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
+
+    return format_diagnostics_for_llm(all_diagnostics, file_paths[0])
 
 
 _DEFAULT_IGNORE = {
@@ -375,7 +421,24 @@ def _should_route_binary_read(path: Path, content: bytes, mime_type: str) -> boo
     if b"\x00" in content:
         return True
     suffix = path.suffix.lower()
-    return suffix in {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".mov", ".webm"}
+    return suffix in {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".mp3",
+        ".wav",
+        ".ogg",
+        ".m4a",
+        ".mp4",
+        ".mov",
+        ".webm",
+    }
 
 
 def _binary_read_result(path: Path, content: bytes, mime_type: str) -> ToolResult:
@@ -474,7 +537,9 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
     return await _with_file_lock(context, path, _write)
 
 
-async def handle_artifact_save(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+async def handle_artifact_save(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
     """Save a controller-resolved Cognis artifact to the executor filesystem."""
     file_path = arguments.get("file_path", "")
     content_b64 = arguments.get("source_artifact_content_b64")
@@ -634,9 +699,7 @@ def _find_skill_asset(
     return candidates[0] if len(candidates) == 1 else None
 
 
-async def _load_skill_asset_content(
-    asset: dict[str, Any], context: ToolExecutionContext
-) -> bytes:
+async def _load_skill_asset_content(asset: dict[str, Any], context: ToolExecutionContext) -> bytes:
     content_b64 = asset.get("content_b64")
     if isinstance(content_b64, str) and content_b64.strip():
         return base64.b64decode(content_b64, validate=True)
@@ -650,6 +713,15 @@ async def _load_skill_asset_content(
             try:
                 response = await client.get(url)
                 response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                body = response.text[:200].replace("\n", " ").strip()
+                detail = f"HTTP {response.status_code}"
+                if body:
+                    detail = f"{detail}: {body}"
+                raise ValueError(
+                    f"failed to fetch controller-provided asset URL ({detail})"
+                ) from exc
             except Exception as exc:
                 raise ValueError("failed to fetch controller-provided asset URL") from exc
             return response.content
@@ -670,11 +742,14 @@ async def _load_skill_asset_content(
 
 def _default_skill_asset_path(skill_id: str, asset: dict[str, Any], filename: str) -> Path:
     safe_skill = re.sub(r"[^a-zA-Z0-9_.-]+", "_", skill_id).strip("._") or "skill"
-    safe_asset = re.sub(
-        r"[^a-zA-Z0-9_.-]+",
-        "_",
-        str(asset.get("asset_id") or asset.get("content_hash") or "asset"),
-    ).strip("._") or "asset"
+    safe_asset = (
+        re.sub(
+            r"[^a-zA-Z0-9_.-]+",
+            "_",
+            str(asset.get("asset_id") or asset.get("content_hash") or "asset"),
+        ).strip("._")
+        or "asset"
+    )
     root = Path(tempfile.gettempdir()) / "cognis_skill_assets" / safe_skill / safe_asset
     target = (root / filename).resolve()
     if not target.is_relative_to(root.resolve()):
@@ -697,7 +772,9 @@ def _validate_skill_asset_url(url: str, context: ToolExecutionContext) -> None:
     controller_url = str(context.runtime_metadata.get("controller_url") or "").strip()
     if not controller_url:
         raise ValueError("skill asset URL requires a configured controller origin")
-    controller = urlparse(controller_url.replace("ws://", "http://", 1).replace("wss://", "https://", 1))
+    controller = urlparse(
+        controller_url.replace("ws://", "http://", 1).replace("wss://", "https://", 1)
+    )
     if controller.netloc and parsed.netloc != controller.netloc:
         raise ValueError("skill asset URL host does not match the configured controller")
 
@@ -776,7 +853,9 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
     return await _with_file_lock(context, path, _edit)
 
 
-async def handle_apply_patch(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+async def handle_apply_patch(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
     """Apply an apply_patch envelope, native operation, or unified diff patch."""
     patch_text = arguments.get("patchText") or ""
     operation = arguments.get("operation")
@@ -807,7 +886,9 @@ async def handle_apply_patch(arguments: dict[str, Any], context: ToolExecutionCo
             # Re-stage once more immediately before apply so we catch files
             # that changed after the initial read but before the write phase.
             staged = await _stage_patch_operations(operations, context)
-            summary_lines, diagnostic_paths, file_diffs = await _apply_staged_patch_operations(staged, context)
+            summary_lines, diagnostic_paths, file_diffs = await _apply_staged_patch_operations(
+                staged, context
+            )
     except (
         PatchFormatError,
         PatchConflictError,
@@ -823,9 +904,17 @@ async def handle_apply_patch(arguments: dict[str, Any], context: ToolExecutionCo
 
     diagnostics_targets = [str(path) for path in diagnostic_paths]
     if diagnostics_targets:
-        diagnostics_text = await _collect_lsp_diagnostics_batch(context, diagnostics_targets)
+        if _should_wait_for_edit_diagnostics(context, diagnostics_targets):
+            diagnostics_text = await _collect_lsp_diagnostics_batch(context, diagnostics_targets)
+        else:
+            _warm_lsp_batch(context, diagnostics_targets)
+            diagnostics_text = ""
         if diagnostics_text:
             summary_lines.append(diagnostics_text)
+
+    stale_diagnostics = _format_cached_lsp_diagnostics(context, diagnostics_targets)
+    if stale_diagnostics:
+        summary_lines.append(stale_diagnostics)
 
     return ToolResult(
         output="\n".join(summary_lines),
@@ -908,7 +997,8 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
         return ToolResult(
             output=output,
             metadata=_files_written_metadata(
-                [path], [{"path": str(path), "diff": _unified_diff(path, original_content, final_content)}]
+                [path],
+                [{"path": str(path), "diff": _unified_diff(path, original_content, final_content)}],
             ),
         )
 
@@ -1233,13 +1323,21 @@ def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> lis
 
 
 def _parse_patch_envelope_hunk(lines: list[str], start_index: int) -> tuple[_PatchHunk, int]:
+    header = _line_stripped(lines[start_index])
+    change_context = None
+    if header.startswith("@@ "):
+        change_context = header[3:]
     index = start_index + 1
     old_parts: list[str] = []
     new_parts: list[str] = []
     last_line_kind: str | None = None
+    is_end_of_file = False
     while index < len(lines):
         stripped = _line_stripped(lines[index])
         if lines[index].startswith("@@") or _is_patch_envelope_header(stripped):
+            if stripped == "*** End of File":
+                is_end_of_file = True
+                index += 1
             break
         if _is_no_newline_marker(stripped):
             _apply_no_newline_marker(old_parts, new_parts, last_line_kind)
@@ -1260,7 +1358,15 @@ def _parse_patch_envelope_hunk(lines: list[str], start_index: int) -> tuple[_Pat
         else:
             raise PatchFormatError(f"Invalid hunk line: {_line_stripped(line) or '<blank>'}")
         index += 1
-    return _PatchHunk(old_text="".join(old_parts), new_text="".join(new_parts)), index
+    return (
+        _PatchHunk(
+            old_text="".join(old_parts),
+            new_text="".join(new_parts),
+            change_context=change_context,
+            is_end_of_file=is_end_of_file,
+        ),
+        index,
+    )
 
 
 def _parse_unified_diff(patch_text: str, context: ToolExecutionContext) -> list[_PatchOperation]:
@@ -1478,23 +1584,123 @@ def _apply_envelope_hunks(content: str, hunks: list[_PatchHunk], newline: str) -
             offset += len(new_lines) - len(old_lines)
         return "".join(lines)
 
-    updated = content
+    lines = content.splitlines(keepends=True)
+    replacements: list[tuple[int, int, list[str]]] = []
+    line_index = 0
     for hunk in hunks:
         old_text = _normalize_patch_text_for_newline(hunk.old_text, newline)
         new_text = _normalize_patch_text_for_newline(hunk.new_text, newline)
-        matches = updated.count(old_text)
-        if matches == 0 and old_text != (trimmed_old := _strip_one_trailing_newline(old_text)):
-            trimmed_new = _strip_one_trailing_newline(new_text)
-            trimmed_matches = updated.count(trimmed_old)
-            if trimmed_matches == 1:
-                updated = updated.replace(trimmed_old, trimmed_new, 1)
+        old_lines = old_text.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+
+        if hunk.change_context is not None:
+            context_line = _normalize_patch_text_for_newline(hunk.change_context, newline)
+            context_index = _seek_patch_sequence(lines, [context_line], line_index, eof=False)
+            if context_index is None:
+                raise PatchConflictError(
+                    f"Failed to find context '{hunk.change_context}' in the current file content."
+                )
+            line_index = context_index + 1
+
+        if not old_lines:
+            if not new_lines:
                 continue
-        if matches == 0:
+            replacements.append((len(lines), 0, new_lines))
+            continue
+
+        found = _seek_patch_sequence(lines, old_lines, line_index, hunk.is_end_of_file)
+        if found is None and old_lines[-1] == "":
+            old_lines = old_lines[:-1]
+            if new_lines and new_lines[-1] == "":
+                new_lines = new_lines[:-1]
+            found = _seek_patch_sequence(lines, old_lines, line_index, hunk.is_end_of_file)
+        if found is None:
             raise PatchConflictError("Patch hunk did not match the current file content.")
-        if matches > 1:
-            raise PatchConflictError("Patch hunk matched multiple locations in the current file.")
-        updated = updated.replace(old_text, new_text, 1)
-    return updated
+
+        replacements.append((found, len(old_lines), new_lines))
+        line_index = found + len(old_lines)
+
+    updated_lines = lines.copy()
+    for start_index, old_len, new_segment in sorted(replacements, reverse=True):
+        updated_lines[start_index : start_index + old_len] = new_segment
+    return "".join(updated_lines)
+
+
+def _seek_patch_sequence(lines: list[str], pattern: list[str], start: int, eof: bool) -> int | None:
+    if not pattern:
+        return start
+    if len(pattern) > len(lines):
+        return None
+    search_start = len(lines) - len(pattern) if eof else start
+    search_end = len(lines) - len(pattern)
+    if search_start > search_end:
+        return None
+
+    def exact(left: str, right: str) -> bool:
+        return _line_stripped(left) == _line_stripped(right)
+
+    def trim_end(left: str, right: str) -> bool:
+        return _line_stripped(left).rstrip() == _line_stripped(right).rstrip()
+
+    def trim(left: str, right: str) -> bool:
+        return _line_stripped(left).strip() == _line_stripped(right).strip()
+
+    for predicate in (exact, trim_end, trim, _normalized_patch_line_equal):
+        found = _seek_patch_sequence_with(lines, pattern, search_start, search_end, predicate)
+        if found is not None:
+            return found
+    return None
+
+
+def _seek_patch_sequence_with(
+    lines: list[str],
+    pattern: list[str],
+    search_start: int,
+    search_end: int,
+    predicate: Callable[[str, str], bool],
+) -> int | None:
+    for index in range(search_start, search_end + 1):
+        if all(predicate(lines[index + offset], item) for offset, item in enumerate(pattern)):
+            return index
+    return None
+
+
+def _normalized_patch_line_equal(left: str, right: str) -> bool:
+    return _normalize_patch_line_for_match(left) == _normalize_patch_line_for_match(right)
+
+
+def _normalize_patch_line_for_match(text: str) -> str:
+    replacements = {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u201f": '"',
+        "\u00a0": " ",
+        "\u2002": " ",
+        "\u2003": " ",
+        "\u2004": " ",
+        "\u2005": " ",
+        "\u2006": " ",
+        "\u2007": " ",
+        "\u2008": " ",
+        "\u2009": " ",
+        "\u200a": " ",
+        "\u202f": " ",
+        "\u205f": " ",
+        "\u3000": " ",
+    }
+    return "".join(replacements.get(char, char) for char in _line_stripped(text).strip())
 
 
 async def _apply_staged_patch_operations(
@@ -1540,6 +1746,9 @@ async def _apply_staged_patch_operations(
 
         if operation.kind == "update":
             assert operation.source_path is not None and operation.content is not None
+            if operation.content == operation.previous_content:
+                summary_lines.append(f"Unchanged {operation.source_path}")
+                continue
             operation.source_path.write_text(operation.content, encoding="utf-8", newline="")
             formatter_changed = await _maybe_format_file(operation.source_path)
             final_content = _read_text_file(operation.source_path)
@@ -1573,7 +1782,9 @@ async def _apply_staged_patch_operations(
                 final_content = operation.content
             else:
                 operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
-                operation.destination_path.write_text(operation.content, encoding="utf-8", newline="")
+                operation.destination_path.write_text(
+                    operation.content, encoding="utf-8", newline=""
+                )
                 formatter_changed = await _maybe_format_file(operation.destination_path)
                 final_content = _read_text_file(operation.destination_path)
                 if formatter_changed:

@@ -51,6 +51,7 @@ class FollowUpMode(StrEnum):
 class FollowUpOriginKind(StrEnum):
     TASK_RESULT = "task_result"
     DELEGATION_RESULT = "delegation_result"
+    BACKGROUND_TOOL_RESULT = "background_tool_result"
     GATE = "gate"
     SCHEDULE = "schedule"
     OTHER = "other"
@@ -104,6 +105,19 @@ class DelegationResultFollowUp(FollowUpBase):
     result_summary: str | None = Field(default=None, max_length=_MAX_TEXT_FIELD_CHARS)
 
 
+class BackgroundToolResultFollowUp(FollowUpBase):
+    origin_kind: Literal[FollowUpOriginKind.BACKGROUND_TOOL_RESULT]
+    tool_name: str = Field(min_length=1, max_length=80)
+    shell_id: str = Field(min_length=1, max_length=120)
+    executor_id: str | None = Field(default=None, max_length=120)
+    executor_type: str | None = Field(default=None, max_length=64)
+    command_summary: str | None = Field(default=None, max_length=_MAX_TEXT_FIELD_CHARS)
+    description: str | None = Field(default=None, max_length=_MAX_TEXT_FIELD_CHARS)
+    runtime_seconds: float | None = None
+    exit_code: int | None = None
+    output_summary: str | None = Field(default=None, max_length=_MAX_TEXT_FIELD_CHARS)
+
+
 class GateFollowUp(FollowUpBase):
     origin_kind: Literal[FollowUpOriginKind.GATE]
     task_id: str = Field(min_length=1, max_length=120)
@@ -118,7 +132,9 @@ class GateFollowUp(FollowUpBase):
         return self
 
 
-FollowUpMetadata = TaskResultFollowUp | DelegationResultFollowUp | GateFollowUp
+FollowUpMetadata = (
+    TaskResultFollowUp | DelegationResultFollowUp | BackgroundToolResultFollowUp | GateFollowUp
+)
 
 
 def parse_follow_up_metadata(payload: dict[str, Any]) -> FollowUpMetadata:
@@ -132,6 +148,8 @@ def parse_follow_up_metadata(payload: dict[str, Any]) -> FollowUpMetadata:
         return TaskResultFollowUp.model_validate(payload)
     if origin is FollowUpOriginKind.DELEGATION_RESULT:
         return DelegationResultFollowUp.model_validate(payload)
+    if origin is FollowUpOriginKind.BACKGROUND_TOOL_RESULT:
+        return BackgroundToolResultFollowUp.model_validate(payload)
     if origin is FollowUpOriginKind.GATE:
         return GateFollowUp.model_validate(payload)
     raise ValueError(f"Unsupported follow-up origin: {origin.value}")
@@ -196,6 +214,30 @@ def render_follow_up_block(follow_up: FollowUpMetadata) -> str:
         )
         if follow_up.result_summary:
             lines.append(f"summary: {_xml_safe(follow_up.result_summary)}")
+    elif isinstance(follow_up, BackgroundToolResultFollowUp):
+        lines.extend(
+            [
+                f"tool: {_xml_safe(follow_up.tool_name)}",
+                f"shell_id: {_xml_safe(follow_up.shell_id)}",
+                f"status: {follow_up.status.value}",
+            ]
+        )
+        if follow_up.executor_id:
+            executor = follow_up.executor_id
+            if follow_up.executor_type:
+                executor += f" ({follow_up.executor_type})"
+            lines.append(f"executor: {_xml_safe(executor)}")
+        if follow_up.exit_code is not None:
+            lines.append(f"exit_code: {follow_up.exit_code}")
+        if follow_up.runtime_seconds is not None:
+            lines.append(f"runtime_seconds: {follow_up.runtime_seconds:.1f}")
+        if follow_up.description:
+            lines.append(f"description: {_xml_safe(follow_up.description)}")
+        if follow_up.command_summary:
+            lines.append(f"command: {_xml_safe(follow_up.command_summary)}")
+        if follow_up.output_summary:
+            lines.append(f"output_tail: {_xml_safe(follow_up.output_summary)}")
+        lines.append("Use bash_output with this shell_id to inspect full output if needed.")
     elif isinstance(follow_up, GateFollowUp):
         lines.extend(
             [
@@ -381,6 +423,61 @@ class FollowUpPolicy:
             status=normalized_status,
             child_session_id=child_session_id,
             result_summary=truncate_follow_up_text(result_summary, max_chars=_MAX_TEXT_FIELD_CHARS),
+        )
+        FOLLOW_UP_CLASSIFICATIONS_TOTAL.labels(
+            mode=follow_up.mode.value,
+            origin=follow_up.origin_kind.value,
+            source="policy",
+        ).inc()
+        return follow_up
+
+    def build_background_tool_follow_up(
+        self,
+        *,
+        conversation_id: str,
+        shell_id: str,
+        executor_id: str | None,
+        executor_type: str | None,
+        status: str,
+        exit_code: int | None,
+        command: str | None,
+        description: str | None,
+        runtime_seconds: float | None,
+        output_tail: str | None,
+    ) -> BackgroundToolResultFollowUp:
+        normalized_status = (
+            FollowUpStatus.COMPLETED if status in {"completed", "killed"} else FollowUpStatus.FAILED
+        )
+        follow_up = BackgroundToolResultFollowUp(
+            follow_up_id=build_follow_up_id(
+                kind=FollowUpOriginKind.BACKGROUND_TOOL_RESULT.value,
+                conversation_id=conversation_id,
+                parts={
+                    "shell_id": shell_id,
+                    "executor_id": executor_id,
+                    "status": status,
+                    "exit_code": exit_code,
+                },
+            ),
+            mode=FollowUpMode.INTEGRATE,
+            origin_kind=FollowUpOriginKind.BACKGROUND_TOOL_RESULT,
+            relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+            required_action=(
+                FollowUpRequiredAction.INTEGRATE_RESULT
+                if normalized_status is FollowUpStatus.COMPLETED
+                else FollowUpRequiredAction.INFORM_FAILURE
+            ),
+            topic_ref=shell_id,
+            status=normalized_status,
+            tool_name="bash",
+            shell_id=shell_id,
+            executor_id=executor_id,
+            executor_type=executor_type,
+            command_summary=truncate_follow_up_text(command, max_chars=_MAX_TEXT_FIELD_CHARS),
+            description=truncate_follow_up_text(description, max_chars=_MAX_TEXT_FIELD_CHARS),
+            runtime_seconds=runtime_seconds,
+            exit_code=exit_code,
+            output_summary=truncate_follow_up_text(output_tail, max_chars=_MAX_TEXT_FIELD_CHARS),
         )
         FOLLOW_UP_CLASSIFICATIONS_TOTAL.labels(
             mode=follow_up.mode.value,

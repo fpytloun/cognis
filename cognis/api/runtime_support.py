@@ -50,6 +50,10 @@ from cognis.tools.builtin.conversations import (
 )
 from cognis.tools.builtin.datetime_tools import build_datetime_tool_handlers, datetime_tools
 from cognis.tools.builtin.image import image_tools
+from cognis.tools.builtin.knowledgebase import (
+    build_knowledgebase_tool_handlers,
+    knowledgebase_tools,
+)
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.projects import build_project_tool_handlers, project_tools
@@ -185,6 +189,7 @@ def _runtime_info(
     inventory_tool_count: int,
     visible_tool_count: int | None = None,
     failure_reason: str | None = None,
+    executor_pin_fallback_notice: dict[str, Any] | None = None,
     tool_agent: AgentDefinition | None = None,
     executor_agent: AgentDefinition | None = None,
 ) -> dict[str, Any]:
@@ -209,6 +214,7 @@ def _runtime_info(
         "runtime_source": runtime_source,
         "fallback_used": fallback_used,
         "failure_reason": failure_reason,
+        "executor_pin_fallback_notice": executor_pin_fallback_notice,
         "environment": _environment_payload(environment),
         "inventory_tool_count": inventory_tool_count,
         "visible_tool_count": visible_tool_count,
@@ -268,6 +274,7 @@ async def _resolve_eligible_executor_config(
     policy: ExecutorPolicy,
     *,
     conversation_active_executor_id: str | None = None,
+    conversation_active_executor_expires_at: Any | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
 ) -> dict[str, Any]:
@@ -281,9 +288,9 @@ async def _resolve_eligible_executor_config(
       to that executor (provided it is currently assigned to the agent and
       usable). The pin is the conversation's persisted choice from a prior
       ``switch_executor`` or ``/executor``.
-    - When the pin is set but unassigned or unusable, the controller does
-      NOT silently re-route. It raises so the tool dispatch path can
-      surface a factual error.
+    - When a non-primary pin expires or the executor disconnects, the
+      controller switches the pin back to a usable primary executor and
+      returns a factual notice for the UI and LLM context.
     - When no pin is set and the agent is on its first turn, the
       controller picks one usable primary executor (preferring
       ``runtime_state == active`` over ``degraded``, then sorted by id)
@@ -366,6 +373,26 @@ async def _resolve_eligible_executor_config(
                 executor_owner_email=executor_owner_email,
                 policy=policy,
             )
+            from cognis.core.executor_pin_lifecycle import (
+                ensure_active_executor_pin,
+                load_executor_pin_lifecycle_settings,
+            )
+
+            settings = await load_executor_pin_lifecycle_settings(session_factory)
+            lifecycle = await ensure_active_executor_pin(
+                session_factory=session_factory,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                pool=pool,
+                active_executor_id=conversation_active_executor_id,
+                active_executor_expires_at=conversation_active_executor_expires_at,
+                ws_provider=getattr(getattr(providers, "executor", None), "websocket", None),
+                retry_seconds=settings["retry_seconds"],
+                retry_interval_seconds=settings["retry_interval_seconds"],
+            )
+            if lifecycle.active_executor_id:
+                conversation_active_executor_id = lifecycle.active_executor_id
+            assert isinstance(conversation_active_executor_id, str)
             target = pool.by_id(conversation_active_executor_id)
             if target is None:
                 raise RuntimeError(
@@ -385,7 +412,7 @@ async def _resolve_eligible_executor_config(
             # upgrade), seed the task pin too. The IS NULL guards keep
             # this idempotent.
             await _persist_initial_active_executor(session, target.executor_id)
-            return _executor_config_from_row(
+            config = _executor_config_from_row(
                 target.row,
                 executor_owner_email=executor_owner_email,
                 selection_source=(
@@ -394,6 +421,16 @@ async def _resolve_eligible_executor_config(
                     else "conversation_active_additional"
                 ),
             )
+            notice = getattr(lifecycle, "notice", None)
+            if notice is not None:
+                config["executor_pin_fallback_notice"] = {
+                    "previous_executor_id": notice.previous_executor_id,
+                    "new_executor_id": notice.new_executor_id,
+                    "reason": notice.reason,
+                    "ui_message": notice.ui_message,
+                    "llm_message": notice.llm_message,
+                }
+            return config
 
         if explicit_id:
             # Explicit primary id is a single-row lookup — keep the legacy
@@ -477,7 +514,7 @@ async def _resolve_eligible_executor_config(
         )
 
 
-def static_tool_definitions() -> list[ToolDefinition]:
+def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[ToolDefinition]:
     """Return all static tool definitions available to Cognis.
 
     Includes builtin controller tools, workflow tools, memory tools,
@@ -501,6 +538,7 @@ def static_tool_definitions() -> list[ToolDefinition]:
         *agent_management_tools(),
         *conversation_tools(),
         *project_tools(),
+        *(knowledgebase_tools() if knowledgebase_enabled else []),
         *task_continuation_tools(),
         *tool_output_tools(),
         *image_tools(),
@@ -537,9 +575,10 @@ def select_static_tools(
     agent: Any | None = None,
     *,
     access_context: RuntimeAccessContext | None = None,
+    knowledgebase_enabled: bool = False,
 ) -> list[ToolDefinition]:
     """Filter static builtin tools for an agent definition."""
-    definitions = static_tool_definitions()
+    definitions = static_tool_definitions(knowledgebase_enabled=knowledgebase_enabled)
     if agent is None:
         return [tool for tool in definitions if tool.name not in DEFAULT_OFF_BUILTIN_TOOLS]
 
@@ -593,7 +632,10 @@ def select_static_tools(
 
 
 def _build_handler_map(
-    session_factory: Any, status_provider: Any, guardrails_provider: Any | None = None
+    session_factory: Any,
+    status_provider: Any,
+    guardrails_provider: Any | None = None,
+    knowledgebase_service: Any | None = None,
 ) -> dict[str, Any]:
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
@@ -601,6 +643,8 @@ def _build_handler_map(
     if guardrails_provider is not None:
         handlers.update(build_conversation_tool_handlers(session_factory, guardrails_provider))
     handlers.update(build_project_tool_handlers(session_factory))
+    if knowledgebase_service is not None:
+        handlers.update(build_knowledgebase_tool_handlers(knowledgebase_service))
     handlers.update(build_task_continuation_tool_handlers(session_factory))
     handlers.update(build_datetime_tool_handlers())
     handlers.update(executor_tool_handlers())
@@ -649,7 +693,9 @@ def _build_remote_runtime_registry(
     return registry
 
 
-def build_static_registry(agent: AgentDefinition | None = None) -> ToolRegistry:
+def build_static_registry(
+    agent: AgentDefinition | None = None, *, knowledgebase_enabled: bool = False
+) -> ToolRegistry:
     """Build a static ToolRegistry for one agent's builtin tools.
 
     NOTE: This registry has handler=None for all tools. It is used only for
@@ -657,13 +703,15 @@ def build_static_registry(agent: AgentDefinition | None = None) -> ToolRegistry:
     build_registry_with_handlers().
     """
     registry = ToolRegistry()
-    for tool in select_static_tools(agent):
+    for tool in select_static_tools(agent, knowledgebase_enabled=knowledgebase_enabled):
         registry.register(RegisteredTool(definition=tool))
     return registry
 
 
 async def build_shared_runtime(
     providers: Any,
+    *,
+    knowledgebase_enabled: bool = False,
 ) -> ResolvedStepRuntime:
     """Build the shared builtin runtime used as the template for step runtimes."""
     session_factory = getattr(providers, "_session_factory", None)
@@ -672,7 +720,7 @@ async def build_shared_runtime(
         if not policy.allow_in_process:
             logger.info("Shared in-process executor disabled by policy; using static-only template")
             return ResolvedStepRuntime(
-                tool_registry=build_static_registry(),
+                tool_registry=build_static_registry(knowledgebase_enabled=knowledgebase_enabled),
                 executor_connection=None,
                 cleanup=noop_cleanup,
                 executor_environment=build_local_executor_environment(
@@ -680,7 +728,7 @@ async def build_shared_runtime(
                     source="shared_runtime_disabled",
                 ),
             )
-    tools = static_tool_definitions()
+    tools = static_tool_definitions(knowledgebase_enabled=knowledgebase_enabled)
     handle = await providers.executor.spawn(
         ExecutorConfig(
             executor_id="controller_shared_builtin",
@@ -689,7 +737,7 @@ async def build_shared_runtime(
         )
     )
     connection = await providers.executor.get_executor(handle)
-    registry = build_static_registry()
+    registry = build_static_registry(knowledgebase_enabled=knowledgebase_enabled)
 
     async def cleanup() -> None:
         await providers.executor.cancel(handle)
@@ -713,6 +761,7 @@ def build_step_runtime_factory(
     shared_connection: Any,
     session_factory: Any,
     artifact_store: Any | None = None,
+    knowledgebase_service: Any | None = None,
 ) -> RuntimeFactory:
     """Create a per-step runtime factory.
 
@@ -731,6 +780,8 @@ def build_step_runtime_factory(
         access_context: RuntimeAccessContext | None = None,
         conversation_id: str | None = None,
         task_id: str | None = None,
+        _executor_pin_fallback_notice: dict[str, Any] | None = None,
+        _executor_pin_fallback_retried: bool = False,
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
@@ -752,6 +803,7 @@ def build_step_runtime_factory(
         # may not yet be reflected on the conversation row when the first
         # step resolves).
         conversation_active_executor_id: str | None = None
+        conversation_active_executor_expires_at: Any | None = None
         if session_factory is not None and (conversation_id or task_id):
             from cognis.store.queries import get_conversation, get_task
 
@@ -763,11 +815,17 @@ def build_step_runtime_factory(
                             conversation_active_executor_id = getattr(
                                 conv_row, "active_executor_id", None
                             )
+                            conversation_active_executor_expires_at = getattr(
+                                conv_row, "active_executor_expires_at", None
+                            )
                     if conversation_active_executor_id is None and task_id:
                         task_row = await get_task(db_session, task_id)
                         if task_row is not None:
                             conversation_active_executor_id = getattr(
                                 task_row, "active_executor_id", None
+                            )
+                            conversation_active_executor_expires_at = getattr(
+                                task_row, "active_executor_expires_at", None
                             )
             except Exception:
                 logger.debug(
@@ -781,9 +839,12 @@ def build_step_runtime_factory(
             user_email,
             policy,
             conversation_active_executor_id=conversation_active_executor_id,
+            conversation_active_executor_expires_at=conversation_active_executor_expires_at,
             conversation_id=conversation_id,
             task_id=task_id,
         )
+        if _executor_pin_fallback_notice is not None:
+            executor_config["executor_pin_fallback_notice"] = _executor_pin_fallback_notice
 
         # Stage 36: resolve the agent's full executor pool (primary + additional)
         # so downstream code can route per-call to other assigned executors.
@@ -833,7 +894,12 @@ def build_step_runtime_factory(
         # based on available backends.
         agent_tools = [
             t
-            for t in select_static_tools(tool_agent, access_context=access_context)
+            for t in select_static_tools(
+                tool_agent,
+                access_context=access_context,
+                knowledgebase_enabled=knowledgebase_service is not None
+                and bool(getattr(knowledgebase_service, "enabled", False)),
+            )
             if t.category != "web"
         ]
 
@@ -964,10 +1030,17 @@ def build_step_runtime_factory(
             mcp_servers = await _resolve_executor_mcp_servers(executor_config, session_factory)
             secret_owner_email = executor_config.get("executor_owner_email", user_email)
             secrets = await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
+            handler_map = _build_handler_map(
+                session_factory,
+                getattr(providers.executor, "status_provider", None),
+                getattr(providers, "guardrails", None),
+                knowledgebase_service,
+            )
             handle = await providers.executor.spawn(
                 ExecutorConfig(
                     executor_id=f"{executor_config['executor_id']}:run:{uuid4().hex}",
                     tools=agent_tools,
+                    tool_handlers=handler_map,
                     mcp_servers=mcp_servers,
                     secrets=secrets,
                     metadata=runtime_metadata,
@@ -997,6 +1070,9 @@ def build_step_runtime_factory(
                     hard_bound=hard_bound_executor,
                     runtime_source="direct_in_process_executor",
                     fallback_used=False,
+                    executor_pin_fallback_notice=executor_config.get(
+                        "executor_pin_fallback_notice"
+                    ),
                     environment=env_snapshot,
                     inventory_tool_count=len(registry.list_tools()),
                     tool_agent=tool_agent,
@@ -1048,6 +1124,7 @@ def build_step_runtime_factory(
                         session_factory,
                         getattr(providers.executor, "status_provider", None),
                         getattr(providers, "guardrails", None),
+                        knowledgebase_service,
                     )
                     remote_registry = _build_remote_runtime_registry(
                         merge_result.tools,
@@ -1107,6 +1184,9 @@ def build_step_runtime_factory(
                             hard_bound=hard_bound_executor,
                             runtime_source="remote_executor",
                             fallback_used=False,
+                            executor_pin_fallback_notice=executor_config.get(
+                                "executor_pin_fallback_notice"
+                            ),
                             environment=env_snapshot,
                             inventory_tool_count=len(all_tools),
                             tool_agent=tool_agent,
@@ -1117,6 +1197,36 @@ def build_step_runtime_factory(
                     )
                 except Exception as exc:
                     message = f"Selected executor '{executor_id}' failed while listing tools"
+                    from cognis.core.executor_pin_lifecycle import (
+                        fallback_active_executor_after_remote_failure,
+                    )
+
+                    fallback_lifecycle = await fallback_active_executor_after_remote_failure(
+                        session_factory=session_factory,
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        pool=executor_pool_obj,
+                        active_executor_id=executor_id,
+                        reason="secondary executor failed while listing tools",
+                    )
+                    if fallback_lifecycle.notice is not None:
+                        notice = fallback_lifecycle.notice
+                        return await factory(
+                            agent,
+                            user_email,
+                            executor_agent=executor_agent,
+                            access_context=access_context,
+                            conversation_id=conversation_id,
+                            task_id=task_id,
+                            _executor_pin_fallback_notice={
+                                "previous_executor_id": notice.previous_executor_id,
+                                "new_executor_id": notice.new_executor_id,
+                                "reason": notice.reason,
+                                "ui_message": notice.ui_message,
+                                "llm_message": notice.llm_message,
+                            },
+                            _executor_pin_fallback_retried=True,
+                        )
                     logger.warning(
                         "Failed to get tools from selected remote executor",
                         extra={
@@ -1129,6 +1239,36 @@ def build_step_runtime_factory(
                         exc_info=True,
                     )
                     raise RuntimeError(message) from exc
+            from cognis.core.executor_pin_lifecycle import (
+                fallback_active_executor_after_remote_failure,
+            )
+
+            fallback_lifecycle = await fallback_active_executor_after_remote_failure(
+                session_factory=session_factory,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                pool=executor_pool_obj,
+                active_executor_id=executor_id,
+                reason="secondary executor is not connected or not ready",
+            )
+            if fallback_lifecycle.notice is not None:
+                notice = fallback_lifecycle.notice
+                return await factory(
+                    agent,
+                    user_email,
+                    executor_agent=executor_agent,
+                    access_context=access_context,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    _executor_pin_fallback_notice={
+                        "previous_executor_id": notice.previous_executor_id,
+                        "new_executor_id": notice.new_executor_id,
+                        "reason": notice.reason,
+                        "ui_message": notice.ui_message,
+                        "llm_message": notice.llm_message,
+                    },
+                    _executor_pin_fallback_retried=True,
+                )
             message = f"Selected executor '{executor_id}' is not connected or not ready"
             _raise_runtime_resolution_error(
                 message,

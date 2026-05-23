@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -13,7 +14,11 @@ from fastapi.responses import Response
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.models.artifact import ArtifactKind
-from cognis.store.queries import create_artifact_record, get_artifact_record
+from cognis.store.queries import (
+    create_artifact_record,
+    get_artifact_record,
+    get_skill_asset_by_artifact_object,
+)
 
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
 
@@ -30,6 +35,25 @@ def _kind_for_content_type(content_type: str) -> ArtifactKind:
     return ArtifactKind.FILE
 
 
+def _is_expired(row: object, *, now: datetime | None = None) -> bool:
+    expires_at = getattr(row, "expires_at", None)
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= (now or datetime.now(UTC))
+
+
+def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> int:
+    expires_at = getattr(row, "expires_at", None)
+    if expires_at is None:
+        return requested_ttl_seconds
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    remaining_seconds = int((expires_at - datetime.now(UTC)).total_seconds())
+    return max(60, min(requested_ttl_seconds, remaining_seconds))
+
+
 @router.post("/upload")
 async def upload_artifact(
     request: Request,
@@ -41,6 +65,7 @@ async def upload_artifact(
     artifact_store = request.app.state.artifact_store
 
     content = await file.read()
+    content_hash = hashlib.sha256(content).hexdigest()
     max_size = artifact_store._config.max_size_bytes  # noqa: SLF001
     if len(content) > max_size:
         raise api_exception(400, "validation_error", "Artifact too large")
@@ -75,6 +100,7 @@ async def upload_artifact(
             size_bytes=len(content),
             status="temporary",
             expires_at=datetime.now(UTC) + timedelta(hours=24),
+            content_hash=content_hash,
         )
         await session.commit()
 
@@ -99,10 +125,11 @@ async def get_signed_url(
     artifact_store = request.app.state.artifact_store
     async with request.app.state.session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted":
+    if row is None or row.status == "deleted" or _is_expired(row):
         raise api_exception(404, "not_found", "Artifact not found")
     if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
         raise api_exception(404, "not_found", "Artifact not found")
+    ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
     url = await artifact_store.async_get_public_url(
         row.namespace,
         row.object_id,
@@ -128,6 +155,31 @@ async def serve_signed_artifact(
     artifact_store = request.app.state.artifact_store
     if not artifact_store.verify_signed_request(namespace, object_id, filename, exp=exp, sig=sig):
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
+    async with request.app.state.session_factory() as session:
+        row = await get_artifact_record(session, object_id)
+        if row is None and namespace == "skills":
+            row = await get_skill_asset_by_artifact_object(
+                session,
+                artifact_namespace=namespace,
+                artifact_object_id=object_id,
+                filename=filename,
+            )
+    if row is None:
+        raise api_exception(404, "not_found", "Artifact not found")
+    if getattr(row, "status", None) == "deleted" or _is_expired(row):
+        raise api_exception(404, "not_found", "Artifact not found")
+    if (
+        getattr(row, "namespace", None) != namespace
+        and getattr(row, "artifact_namespace", None) != namespace
+    ):
+        raise api_exception(404, "not_found", "Artifact not found")
+    if (
+        getattr(row, "object_id", None) != object_id
+        and getattr(row, "artifact_object_id", None) != object_id
+    ):
+        raise api_exception(404, "not_found", "Artifact not found")
+    if row.filename != filename:
+        raise api_exception(404, "not_found", "Artifact not found")
     content, content_type = await artifact_store.async_load(namespace, object_id, filename)
     headers = {
         "Cache-Control": "private, max-age=60",

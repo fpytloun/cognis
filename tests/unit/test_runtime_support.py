@@ -15,6 +15,7 @@ from cognis.api.runtime_support import (
 from cognis.core.executor_policy import ExecutorPolicy
 from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition
+from cognis.models.knowledgebase import KnowledgebaseModel
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
     ExecutorHandle,
@@ -26,7 +27,7 @@ from cognis.models.tool import (
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.runtime_context import RuntimeAccessContext
 from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
-from cognis.tools.registry import RegisteredTool, ToolRegistry
+from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 from cognis.tools.skills import ResolvedSkillSet
 
 
@@ -220,7 +221,9 @@ async def test_manage_agents_execution_rechecks_explicit_opt_in() -> None:
                 }
             },
         ),
-        SessionModel(session_id="s", conversation_id="c", user_email="user@example.com", agent_id="agent-1"),
+        SessionModel(
+            session_id="s", conversation_id="c", user_email="user@example.com", agent_id="agent-1"
+        ),
         AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         registry,
         executor=object(),
@@ -775,9 +778,11 @@ class _InProcessExecutorProvider:
         self.spawned_ids: list[str] = []
         self.cancelled_ids: list[str] = []
         self.registry = ToolRegistry()
+        self.spawned_configs: list[object] = []
 
     async def spawn(self, config: object) -> ExecutorHandle:
         executor_id = config.executor_id  # type: ignore[attr-defined]
+        self.spawned_configs.append(config)
         self.spawned_ids.append(executor_id)
         return ExecutorHandle(executor_id=executor_id, executor_type="in_process")
 
@@ -1109,7 +1114,9 @@ async def test_runtime_factory_refuses_explicit_websocket_fallback(
         return ResolvedSkillSet()
 
     monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
-    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
     monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
     monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
 
@@ -1161,7 +1168,9 @@ async def test_runtime_factory_returns_runtime_diagnostics_for_selected_executor
         return ResolvedSkillSet()
 
     monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
-    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
     monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
     monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
 
@@ -1218,7 +1227,9 @@ async def test_runtime_factory_uses_unique_in_process_handle_per_run(
         return ResolvedSkillSet()
 
     monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
-    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
     monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
     monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
 
@@ -1262,6 +1273,88 @@ async def test_runtime_factory_uses_unique_in_process_handle_per_run(
         await second.cleanup()
 
     assert executor.cancelled_ids == executor.spawned_ids
+
+
+@pytest.mark.asyncio
+async def test_direct_in_process_runtime_receives_knowledgebase_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(*_: object, **__: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=False)
+
+    async def _eligible_executor_config(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "executor_id": "alice_local",
+            "executor_type": "in_process",
+            "enabled_tools": [],
+            "enabled_tool_groups": [],
+            "config": {},
+            "executor_owner_email": "alice@example.com",
+            "owner_email": "alice@example.com",
+            "selection_source": "explicit",
+            "runtime_state": "active",
+            "desired_config_version": 1,
+            "applied_config_version": 1,
+        }
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {"web_available_backends": [], "web_backend": None}
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet()
+
+    class _KnowledgebaseService:
+        enabled = True
+
+        async def list(
+            self, *, owner_email: str, access_context: object | None = None
+        ) -> list[KnowledgebaseModel]:
+            return [KnowledgebaseModel(knowledgebase_id="kb-1", name=owner_email)]
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    executor = _InProcessExecutorProvider()
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers_with_executor(executor),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+        knowledgebase_service=_KnowledgebaseService(),
+    )
+
+    runtime = await factory(
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_id": "alice_local"},
+        ),
+        user_email="alice@example.com",
+    )
+
+    try:
+        config = executor.spawned_configs[0]
+        assert "knowledgebase_list" in {
+            tool.name
+            for tool in config.tools  # type: ignore[attr-defined]
+        }
+        handler = config.tool_handlers["knowledgebase_list"]  # type: ignore[attr-defined]
+        result = await handler(
+            {},
+            ToolExecutionContext(
+                executor_handle=runtime.executor_connection.handle,
+                runtime_metadata={"user_email": "alice@example.com"},
+            ),
+        )
+        assert result[0]["knowledgebase_id"] == "kb-1"
+        assert result[0]["name"] == "alice@example.com"
+    finally:
+        await runtime.cleanup()
 
 
 # ---------------------------------------------------------------------------

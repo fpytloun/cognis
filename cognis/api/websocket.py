@@ -200,6 +200,23 @@ class WebSocketTurnObserver:
     def _release_sentence_buffer(self, conversation_id: str, message_id: str) -> Any:
         return self._sentence_buffers.pop((conversation_id, message_id), None)
 
+    async def _send_conversation_activity(
+        self,
+        conversation_id: str,
+        *,
+        has_active_turn: bool,
+        last_message_at: datetime | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": "conversation_updated",
+            "conversation_id": conversation_id,
+            "has_active_turn": has_active_turn,
+        }
+        if last_message_at is not None:
+            payload["last_message_at"] = last_message_at.isoformat()
+            payload["updated_at"] = last_message_at.isoformat()
+        await self._manager.send_to_conversation(conversation_id, payload)
+
     async def on_token(
         self,
         conversation_id: str,
@@ -277,6 +294,7 @@ class WebSocketTurnObserver:
         attachments: list[dict[str, Any]] | None = None,
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
+        presentation: dict[str, Any] | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "tool_result",
@@ -296,7 +314,39 @@ class WebSocketTurnObserver:
             payload["attachments"] = strip_attachment_payload_bytes(attachments)
         if file_diffs:
             payload["file_diffs"] = file_diffs
+        if presentation:
+            payload.update(presentation)
         await self._manager.send_to_conversation(conversation_id, payload)
+
+    async def on_tool_output_chunk(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        delta: str,
+        stream: str | None,
+        turn_id: str | None = None,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
+    ) -> None:
+        await self._manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "tool_result_chunk",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "delta": delta,
+                "stream": stream,
+                "is_error": stream == "stderr",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "turn_id": turn_id,
+                "chunk_index": chunk_index,
+                "content_offset": content_offset,
+            },
+        )
 
     async def on_turn_complete(self, result: TurnResult) -> None:
         queued_messages = self._manager.app.state.turn_scheduler.queued_messages(
@@ -332,12 +382,26 @@ class WebSocketTurnObserver:
             "context_usage": result.context_usage,
             "queued_count": len(queued_messages),
             "messages": queued_messages,
+            "completed_at": (
+                result.completed_at.isoformat()
+                if result.completed_at is not None
+                else datetime.now(UTC).isoformat()
+            ),
             "attachments": strip_attachment_payload_bytes(result.attachments or []),
+            "chat_mode": result.chat_mode,
+            "chat_mode_source": result.chat_mode_source,
         }
         if result.delegated:
             payload["delegated"] = True
             payload["task_id"] = result.task_id
         await self._manager.send_to_conversation(result.conversation_id, payload)
+
+        completed_at = result.completed_at if result.completed_at is not None else datetime.now(UTC)
+        await self._send_conversation_activity(
+            result.conversation_id,
+            has_active_turn=False,
+            last_message_at=completed_at,
+        )
 
         # Notify clients if the conversation title changed
         if result.title_changed and result.new_title:
@@ -347,6 +411,9 @@ class WebSocketTurnObserver:
                     "type": "conversation_updated",
                     "conversation_id": result.conversation_id,
                     "title": result.new_title,
+                    "has_active_turn": False,
+                    "last_message_at": completed_at.isoformat(),
+                    "updated_at": completed_at.isoformat(),
                 },
             )
 
@@ -361,6 +428,7 @@ class WebSocketTurnObserver:
                 detail=error.detail,
             ).model_dump(),
         )
+        await self._send_conversation_activity(conversation_id, has_active_turn=False)
 
     async def on_thinking(
         self,
@@ -373,6 +441,11 @@ class WebSocketTurnObserver:
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None:
         """Emit assistant thinking chunk or block boundary frame.
 
@@ -395,6 +468,11 @@ class WebSocketTurnObserver:
                     "delta": delta,
                     "title": title,
                     "complete": complete,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_ms": duration_ms,
+                    "source": source,
+                    "provider_block_index": provider_block_index,
                 },
             )
         if complete:
@@ -411,6 +489,11 @@ class WebSocketTurnObserver:
                     "title": title,
                     "complete": True,
                     "content": content,
+                    "started_at": started_at,
+                    "completed_at": completed_at,
+                    "duration_ms": duration_ms,
+                    "source": source,
+                    "provider_block_index": provider_block_index,
                 },
             )
 
@@ -567,9 +650,7 @@ class WebSocketConnectionManager:
                 return True
         return False
 
-    async def send_to_tts_subscribers(
-        self, conversation_id: str, payload: dict[str, Any]
-    ) -> None:
+    async def send_to_tts_subscribers(self, conversation_id: str, payload: dict[str, Any]) -> None:
         """Fan out a payload only to TTS-enabled connections."""
         connection_ids = self._by_conversation.get(conversation_id, set())
         if not connection_ids:
@@ -710,7 +791,37 @@ class WebSocketConnectionManager:
             for item in result.events:
                 event_type = item.get("type")
                 data = item.get("data", {})
-                if event_type == "assistant_message":
+                if event_type == "user_message":
+                    attachments = await hydrate_attachment_refs(
+                        artifact_session,
+                        artifact_store,
+                        data.get("attachments")
+                        if isinstance(data.get("attachments"), list)
+                        else [],
+                        owner_email=connection.user_email,
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                    )
+                    await connection.send_json(
+                        {
+                            "type": "user_message",
+                            "conversation_id": conversation_id,
+                            "session_id": data.get("session_id") or session.session_id,
+                            "message_id": data.get("message_id") or data.get("event_id"),
+                            "event_id": data.get("event_id") or data.get("message_id"),
+                            "timestamp": item.get("timestamp"),
+                            "seq": item.get("seq", 0),
+                            "turn_id": data.get("turn_id"),
+                            "content": data.get("content", ""),
+                            "attachments": attachments,
+                            "queue_id": data.get("queue_id"),
+                            "client_message_id": data.get("client_message_id"),
+                            "chat_mode": data.get("chat_mode"),
+                            "chat_mode_source": data.get("chat_mode_source"),
+                        }
+                    )
+                    replayed += 1
+                elif event_type == "assistant_message":
                     turn_id = data.get("turn_id") if isinstance(data.get("turn_id"), str) else None
                     message_id = turn_id or f"replay_{item.get('seq', uuid.uuid4().hex)}"
                     content = str(data.get("content", ""))
@@ -813,6 +924,11 @@ class WebSocketConnectionManager:
                             "title": data.get("title"),
                             "content": data.get("content", ""),
                             "complete": True,
+                            "started_at": data.get("started_at"),
+                            "completed_at": data.get("completed_at"),
+                            "duration_ms": data.get("duration_ms"),
+                            "source": data.get("reasoning_source") or data.get("source"),
+                            "provider_block_index": data.get("provider_block_index"),
                             "seq": item.get("seq"),
                         }
                     )
@@ -861,7 +977,13 @@ class WebSocketConnectionManager:
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
                                 "agent_id": data.get("agent_id"),
-                                "task": data.get("task"),
+                                "task": data.get("title")
+                                or data.get("task_title")
+                                or data.get("task"),
+                                "title": data.get("title") or data.get("task_title"),
+                                "task_title": data.get("task_title") or data.get("title"),
+                                "used_agent_id": data.get("used_agent_id"),
+                                "duration_ms": data.get("duration_ms"),
                                 "result": data.get("result_summary"),
                                 "turn_id": data.get("turn_id"),
                             }
@@ -873,8 +995,15 @@ class WebSocketConnectionManager:
                                 "conversation_id": conversation_id,
                                 "child_session_id": data.get("child_session_id"),
                                 "agent_id": data.get("agent_id"),
-                                "task": data.get("task"),
+                                "task": data.get("title")
+                                or data.get("task_title")
+                                or data.get("task"),
+                                "title": data.get("title") or data.get("task_title"),
+                                "task_title": data.get("task_title") or data.get("title"),
+                                "used_agent_id": data.get("used_agent_id"),
+                                "duration_ms": data.get("duration_ms"),
                                 "reason": data.get("error"),
+                                "recoverable": data.get("recoverable"),
                                 "turn_id": data.get("turn_id"),
                             }
                         )
@@ -887,7 +1016,13 @@ class WebSocketConnectionManager:
                                 "child_session_id": data.get("child_session_id"),
                                 "mode": data.get("mode"),
                                 "agent_id": data.get("agent_id"),
-                                "task": data.get("task"),
+                                "task": data.get("title")
+                                or data.get("task_title")
+                                or data.get("task"),
+                                "title": data.get("title") or data.get("task_title"),
+                                "task_title": data.get("task_title") or data.get("title"),
+                                "used_agent_id": data.get("used_agent_id"),
+                                "input_redacted": data.get("input_redacted"),
                                 "turn_id": data.get("turn_id"),
                             }
                         )
@@ -900,6 +1035,9 @@ class WebSocketConnectionManager:
                             "seq": item.get("seq"),
                             "text": str(data.get("message", "")),
                             "turn_id": data.get("turn_id"),
+                            "notice_id": data.get("notice_id"),
+                            "kind": data.get("kind"),
+                            "scope": data.get("scope"),
                         }
                     )
                     replayed += 1
@@ -947,9 +1085,7 @@ class WebSocketConnectionManager:
             )
 
         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
-        has_active_turn = bool(
-            turn_scheduler and turn_scheduler.has_running_turn(conversation_id)
-        )
+        has_active_turn = bool(turn_scheduler and turn_scheduler.has_running_turn(conversation_id))
         if turn_scheduler is not None:
             for snapshot in await turn_scheduler.active_stream_snapshots(conversation_id):
                 await connection.send_json(
@@ -1220,12 +1356,13 @@ async def _handle_message(
     command_dispatcher = getattr(app.state, "command_dispatcher", None)
     turn_scheduler = getattr(app.state, "turn_scheduler", None)
 
-    if command_dispatcher is not None:
+    if command_dispatcher is not None and content.strip().startswith("/"):
         # Load minimal runtime for command dispatch
         from cognis.api.serializers import agent_to_response
         from cognis.core.session import _to_conversation_model, _to_session_model
         from cognis.store.queries import get_agent, get_conversation, get_session_row
 
+        session_manager = getattr(app.state, "session_manager", None)
         async with app.state.session_factory() as db_session:
             conversation_row = await get_conversation(db_session, conversation_id)
             if conversation_row is None:
@@ -1251,6 +1388,16 @@ async def _handle_message(
             )
 
         session_model = _to_session_model(session_row) if session_row else None
+        if session_model is None and session_manager is not None:
+            session_model = await session_manager.ensure_root_session(
+                conversation_id=conversation_id,
+                user_email=connection.user_email,
+                agent_id=conversation_model.agent_id,
+                intention=content,
+            )
+            conversation_model = conversation_model.model_copy(
+                update={"active_session_id": session_model.session_id}
+            )
 
         # Try command dispatch
         if session_model is not None:
@@ -1345,7 +1492,7 @@ async def _handle_cancel(
     if turn_scheduler is None:
         return
 
-    cancelled = await turn_scheduler.cancel_turn(conversation_id)
+    cancelled = await turn_scheduler.cancel_turn(conversation_id, clear_queue=False)
     if cancelled:
         await manager.send_to_conversation(
             conversation_id,
@@ -1842,6 +1989,7 @@ async def _render_command_result(
                 "type": "system_message",
                 "conversation_id": conversation_id,
                 "text": result.text,
+                **result.data,
             },
         )
     elif result.type == "error":
@@ -1875,6 +2023,16 @@ async def _render_command_result(
             conversation_id,
             {
                 "type": "session_reset",
+                **result.data,
+            },
+        )
+    elif result.type == "history_rebased":
+        await manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "history_rebased",
+                "conversation_id": conversation_id,
+                "message": result.text,
                 **result.data,
             },
         )
@@ -1942,7 +2100,24 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "session_id": event.data.get("session_id"),
             "text": event.data.get("message"),
             "turn_id": event.data.get("turn_id"),
+            "notice_id": event.data.get("notice_id"),
+            "kind": event.data.get("kind"),
+            "scope": event.data.get("scope"),
         }
+    if event.type == EventType.CONVERSATION_UPDATED:
+        payload: dict[str, Any] = {
+            "type": "conversation_updated",
+            "conversation_id": conversation_id,
+        }
+        if event.data.get("title") is not None:
+            payload["title"] = event.data.get("title")
+        if isinstance(event.data.get("has_active_turn"), bool):
+            payload["has_active_turn"] = event.data.get("has_active_turn")
+        if event.data.get("last_message_at") is not None:
+            payload["last_message_at"] = event.data.get("last_message_at")
+        if event.data.get("updated_at") is not None:
+            payload["updated_at"] = event.data.get("updated_at")
+        return payload
     if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
         "tool_call_started",
         "tool_call_completed",
@@ -1988,6 +2163,10 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "session_id": event.data.get("session_id"),
             "message_id": event.data.get("message_id"),
             "queued_count": event.data.get("queued_count", 0),
+            "chat_mode": event.data.get("chat_mode"),
+            "chat_mode_source": event.data.get("chat_mode_source"),
+            "completed_at": event.data.get("completed_at")
+            or (event.timestamp.isoformat() if event.timestamp else None),
         }
     if event.type == EventType.TASK_STARTED:
         return {
@@ -2033,7 +2212,13 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "child_session_id": event.data.get("child_session_id"),
             "mode": event.data.get("mode"),
             "agent_id": event.data.get("agent_id"),
-            "task": event.data.get("task"),
+            "used_agent_id": event.data.get("used_agent_id"),
+            "task": event.data.get("title")
+            or event.data.get("task_title")
+            or event.data.get("task"),
+            "title": event.data.get("title") or event.data.get("task_title"),
+            "task_title": event.data.get("task_title") or event.data.get("title"),
+            "input_redacted": event.data.get("input_redacted"),
         }
     if event.type == EventType.DELEGATION_PROGRESS:
         return {
@@ -2043,6 +2228,9 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "tool_call_count": event.data.get("tool_call_count"),
             "max_tool_calls": event.data.get("max_tool_calls"),
             "last_tool": event.data.get("last_tool"),
+            "title": event.data.get("title") or event.data.get("task_title"),
+            "task_title": event.data.get("task_title") or event.data.get("title"),
+            "todos": event.data.get("todos"),
         }
     if event.type == EventType.DELEGATION_COMPLETED:
         return {
@@ -2050,8 +2238,19 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "child_session_id": event.data.get("child_session_id"),
             "agent_id": event.data.get("agent_id"),
-            "task": event.data.get("task"),
+            "used_agent_id": event.data.get("used_agent_id"),
+            "task": event.data.get("title")
+            or event.data.get("task_title")
+            or event.data.get("task"),
+            "title": event.data.get("title") or event.data.get("task_title"),
+            "task_title": event.data.get("task_title") or event.data.get("title"),
+            "duration_ms": event.data.get("duration_ms"),
             "result": event.data.get("result_summary"),
+            "result_content": event.data.get("result_content"),
+            "result_source": event.data.get("result_source"),
+            "result_anchors": event.data.get("result_anchors"),
+            "result_truncated": event.data.get("result_truncated"),
+            "todos": event.data.get("todos"),
         }
     if event.type == EventType.DELEGATION_FAILED:
         return {
@@ -2059,8 +2258,16 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "child_session_id": event.data.get("child_session_id"),
             "agent_id": event.data.get("agent_id"),
-            "task": event.data.get("task"),
+            "used_agent_id": event.data.get("used_agent_id"),
+            "task": event.data.get("title")
+            or event.data.get("task_title")
+            or event.data.get("task"),
+            "title": event.data.get("title") or event.data.get("task_title"),
+            "task_title": event.data.get("task_title") or event.data.get("title"),
+            "duration_ms": event.data.get("duration_ms"),
             "reason": event.data.get("reason"),
+            "recoverable": event.data.get("recoverable"),
+            "todos": event.data.get("todos"),
         }
     if event.type == EventType.SESSION_RECOVERED:
         return {
@@ -2097,6 +2304,25 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "summary_preview": event.data.get("summary_preview"),
             "method": event.data.get("method"),
             "turns_compacted": event.data.get("turns_compacted"),
+            "trigger": event.data.get("trigger"),
+            "reason": event.data.get("reason"),
+            "tokens_before": event.data.get("tokens_before"),
+            "tokens_after": event.data.get("tokens_after"),
+            "prompt_tokens": event.data.get("prompt_tokens"),
+            "max_context_tokens": event.data.get("max_context_tokens"),
+            "max_input_tokens": event.data.get("max_input_tokens"),
+            "available_prompt_tokens": event.data.get("available_prompt_tokens"),
+            "compaction_threshold_prompt_tokens": event.data.get(
+                "compaction_threshold_prompt_tokens"
+            ),
+            "loop_pressure_threshold_prompt_tokens": event.data.get(
+                "loop_pressure_threshold_prompt_tokens"
+            ),
+            "compaction_threshold": event.data.get("compaction_threshold"),
+            "previous_usage_percentage": event.data.get("previous_usage_percentage"),
+            "effective_usage_percentage": event.data.get("effective_usage_percentage"),
+            "hard_pressure_exceeded": event.data.get("hard_pressure_exceeded"),
+            "used_timeout_fallback": event.data.get("used_timeout_fallback"),
         }
     # Unified notification events
     if event.type == EventType.NOTIFICATION_CREATED:
@@ -2206,11 +2432,16 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "type": "user_message",
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
+            "message_id": event.data.get("message_id") or event.data.get("event_id"),
+            "event_id": event.data.get("event_id") or event.data.get("message_id"),
+            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
             "content": event.data.get("content", ""),
             "attachments": event.data.get("attachments", []),
             "turn_id": event.data.get("turn_id"),
             "queue_id": event.data.get("queue_id"),
             "client_message_id": event.data.get("client_message_id"),
+            "chat_mode": event.data.get("chat_mode"),
+            "chat_mode_source": event.data.get("chat_mode_source"),
         }
     return None
 

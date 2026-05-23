@@ -38,6 +38,7 @@ __all__ = [
     "get_tavily_backend",
     "get_browser_fetch_backend",
     "get_headed_browser_fetch_backend",
+    "get_preferred_browser_fetch_backend",
     "headed_fallback_enabled",
     "resolve_fetch_backend",
     "resolve_search_backend",
@@ -161,6 +162,25 @@ def _get_headed_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend |
     return _browser_fetch_headed
 
 
+def _prefer_headed_browser_fetch(metadata: dict[str, Any]) -> bool:
+    """Return True when browser fetch should prefer a headed context."""
+    return bool(
+        metadata.get(
+            "web_browser_fetch_prefer_headed",
+            metadata.get("web_browser_fetch_headed_fallback_enabled", False),
+        )
+    )
+
+
+def _get_preferred_browser_fetch(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
+    """Return the least bot-sensitive browser fetch backend available."""
+    if _prefer_headed_browser_fetch(metadata):
+        headed = _get_headed_browser_fetch(metadata)
+        if headed is not None:
+            return headed
+    return _get_browser_fetch(metadata)
+
+
 def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float, float, str, float]:
     wait_timeout_raw = metadata.get("web_browser_fetch_wait_timeout_seconds", 30.0)
     idle_raw = metadata.get("web_browser_fetch_session_idle_seconds", 60.0)
@@ -231,7 +251,7 @@ def resolve_fetch_backend(
         if explicit_override:
             return _UnavailableTavilyBackend()
     if backend_name == "browser":
-        browser = _get_browser_fetch(metadata)
+        browser = _get_preferred_browser_fetch(metadata)
         if browser is not None:
             return browser
         return _UnavailableBrowserBackend()
@@ -278,6 +298,11 @@ def get_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetchBackend |
 def get_headed_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
     """Return the headed browser fetch backend if it is allowed by config."""
     return _get_headed_browser_fetch(metadata)
+
+
+def get_preferred_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetchBackend | None:
+    """Return headed browser fetch when available, otherwise headless."""
+    return _get_preferred_browser_fetch(metadata)
 
 
 def headed_fallback_enabled(metadata: dict[str, Any]) -> bool:

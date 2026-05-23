@@ -12,9 +12,9 @@ from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
-from cognis.store.models import ModelRouting
 from cognis.store.queries import (
     get_artifact_record,
+    get_model_routing,
     list_recent_artifact_records,
     search_artifact_records,
 )
@@ -43,6 +43,16 @@ _TEXT_MIME_TYPES = {
 
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
+
+
+def _is_expired_artifact_row(row: object, *, now: datetime | None = None) -> bool:
+    expires_at = getattr(row, "expires_at", None)
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= (now or datetime.now(UTC))
+
 
 ARTIFACT_READ_TOOL = ToolDefinition(
     name="artifact_read",
@@ -283,6 +293,7 @@ async def handle_artifact_tool(
     user_email: str | None,
     current_model: str | None = None,
     current_provider_id: str | None = None,
+    owner_email: str | None = None,
 ) -> ToolResult:
     """Handle artifact inspection tools."""
 
@@ -295,6 +306,7 @@ async def handle_artifact_tool(
             user_email=user_email,
             current_model=current_model,
             current_provider_id=current_provider_id,
+            owner_email=owner_email or user_email,
         )
     if tool_name == ARTIFACT_LIST_RECENT_TOOL.name:
         return await _handle_artifact_list_recent(
@@ -347,7 +359,7 @@ async def _handle_artifact_read(
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted":
+    if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
     if row.owner_email and user_email and row.owner_email != user_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
@@ -386,6 +398,7 @@ async def _handle_artifact_read(
         session_factory=session_factory,
         current_model=current_model,
         current_provider_id=current_provider_id,
+        owner_email=user_email,
         text_offset=offset,
         text_limit=limit,
     )
@@ -529,7 +542,7 @@ async def _handle_artifact_get_metadata(
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted":
+    if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
     if row.owner_email and user_email and row.owner_email != user_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
@@ -557,7 +570,7 @@ async def _handle_artifact_get_url(
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
-    if row is None or row.status == "deleted":
+    if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
     if row.owner_email and user_email and row.owner_email != user_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
@@ -597,6 +610,7 @@ async def analyze_attachment_ref(
     session_factory: Any,
     current_model: str | None,
     current_provider_id: str | None,
+    owner_email: str | None = None,
     text_offset: int = 1,
     text_limit: int = _MAX_READ_LINES,
 ) -> ToolResult:
@@ -620,7 +634,9 @@ async def analyze_attachment_ref(
             model_info = None
 
     if model_info is None:
-        route_model, route_provider_id = await _get_attachment_analysis_route(session_factory)
+        route_model, route_provider_id = await _get_attachment_analysis_route(
+            session_factory, owner_email=owner_email
+        )
         if route_model:
             selected_model = route_model
             selected_provider_id = route_provider_id
@@ -752,9 +768,15 @@ async def _hydrate_attachment_ref(
     )
 
 
-async def _get_attachment_analysis_route(session_factory: Any) -> tuple[str | None, str | None]:
+async def _get_attachment_analysis_route(
+    session_factory: Any, *, owner_email: str | None = None
+) -> tuple[str | None, str | None]:
     async with session_factory() as session:
-        route = await session.get(ModelRouting, "attachment_analysis")
+        route = None
+        if owner_email:
+            route = await get_model_routing(session, "attachment_analysis", owner_email=owner_email)
+        if route is None:
+            route = await get_model_routing(session, "attachment_analysis")
     if route is None:
         return None, None
     model = str(getattr(route, "model", "") or "").strip()

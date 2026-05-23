@@ -2,9 +2,9 @@
 
 CommandDispatcher handles all slash commands (``/compact``, ``/new``,
 ``/model``, ``/thinking``, ``/context``, ``/info``, ``/lsp``, ``/help``,
-``/approve``, ``/deny``, ``/retry``, ``/continue``) without any dependency on
-WebSocket or other
-transport layers.
+``/task``, ``/research``, ``/implement``, ``/delegate``, ``/approve``,
+``/deny``, ``/retry``, ``/continue``) without any dependency on WebSocket or
+other transport layers.
 
 Each command returns a ``CommandResult`` that the transport layer renders
 into its native format (WS JSON, REST response, CLI output, etc.).
@@ -17,10 +17,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cognis.core.agent_loop import PauseResolution
+from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
+from cognis.core.compaction import CompactionModelContext
 from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.task import TaskDelivery
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
     reasoning_efforts_for_model,
@@ -30,6 +33,61 @@ from cognis.providers.llm.reasoning import (
 logger = get_logger(__name__)
 
 _EXECUTION_PATH_CONTEXT_KEYS = frozenset({"workspace_root", "working_directory"})
+_EXACT_SYSTEM_SLASH_COMMANDS = frozenset(
+    {
+        "/compact",
+        "/summarize",
+        "/new",
+        "/reset",
+        "/clear",
+        "/fork",
+        "/undo",
+        "/redo",
+        "/context",
+        "/plan",
+        "/build",
+        "/default",
+        "/info",
+        "/lsp",
+        "/help",
+    }
+)
+_PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
+    {
+        "/model",
+        "/thinking",
+        "/executor",
+        "/task",
+        "/research",
+        "/implement",
+        "/delegate",
+        "/approve",
+        "/deny",
+        "/retry",
+        "/continue",
+        "/stop",
+        "/cancel",
+    }
+)
+
+
+def normalize_slash_command_message(value: str) -> str:
+    stripped = value.strip()
+    if not stripped.startswith("/"):
+        return stripped
+    return f"/{stripped[1:].lstrip()}"
+
+
+def is_system_slash_command_message(value: str) -> bool:
+    """Return true for slash commands handled by the command dispatcher."""
+
+    normalized = normalize_slash_command_message(value)
+    if normalized in _EXACT_SYSTEM_SLASH_COMMANDS:
+        return True
+    return any(
+        normalized == command or normalized.startswith(f"{command} ")
+        for command in _PREFIX_SYSTEM_SLASH_COMMANDS
+    )
 
 
 def _without_execution_paths(platform_data: dict[str, Any] | None) -> dict[str, Any]:
@@ -78,6 +136,7 @@ class CommandResult:
     - ``session_compacted``: session was compacted, ``data`` has details
     - ``conversation_created``: new conversation created, ``data`` has IDs
     - ``session_reset``: session was reset, ``data`` has IDs
+    - ``history_rebased``: active conversation history was undone/redone
     - ``error``: command failed, ``text`` has the error message
     - ``queued``: message queued (escalation pending), ``data`` has reason
     """
@@ -121,6 +180,10 @@ class CommandDispatcher:
         self._notification_service = notification_service
         self._turn_scheduler = turn_scheduler
 
+    @property
+    def _task_queue(self) -> Any | None:
+        return getattr(self._turn_scheduler, "_task_queue", None)
+
     async def dispatch(
         self,
         command: str,
@@ -133,10 +196,9 @@ class CommandDispatcher:
         has_busy_turn: bool | None = None,
     ) -> CommandResult | None:
         """Dispatch a slash command. Returns None if not a command."""
-        stripped = command.strip()
+        stripped = normalize_slash_command_message(command)
         if not stripped.startswith("/"):
             return None
-        stripped = f"/{stripped[1:].lstrip()}"
         has_busy_turn = has_active_turn if has_busy_turn is None else has_busy_turn
 
         # /compact or /summarize
@@ -147,7 +209,7 @@ class CommandDispatcher:
                     text="Cannot compact while a turn is active. Wait for it to finish or cancel it.",
                     data={"code": "turn_active"},
                 )
-            return await self._handle_compact(conversation, session)
+            return await self._handle_compact(conversation, session, agent, user_email)
 
         # /new, /reset, /clear
         if stripped in ("/new", "/reset", "/clear"):
@@ -169,9 +231,35 @@ class CommandDispatcher:
                 )
             return await self._handle_fork(conversation, session, agent, user_email)
 
+        # /undo and /redo rebase visible history within the same conversation.
+        if stripped == "/undo":
+            if has_busy_turn:
+                return CommandResult(
+                    type="error",
+                    text="Cannot undo while a turn is active. Wait for it to finish or cancel it.",
+                    data={"code": "turn_active"},
+                )
+            return await self._handle_undo(conversation, session, agent)
+        if stripped == "/redo":
+            if has_busy_turn:
+                return CommandResult(
+                    type="error",
+                    text="Cannot redo while a turn is active. Wait for it to finish or cancel it.",
+                    data={"code": "turn_active"},
+                )
+            return await self._handle_redo(conversation, session)
+
         # /context
         if stripped == "/context":
             return await self._handle_context(session)
+
+        # /plan, /build, /default persistent chat mode switches. One-shot
+        # forms with trailing text are parsed by turn submission.
+        if stripped in ("/plan", "/build", "/default"):
+            mode: ChatMode = stripped[1:]  # type: ignore[assignment]
+            return await self._handle_chat_mode(conversation, mode)
+        if stripped.startswith(("/plan ", "/build ", "/default ")):
+            return None
 
         # /info
         if stripped == "/info":
@@ -209,6 +297,19 @@ class CommandDispatcher:
         if stripped == "/help":
             return self._handle_help()
 
+        # /task, /research, /implement, /delegate <description>
+        if stripped in ("/task", "/research", "/implement", "/delegate") or stripped.startswith(
+            ("/task ", "/research ", "/implement ", "/delegate ")
+        ):
+            command_name, _, description = stripped.partition(" ")
+            return await self._handle_task_command(
+                command_name=command_name,
+                description=description.strip(),
+                conversation=conversation,
+                agent=agent,
+                user_email=user_email,
+            )
+
         # /approve [note] or /deny [note]
         if stripped.startswith("/approve") or stripped.startswith("/deny"):
             is_approve = stripped.startswith("/approve")
@@ -245,14 +346,70 @@ class CommandDispatcher:
     # Command handlers
     # ------------------------------------------------------------------
 
+    async def _compaction_model_context(
+        self,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str | None,
+    ) -> CompactionModelContext:
+        model_override = self._session_cache.get_model_override(session.session_id)
+        reasoning_override = self._session_cache.get_reasoning_effort_override(session.session_id)
+        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
+        provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        reasoning_effort = reasoning_override or (
+            agent.llm_config.reasoning_effort if agent.llm_config else None
+        )
+        if explicit_model:
+            return CompactionModelContext(
+                model=explicit_model,
+                provider_id=provider_id,
+                reasoning_effort=reasoning_effort,
+            )
+        if self._providers is None or getattr(self._providers, "llm", None) is None:
+            return CompactionModelContext(
+                model=explicit_model,
+                provider_id=provider_id,
+                reasoning_effort=reasoning_effort,
+            )
+        try:
+            resolved_model, resolved_provider = await self._providers.llm.resolve_model_target(
+                explicit_provider_id=provider_id,
+                task_type="default",
+                acting_user_email=user_email,
+            )
+            return CompactionModelContext(
+                model=resolved_model,
+                provider_id=getattr(resolved_provider, "provider_id", provider_id),
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to resolve manual compaction same-session model context",
+                extra={"extra_data": {"session_id": session.session_id}},
+                exc_info=True,
+            )
+            return CompactionModelContext(
+                model=explicit_model,
+                provider_id=provider_id,
+                reasoning_effort=reasoning_effort,
+            )
+
     async def _handle_compact(
-        self, conversation: ConversationModel, session: SessionModel
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str | None = None,
     ) -> CommandResult:
         """Handle /compact or /summarize."""
         conversation_id = conversation.conversation_id
 
         try:
-            compaction_result = await self._compaction_strategy.compact(session, trigger="manual")
+            compaction_result = await self._compaction_strategy.compact(
+                session,
+                trigger="manual",
+                model_context=await self._compaction_model_context(session, agent, user_email),
+            )
         except Exception:
             logger.exception(
                 "Command /compact failed",
@@ -265,17 +422,41 @@ class CommandDispatcher:
             )
 
         if not compaction_result.compacted:
+            if compaction_result.method == "llm_failed":
+                return CommandResult(
+                    type="error",
+                    text=(
+                        "Compaction requires the LLM and the request failed. "
+                        "Please try again, or use /new to start a fresh conversation."
+                    ),
+                    data={"code": "compaction_llm_failed"},
+                )
             return CommandResult(
                 type="system_message",
                 text="Not enough conversation history to compact.",
             )
 
-        # Mark current session as completed (deferred creation)
-        await self._session_manager.mark_completed(
-            session.session_id,
-            result_summary=f"Compacted ({compaction_result.method})",
-            completion_reason="compacted",
-        )
+        try:
+            new_session = await self._session_manager.rotate_session(
+                conversation_id=conversation_id,
+                current_session=session,
+                intention="Continued conversation",
+                completion_reason="compacted",
+                compaction_summary=compaction_result.summary,
+                tail_events=getattr(compaction_result, "preserved_tail_events", None),
+            )
+            if compaction_result.summary:
+                await self._session_cache.refresh(new_session)
+        except Exception:
+            logger.exception(
+                "Command /compact rotation failed",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
+            return CommandResult(
+                type="error",
+                text="Compaction succeeded, but session rotation failed. Try again or continue chatting.",
+                data={"code": "compaction_rotation_failed"},
+            )
 
         summary_preview = (compaction_result.summary or "")[:500]
         return CommandResult(
@@ -283,7 +464,7 @@ class CommandDispatcher:
             text="Conversation history compacted.",
             data={
                 "conversation_id": conversation_id,
-                "session_id": session.session_id,
+                "session_id": new_session.session_id,
                 "previous_session_id": session.session_id,
                 "summary_preview": summary_preview,
                 "method": compaction_result.method,
@@ -357,6 +538,13 @@ class CommandDispatcher:
                     completion_reason="user_reset",
                 )
                 await self._clear_conversation_execution_paths(conversation)
+                async with self._session_factory() as db_session:
+                    from cognis.store import queries as store_queries
+
+                    await store_queries.reset_conversation_active_executor(
+                        db_session, conversation_id
+                    )
+                    await db_session.commit()
             except Exception:
                 logger.exception("Command /new failed to rotate session")
                 return CommandResult(
@@ -367,6 +555,10 @@ class CommandDispatcher:
 
             return CommandResult(
                 type="session_reset",
+                text=(
+                    "Started a fresh session. Executor selection will be resolved again "
+                    "from the agent's primary executor pool."
+                ),
                 data={
                     "conversation_id": conversation_id,
                     "session_id": new_session.session_id,
@@ -442,6 +634,76 @@ class CommandDispatcher:
             },
         )
 
+    async def _handle_undo(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+    ) -> CommandResult:
+        """Handle /undo."""
+
+        try:
+            result = await self._session_manager.undo_last_turn(
+                conversation=conversation,
+                current_session=session,
+                is_slash_command_message=is_system_slash_command_message,
+                intention=f"Undo conversation with {agent.name}",
+            )
+        except Exception:
+            logger.exception(
+                "Command /undo failed",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
+            return CommandResult(
+                type="error",
+                text="Could not undo the last turn.",
+                data={"code": "undo_failed"},
+            )
+        if result is None:
+            return CommandResult(type="system_message", text="Nothing to undo.")
+        return self._history_rebased_result(result)
+
+    async def _handle_redo(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+    ) -> CommandResult:
+        """Handle /redo."""
+
+        try:
+            result = await self._session_manager.redo_last_undo(
+                conversation=conversation,
+                current_session=session,
+            )
+        except Exception:
+            logger.exception(
+                "Command /redo failed",
+                extra={"extra_data": {"session_id": session.session_id}},
+            )
+            return CommandResult(
+                type="error",
+                text="Could not redo the last undone turn.",
+                data={"code": "redo_failed"},
+            )
+        if result is None:
+            return CommandResult(type="system_message", text="Nothing to redo.")
+        return self._history_rebased_result(result)
+
+    @staticmethod
+    def _history_rebased_result(result: Any) -> CommandResult:
+        return CommandResult(
+            type="history_rebased",
+            text=result.message,
+            data={
+                "conversation_id": result.session.conversation_id,
+                "session_id": result.session.session_id,
+                "previous_session_id": result.previous_session.session_id,
+                "operation": result.operation,
+                "undo_available": result.undo_available,
+                "redo_available": result.redo_available,
+            },
+        )
+
     async def _clear_conversation_execution_paths(self, conversation: ConversationModel) -> None:
         """Remove persisted execution paths from one conversation context."""
 
@@ -470,6 +732,114 @@ class CommandDispatcher:
                     extra={"extra_data": {"conversation_id": conversation.conversation_id}},
                     exc_info=True,
                 )
+
+    async def _handle_task_command(
+        self,
+        *,
+        command_name: str,
+        description: str,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+    ) -> CommandResult:
+        """Create a workflow task from an explicit task slash command."""
+
+        if not description:
+            return CommandResult(
+                type="error",
+                text=f"Usage: {command_name} <task description>",
+                data={"code": "missing_task_description", "command": command_name},
+            )
+
+        task_queue = self._task_queue
+        if task_queue is None:
+            return CommandResult(
+                type="error",
+                text="Task queue is not available.",
+                data={"code": "task_queue_unavailable", "command": command_name},
+            )
+
+        platform_data = conversation.context.platform_data or {}
+        workflow_id = self._workflow_hint_for_task_command(command_name)
+        task = await task_queue.submit(
+            created_by=user_email,
+            agent_id=agent.agent_id,
+            title=description[:80],
+            description=description,
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            delivery=TaskDelivery(mode="same_conversation"),
+            workflow_id=workflow_id,
+            project_id=conversation.project_id,
+            workspace_root=platform_data.get("workspace_root"),
+            working_directory=platform_data.get("working_directory"),
+            status="queued",
+        )
+        return CommandResult(
+            type="queued",
+            text="Working on that in the background.",
+            data={
+                "code": "task_created",
+                "task_id": task.task_id,
+                "command": command_name,
+            },
+        )
+
+    @staticmethod
+    def _workflow_hint_for_task_command(command_name: str) -> str | None:
+        if command_name == "/research":
+            return "system:research"
+        if command_name == "/implement":
+            return "system:software-development"
+        return None
+
+    async def _handle_chat_mode(
+        self,
+        conversation: ConversationModel,
+        mode: ChatMode,
+    ) -> CommandResult:
+        """Persist a conversation-level chat-mode override."""
+
+        updated_platform_data = dict(conversation.context.platform_data or {})
+        if mode == "default":
+            updated_platform_data.pop(CHAT_MODE_CONTEXT_KEY, None)
+        else:
+            updated_platform_data[CHAT_MODE_CONTEXT_KEY] = mode
+        conversation.context.platform_data = updated_platform_data
+
+        if self._session_factory is not None:
+            from cognis.store.queries import update_conversation_context_data
+
+            async with self._session_factory() as db_session:
+                try:
+                    await update_conversation_context_data(
+                        db_session,
+                        conversation.conversation_id,
+                        context_data=updated_platform_data,
+                    )
+                    await db_session.commit()
+                except Exception:
+                    await db_session.rollback()
+                    logger.exception(
+                        "Command chat-mode update failed",
+                        extra={"extra_data": {"conversation_id": conversation.conversation_id}},
+                    )
+                    return CommandResult(
+                        type="error",
+                        text="Could not update chat mode.",
+                        data={"code": "chat_mode_update_failed"},
+                    )
+
+        return CommandResult(
+            type="system_message",
+            text=chat_mode_system_message(mode),
+            data={
+                "chat_mode": mode,
+                "chat_mode_source": "conversation_override"
+                if mode != "default"
+                else "system_default",
+            },
+        )
 
     async def _handle_context(self, session: SessionModel) -> CommandResult:
         """Handle /context — display context window usage."""
@@ -670,6 +1040,9 @@ class CommandDispatcher:
         """Append cached context-usage diagnostics to a command response."""
 
         lines.append(f"Effective context window: {usage['max_context_tokens']:,} tokens")
+        max_input_tokens = usage.get("max_input_tokens")
+        if isinstance(max_input_tokens, int) and max_input_tokens > 0:
+            lines.append(f"Max input tokens: {max_input_tokens:,}")
         lines.append(
             f"Current usage: {usage['prompt_tokens']:,} tokens ({usage['percentage']}% of model window)"
         )
@@ -699,9 +1072,65 @@ class CommandDispatcher:
         if isinstance(loop_pressure_threshold, int):
             lines.append(f"Loop pressure threshold: {loop_pressure_threshold:,} tokens")
 
-        compaction_threshold = getattr(self._compaction_strategy, "compaction_threshold", None)
+        projection_policy = usage.get("projection_policy")
+        if isinstance(projection_policy, dict):
+            phase = projection_policy.get("phase")
+            pressure_mode = projection_policy.get("pressure_mode")
+            if isinstance(phase, str) and isinstance(pressure_mode, str):
+                lines.append(f"Projection policy: {phase} / {pressure_mode}")
+            steady_target = projection_policy.get("steady_target_tokens")
+            burst_target = projection_policy.get("burst_target_tokens")
+            hard_prompt = projection_policy.get("hard_prompt_tokens")
+            if all(isinstance(value, int) for value in (steady_target, burst_target, hard_prompt)):
+                lines.append(
+                    "Projection prompt targets: "
+                    f"{steady_target:,} steady, {burst_target:,} burst, {hard_prompt:,} hard"
+                )
+            cross_tool_budget = projection_policy.get("cross_turn_tool_budget_tokens")
+            within_tool_budget = projection_policy.get("within_turn_tool_budget_tokens")
+            if all(isinstance(value, int) for value in (cross_tool_budget, within_tool_budget)):
+                lines.append(
+                    "Projection tool budgets: "
+                    f"{cross_tool_budget:,} cross-turn, {within_tool_budget:,} within-turn tokens"
+                )
+            preserve_groups = projection_policy.get("preserve_recent_tool_groups")
+            preserve_bytes = projection_policy.get("preserve_recent_tool_bytes")
+            historical_bytes = projection_policy.get("max_historical_tool_result_bytes")
+            projection_parts: list[str] = []
+            if isinstance(preserve_groups, int):
+                projection_parts.append(f"{preserve_groups} recent groups")
+            if isinstance(preserve_bytes, int):
+                projection_parts.append(f"{preserve_bytes:,} recent bytes")
+            if isinstance(historical_bytes, int):
+                projection_parts.append(f"{historical_bytes:,} historical bytes")
+            if projection_parts:
+                lines.append(f"Projection retention: {', '.join(projection_parts)}")
+
+        compaction_threshold = usage.get("compaction_threshold")
+        if not isinstance(compaction_threshold, int | float):
+            compaction_threshold = getattr(self._compaction_strategy, "compaction_threshold", None)
         if isinstance(compaction_threshold, int | float):
             lines.append(f"Compaction threshold: {int(compaction_threshold * 100)}%")
+
+        prompt_tokens = usage.get("prompt_tokens")
+        if isinstance(prompt_tokens, int):
+            status = "healthy"
+            if (
+                isinstance(loop_pressure_threshold, int)
+                and prompt_tokens >= loop_pressure_threshold
+            ):
+                status = "hard pressure exceeded - next turn should compact before model call"
+            elif (
+                isinstance(effective_prompt_budget, int)
+                and isinstance(compaction_threshold, int | float)
+                and prompt_tokens >= int(effective_prompt_budget * float(compaction_threshold))
+            ):
+                status = "compaction recommended"
+            elif (
+                isinstance(effective_prompt_budget, int) and prompt_tokens > effective_prompt_budget
+            ):
+                status = "prompt budget exceeded"
+            lines.append(f"Context status: {status}")
 
         self._append_last_llm_usage_lines(lines, usage.get("last_llm_usage"))
 
@@ -1076,9 +1505,7 @@ class CommandDispatcher:
         try:
             return await resolve_executor_pool(
                 session_factory=self._session_factory,
-                agent_execution=(
-                    agent.execution if isinstance(agent.execution, dict) else {}
-                ),
+                agent_execution=(agent.execution if isinstance(agent.execution, dict) else {}),
                 user_email=user_email,
                 executor_owner_email=user_email,
                 policy=policy,
@@ -1108,14 +1535,10 @@ class CommandDispatcher:
             lines.append(f"  State: {active_target.state.value}")
             if active_target.description:
                 lines.append(f"  Description: {active_target.description}")
-            tool_count = len(active_target.observed_tool_names) or len(
-                active_target.enabled_tools
-            )
+            tool_count = len(active_target.observed_tool_names) or len(active_target.enabled_tools)
             lines.append(f"  Tools available: {tool_count}")
         elif active_id:
-            lines.append(
-                f"Active executor: {active_id} (not in current assigned pool)"
-            )
+            lines.append(f"Active executor: {active_id} (not in current assigned pool)")
         else:
             lines.append(
                 "Active executor: none (the controller will pick a primary "
@@ -1427,6 +1850,10 @@ Available commands:
   /compact           Compact conversation history
   /summarize         Alias for /compact
   /fork              Fork this conversation into a new chat
+  /task <text>       Create a background workflow task
+  /research <text>   Create a background research task
+  /implement <text>  Create a background implementation task
+  /delegate <text>   Create a background workflow task
   /new               Start a new conversation
   /reset             Alias for /new
   /clear             Alias for /new

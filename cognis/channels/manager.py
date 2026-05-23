@@ -35,6 +35,10 @@ from cognis.models.config import ProviderHealth
 logger = get_logger(__name__)
 
 
+class ExecutorChannelDeferred(RuntimeError):
+    """Executor-hosted channel cannot start until its executor connects."""
+
+
 def _create_adapter(channel_type: str) -> BaseChannelAdapter:
     """Create an adapter instance for a channel type."""
     from cognis.channels.factory import create_adapter
@@ -95,6 +99,18 @@ class ChannelManager:
             try:
                 await self.start_account(config)
                 started += 1
+            except ExecutorChannelDeferred as exc:
+                logger.info(
+                    "channel manager: deferred executor-hosted account startup",
+                    extra={
+                        "extra_data": {
+                            "account_id": config.account_id,
+                            "channel_type": config.channel_type,
+                            "executor_id": config.executor_id,
+                            "reason": str(exc),
+                        }
+                    },
+                )
             except Exception:
                 logger.exception(
                     "channel manager: failed to start account",
@@ -371,7 +387,7 @@ class ChannelManager:
                 f"No connected executor available for channel account {config.account_id}. "
                 f"Requested executor_id={config.executor_id!r}."
             )
-            raise ValueError(msg)
+            raise ExecutorChannelDeferred(msg)
 
         meta = get_channel_meta(config.channel_type)
         capabilities = meta.capabilities if meta else ChannelCapabilities()

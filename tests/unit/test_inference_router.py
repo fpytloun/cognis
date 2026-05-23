@@ -53,6 +53,22 @@ class _Provider:
         return self.connection
 
 
+class _MultiProvider:
+    def __init__(self) -> None:
+        self.connection = _Connection()
+        self.selected_executor_id: str | None = None
+
+    async def list_active(self):
+        return [
+            SimpleNamespace(executor_id="empty-labels", metadata={"labels": {}}),
+            SimpleNamespace(executor_id="labeled", metadata={"labels": {"location": "local"}}),
+        ]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        self.selected_executor_id = str(handle.executor_id)
+        return self.connection
+
+
 @pytest.mark.asyncio
 async def test_inference_router_route_generate_reconstructs_normalized_response() -> None:
     router = InferenceRouter(_Provider())
@@ -69,6 +85,24 @@ async def test_inference_router_route_generate_reconstructs_normalized_response(
     assert result["choices"][0]["message"]["reasoning"] == "Need tests"
     assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
     assert result["usage"]["total_tokens"] == 9
+
+
+@pytest.mark.asyncio
+async def test_inference_router_route_generate_can_target_explicit_executor_without_labels() -> (
+    None
+):
+    provider = _MultiProvider()
+    router = InferenceRouter(provider)
+
+    result = await router.route_generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        executor_id="empty-labels",
+        request_kwargs={"cognis_llm_api": "responses"},
+    )
+
+    assert result["choices"][0]["message"]["content"] == "Hello"
+    assert provider.selected_executor_id == "empty-labels"
 
 
 class _StructuredConnection:

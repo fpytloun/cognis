@@ -7,8 +7,12 @@ import pytest
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.queries import create_user, get_skill_scoped
-from cognis.tools.builtin.skill_management import _handle_skill_get, _handle_skill_write
+from cognis.store.queries import create_skill, create_user, get_skill_scoped
+from cognis.tools.builtin.skill_management import (
+    _handle_skill_get,
+    _handle_skill_load,
+    _handle_skill_write,
+)
 from cognis.tools.skill_service import resolve_current_skill_version
 
 
@@ -78,11 +82,47 @@ async def test_skill_write_persists_decomposition_steps_with_step_profiles(tmp_p
     loaded = await _handle_skill_get(session_factory, "user@example.com", {"skill_id": skill_id})
     loaded_payload = json.loads(loaded.output)
     assert loaded_payload["current_version"]["steps"][0]["step_profile_id"] == "system:research"
-    assert loaded_payload["current_version"]["steps"][1]["step_profile"]["matrix"]["development"] == [
+    assert loaded_payload["current_version"]["steps"][1]["step_profile"]["matrix"][
+        "development"
+    ] == [
         "read",
         "write",
         "privileged",
     ]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_skill_load_accepts_claude_native_skill_argument_by_name(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/skills.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hashed",
+        )
+        await create_skill(
+            session,
+            skill_id="skill_lumilens_alertmanager_ops",
+            name="lumilens-alertmanager-ops",
+            instructions="Inspect Lumilens Alertmanager safely.",
+            owner_email="user@example.com",
+        )
+        await session.commit()
+
+    load_result = await _handle_skill_load(
+        session_factory,
+        "user@example.com",
+        {"skill": "lumilens-alertmanager-ops"},
+    )
+
+    assert load_result.is_error is False
+    payload = json.loads(load_result.output)
+    assert payload["skill_id"] == "skill_lumilens_alertmanager_ops"
 
     await engine.dispose()
 
@@ -160,8 +200,80 @@ async def test_skill_write_persists_linked_runtime_tool_ids(tmp_path):
         assert row is not None
         assert row.linked_tool_ids == ["builtin:bash", "builtin:read"]
 
-    loaded = await _handle_skill_get(session_factory, "user@example.com", {"skill_id": payload["skill_id"]})
+    loaded = await _handle_skill_get(
+        session_factory, "user@example.com", {"skill_id": payload["skill_id"]}
+    )
     loaded_payload = json.loads(loaded.output)
     assert loaded_payload["linked_tool_ids"] == ["builtin:bash", "builtin:read"]
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_skill_write_binds_created_and_updated_skill_to_current_agent(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/skills.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    artifact_store = ArtifactStore(
+        ArtifactStoreConfig(backend="filesystem", path=str(tmp_path / "artifacts"))
+    )
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hashed",
+        )
+        from cognis.store.queries import create_agent, get_agent
+
+        await create_agent(
+            session,
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent 1",
+            status="active",
+        )
+        await session.commit()
+
+    create_result = await _handle_skill_write(
+        session_factory,
+        "user@example.com",
+        {
+            "name": "Bound Skill",
+            "instructions": "Use this skill.",
+        },
+        llm=None,
+        artifact_store=artifact_store,
+        current_agent_id="agent-1",
+    )
+
+    assert create_result.is_error is False
+    payload = json.loads(create_result.output)
+    skill_id = payload["skill_id"]
+    assert create_result.metadata is not None
+    assert create_result.metadata["attached_skill_id"] == skill_id
+
+    update_result = await _handle_skill_write(
+        session_factory,
+        "user@example.com",
+        {
+            "skill_id": skill_id,
+            "name": "Bound Skill",
+            "instructions": "Use this updated skill.",
+        },
+        llm=None,
+        artifact_store=artifact_store,
+        current_agent_id="agent-1",
+    )
+
+    assert update_result.is_error is False
+    assert update_result.metadata is not None
+    assert update_result.metadata["attached_skill_id"] == skill_id
+
+    async with session_factory() as session:
+        agent = await get_agent(session, "agent-1")
+        assert agent is not None
+        items = agent.skills["items"]
+        assert items == [{"skill_id": skill_id, "enabled": True}]
 
     await engine.dispose()

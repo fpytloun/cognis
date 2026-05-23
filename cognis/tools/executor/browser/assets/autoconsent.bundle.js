@@ -167,6 +167,7 @@
       if (isVisible(node)) {
         try {
           node.click();
+          markClicked();
           return true;
         } catch {
           /* swallow click errors, try next */
@@ -195,74 +196,197 @@
     return false;
   }
 
-  // Heuristic fallback: scan visible <button>/<a> for common consent text.
+  function normalizeText(value) {
+    return String(value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function elementText(el) {
+    return normalizeText([
+      el.innerText,
+      el.textContent,
+      el.getAttribute("aria-label"),
+      el.getAttribute("title"),
+      el.getAttribute("value"),
+      el.getAttribute("data-testid"),
+    ].filter(Boolean).join(" "));
+  }
+
+  const BANNER_TOKENS = [
+    "cookie", "cookies", "consent", "gdpr", "privacy", "personal data",
+    "soubory cookie", "cookies", "souhlas", "osobni udaje", "ochrana osobnich udaju",
+    "sukromi", "sukromie", "udaje", "ochrana osobnych udajov",
+    "ciasteczka", "zgoda", "prywatnosc", "dane osobowe",
+    "datenschutz", "einwilligung", "personenbezogene daten",
+    "confidentialite", "donnees personnelles", "consentement",
+    "privacidad", "datos personales", "consentimiento",
+    "privacidade", "dados pessoais", "consentimento",
+    "privacy", "dati personali", "consenso",
+    "prywatnosci", "datove", "udaju",
+  ];
+
+  const ACCEPT_LABELS = [
+    "accept all", "accept", "agree", "i agree", "ok", "got it", "allow all", "allow", "continue",
+    "rozumim a souhlasim", "souhlasim", "prijmout vse", "prijmout vsechny", "povolit vse", "pokracovat", "rozumim",
+    "suhlasim", "prijat vsetko", "prijat vsetky", "povolit vsetko",
+    "akceptuj wszystko", "zaakceptuj wszystkie", "zgadzam sie", "zgoda", "zezwol na wszystko",
+    "alle akzeptieren", "akzeptieren", "zustimmen", "ich stimme zu", "alle zulassen",
+    "tout accepter", "accepter", "j accepte", "autoriser tout",
+    "aceptar todo", "aceptar", "estoy de acuerdo", "permitir todo",
+    "aceitar tudo", "aceitar", "concordo", "permitir tudo",
+    "accetta tutto", "accetta", "acconsento", "consenti tutto",
+    "alles accepteren", "accepteren", "ik ga akkoord", "alles toestaan",
+    "godta alle", "godta", "acceptera alla", "acceptera", "acceptar alle", "acceptar",
+  ];
+
+  const REJECT_LABELS = [
+    "reject all", "reject", "decline", "decline all", "deny", "deny all", "only essential", "only necessary", "necessary only",
+    "pouze nezbytne cookies", "pouze nezbytne", "jen nezbytne", "odmitnout vse", "odmitnout", "nesouhlasim",
+    "iba nevyhnutne", "len nevyhnutne", "odmietnut vsetko", "odmietnut", "nesuhlasim",
+    "tylko niezbedne", "odrzuc wszystkie", "odrzuc", "nie zgadzam sie",
+    "nur notwendige", "nur erforderliche", "alle ablehnen", "ablehnen", "nicht zustimmen",
+    "uniquement necessaires", "tout refuser", "refuser", "je refuse",
+    "solo necesarias", "rechazar todo", "rechazar", "no acepto",
+    "apenas necessarios", "rejeitar tudo", "rejeitar", "nao aceito",
+    "solo necessari", "rifiuta tutto", "rifiuta", "non accetto",
+    "alleen noodzakelijke", "alles weigeren", "weigeren",
+  ];
+
+  function labelMatches(label, candidates) {
+    if (!label) return false;
+    const compact = label.replace(/["'“”„]/g, "").trim();
+    return candidates.some((candidate) => {
+      if (compact === candidate) return true;
+      return compact.length <= 80 && compact.includes(candidate);
+    });
+  }
+
+  // Heuristic fallback: scan visible <button>/<a> for multilingual consent text.
   // Only used after every named rule failed and a banner-shaped container
-  // is likely present (we look for elements whose computed position is
-  // fixed/absolute and that contain "cookie" text).
+  // is likely present.
   function heuristicFallback() {
     const banners = [];
-    for (const el of document.querySelectorAll("div, section, aside, footer")) {
+    for (const el of document.querySelectorAll("div, section, aside, footer, dialog, [role='dialog'], [aria-modal='true']")) {
       if (!isVisible(el)) continue;
       const style = window.getComputedStyle(el);
-      if (style.position !== "fixed" && style.position !== "sticky" && style.position !== "absolute") continue;
-      const text = (el.innerText || "").toLowerCase();
-      if (text.length < 8 || text.length > 4000) continue;
-      if (text.includes("cookie") || text.includes("consent") || text.includes("gdpr") || text.includes("privacy")) {
+      const rect = el.getBoundingClientRect();
+      const isOverlay = style.position === "fixed" || style.position === "sticky" || style.position === "absolute";
+      const isLargeDialog = rect.width >= Math.min(window.innerWidth * 0.45, 480) && rect.height >= 120;
+      if (!isOverlay && !isLargeDialog) continue;
+      const text = normalizeText(el.innerText || el.textContent || "");
+      if (text.length < 8 || text.length > 8000) continue;
+      if (BANNER_TOKENS.some((token) => text.includes(token))) {
         banners.push(el);
       }
     }
     if (!banners.length) return false;
 
-    const acceptPatterns = [
-      /^accept all$/i,
-      /^accept$/i,
-      /^agree$/i,
-      /^i agree$/i,
-      /^ok$/i,
-      /^got it$/i,
-      /^allow all$/i,
-      /^allow$/i,
-      /^continue$/i,
-    ];
-    const rejectPatterns = [
-      /^reject all$/i,
-      /^reject$/i,
-      /^decline$/i,
-      /^decline all$/i,
-      /^deny$/i,
-      /^deny all$/i,
-      /only essential/i,
-      /only necessary/i,
-    ];
-    const patterns = action === "accept" ? acceptPatterns : rejectPatterns;
+    const labels = action === "accept" ? ACCEPT_LABELS : REJECT_LABELS;
 
     for (const banner of banners) {
-      const buttons = banner.querySelectorAll("button, a, [role='button']");
+      const buttons = banner.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']");
       for (const btn of buttons) {
         if (!isVisible(btn)) continue;
-        const label = (btn.innerText || btn.getAttribute("aria-label") || "").trim();
-        if (!label) continue;
-        for (const pat of patterns) {
-          if (pat.test(label)) {
-            try {
-              btn.click();
-              try { console.debug("[cognis-autoconsent] heuristic " + action + ": " + label); } catch {}
-              return true;
-            } catch {
-              /* try next */
-            }
-          }
+        const label = elementText(btn);
+        if (!labelMatches(label, labels)) continue;
+        try {
+          btn.click();
+          markClicked();
+          try { console.debug("[cognis-autoconsent] heuristic " + action + ": " + label); } catch {}
+          return true;
+        } catch {
+          /* try next */
         }
+      }
+    }
+
+    if (action !== "accept") return false;
+
+    // Some CMPs render controls outside the textual banner. For accept-only,
+    // allow a final page-wide pass, but require an active banner first to avoid
+    // clicking unrelated CTA buttons.
+    for (const btn of document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")) {
+      if (!isVisible(btn)) continue;
+      const label = elementText(btn);
+      if (!labelMatches(label, ACCEPT_LABELS)) continue;
+      try {
+        btn.click();
+        markClicked();
+        try { console.debug("[cognis-autoconsent] heuristic global accept: " + label); } catch {}
+        return true;
+      } catch {
+        /* try next */
       }
     }
     return false;
   }
 
+  function removeConsentBackdrops() {
+    for (const el of document.querySelectorAll("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
+      if (!isVisible(el)) continue;
+      const style = window.getComputedStyle(el);
+      if (style.position !== "fixed" && style.position !== "sticky" && style.position !== "absolute") continue;
+      const text = normalizeText(el.innerText || el.textContent || "");
+      if (text.length < 8 || text.length > 8000) continue;
+      if (!BANNER_TOKENS.some((token) => text.includes(token))) continue;
+      const labels = Array.from(el.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']"))
+        .map((btn) => elementText(btn));
+      const hasAction = labels.some((label) => labelMatches(label, ACCEPT_LABELS) || labelMatches(label, REJECT_LABELS));
+      if (!hasAction) continue;
+      try {
+        el.remove();
+      } catch {
+        try { el.style.display = "none"; } catch {}
+      }
+    }
+    const body = document.body;
+    if (body) {
+      try {
+        body.style.overflow = "auto";
+        body.style.position = "";
+      } catch {
+        /* ignore style cleanup failures */
+      }
+    }
+  }
+
+  function clickedCookieBannerRecently() {
+    try {
+      const clickedAt = Number(window.__cognis_autoconsent_clicked_at || 0);
+      return clickedAt > 0 && Date.now() - clickedAt < 5000;
+    } catch {
+      return false;
+    }
+  }
+
+  function markClicked() {
+    try {
+      window.__cognis_autoconsent_clicked_at = Date.now();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function cleanupAfterClick() {
+    if (!clickedCookieBannerRecently()) return;
+    setTimeout(removeConsentBackdrops, 250);
+    setTimeout(removeConsentBackdrops, 1000);
+  }
+
   function attempt() {
     for (const rule of RULES) {
-      if (tryRule(rule)) return true;
+      if (tryRule(rule)) {
+        cleanupAfterClick();
+        return true;
+      }
     }
-    return heuristicFallback();
+    const clicked = heuristicFallback();
+    if (clicked) cleanupAfterClick();
+    return clicked;
   }
 
   function start() {

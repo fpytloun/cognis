@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -49,6 +50,15 @@ class _FailingSyncAdapter(_FakeAdapter):
 class _FakeSecrets:
     async def get_secret(self, **kwargs: Any) -> str:
         return "tok"
+
+
+class _FakeWebSocketProvider:
+    def __init__(self) -> None:
+        self._handles: dict[str, Any] = {}
+
+    def get_connection(self, executor_id: str) -> None:
+        del executor_id
+        return None
 
 
 class _FakeHTTPResponse:
@@ -118,6 +128,52 @@ async def _setup(tmp_path: Any) -> tuple[Any, Any, EventBus]:
         await session.commit()
     event_bus = EventBus()
     return engine, session_factory, event_bus
+
+
+@pytest.mark.asyncio
+async def test_start_all_defers_executor_channel_without_connected_executor(
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine, session_factory, event_bus = await _setup(tmp_path)
+    try:
+        caplog.set_level(logging.INFO, logger="cognis.channels.manager")
+        from cognis.store.models import ChannelAccountRow
+
+        async with session_factory() as session:
+            session.add(
+                ChannelAccountRow(
+                    account_id="ch_executor",
+                    channel_type="signal",
+                    display_name="Executor Signal",
+                    credential_refs={},
+                    agent_id="agent-1",
+                    user_email="owner@example.com",
+                    adapter_location="executor",
+                    executor_id=None,
+                    enabled=True,
+                )
+            )
+            await session.commit()
+
+        manager = ChannelManager(
+            session_factory=session_factory,
+            inbound_pipeline=None,  # type: ignore[arg-type]
+            secrets_provider=_FakeSecrets(),
+            artifact_store=None,
+            event_bus=event_bus,
+            ws_provider=_FakeWebSocketProvider(),
+        )
+
+        await manager.start_all()
+
+        assert "ch_executor" not in manager._adapters
+        assert any(
+            record.message == "channel manager: deferred executor-hosted account startup"
+            for record in caplog.records
+        )
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

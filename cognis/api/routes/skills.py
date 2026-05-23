@@ -7,7 +7,12 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
+from cognis.api.common import (
+    api_exception,
+    check_agent_access,
+    forbid_mutation_for_viewer,
+    require_current_user,
+)
 from cognis.api.models import (
     SkillAssetResponse,
     SkillCreateRequest,
@@ -24,12 +29,14 @@ from cognis.models.skill import ImportProvenance, SkillExportData
 from cognis.store.queries import (
     create_skill,
     delete_skill,
+    get_agent,
     get_next_version_number,
     get_skill_scoped,
     list_skill_versions,
     list_skills,
     reset_skill_to_defaults,
     set_current_version,
+    update_agent,
     update_skill,
 )
 from cognis.tools.skill_import import import_skill_from_url
@@ -54,6 +61,27 @@ from cognis.tools.skills import raw_skill_tools_to_definitions
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["skills"])
+
+
+async def _bind_skill_to_agent(
+    request: Request, session: Any, agent_id: str | None, skill_id: str
+) -> None:
+    """Attach ``skill_id`` to ``agent_id`` if requested and not already present."""
+
+    if not agent_id:
+        return
+    agent = await get_agent(session, agent_id)
+    if agent is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    await check_agent_access(request, agent, required="edit")
+    skills = dict(agent.skills or {})
+    items = skills.get("items")
+    if not isinstance(items, list):
+        items = []
+    if not any(isinstance(item, dict) and item.get("skill_id") == skill_id for item in items):
+        items.append({"skill_id": skill_id, "enabled": True})
+        skills["items"] = items
+        await update_agent(session, agent_id, updates={"skills": skills})
 
 
 def _coerce_tools_list(value: Any) -> list[dict[str, Any]] | None:
@@ -98,7 +126,9 @@ def _version_to_response(
         secret_placeholders=row.secret_placeholders,
         steps=[item for item in (getattr(row, "steps", None) or []) if isinstance(item, dict)],
         decomposition_source_hash=decomposition_source_hash,
-        decomposition_stale=bool(decomposition_source_hash and decomposition_source_hash != current_source_hash),
+        decomposition_stale=bool(
+            decomposition_source_hash and decomposition_source_hash != current_source_hash
+        ),
         source_url=row.source_url,
         resolved_url=row.resolved_url,
         commit_sha=row.commit_sha,
@@ -146,7 +176,9 @@ def _skill_to_response(
     asset_refs: list[Any] | None = None,
 ) -> SkillResponse:
     current_version = (
-        _version_to_response(version_row, asset_refs=asset_refs) if version_row is not None else None
+        _version_to_response(version_row, asset_refs=asset_refs)
+        if version_row is not None
+        else None
     )
     instructions = version_row.instructions if version_row is not None else row.instructions
     tools = _coerce_tools_list(version_row.tools if version_row is not None else row.tools)
@@ -190,7 +222,9 @@ async def _load_skill_response(request: Request, session: Any, row: Any) -> Skil
     version_row = await resolve_current_skill_version(session, row)
     asset_refs = []
     if version_row is not None:
-        asset_refs = await load_skill_asset_refs(session, version_row, artifact_store=artifact_store)
+        asset_refs = await load_skill_asset_refs(
+            session, version_row, artifact_store=artifact_store
+        )
     return _skill_to_response(row, version_row=version_row, asset_refs=asset_refs)
 
 
@@ -211,12 +245,19 @@ async def _enqueue_skill_tool_classifications(request: Request, row: Any, versio
     except Exception:
         logger.warning(
             "Failed to enqueue skill tool classifications",
-            extra={"extra_data": {"skill_id": row.skill_id, "version_id": getattr(version_row, "version_id", None)}},
+            extra={
+                "extra_data": {
+                    "skill_id": row.skill_id,
+                    "version_id": getattr(version_row, "version_id", None),
+                }
+            },
             exc_info=True,
         )
 
 
-def _provenance_from_payload(data: dict[str, Any], fallback_format: str | None = None) -> ImportProvenance | None:
+def _provenance_from_payload(
+    data: dict[str, Any], fallback_format: str | None = None
+) -> ImportProvenance | None:
     raw = data.get("provenance")
     if not isinstance(raw, dict):
         if fallback_format is None:
@@ -231,7 +272,10 @@ def _provenance_from_payload(data: dict[str, Any], fallback_format: str | None =
 def _asset_inputs_from_request(items: list[Any] | None) -> list[dict[str, Any]] | None:
     if items is None:
         return None
-    return [item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else dict(item) for item in items]
+    return [
+        item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else dict(item)
+        for item in items
+    ]
 
 
 def _canonical_asset_inputs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -331,6 +375,7 @@ async def create_skill_route(request: Request, body: SkillCreateRequest) -> Skil
             raise api_exception(400, "validation_error", str(exc)) from exc
         await set_current_version(session, row.skill_id, version_row.version_id)
         row.current_version_id = version_row.version_id
+        await _bind_skill_to_agent(request, session, body.agent_id, row.skill_id)
         await session.commit()
         await _enqueue_skill_tool_classifications(request, row, version_row)
         return await _load_skill_response(request, session, row)
@@ -353,17 +398,23 @@ async def update_skill_route(
             raise api_exception(404, "not_found", "Skill not found")
         current_version = await resolve_current_skill_version(session, row)
         current_assets = (
-            await load_skill_asset_refs(session, current_version) if current_version is not None else []
+            await load_skill_asset_refs(session, current_version)
+            if current_version is not None
+            else []
         )
 
         try:
             instructions = body.instructions
             if instructions is None:
                 instructions = (
-                    current_version.instructions if current_version is not None else row.instructions
+                    current_version.instructions
+                    if current_version is not None
+                    else row.instructions
                 )
-            tools = normalize_skill_tools(body.tools) if body.tools is not None else (
-                current_version.tools if current_version is not None else row.tools
+            tools = (
+                normalize_skill_tools(body.tools)
+                if body.tools is not None
+                else (current_version.tools if current_version is not None else row.tools)
             )
             linked_tool_ids = (
                 normalize_linked_tool_ids(body.linked_tool_ids)
@@ -391,7 +442,9 @@ async def update_skill_route(
             steps = (
                 normalize_skill_steps(body.steps)
                 if body.steps is not None
-                else (getattr(current_version, "steps", None) if current_version is not None else None)
+                else (
+                    getattr(current_version, "steps", None) if current_version is not None else None
+                )
             )
             asset_inputs = (
                 _asset_inputs_from_request(body.assets)
@@ -413,15 +466,21 @@ async def update_skill_route(
         if body.attach_to_all_agents is not None or body.auto_load is not None:
             metadata_updates["auto_load"] = _resolve_attach_to_all_agents(body)
 
-        current_instructions = current_version.instructions if current_version is not None else row.instructions
+        current_instructions = (
+            current_version.instructions if current_version is not None else row.instructions
+        )
         current_tools = current_version.tools if current_version is not None else row.tools
         current_templates = (
-            current_version.prompt_templates if current_version is not None else row.prompt_templates
+            current_version.prompt_templates
+            if current_version is not None
+            else row.prompt_templates
         )
         current_placeholders = (
             current_version.secret_placeholders if current_version is not None else None
         )
-        current_steps = getattr(current_version, "steps", None) if current_version is not None else None
+        current_steps = (
+            getattr(current_version, "steps", None) if current_version is not None else None
+        )
         comparable_asset_inputs = _canonical_asset_inputs(asset_inputs)
         current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
         current_source_hash = compute_decomposition_source_hash(
@@ -515,8 +574,14 @@ async def update_skill_route(
         content_changed = (
             (body.instructions is not None and instructions != current_instructions)
             or (body.tools is not None and (tools or []) != (current_tools or []))
-            or (body.prompt_templates is not None and (prompt_templates or {}) != (current_templates or {}))
-            or (body.secret_placeholders is not None and (secret_placeholders or []) != (current_placeholders or []))
+            or (
+                body.prompt_templates is not None
+                and (prompt_templates or {}) != (current_templates or {})
+            )
+            or (
+                body.secret_placeholders is not None
+                and (secret_placeholders or []) != (current_placeholders or [])
+            )
             or (
                 body.linked_tool_ids is not None
                 and (linked_tool_ids or [])
@@ -571,16 +636,25 @@ async def update_skill_route(
                     assets=asset_inputs,
                     allow_binary_assets=True,
                     source_url=current_version.source_url if current_version is not None else None,
-                    resolved_url=current_version.resolved_url if current_version is not None else None,
+                    resolved_url=current_version.resolved_url
+                    if current_version is not None
+                    else None,
                     commit_sha=current_version.commit_sha if current_version is not None else None,
-                    import_checksum=current_version.import_checksum if current_version is not None else None,
-                    imported_at=current_version.imported_at if current_version is not None else None,
-                    import_format=current_version.import_format if current_version is not None else None,
+                    import_checksum=current_version.import_checksum
+                    if current_version is not None
+                    else None,
+                    imported_at=current_version.imported_at
+                    if current_version is not None
+                    else None,
+                    import_format=current_version.import_format
+                    if current_version is not None
+                    else None,
                 )
             except ValueError as exc:
                 raise api_exception(400, "validation_error", str(exc)) from exc
             await set_current_version(session, skill_id, version_row.version_id)
             updated_row.current_version_id = version_row.version_id
+        await _bind_skill_to_agent(request, session, body.agent_id, skill_id)
         await session.commit()
         if content_changed and version_row is not None:
             await _enqueue_skill_tool_classifications(request, updated_row, version_row)
@@ -624,9 +698,13 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
         current_version = await resolve_current_skill_version(session, row)
         current_tools = current_version.tools if current_version is not None else row.tools
         current_templates = (
-            current_version.prompt_templates if current_version is not None else row.prompt_templates
+            current_version.prompt_templates
+            if current_version is not None
+            else row.prompt_templates
         )
-        current_steps = getattr(current_version, "steps", None) if current_version is not None else None
+        current_steps = (
+            getattr(current_version, "steps", None) if current_version is not None else None
+        )
         expected_decomposition_hash = (
             compute_decomposition_source_hash(
                 str(defaults["instructions"]),
@@ -640,10 +718,14 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             else None
         )
         current_decomposition_hash = (
-            getattr(current_version, "decomposition_source_hash", None) if current_version is not None else None
+            getattr(current_version, "decomposition_source_hash", None)
+            if current_version is not None
+            else None
         )
         current_assets = (
-            await load_skill_asset_refs(session, current_version) if current_version is not None else []
+            await load_skill_asset_refs(session, current_version)
+            if current_version is not None
+            else []
         )
         if (
             row.name == str(defaults["name"])
@@ -667,7 +749,9 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 session,
                 skill_id,
                 name=str(defaults["name"]),
-                description=str(defaults["description"]) if defaults.get("description") is not None else None,
+                description=str(defaults["description"])
+                if defaults.get("description") is not None
+                else None,
                 instructions=str(defaults["instructions"]),
                 tools=normalize_skill_tools(defaults.get("tools")),
                 linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")),
@@ -745,7 +829,9 @@ async def decompose_skill_preview_route(
             raise api_exception(404, "not_found", "Skill not found")
         version_row = await resolve_current_skill_version(session, row)
         instructions = version_row.instructions if version_row is not None else row.instructions
-        tools = _coerce_tools_list(version_row.tools if version_row is not None else row.tools) or []
+        tools = (
+            _coerce_tools_list(version_row.tools if version_row is not None else row.tools) or []
+        )
         prompt_templates = (
             version_row.prompt_templates if version_row is not None else row.prompt_templates
         ) or {}
@@ -755,7 +841,9 @@ async def decompose_skill_preview_route(
             else []
         )
         asset_manifest = [
-            item for item in (getattr(version_row, "asset_manifest", None) or []) if isinstance(item, dict)
+            item
+            for item in (getattr(version_row, "asset_manifest", None) or [])
+            if isinstance(item, dict)
         ]
 
     try:
@@ -799,7 +887,9 @@ async def decompose_skill_preview_route(
     )
 
 
-@router.post("/api/v1/skills/{skill_id}/versions/{version_id}/restore", response_model=SkillResponse)
+@router.post(
+    "/api/v1/skills/{skill_id}/versions/{version_id}/restore", response_model=SkillResponse
+)
 async def restore_skill_version_route(
     request: Request,
     skill_id: str,
@@ -813,7 +903,9 @@ async def restore_skill_version_route(
             raise api_exception(404, "not_found", "Skill not found")
         if row.is_system:
             raise api_exception(403, "forbidden", "System skills cannot be restored")
-        versions = {version.version_id: version for version in await list_skill_versions(session, skill_id)}
+        versions = {
+            version.version_id: version for version in await list_skill_versions(session, skill_id)
+        }
         version_row = versions.get(version_id)
         if version_row is None:
             raise api_exception(404, "not_found", "Skill version not found")
@@ -841,11 +933,11 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
             try:
                 raw_content = base64.b64decode(body.content_b64, validate=True)
             except Exception as exc:
-                raise api_exception(400, "validation_error", "content_b64 must be valid base64") from exc
+                raise api_exception(
+                    400, "validation_error", "content_b64 must be valid base64"
+                ) from exc
             import_format = body.format or (
-                "cognis_package"
-                if (body.filename or "").lower().endswith(".zip")
-                else None
+                "cognis_package" if (body.filename or "").lower().endswith(".zip") else None
             )
             if import_format == "cognis_package":
                 skill_data, _member = parse_cognis_package(raw_content)
@@ -866,9 +958,14 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
         name = body.name or str(skill_data.get("name") or "Imported Skill")
         instructions = str(skill_data.get("instructions") or "")
         tools = normalize_skill_tools(skill_data.get("tools"))
-        linked_tool_ids = normalize_linked_tool_ids(
-            body.linked_tool_ids if body.linked_tool_ids is not None else skill_data.get("linked_tool_ids")
-        ) or []
+        linked_tool_ids = (
+            normalize_linked_tool_ids(
+                body.linked_tool_ids
+                if body.linked_tool_ids is not None
+                else skill_data.get("linked_tool_ids")
+            )
+            or []
+        )
         prompt_templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         secret_placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
         steps = normalize_skill_steps(skill_data.get("steps"))
@@ -967,8 +1064,14 @@ async def export_skill_route(
         prompt_templates=version_row.prompt_templates or {}
         if version_row is not None
         else row.prompt_templates or {},
-        secret_placeholders=version_row.secret_placeholders or [] if version_row is not None else [],
-        steps=[item for item in ((version_row.steps if version_row is not None else None) or []) if isinstance(item, dict)],
+        secret_placeholders=version_row.secret_placeholders or []
+        if version_row is not None
+        else [],
+        steps=[
+            item
+            for item in ((version_row.steps if version_row is not None else None) or [])
+            if isinstance(item, dict)
+        ],
         decomposition_source_hash=(
             version_row.decomposition_source_hash if version_row is not None else None
         ),

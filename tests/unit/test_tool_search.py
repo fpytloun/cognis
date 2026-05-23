@@ -16,6 +16,22 @@ def _tool(name: str, description: str, category: str) -> ToolDefinition:
     )
 
 
+def _mcp_tool(name: str, raw_name: str, server_id: str = "slack-lumilens") -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=f"MCP tool {raw_name}",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_id=server_id,
+            server_name=server_id,
+            raw_tool_name=raw_name,
+        ),
+        category="mcp",
+        read_only=True,
+    )
+
+
 def test_search_inventory_returns_ranked_permission_filtered_matches() -> None:
     tools = [
         SEARCH_TOOLS_TOOL,
@@ -142,6 +158,101 @@ def test_search_inventory_uses_bm25_for_multi_term_mcp_queries() -> None:
     )
 
     assert matches[0]["name"] == "mcp_googleworkspace__search_messages"
+
+
+def test_search_inventory_selects_claude_mcp_prefixed_tool_names() -> None:
+    tools = [
+        _tool("skill_load", "Load a skill", "skill"),
+        _mcp_tool(
+            "mcp_slack-lumilens__conversations_search_messages",
+            "conversations_search_messages",
+        ),
+        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        (
+            "select:mcp__cognis__skill_load,"
+            "mcp__cognis__mcp_slack-lumilens__conversations_search_messages,"
+            "mcp__cognis__mcp_slack-lumilens__channels_list"
+        ),
+        limit=5,
+    )
+
+    assert [match["handle"]["callable_name"] for match in matches] == [
+        "skill_load",
+        "mcp_slack-lumilens__conversations_search_messages",
+        "mcp_slack-lumilens__channels_list",
+    ]
+    assert all(match["handle"]["confidence"] == 100.0 for match in matches)
+
+
+def test_search_inventory_select_accepts_stable_ids_and_raw_names() -> None:
+    tools = [
+        _mcp_tool(
+            "mcp_slack-lumilens__conversations_search_messages",
+            "conversations_search_messages",
+        ),
+        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "select:mcp:slack-lumilens:conversations_search_messages,channels_list,missing",
+        limit=5,
+    )
+
+    assert [match["handle"]["callable_name"] for match in matches] == [
+        "mcp_slack-lumilens__conversations_search_messages",
+        "mcp_slack-lumilens__channels_list",
+    ]
+
+
+def test_search_inventory_select_accepts_double_underscore_mcp_aliases() -> None:
+    tools = [
+        _mcp_tool(
+            "mcp_slack-lumilens__conversations_search_messages",
+            "conversations_search_messages",
+        ),
+        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        (
+            "select:mcp__cognis__mcp__slack-lumilens__conversations_search_messages,"
+            "mcp__cognis__mcp__slack-lumilens__channels_list"
+        ),
+        limit=5,
+    )
+
+    assert [match["handle"]["callable_name"] for match in matches] == [
+        "mcp_slack-lumilens__conversations_search_messages",
+        "mcp_slack-lumilens__channels_list",
+    ]
+
+
+def test_search_inventory_select_returns_already_visible_tools() -> None:
+    tools = [
+        SEARCH_TOOLS_TOOL,
+        _tool("skill_load", "Load a skill", "skill"),
+        _mcp_tool("mcp_slack-lumilens__channels_list", "channels_list"),
+    ]
+
+    matches = search_inventory(
+        tools,
+        "select:mcp__cognis__search_tools,mcp__cognis__skill_load,mcp__cognis__mcp_slack-lumilens__channels_list",
+        already_visible_tool_ids={"builtin:skill_load"},
+        limit=5,
+    )
+
+    assert [match["handle"]["callable_name"] for match in matches] == [
+        "skill_load",
+        "mcp_slack-lumilens__channels_list",
+    ]
+    assert matches[0]["already_visible"] is True
+    assert matches[1]["already_visible"] is False
 
 
 def test_retrieve_relevant_skills_returns_exact_skill_match() -> None:

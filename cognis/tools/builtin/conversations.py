@@ -54,7 +54,7 @@ LIST_CONVERSATIONS_TOOL = _tool(
     {
         "agent_id": {"type": "string"},
         "project_id": {"type": "string"},
-        "status": {"type": "string", "enum": ["active", "archived", "all"]},
+        "status": {"type": "string", "enum": ["active", "starred", "archived", "all"]},
         "since": {"type": "string", "description": "ISO 8601 lower bound for activity time."},
         "until": {"type": "string", "description": "ISO 8601 upper bound for activity time."},
         "limit": {"type": "integer", "default": 25, "maximum": 100},

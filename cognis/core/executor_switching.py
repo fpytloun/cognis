@@ -25,8 +25,13 @@ message from ``SwitchOutcome``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
+from cognis.core.executor_pin_lifecycle import (
+    load_executor_pin_lifecycle_settings,
+    secondary_pin_expires_at,
+)
 from cognis.core.executor_pool import (
     ExecutorAvailability,
     ExecutorPool,
@@ -83,8 +88,11 @@ class SwitchOutcome:
             )
             if not self.is_primary:
                 line += (
-                    " You are now routing to a non-primary executor; "
-                    "switch_executor or /executor again to return to a primary."
+                    " You are now routing to a non-primary executor. Additional "
+                    "executors are special-purpose targets, not fallback capacity; "
+                    "switch_executor or /executor again to return to a primary "
+                    "when the specific task is done or before unrelated generic "
+                    "work."
                 )
             return line
         if self.error_reason == "not_assigned":
@@ -156,9 +164,7 @@ async def perform_executor_switch(
                 state=ExecutorAvailability.NOT_FOUND,
             ),
             error_reason="not_assigned",
-            error_detail=(
-                f"Executor '{executor_id}' is not in the agent's assigned pool."
-            ),
+            error_detail=(f"Executor '{executor_id}' is not in the agent's assigned pool."),
         )
 
     if not target.usable:
@@ -177,10 +183,7 @@ async def perform_executor_switch(
             status="error",
             target=target,
             error_reason="unavailable",
-            error_detail=(
-                f"Executor '{executor_id}' is not usable "
-                f"(state: {target.state.value})."
-            ),
+            error_detail=(f"Executor '{executor_id}' is not usable (state: {target.state.value})."),
         )
 
     # Persist the new active executor on the conversation, and on the
@@ -191,8 +194,26 @@ async def perform_executor_switch(
     )
 
     async with session_factory() as session:
+        assigned_at = datetime.now(UTC)
+        expires_at = None
+        if not target.is_primary:
+            try:
+                settings = await load_executor_pin_lifecycle_settings(session_factory)
+            except Exception:
+                logger.debug(
+                    "executor_switch: failed to load pin lifecycle settings", exc_info=True
+                )
+                settings = {"ttl_seconds": 3600}
+            expires_at = secondary_pin_expires_at(
+                ttl_seconds=settings["ttl_seconds"], assigned_at=assigned_at
+            )
         ok = await set_conversation_active_executor(
-            session, conversation_id, target.executor_id
+            session,
+            conversation_id,
+            target.executor_id,
+            assigned_at=assigned_at,
+            expires_at=expires_at,
+            source=f"{actor}_switch",
         )
         if not ok:
             await session.rollback()
@@ -208,7 +229,14 @@ async def perform_executor_switch(
             # Best-effort task pin update; failure here should not undo the
             # conversation-level switch the agent already saw succeed.
             try:
-                await set_task_active_executor(session, task_id, target.executor_id)
+                await set_task_active_executor(
+                    session,
+                    task_id,
+                    target.executor_id,
+                    assigned_at=assigned_at,
+                    expires_at=expires_at,
+                    source=f"{actor}_switch",
+                )
             except Exception:
                 logger.debug(
                     "executor_switch: failed to persist task pin",

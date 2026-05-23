@@ -54,7 +54,7 @@ cognis/
 │   │   ├── session.py             # Session Manager
 │   │   ├── session_cache.py       # L1 in-memory cache for Intaris-derived state
 │   │   ├── tool_router.py         # Tool routing logic
-│   │   ├── compaction.py          # Context compaction (LLM + mechanical fallback)
+│   │   ├── compaction/            # Context compaction package (strategy, banding, fallback, recovery)
 │   │   ├── context.py             # Context assembly (parallel external fetches)
 │   │   ├── events.py              # Event Bus + hooks
 │   │   ├── remember_queue.py      # Bounded retry queue for Mnemory remember
@@ -207,15 +207,17 @@ cognis/
 
 11. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
 
-12. **Compaction creates new sessions**: When context exceeds 85% capacity, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) defers session creation until the next user message; automatic compaction creates it immediately since the user message is available. The old session is marked completed with `completion_reason="compacted"`.
+12. **Compaction creates new sessions**: When context exceeds 85% capacity, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) defers session creation until the next user message; automatic compaction creates it immediately since the user message is available. The old session is marked completed with `completion_reason="compacted"`. Compaction input is assembled using a three-band strategy (head 20% / middle-drop / tail 60%) token-budgeted against the compaction model's `max_input_tokens`. The LLM is retried once on transient errors before falling back to a sliding-window mechanical summary (last 8 user messages + 4 assistant finals + 4 deliverables verbatim). The mechanical fallback is a last resort — the `cognis_compaction_fallback_used_total` counter is alert-worthy. Compaction recursion is bounded at `session.compaction_max_recursion` (default 2); exceeding it surfaces a `compaction_recursion_exhausted` classified failure. The deferred-rotation path re-fetches preserved tail events from the old session's Intaris stream (using `tail_start_seq` from the `compaction_summary` event) and seeds them into the new session so continuity is preserved.
 
-13. **Prompt caching via immutable prefix**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary) followed by a mutable suffix (environment → history → recalled memories → delegations → user message). The immutable prefix benefits from LLM prompt caching (Anthropic `cache_control`, OpenAI automatic prefix caching). Memory instructions and core memories are cached in the session cache for the duration of the session with a 30-minute TTL refresh. Tool schemas are kept stable across turns — the tool exposure layer uses provider-specific mechanisms (`allowed_tools`, `defer_loading`, `tool_search`) to vary tool visibility without changing the cached `tools` array. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
+13. **Prompt caching via immutable prefix**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary) followed by a mutable suffix (environment → history → recalled memories → delegations → user message). The immutable prefix benefits from LLM prompt caching (Anthropic `cache_control`, OpenAI automatic prefix caching). Memory instructions and core memories are cached for the lifetime of the session cache entry. Refresh is triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. There is no time-based TTL — the cache is valid until one of these signals fires. Tool schemas are kept stable across turns — the tool exposure layer uses provider-specific mechanisms (`allowed_tools`, `defer_loading`, `tool_search`) to vary tool visibility without changing the cached `tools` array. Within-turn re-projection only fires when real context pressure exists (≥ 92% of available tokens, or an oversized tool result was appended); ordinary turns skip re-projection entirely to preserve the provider prefix cache. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
 
 14. **External channel senders must be verifiable**: Channel accounts should default to `pairing` so unknown remote senders cannot talk to an agent until they redeem a short-lived verification code in the Cognis UI.
 
 15. **Channel adapters may run on executors**: The default location is still the controller, but the target architecture allows a channel account to run on a connected executor when the platform needs user-local services or network reachability (for example Signal via `signal-cli`). The executor reuses the exact same adapter code; the controller does not own the platform-side connection state.
 
 16. **LLM provider executor routing**: LLM providers are configured normally (same UI, same DB table). Setting `location="executor"` on a provider routes inference through a matching remote executor instead of calling the API from the controller. The executor is a transparent LiteLLM proxy — it receives the fully resolved model string and kwargs per-call. `executor_labels` on the provider config selects which executor to use. This means any LiteLLM-supported provider can run on any executor.
+
+17. **Structured LLM stream failures**: Both Responses and Chat Completions streams emit mid-stream failures as `mid_stream_failure=true` chunks with a normalized `response_error` payload. Error classes and payload categories live in `cognis/providers/llm/errors.py`. The agent loop uses `cognis_llm_mid_stream_errors_total{provider_id,model,category}` as the canonical stream-failure metric; older phase-specific idle-timeout counters were removed. Mid-stream retries use the shared exponential retry policy, and runtime capability fallback markers (native OpenAI tool search, JSON mode, prompt cache key, reasoning summaries) expire after one hour by default. If a provider rejects `reasoning.summary`, Cognis retries the same Responses request once with the summary field omitted and marks that provider/model pair temporarily broken.
 
 ## Build / Run / Test
 
@@ -418,6 +420,8 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_CONTROLLER_URL` | — | Executor: controller WebSocket URL (alternative to `--controller-url`) |
 | `COGNIS_EXECUTOR_TOKEN` | — | Executor: JWT auth token (alternative to `--token`) |
 | `COGNIS_EXECUTOR_WORKDIR` | `~` | Executor: default working directory for tool calls (alternative to `--workdir`) |
+| `COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED` | `true` | Attach explicit `prompt_cache_key` to ChatGPT/Codex Responses requests. Set to `false` to disable globally; per-provider `use_prompt_cache_key: false` disables for a single provider. |
+| `CHATGPT_DEFAULT_INSTRUCTIONS` | suppressed by Cognis | LiteLLM reads this to override the Codex CLI default instructions block. Cognis suppresses it at startup to prevent the ~5 KB Codex prompt from being prepended to every request. Set a non-empty value in the environment before startup to override. |
 
 ### Database
 
@@ -468,8 +472,8 @@ class SessionCache:
     last_compaction_seq: int         # Updated on compaction
     last_compaction_summary: str     # Updated on compaction
     intention: str | None            # Read-through at turn start
-    memory_instructions: str | None  # Cached from first Mnemory recall (30 min TTL)
-    core_memories: str | None        # Cached from first Mnemory recall (30 min TTL)
+    memory_instructions: str | None  # Cached for session lifetime; refreshed on repair signal
+    core_memories: str | None        # Cached for session lifetime; refreshed on repair signal
 ```
 
 - **Events are immutable in Intaris object store** — safe to cache without invalidation

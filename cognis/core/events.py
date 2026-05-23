@@ -80,12 +80,14 @@ class EventType(StrEnum):
     DELEGATION_PROGRESS = "delegation_progress"
     DELEGATION_COMPLETED = "delegation_completed"
     DELEGATION_FAILED = "delegation_failed"
+    BACKGROUND_TOOL_COMPLETED = "background_tool_completed"
 
     # Turn lifecycle (TurnScheduler)
     TURN_STARTED = "turn_started"
     TURN_COMPLETED = "turn_completed"
     TURN_ERROR = "turn_error"
     USER_MESSAGE = "user_message"
+    CONVERSATION_UPDATED = "conversation_updated"
 
     # Agent lifecycle
     AGENT_PROFILE_UPDATED = "agent_profile_updated"

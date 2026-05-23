@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -171,9 +172,83 @@ class TestGetDiagnostics:
         result = client.get_diagnostics("file:///nonexistent.py")
         assert result == {}
 
+    def test_has_pending_diagnostics(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+
+        assert not client.has_pending_diagnostics("file:///a.py")
+        client._pending_diagnostics.add("file:///a.py")
+        assert client.has_pending_diagnostics("file:///a.py")
+
 
 class TestDispatch:
     """Test the message dispatch logic."""
+
+    def test_configuration_response_returns_matching_sections(self) -> None:
+        client = LSPClient(
+            "pyright",
+            "test-cmd",
+            [],
+            "file:///tmp",
+            workspace_configuration={"python": {"analysis": {"diagnosticMode": "openFilesOnly"}}},
+        )
+
+        result = client._configuration_response(
+            [{"section": "python"}, {"section": "missing"}, {"scopeUri": "file:///tmp/a.py"}]
+        )
+
+        assert result == [{"analysis": {"diagnosticMode": "openFilesOnly"}}, {}, {}]
+
+    def test_configuration_response_ignores_malformed_items(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+
+        assert client._configuration_response(["bad", {"section": "python"}]) == [{}, {}]
+        assert client._configuration_response({"section": "python"}) == []
+
+    def test_configuration_sections_extracts_log_context(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+
+        assert client._configuration_sections(
+            ["bad", {"section": "python"}, {"section": 123}, {"scopeUri": "file:///tmp/a.py"}]
+        ) == [None, "python", None, None]
+        assert client._configuration_sections({"section": "python"}) == []
+
+    @pytest.mark.asyncio()
+    async def test_dispatch_logs_workspace_configuration_context(self, caplog) -> None:
+        caplog.set_level(logging.INFO, logger="cognis.tools.executor.lsp.client")
+        client = LSPClient(
+            "pyright",
+            "test-cmd",
+            [],
+            "file:///tmp",
+            workspace_configuration={"python": {"analysis": {}}},
+        )
+
+        client._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "workspace/configuration",
+                "params": {"items": [{"section": "python"}]},
+            }
+        )
+        await asyncio.sleep(0)
+
+        assert "server_id=pyright" in caplog.text
+        assert "requested_sections=['python']" in caplog.text
+
+    @pytest.mark.asyncio()
+    async def test_wait_for_diagnostics_tracks_pending_state(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+
+        task = asyncio.create_task(client.wait_for_diagnostics(uri, timeout_ms=1000))
+        await asyncio.sleep(0)
+        assert client.has_pending_diagnostics(uri)
+
+        client._handle_publish_diagnostics({"uri": uri, "diagnostics": []})
+        await task
+
+        assert not client.has_pending_diagnostics(uri)
 
     @pytest.mark.asyncio()
     async def test_dispatch_response(self) -> None:

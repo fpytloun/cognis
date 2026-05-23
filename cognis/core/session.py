@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import os
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
 from cognis.core.immutable_prefix import (
+    PREFIX_EVENT_TYPES,
     ImmutablePrefixEntry,
     build_context_snapshot_event,
     build_prefix_message_events,
 )
+from cognis.core.session_cache import CachedEvent
+from cognis.core.session_event_types import INTARIS_APPENDABLE_EVENT_TYPES
 from cognis.core.session_fork import fork_session_events
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -28,6 +36,7 @@ from cognis.models.session import (
 )
 from cognis.runtime_context import (
     current_effective_working_directory,
+    current_executor_environment,
     current_workspace_root,
     scoped_runtime_context,
 )
@@ -38,6 +47,26 @@ logger = get_logger(__name__)
 _WHITESPACE_RE = re.compile(r"\s+")
 _MAX_INTENTION_LENGTH = 500
 _MAX_STATUS_REASON_LENGTH = 500
+_USABLE_REDO_SESSION_STATUSES = {SessionStatus.ACTIVE, SessionStatus.IDLE}
+
+
+def _hash_log_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(slots=True)
+class HistoryRebaseResult:
+    """Result of same-conversation history undo/redo."""
+
+    operation: str
+    session: SessionModel
+    previous_session: SessionModel
+    undo_available: bool
+    redo_available: bool
+    message: str
+
 
 # Cognis → Intaris session status mapping.  Intaris does not have
 # ``failed`` or ``cancelled``; both map to ``terminated`` with a
@@ -96,7 +125,59 @@ def _normalize_intention(value: str | None, fallback: str = "Conversation") -> s
 def _resolve_runtime_workdir() -> str | None:
     """Pick the most specific working directory from the runtime context vars."""
 
-    return current_effective_working_directory.get() or current_workspace_root.get()
+    workdir = current_effective_working_directory.get() or current_workspace_root.get()
+    if isinstance(workdir, str) and workdir.strip():
+        return workdir
+    environment = current_executor_environment.get()
+    cwd = getattr(environment, "cwd", None)
+    if isinstance(cwd, str) and cwd.strip():
+        return cwd
+    home = getattr(environment, "home", None)
+    if isinstance(home, str) and home.strip():
+        return home
+    return None
+
+
+def executor_home_from_workspace_root(workspace_root: str | None) -> str | None:
+    """Best-effort executor home inference from a known executor workspace path."""
+
+    if isinstance(workspace_root, str):
+        marker = "/src/"
+        marker_index = workspace_root.find(marker)
+        if marker_index > 0:
+            return workspace_root[:marker_index]
+    return None
+
+
+def _resolve_executor_home() -> str | None:
+    """Return the active executor home directory from runtime context, if known."""
+
+    environment = current_executor_environment.get()
+    home = getattr(environment, "home", None)
+    if isinstance(home, str) and home.strip():
+        return home
+    return executor_home_from_workspace_root(current_workspace_root.get())
+
+
+def _expand_executor_user_path(value: str, executor_home: str | None = None) -> str:
+    if not executor_home or not (value == "~" or value.startswith("~/")):
+        return value
+    return f"{executor_home.rstrip('/')}{value[1:]}"
+
+
+def _normalize_executor_path(value: str | None, *, executor_home: str | None = None) -> str | None:
+    """Return an executor-visible absolute path for Intaris session policy."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    stripped = _expand_executor_user_path(value.strip(), executor_home=executor_home)
+    try:
+        expanded = os.path.expandvars(stripped)
+        if expanded == "~" or expanded.startswith("~/"):
+            return expanded
+        return os.path.realpath(expanded)
+    except OSError:
+        return stripped
 
 
 async def _project_source_paths(db_session: AsyncSession, project_id: str | None) -> list[str]:
@@ -125,6 +206,7 @@ async def _project_source_paths(db_session: AsyncSession, project_id: str | None
 def _intaris_session_details(
     working_directory: str | None,
     *,
+    source: str = "cognis",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``details`` payload for ``guardrails.create_session``.
@@ -134,7 +216,7 @@ def _intaris_session_details(
     instead of falling through to the LLM evaluation path.
     """
 
-    details: dict[str, Any] = {"source": "cognis"}
+    details: dict[str, Any] = {"source": source}
     if working_directory:
         details["working_directory"] = working_directory
     if extra:
@@ -144,34 +226,91 @@ def _intaris_session_details(
     return details
 
 
+def _derive_intaris_source_label(
+    working_directory: str | None,
+    *,
+    project_paths: list[str],
+    executor_home: str | None = None,
+    fallback: str = "cognis",
+) -> str:
+    """Use the matching project source basename for Intaris display details."""
+
+    executor_home = executor_home or _resolve_executor_home()
+    normalized_workdir = _normalize_executor_path(working_directory, executor_home=executor_home)
+    if not normalized_workdir:
+        return fallback
+    for project_path in project_paths:
+        normalized_project_path = _normalize_executor_path(
+            project_path, executor_home=executor_home
+        )
+        if normalized_project_path and (
+            normalized_workdir == normalized_project_path
+            or normalized_workdir.startswith(f"{normalized_project_path}/")
+        ):
+            return normalized_project_path.rstrip("/").rsplit("/", 1)[-1] or fallback
+    return fallback
+
+
 def _intaris_session_policy(
     working_directory: str | None,
     *,
     project_paths: list[str] | None = None,
+    executor_home: str | None = None,
+    executor_tmpdir: str | None = None,
 ) -> dict[str, Any]:
     """Build the ``policy`` payload for ``guardrails.create_session``.
 
-    ``allow_paths`` widens the in-project boundary so that read tools
-    targeting the executor-visible working directory or any configured
-    project source remain on Intaris's fast path. Do not add controller-local
-    paths here; remote executors have a different filesystem namespace.
+    ``allow_paths`` widens the in-project boundary so that read tools targeting
+    the executor-visible working directory, common scratch directories, or any
+    configured project source remain on Intaris's fast path. Do not add
+    controller-local paths here; remote executors have a different filesystem
+    namespace.
     """
 
+    executor_home = executor_home or _resolve_executor_home()
     paths: list[str] = []
     seen: set[str] = set()
 
-    def _add(pattern: str) -> None:
-        if pattern and pattern not in seen:
+    def _add(raw_path: str | None) -> None:
+        path = _normalize_executor_path(raw_path, executor_home=executor_home)
+        if not path:
+            return
+        pattern = f"{path.rstrip('/')}/*"
+        if pattern not in seen:
             paths.append(pattern)
             seen.add(pattern)
 
-    if working_directory:
-        _add(f"{working_directory}/*")
+    _add("/tmp")
+    _add("/var/tmp")
+    _add(executor_tmpdir)
+    if executor_home:
+        _add(executor_home)
+        _add(f"{executor_home.rstrip('/')}/.local/share/cognis")
+    _add(working_directory)
     for raw_path in project_paths or []:
-        if raw_path:
-            _add(f"{raw_path}/*")
+        _add(raw_path)
 
     return {"allow_paths": paths} if paths else {}
+
+
+def _intaris_session_context(
+    working_directory: str | None,
+    *,
+    project_paths: list[str],
+) -> tuple[dict[str, Any], str]:
+    executor_home = _resolve_executor_home()
+    policy = _intaris_session_policy(
+        working_directory,
+        project_paths=project_paths,
+        executor_home=executor_home,
+        executor_tmpdir=getattr(current_executor_environment.get(), "tmpdir", None),
+    )
+    source_label = _derive_intaris_source_label(
+        working_directory,
+        project_paths=project_paths,
+        executor_home=executor_home,
+    )
+    return policy, source_label
 
 
 class SessionManager:
@@ -195,6 +334,37 @@ class SessionManager:
         await self.session_cache.evict(session_id)
         if self.session_lock is not None:
             self.session_lock.evict(session_id)
+
+    async def refresh_intaris_session_policy(self, session: SessionModel) -> None:
+        """Widen an existing Intaris session policy when runtime paths become known."""
+
+        workdir = _resolve_runtime_workdir()
+        if not workdir:
+            return
+        async with self.session_factory() as db_session:
+            project_id = await self._lookup_conversation_project_id(
+                db_session, session.conversation_id
+            )
+            project_paths = await _project_source_paths(db_session, project_id)
+        new_policy = _intaris_session_policy(workdir, project_paths=project_paths)
+        if not new_policy.get("allow_paths"):
+            return
+        intaris_session_id = session.intaris_session_id or session.session_id
+        if hasattr(self.providers.guardrails, "update_session_policy"):
+            try:
+                await self.providers.guardrails.update_session_policy(
+                    intaris_session_id,
+                    agent_id=session.agent_id,
+                    user_id=session.user_email,
+                    details=_intaris_session_details(workdir),
+                    policy=new_policy,
+                )
+            except Exception:
+                logger.warning(
+                    "session: failed to refresh Intaris session policy",
+                    extra={"extra_data": {"session_id": session.session_id}},
+                    exc_info=True,
+                )
 
     async def create_conversation(
         self,
@@ -326,6 +496,10 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
+                source_label = _derive_intaris_source_label(
+                    workdir,
+                    project_paths=project_paths,
+                )
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -336,7 +510,7 @@ class SessionManager:
                         intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
-                        details=_intaris_session_details(workdir),
+                        details=_intaris_session_details(workdir, source=source_label),
                         policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
@@ -376,6 +550,10 @@ class SessionManager:
         title_source: str = "unset",
         intention: str | None = None,
         initial_active_executor_id: str | None = None,
+        initial_active_executor_assigned_at: datetime | None = None,
+        initial_active_executor_expires_at: datetime | None = None,
+        initial_active_executor_source: str | None = None,
+        project_id: str | None = None,
     ) -> tuple[ConversationModel, SessionModel]:
         """Create a conversation and root session atomically.
 
@@ -398,6 +576,7 @@ class SessionManager:
                     context_ref=context.ref,
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
+                    project_id=project_id,
                 )
                 # Stage 36: seed the conversation's active_executor_id from
                 # the task-level pin (if provided). The runtime factory
@@ -405,6 +584,9 @@ class SessionManager:
                 # carries the agent's prior choice into the new step.
                 if initial_active_executor_id:
                     conversation.active_executor_id = initial_active_executor_id
+                    conversation.active_executor_assigned_at = initial_active_executor_assigned_at
+                    conversation.active_executor_expires_at = initial_active_executor_expires_at
+                    conversation.active_executor_source = initial_active_executor_source
                 session_row = await queries.create_session(
                     db_session,
                     conversation_id=conversation.conversation_id,
@@ -414,9 +596,13 @@ class SessionManager:
                 resolved_intention = _normalize_intention(
                     intention or self._build_root_intention(agent, title)
                 )
-                project_id = getattr(conversation, "project_id", None)
-                project_paths = await _project_source_paths(db_session, project_id)
+                conversation_project_id = getattr(conversation, "project_id", None)
+                project_paths = await _project_source_paths(db_session, conversation_project_id)
                 workdir = _resolve_runtime_workdir()
+                source_label = _derive_intaris_source_label(
+                    workdir,
+                    project_paths=project_paths,
+                )
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -427,7 +613,7 @@ class SessionManager:
                         intention=resolved_intention,
                         agent_id=agent_id,
                         user_id=user_email,
-                        details=_intaris_session_details(workdir),
+                        details=_intaris_session_details(workdir, source=source_label),
                         policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
                 await queries.set_session_intaris_session_id(
@@ -501,6 +687,251 @@ class SessionManager:
         )
         return conversation, session, copied
 
+    async def undo_last_turn(
+        self,
+        *,
+        conversation: ConversationModel,
+        current_session: SessionModel,
+        is_slash_command_message: Any,
+        intention: str | None = None,
+    ) -> HistoryRebaseResult | None:
+        """Create a same-conversation root session that excludes the last user turn."""
+
+        events = await self._read_history_events(current_session)
+        undo_event = self._find_last_real_user_event(events, is_slash_command_message)
+        if undo_event is None:
+            return None
+
+        cutoff_seq, cutoff_turn_id = self._undo_cutoff(events, undo_event)
+        retained_events = [
+            event
+            for event in events
+            if event.type not in PREFIX_EVENT_TYPES and event.seq < cutoff_seq
+        ]
+        retained_max_seq = max((event.seq for event in retained_events), default=0)
+
+        new_session = await self._create_history_rebase_session(
+            current_session=current_session,
+            intention=intention or current_session.result_summary or "Undo conversation history",
+        )
+        copied = await fork_session_events(
+            providers=self.providers,
+            session_cache=self.session_cache,
+            source_cognis_session_id=current_session.session_id,
+            source_intaris_session_id=current_session.intaris_session_id
+            or current_session.session_id,
+            target_session=new_session,
+            source_label="history_undo",
+            snapshot_source="undo",
+            snapshot_extras={
+                "operation": "undo",
+                "undo_of_session_id": current_session.session_id,
+                "undo_cutoff_seq": cutoff_seq,
+                "undo_cutoff_turn_id": cutoff_turn_id,
+            },
+            max_source_seq=retained_max_seq,
+            event_filter=lambda event: (
+                event.type not in PREFIX_EVENT_TYPES and event.seq < cutoff_seq
+            ),
+            record_source="cognis:undo",
+        )
+        if retained_events and not copied:
+            raise RuntimeError("Could not copy retained history into undo session")
+
+        metadata = {
+            "operation": "undo",
+            "redo_session_id": current_session.session_id,
+            "undo_session_id": new_session.session_id,
+            "undo_of_session_id": current_session.session_id,
+            "undo_cutoff_seq": cutoff_seq,
+            "undo_cutoff_turn_id": cutoff_turn_id,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        async with self.session_factory() as db_session:
+            try:
+                await queries.update_conversation_active_session(
+                    db_session, conversation.conversation_id, new_session.session_id
+                )
+                await queries.set_conversation_history_rebase_metadata(
+                    db_session, conversation.conversation_id, metadata
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+        self._copy_runtime_overrides(current_session.session_id, new_session.session_id)
+        return HistoryRebaseResult(
+            operation="undo",
+            session=new_session,
+            previous_session=current_session,
+            undo_available=bool(retained_events),
+            redo_available=True,
+            message="Undid last turn.",
+        )
+
+    async def redo_last_undo(
+        self,
+        *,
+        conversation: ConversationModel,
+        current_session: SessionModel,
+    ) -> HistoryRebaseResult | None:
+        """Restore the saved redo session when the undo branch has not diverged."""
+
+        metadata = dict((conversation.context.platform_data or {}).get("history_rebase") or {})
+        redo_session_id = metadata.get("redo_session_id")
+        undo_session_id = metadata.get("undo_session_id")
+        if not isinstance(redo_session_id, str) or undo_session_id != current_session.session_id:
+            await self.clear_history_redo_metadata(conversation.conversation_id)
+            return None
+
+        async with self.session_factory() as db_session:
+            try:
+                redo_row = await queries.get_session_row(db_session, redo_session_id)
+                if (
+                    redo_row is None
+                    or redo_row.conversation_id != conversation.conversation_id
+                    or redo_row.user_email != conversation.user_email
+                    or redo_row.status not in _USABLE_REDO_SESSION_STATUSES
+                ):
+                    await queries.clear_conversation_history_rebase_metadata(
+                        db_session, conversation.conversation_id
+                    )
+                    await db_session.commit()
+                    return None
+                await queries.update_conversation_active_session(
+                    db_session, conversation.conversation_id, redo_session_id
+                )
+                await queries.clear_conversation_history_rebase_metadata(
+                    db_session, conversation.conversation_id
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+        return HistoryRebaseResult(
+            operation="redo",
+            session=_to_session_model(redo_row),
+            previous_session=current_session,
+            undo_available=True,
+            redo_available=False,
+            message="Redid last turn.",
+        )
+
+    async def clear_history_redo_metadata(self, conversation_id: str) -> None:
+        """Best-effort clear of stale redo metadata."""
+
+        async with self.session_factory() as db_session:
+            try:
+                await queries.clear_conversation_history_rebase_metadata(
+                    db_session, conversation_id
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+    async def _create_history_rebase_session(
+        self,
+        *,
+        current_session: SessionModel,
+        intention: str,
+    ) -> SessionModel:
+        async with self.session_factory() as db_session:
+            try:
+                agent = await self._require_agent(db_session, current_session.agent_id)
+                session_row = await queries.create_session(
+                    db_session,
+                    conversation_id=current_session.conversation_id,
+                    user_email=current_session.user_email,
+                    agent_id=current_session.agent_id,
+                    previous_session_id=None,
+                    mnemory_session_id=None,
+                )
+                project_id = await self._lookup_conversation_project_id(
+                    db_session, current_session.conversation_id
+                )
+                project_paths = await _project_source_paths(db_session, project_id)
+                workdir = _resolve_runtime_workdir()
+                with scoped_runtime_context(
+                    user_email=current_session.user_email,
+                    agent_id=current_session.agent_id,
+                    agent_owner_email=agent.owner_email,
+                ):
+                    await self.providers.guardrails.create_session(
+                        session_id=session_row.session_id,
+                        intention=_normalize_intention(intention),
+                        agent_id=current_session.agent_id,
+                        user_id=current_session.user_email,
+                        details=_intaris_session_details(workdir, source="cognis:undo"),
+                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                    )
+                await queries.set_session_intaris_session_id(
+                    db_session, session_row.session_id, session_row.session_id
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+        session_row.intaris_session_id = session_row.session_id
+        return _to_session_model(session_row)
+
+    async def _read_history_events(self, session: SessionModel) -> list[CachedEvent]:
+        cache_entry = self.session_cache.get_entry(session.session_id)
+        if cache_entry is not None and cache_entry.initialized and cache_entry.events:
+            return sorted(list(cache_entry.events), key=lambda event: event.seq)
+        event_read = await self.providers.guardrails.read_events(
+            session_id=session.intaris_session_id or session.session_id,
+            after_seq=0,
+        )
+        events: list[CachedEvent] = []
+        for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0) or 0)):
+            events.append(
+                CachedEvent(
+                    seq=int(raw_event.get("seq", 0) or 0),
+                    type=str(raw_event.get("type") or ""),
+                    data=dict(raw_event.get("data") or {}),
+                    source=raw_event.get("source"),
+                    ts=raw_event.get("ts"),
+                )
+            )
+        return events
+
+    @staticmethod
+    def _find_last_real_user_event(
+        events: list[CachedEvent],
+        is_slash_command_message: Any,
+    ) -> CachedEvent | None:
+        for event in reversed(events):
+            if event.type != "user_message":
+                continue
+            content = event.data.get("content")
+            if isinstance(content, str) and is_slash_command_message(content):
+                continue
+            return event
+        return None
+
+    @staticmethod
+    def _undo_cutoff(events: list[CachedEvent], undo_event: CachedEvent) -> tuple[int, str | None]:
+        raw_turn_id = undo_event.data.get("turn_id")
+        turn_id = raw_turn_id if isinstance(raw_turn_id, str) and raw_turn_id else None
+        if turn_id:
+            turn_event_seqs = [
+                event.seq for event in events if event.data.get("turn_id") == turn_id
+            ]
+            if turn_event_seqs:
+                return min(turn_event_seqs), turn_id
+        return undo_event.seq, turn_id
+
+    def _copy_runtime_overrides(self, source_session_id: str, target_session_id: str) -> None:
+        model_override = self.session_cache.get_model_override(source_session_id)
+        reasoning_override = self.session_cache.get_reasoning_effort_override(source_session_id)
+        if model_override is not None:
+            self.session_cache.set_model_override(target_session_id, model_override)
+        if reasoning_override is not None:
+            self.session_cache.set_reasoning_effort_override(target_session_id, reasoning_override)
+
     async def create_child_session(
         self,
         parent_session: SessionModel,
@@ -512,6 +943,8 @@ class SessionManager:
         expected_output: str | None = None,
         constraints: dict[str, Any] | None = None,
         intention: str | None = None,
+        workspace_root: str | None = None,
+        working_directory: str | None = None,
     ) -> SessionModel:
         """Create a delegated child session and corresponding Intaris session."""
 
@@ -534,7 +967,7 @@ class SessionManager:
                     db_session, parent_session.conversation_id
                 )
                 project_paths = await _project_source_paths(db_session, project_id)
-                workdir = _resolve_runtime_workdir()
+                workdir = working_directory or workspace_root
                 child_details = _intaris_session_details(
                     workdir,
                     extra={
@@ -634,8 +1067,12 @@ class SessionManager:
                 extra={
                     "extra_data": {
                         "session_id": session_id,
+                        "target_session_id": target_session_id,
+                        "uses_intaris_session_id": target_session_id != session_id,
                         "cognis_status": cognis_status,
                         "intaris_status": intaris_status,
+                        "has_user_email": bool(resolved_user_email),
+                        "user_email_hash": _hash_log_value(resolved_user_email),
                     }
                 },
                 exc_info=True,
@@ -674,6 +1111,7 @@ class SessionManager:
         self,
         session_id: str,
         result_summary: str | None = None,
+        result_content: str | None = None,
         completion_reason: str | None = None,
     ) -> bool:
         """Mark a session completed and evict cache state."""
@@ -686,6 +1124,7 @@ class SessionManager:
                     SessionStatus.COMPLETED,
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
+                    result_content=result_content,
                     completion_reason=completion_reason,
                 )
                 await db_session.commit()
@@ -702,7 +1141,12 @@ class SessionManager:
             )
         return updated
 
-    async def mark_failed(self, session_id: str, result_summary: str | None = None) -> bool:
+    async def mark_failed(
+        self,
+        session_id: str,
+        result_summary: str | None = None,
+        result_content: str | None = None,
+    ) -> bool:
         """Mark a session failed and evict cache state."""
 
         async with self.session_factory() as db_session:
@@ -713,6 +1157,7 @@ class SessionManager:
                     SessionStatus.FAILED,
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
+                    result_content=result_content,
                 )
                 await db_session.commit()
             except Exception:
@@ -792,6 +1237,7 @@ class SessionManager:
         intention: str,
         completion_reason: str = "compacted",
         compaction_summary: str | None = None,
+        tail_events: list[Any] | None = None,
     ) -> SessionModel:
         """Create a new root session, completing the current one.
 
@@ -892,18 +1338,47 @@ class SessionManager:
 
         new_session_row.intaris_session_id = new_session_row.session_id
         new_session = _to_session_model(new_session_row)
-        if prefix_entries:
-            rotated_prefix: list[ImmutablePrefixEntry] = [
-                entry for entry in prefix_entries if entry.source != "compaction_summary"
-            ]
-            if compaction_summary:
-                rotated_prefix.append(
-                    ImmutablePrefixEntry(
-                        role="developer",
-                        source="compaction_summary",
-                        content=compaction_summary,
-                    )
+        rotated_prefix: list[ImmutablePrefixEntry] = [
+            entry for entry in prefix_entries if entry.source != "compaction_summary"
+        ]
+        if compaction_summary:
+            rotated_prefix.append(
+                ImmutablePrefixEntry(
+                    role="developer",
+                    source="compaction_summary",
+                    content=compaction_summary,
                 )
+            )
+        durable_summary_events = (
+            with_session_events_turn_id(
+                [
+                    SessionEvent(
+                        type="compaction_summary",
+                        data={
+                            "summary": compaction_summary,
+                            "method": "rotation",
+                            "trigger": completion_reason,
+                            "source_session_id": current_session.session_id,
+                        },
+                    )
+                ],
+                None,
+            )
+            if compaction_summary
+            else []
+        )
+        summary_result: Any | None = None
+        if durable_summary_events:
+            summary_result = await self.providers.guardrails.record_events(
+                session_id=new_session.intaris_session_id or new_session.session_id,
+                events=durable_summary_events,
+                source="cognis",
+                idempotency_key=f"{new_session.session_id}:compaction_summary:rotation",
+            )
+            if not summary_result.ok:
+                raise RuntimeError("failed to persist rotated compaction summary")
+
+        if rotated_prefix:
             message_events = with_session_events_turn_id(
                 build_prefix_message_events(rotated_prefix),
                 None,
@@ -963,6 +1438,17 @@ class SessionManager:
                     "session: failed to persist compaction prefix messages",
                     extra={"extra_data": {"session_id": new_session.session_id}},
                 )
+        if durable_summary_events and summary_result is not None:
+            append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
+            if callable(append_recorded_events):
+                await append_recorded_events(new_session, durable_summary_events, summary_result)
+
+        if tail_events:
+            await self._seed_rotated_tail_events(
+                new_session,
+                tail_events=tail_events,
+                previous_session_id=current_session.session_id,
+            )
 
         logger.info(
             "session: rotation completed",
@@ -975,6 +1461,67 @@ class SessionManager:
             },
         )
         return new_session
+
+    async def _seed_rotated_tail_events(
+        self,
+        new_session: SessionModel,
+        *,
+        tail_events: list[Any],
+        previous_session_id: str,
+    ) -> None:
+        """Copy recent un-compacted events into the rotated session."""
+
+        session_id = new_session.intaris_session_id or new_session.session_id
+        cloned_events: list[SessionEvent] = []
+        skipped_event_types: dict[str, int] = {}
+        for event in tail_events:
+            event_type = getattr(event, "type", None)
+            data = getattr(event, "data", None)
+            if not isinstance(event_type, str) or not isinstance(data, dict):
+                continue
+            if event_type not in INTARIS_APPENDABLE_EVENT_TYPES:
+                skipped_event_types[event_type] = skipped_event_types.get(event_type, 0) + 1
+                continue
+            cloned_data = copy.deepcopy(data)
+            cloned_data.setdefault("compaction_tail", True)
+            cloned_data.setdefault("source_session_id", previous_session_id)
+            source_seq = getattr(event, "seq", None)
+            if isinstance(source_seq, int):
+                cloned_data.setdefault("source_seq", source_seq)
+            cloned_events.append(SessionEvent(type=event_type, data=cloned_data))
+        if skipped_event_types:
+            logger.info(
+                "session: skipped non-appendable compaction tail events",
+                extra={
+                    "extra_data": {
+                        "session_id": new_session.session_id,
+                        "skipped_count": sum(skipped_event_types.values()),
+                        "skipped_types": dict(sorted(skipped_event_types.items())),
+                    }
+                },
+            )
+        if not cloned_events:
+            return
+        try:
+            append_result = await self.providers.guardrails.record_events(
+                session_id=session_id,
+                events=cloned_events,
+                source="cognis",
+                idempotency_key=f"{new_session.session_id}:compaction_tail:{previous_session_id}",
+            )
+            append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
+            if append_result.ok and callable(append_recorded_events):
+                await append_recorded_events(new_session, cloned_events, append_result)
+        except Exception as exc:
+            extra_data: dict[str, Any] = {"session_id": new_session.session_id}
+            if isinstance(exc, httpx.HTTPStatusError):
+                extra_data["response_status_code"] = exc.response.status_code
+                extra_data["response_body"] = exc.response.text[:1000]
+            logger.warning(
+                "session: failed to seed compaction tail events",
+                extra={"extra_data": extra_data},
+                exc_info=True,
+            )
 
     async def recover_stale_sessions(self, stale_after_seconds: int = 300) -> list[str]:
         """Mark stale active sessions idle on controller startup."""
@@ -1254,6 +1801,10 @@ def _to_conversation_model(row: Any) -> ConversationModel:
         project_id=getattr(row, "project_id", None),
         active_session_id=row.active_session_id,
         active_executor_id=getattr(row, "active_executor_id", None),
+        active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
+        active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
+        active_executor_source=getattr(row, "active_executor_source", None),
+        starred_at=getattr(row, "starred_at", None),
         status=row.status,
         last_message_at=row.last_message_at,
         created_at=row.created_at,
@@ -1279,5 +1830,6 @@ def _to_session_model(row: Any) -> SessionModel:
         idle_since=row.idle_since,
         completed_at=row.completed_at,
         result_summary=row.result_summary,
+        result_content=getattr(row, "result_content", None),
         updated_at=row.updated_at,
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,15 +11,18 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
-from cognis.core.events import EventBus, EventType
+from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
     FollowUpMode,
     FollowUpOriginKind,
+    FollowUpRelevanceHint,
     FollowUpRequiredAction,
     FollowUpStatus,
     TaskResultFollowUp,
 )
 from cognis.core.turn_scheduler import (
+    ActiveToolOutputSnapshot,
     TurnScheduler,
     _effective_user_content,
     _QueuedMessage,
@@ -28,6 +32,15 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import SessionStatus
 from cognis.store.models import Base
+from cognis.store.queries import create_agent, create_conversation, create_user, get_conversation
+
+
+class _NoopAsyncContext:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class _RecordingObserver:
@@ -74,6 +87,21 @@ class _RecordingObserver:
         attachments: list[dict[str, object]] | None = None,
         file_diffs: list[dict[str, object]] | None = None,
         turn_id: str | None = None,
+        presentation: dict[str, object] | None = None,
+    ) -> None:
+        return None
+
+    async def on_tool_output_chunk(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        delta: str,
+        stream: str | None,
+        turn_id: str | None = None,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None:
         return None
 
@@ -88,6 +116,11 @@ class _RecordingObserver:
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None:
         return None
 
@@ -109,6 +142,192 @@ class _RecordingObserver:
         self.queued_messages.append(messages)
 
 
+class _LegacyThinkingObserver:
+    def __init__(self) -> None:
+        self.thinking: list[tuple[str, str, str | None, bool, str | None]] = []
+
+    async def on_thinking(
+        self,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        turn_id: str | None,
+        block_id: str,
+        delta: str,
+        title: str | None,
+        complete: bool,
+        content: str | None = None,
+    ) -> None:
+        self.thinking.append((block_id, delta, title, complete, content))
+
+
+class _CommitSession:
+    def __init__(self) -> None:
+        self.commits = 0
+
+    async def __aenter__(self) -> _CommitSession:
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+def _scheduler_for_redo_invalidation(session_factory: object) -> TurnScheduler:
+    scheduler = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(mark_active=AsyncMock(return_value=False)),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
+            False,
+        )
+
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = AsyncMock(return_value=([], None))  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    scheduler._load_turn_limits = AsyncMock(return_value=(10, 10))  # type: ignore[method-assign]
+    scheduler._launch_turn = MagicMock()  # type: ignore[method-assign]
+    return scheduler
+
+
+@pytest.mark.asyncio
+async def test_accepted_immediate_turn_clears_redo_metadata(monkeypatch) -> None:
+    db_session = _CommitSession()
+    clear_metadata = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.turn_scheduler.queries.clear_conversation_history_rebase_metadata",
+        clear_metadata,
+    )
+    scheduler = _scheduler_for_redo_invalidation(lambda: db_session)
+
+    error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+
+    assert error is None
+    clear_metadata.assert_awaited_once_with(db_session, "conv-1")
+    assert db_session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_queued_turn_clears_redo_metadata(monkeypatch) -> None:
+    db_session = _CommitSession()
+    clear_metadata = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.turn_scheduler.queries.clear_conversation_history_rebase_metadata",
+        clear_metadata,
+    )
+    scheduler = _scheduler_for_redo_invalidation(lambda: db_session)
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(60))
+    try:
+        error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+    finally:
+        scheduler._active_turns["conv-1"].cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler._active_turns["conv-1"]
+
+    assert error is None
+    clear_metadata.assert_awaited_once_with(db_session, "conv-1")
+    assert db_session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_rejected_turn_preserves_redo_metadata(monkeypatch) -> None:
+    clear_metadata = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.turn_scheduler.queries.clear_conversation_history_rebase_metadata",
+        clear_metadata,
+    )
+    scheduler = _scheduler_for_redo_invalidation(lambda: _CommitSession())
+    scheduler._load_turn_limits = AsyncMock(return_value=(0, 10))  # type: ignore[method-assign]
+
+    error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+
+    assert error is not None
+    assert error.code == "rate_limited"
+    clear_metadata.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slash_command_turn_preserves_redo_metadata(monkeypatch) -> None:
+    clear_metadata = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.turn_scheduler.queries.clear_conversation_history_rebase_metadata",
+        clear_metadata,
+    )
+    scheduler = _scheduler_for_redo_invalidation(lambda: _CommitSession())
+
+    error = await scheduler.submit_turn("conv-1", "/undo", user_email="user@example.com")
+
+    assert error is None
+    clear_metadata.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_uses_configurable_per_user_limit() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    async def _runtime(conversation_id: str, **__: object) -> tuple[object, object, object, bool]:
+        return (
+            SimpleNamespace(
+                conversation_id=conversation_id, user_email="user@example.com", status="active"
+            ),
+            SimpleNamespace(session_id=f"sess-{conversation_id}", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = AsyncMock(return_value=([], None))  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    scheduler._load_turn_limits = AsyncMock(return_value=(1, 20))  # type: ignore[method-assign]
+
+    first = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+    second = await scheduler.submit_turn("conv-2", "hello", user_email="user@example.com")
+
+    assert first is None
+    assert second is not None
+    assert second.code == "rate_limited"
+
+    scheduler._active_turns["conv-1"].cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scheduler._active_turns["conv-1"]
+
+
 @pytest.mark.asyncio
 async def test_has_running_turn_hides_settled_cleanup_state() -> None:
     scheduler = TurnScheduler(
@@ -116,7 +335,7 @@ async def test_has_running_turn_hides_settled_cleanup_state() -> None:
         workflow_engine=SimpleNamespace(),
         decision_engine=SimpleNamespace(),
         task_queue=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
         session_cache=SimpleNamespace(),
         compaction_strategy=SimpleNamespace(),
         agent_loop=SimpleNamespace(),
@@ -152,7 +371,7 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
         workflow_engine=SimpleNamespace(),
         decision_engine=SimpleNamespace(),
         task_queue=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
         session_cache=SimpleNamespace(),
         compaction_strategy=SimpleNamespace(),
         agent_loop=SimpleNamespace(),
@@ -164,12 +383,14 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
         event_bus=EventBus(),
     )
     observer = _RecordingObserver()
-    on_token, _on_thinking, on_tool_call, _on_tool_result = scheduler._build_callbacks(
-        "conv-1",
-        "sess-1",
-        "turn-1",
-        "turn-1",
-        turn_observers=(observer,),
+    on_token, _on_thinking, on_tool_call, _on_tool_result, _on_tool_output_chunk = (
+        scheduler._build_callbacks(
+            "conv-1",
+            "sess-1",
+            "turn-1",
+            "turn-1",
+            turn_observers=(observer,),
+        )
     )
 
     await on_token("Hello")
@@ -192,6 +413,180 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
 
     await on_tool_call("example_tool", "call-1", {})
     assert await scheduler.active_stream_snapshots("conv-1") == []
+
+
+@pytest.mark.asyncio
+async def test_thinking_callback_trims_metadata_for_legacy_observers() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(update_active_thinking=MagicMock()),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _LegacyThinkingObserver()
+    _on_token, on_thinking, _on_tool_call, _on_tool_result, _on_tool_output_chunk = (
+        scheduler._build_callbacks(
+            "conv-1",
+            "sess-1",
+            "turn-1",
+            "turn-1",
+            turn_observers=(observer,),
+        )
+    )
+
+    await on_thinking(
+        "thk_request_1",
+        "Thinking",
+        "Reasoning title",
+        False,
+        None,
+        "2026-04-20T00:00:00Z",
+        None,
+        None,
+        "summary",
+        0,
+    )
+
+    assert observer.thinking == [("thk_request_1", "Thinking", "Reasoning title", False, None)]
+
+
+@pytest.mark.asyncio
+async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    await scheduler._append_active_tool_output_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        call_id="call-1",
+        tool_name="bash",
+        turn_id="turn-1",
+        delta="hello",
+        stream="stdout",
+    )
+    snapshots = await scheduler.active_tool_output_snapshots("conv-1")
+    assert len(snapshots) == 1
+    assert snapshots[0]["result"] == "hello"
+    assert snapshots[0]["status"] == "running"
+
+    await scheduler._finalize_active_tool_output(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        call_id="call-1",
+        tool_name="bash",
+        turn_id="turn-1",
+        result="cut",
+        is_error=False,
+        metadata={"transport_truncated": True, "output_size": 5},
+    )
+    snapshots = await scheduler.active_tool_output_snapshots("conv-1")
+    assert snapshots[0]["status"] == "completed"
+    assert snapshots[0]["result"] == "hello"
+    assert "_raw_output" not in snapshots[0]
+
+
+@pytest.mark.asyncio
+async def test_active_tool_output_chunk_offsets_remain_monotonic_after_truncation() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    first_index, first_offset = await scheduler._append_active_tool_output_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        call_id="call-1",
+        tool_name="bash",
+        turn_id="turn-1",
+        delta="a" * 70_000,
+        stream="stdout",
+    )
+    second_index, second_offset = await scheduler._append_active_tool_output_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        call_id="call-1",
+        tool_name="bash",
+        turn_id="turn-1",
+        delta="b",
+        stream="stdout",
+    )
+    snapshots = await scheduler.active_tool_output_snapshots("conv-1")
+
+    assert (first_index, first_offset) == (0, 0)
+    assert (second_index, second_offset) == (1, 70_000)
+    assert snapshots[0]["content_offset"] == 70_001
+    assert snapshots[0]["output_size"] == 70_001
+    assert snapshots[0]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_active_tool_output_snapshots_filter_expired_items() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    stale = scheduler._active_tool_outputs[("conv-1", "sess-1", "call-1")] = (
+        ActiveToolOutputSnapshot(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            call_id="call-1",
+            tool_name="bash",
+            turn_id="turn-1",
+            result="stale",
+        )
+    )
+    stale.updated_at = stale.updated_at - timedelta(hours=7)
+
+    assert await scheduler.active_tool_output_snapshots("conv-1") == []
+    assert scheduler._active_tool_outputs == {}
 
 
 @pytest.mark.asyncio
@@ -454,6 +849,32 @@ async def test_build_attachment_notice_uses_pdf_text_fallback() -> None:
     assert "Extracted text from spec.pdf" in context
 
 
+def test_attachment_normalization_accepts_pydantic_refs() -> None:
+    attachment = AttachmentRef(
+        artifact_id="art-1",
+        kind=ArtifactKind.IMAGE,
+        mime_type="image/png",
+        filename="image.png",
+        size_bytes=123,
+        url="http://example.test/image.png",
+    )
+
+    normalized = normalize_attachment_refs([attachment])
+    safe = strip_attachment_payload_bytes([attachment])
+
+    assert normalized == [
+        {
+            "artifact_id": "art-1",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "image.png",
+            "size_bytes": 123,
+            "url": "http://example.test/image.png",
+        }
+    ]
+    assert safe == normalized
+
+
 @pytest.mark.asyncio
 async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
     pause_waiter = PauseWaiter()
@@ -511,6 +932,217 @@ async def test_submit_turn_only_notifies_once_per_pending_escalation() -> None:
     assert second is None
     scheduler._notify_observers_system_message.assert_awaited_once()
     assert len(scheduler._queued_messages["conv-1"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_uses_configurable_queue_limit() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        status="active",
+    )
+    session = SimpleNamespace(status=SessionStatus.ACTIVE)
+    agent = SimpleNamespace()
+    scheduler._load_conversation_runtime = AsyncMock(  # type: ignore[method-assign]
+        return_value=(conversation, session, agent, False)
+    )
+    scheduler._build_attachment_support_messages = AsyncMock(return_value=(None, None))  # type: ignore[method-assign]
+    scheduler._load_turn_limits = AsyncMock(return_value=(20, 1))  # type: ignore[method-assign]
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(1))
+
+    first = await scheduler.submit_turn("conv-1", "one", user_email="user@example.com")
+    second = await scheduler.submit_turn("conv-1", "two", user_email="user@example.com")
+
+    assert first is None
+    assert second is not None
+    assert second.code == "queue_full"
+
+    scheduler._active_turns["conv-1"].cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scheduler._active_turns["conv-1"]
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_touches_conversation_when_user_message_is_accepted(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'activity.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            status="active",
+        )
+        conversation = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+        )
+        await db_session.commit()
+
+    scheduler = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._load_conversation_runtime = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            SimpleNamespace(
+                conversation_id=conversation.conversation_id,
+                user_email="user@example.com",
+                status="active",
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
+            False,
+        )
+    )
+    scheduler._build_attachment_support_messages = AsyncMock(return_value=(None, None))  # type: ignore[method-assign]
+    scheduler._load_turn_limits = AsyncMock(return_value=(20, 20))  # type: ignore[method-assign]
+    scheduler._active_turns[conversation.conversation_id] = asyncio.create_task(asyncio.sleep(1))
+
+    try:
+        error = await scheduler.submit_turn(
+            conversation.conversation_id,
+            "queued user message",
+            user_email="user@example.com",
+        )
+
+        assert error is None
+        async with session_factory() as db_session:
+            row = await get_conversation(db_session, conversation.conversation_id)
+            assert row is not None
+            assert row.last_message_at is not None
+            assert row.updated_at == row.last_message_at
+    finally:
+        scheduler._active_turns[conversation.conversation_id].cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler._active_turns[conversation.conversation_id]
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_touches_conversation_before_launch() -> None:
+    scheduler = TurnScheduler(
+        session_factory=lambda: _NoopAsyncContext(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._load_conversation_runtime = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
+            False,
+        )
+    )
+    scheduler._build_attachment_support_messages = AsyncMock(return_value=(None, None))  # type: ignore[method-assign]
+    scheduler._load_turn_limits = AsyncMock(return_value=(20, 20))  # type: ignore[method-assign]
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._launch_turn = MagicMock()  # type: ignore[method-assign]
+
+    error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+
+    assert error is None
+    scheduler._touch_conversation.assert_awaited_once_with("conv-1")
+    scheduler._launch_turn.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_touches_conversation_when_queued_behind_escalation() -> None:
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id="pause-1",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            pause_type="escalation",
+        )
+    )
+    scheduler = TurnScheduler(
+        session_factory=lambda: _NoopAsyncContext(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=pause_waiter,
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._load_conversation_runtime = AsyncMock(  # type: ignore[method-assign]
+        return_value=(
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            SimpleNamespace(session_id="sess-1", status=SessionStatus.ACTIVE),
+            SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
+            False,
+        )
+    )
+    scheduler._build_attachment_support_messages = AsyncMock(return_value=(None, None))  # type: ignore[method-assign]
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_observers_system_message = AsyncMock()  # type: ignore[method-assign]
+
+    error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
+
+    assert error is None
+    scheduler._touch_conversation.assert_awaited_once_with("conv-1")
+    assert len(scheduler._queued_messages["conv-1"]) == 1
 
 
 @pytest.mark.asyncio
@@ -947,10 +1579,10 @@ async def test_queued_turn_observer_only_receives_its_own_turn() -> None:
 @pytest.mark.asyncio
 async def test_consume_queued_batch_for_active_turn_publishes_user_messages() -> None:
     event_bus = EventBus()
-    seen_user_messages: list[str] = []
+    seen_user_messages: list[dict[str, object]] = []
 
-    async def _capture_user_message(event: object) -> None:
-        seen_user_messages.append(str(event.data.get("content") or ""))
+    async def _capture_user_message(event: Event) -> None:
+        seen_user_messages.append(dict(event.data))
 
     event_bus.subscribe(EventType.USER_MESSAGE, _capture_user_message)
 
@@ -979,6 +1611,7 @@ async def test_consume_queued_batch_for_active_turn_publishes_user_messages() ->
             _QueuedMessage(
                 content="first queued",
                 user_email="user@example.com",
+                client_message_id="cmsg-first",
                 attachment_notice="Attachment warning",
                 outbound_attachments=[{"artifact_id": "art-1", "filename": "report.txt"}],
                 channel_deliverable=True,
@@ -995,7 +1628,11 @@ async def test_consume_queued_batch_for_active_turn_publishes_user_messages() ->
     )
 
     assert [item["content"] for item in batch] == ["first queued", "second queued"]
-    assert seen_user_messages == ["first queued", "second queued"]
+    assert [item["content"] for item in seen_user_messages] == ["first queued", "second queued"]
+    assert seen_user_messages[0]["event_id"] == "client:cmsg-first"
+    assert seen_user_messages[0]["message_id"] == "client:cmsg-first"
+    assert str(seen_user_messages[1]["event_id"]).startswith("queue:qmsg_")
+    assert seen_user_messages[1]["message_id"] == seen_user_messages[1]["event_id"]
     assert scheduler.queued_count("conv-1") == 0
     assert observer.queued == [0]
     assert observer.system_messages == ["Attachment warning"]
@@ -1487,6 +2124,49 @@ async def test_cancel_turn_clears_pending_queued_follow_up() -> None:
     assert ("conv-1", "fup_1") not in scheduler._pending_follow_ups
 
 
+@pytest.mark.asyncio
+async def test_cancel_turn_can_preserve_queued_messages() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(cancel_children=AsyncMock(return_value=0)),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint=FollowUpRelevanceHint.UNKNOWN,
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    scheduler._pending_follow_ups.add(("conv-1", "fup_1"))
+    scheduler._queued_messages["conv-1"].append(SimpleNamespace(follow_up=follow_up))
+
+    cancelled = await scheduler.cancel_turn("conv-1", clear_queue=False)
+
+    assert cancelled is False
+    assert len(scheduler._queued_messages["conv-1"]) == 1
+    assert ("conv-1", "fup_1") in scheduler._pending_follow_ups
+
+
 def test_effective_user_content_describes_audio_only_turns() -> None:
     assert _effective_user_content("hello", []) == "hello"
     assert _effective_user_content("", []) == ""
@@ -1539,7 +2219,7 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
             decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
         ),
         task_queue=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
         session_cache=SimpleNamespace(
             refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
             get_context_usage=MagicMock(return_value=None),
@@ -1562,7 +2242,7 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
             conversation_id="conv-1", title="", user_email="user@example.com"
         ),
         session=SimpleNamespace(session_id="sess-1"),
-        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
         content="",
         user_email="user@example.com",
         attachments=[
@@ -1593,6 +2273,8 @@ async def test_run_turn_publishes_effective_user_message_content() -> None:
     # The server now broadcasts the raw (empty) content for attachment-only messages
     # so the UI optimistic-bubble deduplication can match it directly.
     assert user_events[0].data["content"] == ""
+    assert user_events[0].data["event_id"] == user_events[0].data["message_id"]
+    assert str(user_events[0].data["event_id"]).startswith("user:sess-1:turn_")
 
 
 @pytest.mark.asyncio

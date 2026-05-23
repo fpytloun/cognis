@@ -368,7 +368,9 @@ def is_skill_management_tool(tool_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _auto_bind_skill_to_agent(session_factory: Any, skill_id: str) -> None:
+async def _auto_bind_skill_to_agent(
+    session_factory: Any, skill_id: str, *, agent_id: str | None = None
+) -> None:
     """Add a skill to the current agent's selected skills if not already present.
 
     Uses ``current_agent_id`` from the runtime context.  Best-effort:
@@ -377,17 +379,17 @@ async def _auto_bind_skill_to_agent(session_factory: Any, skill_id: str) -> None
     from cognis.runtime_context import current_agent_id
     from cognis.store.queries import get_agent, update_agent
 
-    agent_id = current_agent_id.get()
-    if not agent_id:
+    target_agent_id = agent_id or current_agent_id.get()
+    if not target_agent_id:
         return
 
     try:
         async with session_factory() as session:
-            agent_row = await get_agent(session, agent_id)
+            agent_row = await get_agent(session, target_agent_id)
             if agent_row is None:
                 return
 
-            skills_json = agent_row.skills or {}
+            skills_json = dict(agent_row.skills or {})
             items = skills_json.get("items", [])
             if not isinstance(items, list):
                 items = []
@@ -401,12 +403,12 @@ async def _auto_bind_skill_to_agent(session_factory: Any, skill_id: str) -> None
             items.append({"skill_id": skill_id, "enabled": True})
             skills_json["items"] = items
 
-            await update_agent(session, agent_id, updates={"skills": skills_json})
+            await update_agent(session, target_agent_id, updates={"skills": skills_json})
             await session.commit()
     except Exception:
         logger.warning(
             "Failed to auto-bind skill to agent",
-            extra={"extra_data": {"skill_id": skill_id, "agent_id": agent_id}},
+            extra={"extra_data": {"skill_id": skill_id, "agent_id": target_agent_id}},
             exc_info=True,
         )
 
@@ -484,6 +486,7 @@ async def handle_skill_management_tool(
     user_email: str,
     llm: Any | None = None,
     artifact_store: Any | None = None,
+    current_agent_id: str | None = None,
 ) -> ToolResult:
     """Handle a skill management tool call."""
     try:
@@ -497,7 +500,12 @@ async def handle_skill_management_tool(
             return await _handle_skill_versions(session_factory, user_email, arguments)
         if tool_name == "skill_write":
             return await _handle_skill_write(
-                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
+                session_factory,
+                user_email,
+                arguments,
+                llm=llm,
+                artifact_store=artifact_store,
+                current_agent_id=current_agent_id,
             )
         if tool_name == "skill_asset_write":
             return await _handle_skill_asset_write(
@@ -677,14 +685,22 @@ async def _handle_skill_load(
     """
     import json
 
-    from cognis.store.queries import get_skill_scoped
+    from cognis.store.queries import get_skill_scoped, list_skills
 
-    skill_id = str(arguments.get("skill_id", "")).strip()
+    skill_id = str(arguments.get("skill_id") or arguments.get("skill") or "").strip()
     if not skill_id:
         return ToolResult(output="skill_id is required", is_error=True)
 
     async with session_factory() as session:
         row = await get_skill_scoped(session, skill_id, owner_email=user_email)
+        if row is None and not skill_id.startswith("skill_"):
+            candidates = [
+                skill
+                for skill in await list_skills(session, owner_email=user_email)
+                if skill.name == skill_id or skill.skill_id == skill_id
+            ]
+            if len(candidates) == 1:
+                row = candidates[0]
         if row is None:
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
 
@@ -972,6 +988,7 @@ async def _handle_skill_write(
     *,
     llm: Any | None,
     artifact_store: Any | None,
+    current_agent_id: str | None = None,
 ) -> ToolResult:
     import json
 
@@ -1078,7 +1095,9 @@ async def _handle_skill_write(
                     current_instructions=current_version.instructions
                     if current_version is not None
                     else row.instructions,
-                    current_tools=current_version.tools if current_version is not None else row.tools,
+                    current_tools=current_version.tools
+                    if current_version is not None
+                    else row.tools,
                     current_linked_tool_ids=(
                         getattr(current_version, "linked_tool_ids", None)
                         if current_version is not None
@@ -1175,9 +1194,12 @@ async def _handle_skill_write(
         await session.commit()
 
     metadata: dict[str, Any] = {}
-    if created_new_skill:
-        # Auto-bind newly created skills to the current agent so they are immediately available.
-        await _auto_bind_skill_to_agent(session_factory, skill_id)
+    if current_agent_id:
+        # Keep created and updated skills attached to the agent that performed the mutation.
+        await _auto_bind_skill_to_agent(session_factory, skill_id, agent_id=current_agent_id)
+        metadata["attached_skill_id"] = skill_id
+
+    if created_new_skill or current_agent_id:
         metadata["attached_skill_id"] = skill_id
         metadata["discovered_tool_ids"] = sorted(
             _resolved_skill_tool_ids(
@@ -1539,11 +1561,14 @@ async def _handle_skill_import_url(
         name = arguments.get("name") or skill_data.get("name") or "Imported Skill"
         instructions = str(skill_data.get("instructions") or "")
         tools = normalize_skill_tools(skill_data.get("tools"))
-        linked_tool_ids = normalize_linked_tool_ids(
-            arguments.get("linked_tool_ids")
-            if arguments.get("linked_tool_ids") is not None
-            else skill_data.get("linked_tool_ids")
-        ) or []
+        linked_tool_ids = (
+            normalize_linked_tool_ids(
+                arguments.get("linked_tool_ids")
+                if arguments.get("linked_tool_ids") is not None
+                else skill_data.get("linked_tool_ids")
+            )
+            or []
+        )
         templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
         steps = skill_data.get("steps") if isinstance(skill_data.get("steps"), list) else None

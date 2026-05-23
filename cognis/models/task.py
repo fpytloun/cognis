@@ -75,6 +75,10 @@ class TaskModel(BaseModel):
     workspace_root: str | None = None
     working_directory: str | None = None
     workflow_state: WorkflowState | None = None
+    active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
+    active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
     queue_name: str = "default"
     scheduled_for: datetime | None = None
     created_at: datetime | None = None

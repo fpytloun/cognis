@@ -34,6 +34,7 @@ class RuntimeAccessContext:
             and not self.workflow_step
         )
 
+
 current_user_email: ContextVar[str | None] = ContextVar("current_user_email", default=None)
 current_agent_id: ContextVar[str | None] = ContextVar("current_agent_id", default=None)
 current_agent_owner_email: ContextVar[str | None] = ContextVar(
@@ -42,6 +43,9 @@ current_agent_owner_email: ContextVar[str | None] = ContextVar(
 current_workspace_root: ContextVar[str | None] = ContextVar("current_workspace_root", default=None)
 current_effective_working_directory: ContextVar[str | None] = ContextVar(
     "current_effective_working_directory", default=None
+)
+current_executor_environment: ContextVar[object | None] = ContextVar(
+    "current_executor_environment", default=None
 )
 current_runtime_access_context: ContextVar[RuntimeAccessContext | None] = ContextVar(
     "current_runtime_access_context", default=None
@@ -56,6 +60,7 @@ def scoped_runtime_context(
     agent_owner_email: str | None = None,
     workspace_root: str | None = None,
     effective_working_directory: str | None = None,
+    executor_environment: object | None = None,
     access_context: RuntimeAccessContext | None = None,
 ) -> Iterator[None]:
     """Temporarily override request-scoped runtime context variables."""
@@ -73,6 +78,11 @@ def scoped_runtime_context(
         if effective_working_directory is not None
         else None
     )
+    executor_env_token = (
+        current_executor_environment.set(executor_environment)
+        if executor_environment is not None
+        else None
+    )
     access_token = (
         current_runtime_access_context.set(access_context) if access_context is not None else None
     )
@@ -81,6 +91,8 @@ def scoped_runtime_context(
     finally:
         if access_token is not None:
             current_runtime_access_context.reset(access_token)
+        if executor_env_token is not None:
+            current_executor_environment.reset(executor_env_token)
         if cwd_token is not None:
             current_effective_working_directory.reset(cwd_token)
         if workspace_token is not None:

@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,12 +21,14 @@ from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.chat_modes import is_plan_hidden_tool
 from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
 )
+from cognis.core.session import executor_home_from_workspace_root
 from cognis.core.tool_arguments import validate_tool_arguments
-from cognis.core.truncation import middle_truncate
+from cognis.core.tool_output_presentation import present_tool_output
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -77,6 +80,8 @@ IMAGE_GENERATION_TOTAL = Counter(
 )
 
 logger = get_logger(__name__)
+
+ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 _MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_BROWSER_UPLOAD_FILES = 10
 
@@ -228,10 +233,21 @@ class ToolRouter:
         registered_tool = registry.get(tool_call.name)
         if registered_tool is None:
             return PermissionDecision(decision="deny", reasoning="Unknown tool", source="registry")
+        evaluation_context = self._evaluation_context(tool_call)
+        if evaluation_context.get("read_only_required") is True and is_plan_hidden_tool(
+            registered_tool.definition
+        ):
+            return PermissionDecision(
+                decision="deny",
+                reasoning=(
+                    "Plan mode is active for this turn. Write tools are disabled "
+                    "because the agent must not make changes while planning."
+                ),
+                source="chat_mode",
+            )
         if self._is_non_bypassable(
             registered_tool.definition.name, registered_tool.definition.non_bypassable
         ):
-            evaluation_context = self._evaluation_context(tool_call)
             evaluation = await self.guardrails.evaluate(
                 session_id=_guardrails_session_id(session),
                 tool_name=tool_call.name,
@@ -261,7 +277,6 @@ class ToolRouter:
         if permission is Permission.ALLOW:
             return PermissionDecision(decision="approve", source="agent")
 
-        evaluation_context = self._evaluation_context(tool_call)
         cached = self._get_cached_decision(
             session.session_id,
             tool_call.name,
@@ -304,10 +319,22 @@ class ToolRouter:
 
         runtime = tool_call.runtime_metadata or {}
         context: dict[str, Any] = {}
-        for key in ("workspace_root", "working_directory", "executor_environment"):
+        for key in (
+            "workspace_root",
+            "working_directory",
+            "executor_environment",
+            "chat_mode",
+            "chat_mode_source",
+            "read_only_required",
+        ):
             value = runtime.get(key)
             if value is not None:
                 context[key] = value
+        executor_env = context.get("executor_environment")
+        if isinstance(executor_env, dict) and not executor_env.get("home"):
+            inferred_home = executor_home_from_workspace_root(context.get("workspace_root"))
+            if inferred_home:
+                context["executor_environment"] = {**executor_env, "home": inferred_home}
         return context
 
     def _get_cached_decision(
@@ -400,6 +427,9 @@ class ToolRouter:
             payload = json.dumps(
                 {
                     "executor_environment": (context or {}).get("executor_environment"),
+                    "chat_mode": (context or {}).get("chat_mode"),
+                    "chat_mode_source": (context or {}).get("chat_mode_source"),
+                    "read_only_required": (context or {}).get("read_only_required"),
                     "working_directory": (context or {}).get("working_directory"),
                     "workspace_root": (context or {}).get("workspace_root"),
                 },
@@ -420,6 +450,7 @@ class ToolRouter:
         agent: AgentDefinition,
         registry: ToolRegistry,
         executor: Any,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
     ) -> ToolResult:
         """Execute a tool call using the appropriate route."""
 
@@ -446,6 +477,10 @@ class ToolRouter:
             },
         )
         TOOL_ROUTE_DECISIONS.labels(route=str(route)).inc()
+        plan_denial = self._plan_mode_denial_result(tool_call, registry)
+        if plan_denial is not None:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+            return plan_denial
         if route is ToolRoute.UNKNOWN:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="unknown").inc()
             return self._sanitize_result(
@@ -455,6 +490,25 @@ class ToolRouter:
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
+        if route is ToolRoute.LOCAL and registered_tool is not None:
+            validation_error = validate_tool_arguments(
+                tool_call.name,
+                tool_call.arguments,
+                schema=registered_tool.definition.parameters,
+            )
+            if validation_error is not None:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    ),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
         if route is ToolRoute.ORCHESTRATION:
             result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
@@ -476,7 +530,7 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     memory_provider=self.memory,
                     agent_id=agent.agent_id if agent else None,
-                    user_email=current_user_email.get(),
+                    user_email=current_user_email.get() or session.user_email,
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -645,6 +699,7 @@ class ToolRouter:
                         image_generation_provider=self.image_generation_provider,
                         llm=self.llm,
                         task_queue=getattr(self, "_task_queue", None),
+                        guardrails=self.guardrails,
                     ),
                     user_email=current_user_email.get() or session.user_email,
                     current_agent_id=current_agent_id.get() or agent.agent_id,
@@ -705,7 +760,7 @@ class ToolRouter:
             if self._session_factory is None:
                 result = ToolResult(output="Skill management not available.", is_error=True)
             else:
-                from cognis.runtime_context import current_user_email
+                from cognis.runtime_context import current_agent_id, current_user_email
 
                 result = await handle_skill_management_tool(
                     tool_name=tool_call.name,
@@ -714,6 +769,7 @@ class ToolRouter:
                     user_email=current_user_email.get(),
                     llm=self.llm,
                     artifact_store=self.artifact_store,
+                    current_agent_id=current_agent_id.get() or agent.agent_id,
                 )
             # Signal same-turn refresh for mutation tools so the agent loop
             # can re-resolve skills before the next model call.
@@ -881,6 +937,7 @@ class ToolRouter:
                     scoped_tool_call,
                     registered_tool=registered_tool,
                     executor=executor,
+                    output_chunk_callback=output_chunk_callback,
                 )
                 result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             except CredentialAccessError as exc:
@@ -906,7 +963,9 @@ class ToolRouter:
         try:
             result = await asyncio.wait_for(
                 executor.tool_execute(
-                    scoped_tool_call, timeout_seconds=registered_tool.definition.timeout_seconds
+                    scoped_tool_call,
+                    timeout_seconds=registered_tool.definition.timeout_seconds,
+                    output_chunk_callback=output_chunk_callback,
                 ),
                 timeout=registered_tool.definition.timeout_seconds,
             )
@@ -1007,6 +1066,7 @@ class ToolRouter:
                 if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
                 else None
             ),
+            owner_email=session.user_email,
         )
         next_metadata = {k: v for k, v in metadata.items() if k != "attachment_analysis_request"}
         if analysis.metadata:
@@ -1019,6 +1079,7 @@ class ToolRouter:
         *,
         registered_tool: Any,
         executor: Any,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
     ) -> ToolResult:
         handler = registered_tool.handler
         if handler is None:
@@ -1048,6 +1109,7 @@ class ToolRouter:
                 executor_metadata if isinstance(executor_metadata, dict) else None
             ),
             execution_scope_id=tool_call.execution_scope_id,
+            output_chunk_callback=output_chunk_callback,
         )
         normalized_arguments = strip_empty_optional_values(
             tool_call.arguments,
@@ -1613,11 +1675,20 @@ class ToolRouter:
             raise ValueError("Artifact support not available")
         async with self._session_factory() as db_session:
             row = await get_artifact_record(db_session, artifact_id)
-        if row is None or row.status == "deleted":
+        if row is None or row.status == "deleted" or self._artifact_row_expired(row):
             raise ValueError(f"Artifact not found: {artifact_id}")
         if row.owner_email and row.owner_email != user_email:
             raise ValueError(f"Artifact access denied: {artifact_id}")
         return row
+
+    @staticmethod
+    def _artifact_row_expired(row: Any) -> bool:
+        expires_at = getattr(row, "expires_at", None)
+        if expires_at is None:
+            return False
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return expires_at <= datetime.now(UTC)
 
     async def _materialize_inline_attachments(
         self,
@@ -1698,7 +1769,8 @@ class ToolRouter:
     def _enrich_attachment_output(self, output: str, attachments: list[dict[str, Any]]) -> str:
         if not attachments:
             return output
-        primary = next((item for item in attachments if isinstance(item, dict)), None)
+        materialized = [item for item in attachments if isinstance(item, dict)]
+        primary = next(iter(materialized), None)
         if primary is None:
             return output
         enriched = {
@@ -1722,14 +1794,85 @@ class ToolRouter:
         except Exception:
             pass
         summary = json.dumps({k: v for k, v in enriched.items() if v is not None}, sort_keys=True)
+        guidance = self._attachment_guidance_block(materialized)
         if not output.strip():
-            return summary
-        return f"{output}\n\nAttachment metadata: {summary}"
+            return guidance or summary
+        sections = [output, f"Attachment metadata: {summary}"]
+        if guidance:
+            sections.append(guidance)
+        return "\n\n".join(sections)
+
+    def _attachment_guidance_block(self, attachments: list[dict[str, Any]]) -> str:
+        lines: list[str] = ["[[attachments]]"]
+        count = 0
+        for item in attachments:
+            artifact_id = item.get("artifact_id")
+            if not artifact_id:
+                continue
+            count += 1
+            if count > 1:
+                lines.append("")
+            lines.append(f"Artifact ID: {artifact_id}")
+            filename = item.get("filename")
+            if filename:
+                lines.append(f"Filename: {filename}")
+            mime_type = item.get("mime_type")
+            if mime_type:
+                lines.append(f"MIME type: {mime_type}")
+            kind = item.get("kind")
+            if kind:
+                lines.append(f"Kind: {kind}")
+            size_bytes = item.get("size_bytes")
+            if size_bytes is not None:
+                lines.append(f"Size bytes: {size_bytes}")
+            url = item.get("url")
+            if url:
+                lines.append(f"URL: {url}")
+        if count == 0:
+            return ""
+        first_id = next(
+            str(item["artifact_id"])
+            for item in attachments
+            if isinstance(item.get("artifact_id"), str) and item.get("artifact_id")
+        )
+        lines.extend(
+            [
+                "",
+                f'Use artifact_read with artifact_id="{first_id}" to inspect or analyze the attachment.',
+                f'Use artifact_get_url with artifact_id="{first_id}" to view or download it.',
+            ]
+        )
+        return "\n".join(lines)
 
     def _is_non_bypassable(self, tool_name: str, explicit_flag: bool) -> bool:
         if explicit_flag:
             return True
         return any(fnmatchcase(tool_name, pattern) for pattern in self.non_bypassable_patterns)
+
+    def _plan_mode_denial_result(
+        self, tool_call: ToolCall, registry: ToolRegistry
+    ) -> ToolResult | None:
+        registered_tool = registry.get(tool_call.name)
+        if registered_tool is None:
+            return None
+        if tool_call.runtime_metadata.get("read_only_required") is not True:
+            return None
+        if not is_plan_hidden_tool(registered_tool.definition):
+            return None
+        return self._sanitize_result(
+            tool_call.name,
+            ToolResult(
+                output=(
+                    "Plan mode is active for this turn. Write tools are disabled "
+                    "because the agent must not make changes while planning."
+                ),
+                is_error=True,
+                metadata={"code": "plan_mode_mutation_denied"},
+            ),
+            _tool_max_size(registry, tool_call.name),
+            call_id=tool_call.call_id,
+            runtime_metadata=tool_call.runtime_metadata,
+        )
 
     async def _call_intaris_mcp(
         self,
@@ -1747,6 +1890,7 @@ class ToolRouter:
             server_name=source.server_name,
             tool_name=raw_tool_name,
             arguments=tool_call.arguments,
+            context=self._evaluation_context(tool_call),
         )
         if isinstance(result, ToolResult):
             return result
@@ -1776,19 +1920,21 @@ class ToolRouter:
 
             max_tokens = max(256, max_size // 4)
         anchor_names = _extract_output_anchor_names(result.metadata, raw_output)
-        output, was_truncated = middle_truncate(
+        presentation = present_tool_output(
             raw_output,
             max_size,
-            call_id=call_id,
+            recovery_call_id=call_id,
+            has_full_output=True,
             token_counter=token_counter,
             max_tokens=max_tokens,
             anchors=anchor_names,
         )
-        wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{output}\n</tool_result>'
+        wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{presentation.result}\n</tool_result>'
         metadata = dict(result.metadata or {})
         metadata["wrapped"] = True
-        metadata["truncated"] = was_truncated
+        metadata["truncated"] = presentation.truncated
         metadata["original_size"] = len(raw_output)
+        metadata.update(presentation.event_fields())
         if max_tokens is not None:
             metadata["token_budget"] = max_tokens
         # Preserve raw output for the ToolOutputStore (before wrapping/truncation).

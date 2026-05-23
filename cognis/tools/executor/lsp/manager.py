@@ -75,6 +75,11 @@ _IDLE_CHECK_INTERVAL = 60.0
 # Retry-after for broken servers (5 minutes)
 _BROKEN_RETRY_SECONDS = 300.0
 
+# Heavy workspace analyzers are useful for project files but pathological for
+# temporary scratch copies because every unique temp directory becomes a new root.
+_SCRATCH_ROOTS = ("/tmp", "/var/tmp")
+_SCRATCH_DISABLED_SERVERS = frozenset({"pyright"})
+
 
 class LSPManager:
     """Manages LSP client lifecycle, file routing, and diagnostics aggregation."""
@@ -159,6 +164,19 @@ class LSPManager:
         for server_def in servers:
             root_path = _find_project_root(abs_path, server_def.root_markers)
             client_key = f"{server_def.server_id}:{root_path}"
+            if _should_skip_server_for_path(server_def.server_id, abs_path, root_path):
+                logger.info(
+                    "lsp: skipping server for scratch path "
+                    f"server_id={server_def.server_id} root_path={root_path} file_path={abs_path}",
+                    extra={
+                        "extra_data": {
+                            "server_id": server_def.server_id,
+                            "root_path": root_path,
+                            "file_path": abs_path,
+                        }
+                    },
+                )
+                continue
 
             # Check if broken (with retry-after)
             broken_until = self._broken.get(client_key)
@@ -272,6 +290,26 @@ class LSPManager:
             LSP_ERRORS_TOTAL.labels(error_type="diagnostics_wait").inc()
         finally:
             LSP_DIAGNOSTICS_WAIT.labels(server_id=client.server_id).observe(perf_counter() - start)
+
+    def has_pending_diagnostics(self, file_paths: list[str]) -> bool:
+        """Return whether any active client is already analyzing these files."""
+        if not file_paths:
+            return False
+
+        uris = {file_uri(os.path.abspath(path)) for path in file_paths}
+        return any(
+            client.has_pending_diagnostics(uri) for client in self._clients.values() for uri in uris
+        )
+
+    def has_cached_diagnostics(self, file_paths: list[str]) -> bool:
+        """Return whether any active client has diagnostics state for these files."""
+        if not file_paths:
+            return False
+
+        uris = {file_uri(os.path.abspath(path)) for path in file_paths}
+        return any(
+            client.has_cached_diagnostics(uri) for client in self._clients.values() for uri in uris
+        )
 
     def get_diagnostics(self, file_path: str | None = None) -> dict[str, list[Diagnostic]]:
         """Return aggregated diagnostics from all active clients.
@@ -551,6 +589,8 @@ class LSPManager:
         for server_def in servers:
             root_path = _find_project_root(abs_path, server_def.root_markers)
             client_key = f"{server_def.server_id}:{root_path}"
+            if _should_skip_server_for_path(server_def.server_id, abs_path, root_path):
+                continue
             client = self._clients.get(client_key)
             if client is None or not client.is_alive:
                 if not wait:
@@ -601,11 +641,13 @@ class LSPManager:
         """Spawn and initialize a new LSP client."""
         start = perf_counter()
         logger.info(
-            "lsp: spawning client",
+            "lsp: spawning client "
+            f"server_id={server_def.server_id} root_path={root_path} client_key={client_key}",
             extra={
                 "extra_data": {
                     "server_id": server_def.server_id,
                     "root_path": root_path,
+                    "client_key": client_key,
                 }
             },
         )
@@ -659,7 +701,8 @@ class LSPManager:
                 command=command,
                 args=args,
                 root_uri=root_uri,
-                init_options=server_def.init_options,
+                init_options=server_def.initialization_options_for(root_path),
+                workspace_configuration=server_def.workspace_configuration_for(root_path),
             )
             await client.start()
 
@@ -674,11 +717,14 @@ class LSPManager:
             )
 
             logger.info(
-                "lsp: client spawned successfully",
+                "lsp: client spawned successfully "
+                f"server_id={server_def.server_id} root_path={root_path} "
+                f"client_key={client_key} duration_ms={int(duration_s * 1000)}",
                 extra={
                     "extra_data": {
                         "server_id": server_def.server_id,
                         "root_path": root_path,
+                        "client_key": client_key,
                         "duration_ms": int(duration_s * 1000),
                     }
                 },
@@ -738,7 +784,9 @@ class LSPManager:
 
                 for key in to_remove:
                     logger.info(
-                        "lsp: shutting down idle server",
+                        "lsp: shutting down idle server "
+                        f"client_key={key} "
+                        f"idle_seconds={int(monotonic() - self._last_access.get(key, 0))}",
                         extra={
                             "extra_data": {
                                 "client_key": key,
@@ -769,3 +817,27 @@ def _find_project_root(file_path: str, root_markers: tuple[str, ...]) -> str:
 
     # Fallback: file's parent directory
     return str(Path(file_path).parent)
+
+
+def _should_skip_server_for_path(server_id: str, file_path: str, root_path: str) -> bool:
+    """Return whether a heavyweight server should be skipped for scratch files."""
+    if server_id not in _SCRATCH_DISABLED_SERVERS:
+        return False
+    file_resolved = Path(file_path).resolve(strict=False)
+    root_resolved = Path(root_path).resolve(strict=False)
+    for scratch in _SCRATCH_ROOTS:
+        scratch_path = Path(scratch)
+        if _is_relative_to(file_resolved, scratch_path) or _is_relative_to(
+            root_resolved, scratch_path
+        ):
+            return True
+    return False
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    """Return whether path is under parent."""
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True

@@ -31,6 +31,9 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
                 "enum": [
                     "list",
                     "get",
+                    "settings_get",
+                    "settings_schema",
+                    "settings_update",
                     "create",
                     "update",
                     "archive",
@@ -57,6 +60,13 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
             "permissions": {"type": "object"},
             "llm_config": {"type": "object"},
             "execution": {"type": "object"},
+            "settings": {
+                "type": "object",
+                "description": (
+                    "UI-editable agent settings for settings_update. Use settings_schema first "
+                    "to discover valid fields and options."
+                ),
+            },
             "avatar_image_id": {"type": "string"},
             "agent_type": {"type": "string", "enum": ["primary", "secondary"]},
             "status": {"type": "string"},
@@ -141,5 +151,7 @@ async def handle_agent_management_tool(
             arguments=arguments,
         )
     except AgentManagementError as exc:
-        return ToolResult(output=str(exc), is_error=True, metadata={"code": "agent_management_error"})
+        return ToolResult(
+            output=str(exc), is_error=True, metadata={"code": "agent_management_error"}
+        )
     return ToolResult(output=result_to_json(result))

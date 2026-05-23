@@ -6,6 +6,7 @@ Routed via ToolRoute.IMAGE in the tool router.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
 from typing import Any
@@ -209,10 +210,8 @@ async def handle_image_tool(
                             )
                             await session.commit()
                     except Exception as exc:
-                        try:
+                        with contextlib.suppress(Exception):
                             await artifact_store.async_delete("images", image_id, "image")
-                        except Exception:
-                            pass
                         return ToolResult(
                             output=f"Image artifact registration failed: {exc}",
                             is_error=True,

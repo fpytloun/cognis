@@ -65,6 +65,7 @@ class LSPClient:
         *,
         env: dict[str, str] | None = None,
         init_options: dict[str, Any] | None = None,
+        workspace_configuration: dict[str, Any] | None = None,
     ) -> None:
         self.server_id = server_id
         self.command = command
@@ -72,6 +73,7 @@ class LSPClient:
         self.root_uri = root_uri
         self.env: dict[str, str] = {**os.environ, **(env or {})}
         self.init_options = init_options
+        self.workspace_configuration = workspace_configuration
 
         self.process: asyncio.subprocess.Process | None = None
         self.server_name: str | None = None
@@ -83,6 +85,7 @@ class LSPClient:
         # Diagnostics state
         self._diagnostics: dict[str, list[Diagnostic]] = {}
         self._diag_events: dict[str, asyncio.Event] = {}
+        self._pending_diagnostics: set[str] = set()
 
         # Background tasks
         self._reader_task: asyncio.Task[None] | None = None
@@ -291,6 +294,14 @@ class LSPClient:
             return {uri: diags} if diags else {}
         return dict(self._diagnostics)
 
+    def has_pending_diagnostics(self, uri: str) -> bool:
+        """Return whether a diagnostics wait is already active for a URI."""
+        return uri in self._pending_diagnostics
+
+    def has_cached_diagnostics(self, uri: str) -> bool:
+        """Return whether this client has seen diagnostics for a URI."""
+        return uri in self._diagnostics
+
     async def wait_for_diagnostics(
         self,
         uri: str,
@@ -315,50 +326,54 @@ class LSPClient:
             self._diag_events[uri] = asyncio.Event()
         event = self._diag_events[uri]
         event.clear()
+        self._pending_diagnostics.add(uri)
 
-        while True:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                logger.debug(
-                    "lsp: diagnostics timeout",
-                    extra={
-                        "extra_data": {
-                            "server_id": self.server_id,
-                            "uri": uri,
-                            "timeout_ms": timeout_ms,
-                            "diagnostics_count": len(self._diagnostics.get(uri, [])),
-                        }
-                    },
-                )
-                break
-
-            # Wait for a diagnostic event
-            try:
-                await asyncio.wait_for(event.wait(), timeout=remaining)
-            except TimeoutError:
-                break
-
-            event.clear()
-
-            # Debounce: wait for silence
-            debounce_end = monotonic() + debounce_ms / 1000.0
-            settled = True
-            while monotonic() < min(debounce_end, deadline):
-                wait_time = min(debounce_end - monotonic(), deadline - monotonic())
-                if wait_time <= 0:
+        try:
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    logger.debug(
+                        "lsp: diagnostics timeout",
+                        extra={
+                            "extra_data": {
+                                "server_id": self.server_id,
+                                "uri": uri,
+                                "timeout_ms": timeout_ms,
+                                "diagnostics_count": len(self._diagnostics.get(uri, [])),
+                            }
+                        },
+                    )
                     break
+
+                # Wait for a diagnostic event
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=wait_time)
-                    # Got another diagnostic — reset debounce
-                    event.clear()
-                    debounce_end = monotonic() + debounce_ms / 1000.0
-                    settled = False
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
                 except TimeoutError:
-                    settled = True
                     break
 
-            if settled:
-                break
+                event.clear()
+
+                # Debounce: wait for silence
+                debounce_end = monotonic() + debounce_ms / 1000.0
+                settled = True
+                while monotonic() < min(debounce_end, deadline):
+                    wait_time = min(debounce_end - monotonic(), deadline - monotonic())
+                    if wait_time <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=wait_time)
+                        # Got another diagnostic — reset debounce
+                        event.clear()
+                        debounce_end = monotonic() + debounce_ms / 1000.0
+                        settled = False
+                    except TimeoutError:
+                        settled = True
+                        break
+
+                if settled:
+                    break
+        finally:
+            self._pending_diagnostics.discard(uri)
 
         duration_ms = int((monotonic() - start) * 1000)
         diags = self._diagnostics.get(uri, [])
@@ -578,10 +593,26 @@ class LSPClient:
         elif method == "window/logMessage":
             self._handle_log_message(params)
         elif method == "workspace/configuration":
-            # Some servers request configuration — respond with empty
+            # Some servers request configuration during initialization.
             if "id" in message:
                 items = params.get("items", [])
-                asyncio.create_task(self._respond(message["id"], [{}] * len(items)))
+                response = self._configuration_response(items)
+                requested_sections = self._configuration_sections(items)
+                configured_sections = list((self.workspace_configuration or {}).keys())
+                logger.info(
+                    "lsp: workspace configuration requested "
+                    f"server_id={self.server_id} requested_sections={requested_sections} "
+                    f"configured_sections={configured_sections} response_count={len(response)}",
+                    extra={
+                        "extra_data": {
+                            "server_id": self.server_id,
+                            "requested_sections": requested_sections,
+                            "configured_sections": configured_sections,
+                            "response_count": len(response),
+                        }
+                    },
+                )
+                asyncio.create_task(self._respond(message["id"], response))
         elif method == "client/registerCapability" and "id" in message:
             # Accept dynamic registration requests
             asyncio.create_task(self._respond(message["id"], None))
@@ -589,6 +620,32 @@ class LSPClient:
     async def _respond(self, request_id: Any, result: Any) -> None:
         """Send a JSON-RPC response to a server-initiated request."""
         await self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    def _configuration_response(self, items: Any) -> list[dict[str, Any]]:
+        """Return workspace/configuration results for server-requested sections."""
+        if not isinstance(items, list):
+            return []
+
+        config = self.workspace_configuration or {}
+        response: list[dict[str, Any]] = []
+        for item in items:
+            section = item.get("section") if isinstance(item, dict) else None
+            if isinstance(section, str) and section in config:
+                section_config = config[section]
+                response.append(section_config if isinstance(section_config, dict) else {})
+            else:
+                response.append({})
+        return response
+
+    def _configuration_sections(self, items: Any) -> list[str | None]:
+        """Return requested workspace configuration section names for logging."""
+        if not isinstance(items, list):
+            return []
+        sections: list[str | None] = []
+        for item in items:
+            section = item.get("section") if isinstance(item, dict) else None
+            sections.append(section if isinstance(section, str) else None)
+        return sections
 
     def _handle_publish_diagnostics(self, params: dict[str, Any]) -> None:
         """Process a ``textDocument/publishDiagnostics`` notification."""

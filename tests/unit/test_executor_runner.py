@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,51 @@ class DummyMessageWebSocket(DummyWebSocket):
         if not self._messages:
             raise StopAsyncIteration
         return self._messages.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_runner_retries_immediately_after_clean_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def _connect_and_serve() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            runner._running = False
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+
+    await runner.run()
+
+    assert attempts == 2
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_runner_logs_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    async def _connect_and_serve() -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runner, "_connect_and_serve", _connect_and_serve)
+    caplog.set_level(logging.INFO, logger="cognis.executor.runner")
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run()
+
+    assert "Executor runner cancelled, shutting down" in caplog.text
 
 
 def test_normalize_result_from_string() -> None:
@@ -187,6 +233,40 @@ async def test_handle_llm_complete_streams_chunks() -> None:
     assert ws.sent[0]["result"]["status"] == "streaming"
     assert ws.sent[1]["method"] == "llm.chunk"
     assert ws.sent[2]["method"] == "llm.done"
+
+
+@pytest.mark.asyncio
+async def test_handle_llm_complete_serializes_model_tool_calls() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
+
+    class ToolCall:
+        def model_dump(self, **_: object) -> dict[str, object]:
+            return {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+            }
+
+    runner._inference_handler = AsyncMock()
+
+    async def _stream_complete(**_: object):
+        yield {"tool_calls": [ToolCall()], "index": 0}
+        yield {"done": True, "usage": {"prompt_tokens": 1}, "finish_reason": "tool_calls"}
+
+    runner._inference_handler.stream_complete = _stream_complete
+    ws.sent.clear()
+
+    await runner._handle_llm_complete(
+        ws,
+        "rpc-1",
+        {"request_id": "req-1", "model": "anthropic/claude-opus-4-7", "messages": []},
+    )
+
+    assert ws.sent[1]["params"]["tool_calls"][0]["function"]["name"] == "bash"
+    assert ws.sent[2]["params"]["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.asyncio
@@ -773,89 +853,81 @@ async def test_close_clients_reraises_cancelled_when_not_suppressed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_background_close_does_not_block_caller() -> None:
-    """_spawn_background_close returns immediately; the close runs in a task."""
-    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
-    close_started = asyncio.Event()
-    close_done = asyncio.Event()
-
-    class _SlowClient:
-        async def close(self, *, suppress_cancelled: bool = False) -> None:
-            close_started.set()
-            await asyncio.sleep(0.05)
-            close_done.set()
-
-    runner._spawn_background_close({"slow": _SlowClient()})  # type: ignore[arg-type]
-
-    # The method returns before the close finishes.
-    assert not close_done.is_set()
-    # Allow the background task to run to completion.
-    await asyncio.wait_for(close_done.wait(), timeout=2)
-    assert close_done.is_set()
-
-
-@pytest.mark.asyncio
-async def test_run_finally_drains_pending_closes() -> None:
-    """run() cancels + awaits _pending_closes before exiting.
-
-    Stale subprocess transports must be cleaned up before the event loop
-    closes so that BaseSubprocessTransport.__del__ doesn't fire with
-    'Event loop is closed' at interpreter shutdown.
-    """
-    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
-    task_was_cancelled: list[bool] = []
-
-    async def _long_close() -> None:
-        try:
-            await asyncio.sleep(10)
-        except asyncio.CancelledError:
-            task_was_cancelled.append(True)
-
-    async def _fake_connect_and_serve() -> None:
-        # Yield once so _long_close gets a chance to start and reach its
-        # first await (asyncio.sleep) before we set _running=False.
-        await asyncio.sleep(0)
-        runner._running = False
-
-    task: asyncio.Task[None] = asyncio.create_task(_long_close(), name="test-close")
-    runner._pending_closes.add(task)
-    runner._connect_and_serve = _fake_connect_and_serve  # type: ignore[method-assign]
-
-    await runner.run()
-
-    assert task.done(), "background close task must be done after run() returns"
-    assert task_was_cancelled == [True], "CancelledError must have been raised inside the task"
-    assert len(runner._pending_closes) == 0
-
-
-@pytest.mark.asyncio
-async def test_reconfigure_uses_background_close_for_stale_clients(
+async def test_mcp_prepare_runs_in_configure_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconfiguring must not call _close_clients inline for stale MCP clients.
+    """MCP transports must be entered in the same task that later closes them.
 
-    Previously, _handle_configure awaited _close_clients(previous_clients) on
-    the configure task.  If anyio cross-task scope teardown raised
-    BaseExceptionGroup this escaped run()'s except Exception: guard and caused
-    the executor to exit.  The fix spawns teardown on a background task.
+    asyncio.wait_for(coro) wraps ``coro`` in a child task.  The MCP SDK's anyio
+    transports bind cancel scopes to the entering task, so configure uses
+    asyncio.timeout() instead to keep transport enter/exit in the message-loop
+    task.
     """
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
+    configure_task = asyncio.current_task()
+    seen_tasks: list[asyncio.Task[object] | None] = []
+
+    class _RecordingClient:
+        async def connect(self) -> None:
+            seen_tasks.append(asyncio.current_task())
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            seen_tasks.append(asyncio.current_task())
+            return []
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            del tool_name, arguments
+            return {}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+            seen_tasks.append(asyncio.current_task())
+
+    monkeypatch.setattr("cognis.executor.runner.build_mcp_client", lambda *_: _RecordingClient())
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": ["read"],
+            "mcp_servers": [
+                {
+                    "name": "recording",
+                    "transport": "stdio",
+                    "command": "recording",
+                }
+            ],
+            "config": {},
+        },
+    )
+
+    await runner._close_mcp_clients()
+
+    assert seen_tasks
+    assert all(task is configure_task for task in seen_tasks)
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_closes_stale_clients_inline() -> None:
+    """Reconfigure closes stale MCP clients in the configure/message-loop task."""
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    configure_task = asyncio.current_task()
 
     # First configure – establishes v1 state.
     await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
     assert runner._config_version == 1
     ws.sent.clear()
 
-    # Inject a fake stale MCP client that raises BaseExceptionGroup on close.
-    bomb_close_called = asyncio.Event()
+    closed_in_task: list[asyncio.Task[object] | None] = []
 
-    class _BombClient:
+    class _StaleClient:
         async def close(self, *, suppress_cancelled: bool = False) -> None:
-            bomb_close_called.set()
-            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+            del suppress_cancelled
+            closed_in_task.append(asyncio.current_task())
 
-    runner._mcp_clients = {"bomb": _BombClient()}  # type: ignore[assignment]
+    runner._mcp_clients = {"stale": _StaleClient()}  # type: ignore[assignment]
 
     # Second configure (reconfigure) – must succeed and NOT shut the runner down.
     await runner._handle_configure(ws, "cfg-2", {"enabled_tools": ["glob"], "config": {}})
@@ -864,6 +936,4 @@ async def test_reconfigure_uses_background_close_for_stale_clients(
     assert runner._configured is True
     assert runner._running is True  # critical: runner must not exit
     assert ws.sent[-1]["result"]["applied_version"] == 2
-
-    # The background close task should eventually call close() on the bomb client.
-    await asyncio.wait_for(bomb_close_called.wait(), timeout=2)
+    assert closed_in_task == [configure_task]

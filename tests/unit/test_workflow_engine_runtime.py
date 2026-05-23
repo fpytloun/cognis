@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
-from cognis.core.workflow_engine import WorkflowEngine
+from cognis.core.workflow_engine import WorkflowEngine, _resolve_task_execution_paths
+from cognis.models.agent import AgentDefinition
+from cognis.models.session import ConversationContext
 from cognis.models.task import TaskModel
 from cognis.models.workflow import (
     GateConfig,
@@ -45,16 +48,154 @@ class _EventBus:
 
 
 def _build_engine() -> WorkflowEngine:
+    async def _refresh_intaris_session_policy(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
     return WorkflowEngine(
         session_factory=_SessionFactory(),
         providers=SimpleNamespace(llm=None),
         agent_loop=SimpleNamespace(),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(
+            refresh_intaris_session_policy=_refresh_intaris_session_policy
+        ),
         event_bus=_EventBus(),
         pause_waiter=PauseWaiter(),
     )
+
+
+@pytest.mark.asyncio
+async def test_create_step_session_passes_task_project_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    calls: list[dict[str, object]] = []
+
+    async def _get_task(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return SimpleNamespace(active_executor_id="executor-1")
+
+    async def _create_conversation_with_root_session(**kwargs: object) -> tuple[object, object]:
+        calls.append(dict(kwargs))
+        return SimpleNamespace(conversation_id="conv-1"), SimpleNamespace(session_id="sess-1")
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr(
+        engine._session_manager,
+        "create_conversation_with_root_session",
+        _create_conversation_with_root_session,
+        raising=False,
+    )
+
+    await engine._create_step_session(
+        TaskModel(
+            task_id="task-1",
+            title="Task",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            project_id="proj-1",
+        ),
+        StepDefinition(name="plan", type="run", prompt="Plan"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+    )
+
+    assert calls
+    assert calls[0]["project_id"] == "proj-1"
+    assert calls[0]["initial_active_executor_id"] == "executor-1"
+    context = cast(ConversationContext, calls[0]["context"])
+    assert context.platform_data == {
+        "workspace_root": None,
+        "working_directory": None,
+    }
+
+
+def test_resolve_task_execution_paths_defaults_unassigned_task_to_executor_home() -> None:
+    task = TaskModel(
+        task_id="task-1",
+        title="Research",
+        created_by="user@example.com",
+        agent_id="agent-1",
+    )
+
+    workspace_root, working_directory = _resolve_task_execution_paths(
+        task,
+        executor_home="/home/user",
+        executor_cwd="/home/user",
+    )
+
+    assert workspace_root == "/home/user"
+    assert working_directory == "/home/user"
+
+
+def test_resolve_task_execution_paths_preserves_project_paths() -> None:
+    task = TaskModel(
+        task_id="task-1",
+        title="Project work",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        project_id="proj-1",
+        workspace_root="/home/user/src/cognis",
+        working_directory="/home/user/src/cognis/ui/src/lib",
+    )
+
+    workspace_root, working_directory = _resolve_task_execution_paths(
+        task,
+        executor_home="/home/user",
+        executor_cwd="/home/user",
+    )
+
+    assert workspace_root == "/home/user/src/cognis"
+    assert working_directory == "/home/user/src/cognis/ui/src/lib"
+
+
+@pytest.mark.asyncio
+async def test_system_step_full_input_does_not_copy_primary_prefix() -> None:
+    engine = _build_engine()
+    target_session = SimpleNamespace(session_id="architect-session")
+    state = WorkflowState(
+        step_outputs={
+            "plan": {
+                "session_id": "plan-session",
+                "intaris_session_id": "plan-intaris",
+            }
+        }
+    )
+    system_step_agent = AgentDefinition(
+        agent_id="system:architect",
+        owner_email="system@cognis.local",
+        name="Architect",
+        agent_type="secondary",
+        is_system=True,
+    )
+    calls: list[dict[str, object]] = []
+
+    async def _fork_session_events(**kwargs: object) -> bool:
+        calls.append(dict(kwargs))
+        return True
+
+    engine._fork_session_events = _fork_session_events  # type: ignore[method-assign]
+
+    copied = await engine._fork_source_events(
+        source_name="plan",
+        target_session=target_session,
+        state=state,
+        copy_prefix=not (
+            system_step_agent.is_system or system_step_agent.agent_type == "secondary"
+        ),
+    )
+
+    assert copied is True
+    assert calls == [
+        {
+            "source_cognis_session_id": "plan-session",
+            "source_intaris_session_id": "plan-intaris",
+            "target_session": target_session,
+            "source_label": "plan",
+            "copy_prefix": False,
+        }
+    ]
 
 
 class _NotificationService:
@@ -1172,6 +1313,96 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
 
     assert ("sr_" in updated_statuses[0][0]) is True
     assert updated_statuses[-1][1] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_state=WorkflowState(),
+    )
+    step_def = StepDefinition(name="execute", type="run", prompt="Do work")
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
+    conversation = SimpleNamespace(conversation_id="conv-1")
+    session = SimpleNamespace(
+        session_id="sess-1",
+        intaris_session_id="sess-1",
+        user_email="user@example.com",
+        parent_session_id=None,
+        delegation_mode="primary",
+    )
+    refreshed: list[tuple[str | None, str | None]] = []
+
+    async def _resolve_step_agents(
+        *args: object, **kwargs: object
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        del args, kwargs
+        agent = SimpleNamespace(
+            agent_id="agent-1",
+            agent_type="primary",
+            owner_email="user@example.com",
+            is_system=False,
+        )
+        return agent, agent
+
+    async def _create_step_session(*args: object, **kwargs: object):
+        del args, kwargs
+        return conversation, session
+
+    async def _resolve_runtime(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            tool_registry=None,
+            executor_connection=None,
+            executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user/src/cognis"),
+            runtime_info=None,
+            cleanup=lambda: asyncio.sleep(0),
+        )
+
+    async def _latest_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return None
+
+    async def _create_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return SimpleNamespace()
+
+    async def _update_step_run(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def _run_step(*args: object, **kwargs: object) -> StepOutput:
+        del args, kwargs
+        return StepOutput(summary="done", content="done")
+
+    async def _refresh(_session: object) -> None:
+        del _session
+        refreshed.append((task.workspace_root, task.working_directory))
+
+    monkeypatch.setattr(engine, "_resolve_step_agents", _resolve_step_agents)
+    monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
+    monkeypatch.setattr(engine, "_resolve_step_runtime", _resolve_runtime)
+    monkeypatch.setattr(engine._agent_loop, "run_step", _run_step, raising=False)
+    monkeypatch.setattr(engine._session_manager, "refresh_intaris_session_policy", _refresh)
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr("cognis.core.workflow_engine.create_step_run", _create_step_run)
+    monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)
+
+    output, _step_run_id = await engine._execute_run_step(
+        task, step_def, task.workflow_state or WorkflowState(), workflow
+    )
+
+    assert output is not None
+    assert refreshed == [("/home/user/src/cognis", "/home/user/src/cognis")]
 
 
 @pytest.mark.asyncio

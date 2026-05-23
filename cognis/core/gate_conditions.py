@@ -46,6 +46,51 @@ def evaluate_gate_conditions(
     return any(bool(_eval_expression(expr, context)) for expr in expressions)
 
 
+def evaluate_gate_conditions_detailed(
+    expressions: list[str],
+    *,
+    step_outputs: dict[str, dict[str, Any]],
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate gate conditions and return UI-safe observability metadata."""
+
+    context = _build_context(step_outputs=step_outputs, thresholds=thresholds or {})
+    details: list[dict[str, Any]] = []
+    errors: list[str] = []
+    passed = not expressions
+    for expression in expressions:
+        detail: dict[str, Any] = {
+            "expression": expression,
+            "operator": None,
+            "referenced_values": {},
+            "expected_values": {},
+            "actual_result": None,
+            "passed": False,
+            "error": None,
+        }
+        try:
+            tree = _parse(expression)
+            refs = _expression_reference_values(tree, context)
+            detail["referenced_values"] = refs["referenced_values"]
+            detail["expected_values"] = refs["expected_values"]
+            detail["operator"] = _first_compare_operator(tree)
+            result = bool(_eval_node(tree.body, context))
+            detail["actual_result"] = result
+            detail["passed"] = result
+            passed = passed or result
+        except ValueError as exc:
+            message = str(exc)
+            detail["error"] = message
+            errors.append(message)
+        details.append(detail)
+    return {
+        "condition_mode": "any",
+        "conditions": details,
+        "passed": passed,
+        "errors": errors,
+    }
+
+
 def validate_gate_conditions(workflow: Workflow) -> None:
     """Validate conditional gate syntax and references within a workflow."""
 
@@ -153,6 +198,60 @@ def _compare(left: Any, op: ast.cmpop, right: Any) -> bool:
     except TypeError as exc:
         raise ValueError("Gate condition compared incompatible values") from exc
     raise ValueError(f"Unsupported gate comparison: {type(op).__name__}")
+
+
+def _expression_reference_values(tree: ast.AST, context: dict[str, Any]) -> dict[str, Any]:
+    referenced: dict[str, Any] = {}
+    expected: dict[str, Any] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        parts = _attribute_parts(node)
+        if not parts or parts[0] not in {"metadata", "outputs", "thresholds"}:
+            continue
+        if parts[0] in {"metadata", "outputs"} and len(parts) < 3:
+            continue
+        key = ".".join(parts)
+        value = _resolve_parts(parts, context)
+        target = expected if parts[0] == "thresholds" else referenced
+        target[key] = _safe_gate_value(value)
+    return {"referenced_values": referenced, "expected_values": expected}
+
+
+def _resolve_parts(parts: list[str], context: dict[str, Any]) -> Any:
+    value: Any = context
+    for part in parts:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _safe_gate_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 200 else value[:200] + "..."
+    if isinstance(value, list | tuple):
+        return [_safe_gate_value(item) for item in list(value)[:10]]
+    return f"<{type(value).__name__}>"
+
+
+def _first_compare_operator(tree: ast.AST) -> str | None:
+    labels = {
+        ast.Eq: "==",
+        ast.NotEq: "!=",
+        ast.Lt: "<",
+        ast.LtE: "<=",
+        ast.Gt: ">",
+        ast.GtE: ">=",
+        ast.In: "in",
+        ast.NotIn: "not in",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare) and node.ops:
+            return labels.get(type(node.ops[0]), type(node.ops[0]).__name__)
+    return None
 
 
 def _resolve_attribute(node: ast.Attribute, context: dict[str, Any]) -> Any:

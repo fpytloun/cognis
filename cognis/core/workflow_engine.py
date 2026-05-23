@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import os
 import re
 import uuid
 from collections.abc import Callable
@@ -31,11 +32,13 @@ from cognis.core.agent_loop import (
     StepInterrupted,
     TokenCallback,
     ToolCallCallback,
+    ToolOutputChunkCallback,
     ToolResultCallback,
 )
+from cognis.core.chat_modes import ResolvedChatMode
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
-from cognis.core.gate_conditions import evaluate_gate_conditions
+from cognis.core.gate_conditions import evaluate_gate_conditions_detailed
 from cognis.core.project_runtime import build_project_context_message
 from cognis.core.runtime import ResolvedStepRuntime
 from cognis.core.session_fork import fork_session_events
@@ -88,6 +91,52 @@ from cognis.store.queries import (
 from cognis.tools.builtin.orchestration import OrchestrationMode
 
 logger = get_logger(__name__)
+
+
+def _normalize_executor_path(value: str | None) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return os.path.realpath(os.path.expandvars(os.path.expanduser(value.strip())))
+    except OSError:
+        return value.strip()
+
+
+def _resolve_execution_paths(
+    *,
+    workspace_root: str | None,
+    working_directory: str | None,
+    executor_home: str | None = None,
+    executor_cwd: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve execution paths using the same default as executor tools: cwd, then home."""
+
+    resolved_workspace_root = _normalize_executor_path(workspace_root)
+    resolved_working_directory = _normalize_executor_path(working_directory)
+    if resolved_working_directory is None:
+        resolved_working_directory = resolved_workspace_root or _normalize_executor_path(
+            executor_cwd
+        )
+    if resolved_working_directory is None:
+        resolved_working_directory = _normalize_executor_path(executor_home)
+    if resolved_workspace_root is None:
+        resolved_workspace_root = resolved_working_directory
+    return resolved_workspace_root, resolved_working_directory
+
+
+def _resolve_task_execution_paths(
+    task: TaskModel,
+    *,
+    executor_home: str | None = None,
+    executor_cwd: str | None = None,
+) -> tuple[str | None, str | None]:
+    return _resolve_execution_paths(
+        workspace_root=task.workspace_root,
+        working_directory=task.working_directory,
+        executor_home=executor_home,
+        executor_cwd=executor_cwd,
+    )
+
 
 # Prometheus metrics
 WORKFLOWS_TOTAL = Counter(
@@ -172,9 +221,11 @@ class WorkflowEngine:
         on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
+        on_tool_output_chunk: ToolOutputChunkCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         bootstrap_wait_for_intention: bool = False,
         turn_id: str | None = None,
+        chat_mode: ResolvedChatMode | None = None,
         consume_boundary_batch: Callable[[str], Any] | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
@@ -242,7 +293,14 @@ class WorkflowEngine:
             bootstrap_wait_for_intention=bootstrap_wait_for_intention,
             orchestration_mode=OrchestrationMode.FULL,
             turn_id=turn_id,
+            chat_mode=chat_mode,
             consume_boundary_batch=consume_boundary_batch,
+        )
+        ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
+            workspace_root=ctx.workspace_root,
+            working_directory=ctx.working_directory,
+            executor_home=getattr(runtime.executor_environment, "home", None),
+            executor_cwd=getattr(runtime.executor_environment, "cwd", None),
         )
 
         try:
@@ -252,14 +310,17 @@ class WorkflowEngine:
                 agent_owner_email=agent.owner_email,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
+                executor_environment=runtime.executor_environment,
                 access_context=access_context,
             ):
+                await self._session_manager.refresh_intaris_session_policy(session)
                 return await self._agent_loop.run_step(
                     ctx,
                     on_token=on_progress,
                     on_thinking=on_thinking,
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
+                    on_tool_output_chunk=on_tool_output_chunk,
                 )
         finally:
             await runtime.cleanup()
@@ -800,6 +861,7 @@ class WorkflowEngine:
                     source_name=effective_input.single_source(),
                     target_session=session,
                     state=state,
+                    copy_prefix=not (agent.is_system or agent.agent_type == "secondary"),
                 )
 
         persisted_todos: list[dict[str, Any]] = []
@@ -877,16 +939,28 @@ class WorkflowEngine:
                 delegation_mode=session.delegation_mode,
                 workflow_step=True,
             )
-            runtime = await self._resolve_step_runtime(
-                agent=agent,
-                executor_agent=executor_agent,
-                user_email=task.created_by,
-                access_context=access_context,
-                conversation_id=getattr(conversation, "conversation_id", None)
-                if conversation is not None
-                else None,
-                task_id=task.task_id,
+            runtime_workspace_root, runtime_working_directory = _resolve_task_execution_paths(task)
+            with scoped_runtime_context(
+                workspace_root=runtime_workspace_root,
+                effective_working_directory=runtime_working_directory,
+            ):
+                runtime = await self._resolve_step_runtime(
+                    agent=agent,
+                    executor_agent=executor_agent,
+                    user_email=task.created_by,
+                    access_context=access_context,
+                    conversation_id=getattr(conversation, "conversation_id", None)
+                    if conversation is not None
+                    else None,
+                    task_id=task.task_id,
+                )
+            runtime_workspace_root, runtime_working_directory = _resolve_task_execution_paths(
+                task,
+                executor_home=getattr(runtime.executor_environment, "home", None),
+                executor_cwd=getattr(runtime.executor_environment, "cwd", None),
             )
+            task.workspace_root = runtime_workspace_root
+            task.working_directory = runtime_working_directory
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             logger.warning(
@@ -972,8 +1046,8 @@ class WorkflowEngine:
             task_expected_output=task.expected_output,
             project_context=project_context,
             completion_delivery=task.completion_delivery,
-            workspace_root=task.workspace_root,
-            working_directory=task.working_directory,
+            workspace_root=runtime_workspace_root,
+            working_directory=runtime_working_directory,
             workspace_root_explicit=bool(task.workspace_root),
             working_directory_explicit=bool(task.working_directory),
             step_run_id=step_run_id,
@@ -1003,6 +1077,11 @@ class WorkflowEngine:
             title: str | None,
             complete: bool,
             content: str | None = None,
+            started_at: str | None = None,
+            completed_at: str | None = None,
+            duration_ms: int | None = None,
+            source: str | None = None,
+            provider_block_index: int | None = None,
         ) -> None:
             if hasattr(self._session_cache, "update_active_thinking"):
                 self._session_cache.update_active_thinking(
@@ -1014,6 +1093,11 @@ class WorkflowEngine:
                     title=title,
                     complete=complete,
                     content=content,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    duration_ms=duration_ms,
+                    source=source,
+                    provider_block_index=provider_block_index,
                 )
 
         # Run agent loop
@@ -1024,8 +1108,10 @@ class WorkflowEngine:
                 agent_owner_email=agent.owner_email,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
+                executor_environment=runtime.executor_environment,
                 access_context=access_context,
             ):
+                await self._session_manager.refresh_intaris_session_policy(session)
                 output = await self._agent_loop.run_step(
                     ctx,
                     on_token=on_progress,
@@ -1147,23 +1233,86 @@ class WorkflowEngine:
         if gate is None:
             return "continue"
 
-        if gate.conditions:
-            try:
-                should_pause = evaluate_gate_conditions(
-                    [condition.expression for condition in gate.conditions],
-                    step_outputs=state.step_outputs,
-                    thresholds=gate.thresholds,
+        async def _persist_gate_evaluation(details: dict[str, Any]) -> None:
+            async with self._session_factory() as db_session:
+                latest = await get_latest_step_run_for_task_step(
+                    db_session, task.task_id, step_def.name, attempt_number=task.attempt_number
                 )
-            except ValueError:
+                if latest is None:
+                    step_run_id = f"sr_{uuid.uuid4().hex}"
+                    initial_status = (
+                        "approved" if details.get("action_taken") == "continue" else "paused"
+                    )
+                    gate_recorded_at = datetime.now(UTC)
+                    await create_step_run(
+                        db_session,
+                        task_id=task.task_id,
+                        step_name=step_def.name,
+                        step_type=step_def.type,
+                        agent_id=task.agent_id,
+                        attempt=1,
+                        attempt_number=task.attempt_number,
+                        step_run_id=step_run_id,
+                        status=initial_status,
+                        workspace_root=task.workspace_root,
+                        working_directory=task.working_directory,
+                        started_at=gate_recorded_at,
+                        completed_at=gate_recorded_at,
+                        runtime_info={"gate_evaluation": details},
+                    )
+                else:
+                    step_run_id = latest.step_run_id
+                    runtime_info = dict(latest.runtime_info or {})
+                    runtime_info["gate_evaluation"] = details
+                    gate_recorded_at = datetime.now(UTC)
+                    await update_step_run(
+                        db_session,
+                        step_run_id,
+                        status=(
+                            "approved" if details.get("action_taken") == "continue" else "paused"
+                        ),
+                        runtime_info=runtime_info,
+                        started_at=latest.started_at or gate_recorded_at,
+                        completed_at=gate_recorded_at,
+                    )
+                await db_session.commit()
+
+        if gate.conditions:
+            gate_evaluation = evaluate_gate_conditions_detailed(
+                [condition.expression for condition in gate.conditions],
+                step_outputs=state.step_outputs,
+                thresholds=gate.thresholds,
+            )
+            if gate_evaluation["errors"]:
                 logger.warning(
                     "gate condition evaluation failed; requiring conditional gate",
                     extra={"extra_data": {"task_id": task.task_id, "step_name": step_def.name}},
-                    exc_info=True,
                 )
                 should_pause = True
+                gate_evaluation.update(
+                    {"branch": "error_pause", "action_taken": "pause", "passed": True}
+                )
+            else:
+                should_pause = bool(gate_evaluation["passed"])
+                gate_evaluation.update(
+                    {
+                        "branch": "condition_pass" if should_pause else "condition_skip",
+                        "action_taken": "pause" if should_pause else "continue",
+                    }
+                )
             if not should_pause:
+                await _persist_gate_evaluation(gate_evaluation)
                 GATES_TOTAL.labels(action="condition_skip").inc()
                 return "continue"
+        else:
+            gate_evaluation = {
+                "condition_mode": "any",
+                "conditions": [],
+                "passed": True,
+                "errors": [],
+                "branch": "unconditional_pause",
+                "action_taken": "pause",
+            }
 
         # Build gate context from specified inputs
         gate_context: dict[str, Any] = {}
@@ -1194,6 +1343,8 @@ class WorkflowEngine:
                     resolution.get("note") or resolution.get("feedback") or ""
                 ).strip()
                 GATES_TOTAL.labels(action=action).inc()
+                gate_evaluation.update({"action_taken": action, "branch": "operator_decision"})
+                await _persist_gate_evaluation(gate_evaluation)
                 state.status = "running"
                 state.current_step_status = "running"
                 state.pending_pause_type = None
@@ -1361,6 +1512,8 @@ class WorkflowEngine:
             instruction = ""
 
         GATES_TOTAL.labels(action=action).inc()
+        gate_evaluation.update({"action_taken": action, "branch": "operator_decision"})
+        await _persist_gate_evaluation(gate_evaluation)
 
         # Resume — write status + workflow_state atomically
         state.status = "running"
@@ -2542,6 +2695,8 @@ class WorkflowEngine:
         source_name: str | None,
         target_session: Any,
         state: WorkflowState,
+        *,
+        copy_prefix: bool = True,
     ) -> bool:
         """Copy events from a source step's session into the target session.
 
@@ -2563,6 +2718,7 @@ class WorkflowEngine:
             source_intaris_session_id=raw_output.get("intaris_session_id"),
             target_session=target_session,
             source_label=source_name,
+            copy_prefix=copy_prefix,
         )
 
     async def _fork_session_events(
@@ -2572,6 +2728,7 @@ class WorkflowEngine:
         source_intaris_session_id: str | None,
         target_session: Any,
         source_label: str,
+        copy_prefix: bool = True,
     ) -> bool:
         """Copy events from one session into another session."""
         return await fork_session_events(
@@ -2583,6 +2740,7 @@ class WorkflowEngine:
             source_label=source_label,
             snapshot_source="fork",
             snapshot_extras={"source_step": source_label},
+            copy_prefix=copy_prefix,
         )
 
     async def _resolve_step_runtime(
@@ -2749,13 +2907,21 @@ class WorkflowEngine:
         """
         from cognis.models.session import ConversationContext
 
+        workspace_root, working_directory = _resolve_task_execution_paths(task)
         context = ConversationContext(
             type="task",
             ref=task.task_id,
+            platform_data={
+                "workspace_root": workspace_root,
+                "working_directory": working_directory,
+            },
         )
         # Stage 36: read the task-level active executor pin so it carries
         # forward to this step's conversation.
         task_active_executor_id: str | None = None
+        task_active_executor_assigned_at = None
+        task_active_executor_expires_at = None
+        task_active_executor_source = None
         try:
             async with self._session_factory() as db_session:
                 from cognis.store.queries import get_task
@@ -2763,20 +2929,38 @@ class WorkflowEngine:
                 task_row = await get_task(db_session, task.task_id)
                 if task_row is not None:
                     task_active_executor_id = getattr(task_row, "active_executor_id", None)
+                    task_active_executor_assigned_at = getattr(
+                        task_row, "active_executor_assigned_at", None
+                    )
+                    task_active_executor_expires_at = getattr(
+                        task_row, "active_executor_expires_at", None
+                    )
+                    task_active_executor_source = getattr(task_row, "active_executor_source", None)
         except Exception:
             logger.debug(
                 "stage36: failed to read task.active_executor_id",
                 exc_info=True,
             )
-        conversation, session = await self._session_manager.create_conversation_with_root_session(
-            user_email=task.created_by,
-            agent_id=agent.agent_id,
-            context=context,
-            title=f"Task: {task.title} / Step: {step_def.name}",
-            title_source="manual",
-            intention=f"Task: {task.title} — Step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
-            initial_active_executor_id=task_active_executor_id,
-        )
+        with scoped_runtime_context(
+            workspace_root=workspace_root,
+            effective_working_directory=working_directory,
+        ):
+            (
+                conversation,
+                session,
+            ) = await self._session_manager.create_conversation_with_root_session(
+                user_email=task.created_by,
+                agent_id=agent.agent_id,
+                context=context,
+                title=f"Task: {task.title} / Step: {step_def.name}",
+                title_source="manual",
+                intention=f"Task: {task.title} — Step: {step_def.name} — {step_def.description or step_def.prompt[:100]}",
+                initial_active_executor_id=task_active_executor_id,
+                initial_active_executor_assigned_at=task_active_executor_assigned_at,
+                initial_active_executor_expires_at=task_active_executor_expires_at,
+                initial_active_executor_source=task_active_executor_source,
+                project_id=task.project_id,
+            )
         return conversation, session
 
     async def _reuse_or_create_step_session(

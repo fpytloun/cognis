@@ -12,7 +12,6 @@ from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY
 from cognis.tools.executor.web.backends import (
     get_browser_fetch_backend,
     get_headed_browser_fetch_backend,
-    headed_fallback_enabled,
     resolve_fetch_backend,
     resolve_search_backend,
 )
@@ -27,8 +26,8 @@ from cognis.tools.registry import ToolExecutionContext
 
 logger = logging.getLogger(__name__)
 
-# Heuristic markers that indicate the direct backend hit a wall the
-# headless browser fallback can usually clear.
+# Heuristic markers that indicate the direct backend hit a wall the browser
+# fallback can usually clear.
 _BROWSER_FALLBACK_HINT_TOKENS: tuple[str, ...] = (
     "cloudflare",
     "circuit breaker",
@@ -110,14 +109,40 @@ def _backend_label(backend: Any, default: str = "direct") -> str:
 
 def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
     """Return True when ``result`` looks like a transient/blocked failure
-    that the headless browser fallback can usually overcome."""
+    that browser fallback can usually overcome."""
+    metadata = result.metadata or {}
+    if _looks_like_blocked_empty_extraction(metadata):
+        return True
     if not result.is_error:
         return False
-    metadata = result.metadata or {}
     if metadata.get("cloudflare_blocked"):
         return True
     output = (result.output or "").lower()
     return any(token in output for token in _BROWSER_FALLBACK_HINT_TOKENS)
+
+
+def _looks_like_blocked_empty_extraction(metadata: dict[str, Any]) -> bool:
+    document = metadata.get("extracted_document")
+    if not isinstance(document, dict):
+        return False
+    extractor = str(document.get("extractor") or "").lower()
+    score = document.get("extraction_score")
+    score_float = float(score) if isinstance(score, int | float) else 0.0
+    if extractor != "empty" and score_float > 0:
+        return False
+    text = " ".join(
+        str(document.get(key) or "") for key in ("title", "description", "url", "canonical_url")
+    ).lower()
+    return any(
+        marker in text
+        for marker in (
+            "please wait for verification",
+            "verify you are human",
+            "access denied",
+            "blocked",
+            "just a moment",
+        )
+    )
 
 
 def _browser_block_signal(result: ToolResult) -> str | None:
@@ -188,7 +213,7 @@ def _should_attempt_browser_fallback(
     fallback_setting = runtime_metadata.get("web_fetch_fallback_browser", True)
     if fallback_setting is False:
         return False
-    return get_browser_fetch_backend(runtime_metadata) is not None
+    return bool(_browser_fallback_attempts(runtime_metadata))
 
 
 def _explain_skipped_fallback(
@@ -582,107 +607,55 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
             metadata=primary_result.metadata,
         )
 
-    browser_backend = get_browser_fetch_backend(runtime_metadata)
-    if browser_backend is None:
-        return primary_result
-
     fallback_attempts: list[tuple[str, ToolResult]] = []
     modes_attempted: list[str] = []
+    browser_attempts = _browser_fallback_attempts(runtime_metadata)
+    if not browser_attempts:
+        return primary_result
+
     headed_skipped_reason: str | None = None
 
-    logger.info(
-        "web: fetch falling back to headless browser backend",
-        extra={
-            "extra_data": {
-                "url_host": host_for(url) or "unknown",
-                "primary_backend": primary_label,
-                "primary_error": primary_result.output[:120],
-            }
-        },
-    )
-    headless_result = await _run_fetch_with_concurrency(
-        controller=controller,
-        backend=browser_backend,
-        backend_label="browser",
-        url=url,
-        output_format=output_format,
-        timeout=timeout_int,
-        options=fetch_options,
-    )
-    modes_attempted.append("headless")
-    headless_block_signal = _browser_block_signal(headless_result)
-    if not headless_result.is_error and not headless_block_signal:
-        return build_fetch_tool_result(
-            url=url,
-            content=headless_result.output,
-            metadata=_annotate_fallback_metadata(
-                headless_result,
-                fallback_used=True,
-                fallback_mode="headless",
-                modes_attempted=modes_attempted,
-                primary_backend=primary_label,
-            ).metadata,
-        )
-    if headless_block_signal:
-        headless_result = _browser_block_failure("headless", headless_result, headless_block_signal)
-    fallback_attempts.append(("headless", headless_result))
-
-    headed_setting_enabled = bool(
-        runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", False)
-    )
-    headed_backend = (
-        get_headed_browser_fetch_backend(runtime_metadata)
-        if headed_setting_enabled and headed_fallback_enabled(runtime_metadata)
-        else None
-    )
-    if headed_backend is None:
-        if headed_setting_enabled:
-            headed_skipped_reason = (
-                "Headed browser fallback is enabled but the executor browser "
-                "manager has not been opted in to headed mode (browser.headed_allowed)."
-            )
-        else:
-            headed_skipped_reason = (
-                "Headed browser fallback is disabled "
-                "(web.browser_fetch.headed_fallback_enabled=false)."
-            )
-    else:
+    for mode, browser_backend in browser_attempts:
         logger.info(
-            "web: fetch escalating to headed browser fallback",
+            "web: fetch falling back to %s browser backend",
+            mode,
             extra={
                 "extra_data": {
                     "url_host": host_for(url) or "unknown",
                     "primary_backend": primary_label,
-                    "headless_error": headless_result.output[:120],
+                    "primary_error": primary_result.output[:120],
                 }
             },
         )
-        headed_result = await _run_fetch_with_concurrency(
+        browser_result = await _run_fetch_with_concurrency(
             controller=controller,
-            backend=headed_backend,
+            backend=browser_backend,
             backend_label="browser",
             url=url,
             output_format=output_format,
             timeout=timeout_int,
             options=fetch_options,
         )
-        modes_attempted.append("headed")
-        headed_block_signal = _browser_block_signal(headed_result)
-        if not headed_result.is_error and not headed_block_signal:
+        modes_attempted.append(mode)
+        block_signal = _browser_block_signal(browser_result)
+        if not browser_result.is_error and not block_signal:
             return build_fetch_tool_result(
                 url=url,
-                content=headed_result.output,
+                content=browser_result.output,
                 metadata=_annotate_fallback_metadata(
-                    headed_result,
+                    browser_result,
                     fallback_used=True,
-                    fallback_mode="headed",
+                    fallback_mode=mode,
                     modes_attempted=modes_attempted,
                     primary_backend=primary_label,
                 ).metadata,
             )
-        if headed_block_signal:
-            headed_result = _browser_block_failure("headed", headed_result, headed_block_signal)
-        fallback_attempts.append(("headed", headed_result))
+        if block_signal:
+            browser_result = _browser_block_failure(mode, browser_result, block_signal)
+        fallback_attempts.append((mode, browser_result))
+
+    if not any(mode == "headed" for mode in modes_attempted):
+        headed_skipped_reason = _headed_fallback_skipped_reason(runtime_metadata)
 
     return _combined_fallback_failure(
         primary_label=primary_label,
@@ -690,6 +663,32 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         fallback_results=fallback_attempts,
         modes_attempted=modes_attempted,
         headed_skipped_reason=headed_skipped_reason,
+    )
+
+
+def _browser_fallback_attempts(runtime_metadata: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Prefer headed fallback when possible; use headless only if headed cannot run."""
+    headed = (
+        get_headed_browser_fetch_backend(runtime_metadata)
+        if bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", False))
+        else None
+    )
+    if headed is not None:
+        return [("headed", headed)]
+    headless = get_browser_fetch_backend(runtime_metadata)
+    if headless is not None:
+        return [("headless", headless)]
+    return []
+
+
+def _headed_fallback_skipped_reason(runtime_metadata: dict[str, Any]) -> str:
+    if not bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", False)):
+        return (
+            "Headed browser fallback is disabled (web.browser_fetch.headed_fallback_enabled=false)."
+        )
+    return (
+        "Headed browser fallback is enabled but the executor browser manager has not "
+        "been opted in to headed mode (browser.headed_allowed)."
     )
 
 

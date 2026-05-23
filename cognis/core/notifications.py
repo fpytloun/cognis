@@ -515,13 +515,22 @@ class NotificationService:
                 exc_info=True,
             )
             return False
-        if remote is None or not remote.resolved:
+        if remote is None:
+            return False
+        remote_user_decision = str(getattr(remote, "user_decision", "") or "").strip().lower()
+        remote_resolved = bool(remote.resolved or remote_user_decision)
+        if not remote_resolved:
             return False
 
-        decision = remote.decision or str(resolution.get("decision") or "approve")
+        if remote_user_decision in {"approve", "deny"}:
+            decision = remote_user_decision
+        else:
+            decision = remote.decision or str(resolution.get("decision") or "approve")
+        remote_note = getattr(remote, "user_note", None)
+        note = str(remote_note if remote_note is not None else resolution.get("note", ""))
         pause_waiter_ok = self._pause_waiter.resolve(
             row.notification_id,
-            PauseResolution(decision=decision, data={"note": resolution.get("note", "")}),
+            PauseResolution(decision=decision, data={"note": note}),
         )
 
         if not pause_waiter_ok:
@@ -533,6 +542,7 @@ class NotificationService:
                         resolution={
                             **resolution,
                             "decision": decision,
+                            "note": note,
                             "state": "submitted_remote",
                         },
                     )
@@ -541,7 +551,9 @@ class NotificationService:
             NOTIFICATION_ESCALATION_RECOVERY_PENDING.inc()
             logger.warning(
                 "notification: external escalation decision recorded but local resume is pending recovery",
-                extra={"extra_data": {"notification_id": row.notification_id, "decision": decision}},
+                extra={
+                    "extra_data": {"notification_id": row.notification_id, "decision": decision}
+                },
             )
             return False
 
@@ -552,7 +564,12 @@ class NotificationService:
                 .where(NotificationRow.notification_id == row.notification_id)
                 .values(
                     status="resolved",
-                    resolution={**resolution, "decision": decision, "state": "resolved_remote"},
+                    resolution={
+                        **resolution,
+                        "decision": decision,
+                        "note": note,
+                        "state": "resolved_remote",
+                    },
                     resolved_at=now,
                 )
             )
@@ -569,11 +586,19 @@ class NotificationService:
             )
         )
 
-        safe_decision = decision if decision in {"approve", "deny", "continue", "cancel"} else "other"
+        safe_decision = (
+            decision if decision in {"approve", "deny", "continue", "cancel"} else "other"
+        )
         NOTIFICATIONS_RESOLVED.labels(type=row.notification_type, decision=safe_decision).inc()
         if row.created_at:
-            created_at = row.created_at if row.created_at.tzinfo is not None else row.created_at.replace(tzinfo=UTC)
-            NOTIFICATION_RESOLUTION_DURATION.labels(type=row.notification_type).observe((now - created_at).total_seconds())
+            created_at = (
+                row.created_at
+                if row.created_at.tzinfo is not None
+                else row.created_at.replace(tzinfo=UTC)
+            )
+            NOTIFICATION_RESOLUTION_DURATION.labels(type=row.notification_type).observe(
+                (now - created_at).total_seconds()
+            )
 
         logger.info(
             "notification: reconciled external escalation decision",
@@ -586,6 +611,14 @@ class NotificationService:
             },
         )
         return True
+
+    async def reconcile_remote_escalation(self, notification_id: str) -> bool:
+        """Resolve a pending escalation if Intaris recorded an external decision."""
+        async with self._session_factory() as db:
+            row = await db.get(NotificationRow, notification_id)
+            if row is None:
+                return False
+        return await self._reconcile_remote_escalation(row)
 
     async def get(self, notification_id: str) -> Notification | None:
         """Get a single notification by ID."""
@@ -791,7 +824,9 @@ def _is_expired_escalation(row: NotificationRow, *, now: datetime) -> bool:
         return False
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
-    timeout_raw = (row.payload or {}).get("timeout_seconds") if isinstance(row.payload, dict) else None
+    timeout_raw = (
+        (row.payload or {}).get("timeout_seconds") if isinstance(row.payload, dict) else None
+    )
     try:
         timeout_seconds = float(timeout_raw)
     except (TypeError, ValueError):

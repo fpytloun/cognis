@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from cognis.core.agent_loop import PauseWaiter, PendingPause
-from cognis.core.commands import CommandDispatcher
-from cognis.models.agent import AgentDefinition
+from cognis.core.commands import CommandDispatcher, is_system_slash_command_message
+from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
@@ -15,6 +16,10 @@ from cognis.models.session import (
     SessionModel,
 )
 from cognis.tools.executor.lsp.runtime import LSPStatusConfig, LSPStatusReport, LSPStatusTotals
+
+
+class _HistoryRebaseResult(SimpleNamespace):
+    pass
 
 
 class _NotificationService:
@@ -54,6 +59,30 @@ class _TurnScheduler:
     async def cancel_turn(self, conversation_id: str) -> bool:
         self.calls.append(conversation_id)
         return self.cancelled
+
+
+class _TaskQueue:
+    def __init__(self) -> None:
+        self.submit = AsyncMock(return_value=SimpleNamespace(task_id="task-1"))
+
+
+class _TurnSchedulerWithTaskQueue:
+    def __init__(self) -> None:
+        self._task_queue = _TaskQueue()
+
+
+class _CompactionStrategy:
+    def __init__(self) -> None:
+        self.compaction_threshold = 0.85
+        self.calls: list[dict[str, object]] = []
+
+    async def compact(self, session: SessionModel, **kwargs: object) -> object:
+        self.calls.append({"session": session, **kwargs})
+        return SimpleNamespace(
+            compacted=False,
+            method="skipped",
+            reason="nothing_to_compact",
+        )
 
 
 class _SessionCache:
@@ -183,6 +212,8 @@ class _SessionManager:
             )
         )
         self.mark_completed = AsyncMock(return_value=True)
+        self.undo_last_turn = AsyncMock(return_value=None)
+        self.redo_last_undo = AsyncMock(return_value=None)
 
 
 def _session() -> SessionModel:
@@ -196,6 +227,83 @@ def _session() -> SessionModel:
 
 def _agent() -> AgentDefinition:
     return AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_resolves_same_session_model_from_default_route() -> None:
+    strategy = _CompactionStrategy()
+    resolve_model_target = AsyncMock(
+        return_value=(
+            "default-model",
+            SimpleNamespace(provider_id="default-provider"),
+        )
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=SimpleNamespace(llm=SimpleNamespace(resolve_model_target=resolve_model_target)),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    resolve_model_target.assert_awaited_once_with(
+        explicit_provider_id=None,
+        task_type="default",
+        acting_user_email="user@example.com",
+    )
+    model_context = cast(Any, strategy.calls[0]["model_context"])
+    assert model_context.model == "default-model"
+    assert model_context.provider_id == "default-provider"
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_preserves_explicit_agent_model_context() -> None:
+    strategy = _CompactionStrategy()
+    resolve_model_target = AsyncMock()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=SimpleNamespace(llm=SimpleNamespace(resolve_model_target=resolve_model_target)),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=_session(),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            llm_config=AgentLLMConfig(
+                model="agent-model",
+                provider_id="agent-provider",
+                reasoning_effort="none",
+            ),
+        ),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    resolve_model_target.assert_not_awaited()
+    model_context = cast(Any, strategy.calls[0]["model_context"])
+    assert model_context.model == "agent-model"
+    assert model_context.provider_id == "agent-provider"
+    assert model_context.reasoning_effort == "none"
 
 
 @pytest.mark.asyncio
@@ -245,13 +353,405 @@ async def test_new_web_conversation_does_not_clone_execution_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_new_channel_session_clears_execution_paths_but_preserves_routing(monkeypatch) -> None:
+async def test_plan_command_sets_conversation_chat_mode() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    conversation = _conversation()
+
+    result = await dispatcher.dispatch(
+        "/plan",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert conversation.context.platform_data["chat_mode"] == "plan"
+    assert result.data == {"chat_mode": "plan", "chat_mode_source": "conversation_override"}
+
+
+@pytest.mark.asyncio
+async def test_default_command_clears_conversation_chat_mode() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    conversation = _conversation()
+    conversation.context.platform_data["chat_mode"] = "plan"
+
+    result = await dispatcher.dispatch(
+        "/default",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert "chat_mode" not in conversation.context.platform_data
+    assert result.data == {"chat_mode": "default", "chat_mode_source": "system_default"}
+
+
+@pytest.mark.asyncio
+async def test_one_shot_chat_mode_command_is_not_dispatched() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/plan inspect the code",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_undo_blocked_during_busy_turn() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/undo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "turn_active"}
+    manager.undo_last_turn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_redo_blocked_during_busy_turn() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/redo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "turn_active"}
+    manager.redo_last_undo.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_undo_nothing_to_undo() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/undo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "Nothing to undo."
+
+
+@pytest.mark.asyncio
+async def test_redo_nothing_to_redo() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/redo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "Nothing to redo."
+
+
+@pytest.mark.asyncio
+async def test_undo_returns_history_rebased_without_new_conversation() -> None:
+    manager = _SessionManager()
+    new_session = SessionModel(
+        session_id="sess-undo",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    manager.undo_last_turn.return_value = _HistoryRebaseResult(
+        operation="undo",
+        session=new_session,
+        previous_session=_session(),
+        undo_available=True,
+        redo_available=True,
+        message="Undid last turn.",
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/undo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "history_rebased"
+    assert result.data["operation"] == "undo"
+    assert result.data["conversation_id"] == "conv-1"
+    assert result.data["session_id"] == "sess-undo"
+    manager.create_conversation_with_root_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_redo_returns_history_rebased_same_conversation() -> None:
+    manager = _SessionManager()
+    restored_session = SessionModel(
+        session_id="sess-1",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    manager.redo_last_undo.return_value = _HistoryRebaseResult(
+        operation="redo",
+        session=restored_session,
+        previous_session=SessionModel(
+            session_id="sess-undo",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        undo_available=True,
+        redo_available=False,
+        message="Redid last turn.",
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/redo",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "history_rebased"
+    assert result.data["operation"] == "redo"
+    assert result.data["conversation_id"] == "conv-1"
+    assert result.data["session_id"] == "sess-1"
+
+
+def test_slash_command_classification_ignores_one_shot_chat_modes() -> None:
+    assert is_system_slash_command_message("/undo")
+    assert is_system_slash_command_message("/model gpt-5")
+    assert is_system_slash_command_message("/task do work")
+    assert is_system_slash_command_message("/research compare options")
+    assert is_system_slash_command_message("/implement add support")
+    assert is_system_slash_command_message("/delegate coordinate this")
+    assert not is_system_slash_command_message("/plan inspect this code")
+    assert not is_system_slash_command_message("/taskfoo do work")
+
+
+@pytest.mark.asyncio
+async def test_task_slash_command_creates_background_task() -> None:
+    scheduler = _TurnSchedulerWithTaskQueue()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+    conversation = _conversation()
+    conversation.context.platform_data = {
+        "workspace_root": "/repo",
+        "working_directory": "/repo/src",
+    }
+
+    result = await dispatcher.dispatch(
+        "/task inspect task routing",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "queued"
+    assert result.data["task_id"] == "task-1"
+    scheduler._task_queue.submit.assert_awaited_once()
+    kwargs = scheduler._task_queue.submit.await_args.kwargs
+    assert kwargs["title"] == "inspect task routing"
+    assert kwargs["description"] == "inspect task routing"
+    assert kwargs["source_type"] == "chat"
+    assert kwargs["source_ref"] == "conv-1"
+    assert kwargs["workflow_id"] is None
+    assert kwargs["workspace_root"] == "/repo"
+    assert kwargs["working_directory"] == "/repo/src"
+
+
+@pytest.mark.asyncio
+async def test_task_slash_command_requires_description() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=_TurnSchedulerWithTaskQueue(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/task",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "missing_task_description"
+
+
+@pytest.mark.asyncio
+async def test_research_and_implement_commands_set_workflow_hints() -> None:
+    scheduler = _TurnSchedulerWithTaskQueue()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    await dispatcher.dispatch(
+        "/research compare task routing options",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    await dispatcher.dispatch(
+        "/implement clean task routing",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    calls = scheduler._task_queue.submit.await_args_list
+    assert calls[0].kwargs["workflow_id"] == "system:research"
+    assert calls[1].kwargs["workflow_id"] == "system:software-development"
+
+
+@pytest.mark.asyncio
+async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
+    monkeypatch,
+) -> None:
     import cognis.store.queries as store_queries
 
     manager = _SessionManager()
     session_factory = _DBSessionFactory()
     update_context_data = AsyncMock(return_value=True)
+    reset_active_executor = AsyncMock(return_value=True)
     monkeypatch.setattr(store_queries, "update_conversation_context_data", update_context_data)
+    monkeypatch.setattr(store_queries, "reset_conversation_active_executor", reset_active_executor)
     pause_waiter = PauseWaiter()
     pause_waiter.register(
         PendingPause(
@@ -317,6 +817,7 @@ async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
 
     assert result is not None
     assert result.type == "session_reset"
+    assert "Executor selection will be resolved again" in (result.text or "")
     manager.rotate_session.assert_awaited_once()
     update_context_data.assert_awaited_once_with(
         session_factory.session,
@@ -334,7 +835,8 @@ async def test_new_channel_session_clears_execution_paths_but_preserves_routing(
         "chat_id": "chat-1",
         "thread_id": None,
     }
-    assert session_factory.session.commits == 1
+    assert session_factory.session.commits == 2
+    reset_active_executor.assert_awaited_once_with(session_factory.session, "conv-1")
     assert session_factory.session.rollbacks == 0
     assert notifications.calls == [
         ("cred-direct", "cancel", {}),
@@ -976,6 +1478,18 @@ async def test_context_reports_effective_prompt_budget() -> None:
                 "effective_reserve_output_tokens": 32_768,
                 "effective_prompt_budget": 1_015_808,
                 "loop_pressure_threshold": 965_017,
+                "projection_policy": {
+                    "phase": "within_turn",
+                    "pressure_mode": "normal",
+                    "steady_target_tokens": 320_000,
+                    "burst_target_tokens": 600_000,
+                    "hard_prompt_tokens": 660_000,
+                    "cross_turn_tool_budget_tokens": 57_600,
+                    "within_turn_tool_budget_tokens": 228_000,
+                    "preserve_recent_tool_groups": 20,
+                    "preserve_recent_tool_bytes": 912_000,
+                    "max_historical_tool_result_bytes": 25_600,
+                },
                 "last_llm_usage": {
                     "prompt_tokens": 12_345,
                     "completion_tokens": 678,
@@ -1013,6 +1527,13 @@ async def test_context_reports_effective_prompt_budget() -> None:
     )
     assert "Effective prompt budget: 1,015,808 tokens" in result.text
     assert "Loop pressure threshold: 965,017 tokens" in result.text
+    assert "Projection policy: within_turn / normal" in result.text
+    assert "Projection prompt targets: 320,000 steady, 600,000 burst, 660,000 hard" in result.text
+    assert "Projection tool budgets: 57,600 cross-turn, 228,000 within-turn tokens" in result.text
+    assert (
+        "Projection retention: 20 recent groups, 912,000 recent bytes, 25,600 historical bytes"
+        in result.text
+    )
     assert "Last LLM call tokens: 12,345 prompt, 678 completion, 13,023 total" in result.text
     assert "Last LLM call cache read tokens: 7,277" in result.text
     assert "Last LLM call cache write tokens: 248" in result.text
@@ -1451,7 +1972,7 @@ async def test_executor_command_switch_succeeds(monkeypatch) -> None:
 
     persisted: dict[str, str | None] = {"id": None}
 
-    async def _set_active(_session, conversation_id, active_executor_id):
+    async def _set_active(_session, conversation_id, active_executor_id, **_metadata):
         persisted["id"] = active_executor_id
         return True
 
@@ -1585,11 +2106,11 @@ async def test_executor_command_in_task_conversation_propagates_to_task_pin(
     persisted_conv: list[tuple[str, str]] = []
     persisted_task: list[tuple[str, str]] = []
 
-    async def _set_active(_session, conversation_id, executor_id):
+    async def _set_active(_session, conversation_id, executor_id, **_metadata):
         persisted_conv.append((conversation_id, executor_id))
         return True
 
-    async def _set_task(_session, task_id, executor_id):
+    async def _set_task(_session, task_id, executor_id, **_metadata):
         persisted_task.append((task_id, executor_id))
         return True
 

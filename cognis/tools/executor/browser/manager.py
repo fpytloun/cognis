@@ -173,11 +173,11 @@ class BrowserManager:
         self.default_timezone_id = default_timezone_id
         self.default_accept_language = default_accept_language
 
-        # Stage C defaults: anchored to ``stealth_enabled`` so users who
-        # disable stealth get a clean baseline, but each can be overridden
-        # explicitly.
+        # Autoconsent is a content-unblocking feature, not a stealth evasion:
+        # keep it on by default even for Patchright, where stealth stacking is
+        # intentionally disabled.
         if auto_consent is None:
-            auto_consent_value = "accept" if self.stealth_enabled else "off"
+            auto_consent_value = "accept"
         else:
             auto_consent_value = str(auto_consent).strip().lower() or "off"
         if auto_consent_value not in SUPPORTED_AUTO_CONSENT_ACTIONS:

@@ -290,7 +290,13 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         allow_silent_completion=payload.allow_silent_completion,
     )
     try:
-        if payload.status == "draft":
+        create_status = payload.status
+        if payload.draft is True or payload.start_immediately is False:
+            create_status = "draft"
+        elif payload.start_immediately is True and create_status == "draft":
+            create_status = "queued"
+
+        if create_status == "draft":
             task = await queue.create_draft(
                 created_by=user.email,
                 agent_id=payload.agent_id,
@@ -325,7 +331,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 project_id=project_id,
                 workspace_root=payload.workspace_root,
                 working_directory=payload.working_directory,
-                status=payload.status,
+                status=create_status,
             )
     except Exception:
         if created_workflow_id is not None:
@@ -352,16 +358,25 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         }
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
+    step_run_responses = [
+        step_run_to_response(
+            row,
+            deliverables=deliverables_by_step_run.get(row.step_run_id, []),
+        )
+        for row in step_rows
+    ]
+    accumulated: dict[str, float] = {}
+    for step_run in step_run_responses:
+        accumulated[step_run.step_name] = accumulated.get(step_run.step_name, 0.0) + (
+            step_run.duration_seconds or 0.0
+        )
+    for step_run in step_run_responses:
+        step_run.accumulated_duration_seconds = accumulated.get(step_run.step_name)
+        step_run.latest_attempt_duration_seconds = step_run.duration_seconds
     return task_detail_to_response(
         task,
         dependencies=[dependency_to_response(row) for row in dep_rows],
-        step_runs=[
-            step_run_to_response(
-                row,
-                deliverables=deliverables_by_step_run.get(row.step_run_id, []),
-            )
-            for row in step_rows
-        ],
+        step_runs=step_run_responses,
         pending_pause=pending_pause,
         workflow_run=workflow_run,
     )
@@ -1396,6 +1411,10 @@ def _row_to_task(row: Any) -> TaskModel:
         attempt_number=getattr(row, "attempt_number", 1),
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
+        active_executor_id=getattr(row, "active_executor_id", None),
+        active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
+        active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
+        active_executor_source=getattr(row, "active_executor_source", None),
         workflow_state=WorkflowState.model_validate(row.workflow_state)
         if row.workflow_state
         else None,

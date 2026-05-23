@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
+import cognis.core.agent_loop as agent_loop_module
 from cognis.core.agent_loop import (
+    AgentLoop,
     PauseResolution,
     PauseWaiter,
     PendingPause,
@@ -187,6 +190,73 @@ async def test_escalation_double_resolve_returns_false() -> None:
 
     assert first is True
     assert second is False
+
+
+@pytest.mark.asyncio
+async def test_escalation_wait_reconciles_external_intaris_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Intaris UI approval unblocks Cognis without using Cognis approve route."""
+    monkeypatch.setattr(agent_loop_module, "_INTARIS_ESCALATION_REMOTE_POLL_SECONDS", 0.01)
+    waiter = PauseWaiter()
+    pause_id = "call_remote_approve"
+    waiter.register(PendingPause(pause_id=pause_id, pause_type="escalation"))
+
+    class _NotificationService:
+        async def reconcile_remote_escalation(self, notification_id: str) -> bool:
+            assert notification_id == pause_id
+            waiter.resolve(
+                notification_id,
+                PauseResolution(decision="approve", data={"note": "approved in Intaris"}),
+            )
+            return True
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SimpleNamespace(),
+        pause_waiter=waiter,
+    )
+    agent_loop.notification_service = _NotificationService()
+
+    resolution = await agent_loop._wait_for_escalation_resolution(pause_id, timeout=3.0)
+
+    assert resolution.decision == "approve"
+    assert resolution.data["note"] == "approved in Intaris"
+
+
+@pytest.mark.asyncio
+async def test_escalation_wait_times_out_when_intaris_stays_pending() -> None:
+    waiter = PauseWaiter()
+    pause_id = "call_remote_pending"
+    waiter.register(PendingPause(pause_id=pause_id, pause_type="escalation"))
+
+    class _NotificationService:
+        async def reconcile_remote_escalation(self, notification_id: str) -> bool:
+            return False
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SimpleNamespace(),
+        pause_waiter=waiter,
+    )
+    agent_loop.notification_service = _NotificationService()
+
+    with pytest.raises(TimeoutError):
+        await agent_loop._wait_for_escalation_resolution(pause_id, timeout=0.01)
 
 
 def test_find_pending_returns_oldest_first() -> None:

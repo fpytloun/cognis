@@ -103,16 +103,27 @@ _TOOL_GUIDANCE_TEMPLATE = """\
 ## Tool usage
 
 - Use the most direct tool for the operation.
-- Use `read`, `grep`, and `glob` for file contents and code inspection.
+- For file/code inspection, prefer dedicated tools: `read` for file contents, \
+  `grep` for content search, `glob` for path discovery, and `list_directory` \
+  for directory listings.
+- Use `bash` only when shell execution itself is needed: git, \
+  build/test/package-manager commands, process control, permissions, background \
+  processes, or atomic filesystem operations.
+- Use `bash(run_in_background=true)` for intentionally long-running shell \
+  operations such as data syncs, deployments, watchers, or commands expected \
+  to outlive a normal foreground tool call.
+- For `bash(run_in_background=true)`, always provide a concise `description`; \
+  it is used as the job identifier in injected status reminders and completion \
+  follow-ups. Do not poll background jobs every turn unless you need output; \
+  use `bash_output` for details and `bash_kill` for abandoned or watcher \
+  processes. If a reminder shows the job is on another executor, route \
+  `bash_output`/`bash_kill` to that executor when the tool schema allows it.
 - Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`, \
   `sed`, or `echo` separators for file/code inspection when structured \
   tools such as `read`, `grep`, `glob`, or `list_directory` are visible.
 - Do not chain file inspection commands with `&&`, `;`, or separator output. \
   Use independent structured tool calls in parallel instead.
 {edit_guidance}
-- Use `bash` for terminal-native operations and atomic filesystem \
-  operations such as `mv`, `cp`, `rm`, `mkdir`, `chmod`, `git`, build, \
-  test, and package-manager commands.
 - Prefer dedicated edit tools over shell or interpreter one-liners for file \
   content changes.
 - Avoid using `bash` to run Python, Perl, Ruby, or shell one-liners that \
@@ -226,6 +237,12 @@ Use tasks for:
 - substantial refactors
 - long-running background work
 - work that benefits from explicit workflow structure
+
+For normal workflow tasks, omit `agent_id` so the current/main agent owns the \
+durable task record, gates, logs, and delivery. System agents such as \
+`system:implement`, `system:explore`, and `system:code-review` execute \
+delegated sub-sessions or workflow steps; they should not own persistent \
+tasks created with `create_task`.
 
 ### Delegate wait behavior
 Use `wait=true` only when conversation continuation requires the delegated \

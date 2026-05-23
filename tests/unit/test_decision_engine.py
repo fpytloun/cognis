@@ -138,8 +138,8 @@ async def test_decision_engine_defaults_ambiguous_to_inline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_decision_engine_explicit_delegate_prefix() -> None:
-    """Slash commands like /research trigger delegation."""
+async def test_decision_engine_leaves_task_slash_commands_inline() -> None:
+    """Slash commands are owned by CommandDispatcher, not DecisionEngine."""
     engine = DecisionEngine(
         llm=_LLM(),
         inline_max_length=200,
@@ -151,12 +151,12 @@ async def test_decision_engine_explicit_delegate_prefix() -> None:
         agent=_agent(),
     )
 
-    assert result.decision == "delegate"
-    assert result.override_source == "keyword"
+    assert result.decision == "inline"
+    assert result.override_source is None
 
 
 @pytest.mark.asyncio
-async def test_decision_engine_blocks_delegation_when_depth_limit_reached() -> None:
+async def test_decision_engine_does_not_parse_delegate_prefix_at_depth_limit() -> None:
     engine = DecisionEngine(
         llm=_LLM(),
         inline_max_length=200,
@@ -169,8 +169,27 @@ async def test_decision_engine_blocks_delegation_when_depth_limit_reached() -> N
         current_depth=3,
     )
 
-    assert result.decision == "ask_user"
+    assert result.decision == "inline"
     assert "limit" in result.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_decision_engine_does_not_delegate_natural_language_task_queries() -> None:
+    engine = DecisionEngine(
+        llm=_LLM(),
+        inline_max_length=200,
+        max_delegation_depth=5,
+    )
+
+    for message in (
+        "run in background",
+        "background task status",
+        "query for task",
+        "continue?",
+        "/taskfoo create something",
+    ):
+        result = await engine.decide(user_message=message, agent=_agent())
+        assert result.decision == "inline"
 
 
 @pytest.mark.asyncio

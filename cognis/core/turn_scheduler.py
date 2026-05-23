@@ -5,8 +5,7 @@ to response — without any dependency on WebSocket or other transport layers.
 
 It handles:
 - Turn submission and serialization (one active turn per conversation)
-- Decision engine dispatch (inline vs delegate)
-- Workflow selection for delegated tasks
+- Decision engine dispatch for inline chat turns
 - Follow-up turns (system-initiated, via EventBus subscription)
 - Turn cancellation
 - Error classification
@@ -22,7 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import html
+import inspect
+import json
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -42,6 +44,13 @@ from cognis.core.attachment_utils import (
     normalize_attachment_refs,
     strip_attachment_payload_bytes,
 )
+from cognis.core.chat_modes import (
+    ChatMode,
+    ResolvedChatMode,
+    parse_chat_mode_directive,
+    resolve_chat_mode,
+)
+from cognis.core.commands import is_system_slash_command_message
 from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
@@ -49,12 +58,9 @@ from cognis.core.followups import (
     FollowUpMetadata,
     parse_follow_up_metadata,
 )
-from cognis.core.workflow_management import (
-    decode_skill_workflow_candidate_id,
-    encode_skill_workflow_candidate_id,
-    materialize_skill_workflow,
-    skill_workflow_criteria,
-)
+from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
+from cognis.core.tool_output_presentation import build_transport_tool_output_preview
+from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -67,10 +73,14 @@ from cognis.runtime_context import (
     current_user_email,
     current_workspace_root,
 )
+from cognis.store import queries
 from cognis.store.models import FollowUpDedupeRow
-from cognis.tools.skills import resolve_skills_for_agent
+from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
+
+_MAX_ACTIVE_TOOL_OUTPUT_CHARS = 64_000
+_ACTIVE_TOOL_OUTPUT_SNAPSHOT_TTL_SECONDS = 6 * 60 * 60
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -97,14 +107,24 @@ FOLLOW_UP_DEDUPE_TOTAL = Counter(
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_QUEUED_MESSAGES = 5
-DEFAULT_TURN_LIMIT = 3
+DEFAULT_MAX_ACTIVE_TURNS_PER_USER = 20
+DEFAULT_MAX_QUEUED_MESSAGES = 20
 _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _positive_int_setting(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _normalize_utc(value: datetime | None) -> datetime | None:
@@ -134,6 +154,27 @@ def _utf16_code_units(value: str) -> int:
     """Return the string length in JavaScript-compatible UTF-16 code units."""
 
     return len(value.encode("utf-16-le")) // 2
+
+
+def _trim_callback_args(callback: Any, args: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Drop newly added optional callback args for older observers."""
+
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return args
+    if any(
+        parameter.kind == inspect.Parameter.VAR_POSITIONAL
+        for parameter in signature.parameters.values()
+    ):
+        return args
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return args[: len(positional)]
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +213,9 @@ class TurnResult:
     delivery_id: str | None = None
     delivery_fallback_text: str | None = None
     attachments: list[dict[str, Any]] | None = None
+    completed_at: datetime | None = None
+    chat_mode: ChatMode = "default"
+    chat_mode_source: str = "system_default"
 
 
 @dataclass(slots=True)
@@ -200,6 +244,100 @@ class ActiveStreamState:
 
 
 @dataclass(slots=True)
+class ActiveToolOutputSnapshot:
+    """Volatile bounded snapshot of streamed tool output."""
+
+    conversation_id: str
+    session_id: str
+    call_id: str
+    tool_name: str
+    turn_id: str | None
+    status: str = "running"
+    result: str = ""
+    stream: str | None = None
+    is_error: bool = False
+    chunk_count: int = 0
+    content_offset: int = 0
+    output_size: int = 0
+    truncated: bool = False
+    agent_visible_truncated: bool = False
+    transport_truncated: bool = False
+    has_full_output: bool = False
+    recovery_call_id: str | None = None
+    tool_output_artifact_id: str | None = None
+    anchors_available: bool = False
+    anchor_count: int = 0
+    updated_at: datetime = field(default_factory=_utcnow)
+
+    def expired(self, now: datetime | None = None) -> bool:
+        return (now or _utcnow()) - self.updated_at > timedelta(
+            seconds=_ACTIVE_TOOL_OUTPUT_SNAPSHOT_TTL_SECONDS
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
+            "call_id": self.call_id,
+            "tool_name": self.tool_name,
+            "turn_id": self.turn_id,
+            "status": self.status,
+            "result": self.result,
+            "stream": self.stream,
+            "is_error": self.is_error,
+            "chunk_count": self.chunk_count,
+            "content_offset": self.content_offset,
+            "output_size": self.output_size,
+            "truncated": self.truncated,
+            "agent_visible_truncated": self.agent_visible_truncated,
+            "transport_truncated": self.transport_truncated,
+            "has_full_output": self.has_full_output,
+            "recovery_call_id": self.recovery_call_id,
+            "tool_output_artifact_id": self.tool_output_artifact_id,
+            "anchors_available": self.anchors_available,
+            "anchor_count": self.anchor_count,
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any]) -> ActiveToolOutputSnapshot | None:
+        try:
+            updated_raw = data.get("updated_at")
+            updated_at = (
+                datetime.fromisoformat(updated_raw) if isinstance(updated_raw, str) else _utcnow()
+            )
+            return cls(
+                conversation_id=str(data["conversation_id"]),
+                session_id=str(data["session_id"]),
+                call_id=str(data["call_id"]),
+                tool_name=str(data.get("tool_name") or "tool"),
+                turn_id=data.get("turn_id") if isinstance(data.get("turn_id"), str) else None,
+                status=str(data.get("status") or "running"),
+                result=str(data.get("result") or ""),
+                stream=data.get("stream") if isinstance(data.get("stream"), str) else None,
+                is_error=bool(data.get("is_error")),
+                chunk_count=int(data.get("chunk_count") or 0),
+                content_offset=int(data.get("content_offset") or 0),
+                output_size=int(data.get("output_size") or 0),
+                truncated=bool(data.get("truncated")),
+                agent_visible_truncated=bool(data.get("agent_visible_truncated")),
+                transport_truncated=bool(data.get("transport_truncated")),
+                has_full_output=bool(data.get("has_full_output")),
+                recovery_call_id=data.get("recovery_call_id")
+                if isinstance(data.get("recovery_call_id"), str)
+                else None,
+                tool_output_artifact_id=data.get("tool_output_artifact_id")
+                if isinstance(data.get("tool_output_artifact_id"), str)
+                else None,
+                anchors_available=bool(data.get("anchors_available")),
+                anchor_count=int(data.get("anchor_count") or 0),
+                updated_at=updated_at,
+            )
+        except Exception:
+            return None
+
+
+@dataclass(slots=True)
 class _QueuedMessage:
     """A message queued behind an active turn."""
 
@@ -217,6 +355,7 @@ class _QueuedMessage:
     follow_up: FollowUpMetadata | None = None
     outbound_attachments: list[dict[str, Any]] | None = None
     turn_observers: tuple[TurnObserver, ...] = ()
+    one_shot_chat_mode: ChatMode | None = None
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
 
@@ -244,6 +383,71 @@ class _TurnControl:
     absorbed_channel_deliverable: bool = False
     absorbed_delivery_id: str | None = None
     absorbed_delivery_fallback_text: str | None = None
+
+
+def _user_message_event_id(
+    *,
+    conversation_id: str,
+    session_id: str | None,
+    turn_id: str | None,
+    client_message_id: str | None,
+    queue_id: str | None,
+    content: str,
+) -> str:
+    """Build a stable client-visible id for live user message events."""
+
+    if client_message_id:
+        return f"client:{client_message_id}"
+    if queue_id:
+        return f"queue:{queue_id}"
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "content": content,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"user:{session_id or conversation_id}:{turn_id or digest}:{digest}"
+
+
+def _user_message_event_payload(
+    *,
+    conversation_id: str,
+    session_id: str | None,
+    content: str,
+    attachments: list[dict[str, Any]],
+    turn_id: str | None = None,
+    chat_mode: str | None = None,
+    chat_mode_source: str | None = None,
+    client_message_id: str | None = None,
+    queue_id: str | None = None,
+) -> dict[str, Any]:
+    event_id = _user_message_event_id(
+        conversation_id=conversation_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        client_message_id=client_message_id,
+        queue_id=queue_id,
+        content=content,
+    )
+    return {
+        "conversation_id": conversation_id,
+        "session_id": session_id,
+        "content": content,
+        "attachments": attachments,
+        "turn_id": turn_id,
+        "chat_mode": chat_mode,
+        "chat_mode_source": chat_mode_source,
+        "client_message_id": client_message_id,
+        "queue_id": queue_id,
+        "event_id": event_id,
+        "message_id": event_id,
+    }
 
 
 class SessionCreationFailedError(Exception):
@@ -301,6 +505,20 @@ class TurnObserver(Protocol):
         attachments: list[dict[str, Any]] | None = None,
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
+        presentation: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    async def on_tool_output_chunk(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        delta: str,
+        stream: str | None,
+        turn_id: str | None = None,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
     ) -> None: ...
 
     async def on_thinking(
@@ -314,6 +532,11 @@ class TurnObserver(Protocol):
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None: ...
 
     async def on_turn_complete(self, result: TurnResult) -> None: ...
@@ -360,6 +583,7 @@ class TurnScheduler:
         artifact_store: Any,
         workflow_registry: Any,
         event_bus: EventBus,
+        tool_output_spool: ToolOutputSpool | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._workflow_engine = workflow_engine
@@ -375,6 +599,7 @@ class TurnScheduler:
         self._artifact_store = artifact_store
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
+        self._tool_output_spool = tool_output_spool or ToolOutputSpool()
 
         # Per-conversation turn serialization
         self._active_turns: dict[str, asyncio.Task[None]] = {}
@@ -386,6 +611,10 @@ class TurnScheduler:
         self._handled_follow_ups: dict[tuple[str, str], float] = {}
         self._active_streams: dict[str, ActiveStreamState] = {}
         self._active_streams_lock = asyncio.Lock()
+        self._published_title_updates: dict[str, str] = {}
+        self._active_tool_outputs: dict[tuple[str, str, str], ActiveToolOutputSnapshot] = {}
+        self._active_tool_outputs_lock = asyncio.Lock()
+        self._active_tool_output_l2: dict[str, dict[str, Any]] = {}
 
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
@@ -400,6 +629,7 @@ class TurnScheduler:
 
         # Register for follow-up turn events
         event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, self._handle_follow_up_event)
+        event_bus.subscribe(EventType.CONVERSATION_UPDATED, self._handle_conversation_updated)
         logger.info("turn_scheduler: registered on EventBus")
         logger.info("turn_scheduler: follow-up dedupe backed by durable store when available")
 
@@ -444,6 +674,206 @@ class TurnScheduler:
                 return []
             return [snapshot.snapshot()]
 
+    async def active_tool_output_snapshots(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Return volatile bounded streamed tool-output snapshots."""
+
+        await self._load_active_tool_output_l2(conversation_id)
+        async with self._active_tool_outputs_lock:
+            self._prune_active_tool_outputs_locked()
+            return [
+                snapshot.snapshot()
+                for (cid, _, _), snapshot in self._active_tool_outputs.items()
+                if cid == conversation_id and snapshot.result and not snapshot.expired()
+            ]
+
+    def _active_tool_output_cache_key(self, conversation_id: str) -> str:
+        return f"active_tool_outputs:{conversation_id}"
+
+    async def _load_active_tool_output_l2(self, conversation_id: str) -> None:
+        cache = getattr(self._session_cache, "_redis", None)
+        if cache is None:
+            return
+        try:
+            raw = await cache.get(self._active_tool_output_cache_key(conversation_id))
+        except Exception:
+            logger.debug("active tool output L2 read failed", exc_info=True)
+            return
+        if raw is None:
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except Exception:
+            return
+        if not isinstance(payload, list):
+            return
+        async with self._active_tool_outputs_lock:
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                snapshot = ActiveToolOutputSnapshot.from_snapshot(item)
+                if snapshot is None or snapshot.expired():
+                    continue
+                self._active_tool_outputs[
+                    (snapshot.conversation_id, snapshot.session_id, snapshot.call_id)
+                ] = snapshot
+
+    async def _persist_active_tool_output_l2(self, conversation_id: str) -> None:
+        cache = getattr(self._session_cache, "_redis", None)
+        if cache is None:
+            return
+        async with self._active_tool_outputs_lock:
+            self._prune_active_tool_outputs_locked()
+            payload = [
+                snapshot.snapshot()
+                for (cid, _, _), snapshot in self._active_tool_outputs.items()
+                if cid == conversation_id and snapshot.result and not snapshot.expired()
+            ]
+        try:
+            key = self._active_tool_output_cache_key(conversation_id)
+            if payload:
+                await cache.setex(
+                    key, _ACTIVE_TOOL_OUTPUT_SNAPSHOT_TTL_SECONDS, json.dumps(payload)
+                )
+            else:
+                await cache.delete(key)
+        except Exception:
+            logger.debug("active tool output L2 write failed", exc_info=True)
+
+    def _prune_active_tool_outputs_locked(self) -> None:
+        expired = [key for key, snapshot in self._active_tool_outputs.items() if snapshot.expired()]
+        for key in expired:
+            self._active_tool_outputs.pop(key, None)
+
+    async def _append_active_tool_output_chunk(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        turn_id: str | None,
+        delta: str,
+        stream: str | None,
+    ) -> tuple[int, int]:
+        async with self._active_tool_outputs_lock:
+            key = (conversation_id, session_id, call_id)
+            snapshot = self._active_tool_outputs.get(key)
+            if snapshot is None:
+                snapshot = ActiveToolOutputSnapshot(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                )
+                self._active_tool_outputs[key] = snapshot
+            index = snapshot.chunk_count
+            offset = snapshot.content_offset
+            next_result = snapshot.result + delta
+            full_output_size = snapshot.output_size + len(delta)
+            next_offset = snapshot.content_offset + _utf16_code_units(delta)
+            preview = build_transport_tool_output_preview(
+                next_result,
+                _MAX_ACTIVE_TOOL_OUTPUT_CHARS,
+                metadata={"output_size": full_output_size},
+            )
+            snapshot.result = preview.result
+            snapshot.truncated = preview.truncated
+            snapshot.transport_truncated = snapshot.truncated
+            snapshot.stream = stream
+            snapshot.is_error = snapshot.is_error or stream == "stderr"
+            snapshot.chunk_count += 1
+            snapshot.content_offset = next_offset
+            snapshot.output_size = full_output_size
+            snapshot.updated_at = _utcnow()
+        self._tool_output_spool.append(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            turn_id=turn_id,
+            text=delta,
+            stream=stream,
+        )
+        await self._persist_active_tool_output_l2(conversation_id)
+        return index, offset
+
+    async def _finalize_active_tool_output(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        turn_id: str | None,
+        result: str,
+        is_error: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        async with self._active_tool_outputs_lock:
+            key = (conversation_id, session_id, call_id)
+            snapshot = self._active_tool_outputs.get(key)
+            if snapshot is None:
+                snapshot = ActiveToolOutputSnapshot(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                )
+                self._active_tool_outputs[key] = snapshot
+            meta = metadata or {}
+            snapshot.status = "failed" if is_error else "completed"
+            if not (meta.get("transport_truncated") and len(snapshot.result) > len(result)):
+                snapshot.result = result
+            snapshot.is_error = is_error
+            snapshot.output_size = int(meta.get("output_size") or len(snapshot.result))
+            snapshot.truncated = bool(meta.get("truncated"))
+            snapshot.agent_visible_truncated = bool(meta.get("agent_visible_truncated"))
+            snapshot.transport_truncated = bool(meta.get("transport_truncated"))
+            snapshot.has_full_output = bool(meta.get("has_full_output"))
+            snapshot.recovery_call_id = (
+                meta.get("recovery_call_id")
+                if isinstance(meta.get("recovery_call_id"), str)
+                else None
+            )
+            snapshot.tool_output_artifact_id = (
+                meta.get("tool_output_artifact_id")
+                if isinstance(meta.get("tool_output_artifact_id"), str)
+                else None
+            )
+            snapshot.anchors_available = bool(meta.get("anchors_available"))
+            snapshot.anchor_count = int(meta.get("anchor_count") or 0)
+            snapshot.updated_at = _utcnow()
+        self._tool_output_spool.mark_complete(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            turn_id=turn_id,
+            status="failed" if is_error else "completed",
+        )
+        await self._persist_active_tool_output_l2(conversation_id)
+
+    def read_live_tool_output_page(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        offset: int = 0,
+        limit: int = 200,
+        latest: bool = False,
+    ) -> ToolOutputSpoolPage | None:
+        return self._tool_output_spool.page(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            call_id=call_id,
+            offset=offset,
+            limit=limit,
+            latest=latest,
+        )
+
     async def _append_active_stream_chunk(
         self,
         *,
@@ -486,6 +916,28 @@ class TurnScheduler:
         async with self._active_streams_lock:
             self._active_streams.pop(conversation_id, None)
 
+    async def _clear_redo_on_accepted_user_turn(
+        self,
+        conversation_id: str,
+        *,
+        content: str,
+        system_initiated: bool,
+    ) -> None:
+        if system_initiated or is_system_slash_command_message(content):
+            return
+        try:
+            async with self._session_factory() as db_session:
+                await queries.clear_conversation_history_rebase_metadata(
+                    db_session, conversation_id
+                )
+                await db_session.commit()
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to clear redo metadata for accepted user turn",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -508,6 +960,7 @@ class TurnScheduler:
         queued_message_id: str | None = None,
         prepared_attachment_notice: str | None = None,
         prepared_attachment_context: str | None = None,
+        one_shot_chat_mode: ChatMode | None = None,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
 
@@ -517,7 +970,7 @@ class TurnScheduler:
         via ``TurnObserver`` callbacks and EventBus lifecycle events.
 
         Turns are serialized per conversation. If a turn is already active,
-        the message is queued (up to ``MAX_QUEUED_MESSAGES``).
+        the message is queued up to ``session.max_queued_messages``.
         """
         normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
             user_email=user_email,
@@ -551,6 +1004,12 @@ class TurnScheduler:
             )
 
         conversation, session, agent, bootstrap_wait_for_intention = runtime
+        if one_shot_chat_mode is None and not system_initiated:
+            directive = parse_chat_mode_directive(content)
+            if directive is not None and directive.one_shot and directive.remaining_content:
+                one_shot_chat_mode = directive.mode
+                content = directive.remaining_content
+                bootstrap_content = _effective_user_content(content, normalized_attachments)
 
         # Authorization check
         if not system_initiated and conversation.user_email != user_email:
@@ -606,6 +1065,7 @@ class TurnScheduler:
                     await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
                     return None
                 # Queue the message behind the escalation
+                await self._touch_conversation(conversation_id)
                 queue.append(
                     _QueuedMessage(
                         queue_id=self._new_queue_id(),
@@ -623,7 +1083,13 @@ class TurnScheduler:
                         delivery_id=delivery_id,
                         delivery_fallback_text=delivery_fallback_text,
                         turn_observers=tuple(turn_observers or ()),
+                        one_shot_chat_mode=one_shot_chat_mode,
                     )
+                )
+                await self._clear_redo_on_accepted_user_turn(
+                    conversation_id,
+                    content=content,
+                    system_initiated=system_initiated,
                 )
                 await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
                 last_notified_pause_id = self._escalation_notice_pause_ids.get(conversation_id)
@@ -659,10 +1125,12 @@ class TurnScheduler:
                         recoverable=True,
                     )
 
+        max_active_turns, max_queued_messages = await self._load_turn_limits()
+
         # Per-user concurrent turn limit
         if not system_initiated:
             user_active = self._user_turn_counts.get(user_email, 0)
-            if user_active >= DEFAULT_TURN_LIMIT:
+            if user_active >= max_active_turns:
                 return TurnError(
                     code="rate_limited",
                     message="Too many concurrent turns. Wait for a turn to finish.",
@@ -678,12 +1146,14 @@ class TurnScheduler:
             ):
                 await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
                 return None
-            if len(queue) >= MAX_QUEUED_MESSAGES:
+            if len(queue) >= max_queued_messages:
                 return TurnError(
                     code="queue_full",
                     message="Message queue is full. Wait for the current turn to finish.",
                     recoverable=True,
                 )
+            if not system_initiated:
+                await self._touch_conversation(conversation_id)
             queue.append(
                 _QueuedMessage(
                     queue_id=self._new_queue_id(),
@@ -700,7 +1170,13 @@ class TurnScheduler:
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
                     turn_observers=tuple(turn_observers or ()),
+                    one_shot_chat_mode=one_shot_chat_mode,
                 )
+            )
+            await self._clear_redo_on_accepted_user_turn(
+                conversation_id,
+                content=content,
+                system_initiated=system_initiated,
             )
             await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
             return None
@@ -723,7 +1199,15 @@ class TurnScheduler:
                     exc_info=True,
                 )
 
+        await self._clear_redo_on_accepted_user_turn(
+            conversation_id,
+            content=content,
+            system_initiated=system_initiated,
+        )
+
         # Launch the turn
+        if not system_initiated:
+            await self._touch_conversation(conversation_id)
         self._launch_turn(
             conversation=conversation,
             session=session,
@@ -743,15 +1227,21 @@ class TurnScheduler:
             turn_observers=tuple(turn_observers or ()),
             client_message_id=client_message_id,
             queue_id=queued_message_id,
+            one_shot_chat_mode=one_shot_chat_mode,
         )
         return None
 
-    async def cancel_turn(self, conversation_id: str) -> bool:
-        """Cancel the active turn and all its child sub-sessions."""
+    async def cancel_turn(self, conversation_id: str, *, clear_queue: bool = True) -> bool:
+        """Cancel the active turn and all its child sub-sessions.
+
+        ``clear_queue`` is reserved for explicit user stop commands. UI stop
+        controls should cancel only the active turn so already queued messages
+        remain pending and run after the cancelled turn settles.
+        """
         control = self._turn_controls.get(conversation_id)
         queue = self._queued_messages.get(conversation_id)
         cleared_queue = False
-        if queue is not None:
+        if clear_queue and queue is not None:
             cleared_queue = bool(queue)
             for queued in queue:
                 if queued.follow_up is not None:
@@ -809,6 +1299,97 @@ class TurnScheduler:
             queued.snapshot(position=index + 1)
             for index, queued in enumerate(self._queued_messages.get(conversation_id, []))
         ]
+
+    async def _load_turn_limits(self) -> tuple[int, int]:
+        """Load user/conversation turn limits from DB-backed settings."""
+        if not callable(self._session_factory):
+            return DEFAULT_MAX_ACTIVE_TURNS_PER_USER, DEFAULT_MAX_QUEUED_MESSAGES
+        async with self._session_factory() as db_session:
+            max_active_turns_raw = await get_setting_value(
+                db_session,
+                "session.max_active_turns_per_user",
+                DEFAULT_MAX_ACTIVE_TURNS_PER_USER,
+            )
+            max_queued_messages_raw = await get_setting_value(
+                db_session,
+                "session.max_queued_messages",
+                DEFAULT_MAX_QUEUED_MESSAGES,
+            )
+        return (
+            _positive_int_setting(max_active_turns_raw, DEFAULT_MAX_ACTIVE_TURNS_PER_USER),
+            _positive_int_setting(max_queued_messages_raw, DEFAULT_MAX_QUEUED_MESSAGES),
+        )
+
+    async def _load_visible_conversation_title(
+        self,
+        conversation_id: str,
+        fallback: str | None,
+    ) -> str | None:
+        """Return the latest persisted title, falling back to the in-memory title."""
+
+        try:
+            async with self._session_factory() as db_session:
+                row = await queries.get_conversation(db_session, conversation_id)
+                return row.title if row is not None else fallback
+        except Exception:
+            logger.debug(
+                "turn_scheduler: failed to reload conversation title",
+                extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
+            return fallback
+
+    async def _adopt_late_intaris_title(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+    ) -> bool:
+        """Adopt a title that Intaris produced after bootstrap reasoning."""
+
+        intaris_session_id = getattr(session, "intaris_session_id", None) or session.session_id
+        if not intaris_session_id:
+            return False
+        if not hasattr(conversation, "title_source"):
+            return False
+        if not can_adopt_intaris_title(conversation):
+            return False
+
+        try:
+            intaris_session = await self._providers.guardrails.get_session(intaris_session_id)
+            title = intaris_session.title
+            if not title:
+                return False
+            async with self._session_factory() as db_session:
+                changed = await sync_intaris_title(
+                    db_session,
+                    conversation,
+                    title,
+                    updated_at=intaris_session.updated_at,
+                )
+                if changed:
+                    await db_session.commit()
+                return changed
+        except Exception:
+            logger.debug(
+                "turn_scheduler: failed to adopt late Intaris title",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation.conversation_id,
+                        "session_id": session.session_id,
+                        "intaris_session_id": intaris_session_id,
+                    }
+                },
+                exc_info=True,
+            )
+            return False
+
+    async def _handle_conversation_updated(self, event: Event) -> None:
+        """Remember realtime title updates already published via EventBus."""
+
+        conversation_id = event.data.get("conversation_id")
+        title = event.data.get("title")
+        if isinstance(conversation_id, str) and isinstance(title, str) and title.strip():
+            self._published_title_updates[conversation_id] = title
 
     async def cancel_queued_message(self, conversation_id: str, queue_id: str) -> bool:
         queue = self._queued_messages.get(conversation_id)
@@ -933,14 +1514,14 @@ class TurnScheduler:
                 await self._event_bus.publish(
                     Event(
                         type=EventType.USER_MESSAGE,
-                        data={
-                            "conversation_id": conversation_id,
-                            "session_id": self._turn_sessions.get(conversation_id),
-                            "content": queued.content,
-                            "attachments": strip_attachment_payload_bytes(queued.attachments or []),
-                            "queue_id": queued.queue_id,
-                            "client_message_id": queued.client_message_id,
-                        },
+                        data=_user_message_event_payload(
+                            conversation_id=conversation_id,
+                            session_id=self._turn_sessions.get(conversation_id),
+                            content=queued.content,
+                            attachments=strip_attachment_payload_bytes(queued.attachments or []),
+                            queue_id=queued.queue_id,
+                            client_message_id=queued.client_message_id,
+                        ),
                     )
                 )
 
@@ -1142,9 +1723,7 @@ class TurnScheduler:
         # Use submit_turn for unified serialization
         # Determine user_email from the conversation
         async with self._session_factory() as db_session:
-            from cognis.store.queries import get_conversation
-
-            row = await get_conversation(db_session, conversation_id)
+            row = await queries.get_conversation(db_session, conversation_id)
         if row is None:
             await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
             logger.warning(
@@ -1419,6 +1998,7 @@ class TurnScheduler:
         turn_observers: tuple[TurnObserver, ...] = (),
         client_message_id: str | None = None,
         queue_id: str | None = None,
+        one_shot_chat_mode: ChatMode | None = None,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
@@ -1448,6 +2028,7 @@ class TurnScheduler:
                 turn_control=control,
                 client_message_id=client_message_id,
                 queue_id=queue_id,
+                one_shot_chat_mode=one_shot_chat_mode,
             )
         )
 
@@ -1474,6 +2055,7 @@ class TurnScheduler:
         turn_observers: tuple[TurnObserver, ...] = (),
         client_message_id: str | None = None,
         queue_id: str | None = None,
+        one_shot_chat_mode: ChatMode | None = None,
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
@@ -1487,14 +2069,23 @@ class TurnScheduler:
             turn_control = _TurnControl(turn_observers=list(turn_observers))
         turn_observers = turn_control.turn_observers
 
+        resolved_chat_mode = ResolvedChatMode(mode="default", source="system_default")
         try:
             current_user_email.set(user_email)
             current_agent_id.set(agent.agent_id)
-            current_agent_owner_email.set(agent.owner_email)
+            current_agent_owner_email.set(getattr(agent, "owner_email", user_email))
             conversation_context = getattr(conversation, "context", None)
             platform_data = getattr(conversation_context, "platform_data", None) or {}
+            resolved_chat_mode = resolve_chat_mode(
+                conversation=conversation,
+                agent=agent,
+                one_shot_mode=one_shot_chat_mode,
+            )
             current_workspace_root.set(platform_data.get("workspace_root"))
             current_effective_working_directory.set(platform_data.get("working_directory"))
+            refresh_policy = getattr(self._session_manager, "refresh_intaris_session_policy", None)
+            if refresh_policy is not None:
+                await refresh_policy(session)
 
             if attachment_notice:
                 await self._notify_observers_system_message(
@@ -1524,6 +2115,8 @@ class TurnScheduler:
                         "session_id": session.session_id,
                         "message_id": message_id,
                         "turn_id": turn_id,
+                        "chat_mode": resolved_chat_mode.mode,
+                        "chat_mode_source": resolved_chat_mode.source,
                         "system_initiated": system_initiated,
                     },
                 )
@@ -1536,17 +2129,19 @@ class TurnScheduler:
                 await self._event_bus.publish(
                     Event(
                         type=EventType.USER_MESSAGE,
-                        data={
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "content": content,
-                            "turn_id": turn_id,
-                            "attachments": [
+                        data=_user_message_event_payload(
+                            conversation_id=conversation_id,
+                            session_id=session.session_id,
+                            content=content,
+                            turn_id=turn_id,
+                            chat_mode=resolved_chat_mode.mode,
+                            chat_mode_source=resolved_chat_mode.source,
+                            attachments=[
                                 item.model_dump(mode="json") for item in (attachments or [])
                             ],
-                            "client_message_id": client_message_id,
-                            "queue_id": queue_id,
-                        },
+                            client_message_id=client_message_id,
+                            queue_id=queue_id,
+                        ),
                     )
                 )
 
@@ -1559,12 +2154,11 @@ class TurnScheduler:
             else:
                 decision = None
 
-            # Handle delegation
-            if decision is not None and decision.decision == "delegate":
+            if decision is not None and getattr(decision, "decision", None) == "delegate":
                 workflow_id = await self._select_workflow(
                     agent,
                     content,
-                    project_id=conversation.project_id,
+                    project_id=getattr(conversation, "project_id", None),
                 )
                 task = await self._task_queue.submit(
                     created_by=user_email,
@@ -1575,13 +2169,11 @@ class TurnScheduler:
                     source_ref=conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
-                    project_id=conversation.project_id,
+                    project_id=getattr(conversation, "project_id", None),
                     workspace_root=current_workspace_root.get(),
                     working_directory=current_effective_working_directory.get(),
                     status="queued",
                 )
-
-                # Notify observers about delegation
                 await self._notify_observers(
                     conversation_id,
                     "on_system_message",
@@ -1589,7 +2181,6 @@ class TurnScheduler:
                     "Working on that in the background.",
                     turn_observers=turn_observers,
                 )
-
                 result = TurnResult(
                     conversation_id=conversation_id,
                     session_id=session.session_id,
@@ -1601,7 +2192,9 @@ class TurnScheduler:
                     channel_deliverable=channel_deliverable,
                     delivery_id=delivery_id,
                     delivery_fallback_text=delivery_fallback_text,
-                    attachments=normalize_attachment_refs(outbound_attachments or []),
+                    attachments=normalize_attachment_refs(outbound_attachments or []) or None,
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
                 )
                 turn_control.settled = True
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
@@ -1610,7 +2203,13 @@ class TurnScheduler:
                 return
 
             # Build streaming callbacks from observers
-            on_token, on_thinking, on_tool_call, on_tool_result = self._build_callbacks(
+            (
+                on_token,
+                on_thinking,
+                on_tool_call,
+                on_tool_result,
+                on_tool_output_chunk,
+            ) = self._build_callbacks(
                 conversation_id,
                 session.session_id,
                 message_id,
@@ -1633,9 +2232,11 @@ class TurnScheduler:
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
+                on_tool_output_chunk=on_tool_output_chunk,
                 cancel_event=cancel_event,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 turn_id=turn_id,
+                chat_mode=resolved_chat_mode,
                 consume_boundary_batch=lambda reason: self._consume_queued_batch_for_active_turn(
                     conversation_id,
                     reason=reason,
@@ -1643,7 +2244,8 @@ class TurnScheduler:
             )
 
             # Post-turn housekeeping
-            await self._touch_conversation(conversation_id)
+            completed_at = datetime.now(UTC)
+            await self._touch_conversation(conversation_id, when=completed_at)
 
             last_seq = 0
             try:
@@ -1665,8 +2267,22 @@ class TurnScheduler:
 
             context_usage = self._session_cache.get_context_usage(session.session_id)
 
-            # Check title change
-            title_changed = bool(conversation.title and conversation.title != _pre_turn_title)
+            await self._adopt_late_intaris_title(conversation, session)
+            latest_title = await self._load_visible_conversation_title(
+                conversation_id,
+                conversation.title,
+            )
+            if latest_title is not None:
+                conversation.title = latest_title
+
+            # Check title change against the persisted row because Intaris title
+            # sync may commit through a separate DB session inside the agent loop.
+            already_published_title = self._published_title_updates.get(conversation_id)
+            title_changed = bool(
+                latest_title
+                and latest_title != _pre_turn_title
+                and latest_title != already_published_title
+            )
 
             result = TurnResult(
                 conversation_id=conversation_id,
@@ -1676,7 +2292,7 @@ class TurnScheduler:
                 last_seq=last_seq,
                 context_usage=context_usage,
                 title_changed=title_changed,
-                new_title=conversation.title if title_changed else None,
+                new_title=latest_title if title_changed else None,
                 final_content=(
                     step_output.content.strip()
                     if step_output and step_output.content.strip()
@@ -1700,6 +2316,9 @@ class TurnScheduler:
                     )
                     or None
                 ),
+                completed_at=completed_at,
+                chat_mode=resolved_chat_mode.mode,
+                chat_mode_source=resolved_chat_mode.source,
             )
             turn_control.settled = True
             await self._publish_turn_completed(result, turn_observers=turn_observers)
@@ -1737,6 +2356,8 @@ class TurnScheduler:
                 delivery_fallback_text=(
                     turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                 ),
+                chat_mode=resolved_chat_mode.mode,
+                chat_mode_source=resolved_chat_mode.source,
                 turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
@@ -1761,6 +2382,8 @@ class TurnScheduler:
                 delivery_fallback_text=(
                     turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                 ),
+                chat_mode=resolved_chat_mode.mode,
+                chat_mode_source=resolved_chat_mode.source,
                 turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="error").inc()
@@ -1821,6 +2444,7 @@ class TurnScheduler:
                         queued_message_id=queued.queue_id,
                         prepared_attachment_notice=queued.attachment_notice,
                         prepared_attachment_context=queued.attachment_context,
+                        one_shot_chat_mode=queued.one_shot_chat_mode,
                     )
                     await self._notify_queue_updated(
                         conversation_id, turn_observers=queued.turn_observers
@@ -1851,7 +2475,7 @@ class TurnScheduler:
         turn_id: str | None,
         *,
         turn_observers: tuple[TurnObserver, ...] = (),
-    ) -> tuple[Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
@@ -1888,6 +2512,11 @@ class TurnScheduler:
             title: str | None,
             complete: bool,
             content: str | None = None,
+            started_at: str | None = None,
+            completed_at: str | None = None,
+            duration_ms: int | None = None,
+            source: str | None = None,
+            provider_block_index: int | None = None,
         ) -> None:
             if hasattr(self._session_cache, "update_active_thinking"):
                 self._session_cache.update_active_thinking(
@@ -1899,6 +2528,11 @@ class TurnScheduler:
                     title=title,
                     complete=complete,
                     content=content,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    duration_ms=duration_ms,
+                    source=source,
+                    provider_block_index=provider_block_index,
                 )
             await asyncio.gather(
                 *(
@@ -1915,6 +2549,11 @@ class TurnScheduler:
                         title,
                         complete,
                         content,
+                        started_at,
+                        completed_at,
+                        duration_ms,
+                        source,
+                        provider_block_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1927,6 +2566,15 @@ class TurnScheduler:
             call_id: str,
             arguments: dict[str, Any] | None = None,
         ) -> None:
+            if tool_name == "delegate" and isinstance(arguments, dict):
+                arguments = {
+                    "title": arguments.get("title")
+                    or arguments.get("task_title")
+                    or "Delegated work",
+                    "agent_id": arguments.get("agent_id") or arguments.get("used_agent_id"),
+                    "wait": bool(arguments.get("wait", False)),
+                    "input_redacted": True,
+                }
             await self._reset_active_stream(conversation_id)
             await asyncio.gather(
                 *(
@@ -1956,7 +2604,25 @@ class TurnScheduler:
             evaluation: dict[str, Any] | None = None,
             attachments: list[dict[str, Any]] | None = None,
             file_diffs: list[dict[str, Any]] | None = None,
+            presentation: dict[str, Any] | None = None,
         ) -> None:
+            metadata = (
+                presentation.get("tool_output_presentation")
+                if isinstance(presentation, dict)
+                else None
+            )
+            if not isinstance(metadata, dict):
+                metadata = presentation if isinstance(presentation, dict) else None
+            await self._finalize_active_tool_output(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                turn_id=turn_id,
+                result=result,
+                is_error=is_error,
+                metadata=metadata,
+            )
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -1974,6 +2640,7 @@ class TurnScheduler:
                         attachments,
                         file_diffs,
                         turn_id,
+                        presentation,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -1981,7 +2648,44 @@ class TurnScheduler:
                 )
             )
 
-        return on_token, on_thinking, on_tool_call, on_tool_result
+        async def on_tool_output_chunk(
+            call_id: str,
+            tool_name: str,
+            delta: str,
+            stream: str | None = None,
+        ) -> None:
+            chunk_index, content_offset = await self._append_active_tool_output_chunk(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                turn_id=turn_id,
+                delta=delta,
+                stream=stream,
+            )
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_tool_output_chunk,
+                        conversation_id,
+                        session_id,
+                        call_id,
+                        tool_name,
+                        delta,
+                        stream,
+                        turn_id,
+                        chunk_index,
+                        content_offset,
+                    )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                )
+            )
+
+        return on_token, on_thinking, on_tool_call, on_tool_result, on_tool_output_chunk
 
     def _iter_observers(
         self,
@@ -2076,6 +2780,13 @@ class TurnScheduler:
                     "delivery_id": result.delivery_id,
                     "delivery_fallback_text": result.delivery_fallback_text,
                     "final_content": result.final_content,
+                    "completed_at": (
+                        result.completed_at.isoformat()
+                        if result.completed_at is not None
+                        else datetime.now(UTC).isoformat()
+                    ),
+                    "chat_mode": result.chat_mode,
+                    "chat_mode_source": result.chat_mode_source,
                     "attachments": strip_attachment_payload_bytes(result.attachments or []),
                 },
             )
@@ -2092,6 +2803,8 @@ class TurnScheduler:
         channel_deliverable: bool = False,
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
+        chat_mode: ChatMode = "default",
+        chat_mode_source: str = "system_default",
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
@@ -2119,6 +2832,8 @@ class TurnScheduler:
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "turn_id": turn_id,
+                    "chat_mode": chat_mode,
+                    "chat_mode_source": chat_mode_source,
                     "error_code": error.code,
                     "error_message": error.message,
                     "recoverable": error.recoverable,
@@ -2138,7 +2853,14 @@ class TurnScheduler:
         *args: Any,
     ) -> None:
         try:
-            await asyncio.wait_for(callback(*args), timeout=1.0)
+            awaitable = callback(*args)
+        except TypeError:
+            trimmed_args = _trim_callback_args(callback, args)
+            if len(trimmed_args) == len(args):
+                raise
+            awaitable = callback(*trimmed_args)
+        try:
+            await asyncio.wait_for(awaitable, timeout=1.0)
         except Exception:
             key = (conversation_id, id(observer))
             self._observer_failures[key] += 1
@@ -2163,100 +2885,6 @@ class TurnScheduler:
                 )
         else:
             self._observer_failures.pop((conversation_id, id(observer)), None)
-
-    # ------------------------------------------------------------------
-    # Workflow selection
-    # ------------------------------------------------------------------
-
-    async def _select_workflow(
-        self,
-        agent: Any,
-        task_description: str,
-        *,
-        project_id: str | None = None,
-    ) -> str:
-        """Select the best workflow for a delegated task."""
-        execution = agent.execution or {}
-        available_ids = execution.get("available_workflow_ids")
-        available_workflows = await self._workflow_registry.list_all(
-            owner_email=agent.owner_email,
-            project_id=project_id,
-        )
-        project_workflow_ids: set[str] = set()
-        if project_id is not None:
-            from cognis.store.queries import list_project_workflow_ids
-
-            async with self._session_factory() as db_session:
-                project_workflow_ids = set(await list_project_workflow_ids(db_session, project_id))
-        if isinstance(available_ids, list) and available_ids:
-            available_workflows = [
-                w for w in available_workflows if w.workflow_id in set(available_ids)
-            ]
-        workflow_candidates = [
-            {
-                "workflow_id": workflow.workflow_id,
-                "name": workflow.name,
-                "description": workflow.description,
-                "criteria": workflow.criteria,
-                "tags": list(workflow.tags),
-                "project_bound": workflow.workflow_id in project_workflow_ids,
-            }
-            for workflow in available_workflows
-        ]
-        async with self._session_factory() as session:
-            resolved_skills = await resolve_skills_for_agent(
-                session,
-                agent,
-                owner_email=agent.owner_email,
-            )
-        for skill in resolved_skills.skills:
-            if not skill.attached or not skill.steps:
-                continue
-            workflow_candidates.append(
-                {
-                    "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
-                    "name": f"Skill: {skill.name}",
-                    "description": skill.description,
-                    "criteria": skill_workflow_criteria(skill),
-                    "tags": list(skill.tags),
-                    "candidate_type": "skill_workflow",
-                }
-            )
-        if not workflow_candidates:
-            default_workflow_id = execution.get("default_workflow_id")
-            if isinstance(default_workflow_id, str):
-                resolved_default = await self._workflow_registry.get(
-                    default_workflow_id,
-                    owner_email=agent.owner_email,
-                    project_id=project_id,
-                )
-                if resolved_default is not None:
-                    return default_workflow_id
-            return "system:general-task"
-        from cognis.core.decision import select_workflow
-
-        selection = await select_workflow(
-            llm=self._providers.llm,
-            task_description=task_description,
-            available_workflows=workflow_candidates,
-            default_workflow_id=execution.get("default_workflow_id", "system:general-task"),
-            selection_mode=execution.get("workflow_selection_mode", "automatic"),
-        )
-        selected_skill_id = decode_skill_workflow_candidate_id(selection.workflow_id)
-        if selected_skill_id is None:
-            return selection.workflow_id
-        try:
-            created_workflow = await materialize_skill_workflow(
-                session_factory=self._session_factory,
-                owner_email=agent.owner_email,
-                skill_id=selected_skill_id,
-                lifecycle="ephemeral",
-                composition_source="agent_composed",
-                composition_intent=task_description,
-            )
-        except ValueError:
-            return execution.get("default_workflow_id", "system:general-task")
-        return created_workflow.workflow_id
 
     # ------------------------------------------------------------------
     # Error classification
@@ -2383,7 +3011,14 @@ class TurnScheduler:
                             False,
                         )
 
-                compaction_summary = await self._read_compaction_summary(session_model)
+                compaction_summary, tail_start_seq = await self._read_compaction_metadata(
+                    session_model
+                )
+                tail_events = (
+                    await self._read_tail_events(session_model, tail_start_seq)
+                    if tail_start_seq is not None
+                    else None
+                )
                 intention = user_message[:200] if user_message else "Continued conversation"
                 if compaction_summary:
                     intention = f"Continuation: {intention}"
@@ -2394,22 +3029,24 @@ class TurnScheduler:
                         intention=intention,
                         completion_reason="compacted",
                         compaction_summary=compaction_summary,
+                        tail_events=tail_events,
                     )
                     ROTATION_TOTAL.labels(trigger="deferred").inc()
+                    if tail_events:
+                        from cognis.core.compaction import COMPACTION_DEFERRED_TAIL_SEEDED
+
+                        COMPACTION_DEFERRED_TAIL_SEEDED.inc(len(tail_events))
                 except Exception as exc:
                     raise SessionCreationFailedError(
                         "Could not create session after compaction"
                     ) from exc
                 conversation_model.active_session_id = new_session.session_id
 
-                # Pre-populate session cache with compaction summary
+                # Pre-populate session cache — rotate_session already seeds tail
+                # events via _seed_rotated_tail_events, so we only need a refresh
+                # here (no manual apply_compaction with compaction_seq=0).
                 if compaction_summary:
                     await self._session_cache.refresh(new_session)
-                    await self._session_cache.apply_compaction(
-                        new_session,
-                        summary=compaction_summary,
-                        compaction_seq=0,
-                    )
 
                 logger.info(
                     "turn_scheduler: deferred session created after compaction",
@@ -2433,8 +3070,15 @@ class TurnScheduler:
 
         return conversation_model, session_model, agent_model, False
 
-    async def _read_compaction_summary(self, session: SessionModel) -> str | None:
-        """Read the last compaction_summary event from a completed session."""
+    async def _read_compaction_metadata(
+        self, session: SessionModel
+    ) -> tuple[str | None, int | None]:
+        """Read the last compaction_summary event from a completed session.
+
+        Returns ``(summary, tail_start_seq)`` so the deferred-rotation path
+        can re-fetch the preserved tail events and seed them into the new
+        session via ``rotate_session(tail_events=...)``.
+        """
         try:
             result = await self._providers.guardrails.read_events(
                 session_id=session.intaris_session_id or session.session_id,
@@ -2443,24 +3087,88 @@ class TurnScheduler:
             )
             for event in reversed(result.events):
                 if event.get("type") == "compaction_summary":
-                    return event.get("data", {}).get("summary")
+                    data = event.get("data", {})
+                    return data.get("summary"), data.get("tail_start_seq")
         except Exception:
             logger.warning(
-                "turn_scheduler: failed to read compaction summary",
+                "turn_scheduler: failed to read compaction metadata",
                 extra={"extra_data": {"session_id": session.session_id}},
             )
-        return None
+        return None, None
 
-    async def _touch_conversation(self, conversation_id: str) -> None:
+    async def _read_tail_events(
+        self, session: SessionModel, tail_start_seq: int
+    ) -> list[Any] | None:
+        """Fetch the preserved tail events from the old session's Intaris stream.
+
+        These are the events that were kept verbatim after compaction.  We
+        re-fetch them so ``rotate_session`` can seed them into the new session
+        via ``_seed_rotated_tail_events``, restoring continuity that would
+        otherwise be lost in the deferred-rotation path.
+
+        Returns a list of simple namespace objects with ``.type``, ``.data``,
+        and ``.seq`` attributes, matching what ``_seed_rotated_tail_events``
+        expects (it uses ``getattr`` for all three fields).
+        """
+        # Content event types to carry forward; skip system/compaction markers.
+        _TAIL_EVENT_TYPES = {
+            "user_message",
+            "assistant_message",
+            "assistant_thinking",
+            "tool_call",
+            "tool_result",
+            "delegation",
+        }
+
+        class _TailEvent:
+            """Lightweight wrapper so _seed_rotated_tail_events can use getattr."""
+
+            __slots__ = ("type", "data", "seq")
+
+            def __init__(self, etype: str, data: dict[str, Any], seq: int | None) -> None:
+                self.type = etype
+                self.data = data
+                self.seq = seq
+
+        try:
+            result = await self._providers.guardrails.read_events(
+                session_id=session.intaris_session_id or session.session_id,
+                after_seq=tail_start_seq - 1,
+                allow_missing_stream=True,
+            )
+            wrapped = [
+                _TailEvent(
+                    etype=e["type"],
+                    data=e.get("data", {}),
+                    seq=e.get("seq"),
+                )
+                for e in result.events
+                if isinstance(e, dict) and e.get("type") in _TAIL_EVENT_TYPES
+            ]
+            return wrapped or None
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to read tail events for deferred rotation",
+                extra={
+                    "extra_data": {
+                        "session_id": session.session_id,
+                        "tail_start_seq": tail_start_seq,
+                    }
+                },
+            )
+            return None
+
+    async def _touch_conversation(
+        self, conversation_id: str, *, when: datetime | None = None
+    ) -> None:
         """Update last_message_at on the conversation for unread tracking."""
         try:
-            from cognis.store.queries import get_conversation
-
             async with self._session_factory() as db_session:
-                row = await get_conversation(db_session, conversation_id)
+                row = await queries.get_conversation(db_session, conversation_id)
                 if row is not None:
-                    row.last_message_at = datetime.now(UTC)
-                    row.updated_at = row.last_message_at
+                    timestamp = when or datetime.now(UTC)
+                    row.last_message_at = timestamp
+                    row.updated_at = timestamp
                     await db_session.commit()
         except Exception:
             logger.warning(

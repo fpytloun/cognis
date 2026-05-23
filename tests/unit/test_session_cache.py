@@ -430,10 +430,18 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
         session,
         prompt_tokens=2_000,
         max_context_tokens=8_000,
+        max_input_tokens=6_000,
+        available_prompt_tokens=6_000,
         model="gpt-5.4",
         provider_id="proxy",
         reserve_output_tokens=1_000,
         effective_reserve_output_tokens=1_000,
+        compaction_threshold=0.85,
+        projection_policy={
+            "phase": "within_turn",
+            "pressure_mode": "normal",
+            "steady_target_tokens": 5_000,
+        },
     )
     cache.update_last_llm_usage(
         session.session_id,
@@ -451,6 +459,15 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
 
     assert usage is not None
     assert usage["provider_id"] == "proxy"
+    assert usage["max_input_tokens"] == 6_000
+    assert usage["available_prompt_tokens"] == 6_000
+    assert usage["effective_prompt_budget"] == 6_000
+    assert usage["compaction_threshold"] == 0.85
+    assert usage["projection_policy"] == {
+        "phase": "within_turn",
+        "pressure_mode": "normal",
+        "steady_target_tokens": 5_000,
+    }
     assert usage["last_llm_usage"] == {
         "prompt_tokens": 1_500,
         "completion_tokens": 200,

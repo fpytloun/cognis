@@ -22,6 +22,7 @@ from cognis.models.tool import (
     ToolCall,
     ToolResult,
 )
+from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 from cognis.tools.executor.lsp.runtime import (
     LSP_STATUS_CAPABILITY,
@@ -113,10 +114,12 @@ class WebSocketExecutorConnection:
 
         # LLM inference streaming queues (request_id → queue)
         self._inference_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._tool_chunk_callbacks: dict[str, ToolOutputChunkCallback] = {}
 
         # Channel adapter notification callbacks (account_id → callback)
         self._channel_message_callbacks: dict[str, Any] = {}
         self._channel_status_callbacks: dict[str, Any] = {}
+        self._background_shell_completed_callback: Any | None = None
 
     @property
     def connected(self) -> bool:
@@ -205,9 +208,14 @@ class WebSocketExecutorConnection:
         return result.get("tools", [])
 
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
     ) -> ToolResult:
         """Execute a tool call on the remote executor."""
+        if output_chunk_callback is not None:
+            self._tool_chunk_callbacks[tool_call.call_id] = output_chunk_callback
         try:
             result = await self.rpc_call(
                 "tool.execute",
@@ -241,6 +249,8 @@ class WebSocketExecutorConnection:
         except Exception as exc:
             error_detail = str(exc)[:500]
             return ToolResult(output=f"Tool execution failed: {error_detail}", is_error=True)
+        finally:
+            self._tool_chunk_callbacks.pop(tool_call.call_id, None)
 
     async def cancel_call(self, call_id: str) -> None:
         """Cancel a running tool execution on the remote executor."""
@@ -288,9 +298,7 @@ class WebSocketExecutorConnection:
             while True:
                 chunk = await asyncio.wait_for(queue.get(), timeout=120.0)
                 if chunk.get("done"):
-                    # Final message — yield usage info and stop
-                    if chunk.get("usage"):
-                        yield chunk
+                    yield chunk
                     break
                 if chunk.get("error"):
                     yield {"error": chunk["error"], "mid_stream_failure": True}
@@ -338,6 +346,14 @@ class WebSocketExecutorConnection:
         """Fetch normalized LSP status from a remote executor."""
         return await self.rpc_call("lsp.status", {}, timeout=_LSP_STATUS_TIMEOUT_SECONDS)
 
+    async def background_shell_status(self, *, include_completed: bool = False) -> dict[str, Any]:
+        """Fetch background shell status from a remote executor."""
+        return await self.rpc_call(
+            "shell.background_status",
+            {"include_completed": include_completed},
+            timeout=10.0,
+        )
+
     # ------------------------------------------------------------------
     # Background receiver
     # ------------------------------------------------------------------
@@ -378,14 +394,23 @@ class WebSocketExecutorConnection:
                 if method == "executor.heartbeat":
                     self.last_heartbeat = datetime.now(UTC)
                 elif method == "tool.progress":
-                    # Tool progress — currently logged, could be forwarded
-                    # to event bus in the future
+                    params = data.get("params", {})
+                    call_id = str(params.get("call_id") or "")
+                    chunk = params.get("delta")
+                    if chunk is None:
+                        chunk = params.get("content")
+                    if chunk is None:
+                        chunk = params.get("text")
+                    callback = self._tool_chunk_callbacks.get(call_id)
+                    if callback is not None and chunk is not None:
+                        stream = params.get("stream")
+                        await callback(str(chunk), str(stream) if stream is not None else None)
                     _logger.debug(
                         "executor_ws: tool progress",
                         extra={
                             "extra_data": {
                                 "executor_id": self.executor_id,
-                                "call_id": data.get("params", {}).get("call_id"),
+                                "call_id": call_id,
                             }
                         },
                     )
@@ -400,6 +425,15 @@ class WebSocketExecutorConnection:
                     if req_id and req_id in self._inference_queues:
                         params["done"] = True
                         self._inference_queues[req_id].put_nowait(params)
+                elif method == "shell.background_completed":
+                    params = data.get("params", {})
+                    if self._background_shell_completed_callback is not None:
+                        asyncio.create_task(
+                            self._background_shell_completed_callback(
+                                self.executor_id,
+                                params if isinstance(params, dict) else {},
+                            )
+                        )
                 elif method == "channel.message":
                     params = data.get("params", {})
                     acct_id = params.get("account_id")
@@ -454,6 +488,11 @@ class WebSocketExecutorConnection:
         self._channel_message_callbacks.pop(account_id, None)
         self._channel_status_callbacks.pop(account_id, None)
 
+    def register_background_shell_completed_callback(self, callback: Any | None) -> None:
+        """Register a callback for background shell completion notifications."""
+
+        self._background_shell_completed_callback = callback
+
     def _fail_pending(self, reason: str) -> None:
         """Fail all pending RPC futures with a disconnection error."""
         for future in self._pending.values():
@@ -480,6 +519,7 @@ class WebSocketExecutorProvider:
         self._connections: dict[str, WebSocketExecutorConnection] = {}
         self._handles: dict[str, ExecutorHandle] = {}
         self._ready_events: dict[str, asyncio.Event] = {}
+        self._background_shell_completed_callback: Any | None = None
 
     # ------------------------------------------------------------------
     # Called by the WS endpoint when an executor connects
@@ -500,6 +540,7 @@ class WebSocketExecutorProvider:
         drive the receiver loop.
         """
         conn = WebSocketExecutorConnection(ws, executor_id, capabilities or ExecutorCapabilities())
+        conn.register_background_shell_completed_callback(self._background_shell_completed_callback)
         conn.start_receiver()
 
         # If this is a reconnection, close the old connection so its receiver
@@ -594,6 +635,20 @@ class WebSocketExecutorProvider:
         if handle is None:
             return None
         return dict(handle.metadata)
+
+    def register_background_shell_completed_callback(self, callback: Any | None) -> None:
+        """Register callback for all current and future executor shell completions."""
+
+        self._background_shell_completed_callback = callback
+        for connection in self._connections.values():
+            connection.register_background_shell_completed_callback(callback)
+
+    def first_ready_connection(self) -> WebSocketExecutorConnection | None:
+        for executor_id, conn in self._connections.items():
+            handle = self._handles.get(executor_id)
+            if conn.connected and handle is not None and handle.status == "ready":
+                return conn
+        return None
 
     # ------------------------------------------------------------------
     # ExecutorProvider protocol

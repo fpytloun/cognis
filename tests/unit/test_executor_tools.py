@@ -6,7 +6,9 @@ import asyncio
 import math
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from cognis.models.tool import ExecutorHandle
@@ -29,7 +31,12 @@ from cognis.tools.executor.filesystem import (
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
 from cognis.tools.executor.search import handle_glob, handle_grep
-from cognis.tools.executor.shell import handle_bash, handle_bash_kill, handle_bash_output
+from cognis.tools.executor.shell import (
+    handle_bash,
+    handle_bash_kill,
+    handle_bash_output,
+    list_background_shell_statuses,
+)
 from cognis.tools.registry import ToolExecutionContext
 
 _DUMMY_CONTEXT = ToolExecutionContext(
@@ -522,6 +529,48 @@ class TestWriteTool:
         assert "host does not match" in result.output
         assert not target.exists()
 
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_reports_controller_http_status(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "tool.py"
+        context = _context(
+            runtime_metadata={
+                "controller_url": "wss://controller.test/api/executor/ws",
+                "skill_manifests": [
+                    {
+                        "skill_id": "url-skill",
+                        "asset_manifest": [
+                            {
+                                "filename": "tool.py",
+                                "asset_id": "sa-url",
+                                "url": "https://controller.test/api/v1/artifacts/content/skills/ska/tool.py",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        response = httpx.Response(
+            404,
+            content=b'{"error":{"message":"Artifact not found"}}',
+            request=httpx.Request("GET", "https://controller.test/asset"),
+        )
+        client = AsyncMock()
+        client.get.return_value = response
+
+        with patch("httpx.AsyncClient") as client_cls:
+            client_cls.return_value.__aenter__.return_value = client
+            result = await handle_skill_asset_materialize(
+                {"skill_id": "url-skill", "asset_id": "sa-url", "target_path": str(target)},
+                context,
+            )
+
+        assert result.is_error
+        assert "failed to fetch controller-provided asset URL (HTTP 404" in result.output
+        assert "Artifact not found" in result.output
+        assert not target.exists()
+
 
 class TestEditTool:
     """Test the edit filesystem tool."""
@@ -859,6 +908,46 @@ class TestApplyPatchTool:
         assert calls == [target]
 
     @pytest.mark.asyncio()
+    async def test_apply_patch_does_not_wait_when_lsp_already_pending(self, tmp_path: Path) -> None:
+        target = tmp_path / "pending_lsp.py"
+        target.write_text("x = 1\n")
+
+        class _PendingLSP:
+            def __init__(self) -> None:
+                self.wait_calls = 0
+                self.warm_calls = 0
+
+            def has_pending_diagnostics(self, _paths: list[str]) -> bool:
+                return True
+
+            async def touch_file(self, _path: str, *, wait: bool = True) -> None:
+                if wait:
+                    self.wait_calls += 1
+                else:
+                    self.warm_calls += 1
+
+            def get_diagnostics(self, *_: object) -> dict[str, list[object]]:
+                return {}
+
+        lsp = _PendingLSP()
+        context = _context(runtime_metadata={"lsp_manager": lsp})
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-x = 1\n+x = 2\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "x = 2\n"
+        assert lsp.wait_calls == 0
+        assert lsp.warm_calls >= 1
+
+    @pytest.mark.asyncio()
     async def test_apply_patch_delete_success(self, tmp_path: Path) -> None:
         target = tmp_path / "delete.txt"
         target.write_text("hello\n")
@@ -1027,7 +1116,9 @@ class TestApplyPatchTool:
         assert "Use the read tool first" in result.output
 
     @pytest.mark.asyncio()
-    async def test_apply_patch_ambiguous_hunk_fails(self, tmp_path: Path) -> None:
+    async def test_apply_patch_repeated_hunk_uses_first_match_like_codex(
+        self, tmp_path: Path
+    ) -> None:
         target = tmp_path / "ambiguous.txt"
         target.write_text("hello\nhello\n")
         context = _context()
@@ -1040,8 +1131,90 @@ class TestApplyPatchTool:
             context,
         )
 
-        assert result.is_error
-        assert "multiple locations" in result.output
+        assert not result.is_error
+        assert target.read_text() == "hi\nhello\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_repeated_hunks_advance_from_previous_match(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "ordered.txt"
+        target.write_text("hello\nhello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n@@\n-hello\n+bye\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\nbye\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_context_anchor_selects_later_repeated_block(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "anchored.txt"
+        target.write_text("class One:\n    value = 1\n\nclass Two:\n    value = 1\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@ class Two:\n-    value = 1\n+    value = 2\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "class One:\n    value = 1\n\nclass Two:\n    value = 2\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_matches_with_codex_whitespace_tolerance(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "whitespace.txt"
+        target.write_text("    hello   \n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": f"*** Begin Patch\n*** Update File: {target}\n@@\n-hello\n+hi\n*** End Patch\n"
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_matches_with_codex_unicode_punctuation_tolerance(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "unicode.txt"
+        target.write_text("local import – avoids top‑level dep\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n@@\n-local import - avoids top-level dep\n+local import ok\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "local import ok\n"
 
     @pytest.mark.asyncio()
     async def test_apply_patch_no_write_on_prevalidation_failure(self, tmp_path: Path) -> None:
@@ -1547,6 +1720,30 @@ class TestBashTool:
         assert "hello" in result.output
 
     @pytest.mark.asyncio()
+    async def test_bash_streams_foreground_output_chunks(self, tmp_path: Path) -> None:
+        chunks: list[tuple[str, str | None]] = []
+        context = _context()
+
+        async def _on_chunk(delta: str, stream: str | None) -> None:
+            chunks.append((delta, stream))
+
+        context.output_chunk_callback = _on_chunk
+
+        result = await handle_bash(
+            {
+                "command": "printf 'out\\n'; printf 'err\\n' >&2",
+                "workdir": str(tmp_path),
+            },
+            context,
+        )
+
+        assert result.is_error is False
+        assert "out" in result.output
+        assert "err" in result.output
+        assert ("out\n", "stdout") in chunks
+        assert ("err\n", "stderr") in chunks
+
+    @pytest.mark.asyncio()
     async def test_bash_rejects_python_file_rewrite_one_liner(self) -> None:
         result = await handle_bash(
             {"command": "python -c \"from pathlib import Path; Path('x.py').write_text('x=1')\""},
@@ -1791,8 +1988,8 @@ class TestBashTool:
     def test_bash_tool_timeout_allows_max_foreground_cleanup(self) -> None:
         from cognis.tools.executor import shell as shell_module
 
-        max_foreground_timeout_ms = getattr(shell_module, "_MAX_FOREGROUND_TIMEOUT_MS")
-        cleanup_grace_seconds = getattr(shell_module, "_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS")
+        max_foreground_timeout_ms = shell_module._MAX_FOREGROUND_TIMEOUT_MS
+        cleanup_grace_seconds = shell_module._FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS
         max_timeout_seconds = math.ceil(max_foreground_timeout_ms / 1000)
         assert BASH_TOOL.timeout_seconds >= max_timeout_seconds + cleanup_grace_seconds
 
@@ -1845,6 +2042,116 @@ class TestBashTool:
         stopped = await handle_bash_kill({"shell_id": shell_id}, read_ctx)
         assert not stopped.is_error
         assert shell_id in stopped.output
+
+    @pytest.mark.asyncio()
+    async def test_background_bash_status_includes_description_and_executor(self) -> None:
+        shared_runtime_metadata: dict[str, Any] = {}
+        ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="exec-a", executor_type="in_process"),
+            runtime_metadata={
+                "runtime_access": {
+                    "conversation_id": "conv-1",
+                    "session_id": "sess-1",
+                    "agent_id": "agent-1",
+                },
+                "turn_id": "turn-1",
+                "tool_call_id": "call-1",
+            },
+            shared_runtime_metadata=shared_runtime_metadata,
+        )
+
+        start = await handle_bash(
+            {
+                "command": "python -u -c \"import time; print('ready'); time.sleep(5)\"",
+                "description": "Run slow regression tests",
+                "run_in_background": True,
+            },
+            ctx,
+        )
+
+        assert not start.is_error
+        shell_id = str((start.metadata or {}).get("shell_id"))
+
+        statuses = await list_background_shell_statuses(shared_runtime_metadata)
+        assert len(statuses) == 1
+        status = statuses[0]
+        assert status["shell_id"] == shell_id
+        assert status["description"] == "Run slow regression tests"
+        assert status["executor_id"] == "exec-a"
+        assert status["executor_type"] == "in_process"
+        assert status["conversation_id"] == "conv-1"
+        assert isinstance(status["pid"], int)
+
+        stopped = await handle_bash_kill({"shell_id": shell_id}, ctx)
+        assert not stopped.is_error
+
+    @pytest.mark.asyncio()
+    async def test_background_bash_completion_callback_fires_once(self) -> None:
+        notifications: list[dict[str, Any]] = []
+
+        async def _completed(status: dict[str, Any]) -> None:
+            notifications.append(status)
+
+        ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="exec-a", executor_type="in_process"),
+            runtime_metadata={
+                "runtime_access": {"conversation_id": "conv-1", "agent_id": "agent-1"},
+                "background_shell_completion_callback": _completed,
+            },
+            shared_runtime_metadata={},
+        )
+
+        start = await handle_bash(
+            {
+                "command": "python -c \"print('done')\"",
+                "description": "Quick background check",
+                "run_in_background": True,
+            },
+            ctx,
+        )
+
+        assert not start.is_error
+        for _ in range(20):
+            if notifications:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(notifications) == 1
+        assert notifications[0]["description"] == "Quick background check"
+        assert notifications[0]["status"] == "completed"
+        assert notifications[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio()
+    async def test_background_bash_kill_suppresses_completion_callback(self) -> None:
+        notifications: list[dict[str, Any]] = []
+
+        async def _completed(status: dict[str, Any]) -> None:
+            notifications.append(status)
+
+        ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="exec-a", executor_type="in_process"),
+            runtime_metadata={
+                "runtime_access": {"conversation_id": "conv-1", "agent_id": "agent-1"},
+                "background_shell_completion_callback": _completed,
+            },
+            shared_runtime_metadata={},
+        )
+
+        start = await handle_bash(
+            {
+                "command": 'python -u -c "import time; time.sleep(5)"',
+                "description": "Long watcher",
+                "run_in_background": True,
+            },
+            ctx,
+        )
+
+        assert not start.is_error
+        shell_id = str((start.metadata or {}).get("shell_id"))
+        stopped = await handle_bash_kill({"shell_id": shell_id}, ctx)
+        assert not stopped.is_error
+        await asyncio.sleep(0.05)
+        assert notifications == []
 
 
 class TestListDirectoryTool:

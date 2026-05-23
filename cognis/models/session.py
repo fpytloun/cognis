@@ -55,8 +55,15 @@ class ConversationModel(BaseModel):
     project_id: str | None = None
     active_session_id: str | None = None
     active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
+    active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
+    starred_at: datetime | None = None
     status: str = "active"
     last_message_at: datetime | None = None
+    last_read_at: datetime | None = None
+    has_unread: bool = False
+    has_active_turn: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -80,6 +87,7 @@ class SessionModel(BaseModel):
     idle_since: datetime | None = None
     completed_at: datetime | None = None
     result_summary: str | None = None
+    result_content: str | None = None
     updated_at: datetime | None = None
 
 
@@ -143,6 +151,42 @@ class IntarisSession(BaseModel):
     parent_session_id: str | None = None
     created_at: str
     updated_at: str
+
+
+class IntarisSessionSummaryRecord(BaseModel):
+    """One Intaris-generated session summary record."""
+
+    id: str
+    session_id: str
+    window_start: str
+    window_end: str
+    trigger: str
+    summary_type: str = "window"
+    summary: str
+    tools_used: list[str] | None = None
+    intent_alignment: str
+    risk_indicators: list[dict[str, Any]] | None = None
+    call_count: int
+    approved_count: int = 0
+    denied_count: int = 0
+    escalated_count: int = 0
+    created_at: str
+
+
+class IntarisAgentSummaryRecord(BaseModel):
+    """One agent-reported session summary record stored in Intaris."""
+
+    id: str
+    session_id: str
+    summary: str
+    created_at: str
+
+
+class IntarisSessionSummaries(BaseModel):
+    """Combined Intaris summary response for a session."""
+
+    intaris_summaries: list[IntarisSessionSummaryRecord] = Field(default_factory=list)
+    agent_summaries: list[IntarisAgentSummaryRecord] = Field(default_factory=list)
 
 
 class ReasoningReportResult(BaseModel):

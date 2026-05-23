@@ -870,8 +870,23 @@ class ChannelTurnObserver:
         attachments: list[dict[str, Any]] | None = None,
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
+        presentation: dict[str, Any] | None = None,
     ) -> None:
         """No-op for tool results."""
+
+    async def on_tool_output_chunk(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        delta: str,
+        stream: str | None,
+        turn_id: str | None = None,
+        chunk_index: int | None = None,
+        content_offset: int | None = None,
+    ) -> None:
+        """No-op for live tool output chunks."""
 
     async def flush_buffered_text(self) -> None:
         """Flush accumulated text to the channel without ending the turn.
@@ -925,6 +940,16 @@ class ChannelTurnObserver:
             return
 
         content = _append_attachment_fallback(self._accumulated_text, attachment_fallback_lines)
+        chat_mode = getattr(result, "chat_mode", None)
+        chat_mode_source = getattr(result, "chat_mode_source", None)
+        explicit_chat_mode = chat_mode_source in {"one_shot", "conversation_override"}
+        if chat_mode in {"plan", "build"} and explicit_chat_mode and content.strip():
+            prefix = (
+                f"[{chat_mode} mode enabled for this turn]"
+                if chat_mode_source == "one_shot"
+                else f"[{chat_mode} mode enabled, use /default to disable]"
+            )
+            content = f"{prefix}\n\n{content}"
         self._accumulated_text = ""
         if not content and not outbound_media:
             return
@@ -1091,6 +1116,11 @@ class ChannelTurnObserver:
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None:
         """No-op — thinking blocks are not delivered to channels."""
 

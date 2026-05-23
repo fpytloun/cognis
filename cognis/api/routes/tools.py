@@ -148,8 +148,9 @@ async def _discover_local_mcp_tools(
 @router.get("/api/v1/tools", response_model=list[ToolResponse])
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
+    kb_enabled = bool(getattr(request.app.state, "knowledgebase_enabled", False))
     tools = await resolve_tool_classifications(
-        select_static_tools(),
+        select_static_tools(knowledgebase_enabled=kb_enabled),
         session_factory=request.app.state.session_factory,
         owner_email=None,
         queue=getattr(request.app.state, "tool_classification_queue", None),
@@ -433,9 +434,12 @@ async def _resolve_effective_tools_response(
     )
 
     configured_tools: list[ToolDefinition] = []
+    kb_enabled = bool(getattr(request.app.state, "knowledgebase_enabled", False))
     for tool in [
         tool
-        for tool in select_static_tools(agent, access_context=access_context)
+        for tool in select_static_tools(
+            agent, access_context=access_context, knowledgebase_enabled=kb_enabled
+        )
         if tool.category != "web"
     ]:
         if tool.source.type == "builtin" or is_tool_enabled(
@@ -633,10 +637,7 @@ async def _resolve_effective_tools_response(
                     executor_type=target.executor_type or None,
                     selection_source=target.selection_source,
                     is_primary=target.is_primary,
-                    is_active=(
-                        selected is not None
-                        and target.executor_id == selected.executor_id
-                    ),
+                    is_active=(selected is not None and target.executor_id == selected.executor_id),
                     state=target.state.value,
                     description=target.description,
                 )
@@ -648,6 +649,7 @@ async def _resolve_effective_tools_response(
 
     # Annotate tool items with the list of executors that observe each tool.
     if pool_observed_tool_names:
+
         def _available_on(tool_name: str) -> list[str]:
             return sorted(
                 executor_id
@@ -781,8 +783,9 @@ async def list_agent_tools(request: Request, agent_id: str) -> list[ToolResponse
         agent_owner_email=agent.owner_email,
         agent_type=agent.agent_type,
     )
+    kb_enabled = bool(getattr(request.app.state, "knowledgebase_enabled", False))
     classified_static = await resolve_tool_classifications(
-        select_static_tools(agent, access_context=access_context),
+        select_static_tools(agent, access_context=access_context, knowledgebase_enabled=kb_enabled),
         session_factory=request.app.state.session_factory,
         owner_email=agent.owner_email,
         queue=getattr(request.app.state, "tool_classification_queue", None),

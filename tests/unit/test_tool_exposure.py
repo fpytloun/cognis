@@ -48,11 +48,13 @@ def _contract(
     llm_api: LLMApiMode = LLMApiMode.CHAT_COMPLETIONS,
     discovery_mode: ToolDiscoveryMode = ToolDiscoveryMode.CONTROLLER_SEARCH,
     native_apply_patch: bool = False,
+    anthropic_defer_loading: bool = True,
 ) -> ToolExposureContract:
     return ToolExposureContract(
         llm_api=llm_api,
         discovery_mode=discovery_mode,
         native_apply_patch=native_apply_patch,
+        anthropic_defer_loading=anthropic_defer_loading,
     )
 
 
@@ -88,11 +90,40 @@ def test_prepare_tool_exposure_uses_anthropic_deferred_loading_with_controller_s
     ]
     assert result.debug_metadata["strategy"] == "anthropic_defer_loading"
     assert result.debug_metadata["discovery_mode"] == "controller_search"
-    assert "search_tools" in tool_names
+    assert tool_names == ["search_tools", "read", sanitize_mcp_tool_name("github", "search/issues")]
+    assert tool_names != sorted(tool_names, key=str.casefold)
+    read_schema = next(
+        tool for tool in result.tools if tool.get("function", {}).get("name") == "read"
+    )
+    assert read_schema["function"]["cache_control"] == {"type": "ephemeral"}
     deferred = [
         tool for tool in result.tools if tool.get("function", {}).get("name", "").startswith("mcp_")
     ]
     assert deferred[0]["function"]["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_can_disable_anthropic_deferred_loading() -> None:
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _mcp("github", "search/issues"),
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="claude-sonnet-4", supports_defer_loading=True),
+        contract=_contract(anthropic_defer_loading=False),
+        promoted_tool_ids=set(),
+    )
+
+    tool_names = [
+        tool.get("function", {}).get("name")
+        for tool in result.tools
+        if tool.get("type") == "function"
+    ]
+    assert result.debug_metadata["strategy"] == "generic_search_tools"
+    assert "search_tools" in tool_names
+    assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
 
 
 def test_prepare_tool_exposure_uses_generic_search_fallback_with_promoted_tools() -> None:
@@ -160,6 +191,64 @@ def test_prepare_tool_exposure_responses_visible_only_when_search_disabled() -> 
     assert function_names == ["read"]
 
 
+def test_prepare_tool_exposure_sorts_final_responses_tools_by_visible_name() -> None:
+    result = prepare_tool_exposure(
+        inventory_tools=[
+            _tool("web_search", category="web"),
+            _tool("bash", source_type="executor", category="shell"),
+            _tool("read", source_type="executor", category="filesystem"),
+        ],
+        controller_tool_schemas=[
+            _search_schema(),
+            {
+                "type": "function",
+                "function": {
+                    "name": "step_complete",
+                    "description": "complete",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids=set(),
+    )
+
+    function_names = [
+        tool.get("function", {}).get("name")
+        for tool in result.tools
+        if tool.get("type") == "function"
+    ]
+    assert function_names == sorted(function_names, key=str.casefold)
+
+
+def test_prepare_tool_exposure_orders_native_apply_patch_alphabetically() -> None:
+    result = prepare_tool_exposure(
+        inventory_tools=[
+            _tool("read", source_type="executor", category="filesystem"),
+            _write_tool("apply_patch"),
+            _tool("bash", source_type="executor", category="shell"),
+        ],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.1-codex", supports_responses_api=True, max_tools=128),
+        contract=_contract(
+            llm_api=LLMApiMode.RESPONSES,
+            discovery_mode=ToolDiscoveryMode.NONE,
+            native_apply_patch=True,
+        ),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    names = [
+        tool.get("function", {}).get("name")
+        if isinstance(tool.get("function"), dict)
+        else tool.get("type")
+        for tool in result.tools
+    ]
+    assert names == ["apply_patch", "bash", "read"]
+
+
 def test_prepare_tool_exposure_keeps_skill_and_tool_output_helpers_visible_under_fallback_cap() -> (
     None
 ):
@@ -185,14 +274,15 @@ def test_prepare_tool_exposure_keeps_skill_and_tool_output_helpers_visible_under
 
     tool_names = [tool["function"]["name"] for tool in result.tools if tool["type"] == "function"]
     assert result.debug_metadata["strategy"] == "openai_responses_controller_search_fallback"
-    assert tool_names[0] == "search_tools"
-    assert set(tool_names[1:]) == {
+    assert set(tool_names) == {
+        "search_tools",
         "skill_load",
         "read_tool_output",
         "search_tool_output",
         "list_tool_output_anchors",
         "read_tool_output_anchor",
     }
+    assert tool_names == sorted(tool_names, key=str.casefold)
 
 
 def test_promoted_tool_always_surfaces_next_turn_even_when_hidden() -> None:
@@ -263,9 +353,7 @@ def test_promoted_tool_surfaces_when_policy_visible_but_cap_hidden() -> None:
     result = prepare_tool_exposure(
         inventory_tools=all_policy,
         controller_tool_schemas=[_search_schema()],
-        model_info=ModelInfo(
-            model_id="gpt-5.4", supports_responses_api=True, max_tools=max_tools
-        ),
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=max_tools),
         contract=_contract(llm_api=LLMApiMode.RESPONSES),
         promoted_tool_ids={stable_tool_id(get_events)},
         # All of them are policy-visible — no hidden bucket.
@@ -302,8 +390,7 @@ def test_promoted_metric_exposes_cap_pressure_divergence() -> None:
         default_visible_tool_ids=policy_visible_ids,
     )
     assert (
-        result_both_fit.debug_metadata["strategy"]
-        == "openai_responses_controller_search_fallback"
+        result_both_fit.debug_metadata["strategy"] == "openai_responses_controller_search_fallback"
     )
     assert result_both_fit.debug_metadata["promoted_requested_count"] == 2
     assert result_both_fit.debug_metadata["promoted_visible_count"] == 2
@@ -512,7 +599,11 @@ def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> 
         model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
         contract=_contract(llm_api=LLMApiMode.RESPONSES, discovery_mode=ToolDiscoveryMode.NONE),
         promoted_tool_ids=set(),
-        default_visible_tool_ids={stable_tool_id(read), stable_tool_id(edit), stable_tool_id(write)},
+        default_visible_tool_ids={
+            stable_tool_id(read),
+            stable_tool_id(edit),
+            stable_tool_id(write),
+        },
         allow_tool_search=False,
     )
 

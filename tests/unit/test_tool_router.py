@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.core.chat_modes import is_plan_hidden_tool
 from cognis.core.tool_router import ToolRoute, ToolRouter, _extract_output_anchor_names
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord
@@ -29,6 +30,7 @@ class _Guardrails:
         self.evaluate_calls = 0
         self.mcp_calls = 0
         self.last_mcp_call: tuple[str, str] | None = None
+        self.last_mcp_context: dict | None = None
         self.last_evaluate_call: tuple[str, str, dict, dict] | None = None
         self.mcp_result = ToolResult(output="remote result")
 
@@ -51,11 +53,17 @@ class _Guardrails:
         )()
 
     async def call_mcp_tool(
-        self, session_id: str, server_name: str, tool_name: str, arguments: dict
+        self,
+        session_id: str,
+        server_name: str,
+        tool_name: str,
+        arguments: dict,
+        context: dict | None = None,
     ) -> ToolResult:
         del session_id, arguments
         self.mcp_calls += 1
         self.last_mcp_call = (server_name, tool_name)
+        self.last_mcp_context = dict(context or {})
         return self.mcp_result
 
 
@@ -66,9 +74,12 @@ class _Executor:
         self.result = result or ToolResult(output="local result")
 
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: object | None = None,
     ) -> ToolResult:
-        del tool_call, timeout_seconds
+        del tool_call, timeout_seconds, output_chunk_callback
         self.calls += 1
         return self.result
 
@@ -78,9 +89,12 @@ class _Executor:
 
 class _SlowExecutor(_Executor):
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: object | None = None,
     ) -> ToolResult:
-        del tool_call, timeout_seconds
+        del tool_call, timeout_seconds, output_chunk_callback
         await asyncio.sleep(0.05)
         return ToolResult(output="too slow")
 
@@ -91,9 +105,12 @@ class _CapturingExecutor(_Executor):
         self.tool_calls: list[ToolCall] = []
 
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: object | None = None,
     ) -> ToolResult:
-        del timeout_seconds
+        del timeout_seconds, output_chunk_callback
         self.calls += 1
         self.tool_calls.append(tool_call)
         return self.result
@@ -249,6 +266,54 @@ def _registry() -> ToolRegistry:
             )
         )
     )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="memory_add",
+                description="add memory",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                category="memory",
+                read_only=False,
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="memory_add_batch",
+                description="add memories",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                category="memory",
+                read_only=False,
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="manage_schedules",
+                description="manage schedules",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+                category="schedule",
+                read_only=False,
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="skill_asset_materialize",
+                description="materialize skill asset",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                category="filesystem",
+                read_only=False,
+            )
+        )
+    )
     return registry
 
 
@@ -319,6 +384,103 @@ def test_tool_router_classifies_routes() -> None:
     assert router.classify("missing", registry) is ToolRoute.UNKNOWN
 
 
+def test_plan_hidden_tool_policy_blocks_writes_but_not_unknown_or_readonly() -> None:
+    registry = _registry()
+    assert is_plan_hidden_tool(registry.get("memory_add").definition) is False
+    assert is_plan_hidden_tool(registry.get("memory_add_batch").definition) is False
+    assert is_plan_hidden_tool(registry.get("skill_asset_materialize").definition) is False
+    assert is_plan_hidden_tool(registry.get("shell").definition) is False
+    assert (
+        is_plan_hidden_tool(registry.get(sanitize_mcp_tool_name("github", "search")).definition)
+        is False
+    )
+    assert is_plan_hidden_tool(_readonly_registry().get("memory_search").definition) is False
+
+    ambiguous = ToolDefinition(
+        name="ambiguous",
+        description="ambiguous",
+        parameters={},
+        source=ToolSource(type="builtin"),
+        read_only=True,
+        classification_status="unknown",
+    )
+    assert is_plan_hidden_tool(ambiguous) is False
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_allows_memory_add_before_execution() -> None:
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    executor = _Executor()
+
+    result = await router.execute(
+        ToolCall(
+            call_id="plan-1",
+            name="memory_add",
+            arguments={"content": "do not write"},
+            runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        executor,
+    )
+
+    assert result.metadata is None or result.metadata.get("code") != "plan_mode_mutation_denied"
+    assert "Write tools are disabled" not in result.output
+    assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_denies_routed_schedule_write_before_execution() -> None:
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+
+    result = await router.execute(
+        ToolCall(
+            call_id="plan-schedule",
+            name="manage_schedules",
+            arguments={"action": "create", "name": "x"},
+            runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert result.is_error is True
+    assert "Plan mode is active" in result.output
+    assert result.metadata and result.metadata["code"] == "plan_mode_mutation_denied"
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_allows_read_like_local_tool_with_schema_visible() -> None:
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    registry = _registry_with_result_limit(600)
+    executor = _Executor(result=ToolResult(output="would write"))
+
+    result = await router.execute(
+        ToolCall(
+            call_id="plan-write",
+            name=sanitize_mcp_tool_name("filesystem", "read_file"),
+            arguments={},
+            runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert (
+        is_plan_hidden_tool(
+            registry.get(sanitize_mcp_tool_name("filesystem", "read_file")).definition
+        )
+        is False
+    )
+    assert result.is_error is False
+    assert executor.calls == 1
+
+
 @pytest.mark.asyncio
 async def test_tool_router_dispatches_intaris_mcp() -> None:
     guardrails = _Guardrails()
@@ -335,6 +497,35 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     assert guardrails.mcp_calls == 1
     assert guardrails.last_mcp_call == ("github", "search")
     assert 'trust="untrusted"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_passes_plan_mode_context_to_intaris_mcp() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+
+    await router.execute(
+        ToolCall(
+            call_id="1",
+            name=sanitize_mcp_tool_name("github", "search"),
+            arguments={},
+            runtime_metadata={
+                "chat_mode": "plan",
+                "chat_mode_source": "one_shot",
+                "read_only_required": True,
+            },
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert guardrails.mcp_calls == 1
+    assert guardrails.last_mcp_context is not None
+    assert guardrails.last_mcp_context["chat_mode"] == "plan"
+    assert guardrails.last_mcp_context["chat_mode_source"] == "one_shot"
+    assert guardrails.last_mcp_context["read_only_required"] is True
 
 
 def test_extract_output_anchor_names_prefers_metadata() -> None:
@@ -401,6 +592,23 @@ def test_decision_cache_key_separates_read_only_by_executor_runtime() -> None:
     )
 
     assert key_a != key_b
+
+
+def test_evaluation_context_infers_executor_home_from_workspace_root() -> None:
+    context = ToolRouter._evaluation_context(
+        ToolCall(
+            call_id="r1",
+            name="read",
+            arguments={"file_path": "~/src/cognis/README.md"},
+            runtime_metadata={
+                "workspace_root": "/home/riker/src/cognis",
+                "working_directory": "/home/riker/src/cognis",
+                "executor_environment": {"executor_id": "exec-1", "home": None},
+            },
+        )
+    )
+
+    assert context["executor_environment"]["home"] == "/home/riker"
 
 
 def test_decision_cache_key_separates_writes_by_arguments() -> None:
@@ -667,6 +875,114 @@ async def test_tool_router_executes_registered_builtin_handler_locally() -> None
 
 
 @pytest.mark.asyncio
+async def test_tool_router_rejects_malformed_local_tool_arguments() -> None:
+    called = False
+
+    async def bash_handler(arguments: dict[str, object], context: object) -> object:
+        nonlocal called
+        del arguments, context
+        called = True
+        return "should not execute"
+
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run shell commands",
+                parameters={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+                source=ToolSource(type="executor"),
+                category="shell",
+                read_only=False,
+                non_bypassable=True,
+            ),
+            handler=bash_handler,
+        )
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="bash-raw-1",
+            name="bash",
+            arguments={"_raw": '{"command":"unterminated'},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(),
+    )
+
+    assert result.is_error is True
+    assert called is False
+    assert result.metadata is not None
+    assert result.metadata["code"] == "invalid_tool_arguments"
+    assert "invalid_tool_arguments" in result.output
+    assert "valid JSON" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_accepts_multiline_local_tool_arguments() -> None:
+    captured: dict[str, object] = {}
+
+    async def bash_handler(arguments: dict[str, object], context: object) -> object:
+        del context
+        captured.update(arguments)
+        return "accepted"
+
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run shell commands",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "workdir": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+                source=ToolSource(type="executor"),
+                category="shell",
+                read_only=False,
+                non_bypassable=True,
+            ),
+            handler=bash_handler,
+        )
+    )
+    command = (
+        'gh pr create --title "feat(blr-lab): configure rclone bisync" '
+        '--body "Mirrors the HA bisync model.\n\n'
+        'AWS secret JSON: {\\"username\\":\\"bisync\\",\\"password\\":\\"...\\"}"'
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="bash-multiline-1",
+            name="bash",
+            arguments={
+                "command": command,
+                "workdir": "/Users/fpytloun/src/lumilens/beskar",
+            },
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(),
+    )
+
+    assert result.is_error is False
+    assert captured["command"] == command
+
+
+@pytest.mark.asyncio
 async def test_tool_router_passes_merged_runtime_metadata_to_registered_handler() -> None:
     captured: dict[str, object] = {}
 
@@ -782,7 +1098,9 @@ async def test_tool_router_persist_browser_auth_state_grants_new_credential_to_a
 
 
 @pytest.mark.asyncio
-async def test_tool_router_persist_browser_auth_state_rejects_existing_ungranted_credential() -> None:
+async def test_tool_router_persist_browser_auth_state_rejects_existing_ungranted_credential() -> (
+    None
+):
     provider = _BrowserAuthStateCredentialProvider(existing=True)
     router = ToolRouter(guardrails=_Guardrails(), credentials_provider=provider)
 
@@ -986,6 +1304,66 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_tool_router_enriches_inline_attachment_output_with_artifact_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=_session_factory(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="web_fetch",
+                description="fetch",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    monkeypatch.setattr("cognis.core.tool_router.create_artifact_record", AsyncMock())
+
+    result = await router.execute(
+        ToolCall(call_id="6b", name="web_fetch", arguments={"url": "https://example.com/a.png"}),
+        _session(),
+        _agent(),
+        registry,
+        _RemoteExecutor(
+            ToolResult(
+                output=(
+                    "[[metadata]]\n"
+                    "Filename: a.png\n"
+                    "Content type: image/png\n"
+                    "Binary content: attached as artifact\n"
+                    "Use artifact_read to analyze this image with a vision-capable model."
+                ),
+                attachments=[
+                    {
+                        "filename": "a.png",
+                        "mime_type": "image/png",
+                        "content_b64": base64.b64encode(b"png").decode("ascii"),
+                    }
+                ],
+            )
+        ),
+    )
+
+    assert result.attachments is not None
+    assert result.attachments[0]["artifact_id"] == "att_1"
+    assert result.metadata is not None
+    raw_output = result.metadata["_raw_output"]
+    assert "[[attachments]]" in raw_output
+    assert "Artifact ID: att_1" in raw_output
+    assert "Filename: a.png" in raw_output
+    assert 'artifact_read with artifact_id="att_1"' in raw_output
+    assert 'artifact_get_url with artifact_id="att_1"' in raw_output
+
+
+@pytest.mark.asyncio
 async def test_tool_router_prepares_document_artifact_assets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1029,6 +1407,49 @@ async def test_tool_router_prepares_document_artifact_assets(
     assert asset["filename"] == "diagram.png"
     assert asset["mime_type"] == "image/png"
     assert base64.b64decode(asset["content_b64"]) == b"image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_rejects_expired_artifact_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=_session_factory(),
+    )
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=type(
+                "ArtifactRow",
+                (),
+                {
+                    "status": "temporary",
+                    "owner_email": "user@example.com",
+                    "namespace": "tool-outputs",
+                    "object_id": "toolout_1",
+                    "filename": "call.txt",
+                    "expires_at": datetime(2026, 4, 21, 13, 0, tzinfo=UTC),
+                },
+            )()
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Artifact not found: toolout_1"):
+        await router._prepare_local_tool_call(  # noqa: SLF001
+            ToolCall(
+                call_id="7-expired",
+                name="document_generate",
+                arguments={
+                    "content": "![x](asset:diag)",
+                    "assets": [{"name": "diag", "artifact_id": "toolout_1"}],
+                },
+            ),
+            _session(),
+            AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        )
 
 
 @pytest.mark.asyncio
@@ -1585,6 +2006,59 @@ async def test_tool_router_handles_artifact_get_url(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_rejects_expired_artifact_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="toolout_expired",
+                namespace="tool-outputs",
+                object_id="toolout_expired",
+                filename="call.txt",
+                owner_email="user@example.com",
+                purpose="tool_output",
+                kind="file",
+                mime_type="text/plain",
+                size_bytes=128,
+                status="temporary",
+                created_at=datetime(2026, 4, 21, 12, 0, tzinfo=UTC),
+                expires_at=datetime(2026, 4, 21, 13, 0, tzinfo=UTC),
+            )
+        ),
+    )
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    for tool_name in ("artifact_read", "artifact_get_metadata", "artifact_get_url"):
+        result = await router.execute(
+            ToolCall(
+                call_id=f"{tool_name}-call",
+                name=tool_name,
+                arguments={"artifact_id": "toolout_expired"},
+            ),
+            _session(),
+            _agent(),
+            ToolRegistry(),
+            None,
+        )
+        assert result.is_error is True
+        assert "Artifact not found: toolout_expired" in result.output
+
+
+@pytest.mark.asyncio
 async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1749,9 +2223,12 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
             self.seen_call: ToolCall | None = None
 
         async def tool_execute(
-            self, tool_call: ToolCall, timeout_seconds: int | None = None
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
         ) -> ToolResult:
-            del timeout_seconds
+            del timeout_seconds, output_chunk_callback
             self.seen_call = tool_call
             return self.result
 
@@ -1840,9 +2317,12 @@ async def test_tool_router_resolves_browser_upload_artifacts_without_guardrails_
             self.seen_call: ToolCall | None = None
 
         async def tool_execute(
-            self, tool_call: ToolCall, timeout_seconds: int | None = None
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
         ) -> ToolResult:
-            del timeout_seconds
+            del timeout_seconds, output_chunk_callback
             self.seen_call = tool_call
             return self.result
 
@@ -1944,9 +2424,12 @@ async def test_tool_router_omits_document_asset_binary_payloads_from_guardrails(
             self.seen_call: ToolCall | None = None
 
         async def tool_execute(
-            self, tool_call: ToolCall, timeout_seconds: int | None = None
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
         ) -> ToolResult:
-            del timeout_seconds
+            del timeout_seconds, output_chunk_callback
             self.seen_call = tool_call
             return self.result
 
@@ -2079,11 +2562,14 @@ async def test_tool_router_postprocesses_binary_read_with_attachment_analysis_ro
         async def commit(self) -> None:
             return None
 
-        async def get(self, model: object, key: str) -> object | None:
-            del model
-            if key == "attachment_analysis":
-                return SimpleNamespace(model="gpt-4o", provider_id="openai")
-            return None
+        async def execute(self, stmt: object) -> object:
+            del stmt
+
+            class _Result:
+                def scalar_one_or_none(self) -> object:
+                    return SimpleNamespace(model="gpt-4o", provider_id="openai")
+
+            return _Result()
 
     @asynccontextmanager
     async def session_factory() -> object:

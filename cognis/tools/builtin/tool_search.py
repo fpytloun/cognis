@@ -17,6 +17,7 @@ from cognis.models.tool import (
     tool_profile_group,
 )
 
+_CLAUDE_MCP_PREFIX = "mcp__cognis__"
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
 
 logger = get_logger(__name__)
@@ -79,15 +80,22 @@ def search_inventory(
     already_visible_tool_ids = already_visible_tool_ids or set()
     extra_data = {
         "target": "search_tools",
-        "query_hash": hashlib.sha256(
-            normalized_query.encode("utf-8", errors="ignore")
-        ).hexdigest()[:12],
+        "query_hash": hashlib.sha256(normalized_query.encode("utf-8", errors="ignore")).hexdigest()[
+            :12
+        ],
         "query_length": len(normalized_query),
         "query_token_count": len(query_terms),
         "category": normalized_category,
         "limit": limit,
         **(dict(log_context) if log_context else {}),
     }
+    if selections := _parse_select_query(normalized_query):
+        return _select_inventory(
+            tools,
+            selections,
+            already_visible_tool_ids=already_visible_tool_ids,
+            log_context=extra_data,
+        )[:limit]
     candidates: list[tuple[ToolDefinition, str, str, str]] = []
     for tool in tools:
         if tool.name == SEARCH_TOOLS_TOOL.name:
@@ -214,6 +222,172 @@ def search_inventory(
             },
         )
     return final_matches
+
+
+def _parse_select_query(normalized_query: str) -> list[str]:
+    if not normalized_query.startswith("select:"):
+        return []
+    raw_selectors = normalized_query.removeprefix("select:").split(",")
+    return [selector.strip() for selector in raw_selectors if selector.strip()]
+
+
+def _select_inventory(
+    tools: list[ToolDefinition],
+    selectors: list[str],
+    *,
+    already_visible_tool_ids: set[str],
+    log_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return exact selected tools requested by a native tool-search call."""
+
+    candidates: list[tuple[ToolDefinition, str, str, bool]] = []
+    for tool in tools:
+        if tool.name == SEARCH_TOOLS_TOOL.name:
+            continue
+        display_name = (
+            tool.source.raw_tool_name
+            if tool.source.type == "skill" and tool.source.raw_tool_name
+            else tool.name
+        )
+        candidates.append(
+            (
+                tool,
+                display_name,
+                tool_profile_group(tool),
+                stable_tool_id(tool) in already_visible_tool_ids,
+            )
+        )
+
+    matches: list[dict[str, Any]] = []
+    matched_selectors: list[str] = []
+    already_visible_selectors: list[str] = []
+    unmatched_selectors: list[str] = []
+    seen_tool_ids: set[str] = set()
+    for selector in selectors:
+        normalized_selector = _normalize_select_identifier(selector)
+        match = next(
+            (
+                candidate
+                for candidate in candidates
+                if _candidate_matches_selector(candidate[0], candidate[1], normalized_selector)
+            ),
+            None,
+        )
+        if match is None:
+            unmatched_selectors.append(selector)
+            continue
+        tool, display_name, profile_group, already_visible = match
+        tool_id = stable_tool_id(tool)
+        if tool_id in seen_tool_ids:
+            continue
+        seen_tool_ids.add(tool_id)
+        matched_selectors.append(selector)
+        if already_visible:
+            already_visible_selectors.append(selector)
+        matches.append(
+            {
+                "tool_id": tool_id,
+                "name": display_name,
+                "description": tool.description,
+                "category": tool.category,
+                "profile_group": profile_group,
+                "already_visible": already_visible,
+                "source": tool.source.model_dump(mode="json"),
+                "handle": _tool_handle(tool, display_name, profile_group, confidence=100.0),
+            }
+        )
+
+    logger.info(
+        "search_tools select completed",
+        extra={
+            "extra_data": {
+                **log_context,
+                "selector_count": len(selectors),
+                "matched_count": len(matched_selectors),
+                "already_visible_match_count": len(already_visible_selectors),
+                "unmatched_count": len(unmatched_selectors),
+                "matched_tools": [
+                    {"tool_id": item["tool_id"], "name": item["name"]} for item in matches
+                ],
+            }
+        },
+    )
+    if unmatched_selectors:
+        logger.debug(
+            "search_tools select unmatched selectors",
+            extra={
+                "extra_data": {
+                    **log_context,
+                    "unmatched_selectors": unmatched_selectors[:20],
+                }
+            },
+        )
+    return matches
+
+
+def _candidate_matches_selector(
+    tool: ToolDefinition,
+    display_name: str,
+    selector: str,
+) -> bool:
+    return selector in _select_aliases(tool, display_name)
+
+
+def _normalize_select_identifier(selector: str) -> str:
+    normalized = selector.strip().lower()
+    if normalized.startswith(_CLAUDE_MCP_PREFIX):
+        normalized = normalized[len(_CLAUDE_MCP_PREFIX) :]
+    return normalized
+
+
+def _select_aliases(tool: ToolDefinition, display_name: str) -> set[str]:
+    aliases = {
+        tool.name,
+        display_name,
+        stable_tool_id(tool),
+        str(tool.source.raw_tool_name or ""),
+    }
+    raw_name = tool.source.raw_tool_name
+    server_id = tool.source.server_id
+    if raw_name and server_id:
+        aliases.update(
+            {
+                f"mcp_{server_id}__{raw_name}",
+                f"mcp__{server_id}__{raw_name}",
+                f"mcp:{server_id}:{raw_name}",
+            }
+        )
+    normalized_aliases = {_normalize_select_identifier(alias) for alias in aliases if alias}
+    expanded_aliases: set[str] = set()
+    for alias in normalized_aliases:
+        expanded_aliases.add(alias)
+        if alias.startswith("mcp__"):
+            expanded_aliases.add("mcp_" + alias[len("mcp__") :])
+        if alias.startswith("mcp_") and not alias.startswith("mcp__"):
+            expanded_aliases.add("mcp__" + alias[len("mcp_") :])
+    return expanded_aliases
+
+
+def _tool_handle(
+    tool: ToolDefinition,
+    display_name: str,
+    profile_group: str,
+    *,
+    confidence: float,
+) -> dict[str, Any]:
+    return {
+        "tool_id": stable_tool_id(tool),
+        "name": display_name,
+        "callable_name": tool.name,
+        "scope": "session",
+        "category": tool.category,
+        "profile_group": profile_group,
+        "source": tool.source.model_dump(mode="json"),
+        "capabilities": sorted(str(capability) for capability in tool_capabilities(tool)),
+        "read_only": tool.read_only,
+        "confidence": confidence,
+        "permission_scope": "current_session_effective_inventory",
+    }
 
 
 def _tokenize(text: str) -> list[str]:

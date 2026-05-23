@@ -7,7 +7,9 @@ servers can be added as data-driven entries.
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from cognis.tools.executor.lsp.install import (
@@ -50,12 +52,125 @@ class LSPServerDefinition:
     init_options: dict[str, Any] | None = None
     """Server-specific initialization options."""
 
+    workspace_configuration: dict[str, Any] | None = None
+    """Server-specific default workspace/configuration response."""
+
+    initialization_settings: dict[str, Any] | None = None
+    """Server-specific default settings sent in initializationOptions."""
+
+    project_config_files: tuple[str, ...] = ()
+    """Project config files that take precedence over default workspace config."""
+
+    pyproject_config_sections: tuple[str, ...] = ()
+    """Dotted pyproject.toml sections that take precedence over defaults."""
+
     npm_run: bool = False
     """If True, the resolved command is a JS file run via ``node``."""
 
     def language_id(self, extension: str) -> str:
         """Return the LSP language ID for a file extension."""
         return self.language_id_map.get(extension, self.server_id)
+
+    def workspace_configuration_for(self, root_path: str) -> dict[str, Any] | None:
+        """Return default workspace config unless native project config exists."""
+        if self._has_native_project_config(root_path):
+            return None
+
+        return self.workspace_configuration
+
+    def initialization_options_for(self, root_path: str) -> dict[str, Any] | None:
+        """Return init options merged with defaults unless native config exists."""
+        options = dict(self.init_options or {})
+        if self.initialization_settings and not self._has_native_project_config(root_path):
+            options["settings"] = self.initialization_settings
+        return options or None
+
+    def _has_native_project_config(self, root_path: str) -> bool:
+        """Return whether native project config should override Cognis defaults."""
+        if self.workspace_configuration is None and self.initialization_settings is None:
+            return False
+
+        root = Path(root_path)
+        if any((root / name).exists() for name in self.project_config_files):
+            return True
+
+        return bool(self.pyproject_config_sections) and _pyproject_has_any_section(
+            root / "pyproject.toml", self.pyproject_config_sections
+        )
+
+
+def _pyproject_has_any_section(path: Path, sections: tuple[str, ...]) -> bool:
+    """Return whether pyproject.toml contains any dotted section path."""
+    if not path.exists():
+        return False
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+
+    for section in sections:
+        current: Any = data
+        for part in section.split("."):
+            if not isinstance(current, dict) or part not in current:
+                break
+            current = current[part]
+        else:
+            return True
+    return False
+
+
+_PYRIGHT_ANALYSIS_DEFAULTS: dict[str, Any] = {
+    # Keep agent edit-time diagnostics bounded and avoid indexing dependency,
+    # generated, cache, and nested-worktree trees in arbitrary projects.
+    "diagnosticMode": "openFilesOnly",
+    "exclude": [
+        "**/.git",
+        "**/.hg",
+        "**/.svn",
+        "**/.venv",
+        "**/venv",
+        "**/.tox",
+        "**/.nox",
+        "**/.mypy_cache",
+        "**/.pytest_cache",
+        "**/.ruff_cache",
+        "**/__pycache__",
+        "**/node_modules",
+        "**/.worktrees",
+        "**/dist",
+        "**/build",
+    ],
+}
+
+_GOPLS_DEFAULTS: dict[str, Any] = {
+    "directoryFilters": [
+        "-.git",
+        "-.hg",
+        "-.svn",
+        "-.worktrees",
+        "-node_modules",
+        "-.venv",
+        "-venv",
+        "-dist",
+        "-build",
+    ]
+}
+
+_RUST_ANALYZER_DEFAULTS: dict[str, Any] = {
+    "files": {
+        "excludeDirs": [
+            ".git",
+            ".hg",
+            ".svn",
+            ".worktrees",
+            "node_modules",
+            ".venv",
+            "venv",
+            "dist",
+            "build",
+        ]
+    }
+}
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +196,13 @@ PYRIGHT = LSPServerDefinition(
         version="1.1.390",
         entry_point="node_modules/pyright/dist/pyright-langserver.js",
     ),
+    workspace_configuration={
+        "python": {"analysis": _PYRIGHT_ANALYSIS_DEFAULTS},
+        "python.analysis": _PYRIGHT_ANALYSIS_DEFAULTS,
+    },
+    initialization_settings={"python": {"analysis": _PYRIGHT_ANALYSIS_DEFAULTS}},
+    project_config_files=("pyrightconfig.json",),
+    pyproject_config_sections=("tool.pyright",),
     npm_run=True,
 )
 
@@ -144,6 +266,7 @@ GOPLS = LSPServerDefinition(
         binary_name="gopls",
         env_overrides={"GOBIN": "{cache_dir}"},
     ),
+    workspace_configuration={"gopls": _GOPLS_DEFAULTS},
 )
 
 RUST_ANALYZER = LSPServerDefinition(
@@ -155,6 +278,7 @@ RUST_ANALYZER = LSPServerDefinition(
     language_id_map={".rs": "rust"},
     # No auto-install — rust-analyzer is typically installed via rustup
     install_strategy=None,
+    workspace_configuration={"rust-analyzer": _RUST_ANALYZER_DEFAULTS},
 )
 
 CLANGD = LSPServerDefinition(

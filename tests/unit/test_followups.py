@@ -183,6 +183,31 @@ def test_gate_follow_up_rejects_non_paused_status() -> None:
         )
 
 
+def test_background_tool_follow_up_renders_executor_and_description() -> None:
+    policy = FollowUpPolicy(llm=None)
+
+    follow_up = policy.build_background_tool_follow_up(
+        conversation_id="conv-1",
+        shell_id="shell_123",
+        executor_id="exec-a",
+        executor_type="websocket",
+        status="completed",
+        exit_code=0,
+        command="pytest tests/unit -q",
+        description="Run focused unit tests",
+        runtime_seconds=12.4,
+        output_tail="12 passed",
+    )
+    rendered = render_follow_up_block(follow_up)
+
+    assert follow_up.origin_kind is FollowUpOriginKind.BACKGROUND_TOOL_RESULT
+    assert follow_up.mode is FollowUpMode.INTEGRATE
+    assert "shell_id: shell_123" in rendered
+    assert "executor: exec-a (websocket)" in rendered
+    assert "description: Run focused unit tests" in rendered
+    assert "Use bash_output with this shell_id" in rendered
+
+
 def test_render_follow_up_block_escapes_tag_like_content() -> None:
     rendered = render_follow_up_block(
         GateFollowUp(

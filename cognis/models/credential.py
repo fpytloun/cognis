@@ -14,6 +14,7 @@ CredentialKind = Literal[
     "totp_seed",
     "recovery_codes",
     "browser_storage_state",
+    "claude_code_profile",
 ]
 
 CredentialStatus = Literal["active", "expired", "revoked", "invalid"]

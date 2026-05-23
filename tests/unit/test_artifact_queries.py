@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -72,6 +72,22 @@ def test_artifact_query_helpers_filter_and_order(monkeypatch: object, tmp_path: 
                     status="deleted",
                 )
                 deleted.created_at = datetime(2026, 4, 24, 9, 0, tzinfo=UTC)
+
+                expired = await create_artifact_record(
+                    session,
+                    artifact_id="doc_expired",
+                    namespace="documents",
+                    object_id="doc_expired",
+                    filename="expired-report.pdf",
+                    owner_email="user@example.com",
+                    purpose="tool_output",
+                    kind="pdf",
+                    mime_type="application/pdf",
+                    size_bytes=19,
+                    status="temporary",
+                    expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                )
+                expired.created_at = datetime(2026, 4, 26, 9, 0, tzinfo=UTC)
 
                 other_owner = await create_artifact_record(
                     session,

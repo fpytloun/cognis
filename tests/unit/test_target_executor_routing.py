@@ -63,7 +63,9 @@ def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     ctx = MagicMock()
     ctx.executor_pool = pool
     ctx.executor_connection = MagicMock(name="active_connection")
-    ctx.active_executor_id = active_executor_id or (pool.primary[0].executor_id if pool.primary else None)
+    ctx.active_executor_id = active_executor_id or (
+        pool.primary[0].executor_id if pool.primary else None
+    )
     ctx.session = MagicMock()
     ctx.agent = MagicMock()
     ctx.tool_registry = registry
@@ -109,6 +111,10 @@ async def test_target_executor_stripped_before_dispatch(loop_with_pool, monkeypa
     routed_tc = call.args[0]
     assert "target_executor" not in routed_tc.arguments
     assert routed_tc.arguments == {"command": "ls"}
+    assert routed_tc.runtime_metadata == {
+        "tool_call_id": "call-1",
+        "tool_name": "bash",
+    }
     # Connection used should be the other one (not the active)
     assert call.args[4] is other_conn
 
@@ -133,9 +139,7 @@ async def test_target_executor_unassigned_returns_factual_error(loop_with_pool) 
 
 @pytest.mark.asyncio
 async def test_target_executor_offline_returns_factual_error(loop_with_pool) -> None:
-    pool = ExecutorPool(
-        primary=[_target("exec-active"), _target("exec-down", usable=False)]
-    )
+    pool = ExecutorPool(primary=[_target("exec-active"), _target("exec-down", usable=False)])
     ctx = _ctx(pool, active_executor_id="exec-active")
 
     loop_with_pool._get_tool_registry = lambda c: c.tool_registry
@@ -225,3 +229,70 @@ async def test_no_target_executor_uses_active_connection(loop_with_pool) -> None
     assert call.args[4] is ctx.executor_connection
     # Arguments unchanged
     assert call.args[0].arguments == {"command": "ls"}
+
+
+def test_install_active_executor_target_rebinds_same_turn_runtime(loop_with_pool) -> None:
+    """switch_executor must affect later no-target tool calls in the same turn."""
+
+    pool = ExecutorPool(primary=[_target("exec-active"), _target("exec-other")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    ctx.conversation.active_executor_id = "exec-active"
+    old_conn = ctx.executor_connection
+    other_conn = MagicMock(name="other_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(return_value=other_conn)
+    ws_provider.get_handle_metadata = MagicMock(
+        return_value={
+            "environment": {
+                "user": "fpytloun",
+                "home": "/Users/fpytloun",
+                "cwd": "/Users/fpytloun",
+                "hostname": "olorin",
+            },
+            "platform": {"os": "darwin", "arch": "arm64", "python": "3.12"},
+        }
+    )
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    switched = loop_with_pool._install_active_executor_target(
+        ctx,
+        pool.by_id("exec-other"),
+    )
+
+    assert switched is True
+    assert ctx.active_executor_id == "exec-other"
+    assert ctx.conversation.active_executor_id == "exec-other"
+    assert ctx.executor_connection is other_conn
+    assert ctx.executor_connection is not old_conn
+    assert ctx.executor_environment.executor_id == "exec-other"
+    assert ctx.executor_environment.home == "/Users/fpytloun"
+
+
+@pytest.mark.asyncio
+async def test_no_target_after_switch_uses_rebound_connection(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_target("exec-active"), _target("exec-other")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    other_conn = MagicMock(name="other_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(return_value=other_conn)
+    ws_provider.get_handle_metadata = MagicMock(return_value={"environment": {}})
+    loop_with_pool.providers.executor.websocket = ws_provider
+    loop_with_pool._install_active_executor_target(ctx, pool.by_id("exec-other"))
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        return_value=ToolResult(output="ok", is_error=False)
+    )
+
+    tc = _toolcall("bash", {"command": "pwd"})
+    await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    call = loop_with_pool.tool_router.execute.await_args
+    assert call.args[4] is other_conn
+    assert call.args[0].arguments == {"command": "pwd"}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -9,6 +10,8 @@ from cognis.logging import get_logger
 from cognis.models.tool import ExecutorHandle, ToolDefinition, ToolResult
 
 logger = get_logger(__name__)
+
+ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 
 SOURCE_PRIORITIES: dict[str, int] = {
     "builtin": 500,
@@ -27,6 +30,7 @@ class ToolExecutionContext:
     runtime_metadata: dict[str, Any] = field(default_factory=dict)
     shared_runtime_metadata: dict[str, Any] | None = None
     execution_scope_id: str | None = None
+    output_chunk_callback: ToolOutputChunkCallback | None = None
 
 
 type ToolHandlerResult = str | dict[str, Any] | list[Any] | ToolResult

@@ -1,10 +1,9 @@
-"""Decision engine for inline vs delegated turns.
+"""Decision engine for chat turn routing.
 
-Uses deterministic fast-path rules only.  The main agent is the
+Uses deterministic fast-path rules only. The main agent is the
 orchestrator and decides whether to delegate via its ``delegate``
-and ``create_task`` tools during the turn.  The decision engine
-handles only unambiguous cases (explicit slash commands, keywords,
-conversational messages) to short-circuit the turn lifecycle.
+and ``create_task`` tools during the turn. The decision engine handles
+only explicit UI overrides and obvious conversational messages.
 """
 
 from __future__ import annotations
@@ -34,8 +33,6 @@ DECISIONS_TOTAL = Counter(
 )
 
 INLINE_OVERRIDE_KEYWORDS = ("just answer", "don't delegate", "do not delegate")
-DELEGATE_OVERRIDE_KEYWORDS = ("run in background", "background task", "delegate this")
-DELEGATE_PREFIXES = ("/research", "/implement", "/delegate", "/task")
 CONVERSATIONAL_PREFIXES = ("hi", "hello", "hey", "thanks", "thank you", "what do you think")
 
 _ROUTING_REMINDER_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -192,9 +189,6 @@ def build_routing_reminder(user_message: str) -> RoutingReminderAdvice | None:
         return None
     if any(keyword in lowered for keyword in INLINE_OVERRIDE_KEYWORDS):
         return None
-    if any(keyword in lowered for keyword in DELEGATE_OVERRIDE_KEYWORDS):
-        return None
-
     for category, patterns in _ROUTING_REMINDER_PATTERNS:
         if any(pattern in lowered for pattern in patterns):
             return RoutingReminderAdvice(
@@ -220,12 +214,12 @@ def _render_routing_reminder(category: str) -> str:
 
 
 class DecisionEngine:
-    """Deterministic fast-path rules for inline vs delegate classification.
+    """Deterministic fast-path rules for chat turn classification.
 
     The LLM classifier has been removed — the main agent decides whether
     to delegate via its orchestration tools (``delegate``, ``create_task``).
-    This engine only handles unambiguous cases: explicit slash commands,
-    keyword overrides, and conversational messages.
+    This engine only handles explicit UI overrides, inline keyword
+    overrides, and conversational messages.
     """
 
     def __init__(
@@ -290,9 +284,6 @@ class DecisionEngine:
 
         lower_text = text.lower()
         explicit_inline = any(keyword in lower_text for keyword in INLINE_OVERRIDE_KEYWORDS)
-        explicit_delegate = lower_text.startswith(DELEGATE_PREFIXES) or any(
-            keyword in lower_text for keyword in DELEGATE_OVERRIDE_KEYWORDS
-        )
 
         if explicit_inline:
             return self._result(
@@ -305,24 +296,12 @@ class DecisionEngine:
             )
 
         if not self._can_delegate(agent, current_depth):
-            decision = "ask_user" if explicit_delegate else "inline"
             return self._result(
-                decision=decision,
+                decision="inline",
                 reason="Delegation limit reached",
                 confidence=1.0,
                 predicted_tool_intensity="medium",
                 source="limits",
-                override_source="policy" if explicit_delegate else None,
-            )
-
-        if explicit_delegate:
-            return self._result(
-                decision="delegate",
-                reason="Explicit delegation request",
-                confidence=1.0,
-                predicted_tool_intensity="high",
-                source="override",
-                override_source="keyword",
             )
 
         if self._is_conversational(lower_text):
@@ -604,7 +583,11 @@ async def select_workflow(
             workflow_id = default_workflow_id or "system:general-task"
         else:
             selected = next(
-                (workflow for workflow in available_workflows if workflow["workflow_id"] == workflow_id),
+                (
+                    workflow
+                    for workflow in available_workflows
+                    if workflow["workflow_id"] == workflow_id
+                ),
                 None,
             )
             if selected is not None and _is_skill_workflow_candidate(selected):

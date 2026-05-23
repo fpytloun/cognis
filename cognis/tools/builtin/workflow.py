@@ -32,7 +32,11 @@ STEP_COMPLETE_TOOL = ToolDefinition(
             },
             "metadata": {
                 "type": "object",
-                "description": "Structured metadata required by this step's metadata contract.",
+                "description": (
+                    "Workflow-step-specific structured metadata. When the current step defines "
+                    "a metadata contract, all required fields must be present and must match "
+                    "the declared JSON types."
+                ),
             },
             "claims": {
                 "type": "array",
@@ -313,8 +317,13 @@ SWITCH_EXECUTOR_TOOL = ToolDefinition(
         "Use when you want to keep working on a different assigned executor without "
         "specifying target_executor on every call. The target executor must be one "
         "of the executors assigned to you (primary or additional) and currently "
-        "usable. Switching to a non-primary (additional) executor will be flagged "
-        "in your context until you switch back to a primary."
+        "usable. Use primary executors for normal work. Additional executors are "
+        "special-purpose targets and must not be used merely as fallback capacity "
+        "when a primary executor is down; switch to one only when the task requires "
+        "that specific machine or the user asks for it. Switch back to a primary "
+        "executor after that specific work is done, and before unrelated or generic "
+        "follow-up work. Switching to a non-primary (additional) executor will be "
+        "flagged in your context until you switch back to a primary."
     ),
     parameters={
         "type": "object",
@@ -324,7 +333,8 @@ SWITCH_EXECUTOR_TOOL = ToolDefinition(
                 "minLength": 1,
                 "description": (
                     "Assigned executor id to make active. Must be one of the agent's "
-                    "primary or additional executors."
+                    "primary or additional executors. Additional executors are "
+                    "special-purpose targets, not general fallback capacity."
                 ),
             },
             "reason": {

@@ -261,6 +261,8 @@ class TaskQueue:
 
         Creates the task in the DB and triggers dependency resolution.
         """
+        if status not in {"draft", "queued", "ready"}:
+            raise ValueError("Task create status must be draft, queued, or ready")
         if not self._accepting:
             raise RuntimeError("Task queue is not accepting new tasks")
 
@@ -307,7 +309,7 @@ class TaskQueue:
         )
 
         # If queued, try to transition to ready
-        if status == "queued":
+        if status in {"queued", "ready"}:
             await self._try_transition_to_ready(task.task_id)
 
         # Wake the drain loop
@@ -1350,6 +1352,10 @@ def _row_to_task_model(row: Any) -> TaskModel:
         attempt_number=getattr(row, "attempt_number", 1),
         workspace_root=getattr(row, "workspace_root", None),
         working_directory=getattr(row, "working_directory", None),
+        active_executor_id=getattr(row, "active_executor_id", None),
+        active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
+        active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
+        active_executor_source=getattr(row, "active_executor_source", None),
         workflow_state=(
             WorkflowState.model_validate(row.workflow_state) if row.workflow_state else None
         ),

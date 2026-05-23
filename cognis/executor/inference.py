@@ -1,4 +1,4 @@
-"""Executor-side LiteLLM proxy for remote inference routing."""
+"""Executor-side inference routing and media helpers."""
 
 from __future__ import annotations
 
@@ -9,13 +9,9 @@ from typing import Any
 import httpx
 import litellm
 
+from cognis.executor.backends.registry import ExecutorBackendRegistry, resolve_backend_name
+from cognis.executor.inference_types import CognisInferenceRequest
 from cognis.logging import get_logger
-from cognis.providers.llm.responses_bridge import (
-    messages_to_responses_input,
-    responses_request_kwargs,
-    responses_stream_to_chat_chunks,
-    responses_to_chat_response,
-)
 
 logger = get_logger(__name__)
 
@@ -26,19 +22,19 @@ def _supports_image_response_format(model: str) -> bool:
 
 
 class InferenceHandler:
-    """Proxy LLM requests from the controller through LiteLLM.
+    """Route executor-side LLM requests through transport backends.
 
     The controller resolves provider configuration, credentials, and model
     routing. The executor simply runs the same LiteLLM call remotely so the
     network origin is the executor host instead of the controller.
     """
 
-    async def close(self) -> None:
-        """Close any background resources.
+    def __init__(self, registry: ExecutorBackendRegistry | None = None) -> None:
+        self._registry = registry or ExecutorBackendRegistry()
 
-        The current implementation uses ``litellm`` directly and has nothing
-        persistent to close, but the method keeps the shutdown path uniform.
-        """
+    async def close(self) -> None:
+        """Close any backend background resources."""
+        await self._registry.close()
 
     async def stream_complete(
         self,
@@ -46,106 +42,27 @@ class InferenceHandler:
         model: str,
         messages: list[dict[str, Any]],
         request_kwargs: dict[str, Any],
+        request_id: str | None = None,
+        backend: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream a completion through LiteLLM using controller-provided args."""
         request_kwargs = dict(request_kwargs)
-        llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
-        usage: dict[str, Any] = {}
-        finish_reason = "stop"
-        response_status = "completed"
-        index = 0
-
         try:
-            if llm_api == "responses":
-                request_kwargs = responses_request_kwargs(request_kwargs)
-                stream = await litellm.aresponses(
-                    model=model,
-                    input=messages_to_responses_input(messages),
-                    stream=True,
-                    **request_kwargs,
-                )
-                async for chunk in responses_stream_to_chat_chunks(stream):
-                    payload = dict(chunk)
-                    if payload.get("mid_stream_failure") or payload.get("error"):
-                        yield {
-                            "done": True,
-                            "error": str(payload.get("error") or "Responses stream failed"),
-                            "finish_reason": "error",
-                        }
-                        return
-                    if payload.get("usage"):
-                        usage = payload["usage"]
-                    if payload.get("response_status"):
-                        response_status = str(payload["response_status"])
-                    choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                    content = delta.get("content")
-                    tool_calls = delta.get("tool_calls")
-                    reasoning_content = delta.get("reasoning_content")
-                    reasoning = delta.get("reasoning")
-                    refusal = delta.get("refusal")
-                    if (
-                        content is None
-                        and tool_calls is None
-                        and reasoning_content is None
-                        and reasoning is None
-                        and refusal is None
-                    ):
-                        continue
-                    yield {
-                        "content": content,
-                        "tool_calls": tool_calls,
-                        "reasoning_content": reasoning_content,
-                        "reasoning": reasoning,
-                        "refusal": refusal,
-                        "index": index,
-                    }
-                    index += 1
-            else:
-                stream = await litellm.acompletion(
-                    model=model,
-                    messages=messages,
-                    stream=True,
-                    **request_kwargs,
-                )
-                async for chunk in stream:
-                    payload = dict(chunk)
-                    if payload.get("usage"):
-                        usage = payload["usage"]
-                    choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                    content = delta.get("content")
-                    tool_calls = delta.get("tool_calls")
-                    reasoning_content = delta.get("reasoning_content")
-                    reasoning = delta.get("reasoning")
-                    refusal = delta.get("refusal")
-                    if (
-                        content is None
-                        and tool_calls is None
-                        and reasoning_content is None
-                        and reasoning is None
-                        and refusal is None
-                    ):
-                        continue
-                    yield {
-                        "content": content,
-                        "tool_calls": tool_calls,
-                        "reasoning_content": reasoning_content,
-                        "reasoning": reasoning,
-                        "refusal": refusal,
-                        "index": index,
-                    }
-                    index += 1
+            request = CognisInferenceRequest(
+                request_id=request_id,
+                model=model,
+                messages=messages,
+                request_kwargs=request_kwargs,
+                backend=resolve_backend_name(request_kwargs, backend),
+                provider_id=provider_id,
+                owner_email=owner_email,
+                backend_metadata=backend_metadata or {},
+            )
+            selected = self._registry.select(request)
+            async for chunk in selected.stream_complete(request):
+                yield chunk
         except Exception as exc:
             yield {
                 "done": True,
@@ -154,39 +71,31 @@ class InferenceHandler:
             }
             return
 
-        yield {
-            "done": True,
-            "usage": usage,
-            "finish_reason": finish_reason,
-            "response_status": response_status,
-        }
-
     async def generate(
         self,
         *,
         model: str,
         messages: list[dict[str, Any]],
         request_kwargs: dict[str, Any],
+        request_id: str | None = None,
+        backend: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run a non-streaming completion through LiteLLM."""
         request_kwargs = dict(request_kwargs)
-        llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
-        if llm_api == "responses":
-            response = await litellm.aresponses(
-                model=model,
-                input=messages_to_responses_input(messages),
-                stream=False,
-                **responses_request_kwargs(request_kwargs),
-            )
-            return responses_to_chat_response(response.model_dump())
-        response = await litellm.acompletion(
+        request = CognisInferenceRequest(
+            request_id=request_id,
             model=model,
             messages=messages,
+            request_kwargs=request_kwargs,
+            backend=resolve_backend_name(request_kwargs, backend),
             stream=False,
-            **request_kwargs,
+            provider_id=provider_id,
+            owner_email=owner_email,
+            backend_metadata=backend_metadata or {},
         )
-        dumped = response.model_dump()
-        return dumped if isinstance(dumped, dict) else {}
+        return await self._registry.select(request).generate(request)
 
     async def image_generate(
         self,
@@ -314,7 +223,6 @@ class InferenceHandler:
             "duration_seconds": payload.get("duration"),
         }
 
-
     async def synthesize(
         self,
         *,
@@ -335,9 +243,7 @@ class InferenceHandler:
             configured_timeout = request_kwargs.get("timeout", 120)
             request_kwargs = dict(request_kwargs)
             request_kwargs["timeout"] = (
-                min(configured_timeout, 20)
-                if isinstance(configured_timeout, int | float)
-                else 20
+                min(configured_timeout, 20) if isinstance(configured_timeout, int | float) else 20
             )
         result = await _run_synthesize_local(
             text=text,

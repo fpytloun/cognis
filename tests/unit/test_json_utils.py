@@ -7,6 +7,7 @@ import pytest
 from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
+    extract_visible_text_from_response,
     infer_evaluation_from_text,
 )
 
@@ -162,6 +163,53 @@ class TestExtractTextFromResponse:
         extracted = extract_text_from_response(response)
         assert '"decision": "revise"' in extracted
         assert '"feedback": "add tests"' in extracted
+
+
+class TestExtractVisibleTextFromResponse:
+    def test_standard_response(self) -> None:
+        response = {"choices": [{"message": {"content": "hello"}}]}
+        assert extract_visible_text_from_response(response) == "hello"
+
+    def test_list_content_blocks_are_concatenated(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "output_text", "text": "visible "},
+                            {"type": "output_text", "text": "text"},
+                        ]
+                    }
+                }
+            ]
+        }
+        assert extract_visible_text_from_response(response) == "visible text"
+
+    def test_reasoning_content_is_not_promoted_to_visible_text(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": '{"tool_ids": ["builtin:bash"]}',
+                    }
+                }
+            ]
+        }
+        assert extract_visible_text_from_response(response) == ""
+
+    def test_reasoning_is_not_promoted_to_visible_text(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning": '{"tool_ids": ["builtin:bash"]}',
+                    }
+                }
+            ]
+        }
+        assert extract_visible_text_from_response(response) == ""
 
 
 # ---------------------------------------------------------------------------

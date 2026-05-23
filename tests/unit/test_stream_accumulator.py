@@ -163,3 +163,28 @@ def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
             }
         ]
     }
+
+
+def test_thinking_blocks_include_stable_request_scoped_id_and_timing() -> None:
+    acc = StreamAccumulator(block_id_prefix="llmr_test")
+
+    acc.feed({"choices": [{"delta": {"reasoning": "Inspecting logs"}}]})
+    chunk_events = acc.pop_thinking_events()
+    assert len(chunk_events) == 1
+    assert chunk_events[0].block_id == "thk_llmr_test_1"
+    assert chunk_events[0].started_at is not None
+    assert chunk_events[0].complete is False
+
+    completed = acc.finalize_thinking()
+    close_events = acc.pop_thinking_events()
+
+    assert len(completed) == 1
+    assert completed[0].block_id == "thk_llmr_test_1"
+    assert completed[0].started_at is not None
+    assert completed[0].completed_at is not None
+    assert isinstance(completed[0].duration_ms, int)
+    assert completed[0].duration_ms >= 0
+    assert len(close_events) == 1
+    assert close_events[0].complete is True
+    assert close_events[0].content == "Inspecting logs"
+    assert close_events[0].duration_ms == completed[0].duration_ms

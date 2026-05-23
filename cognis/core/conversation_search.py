@@ -46,7 +46,7 @@ def _same_search_match(left: SearchMatch, right: SearchMatch) -> bool:
 def _normalized_query(query: str | None) -> str:
     if query is None:
         return ""
-    normalized = query.strip().strip('"\'').strip()
+    normalized = query.strip().strip("\"'").strip()
     return normalized.casefold()
 
 
@@ -114,7 +114,10 @@ async def join_session_matches(
             continue
         if status == "archived" and conversation.status != "archived":
             continue
-        if status not in {"active", "archived", "all"}:
+        starred_at = getattr(conversation, "starred_at", None)
+        if status == "starred" and (starred_at is None or conversation.status != "active"):
+            continue
+        if status not in {"active", "starred", "archived", "all"}:
             continue
         if context_type is not None and getattr(conversation, "context_type", None) != context_type:
             continue

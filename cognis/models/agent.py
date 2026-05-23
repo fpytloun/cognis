@@ -94,6 +94,7 @@ class AgentPermissions(BaseModel):
     tool_permissions: dict[str, Permission] | None = None
     allowed_secrets: list[str] = Field(default_factory=list)
     allowed_credentials: list[str] = Field(default_factory=list)
+    allowed_knowledgebases: list[str] = Field(default_factory=list)
     max_delegation_depth: int = 5
     can_delegate: bool = True
 
@@ -147,6 +148,8 @@ class AgentLLMConfig(BaseModel):
 def _matches_any(tool_name: str, patterns: list[str] | None) -> bool:
     if not patterns:
         return False
+    if "*" in patterns:
+        return True
     return any(fnmatchcase(tool_name, pattern) for pattern in patterns)
 
 

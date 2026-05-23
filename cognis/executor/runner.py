@@ -16,6 +16,7 @@ from time import perf_counter
 from typing import Any
 
 from cognis.core.executor_resolution import filter_tools_by_executor
+from cognis.executor.inference_types import json_safe_inference_payload
 from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
@@ -40,7 +41,11 @@ from cognis.tools.executor.project_context import (
     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
     handle_project_context_probe,
 )
-from cognis.tools.executor.shell import cleanup_shell_manager
+from cognis.tools.executor.shell import (
+    cleanup_shell_manager,
+    list_background_shell_statuses,
+    set_background_shell_completion_callback,
+)
 from cognis.tools.mcp import (
     MCPClient,
     MCPClientError,
@@ -109,10 +114,7 @@ class ExecutorRunner:
         self._channel_handler: Any | None = None
         self._runtime_metadata: dict[str, Any] = {}
         self._started_at = perf_counter()
-        # Background close tasks for stale MCP client sets.  Tracked so that
-        # run()'s finally block can cancel + drain them before tearing down the
-        # event loop, avoiding BaseSubprocessTransport.__del__ noise.
-        self._pending_closes: set[asyncio.Task[None]] = set()
+        self._ws_send_lock = asyncio.Lock()
 
     async def run(self) -> None:
         reconnect_delay = _RECONNECT_BASE
@@ -120,24 +122,20 @@ class ExecutorRunner:
             while self._running:
                 try:
                     await self._connect_and_serve()
-                    reconnect_delay = _RECONNECT_BASE
-                    if not self._running:
-                        break
                 except Exception:
                     logger.warning("Connection lost, reconnecting in %.1fs", reconnect_delay)
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
+                    continue
+                reconnect_delay = _RECONNECT_BASE
+                if not self._running:
+                    break
+                logger.warning("Connection closed, reconnecting immediately")
+        except asyncio.CancelledError:
+            logger.info("Executor runner cancelled, shutting down")
+            raise
         finally:
             logger.info("Executor shutting down, cleaning up resources")
-            # Drain any background close tasks spawned during reconfigure.
-            # Cancel them first so stale subprocess transports are cleaned up
-            # before the event loop closes, which eliminates the
-            # BaseSubprocessTransport.__del__ "Event loop is closed" noise.
-            if self._pending_closes:
-                for task in list(self._pending_closes):
-                    task.cancel()
-                await asyncio.gather(*self._pending_closes, return_exceptions=True)
-                self._pending_closes.clear()
             browser_manager = self._runtime_metadata.get("browser_manager")
             if browser_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -182,7 +180,8 @@ class ExecutorRunner:
         async with websockets.connect(url, compression="deflate", max_size=10 * 1024 * 1024) as ws:
             logger.info("WebSocket connected, sending executor.ready")
             ready_id = uuid.uuid4().hex
-            await ws.send(
+            await self._send_ws(
+                ws,
                 json.dumps(
                     {
                         "jsonrpc": "2.0",
@@ -198,7 +197,7 @@ class ExecutorRunner:
                         },
                         "id": ready_id,
                     }
-                )
+                ),
             )
             response = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
             if "error" in response:
@@ -218,10 +217,28 @@ class ExecutorRunner:
             if self._channel_handler is not None:
                 self._channel_handler.set_ws(ws)
 
+            async def _background_shell_completed(status: dict[str, Any]) -> None:
+                await self._send_ws(
+                    ws,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "shell.background_completed",
+                            "params": status,
+                        }
+                    ),
+                )
+
+            set_background_shell_completion_callback(
+                self._runtime_metadata,
+                _background_shell_completed,
+            )
+
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
                 await self._message_loop(ws)
             finally:
+                set_background_shell_completion_callback(self._runtime_metadata, None)
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat_task
@@ -281,6 +298,8 @@ class ExecutorRunner:
                 asyncio.create_task(self._handle_channel_sync_profile(ws, msg_id, params))
             elif method == "lsp.status":
                 asyncio.create_task(self._handle_lsp_status(ws, msg_id, params))
+            elif method == "shell.background_status":
+                asyncio.create_task(self._handle_background_shell_status(ws, msg_id, params))
             elif method == "executor.cancel":
                 logger.info("Received executor.cancel, shutting down")
                 if msg_id is not None:
@@ -289,6 +308,10 @@ class ExecutorRunner:
                 break
             else:
                 logger.debug("Received unknown method: %s", method)
+        if self._running:
+            logger.warning("Controller websocket closed, leaving message loop")
+        else:
+            logger.info("Executor message loop stopped")
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         requested_version = int(params.get("config_version") or (self._config_version + 1))
@@ -326,15 +349,13 @@ class ExecutorRunner:
         try:
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
             validate_unique_server_names(mcp_servers)
-            (
-                staged_mcp_clients,
-                discovered_tools,
-                mcp_statuses,
-                mcp_warnings,
-            ) = await asyncio.wait_for(
-                self._prepare_mcp_runtime(mcp_servers, secrets),
-                timeout=_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS,
-            )
+            async with asyncio.timeout(_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS):
+                (
+                    staged_mcp_clients,
+                    discovered_tools,
+                    mcp_statuses,
+                    mcp_warnings,
+                ) = await self._prepare_mcp_runtime(mcp_servers, secrets)
         except Exception as exc:
             logger.warning(
                 "Configure v%d failed during MCP preparation: %s", requested_version, exc
@@ -484,14 +505,14 @@ class ExecutorRunner:
             self._channel_handler.set_executor_config(config)
 
             if old_clients is not previous_clients:
-                self._spawn_background_close(old_clients)
+                await self._close_clients(old_clients, suppress_cancelled=True)
             elif previous_clients is not staged_mcp_clients:
-                # Close the stale v_prev MCP clients on a separate task so that
-                # anyio cross-task cancel-scope teardown (when the exit stacks
-                # were entered in the previous configure task) cannot inject a
-                # deferred CancelledError or BaseExceptionGroup into the current
-                # configure task and cause the executor to exit.
-                self._spawn_background_close(previous_clients)
+                # MCP SDK transports use anyio cancel scopes that must be exited
+                # from the same asyncio task that entered them.  Keep stale
+                # client teardown inline with the message-loop/configure task;
+                # closing from a background task leaves async generators for
+                # loop shutdown and triggers anyio cross-task scope errors.
+                await self._close_clients(previous_clients, suppress_cancelled=True)
             old_browser_manager = previous_runtime_metadata.get(BROWSER_MANAGER_KEY)
             if (
                 old_browser_manager is not None
@@ -720,6 +741,15 @@ class ExecutorRunner:
         )
         await self._send_rpc_result(ws, msg_id, report.model_dump(mode="json"))
 
+    async def _handle_background_shell_status(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        statuses = await list_background_shell_statuses(
+            self._runtime_metadata,
+            include_completed=bool(params.get("include_completed", False)),
+        )
+        await self._send_rpc_result(ws, msg_id, {"shells": statuses})
+
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
         if msg_id is None:
             return
@@ -753,6 +783,10 @@ class ExecutorRunner:
         arguments = params.get("arguments", {})
         timeout_seconds = params.get("timeout_seconds")
         start = perf_counter()
+        send_lock = asyncio.Lock()
+        request_runtime_metadata = params.get("runtime_metadata")
+        if not isinstance(request_runtime_metadata, dict):
+            request_runtime_metadata = {}
         try:
             handler = self._tool_handlers.get(tool_name)
             if handler is None:
@@ -771,11 +805,7 @@ class ExecutorRunner:
                     ),
                     runtime_metadata={
                         **self._runtime_metadata,
-                        **(
-                            params.get("runtime_metadata")
-                            if isinstance(params.get("runtime_metadata"), dict)
-                            else {}
-                        ),
+                        **request_runtime_metadata,
                     },
                     shared_runtime_metadata=self._runtime_metadata,
                     execution_scope_id=str(
@@ -783,6 +813,26 @@ class ExecutorRunner:
                         or f"{self.config.executor_id}:{self._runtime_metadata.get('user_email', 'runtime')}"
                     ),
                 )
+
+                async def _send_tool_chunk(delta: str, stream: str | None) -> None:
+                    async with send_lock:
+                        await self._send_ws(
+                            ws,
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "tool.progress",
+                                    "params": {
+                                        "call_id": call_id,
+                                        "tool_name": tool_name,
+                                        "delta": delta,
+                                        "stream": stream,
+                                    },
+                                }
+                            ),
+                        )
+
+                ctx.output_chunk_callback = _send_tool_chunk
 
                 async def _invoke() -> Any:
                     return await handler(tool_call.arguments, ctx)
@@ -806,18 +856,19 @@ class ExecutorRunner:
         finally:
             self._active_calls.pop(call_id, None)
 
-        await self._send_rpc_result(
-            ws,
-            msg_id,
-            {
-                "call_id": call_id,
-                "output": result.output,
-                "is_error": result.is_error,
-                "duration_ms": result.duration_ms,
-                "metadata": result.metadata,
-                "attachments": result.attachments,
-            },
-        )
+        async with send_lock:
+            await self._send_rpc_result(
+                ws,
+                msg_id,
+                {
+                    "call_id": call_id,
+                    "output": result.output,
+                    "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                    "metadata": result.metadata,
+                    "attachments": result.attachments,
+                },
+            )
 
     async def _handle_llm_complete(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -831,52 +882,62 @@ class ExecutorRunner:
             await self._send_rpc_result(ws, msg_id, {"status": "streaming"})
 
         request_kwargs = dict(params.get("request_kwargs") or {})
-        request_kwargs.update(
-            {
-                key: value
-                for key, value in params.items()
-                if key not in {"request_id", "request_kwargs", "model", "messages"}
-            }
-        )
 
         async for chunk in self._inference_handler.stream_complete(
             model=str(params.get("model", "")),
             messages=list(params.get("messages", [])),
             request_kwargs=request_kwargs,
+            request_id=str(request_id),
+            backend=params.get("backend") if isinstance(params.get("backend"), str) else None,
+            provider_id=params.get("provider_id")
+            if isinstance(params.get("provider_id"), str)
+            else None,
+            owner_email=params.get("owner_email")
+            if isinstance(params.get("owner_email"), str)
+            else None,
+            backend_metadata=params.get("backend_metadata")
+            if isinstance(params.get("backend_metadata"), dict)
+            else None,
         ):
+            safe_chunk = json_safe_inference_payload(chunk)
+            if not isinstance(safe_chunk, dict):
+                safe_chunk = {}
             if chunk.get("done"):
-                await ws.send(
+                await self._send_ws(
+                    ws,
                     json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "method": "llm.done",
                             "params": {
                                 "request_id": request_id,
-                                "usage": chunk.get("usage", {}),
-                                "finish_reason": chunk.get("finish_reason", "stop"),
-                                "response_status": chunk.get("response_status", "completed"),
-                                "error": chunk.get("error"),
+                                "usage": safe_chunk.get("usage", {}),
+                                "finish_reason": safe_chunk.get("finish_reason", "stop"),
+                                "response_status": safe_chunk.get("response_status", "completed"),
+                                "error": safe_chunk.get("error"),
+                                "backend_metadata": safe_chunk.get("backend_metadata"),
                             },
                         }
-                    )
+                    ),
                 )
             else:
-                await ws.send(
+                await self._send_ws(
+                    ws,
                     json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "method": "llm.chunk",
                             "params": {
                                 "request_id": request_id,
-                                "content": chunk.get("content"),
-                                "tool_calls": chunk.get("tool_calls"),
-                                "reasoning_content": chunk.get("reasoning_content"),
-                                "reasoning": chunk.get("reasoning"),
-                                "refusal": chunk.get("refusal"),
-                                "index": chunk.get("index", 0),
+                                "content": safe_chunk.get("content"),
+                                "tool_calls": safe_chunk.get("tool_calls"),
+                                "reasoning_content": safe_chunk.get("reasoning_content"),
+                                "reasoning": safe_chunk.get("reasoning"),
+                                "refusal": safe_chunk.get("refusal"),
+                                "index": safe_chunk.get("index", 0),
                             },
                         }
-                    )
+                    ),
                 )
 
     async def _handle_llm_transcribe(
@@ -1044,7 +1105,8 @@ class ExecutorRunner:
     async def _heartbeat_loop(self, ws: Any) -> None:
         while self._running:
             try:
-                await ws.send(
+                await self._send_ws(
+                    ws,
                     json.dumps(
                         {
                             "jsonrpc": "2.0",
@@ -1057,7 +1119,7 @@ class ExecutorRunner:
                                 "config_version": self._config_version,
                             },
                         }
-                    )
+                    ),
                 )
             except Exception:
                 break
@@ -1203,24 +1265,6 @@ class ExecutorRunner:
 
         return _handler
 
-    def _spawn_background_close(self, clients: dict[str, MCPClient]) -> None:
-        """Schedule teardown of stale MCP clients on a dedicated background task.
-
-        Running the close off the configure-handler task prevents anyio
-        cross-task cancel-scope violations from injecting a deferred
-        CancelledError or BaseExceptionGroup into the current task, which
-        would otherwise cause the executor message loop to exit.
-
-        The task is tracked in ``_pending_closes`` so ``run()``'s finally
-        block can cancel and drain it before the event loop is closed.
-        """
-        task: asyncio.Task[None] = asyncio.create_task(
-            self._close_clients(clients, suppress_cancelled=True),
-            name="mcp-stale-close",
-        )
-        self._pending_closes.add(task)
-        task.add_done_callback(self._pending_closes.discard)
-
     async def _close_mcp_clients(self) -> None:
         await self._close_clients(self._mcp_clients, suppress_cancelled=True)
         self._mcp_clients = {}
@@ -1261,16 +1305,21 @@ class ExecutorRunner:
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:
             return
-        await ws.send(json.dumps({"jsonrpc": "2.0", "result": result, "id": msg_id}))
+        await self._send_ws(ws, json.dumps({"jsonrpc": "2.0", "result": result, "id": msg_id}))
 
     async def _send_rpc_error(self, ws: Any, msg_id: str | None, code: int, message: str) -> None:
         if msg_id is None:
             return
-        await ws.send(
+        await self._send_ws(
+            ws,
             json.dumps(
                 {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": msg_id}
-            )
+            ),
         )
+
+    async def _send_ws(self, ws: Any, payload: str) -> None:
+        async with self._ws_send_lock:
+            await ws.send(payload)
 
 
 def _normalize_result(raw: Any, duration_ms: int) -> ToolResult:

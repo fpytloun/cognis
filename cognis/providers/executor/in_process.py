@@ -22,6 +22,7 @@ from cognis.models.tool import (
     ToolCall,
     ToolResult,
 )
+from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.tools.builtin.conversations import build_conversation_tool_handlers
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
@@ -43,7 +44,10 @@ from cognis.tools.executor.project_context import (
     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
     handle_project_context_probe,
 )
-from cognis.tools.executor.shell import cleanup_shell_manager
+from cognis.tools.executor.shell import (
+    cleanup_shell_manager,
+    set_background_shell_completion_callback,
+)
 from cognis.tools.mcp import (
     MCPClient,
     build_mcp_client,
@@ -114,6 +118,16 @@ class InProcessExecutorConnection:
             return {"status": "cancelled"}
         if method in {"heartbeat", "executor.heartbeat"}:
             return {"status": "ok", "active_calls": len(self._active_calls)}
+        if method == "shell.background_status":
+            from cognis.tools.executor.shell import list_background_shell_statuses
+
+            include_completed = bool(params.get("include_completed", False))
+            return {
+                "shells": await list_background_shell_statuses(
+                    self.runtime_metadata,
+                    include_completed=include_completed,
+                )
+            }
         raise ValueError(f"Unsupported executor method: {method}")
 
     async def list_tools(self) -> list[dict[str, Any]]:
@@ -122,7 +136,10 @@ class InProcessExecutorConnection:
         return self.registry.export()
 
     async def tool_execute(
-        self, tool_call: ToolCall, timeout_seconds: int | None = None
+        self,
+        tool_call: ToolCall,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
     ) -> ToolResult:
         """Execute a tool call through the runtime registry."""
 
@@ -140,6 +157,7 @@ class InProcessExecutorConnection:
                 runtime_metadata={**self.runtime_metadata, **tool_call.runtime_metadata},
                 shared_runtime_metadata=self.runtime_metadata,
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
+                output_chunk_callback=output_chunk_callback,
             )
             result = await handler(tool_call.arguments, context)
             duration_ms = int((perf_counter() - start) * 1000)
@@ -186,6 +204,9 @@ class InProcessExecutorProvider:
         self.guardrails_provider = guardrails_provider
         self._active: dict[str, _ExecutorRuntime] = {}
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self._background_shell_completed_callback: (
+            Callable[[str, dict[str, Any]], Awaitable[None]] | None
+        ) = None
 
     async def spawn(self, config: ExecutorConfig) -> ExecutorHandle:
         """Spawn a new in-process executor runtime."""
@@ -198,7 +219,10 @@ class InProcessExecutorProvider:
             capabilities=ExecutorCapabilities(),
             metadata=dict(config.metadata),
         )
-        system_handlers = build_system_tool_handlers(self.session_factory, self.status_provider)
+        system_handlers = dict(config.tool_handlers)
+        system_handlers.update(
+            build_system_tool_handlers(self.session_factory, self.status_provider)
+        )
         if self.guardrails_provider is not None:
             system_handlers.update(
                 build_conversation_tool_handlers(self.session_factory, self.guardrails_provider)
@@ -220,6 +244,16 @@ class InProcessExecutorProvider:
                 registry.register(RegisteredTool(definition=tool, handler=cast(Any, handler)))
             lsp_manager: LSPManager | None = None
             runtime_metadata = dict(config.metadata)
+            if self._background_shell_completed_callback is not None:
+                completion_callback = self._background_shell_completed_callback
+
+                async def _background_shell_completed(status: dict[str, Any]) -> None:
+                    await completion_callback(config.executor_id, status)
+
+                set_background_shell_completion_callback(
+                    runtime_metadata,
+                    _background_shell_completed,
+                )
             get_file_freshness_tracker(runtime_metadata)
             # Stage A: eagerly build the BrowserManager so all tool calls for
             # this executor share a single persistent instance.
@@ -309,6 +343,35 @@ class InProcessExecutorProvider:
         """List active executor handles."""
 
         return [runtime.handle for runtime in self._active.values()]
+
+    def register_background_shell_completed_callback(
+        self,
+        callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Register callback for current and future in-process shell completions."""
+
+        self._background_shell_completed_callback = callback
+        for runtime in self._active.values():
+            if callback is None:
+                set_background_shell_completion_callback(
+                    runtime.connection.runtime_metadata,
+                    None,
+                )
+                continue
+
+            executor_id = runtime.handle.executor_id
+
+            async def _background_shell_completed(
+                status: dict[str, Any],
+                *,
+                executor_id: str = executor_id,
+            ) -> None:
+                await callback(executor_id, status)
+
+            set_background_shell_completion_callback(
+                runtime.connection.runtime_metadata,
+                _background_shell_completed,
+            )
 
     async def get_lsp_statuses(self, *, owner_email: str | None = None) -> list[LSPStatusReport]:
         """Return normalized LSP status for active in-process runtimes."""

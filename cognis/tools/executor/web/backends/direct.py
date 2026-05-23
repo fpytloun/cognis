@@ -18,6 +18,7 @@ import httpx
 from cognis.models.tool import ToolResult
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 from cognis.tools.executor.web.backends.formatting import build_search_tool_result
+from cognis.tools.executor.web.backends.reddit import fetch_reddit_thread
 from cognis.tools.executor.web.headers import (
     clamp_timeout,
     fetch_with_retry,
@@ -43,6 +44,18 @@ class DirectBackend:
     ) -> ToolResult:
         """Fetch a URL using httpx with browser-like headers."""
         timeout = clamp_timeout(timeout)
+
+        try:
+            reddit_result = await fetch_reddit_thread(
+                url,
+                output_format=output_format,
+                timeout=timeout,
+            )
+        except (httpx.HTTPError, ValueError):
+            logger.debug("web: Reddit JSON adapter failed; falling back to direct HTTP")
+        else:
+            if reddit_result is not None:
+                return reddit_result
 
         try:
             result = await _fetch_breaker.call(lambda: fetch_with_retry(url, timeout=timeout))

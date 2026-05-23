@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from cognis.api.routes.artifacts import _clamp_ttl_to_artifact_expiry, _is_expired
 from cognis.artifacts.store import (
     ArtifactStore,
     ArtifactStoreConfig,
@@ -110,3 +112,35 @@ def test_s3_delete_object_deletes_prefix_keys_individually() -> None:
         ("artifacts", "images/img_123/.metadata.json"),
     ]
     assert client.delete_objects_calls == []
+
+
+def test_artifact_route_expiry_helper_rejects_expired_rows() -> None:
+    class _Row:
+        expires_at = None
+
+    row = _Row()
+    now = datetime.now(UTC)
+
+    row.expires_at = now - timedelta(seconds=1)
+    assert _is_expired(row, now=now) is True
+
+    row.expires_at = now + timedelta(seconds=1)
+    assert _is_expired(row, now=now) is False
+
+
+def test_artifact_route_expiry_helper_handles_naive_datetimes() -> None:
+    class _Row:
+        expires_at = None
+
+    row = _Row()
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    row.expires_at = datetime(2025, 12, 31, 23, 59, 59)
+
+    assert _is_expired(row, now=now) is True
+
+
+def test_artifact_signed_url_ttl_clamps_to_artifact_expiry() -> None:
+    class _Row:
+        expires_at = datetime.now(UTC) + timedelta(seconds=300)
+
+    assert _clamp_ttl_to_artifact_expiry(_Row(), 3600) <= 300

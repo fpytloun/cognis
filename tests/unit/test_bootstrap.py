@@ -126,7 +126,9 @@ async def test_bootstrap_does_not_overwrite_existing_settings(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_does_not_seed_legacy_context_cap(monkeypatch: object, tmp_path: Path) -> None:
+async def test_bootstrap_does_not_seed_legacy_context_cap(
+    monkeypatch: object, tmp_path: Path
+) -> None:
     """Bootstrap no longer seeds the removed session.max_context_tokens setting."""
 
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
@@ -190,7 +192,89 @@ async def test_run_schema_bootstrap_upgrades_legacy_sessions_table(tmp_path: Pat
             }
         )
 
-    assert {"idle_since", "updated_at"}.issubset(session_columns)
+    assert {"idle_since", "updated_at", "result_content"}.issubset(session_columns)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_schema_bootstrap_upgrades_legacy_llm_provider_owner_schema(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy_llm.db'}")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE TABLE llm_providers ("
+                "provider_id TEXT PRIMARY KEY, "
+                "display_name TEXT NOT NULL, "
+                "location TEXT NOT NULL, "
+                "backend TEXT NOT NULL, "
+                "config TEXT NOT NULL, "
+                "is_default BOOLEAN NOT NULL DEFAULT 0, "
+                "status TEXT NOT NULL, "
+                "created_at TIMESTAMP NOT NULL, "
+                "updated_at TIMESTAMP NOT NULL"
+                ")"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE TABLE model_routing ("
+                "task_type TEXT PRIMARY KEY, "
+                "provider_id TEXT, "
+                "model TEXT NOT NULL, "
+                "config TEXT, "
+                "updated_at TIMESTAMP NOT NULL"
+                ")"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO llm_providers ("
+                "provider_id, display_name, location, backend, config, status, created_at, updated_at"
+                ") VALUES ('openai', 'OpenAI', 'controller', 'litellm', '{}', 'active', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO model_routing (task_type, provider_id, model, config, updated_at) "
+                "VALUES ('default', 'openai', 'gpt-4o-mini', NULL, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    await run_schema_bootstrap(engine)
+
+    async with engine.begin() as conn:
+        provider_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"] for column in inspect(sync_conn).get_columns("llm_providers")
+            }
+        )
+        routing_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"] for column in inspect(sync_conn).get_columns("model_routing")
+            }
+        )
+        table_names = await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names())
+        owner_email = (
+            await conn.execute(
+                text("SELECT owner_email FROM llm_providers WHERE provider_id = 'openai'")
+            )
+        ).scalar_one()
+        route_id = (
+            await conn.execute(
+                text("SELECT route_id FROM model_routing WHERE task_type = 'default'")
+            )
+        ).scalar_one()
+
+    assert "owner_email" in provider_columns
+    assert {"route_id", "owner_email"}.issubset(routing_columns)
+    assert "llm_provider_auth_sessions" in table_names
+    assert owner_email == "system@cognis.local"
+    assert route_id == "route_default"
 
     await engine.dispose()
 

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
-from cognis.models.session import ConversationContext
+from cognis.models.session import ConversationContext, SessionEvent, SessionModel
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
 from cognis.store.queries import get_conversation, get_session_row, list_conversation_sessions
@@ -19,6 +20,8 @@ class _Guardrails:
         self.status_calls: list[tuple[str, str, str | None]] = []
         self.last_details: dict | None = None
         self.last_policy: dict | None = None
+        self.policy_updates: list[tuple[str, dict | None, dict | None]] = []
+        self.recorded_events: list[tuple[str, list[SessionEvent], str | None]] = []
 
     async def create_session(
         self,
@@ -47,6 +50,38 @@ class _Guardrails:
         if self.fail:
             raise RuntimeError("intaris unavailable")
         self.status_calls.append((session_id, status, status_reason))
+
+    async def update_session_policy(
+        self,
+        session_id: str,
+        *,
+        agent_id: str,
+        user_id: str | None = None,
+        details: dict | None = None,
+        policy: dict | None = None,
+    ) -> None:
+        del agent_id, user_id
+        if self.fail:
+            raise RuntimeError("intaris unavailable")
+        self.last_details = dict(details) if details is not None else None
+        self.last_policy = dict(policy) if policy is not None else None
+        self.policy_updates.append((session_id, self.last_details, self.last_policy))
+
+    async def record_events(
+        self,
+        session_id: str,
+        events: list[SessionEvent],
+        source: str = "cognis",
+        idempotency_key: str | None = None,
+        **_: object,
+    ) -> object:
+        del source
+        self.recorded_events.append((session_id, events, idempotency_key))
+        return type(
+            "_AppendResult",
+            (),
+            {"ok": True, "count": len(events), "first_seq": 1, "last_seq": len(events)},
+        )()
 
 
 class _SlowGuardrails(_Guardrails):
@@ -80,10 +115,58 @@ class _Providers:
 class _Cache:
     def __init__(self) -> None:
         self.evicted: list[str] = []
+        self.appended_events: list[tuple[SessionModel, list[SessionEvent], object]] = []
 
     async def evict(self, session_id: str) -> bool:
         self.evicted.append(session_id)
         return True
+
+    async def append_recorded_events(
+        self,
+        session: SessionModel,
+        events: list[SessionEvent],
+        append_result: object,
+    ) -> None:
+        self.appended_events.append((session, events, append_result))
+
+
+@pytest.mark.asyncio
+async def test_seed_rotated_tail_events_skips_non_appendable_event_types(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+    new_session = SessionModel(
+        session_id="new-session",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intaris_session_id="intaris-new-session",
+    )
+    tail_events = [
+        SimpleNamespace(seq=10, type="user_message", data={"content": "keep"}),
+        SimpleNamespace(seq=11, type="tool_result_chunk", data={"content": "skip"}),
+        SimpleNamespace(seq=12, type="assistant_message", data={"content": "keep too"}),
+    ]
+
+    await manager._seed_rotated_tail_events(
+        new_session,
+        tail_events=tail_events,
+        previous_session_id="old-session",
+    )
+
+    assert len(providers.guardrails.recorded_events) == 1
+    session_id, recorded_events, idempotency_key = providers.guardrails.recorded_events[0]
+    assert session_id == "intaris-new-session"
+    assert idempotency_key == "new-session:compaction_tail:old-session"
+    assert [event.type for event in recorded_events] == ["user_message", "assistant_message"]
+    assert [event.data["source_seq"] for event in recorded_events] == [10, 12]
+    assert all(event.data["compaction_tail"] is True for event in recorded_events)
+    assert all(event.data["source_session_id"] == "old-session" for event in recorded_events)
+    assert len(cache.appended_events) == 1
+    assert cache.appended_events[0][1] == recorded_events
+
+    await engine.dispose()
 
 
 async def _session_factory(tmp_path) -> object:
@@ -283,6 +366,13 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
     # Verify Intaris session was created for new root
     assert len(providers.guardrails.calls) == 2  # original + rotation
     assert providers.guardrails.calls[1][0] == new_session.session_id
+    assert any(
+        key == f"{new_session.session_id}:compaction_summary:rotation"
+        and events
+        and getattr(events[0], "type", None) == "compaction_summary"
+        for session_id, events, key in providers.guardrails.recorded_events
+        if session_id == new_session.session_id
+    )
 
     await engine.dispose()
 
@@ -439,13 +529,21 @@ async def test_mark_completed_syncs_to_intaris(tmp_path) -> None:
         intention="test",
     )
 
-    await manager.mark_completed(root.session_id, completion_reason="compacted")
+    await manager.mark_completed(
+        root.session_id,
+        result_content="Full durable delegate result",
+        completion_reason="compacted",
+    )
 
     assert len(providers.guardrails.status_calls) == 1
     sid, status, reason = providers.guardrails.status_calls[0]
     assert sid == root.session_id
     assert status == "completed"
     assert reason == "completion_reason=compacted"
+    async with session_factory() as db_session:
+        row = await get_session_row(db_session, root.session_id)
+    assert row is not None
+    assert row.result_content == "Full durable delegate result"
 
     await engine.dispose()
 
@@ -576,6 +674,46 @@ async def test_intaris_sync_failure_does_not_block_mark(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_intaris_sync_failure_logs_safe_diagnostics(tmp_path, caplog) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers_ok = _Providers(fail=False)
+    manager_ok = SessionManager(session_factory, providers_ok, _Cache())
+
+    conversation = await manager_ok.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Diagnostics test",
+    )
+    root = await manager_ok.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    providers_fail = _Providers(fail=True)
+    manager_fail = SessionManager(session_factory, providers_fail, _Cache())
+    await manager_fail.mark_idle(root.session_id)
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.message == "session: failed to sync status to Intaris"
+    ]
+    assert matching
+    extra = matching[-1].__dict__.get("extra_data") or {}
+    assert extra["session_id"] == root.session_id
+    assert extra["target_session_id"] == root.session_id
+    assert extra["uses_intaris_session_id"] is False
+    assert extra["has_user_email"] is True
+    assert extra["user_email_hash"]
+    assert "user@example.com" not in str(extra)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_archive_conversation_clears_active_session_and_marks_session_completed(
     tmp_path,
 ) -> None:
@@ -698,25 +836,42 @@ async def test_create_root_session_passes_workdir_and_allow_paths_to_intaris(tmp
 
 
 @pytest.mark.asyncio
-async def test_create_root_session_omits_workdir_when_runtime_context_unset(tmp_path) -> None:
-    """Without a working directory in the runtime context, details must not advertise one."""
+async def test_create_root_session_falls_back_to_executor_cwd_when_context_unset(
+    tmp_path,
+) -> None:
+    """Chat sessions must allow the executor cwd even without platform path data."""
+
+    from types import SimpleNamespace
+
+    from cognis.runtime_context import scoped_runtime_context
 
     engine, session_factory = await _session_factory(tmp_path)
     providers = _Providers()
     manager = SessionManager(session_factory, providers, _Cache())
 
-    conversation, root = await manager.create_conversation_with_root_session(
+    executor_env = SimpleNamespace(home="/home/user", cwd="/home/user/src/cognis")
+    with scoped_runtime_context(
         user_email="user@example.com",
         agent_id="agent-1",
-        context=ConversationContext(type="web"),
-        title="No workdir",
-    )
+        agent_owner_email="user@example.com",
+        executor_environment=executor_env,
+    ):
+        conversation, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            title="No workdir",
+        )
     del conversation, root
 
     assert providers.guardrails.last_details is not None
-    assert "working_directory" not in providers.guardrails.last_details
+    assert providers.guardrails.last_details["working_directory"] == "/home/user/src/cognis"
     assert providers.guardrails.last_policy is not None
-    assert providers.guardrails.last_policy == {}
+    assert "/tmp/*" in providers.guardrails.last_policy["allow_paths"]
+    assert "/var/tmp/*" in providers.guardrails.last_policy["allow_paths"]
+    assert "/home/user/*" in providers.guardrails.last_policy["allow_paths"]
+    assert "/home/user/src/cognis/*" in providers.guardrails.last_policy["allow_paths"]
+    assert "/home/user/.local/share/cognis/*" in providers.guardrails.last_policy["allow_paths"]
 
     await engine.dispose()
 
@@ -783,8 +938,248 @@ async def test_intaris_session_policy_includes_project_source_paths(tmp_path) ->
         )
 
     allow_paths = providers.guardrails.last_policy["allow_paths"]
+    assert "/tmp/*" in allow_paths
+    assert "/var/tmp/*" in allow_paths
     assert "/home/user/src/cognis/*" in allow_paths
     assert "/home/user/src/intaris/*" in allow_paths
     assert f"{workdir}/*" in allow_paths
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_create_conversation_with_root_session_uses_project_source_paths(
+    tmp_path,
+) -> None:
+    """Task step conversations must allow every configured project source."""
+
+    from cognis.runtime_context import scoped_runtime_context
+    from cognis.store.queries import create_project_source
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    async with session_factory() as session:
+        from cognis.store.models import ProjectRow
+
+        session.add(
+            ProjectRow(
+                project_id="proj-1",
+                name="Test Project",
+                owner_email="user@example.com",
+            )
+        )
+        await session.flush()
+        await create_project_source(
+            session,
+            project_id="proj-1",
+            name="cognis",
+            local_path="/home/user/src/cognis",
+            remote_url=None,
+            default_branch="main",
+        )
+        await create_project_source(
+            session,
+            project_id="proj-1",
+            name="intaris",
+            local_path="/home/user/src/intaris",
+            remote_url=None,
+            default_branch="main",
+        )
+        await session.commit()
+
+    narrowed_workdir = "/home/user/src/cognis/ui/src/lib"
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        effective_working_directory=narrowed_workdir,
+    ):
+        conversation, _ = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-1"),
+            title="Task step",
+            project_id="proj-1",
+        )
+
+    assert conversation.project_id == "proj-1"
+    assert providers.guardrails.last_details == {
+        "source": "cognis",
+        "working_directory": narrowed_workdir,
+    }
+    allow_paths = providers.guardrails.last_policy["allow_paths"]
+    assert "/tmp/*" in allow_paths
+    assert "/var/tmp/*" in allow_paths
+    assert "/home/user/src/cognis/*" in allow_paths
+    assert "/home/user/src/intaris/*" in allow_paths
+    assert f"{narrowed_workdir}/*" in allow_paths
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_intaris_session_policy_expands_tilde_with_executor_home(tmp_path) -> None:
+    """Project sources using ~ must be expanded with the executor home directory."""
+
+    from types import SimpleNamespace
+
+    from cognis.runtime_context import scoped_runtime_context
+    from cognis.store.queries import create_project_source
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    async with session_factory() as session:
+        from cognis.store.models import ProjectRow
+
+        session.add(
+            ProjectRow(
+                project_id="proj-tilde",
+                name="Tilde Project",
+                owner_email="user@example.com",
+            )
+        )
+        await session.flush()
+        await create_project_source(
+            session,
+            project_id="proj-tilde",
+            name="cognis",
+            local_path="~/src/cognis",
+            remote_url=None,
+            default_branch="main",
+        )
+        await create_project_source(
+            session,
+            project_id="proj-tilde",
+            name="intaris",
+            local_path="~/src/intaris",
+            remote_url=None,
+            default_branch="main",
+        )
+        await session.commit()
+
+    executor_env = SimpleNamespace(home="/home/executor", cwd="/home/executor/src/cognis")
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        effective_working_directory="~/src/cognis/api",
+        executor_environment=executor_env,
+    ):
+        conversation, _ = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-tilde"),
+            title="Tilde task step",
+            project_id="proj-tilde",
+        )
+
+    assert conversation.project_id == "proj-tilde"
+    assert providers.guardrails.last_details == {
+        "source": "cognis",
+        "working_directory": "~/src/cognis/api",
+    }
+    allow_paths = providers.guardrails.last_policy["allow_paths"]
+    assert "~/src/cognis/*" not in allow_paths
+    assert "~/src/intaris/*" not in allow_paths
+    assert "/home/executor/src/cognis/*" in allow_paths
+    assert "/home/executor/src/intaris/*" in allow_paths
+    assert "/home/executor/src/cognis/api/*" in allow_paths
+    assert "/home/executor/.local/share/cognis/*" in allow_paths
+    assert "/tmp/*" in allow_paths
+    assert "/var/tmp/*" in allow_paths
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_session_does_not_inherit_implicit_runtime_workdir(tmp_path) -> None:
+    """Delegated child sessions stay neutral unless the caller scopes paths explicitly."""
+
+    from types import SimpleNamespace
+
+    from cognis.runtime_context import scoped_runtime_context
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    executor_env = SimpleNamespace(home="/home/user", cwd="/home/user/src/cognis")
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+        executor_environment=executor_env,
+        workspace_root="/home/user/src/codex",
+        effective_working_directory="/home/user/src/codex/codex-rs/protocol/src",
+    ):
+        conversation, parent = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            title="Parent",
+        )
+        child = await manager.create_child_session(
+            parent,
+            mode="sync",
+            task_description="Inspect policy",
+            agent_id="agent-1",
+            effective_agent_id="agent-1",
+        )
+    del conversation, parent, child
+
+    assert providers.guardrails.last_policy is not None
+    assert (
+        "/home/user/src/codex/codex-rs/protocol/src/*"
+        not in providers.guardrails.last_policy["allow_paths"]
+    )
+    assert providers.guardrails.last_details is not None
+    assert "working_directory" not in providers.guardrails.last_details
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_session_uses_explicit_delegation_workdir(tmp_path) -> None:
+    """Explicit delegation paths are still reflected in Intaris details and policy."""
+
+    from cognis.runtime_context import scoped_runtime_context
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        agent_owner_email="user@example.com",
+    ):
+        _, parent = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            title="Parent",
+        )
+        child = await manager.create_child_session(
+            parent,
+            mode="sync",
+            task_description="Inspect policy",
+            agent_id="agent-1",
+            effective_agent_id="agent-1",
+            workspace_root="/home/user/src/cognis",
+            working_directory="/home/user/src/cognis/cognis/core",
+        )
+    del parent, child
+
+    assert providers.guardrails.last_policy is not None
+    assert "/home/user/src/cognis/cognis/core/*" in providers.guardrails.last_policy["allow_paths"]
+    assert providers.guardrails.last_details is not None
+    assert (
+        providers.guardrails.last_details["working_directory"]
+        == "/home/user/src/cognis/cognis/core"
+    )
 
     await engine.dispose()

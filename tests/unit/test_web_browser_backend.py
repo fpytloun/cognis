@@ -14,6 +14,8 @@ from cognis.tools.executor.web.backends import (
     available_fetch_backends,
     available_search_backends,
     get_browser_fetch_backend,
+    get_headed_browser_fetch_backend,
+    get_preferred_browser_fetch_backend,
     resolve_fetch_backend,
     resolve_search_backend,
 )
@@ -89,19 +91,34 @@ def test_available_search_backends_includes_searxng_when_url_set() -> None:
 
 
 class _FakePage:
-    def __init__(self, html: str) -> None:
+    def __init__(self, html: str, *, url: str = "https://example.com") -> None:
         self._html = html
+        self.url = url
+        self.wait_for_function_calls = 0
+        self.goto_calls: list[dict[str, Any]] = []
+        self.evaluate_calls = 0
 
     async def content(self) -> str:
         return self._html
 
-    async def goto(self, url: str) -> None:  # pragma: no cover - unused here
+    async def wait_for_function(self, *_args: Any, **_kwargs: Any) -> None:
+        self.wait_for_function_calls += 1
+
+    async def evaluate(self, *_args: Any, **_kwargs: Any) -> bool:
+        self.evaluate_calls += 1
+        return False
+
+    async def wait_for_load_state(self, *_args: Any, **_kwargs: Any) -> None:
         return None
+
+    async def goto(self, url: str, **kwargs: Any) -> None:
+        self.goto_calls.append({"url": url, **kwargs})
+        self.url = url
 
 
 class _FakeSession:
-    def __init__(self, html: str) -> None:
-        self.page = _FakePage(html)
+    def __init__(self, html: str, *, url: str = "https://example.com") -> None:
+        self.page = _FakePage(html, url=url)
 
 
 class _FakeManager:
@@ -142,10 +159,45 @@ class _FakeManager:
         )
         if self._raise is not None:
             raise self._raise
-        return _FakeSession(self._html)
+        return _FakeSession(self._html, url=url)
 
     async def close_session(self, session_id: str) -> None:
         self.closed.append(session_id)
+
+
+class _ConsentRedirectPage(_FakePage):
+    def __init__(self) -> None:
+        super().__init__(
+            "<html><body><h1>Ochrana osobních údajů</h1>"
+            "<button>Rozumím a souhlasím</button></body></html>",
+            url="https://heureka.group/cs/podminky-pouzivani/ochrana-osobnich-udaju",
+        )
+
+    async def evaluate(self, *_args: Any, **_kwargs: Any) -> bool:
+        self.evaluate_calls += 1
+        return True
+
+    async def goto(self, url: str, **kwargs: Any) -> None:
+        await super().goto(url, **kwargs)
+        self._html = (
+            "<html><body><h1>HiPP BIO Snackie</h1><p>Product content loaded.</p></body></html>"
+        )
+
+
+class _ConsentRedirectSession:
+    def __init__(self) -> None:
+        self.page = _ConsentRedirectPage()
+
+
+class _ConsentRedirectManager(_FakeManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.session: _ConsentRedirectSession | None = None
+
+    async def open_session(self, **kwargs: Any) -> Any:
+        self.opened.append(kwargs)
+        self.session = _ConsentRedirectSession()
+        return self.session
 
 
 @pytest.mark.asyncio
@@ -198,12 +250,210 @@ def test_classify_browser_extract_quality_flags_interstitial() -> None:
     assert signal == "interstitial"
 
 
+def test_classify_browser_extract_quality_flags_cloudflare_challenge() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "html", "extraction_score": 120.0, "title": "Just a moment..."},
+        "Checking if the site connection is secure. Cloudflare Ray ID: 1234",
+    )
+    assert signal == "interstitial"
+
+
+def test_classify_browser_extract_quality_ignores_normal_cloudflare_scripts() -> None:
+    content = " ".join(
+        [
+            "<html><head><title>Hipp | notino.cz</title></head><body>",
+            "<h1>Hipp</h1><h2>Babysanft Sensitive</h2>",
+            "<p>ochranny krem na kazdodenni peci o zadecek 75 ml</p>",
+            "<script src='/googletaggatewayall/UwLjdStQR3wE5nf'></script>",
+            "<script>window.cloudflareAnalytics = true;</script>",
+            "</body></html>",
+        ]
+    )
+
+    signal = _classify_browser_extract_quality(
+        {"extractor": "html", "extraction_score": 4952.0, "title": "Hipp | notino.cz"},
+        content,
+    )
+
+    assert signal is None
+
+
+def test_classify_browser_extract_quality_ignores_drmax_turnstile_product_page() -> None:
+    content = " ".join(
+        [
+            "<html><head><title>Hipp BIO SNACKIE 120 g | Dr. Max Lekarna</title>",
+            '<meta name="description" content="Hipp BIO SNACKIE je ovocna kapsicka idealni pro aktivni deti.">',
+            '<link rel="canonical" href="https://www.drmax.cz/hipp-bio-sport-hruska-pomer-mango-banan-ryze-120g">',
+            '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"></script>',
+            "</head><body><main><h1>Hipp BIO SNACKIE hruška-pomeranč-mango-banán-rýže 120 g</h1>",
+            '<script type="application/ld+json">{"@context":"https://schema.org/","@type":"Product",',
+            '"name":"Hipp BIO SNACKIE hruška-pomeranč-mango-banán-rýže 120 g"}</script>',
+            "<p>Ovocna kapsicka pro deti od ukonceneho 1. roku.</p></main></body></html>",
+        ]
+    )
+
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "html",
+            "extraction_score": 24598.0,
+            "title": "Hipp BIO SNACKIE hruška-pomeranč-mango-banán-rýže 120 g | Dr. Max Lékárna",
+            "description": "Hipp BIO SNACKIE je ovocna kapsicka idealni pro aktivni deti.",
+        },
+        content,
+        requested_url="https://www.drmax.cz/hipp-bio-sport-hruska-pomer-mango-banan-ryze-120g",
+        final_url="https://www.drmax.cz/hipp-bio-sport-hruska-pomer-mango-banan-ryze-120g",
+    )
+
+    assert signal is None
+
+
+def test_classify_browser_extract_quality_flags_reddit_network_security_page() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "trafilatura_recall", "extraction_score": 41.4},
+        "You've been blocked by network security. File a ticket.",
+        requested_url="https://www.reddit.com/r/quails/comments/t8r4dd/example/",
+        final_url="https://www.reddit.com/r/quails/comments/t8r4dd/example/?js_challenge=1&token=abc",
+    )
+
+    assert signal == "interstitial"
+
+
+def test_classify_browser_extract_quality_flags_datadome_captcha() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "html", "extraction_score": 120.0},
+        '<iframe title="DataDome CAPTCHA" src="https://geo.captcha-delivery.com/captcha/">',
+    )
+    assert signal == "interstitial"
+
+
+def test_classify_browser_extract_quality_flags_multilingual_cookie_interstitial() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "trafilatura_precision", "extraction_score": 120.0},
+        " ".join(
+            [
+                "Provozovatel teto webove stranky pouziva cookies pro zajisteni funkcnosti.",
+                "S vasim souhlasem take pro lepsi uzivatelsky zazitek a ochranu soukromi.",
+                "Kliknutim na tlacitko Rozumim a souhlasim vyjadrite souhlas.",
+                "Pouze nezbytne cookies odmitnou personalizaci a analytiku.",
+            ]
+            * 12
+        ),
+    )
+    assert signal == "consent_interstitial"
+
+
+def test_classify_browser_extract_quality_flags_cross_origin_consent_redirect() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "trafilatura_precision", "extraction_score": 7000.0},
+        "Ochrana osobních údajů na portálech Heureka Group a.s. Tento dokument popisuje GDPR.",
+        requested_url="https://maso-zeleninove-prikrmy.heureka.cz/product/",
+        final_url="https://heureka.group/cs/podminky-pouzivani/ochrana-osobnich-udaju",
+    )
+    assert signal == "consent_redirect"
+
+
+def test_classify_browser_extract_quality_flags_same_origin_cookie_redirect() -> None:
+    signal = _classify_browser_extract_quality(
+        {"extractor": "readability", "extraction_score": 900.0, "title": "Prohlaseni o cookies"},
+        "Tento dokument popisuje cookies, souhlas, privacy a gdpr pro tento web.",
+        requested_url="https://www.drmax.cz/hipp-bio-sport-hruska-pomer-mango-banan-ryze-120g",
+        final_url="https://www.drmax.cz/obecne/pouzivani-cookies",
+    )
+    assert signal == "consent_redirect"
+
+
+def test_classify_browser_extract_quality_allows_same_origin_terms_page() -> None:
+    content = " ".join(
+        [
+            "<html><head><title>Terms and conditions | Example</title>",
+            '<meta name="description" content="Terms and conditions for Example purchases and services.">',
+            '<link rel="canonical" href="https://example.com/terms-and-conditions">',
+            "</head><body><main><h1>Terms and conditions</h1>",
+            "<p>These terms describe product orders, delivery, refunds, and service conditions.</p>",
+            "</main></body></html>",
+        ]
+    )
+
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "html",
+            "extraction_score": 1200.0,
+            "title": "Terms and conditions | Example",
+            "description": "Terms and conditions for Example purchases and services.",
+        },
+        content,
+        requested_url="https://example.com/legal",
+        final_url="https://example.com/terms-and-conditions",
+    )
+
+    assert signal is None
+
+
+def test_classify_browser_extract_quality_allows_same_origin_privacy_page() -> None:
+    content = " ".join(
+        [
+            "<html><head><title>Privacy Policy | Example</title>",
+            '<meta name="description" content="Privacy Policy explaining GDPR data handling for customers.">',
+            '<link rel="canonical" href="https://example.com/privacy-policy">',
+            "</head><body><main><h1>Privacy Policy</h1>",
+            "<p>This privacy policy explains GDPR, consent, account data, and customer rights.</p>",
+            "</main></body></html>",
+        ]
+    )
+
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "html",
+            "extraction_score": 1200.0,
+            "title": "Privacy Policy | Example",
+            "description": "Privacy Policy explaining GDPR data handling for customers.",
+        },
+        content,
+        requested_url="https://example.com/legal",
+        final_url="https://example.com/privacy-policy",
+    )
+
+    assert signal is None
+
+
 @pytest.mark.asyncio
 async def test_browser_fetch_returns_html_passthrough() -> None:
     manager = _FakeManager(html="<html><body>raw</body></html>")
     backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
     result = await backend.fetch("https://example.com", output_format="html")
     assert "<html>" in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_recovers_consent_redirect_and_renavigates() -> None:
+    manager = _ConsentRedirectManager()
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+
+    result = await backend.fetch(
+        "https://maso-zeleninove-prikrmy.heureka.cz/hipp-bio-snackie/",
+        output_format="markdown",
+    )
+
+    assert not result.is_error
+    assert "HiPP BIO Snackie" in result.output
+    assert manager.session is not None
+    assert manager.session.page.evaluate_calls == 1
+    assert manager.session.page.goto_calls[0]["url"] == (
+        "https://maso-zeleninove-prikrmy.heureka.cz/hipp-bio-snackie/"
+    )
+    extracted = (result.metadata or {}).get("extracted_document") or {}
+    assert extracted.get("browser_consent_redirect_recovered") is True
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_waits_for_rendered_body_before_extracting() -> None:
+    manager = _FakeManager(html="<html><head><title>Shell</title></head><body></body></html>")
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+
+    result = await backend.fetch("https://example.com", output_format="html")
+
+    assert not result.is_error
+    assert manager.closed == [manager.opened[0]["session_id"]]
 
 
 @pytest.mark.asyncio
@@ -257,6 +507,33 @@ def test_get_browser_fetch_backend_caches_per_manager() -> None:
     metadata[BROWSER_MANAGER_KEY] = new_manager
     c = get_browser_fetch_backend(metadata)
     assert c is not a
+
+
+def test_preferred_browser_fetch_uses_headed_when_available() -> None:
+    manager = BrowserManager(enabled=True, headed_allowed=True)
+    metadata = {
+        BROWSER_MANAGER_KEY: manager,
+        "web_browser_fetch_headed_fallback_enabled": True,
+    }
+
+    backend = get_preferred_browser_fetch_backend(metadata)
+
+    assert backend is get_headed_browser_fetch_backend(metadata)
+    assert backend is not None
+    assert backend.headed is True
+
+
+def test_resolve_browser_fetch_prefers_headed_when_available() -> None:
+    manager = BrowserManager(enabled=True, headed_allowed=True)
+    metadata = {
+        BROWSER_MANAGER_KEY: manager,
+        "web_browser_fetch_headed_fallback_enabled": True,
+    }
+
+    backend = resolve_fetch_backend(metadata, "browser")
+
+    assert isinstance(backend, BrowserFetchBackend)
+    assert backend.headed is True
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +706,59 @@ async def test_handle_web_fetch_explicit_direct_still_allows_fallback(
 
 
 @pytest.mark.asyncio
+async def test_handle_web_fetch_empty_verification_page_attempts_browser_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="",
+                metadata={
+                    "extracted_document": {
+                        "extractor": "empty",
+                        "extraction_score": 0.0,
+                        "title": "Reddit - Please wait for verification",
+                    }
+                },
+            )
+
+    browser_used = False
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            nonlocal browser_used
+            browser_used = True
+            return ToolResult(output="rendered content")
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeBrowser(),
+    )
+
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+        }
+    )
+    result = await handlers.handle_web_fetch(
+        {"url": "https://www.reddit.com/r/quails/comments/t8r4dd/example/"}, ctx
+    )
+
+    assert not result.is_error
+    assert browser_used is True
+    assert "rendered content" in result.output
+
+
+@pytest.mark.asyncio
 async def test_handle_web_fetch_disabled_fallback_returns_primary_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -587,7 +917,7 @@ async def test_handle_web_fetch_escalates_to_headed_when_enabled(
 
     class _FakeHeadless:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
-            return ToolResult(output="still blocked", is_error=True)
+            raise AssertionError("headless fallback should not run when headed is available")
 
     headed_called = False
 
@@ -609,11 +939,6 @@ async def test_handle_web_fetch_escalates_to_headed_when_enabled(
     )
     monkeypatch.setattr(
         handlers,
-        "headed_fallback_enabled",
-        lambda metadata: True,
-    )
-    monkeypatch.setattr(
-        handlers,
         "get_headed_browser_fetch_backend",
         lambda metadata: _FakeHeaded(),
     )
@@ -632,7 +957,7 @@ async def test_handle_web_fetch_escalates_to_headed_when_enabled(
     metadata = result.metadata or {}
     assert metadata.get("browser_fallback") is True
     assert metadata.get("browser_fallback_mode") == "headed"
-    assert metadata.get("browser_fallback_modes_attempted") == ["headless", "headed"]
+    assert metadata.get("browser_fallback_modes_attempted") == ["headed"]
     assert metadata.get("primary_backend") == "direct"
 
 
@@ -652,7 +977,7 @@ async def test_handle_web_fetch_combined_diagnostic_when_all_fallbacks_fail(
 
     class _FakeHeadless:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
-            return ToolResult(output="headless still blocked", is_error=True)
+            raise AssertionError("headless fallback should not run when headed is available")
 
     class _FakeHeaded:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
@@ -667,11 +992,6 @@ async def test_handle_web_fetch_combined_diagnostic_when_all_fallbacks_fail(
         handlers,
         "get_browser_fetch_backend",
         lambda metadata: _FakeHeadless(),
-    )
-    monkeypatch.setattr(
-        handlers,
-        "headed_fallback_enabled",
-        lambda metadata: True,
     )
     monkeypatch.setattr(
         handlers,
@@ -690,17 +1010,16 @@ async def test_handle_web_fetch_combined_diagnostic_when_all_fallbacks_fail(
 
     assert result.is_error
     assert "direct fetch failed" in result.output.lower()
-    assert "headless browser fallback failed" in result.output.lower()
     assert "headed browser fallback failed" in result.output.lower()
     metadata = result.metadata or {}
     assert metadata.get("browser_fallback_attempted") is True
-    assert metadata.get("browser_fallback_modes_attempted") == ["headless", "headed"]
+    assert metadata.get("browser_fallback_modes_attempted") == ["headed"]
     assert metadata.get("browser_fallback_success") is False
     assert metadata.get("cloudflare_blocked") is True
 
 
 @pytest.mark.asyncio
-async def test_headed_fallback_disabled_does_not_attempt_headed(
+async def test_headed_fallback_unavailable_uses_headless(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.tools.executor.web import handlers
@@ -737,13 +1056,8 @@ async def test_headed_fallback_disabled_does_not_attempt_headed(
     )
     monkeypatch.setattr(
         handlers,
-        "headed_fallback_enabled",
-        lambda metadata: False,
-    )
-    monkeypatch.setattr(
-        handlers,
         "get_headed_browser_fetch_backend",
-        lambda metadata: _FakeHeaded(),
+        lambda metadata: None,
     )
 
     ctx = _FakeContext(
@@ -779,7 +1093,7 @@ async def test_handle_web_fetch_treats_headed_empty_extraction_as_failure(
 
     class _FakeHeadless:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
-            return ToolResult(output="headless blocked", is_error=True)
+            raise AssertionError("headless fallback should not run when headed is available")
 
     class _FakeHeaded:
         async def fetch(self, url: str, **_: Any) -> ToolResult:
@@ -805,11 +1119,6 @@ async def test_handle_web_fetch_treats_headed_empty_extraction_as_failure(
     )
     monkeypatch.setattr(
         handlers,
-        "headed_fallback_enabled",
-        lambda metadata: True,
-    )
-    monkeypatch.setattr(
-        handlers,
         "get_headed_browser_fetch_backend",
         lambda metadata: _FakeHeaded(),
     )
@@ -827,7 +1136,7 @@ async def test_handle_web_fetch_treats_headed_empty_extraction_as_failure(
     assert "headed browser fallback failed" in result.output.lower()
     assert "empty_extraction" in result.output
     metadata = result.metadata or {}
-    assert metadata.get("browser_fallback_modes_attempted") == ["headless", "headed"]
+    assert metadata.get("browser_fallback_modes_attempted") == ["headed"]
     assert metadata.get("browser_fallback_success") is False
 
 

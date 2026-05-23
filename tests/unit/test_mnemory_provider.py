@@ -23,8 +23,20 @@ class _AuthProvider:
 
 
 class _Response:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        status_code: int = 200,
+        text: str | None = None,
+    ) -> None:
         self._payload = payload
+        self.status_code = status_code
+        self.text = text if text is not None else str(payload)
+
+    @property
+    def is_success(self) -> bool:
+        return 200 <= self.status_code < 300
 
     def raise_for_status(self) -> None:
         return None
@@ -34,10 +46,22 @@ class _Response:
 
 
 class _Client:
-    def __init__(self, payload: dict[str, object]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        status_code: int = 200,
+        text: str | None = None,
+    ) -> None:
         self.payload = payload
+        self.status_code = status_code
+        self.text = text
         self.last_json: dict[str, object] | None = None
         self.requests: list[tuple[str, str, dict[str, str]]] = []
+
+    async def get(self, path: str, headers: dict[str, str]) -> _Response:
+        self.requests.append(("GET", path, headers))
+        return _Response(self.payload, status_code=self.status_code, text=self.text)
 
     async def post(self, path: str, json: dict[str, object], headers: dict[str, str]) -> _Response:
         del path, headers
@@ -223,3 +247,15 @@ async def test_delete_memory_tool_calls_mnemory_delete_endpoint() -> None:
         )
     ]
     assert auth.calls == [("user@example.com", "agent-1", ["mnemory"], "user@example.com")]
+
+
+@pytest.mark.asyncio
+async def test_health_reports_http_status_details() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    provider.client = _Client({"error": "Unauthorized"}, status_code=401, text="Unauthorized")
+
+    health = await provider.health()
+
+    assert health.status == "degraded"
+    assert health.error == "HTTP 401"
+    assert health.details == {"status_code": 401, "body": "Unauthorized"}

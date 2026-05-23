@@ -10,9 +10,10 @@ import re
 import shutil
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from time import time
-from typing import Any
+from typing import Any, cast
 
 from cognis.models.tool import ToolResult
 from cognis.tools.executor.paths import resolve_path
@@ -66,18 +67,33 @@ _SHELL_PARSE_ERROR_PATTERN = re.compile(
     r"syntax error near unexpected token|parse error near|unexpected EOF|unexpected end of file",
     re.IGNORECASE,
 )
+_BACKGROUND_COMPLETION_CALLBACK_KEY = "background_shell_completion_callback"
+BackgroundShellCompletionCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 @dataclass(slots=True)
 class _BackgroundShellSession:
     shell_id: str
     command: str
+    description: str | None
     cwd: str
     process: asyncio.subprocess.Process
+    executor_id: str | None = None
+    executor_type: str | None = None
+    conversation_id: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
+    call_id: str | None = None
+    agent_id: str | None = None
+    completion_callback: BackgroundShellCompletionCallback | None = None
     created_at: float = field(default_factory=time)
+    last_activity_at: float = field(default_factory=time)
     output: str = ""
     base_offset: int = 0
     exit_code: int | None = None
+    completion_reason: str | None = None
+    completion_notified: bool = False
+    completion_notify_enabled: bool = True
     done: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     readers: list[asyncio.Task[Any]] = field(default_factory=list)
@@ -87,6 +103,7 @@ class _BackgroundShellSession:
             return
         async with self.lock:
             self.output += text
+            self.last_activity_at = time()
             overflow = len(self.output) - _MAX_BACKGROUND_OUTPUT_CHARS
             if overflow > 0:
                 self.output = self.output[overflow:]
@@ -101,6 +118,46 @@ class _BackgroundShellSession:
             truncated = cursor < self.base_offset
             return chunk, next_cursor, self.done.is_set(), self.exit_code, truncated
 
+    async def status_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+        current = now if now is not None else time()
+        async with self.lock:
+            output_chars = len(self.output)
+            tail = self.output[-1200:]
+            cursor = self.base_offset + output_chars
+            trimmed_chars = self.base_offset
+        done = self.done.is_set()
+        status = "completed" if done else "running"
+        if done and self.completion_reason == "killed":
+            status = "killed"
+        elif done and self.exit_code not in {None, 0}:
+            status = "failed"
+        return {
+            "shell_id": self.shell_id,
+            "command": self.command,
+            "description": self.description,
+            "cwd": self.cwd,
+            "pid": self.process.pid,
+            "executor_id": self.executor_id,
+            "executor_type": self.executor_type,
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "call_id": self.call_id,
+            "agent_id": self.agent_id,
+            "created_at": self.created_at,
+            "last_activity_at": self.last_activity_at,
+            "runtime_seconds": max(0.0, current - self.created_at),
+            "idle_seconds": max(0.0, current - self.last_activity_at),
+            "output_chars": output_chars,
+            "trimmed_chars": trimmed_chars,
+            "cursor": cursor,
+            "status": status,
+            "done": done,
+            "exit_code": self.exit_code,
+            "completion_reason": self.completion_reason,
+            "output_tail": tail,
+        }
+
 
 class _BackgroundShellManager:
     def __init__(self) -> None:
@@ -111,14 +168,32 @@ class _BackgroundShellManager:
         *,
         shell_id: str,
         command: str,
+        description: str | None,
         cwd: str,
         process: asyncio.subprocess.Process,
+        executor_id: str | None = None,
+        executor_type: str | None = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        call_id: str | None = None,
+        agent_id: str | None = None,
+        completion_callback: BackgroundShellCompletionCallback | None = None,
     ) -> _BackgroundShellSession:
         session = _BackgroundShellSession(
             shell_id=shell_id,
             command=command,
+            description=description,
             cwd=cwd,
             process=process,
+            executor_id=executor_id,
+            executor_type=executor_type,
+            conversation_id=conversation_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            call_id=call_id,
+            agent_id=agent_id,
+            completion_callback=completion_callback,
         )
         session.readers = [
             asyncio.create_task(self._consume_stream(session, process.stdout, prefix="")),
@@ -154,8 +229,9 @@ class _BackgroundShellManager:
         session = self._sessions.get(shell_id)
         if session is None:
             return ToolResult(output=f"Unknown shell_id: {shell_id}", is_error=True)
+        session.completion_notify_enabled = False
         await _kill_process_tree(session.process)
-        await self._finalize_session(session)
+        await self._finalize_session(session, reason="killed")
         return ToolResult(
             output=f"Stopped background shell {shell_id}.",
             metadata={"shell_id": shell_id, "status": "killed", "exit_code": session.exit_code},
@@ -163,8 +239,19 @@ class _BackgroundShellManager:
 
     async def cleanup(self) -> None:
         for session in list(self._sessions.values()):
+            session.completion_notify_enabled = False
             await _kill_process_tree(session.process)
-            await self._finalize_session(session)
+            await self._finalize_session(session, reason="cleanup")
+
+    async def list_statuses(self, *, include_completed: bool = False) -> list[dict[str, Any]]:
+        now = time()
+        statuses: list[dict[str, Any]] = []
+        for session in list(self._sessions.values()):
+            if not include_completed and session.done.is_set():
+                continue
+            statuses.append(await session.status_snapshot(now=now))
+        statuses.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
+        return statuses
 
     async def _consume_stream(
         self,
@@ -193,13 +280,26 @@ class _BackgroundShellManager:
         try:
             await session.process.wait()
         finally:
-            await self._finalize_session(session)
+            await self._finalize_session(session, reason="completed")
 
-    async def _finalize_session(self, session: _BackgroundShellSession) -> None:
+    async def _finalize_session(
+        self, session: _BackgroundShellSession, *, reason: str = "completed"
+    ) -> None:
         if session.done.is_set():
             return
         session.exit_code = session.process.returncode
+        session.completion_reason = reason
         session.done.set()
+        if (
+            session.completion_notify_enabled
+            and not session.completion_notified
+            and session.completion_callback is not None
+        ):
+            session.completion_notified = True
+            try:
+                await session.completion_callback(await session.status_snapshot())
+            except Exception:
+                return
 
 
 def _shell_name(path: str) -> str:
@@ -276,6 +376,29 @@ async def cleanup_shell_manager(runtime_metadata: dict[str, Any]) -> None:
         await manager.cleanup()
 
 
+async def list_background_shell_statuses(
+    runtime_metadata: dict[str, Any], *, include_completed: bool = False
+) -> list[dict[str, Any]]:
+    """Return background shell statuses stored in runtime metadata."""
+
+    manager = runtime_metadata.get(SHELL_MANAGER_KEY)
+    if not isinstance(manager, _BackgroundShellManager):
+        return []
+    return await manager.list_statuses(include_completed=include_completed)
+
+
+def set_background_shell_completion_callback(
+    runtime_metadata: dict[str, Any],
+    callback: BackgroundShellCompletionCallback | None,
+) -> None:
+    """Install or clear the background shell completion callback."""
+
+    if callback is None:
+        runtime_metadata.pop(_BACKGROUND_COMPLETION_CALLBACK_KEY, None)
+    else:
+        runtime_metadata[_BACKGROUND_COMPLETION_CALLBACK_KEY] = callback
+
+
 async def _create_process(
     *,
     shell_path: str,
@@ -343,9 +466,37 @@ def _command_metadata(command: str, cwd: str, *, ok: bool, exit_code: int | None
     }
 
 
+async def _read_process_stream(
+    stream: asyncio.StreamReader | None,
+    *,
+    stream_name: str,
+    chunks: list[str],
+    context: ToolExecutionContext,
+    mirror_chunks: list[str] | None = None,
+) -> None:
+    if stream is None:
+        return
+    while True:
+        data = await stream.read(4096)
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace")
+        chunks.append(text)
+        if mirror_chunks is not None:
+            mirror_chunks.append(text)
+        if context.output_chunk_callback is not None:
+            await context.output_chunk_callback(text, stream_name)
+
+
 async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Execute a shell command and return its output."""
     command = str(arguments.get("command", ""))
+    raw_description = arguments.get("description")
+    description = (
+        str(raw_description).strip()
+        if isinstance(raw_description, str) and raw_description.strip()
+        else None
+    )
     timeout_ms = arguments.get("timeout", _DEFAULT_TIMEOUT_MS)
     workdir = arguments.get("workdir")
     env = arguments.get("env")
@@ -392,20 +543,61 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     if run_in_background:
         manager = _background_shell_manager(context)
         shell_id = f"shell_{os.urandom(6).hex()}"
+        runtime_access = context.runtime_metadata.get("runtime_access")
+        runtime_access = runtime_access if isinstance(runtime_access, dict) else {}
+        raw_callback = context.runtime_metadata.get(_BACKGROUND_COMPLETION_CALLBACK_KEY)
+        if raw_callback is None:
+            raw_callback = context.shared_runtime_metadata.get(_BACKGROUND_COMPLETION_CALLBACK_KEY)
+        callback = (
+            cast(BackgroundShellCompletionCallback, raw_callback)
+            if callable(raw_callback)
+            else None
+        )
         session = await manager.start(
             shell_id=shell_id,
             command=command,
+            description=description,
             cwd=resolved_cwd,
             process=process,
+            executor_id=context.executor_handle.executor_id,
+            executor_type=context.executor_handle.executor_type,
+            conversation_id=(
+                runtime_access.get("conversation_id")
+                if isinstance(runtime_access.get("conversation_id"), str)
+                else None
+            ),
+            session_id=(
+                runtime_access.get("session_id")
+                if isinstance(runtime_access.get("session_id"), str)
+                else None
+            ),
+            turn_id=(
+                context.runtime_metadata.get("turn_id")
+                if isinstance(context.runtime_metadata.get("turn_id"), str)
+                else None
+            ),
+            call_id=(
+                context.runtime_metadata.get("tool_call_id")
+                if isinstance(context.runtime_metadata.get("tool_call_id"), str)
+                else None
+            ),
+            agent_id=(
+                runtime_access.get("agent_id")
+                if isinstance(runtime_access.get("agent_id"), str)
+                else None
+            ),
+            completion_callback=callback,
         )
         await asyncio.sleep(min(timeout_seconds, _DEFAULT_BACKGROUND_TIMEOUT_MS // 1000))
         initial_output, cursor, done, exit_code, _ = await session.snapshot(0)
         status = "completed" if done else "running"
         preview = initial_output.strip() or "(no initial output yet)"
+        description_line = f"Description: {description}\n" if description else ""
         return ToolResult(
             output=(
                 f"Started background shell {shell_id}.\n"
                 f"Status: {status}\n"
+                f"{description_line}"
                 f"Use bash_output with shell_id='{shell_id}' to read output and bash_kill to stop it.\n\n"
                 f"Initial output:\n{preview}"
             ),
@@ -414,6 +606,10 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
                 "shell_id": shell_id,
                 "status": status,
                 "cursor": cursor,
+                "description": description,
+                "pid": process.pid,
+                "executor_id": context.executor_handle.executor_id,
+                "executor_type": context.executor_handle.executor_type,
                 "commands": [
                     _command_metadata(
                         command, resolved_cwd, ok=not done or exit_code == 0, exit_code=exit_code
@@ -422,8 +618,41 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
             },
         )
 
+    output_chunks: list[str] = []
+    stderr_chunks: list[str] = []
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        if (
+            not hasattr(process, "stdout")
+            or not hasattr(process, "stderr")
+            or not hasattr(process, "wait")
+        ):
+            stdout_data, stderr_data = await asyncio.wait_for(
+                process.communicate(), timeout=timeout_seconds
+            )
+            output_chunks.append(stdout_data.decode("utf-8", errors="replace"))
+            stderr_text = stderr_data.decode("utf-8", errors="replace")
+            output_chunks.append(stderr_text)
+            stderr_chunks.append(stderr_text)
+        else:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_process_stream(
+                        process.stdout,
+                        stream_name="stdout",
+                        chunks=output_chunks,
+                        context=context,
+                    ),
+                    _read_process_stream(
+                        process.stderr,
+                        stream_name="stderr",
+                        chunks=output_chunks,
+                        context=context,
+                        mirror_chunks=stderr_chunks,
+                    ),
+                    process.wait(),
+                ),
+                timeout=timeout_seconds,
+            )
     except TimeoutError:
         await _cleanup_process_tree(process)
         return ToolResult(
@@ -442,16 +671,14 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         await _cleanup_process_tree(process)
         raise
 
-    stdout_text = stdout.decode("utf-8", errors="replace") if stdout else ""
-    stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
+    terminal_text = "".join(output_chunks)
+    stderr_text = "".join(stderr_chunks)
     exit_code = process.returncode or 0
     shell_hint = _shell_parse_error_hint(stderr_text)
 
     parts: list[str] = []
-    if stdout_text:
-        parts.append(stdout_text)
-    if stderr_text:
-        parts.append(f"STDERR:\n{stderr_text}")
+    if terminal_text:
+        parts.append(terminal_text)
     if shell_hint:
         parts.append(shell_hint)
     if exit_code != 0:

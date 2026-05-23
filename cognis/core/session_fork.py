@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
+
+import httpx
 
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
@@ -11,8 +14,9 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
 )
 from cognis.core.session_cache import CachedEvent
+from cognis.core.session_event_types import INTARIS_APPENDABLE_EVENT_TYPES
 from cognis.logging import get_logger
-from cognis.models.session import SessionEvent, with_session_events_turn_id
+from cognis.models.session import SessionEvent
 
 logger = get_logger(__name__)
 
@@ -63,6 +67,10 @@ async def fork_session_events(
     snapshot_extras: dict[str, Any] | None = None,
     extra_prefix_entries: list[ImmutablePrefixEntry] | None = None,
     extra_history_events: list[SessionEvent] | None = None,
+    copy_prefix: bool = True,
+    max_source_seq: int | None = None,
+    event_filter: Callable[[CachedEvent], bool] | None = None,
+    record_source: str = "cognis:fork",
 ) -> bool:
     """Copy one session's event history into another session.
 
@@ -79,8 +87,9 @@ async def fork_session_events(
             source_events = [
                 event for event in cache_entry.events if event.type not in PREFIX_EVENT_TYPES
             ]
-        cached_prefix_entries = session_cache.get_prefix_entries(source_cognis_session_id)
-        prefix_entries.extend(cached_prefix_entries or [])
+        if copy_prefix:
+            cached_prefix_entries = session_cache.get_prefix_entries(source_cognis_session_id)
+            prefix_entries.extend(cached_prefix_entries or [])
 
     if not source_events and source_intaris_session_id:
         try:
@@ -91,6 +100,8 @@ async def fork_session_events(
             for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0))):
                 event_type = str(raw_event.get("type") or "")
                 if event_type in PREFIX_EVENT_TYPES:
+                    if not copy_prefix:
+                        continue
                     entry = _prefix_entry_from_event(raw_event)
                     if entry is not None:
                         prefix_entries.append(entry)
@@ -111,6 +122,11 @@ async def fork_session_events(
                 exc_info=True,
             )
 
+    if max_source_seq is not None:
+        source_events = [event for event in source_events if event.seq <= max_source_seq]
+    if event_filter is not None:
+        source_events = [event for event in source_events if event_filter(event)]
+
     prefix_entries = _dedupe_prefix_entries(
         [
             ImmutablePrefixEntry(role=entry.role, source=entry.source, content=entry.content)
@@ -129,6 +145,25 @@ async def fork_session_events(
             )
             for event in extra_history_events
         )
+    appendable_source_events: list[CachedEvent] = []
+    skipped_event_types: dict[str, int] = {}
+    for event in source_events:
+        if event.type not in INTARIS_APPENDABLE_EVENT_TYPES:
+            skipped_event_types[event.type] = skipped_event_types.get(event.type, 0) + 1
+            continue
+        appendable_source_events.append(event)
+    if skipped_event_types:
+        logger.info(
+            "session fork: skipped non-appendable source events",
+            extra={
+                "extra_data": {
+                    "source_label": source_label,
+                    "skipped_count": sum(skipped_event_types.values()),
+                    "skipped_types": dict(sorted(skipped_event_types.items())),
+                }
+            },
+        )
+    source_events = appendable_source_events
 
     if not source_events and not prefix_entries:
         logger.debug(
@@ -140,21 +175,20 @@ async def fork_session_events(
     target_intaris_id = target_session.intaris_session_id or target_session.session_id
     try:
         if source_events:
-            session_events = with_session_events_turn_id(
-                [SessionEvent(type=event.type, data=event.data) for event in source_events],
-                None,
-            )
+            session_events = [
+                SessionEvent(type=event.type, data=event.data) for event in source_events
+            ]
             append_result = await providers.guardrails.record_events(
                 session_id=target_intaris_id,
                 events=session_events,
-                source="cognis:fork",
+                source=record_source,
             )
             remapped_events = [
                 CachedEvent(
                     seq=append_result.first_seq + index,
                     type=event.type,
                     data=event.data,
-                    source="cognis:fork",
+                    source=record_source,
                     ts=event.ts,
                 )
                 for index, event in enumerate(source_events)
@@ -165,10 +199,7 @@ async def fork_session_events(
             last_seq = 0
 
         if prefix_entries:
-            message_events = with_session_events_turn_id(
-                build_prefix_message_events(prefix_entries),
-                None,
-            )
+            message_events = build_prefix_message_events(prefix_entries)
             message_result = await providers.guardrails.record_events(
                 session_id=target_intaris_id,
                 events=message_events,
@@ -191,7 +222,7 @@ async def fork_session_events(
                     snapshot_source=snapshot_source,
                     extras=extras,
                 )
-                snapshot_events = with_session_events_turn_id([snapshot_event], None)
+                snapshot_events = [snapshot_event]
                 snapshot_result = await providers.guardrails.record_events(
                     session_id=target_intaris_id,
                     events=snapshot_events,
@@ -240,10 +271,14 @@ async def fork_session_events(
             },
         )
         return True
-    except Exception:
+    except Exception as exc:
+        extra_data: dict[str, Any] = {"source_label": source_label}
+        if isinstance(exc, httpx.HTTPStatusError):
+            extra_data["response_status_code"] = exc.response.status_code
+            extra_data["response_body"] = exc.response.text[:1000]
         logger.warning(
             "session fork: failed to copy source session into target session",
-            extra={"extra_data": {"source_label": source_label}},
+            extra={"extra_data": extra_data},
             exc_info=True,
         )
         return False

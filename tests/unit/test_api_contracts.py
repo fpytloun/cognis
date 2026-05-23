@@ -212,6 +212,8 @@ def test_session_events_response_round_trips_active_thinking() -> None:
                         block_id="thk-1",
                         title="Considering options",
                         content="Considering options for the task",
+                        started_at="2026-04-20T00:00:00Z",
+                        duration_ms=1200,
                     )
                 ],
                 updated_at="2026-04-20T00:00:00Z",
@@ -221,6 +223,7 @@ def test_session_events_response_round_trips_active_thinking() -> None:
 
     assert response.active_thinking[0].message_id == "sr-1"
     assert response.active_thinking[0].blocks[0].content == "Considering options for the task"
+    assert response.active_thinking[0].blocks[0].duration_ms == 1200
 
 
 def test_search_responses_round_trip_current_intaris_shape() -> None:
@@ -270,9 +273,7 @@ def test_search_responses_round_trip_current_intaris_shape() -> None:
         == "audit-1"
     )
     assert (
-        ConversationSearchResponse(matches=[conversation_match]).matches[0]
-        .extra_matches[0]
-        .ref_id
+        ConversationSearchResponse(matches=[conversation_match]).matches[0].extra_matches[0].ref_id
         == "audit-2"
     )
     assert ConversationFlatSearchResponse(matches=[flat_match]).matches[0].match.kind == "reasoning"

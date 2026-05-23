@@ -17,6 +17,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 
 
+def _context_usage_for_session(request: Request, session_id: str) -> dict[str, Any] | None:
+    """Return latest cached context/projection diagnostics for a session."""
+
+    session_cache = getattr(request.app.state, "session_cache", None)
+    if session_cache is None:
+        return None
+    try:
+        return session_cache.get_context_usage(session_id)
+    except Exception:
+        logger.debug(
+            "Failed to fetch cached context usage for session %s", session_id, exc_info=True
+        )
+        return None
+
+
+def _latest_intaris_summary_text(summaries: Any) -> str | None:
+    """Pick the best display summary from Intaris' combined summary payload."""
+
+    for items in (summaries.intaris_summaries, summaries.agent_summaries):
+        for item in items:
+            text = (item.summary or "").strip()
+            if text:
+                return text
+    return None
+
+
 @router.get("/{session_id}", response_model=SessionResponse)
 async def session_detail(request: Request, session_id: str) -> SessionResponse:
     async with request.app.state.session_factory() as session:
@@ -37,16 +63,30 @@ async def session_intaris_detail(request: Request, session_id: str) -> dict[str,
     require_resource_owner(request, row.user_email)
     intaris_sid = row.intaris_session_id or row.session_id
     try:
-        intaris_session = await request.app.state.providers.guardrails.get_session(intaris_sid)
+        guardrails = request.app.state.providers.guardrails
+        intaris_session = await guardrails.get_session(intaris_sid)
+        summary: str | None = None
+        try:
+            summaries = await guardrails.get_session_summaries(intaris_sid)
+            summary = _latest_intaris_summary_text(summaries)
+        except Exception:
+            logger.debug(
+                "Failed to fetch Intaris summaries for session %s",
+                intaris_sid,
+                exc_info=True,
+            )
         return {
             "session_id": session_id,
             "intaris_session_id": intaris_sid,
+            "title": intaris_session.title,
             "intention": intaris_session.intention,
+            "summary": summary,
             "status": intaris_session.status,
             "total_calls": intaris_session.total_calls,
             "approved_count": intaris_session.approved_count,
             "denied_count": intaris_session.denied_count,
             "escalated_count": intaris_session.escalated_count,
+            "context_usage": _context_usage_for_session(request, row.session_id),
         }
     except Exception as exc:
         logger.warning("Failed to fetch Intaris session %s", intaris_sid, exc_info=True)

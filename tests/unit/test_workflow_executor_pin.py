@@ -9,6 +9,7 @@ conversation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,12 +25,14 @@ from cognis.store import queries as store_queries
 class _FakeTask:
     task_id: str = "task-1"
     active_executor_id: str | None = None
+    active_executor_expires_at: datetime | None = None
 
 
 @dataclass
 class _FakeConversation:
     conversation_id: str
     active_executor_id: str | None = None
+    active_executor_expires_at: datetime | None = None
 
 
 def _executor_row(
@@ -65,6 +68,8 @@ class _FakeDB:
     conversations: dict[str, _FakeConversation] = field(default_factory=dict)
     initialize_task_calls: list[tuple[str, str]] = field(default_factory=list)
     initialize_conv_calls: list[tuple[str, str]] = field(default_factory=list)
+    set_task_calls: list[tuple[str, str]] = field(default_factory=list)
+    set_conv_calls: list[tuple[str, str]] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -112,21 +117,43 @@ def _patch_runtime_queries(
         task.active_executor_id = executor_id
         return True
 
+    async def _set_conv(_session, conversation_id, executor_id, **_metadata):
+        fake_db.set_conv_calls.append((conversation_id, executor_id))
+        conv = fake_db.conversations.get(conversation_id)
+        if conv is None:
+            return False
+        conv.active_executor_id = executor_id
+        return True
+
+    async def _set_task(_session, task_id, executor_id, **_metadata):
+        fake_db.set_task_calls.append((task_id, executor_id))
+        task = fake_db.tasks.get(task_id)
+        if task is None:
+            return False
+        task.active_executor_id = executor_id
+        return True
+
     monkeypatch.setattr(store_queries, "list_executors", _list_executors)
     monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
     monkeypatch.setattr(store_queries, "get_conversation", _get_conversation)
     monkeypatch.setattr(store_queries, "get_task", _get_task)
-    monkeypatch.setattr(
-        store_queries, "initialize_conversation_active_executor", _initialize_conv
-    )
-    monkeypatch.setattr(
-        store_queries, "initialize_task_active_executor", _initialize_task
-    )
+    monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
+    monkeypatch.setattr(store_queries, "initialize_conversation_active_executor", _initialize_conv)
+    monkeypatch.setattr(store_queries, "initialize_task_active_executor", _initialize_task)
+    monkeypatch.setattr(store_queries, "set_conversation_active_executor", _set_conv)
+    monkeypatch.setattr(store_queries, "set_task_active_executor", _set_task)
+
+
+async def _get_setting_value(_session, _key, default=None):
+    return default
 
 
 class _RuntimeSession:
-    async def __aenter__(self) -> object:
-        return object()
+    async def commit(self) -> None:
+        return None
+
+    async def __aenter__(self) -> _RuntimeSession:
+        return self
 
     async def __aexit__(self, *args: object) -> None:
         return None
@@ -212,6 +239,7 @@ async def test_second_step_reads_task_pin_when_conversation_pin_absent(
         policy,
         *,
         conversation_active_executor_id=None,
+        conversation_active_executor_expires_at=None,
         conversation_id=None,
         task_id=None,
     ):
@@ -235,9 +263,7 @@ async def test_second_step_reads_task_pin_when_conversation_pin_absent(
             "runtime_state": "active",
         }
 
-    monkeypatch.setattr(
-        runtime_support, "_resolve_eligible_executor_config", _capture_resolve
-    )
+    monkeypatch.setattr(runtime_support, "_resolve_eligible_executor_config", _capture_resolve)
     # Skip everything else; we only care that the pin was sourced from the task.
     monkeypatch.setattr(
         runtime_support,
@@ -335,3 +361,51 @@ async def test_initialize_task_is_idempotent(
     # Returns the pin, does NOT call initialize again
     assert config["executor_id"] == "exec-b"
     assert fake_db.tasks["task-1"].active_executor_id == "exec-b"
+
+
+@pytest.mark.asyncio
+async def test_expired_additional_pin_falls_back_to_primary(
+    monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
+) -> None:
+    rows = [
+        _executor_row("exec-primary", labels={"tier": "primary"}),
+        _executor_row("exec-add", labels={"role": "special"}),
+    ]
+    _patch_runtime_queries(monkeypatch, fake_db, rows)
+
+    async def _setting_value(_session, key, default=None):
+        return 0 if key.endswith("retry_seconds") else default
+
+    monkeypatch.setattr(store_queries, "get_setting_value", _setting_value)
+
+    expired = datetime.now(UTC) - timedelta(seconds=1)
+    config = await runtime_support._resolve_eligible_executor_config(
+        SimpleNamespace(
+            _session_factory=_runtime_session_factory,
+            executor=SimpleNamespace(
+                websocket=SimpleNamespace(get_connection=lambda _executor_id: None)
+            ),
+        ),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={
+                "executor_selector": {"tier": "primary"},
+                "additional_executors": [{"executor_id": "exec-add"}],
+            },
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_active_executor_id="exec-add",
+        conversation_active_executor_expires_at=expired,
+        conversation_id="conv-step-1",
+        task_id="task-1",
+    )
+
+    assert config["executor_id"] == "exec-primary"
+    assert fake_db.set_conv_calls == [("conv-step-1", "exec-primary")]
+    assert fake_db.set_task_calls == [("task-1", "exec-primary")]
+    notice = config["executor_pin_fallback_notice"]
+    assert notice["previous_executor_id"] == "exec-add"
+    assert notice["new_executor_id"] == "exec-primary"

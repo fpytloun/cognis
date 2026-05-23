@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from cognis.executor.inference import InferenceHandler
@@ -18,7 +20,7 @@ async def test_stream_complete_proxies_litellm(monkeypatch: pytest.MonkeyPatch) 
     async def fake_acompletion(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.acompletion", fake_acompletion)
 
     chunks = [
         chunk
@@ -34,13 +36,51 @@ async def test_stream_complete_proxies_litellm(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.asyncio
+async def test_stream_complete_serializes_litellm_tool_call_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    class ToolCall:
+        def model_dump(self, **_: object) -> dict[str, object]:
+            return {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+            }
+
+    async def fake_stream():
+        yield {"choices": [{"delta": {"tool_calls": [ToolCall()]}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {}}
+
+    async def fake_acompletion(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.acompletion", fake_acompletion)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="anthropic/claude-opus-4-7",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"tools": []},
+        )
+    ]
+
+    json.dumps(chunks[0])
+    assert chunks[0]["tool_calls"][0]["function"]["name"] == "bash"
+    assert chunks[-1]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
 async def test_stream_complete_returns_error_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = InferenceHandler()
 
     async def fake_acompletion(**_: object):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.acompletion", fake_acompletion)
 
     chunks = [
         chunk
@@ -65,7 +105,7 @@ async def test_generate_returns_model_dump(monkeypatch: pytest.MonkeyPatch) -> N
     async def fake_acompletion(**_: object):
         return Response()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.acompletion", fake_acompletion)
 
     result = await handler.generate(
         model="openai/gpt-4o-mini",
@@ -103,7 +143,7 @@ async def test_stream_complete_normalizes_responses_events(monkeypatch: pytest.M
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -118,6 +158,62 @@ async def test_stream_complete_normalizes_responses_events(monkeypatch: pytest.M
     assert chunks[1]["tool_calls"][0]["function"]["name"] == "search_tools"
     assert chunks[2]["tool_calls"][0]["function"]["arguments"] == '{"query":"docs"}'
     assert chunks[-1]["usage"]["total_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_responses_projects_messages_to_responses_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Executor backend must project chat messages into Responses API input shape."""
+    handler = InferenceHandler()
+    captured: dict[str, object] = {}
+
+    async def fake_stream():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"total_tokens": 4},
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}
+                ],
+            },
+        }
+
+    async def fake_aresponses(**kwargs: object):
+        captured.update(kwargs)
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            ],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    assert chunks[-1]["done"] is True
+    assert captured["input"] == [
+        {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+    # cognis_llm_api is a controller-internal marker and must not leak.
+    assert "cognis_llm_api" not in captured
 
 
 @pytest.mark.asyncio
@@ -151,7 +247,7 @@ async def test_stream_complete_emits_message_item_text_without_output_delta(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -182,7 +278,7 @@ async def test_stream_complete_emits_output_text_done_without_delta(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -214,7 +310,7 @@ async def test_stream_complete_normalizes_enum_style_event_types(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -248,7 +344,7 @@ async def test_stream_complete_does_not_duplicate_output_text_done(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -283,7 +379,7 @@ async def test_stream_complete_emits_content_part_done_text(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -314,7 +410,7 @@ async def test_stream_complete_emits_reasoning_and_refusal_deltas(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk
@@ -352,7 +448,7 @@ async def test_generate_normalizes_responses_payload(monkeypatch: pytest.MonkeyP
     async def fake_aresponses(**_: object):
         return Response()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     result = await handler.generate(
         model="gpt-5.4",
@@ -385,7 +481,7 @@ async def test_generate_preserves_reasoning_only_responses_payload(
     async def fake_aresponses(**_: object):
         return Response()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     result = await handler.generate(
         model="gpt-5.4",
@@ -410,7 +506,7 @@ async def test_generate_translates_responses_tools_shape(monkeypatch: pytest.Mon
         captured.update(kwargs)
         return Response()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     await handler.generate(
         model="gpt-5.4",
@@ -452,7 +548,7 @@ async def test_stream_complete_returns_error_for_failed_responses_event(
     async def fake_aresponses(**_: object):
         return fake_stream()
 
-    monkeypatch.setattr("cognis.executor.inference.litellm.aresponses", fake_aresponses)
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
 
     chunks = [
         chunk

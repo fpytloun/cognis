@@ -8,7 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from cognis.tools.executor.lsp.manager import LSPManager, _find_project_root
+from cognis.tools.executor.lsp.manager import (
+    LSPManager,
+    _find_project_root,
+    _should_skip_server_for_path,
+)
+from cognis.tools.executor.lsp.servers import GOPLS, PYRIGHT, RUST_ANALYZER
 
 
 class TestFindProjectRoot:
@@ -47,6 +52,15 @@ class TestFindProjectRoot:
         root = _find_project_root(str(tmp_path / "script.sh"), ())
         assert root == str(tmp_path)
 
+    def test_skips_pyright_for_scratch_roots(self) -> None:
+        """Scratch copies should not spawn heavyweight Pyright roots."""
+        assert _should_skip_server_for_path("pyright", "/tmp/cognis/foo.py", "/tmp/cognis")
+        assert _should_skip_server_for_path("pyright", "/var/tmp/cognis/foo.py", "/var/tmp")
+        assert not _should_skip_server_for_path("ruff", "/tmp/cognis/foo.py", "/tmp/cognis")
+        assert not _should_skip_server_for_path(
+            "pyright", "/home/riker/src/cognis/foo.py", "/home/riker/src/cognis"
+        )
+
 
 class TestLSPManagerBasic:
     """Test basic LSP manager behavior."""
@@ -71,6 +85,93 @@ class TestLSPManagerBasic:
         assert len(manager._clients) == 0
 
     @pytest.mark.asyncio()
+    async def test_touch_file_skips_pyright_for_scratch_files(self, tmp_path: Path) -> None:
+        """Temp file edits should avoid spawning expensive Pyright clients."""
+        target = tmp_path / "module.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        with (
+            patch(
+                "cognis.tools.executor.lsp.manager.resolve_command",
+                new=AsyncMock(return_value="cmd"),
+            ),
+            patch("cognis.tools.executor.lsp.manager.LSPClient") as mock_client_class,
+        ):
+            mock_client = AsyncMock()
+            mock_client.is_alive = True
+            mock_client_class.return_value = mock_client
+
+            await manager.touch_file(str(target), wait=True)
+
+        spawned_servers = [call.kwargs["server_id"] for call in mock_client_class.call_args_list]
+        assert "pyright" not in spawned_servers
+        assert "ruff" in spawned_servers
+
+    @pytest.mark.asyncio()
+    async def test_spawn_passes_workspace_configuration(self, tmp_path: Path) -> None:
+        """Server definitions should pass default workspace config to clients."""
+        project = tmp_path / "workspace-config"
+        project.mkdir()
+        target = project / "module.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        with (
+            patch(
+                "cognis.tools.executor.lsp.manager.resolve_command",
+                new=AsyncMock(return_value="cmd"),
+            ),
+            patch("cognis.tools.executor.lsp.manager.LSPClient") as mock_client_class,
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_client = AsyncMock()
+            mock_client.is_alive = True
+            mock_client_class.return_value = mock_client
+
+            await manager.touch_file(str(target), wait=True)
+
+        kwargs = next(
+            call.kwargs
+            for call in mock_client_class.call_args_list
+            if call.kwargs["workspace_configuration"] is not None
+        )
+        assert kwargs["workspace_configuration"]["python"]["analysis"]["diagnosticMode"] == (
+            "openFilesOnly"
+        )
+        assert kwargs["init_options"]["settings"]["python"]["analysis"]["diagnosticMode"] == (
+            "openFilesOnly"
+        )
+        assert "**/.worktrees" in kwargs["workspace_configuration"]["python"]["analysis"]["exclude"]
+
+    def test_pyright_project_config_takes_precedence(self, tmp_path: Path) -> None:
+        """Native Pyright project config should suppress Cognis defaults."""
+        (tmp_path / "pyrightconfig.json").write_text("{}\n")
+
+        assert PYRIGHT.workspace_configuration_for(str(tmp_path)) is None
+        assert PYRIGHT.initialization_options_for(str(tmp_path)) is None
+
+    def test_pyright_pyproject_config_takes_precedence(self, tmp_path: Path) -> None:
+        """[tool.pyright] should suppress Cognis Pyright defaults."""
+        (tmp_path / "pyproject.toml").write_text("[tool.pyright]\ntypeCheckingMode = 'strict'\n")
+
+        assert PYRIGHT.workspace_configuration_for(str(tmp_path)) is None
+        assert PYRIGHT.initialization_options_for(str(tmp_path)) is None
+
+    def test_non_python_servers_have_safe_default_excludes(self, tmp_path: Path) -> None:
+        """Broad workspace servers should receive safe default directory filters."""
+        gopls_config = GOPLS.workspace_configuration_for(str(tmp_path))
+        rust_config = RUST_ANALYZER.workspace_configuration_for(str(tmp_path))
+
+        assert gopls_config is not None
+        assert "-.worktrees" in gopls_config["gopls"]["directoryFilters"]
+        assert rust_config is not None
+        assert ".worktrees" in rust_config["rust-analyzer"]["files"]["excludeDirs"]
+
+    @pytest.mark.asyncio()
     async def test_touch_file_no_extension(self) -> None:
         """File without extension should be skipped."""
         manager = LSPManager(enabled=True)
@@ -81,6 +182,15 @@ class TestLSPManagerBasic:
         manager = LSPManager(enabled=True)
         assert manager.get_diagnostics() == {}
         assert manager.get_diagnostics("/src/foo.py") == {}
+
+    def test_has_pending_diagnostics_checks_active_clients(self) -> None:
+        manager = LSPManager(enabled=True)
+        client = MagicMock()
+        client.has_pending_diagnostics.side_effect = lambda uri: uri.endswith("foo.py")
+        manager._clients["pyright:/src"] = client
+
+        assert manager.has_pending_diagnostics(["/src/foo.py"])
+        assert not manager.has_pending_diagnostics(["/src/bar.py"])
 
     @pytest.mark.asyncio()
     async def test_cleanup_idempotent(self) -> None:
@@ -156,7 +266,9 @@ class TestFirstTouchWait:
 
     @pytest.mark.asyncio()
     async def test_first_touch_waits_for_spawn_and_diagnostics(self, tmp_path: Path) -> None:
-        file_path = tmp_path / "app.py"
+        project = tmp_path / "first-touch"
+        project.mkdir()
+        file_path = project / "app.py"
         file_path.write_text("x = 1\n")
 
         manager = LSPManager(enabled=True)
@@ -174,10 +286,16 @@ class TestFirstTouchWait:
         with patch("cognis.tools.executor.lsp.manager.get_servers_for_extension") as mock_servers:
             mock_server = MagicMock()
             mock_server.server_id = "pyright"
-            mock_server.root_markers = ()
+            mock_server.root_markers = ("pyproject.toml",)
             mock_server.language_id.return_value = "python"
             mock_servers.return_value = [mock_server]
-            with patch.object(manager, "_spawn_client", AsyncMock(return_value=fake_client)):
+            with (
+                patch.object(manager, "_spawn_client", AsyncMock(return_value=fake_client)),
+                patch(
+                    "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                    return_value=False,
+                ),
+            ):
                 await manager.touch_file(str(file_path), wait=True)
 
         fake_client.did_open.assert_awaited_once()
@@ -289,7 +407,13 @@ class TestAvailableServers:
                 return "/usr/local/bin/gopls"
             return None
 
-        with patch("cognis.tools.executor.lsp.manager.shutil.which", side_effect=mock_which):
+        with (
+            patch("cognis.tools.executor.lsp.manager.shutil.which", side_effect=mock_which),
+            patch(
+                "cognis.tools.executor.lsp.install.NpmInstall.detect",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
             results = await manager.available_servers()
 
         gopls = next(r for r in results if r["server_id"] == "gopls")

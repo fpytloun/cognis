@@ -1073,6 +1073,70 @@ class TestDirectBackend:
             assert "Hello" in result.output
 
     @pytest.mark.asyncio()
+    async def test_fetch_reddit_thread_uses_json_adapter(self) -> None:
+        backend = DirectBackend()
+        reddit_json = [
+            {
+                "kind": "Listing",
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t3",
+                            "data": {
+                                "title": "Brooder heat plate size for coturnix?",
+                                "selftext": "How many coturnix chicks fit under a heat plate?",
+                                "author": "SpicySnails",
+                                "subreddit_name_prefixed": "r/quails",
+                                "created_utc": 1646665322,
+                                "permalink": "/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/",
+                            },
+                        }
+                    ]
+                },
+            },
+            {
+                "kind": "Listing",
+                "data": {
+                    "children": [
+                        {
+                            "kind": "t1",
+                            "data": {
+                                "author": "quail_keeper",
+                                "body": "A 12x12 plate should work for a small hatch.",
+                            },
+                        }
+                    ]
+                },
+            },
+        ]
+
+        request = httpx.Request(
+            "GET",
+            "https://www.reddit.com/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/.json?raw_json=1",
+        )
+        response = httpx.Response(200, request=request, json=reddit_json)
+
+        with patch("cognis.tools.executor.web.backends.reddit.httpx.AsyncClient") as client_cls:
+            client = AsyncMock()
+            client.__aenter__.return_value = client
+            client.get.return_value = response
+            client_cls.return_value = client
+
+            result = await backend.fetch(
+                "https://www.reddit.com/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/"
+            )
+
+        assert not result.is_error
+        assert "# Brooder heat plate size for coturnix?" in result.output
+        assert "How many coturnix chicks" in result.output
+        assert "A 12x12 plate should work" in result.output
+        document = (result.metadata or {}).get("extracted_document")
+        assert isinstance(document, dict)
+        assert document.get("extractor") == "reddit_json"
+        assert (result.metadata or {}).get("reddit_adapter") is True
+        client.get.assert_awaited_once()
+
+    @pytest.mark.asyncio()
     async def test_fetch_error_result(self) -> None:
         backend = DirectBackend()
         error_result = ToolResult(output="Request timed out", is_error=True)

@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from cognis.core.immutable_prefix import ImmutablePrefixEntry
+from cognis.core.session_cache import CachedEvent
+from cognis.core.session_fork import fork_session_events
+
+
+class _SessionCache:
+    def __init__(self) -> None:
+        self.events = [
+            CachedEvent(seq=1, type="system_message", data={"content": "old identity"}),
+            CachedEvent(seq=2, type="user_message", data={"content": "source input"}),
+        ]
+        self.prefix_entries = [
+            ImmutablePrefixEntry(role="system", source="identity", content="old identity", seq=1),
+            ImmutablePrefixEntry(
+                role="developer",
+                source="core_memories",
+                content="private owner memory",
+                seq=2,
+            ),
+        ]
+        self.seeded_events: list[CachedEvent] = []
+        self.stored_prefix: list[ImmutablePrefixEntry] = []
+
+    def get_entry(self, session_id: str) -> object:
+        del session_id
+        return SimpleNamespace(initialized=True, events=self.events)
+
+    def get_prefix_entries(self, session_id: str) -> list[ImmutablePrefixEntry]:
+        del session_id
+        return list(self.prefix_entries)
+
+    async def seed_events(self, session: object, events: list[CachedEvent], last_seq: int) -> None:
+        del session, last_seq
+        self.seeded_events.extend(events)
+
+    async def append_recorded_events(
+        self, session: object, events: list[object], result: object
+    ) -> None:
+        del session, events, result
+
+    async def store_prefix_snapshot(
+        self,
+        session_id: str,
+        entries: list[ImmutablePrefixEntry],
+        *,
+        snapshot_seq: int,
+        snapshot_source: str,
+    ) -> None:
+        del session_id, snapshot_seq, snapshot_source
+        self.stored_prefix = list(entries)
+
+
+class _Guardrails:
+    def __init__(self) -> None:
+        self.recorded_events: list[object] = []
+
+    async def record_events(self, **kwargs: object) -> object:
+        events = list(kwargs.get("events", []))
+        self.recorded_events.extend(events)
+        return SimpleNamespace(ok=True, first_seq=1, last_seq=len(self.recorded_events))
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_can_skip_source_prefix() -> None:
+    cache = _SessionCache()
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="plan",
+        copy_prefix=False,
+    )
+
+    assert copied is True
+    assert [event.type for event in cache.seeded_events] == ["user_message"]
+    assert cache.stored_prefix == []
+    assert [event.type for event in guardrails.recorded_events] == ["user_message"]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_preserves_copied_event_payloads() -> None:
+    cache = _SessionCache()
+    cache.events = [
+        CachedEvent(seq=1, type="user_message", data={"content": "without turn"}),
+        CachedEvent(
+            seq=2,
+            type="assistant_message",
+            data={"content": "with turn", "turn_id": "turn-1"},
+        ),
+    ]
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="undo",
+        copy_prefix=False,
+    )
+
+    assert copied is True
+    assert [event.data for event in guardrails.recorded_events] == [
+        {"content": "without turn"},
+        {"content": "with turn", "turn_id": "turn-1"},
+    ]
+    assert "turn_id" not in guardrails.recorded_events[0].model_dump()["data"]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_skips_non_appendable_source_events() -> None:
+    cache = _SessionCache()
+    cache.events = [
+        CachedEvent(seq=1, type="user_message", data={"content": "copy me"}),
+        CachedEvent(seq=2, type="tool_result_chunk", data={"content": "live only"}),
+        CachedEvent(seq=3, type="assistant_message", data={"content": "copy me too"}),
+    ]
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="task_chat",
+        copy_prefix=False,
+    )
+
+    assert copied is True
+    assert [event.type for event in guardrails.recorded_events] == [
+        "user_message",
+        "assistant_message",
+    ]
+    assert [event.type for event in cache.seeded_events] == [
+        "user_message",
+        "assistant_message",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_preserves_prefix_by_default() -> None:
+    cache = _SessionCache()
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="conversation_fork",
+    )
+
+    assert copied is True
+    assert [entry.source for entry in cache.stored_prefix] == ["identity", "core_memories"]
+    assert [event.type for event in guardrails.recorded_events] == [
+        "user_message",
+        "system_message",
+        "developer_message",
+        "context_snapshot",
+    ]
+    assert all(
+        "turn_id" not in event.model_dump()["data"] for event in guardrails.recorded_events[1:]
+    )

@@ -314,7 +314,9 @@ async def test_list_pending_reconciles_externally_resolved_submitted_escalations
     row.resolution = {"decision": "approve", "state": "submitted", "note": "approved in intaris"}
     event_bus = _FakeEventBus()
     service = NotificationService(
-        session_factory=_FakeListSessionFactory([row], {"task_live": _task_row("task_live", "paused")}),
+        session_factory=_FakeListSessionFactory(
+            [row], {"task_live": _task_row("task_live", "paused")}
+        ),
         pause_waiter=_FakePauseWaiter(),
         event_bus=event_bus,
         providers=SimpleNamespace(
@@ -340,6 +342,38 @@ async def test_list_pending_reconciles_externally_resolved_submitted_escalations
 
 
 @pytest.mark.asyncio
+async def test_reconcile_remote_escalation_uses_intaris_user_decision() -> None:
+    row = _notification_row()
+    event_bus = _FakeEventBus()
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([row], {}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(
+            guardrails=_FakeGuardrails(
+                escalations={
+                    "call-1": SimpleNamespace(
+                        call_id="call-1",
+                        resolved=False,
+                        decision="escalate",
+                        user_decision="deny",
+                        user_note="denied in Intaris",
+                    )
+                }
+            )
+        ),
+    )
+
+    resolved = await service.reconcile_remote_escalation("call-1")
+
+    assert resolved is True
+    assert row.status == "resolved"
+    assert row.resolution["decision"] == "deny"
+    assert row.resolution["note"] == "denied in Intaris"
+    assert row.resolution["state"] == "resolved_remote"
+
+
+@pytest.mark.asyncio
 async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -353,7 +387,9 @@ async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missi
     monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
 
     service = NotificationService(
-        session_factory=_FakeListSessionFactory([row], {"task_live": _task_row("task_live", "paused")}),
+        session_factory=_FakeListSessionFactory(
+            [row], {"task_live": _task_row("task_live", "paused")}
+        ),
         pause_waiter=_FakePauseWaiter(should_resolve=False),
         event_bus=event_bus,
         providers=SimpleNamespace(

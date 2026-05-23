@@ -42,7 +42,7 @@ async def test_autoconsent_init_script_registered_when_enabled() -> None:
 
 @pytest.mark.asyncio
 async def test_autoconsent_skipped_when_off() -> None:
-    manager = BrowserManager(stealth_enabled=False)  # auto_consent defaults to off
+    manager = BrowserManager(auto_consent="off")
     ctx = _FakeContext()
     await manager._apply_autoconsent_init_script(ctx)  # noqa: SLF001
     assert ctx.scripts == []
@@ -167,24 +167,52 @@ async def test_fingerprint_hardening_per_evasion_exclusion() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stage_c_defaults_anchored_to_stealth_enabled() -> None:
+def test_stage_c_defaults_keep_autoconsent_independent_from_stealth() -> None:
     on_manager = BrowserManager()  # default playwright + stealth on
     assert on_manager.auto_consent == "accept"
     assert on_manager.humanize_input is True
     assert on_manager.fingerprint_hardening is True
 
     off_manager = BrowserManager(stealth_enabled=False)
-    assert off_manager.auto_consent == "off"
+    assert off_manager.auto_consent == "accept"
     assert off_manager.humanize_input is False
     assert off_manager.fingerprint_hardening is False
 
 
 def test_stage_c_defaults_for_patchright_disabled_by_default() -> None:
     manager = BrowserManager(runtime="patchright")
-    # Patchright defaults stealth off; Stage C anchors on that.
-    assert manager.auto_consent == "off"
+    # Patchright defaults stealth off, but autoconsent still unblocks content.
+    assert manager.auto_consent == "accept"
     assert manager.humanize_input is False
     assert manager.fingerprint_hardening is False
+
+
+@pytest.mark.asyncio
+async def test_autoconsent_bundle_includes_multilingual_heuristics() -> None:
+    manager = BrowserManager(auto_consent="accept")
+    ctx = _FakeContext()
+    await manager._apply_autoconsent_init_script(ctx)  # noqa: SLF001
+    payload = ctx.scripts[0]
+
+    assert 'normalize("NFD")' in payload
+    assert "rozumim a souhlasim" in payload
+    assert "pouze nezbytne cookies" in payload
+    assert "alle akzeptieren" in payload
+    assert "tout accepter" in payload
+    assert "aceptar todo" in payload
+    assert "acceptar" in payload
+
+
+@pytest.mark.asyncio
+async def test_autoconsent_marks_clicks_for_overlay_cleanup() -> None:
+    manager = BrowserManager(auto_consent="accept")
+    ctx = _FakeContext()
+    await manager._apply_autoconsent_init_script(ctx)  # noqa: SLF001
+    payload = ctx.scripts[0]
+
+    assert "markClicked();" in payload
+    assert "removeConsentBackdrops" in payload
+    assert 'body.style.overflow = "auto"' in payload
 
 
 def test_stage_c_humanize_intensity_validation() -> None:

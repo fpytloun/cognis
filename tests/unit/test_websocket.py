@@ -9,21 +9,26 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketTurnObserver,
+    _event_to_payload,
     _handle_cancel_queued_message,
     _handle_message,
     _handle_update_queued_message,
     _workflow_composed_payload,
 )
+from cognis.core.events import Event, EventType
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError,
     TurnResult,
@@ -57,6 +62,8 @@ class _RecordingManager:
         self.errors: list[dict[str, object]] = []
         self.snapshots: list[str] = []
         self.subscriptions: list[str] = []
+        self.payloads: list[tuple[str, dict[str, object]]] = []
+        self.app: Any = SimpleNamespace(state=SimpleNamespace())
 
     async def send_error(self, _: object, **kwargs: object) -> None:
         self.errors.append(kwargs)
@@ -66,6 +73,13 @@ class _RecordingManager:
 
     async def send_queue_snapshot(self, _: object, conversation_id: str) -> None:
         self.snapshots.append(conversation_id)
+
+    async def send_to_conversation(self, conversation_id: str, payload: dict[str, object]) -> None:
+        self.snapshots.append(f"event:{conversation_id}:{payload.get('type')}")
+        self.payloads.append((conversation_id, payload))
+
+    def has_tts_enabled_subscribers(self, _conversation_id: str) -> bool:
+        return False
 
 
 async def _seed_conversation(app: Any, *, owner: str = "owner@example.com") -> str:
@@ -100,6 +114,62 @@ class _FakeProviders:
     guardrails: Any = field(default_factory=lambda: _FakeProvider())
     llm: Any = field(default_factory=lambda: _FakeProvider())
     memory: Any = field(default_factory=lambda: _FakeProvider())
+
+
+# ---------------------------------------------------------------------------
+# Event-to-payload mapping tests
+# ---------------------------------------------------------------------------
+
+
+def test_delegation_completed_payload_includes_durable_result_fields() -> None:
+    event = Event(
+        type=EventType.DELEGATION_COMPLETED,
+        data={
+            "child_session_id": "child-1",
+            "agent_id": "agent-1",
+            "used_agent_id": "agent-1",
+            "task": "Review branch",
+            "duration_ms": 123,
+            "result_summary": "Compact result",
+            "result_content": "[assistant_message:1]\nFull result",
+            "result_source": "assistant_messages",
+            "result_anchors": [{"anchor": "assistant_message:1"}],
+            "result_truncated": False,
+        },
+    )
+
+    payload = _event_to_payload(event, "conversation-1")
+
+    assert payload is not None
+    assert payload["type"] == "delegation_completed"
+    assert payload["result"] == "Compact result"
+    assert payload["result_content"] == "[assistant_message:1]\nFull result"
+    assert payload["result_source"] == "assistant_messages"
+    assert payload["result_anchors"] == [{"anchor": "assistant_message:1"}]
+    assert payload["result_truncated"] is False
+
+
+def test_user_message_payload_exposes_stable_live_identity() -> None:
+    event = Event(
+        type=EventType.USER_MESSAGE,
+        data={
+            "conversation_id": "conversation-1",
+            "session_id": "session-1",
+            "event_id": "client:cmsg_1",
+            "message_id": "client:cmsg_1",
+            "content": "hello",
+            "client_message_id": "cmsg_1",
+            "turn_id": "turn_1",
+        },
+    )
+
+    payload = _event_to_payload(event, "conversation-1")
+
+    assert payload is not None
+    assert payload["type"] == "user_message"
+    assert payload["event_id"] == "client:cmsg_1"
+    assert payload["message_id"] == "client:cmsg_1"
+    assert payload["timestamp"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +388,8 @@ async def test_chunk_gap_frame_emitted_after_drops() -> None:
 @pytest.mark.asyncio
 async def test_turn_observer_strips_attachment_payload_bytes() -> None:
     manager = AsyncMock()
+    manager.has_tts_enabled_subscribers = lambda _conversation_id: False
+    manager.app.state.turn_scheduler.queued_messages = lambda _conversation_id: []
     observer = WebSocketTurnObserver(manager)
 
     await observer.on_turn_complete(
@@ -339,7 +411,7 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
         )
     )
 
-    payload = manager.send_to_conversation.await_args.args[1]
+    payload = manager.send_to_conversation.await_args_list[0].args[1]
     assert payload["content"] == "Final answer"
     assert payload["attachments"] == [
         {
@@ -350,6 +422,39 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
             "size_bytes": 3,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_turn_observer_emits_conversation_activity_after_completion() -> None:
+    manager = _RecordingManager()
+    manager.app.state.turn_scheduler = type(
+        "Scheduler",
+        (),
+        {"queued_messages": lambda self, _conversation_id: []},
+    )()
+    observer = WebSocketTurnObserver(cast(Any, manager))
+
+    completed_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-1",
+            turn_id="turn-1",
+            final_content="Done",
+            completed_at=completed_at,
+        )
+    )
+
+    payloads = [payload for _, payload in manager.payloads]
+    assert payloads[0]["type"] == "message_complete"
+    assert payloads[1] == {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "has_active_turn": False,
+        "last_message_at": completed_at.isoformat(),
+        "updated_at": completed_at.isoformat(),
+    }
 
 
 @pytest.mark.asyncio
@@ -439,6 +544,43 @@ def test_workflow_composed_payload_supports_lifecycle_backed_replay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ws_first_slash_command_bootstraps_root_session(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        conversation_id = await _seed_conversation(client.app, owner="owner@example.com")
+
+        async def _create_session(**_: object) -> None:
+            return None
+
+        client.app.state.providers.guardrails.create_session = _create_session
+        manager = _RecordingManager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-first-slash",
+            websocket=AsyncMock(),
+            user_email="owner@example.com",
+            role="user",
+        )
+
+        await _handle_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {"type": "message", "conversation_id": conversation_id, "content": "/plan"},
+        )
+
+        async with client.app.state.session_factory() as session:
+            from cognis.store.queries import get_conversation
+
+            conversation = await get_conversation(session, conversation_id)
+            assert conversation is not None
+            assert conversation.active_session_id is not None
+
+        assert manager.errors == []
+        assert f"event:{conversation_id}:system_message" in manager.snapshots
+
+
+@pytest.mark.asyncio
 async def test_ws_message_does_not_send_queue_snapshot_before_authorization(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -516,8 +658,6 @@ def _create_ws_test_client(monkeypatch: object, tmp_path: Path) -> Any:
     """Create a TestClient for WebSocket auth tests."""
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
-    from fastapi.testclient import TestClient
-
     from cognis.api.app import create_app
 
     app = create_app()

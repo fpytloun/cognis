@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cognis.core.compaction import (
+    CompactionModelContext,
     CompactionStrategy,
     _format_events_for_compaction,
     _mechanical_summary,
@@ -49,13 +50,21 @@ class _Guardrails:
 
     async def record_events(self, **kwargs: object) -> EventAppendResult:
         self.calls += 1
-        self.idempotency_keys.append(kwargs.get("idempotency_key"))
+        idempotency_value = kwargs.get("idempotency_key")
+        idempotency_key: str | None = (
+            idempotency_value if isinstance(idempotency_value, str) else None
+        )
+        self.idempotency_keys.append(idempotency_key)
         if self.fail:
             raise RuntimeError("write failed")
         return EventAppendResult(ok=True, count=1, first_seq=6, last_seq=6)
 
 
 class _LLM:
+    def __init__(self) -> None:
+        self.messages: list[list[dict[str, object]]] = []
+        self.kwargs: list[dict[str, object]] = []
+
     async def generate(
         self,
         messages: list[dict[str, object]],
@@ -63,13 +72,14 @@ class _LLM:
         task_type: str = "default",
         **kwargs: object,
     ) -> dict[str, object]:
-        del messages, model, task_type, kwargs
+        self.messages.append(messages)
+        self.kwargs.append({"model": model, "task_type": task_type, **dict(kwargs)})
         return {"choices": [{"message": {"content": "summary text"}}]}
 
     async def resolve_model(
-        self, explicit_model: str | None = None, task_type: str = "default"
+        self, explicit_model: str | None = None, task_type: str = "default", **kwargs: object
     ) -> str:
-        del explicit_model, task_type
+        del explicit_model, task_type, kwargs
         return "test-model"
 
     def count_tokens(self, text: str, model: str) -> int:
@@ -90,9 +100,10 @@ def _session() -> SessionModel:
 @pytest.mark.asyncio
 async def test_compaction_records_summary_and_updates_cache() -> None:
     cache = _Cache()
+    llm = _LLM()
     strategy = CompactionStrategy(
         guardrails=_Guardrails(),
-        llm=_LLM(),
+        llm=llm,
         session_cache=cache,
         compaction_threshold=0.85,
         preserve_turns=2,
@@ -103,6 +114,11 @@ async def test_compaction_records_summary_and_updates_cache() -> None:
     assert result.compacted is True
     assert result.method == "llm"
     assert cache.applied == [("summary text", 6)]
+    assert llm.kwargs[0]["cognis_session_id"] == "session-1"
+    assert llm.kwargs[0]["model"] is None
+    assert llm.kwargs[0]["task_type"] == "compaction"
+    assert result.tail_start_seq == 3
+    assert [event.seq for event in result.preserved_tail_events] == [3, 4, 5]
 
 
 @pytest.mark.asyncio
@@ -257,3 +273,94 @@ async def test_compaction_uses_idempotency_key() -> None:
     assert result.compacted is True
     assert len(guardrails.idempotency_keys) == 1
     assert guardrails.idempotency_keys[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_compaction_updates_previous_summary_anchor() -> None:
+    cache = _Cache()
+    cache.entry.last_compaction_summary = "## Goal\n- old goal"
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.compact(_session())
+
+    assert result.compacted is True
+    raw_prompt = llm.messages[0][1]["content"]
+    assert isinstance(raw_prompt, str)
+    prompt = raw_prompt
+    assert "<previous-summary>" in prompt
+    assert "old goal" in prompt
+    assert "<new-history>" in prompt
+
+
+@pytest.mark.asyncio
+async def test_same_session_compaction_forwards_model_context() -> None:
+    class _SameSessionLLM(_LLM):
+        async def resolve_model(
+            self, explicit_model: str | None = None, task_type: str = "default", **kwargs: object
+        ) -> str:
+            del explicit_model, task_type, kwargs
+            return "__same_session_model__"
+
+    llm = _SameSessionLLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_Cache(),
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.compact(
+        _session(),
+        model_context=CompactionModelContext(
+            model="agent-model",
+            provider_id="agent-provider",
+            reasoning_effort="none",
+        ),
+    )
+
+    assert result.compacted is True
+    assert llm.kwargs[0]["model"] == "agent-model"
+    assert llm.kwargs[0]["provider_id"] == "agent-provider"
+    assert llm.kwargs[0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_compaction_route_resolution_failure_preserves_route_behavior() -> None:
+    class _FailingResolveLLM(_LLM):
+        async def resolve_model(
+            self, explicit_model: str | None = None, task_type: str = "default", **kwargs: object
+        ) -> str:
+            del explicit_model, task_type, kwargs
+            raise RuntimeError("route lookup failed")
+
+    llm = _FailingResolveLLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_Cache(),
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.compact(
+        _session(),
+        model_context=CompactionModelContext(
+            model="agent-model",
+            provider_id="agent-provider",
+            reasoning_effort="none",
+        ),
+    )
+
+    assert result.compacted is True
+    assert llm.kwargs[0]["model"] is None
+    assert llm.kwargs[0]["task_type"] == "compaction"
+    assert llm.kwargs[0]["provider_id"] is None
+    assert llm.kwargs[0]["reasoning_effort"] is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from cognis.providers.executor.in_process import (
 from cognis.security import create_password_hasher
 from cognis.store.models import Agent, User
 from cognis.tools.builtin.system import LIST_AGENTS_TOOL
+from cognis.tools.executor.definitions import BASH_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
@@ -229,6 +231,73 @@ async def test_executor_connection_trips_circuit_breaker_after_failures() -> Non
     await connection.tool_execute(ToolCall(call_id="2", name="explode", arguments={}))
 
     assert connection.breaker.state == "open"
+
+
+@pytest.mark.asyncio
+async def test_in_process_background_bash_completion_callback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))
+    config = load_config()
+    password_hasher = create_password_hasher()
+    _, engine, session_factory, _ = await bootstrap_runtime(config, password_hasher)
+    provider = InProcessExecutorProvider(session_factory=session_factory)
+    completed: list[tuple[str, dict[str, object]]] = []
+    done = asyncio.Event()
+
+    async def on_completed(executor_id: str, status: dict[str, object]) -> None:
+        completed.append((executor_id, status))
+        done.set()
+
+    provider.register_background_shell_completed_callback(on_completed)
+    handle = await provider.spawn(
+        ExecutorConfig(
+            executor_id="exec-bash",
+            tools=[BASH_TOOL],
+            metadata={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "agent_id": "agent-1",
+            },
+        )
+    )
+    connection = await provider.get_executor(handle)
+
+    result = await connection.tool_execute(
+        ToolCall(
+            call_id="call-bash",
+            name="bash",
+            arguments={
+                "command": "printf done",
+                "description": "quick background command",
+                "run_in_background": True,
+                "timeout": 100,
+            },
+            runtime_metadata={
+                "turn_id": "turn-1",
+                "tool_call_id": "call-bash",
+                "runtime_access": {
+                    "conversation_id": "conv-1",
+                    "session_id": "sess-1",
+                    "agent_id": "agent-1",
+                },
+            },
+            execution_scope_id="scope-1",
+        )
+    )
+
+    await asyncio.wait_for(done.wait(), timeout=5)
+    await provider.cleanup()
+    await engine.dispose()
+
+    assert result.is_error is False
+    assert completed[0][0] == "exec-bash"
+    status = completed[0][1]
+    assert status["shell_id"]
+    assert status["status"] == "completed"
+    assert status["description"] == "quick background command"
+    assert status["conversation_id"] == "conv-1"
+    assert status["call_id"] == "call-bash"
 
 
 @pytest.mark.asyncio

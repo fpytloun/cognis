@@ -20,6 +20,7 @@ from cognis.api.models import (
     ConversationCreateRequest,
     ConversationResolveRequest,
     ConversationResponse,
+    ConversationTitleSuggestionResponse,
     ConversationUpdateRequest,
     CursorPage,
     MessageHistoryResponse,
@@ -29,6 +30,8 @@ from cognis.api.models import (
     SendMessageResponse,
     SessionEventsResponse,
     SessionResponse,
+    ToolOutputChunkResponse,
+    ToolOutputPageResponse,
     UpdateQueuedMessageRequest,
 )
 from cognis.api.serializers import (
@@ -37,6 +40,7 @@ from cognis.api.serializers import (
     session_to_response,
 )
 from cognis.core.attachment_utils import hydrate_attachment_refs
+from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
@@ -123,7 +127,7 @@ async def conversation_list(
     context_type: str | None = Query(default=None),
     agent_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
-    status: str = Query(default="active", pattern="^(active|archived|all)$"),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
@@ -231,6 +235,52 @@ async def conversation_detail(request: Request, conversation_id: str) -> Convers
     return conversation_to_response(row)
 
 
+@router.get(
+    "/{conversation_id}/title-suggestion", response_model=ConversationTitleSuggestionResponse
+)
+async def conversation_title_suggestion(
+    request: Request,
+    conversation_id: str,
+) -> ConversationTitleSuggestionResponse:
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+    row = _require_visible_conversation(request, row)
+    platform_data = row.context_data or {}
+    suggestion = latest_intaris_title_from_platform_data(platform_data)
+    if suggestion:
+        generated_at = platform_data.get("intaris_latest_title_at")
+        return ConversationTitleSuggestionResponse(
+            title=suggestion,
+            generated_at=generated_at if isinstance(generated_at, str) else None,
+            available=True,
+        )
+
+    active_session_id = getattr(row, "active_session_id", None)
+    if active_session_id:
+        async with request.app.state.session_factory() as session:
+            session_row = await get_session_row(session, active_session_id)
+        if session_row is not None:
+            try:
+                intaris_sid = session_row.intaris_session_id or session_row.session_id
+                intaris_session = await request.app.state.providers.guardrails.get_session(
+                    intaris_sid
+                )
+                title = (intaris_session.title or "").strip()
+                if title:
+                    return ConversationTitleSuggestionResponse(title=title, available=True)
+            except Exception:
+                logger.debug(
+                    "conversation: failed to fetch latest Intaris title suggestion",
+                    extra={"extra_data": {"conversation_id": conversation_id}},
+                    exc_info=True,
+                )
+
+    return ConversationTitleSuggestionResponse(
+        available=False,
+        reason="No Intaris title suggestion is available yet.",
+    )
+
+
 @router.patch("/{conversation_id}", response_model=ConversationResponse)
 async def update_conversation(
     request: Request,
@@ -256,6 +306,8 @@ async def update_conversation(
         if payload.project_id is not None:
             await _validate_project_access(request, payload.project_id)
             row.project_id = payload.project_id
+        if "starred_at" in payload.model_fields_set:
+            row.starred_at = payload.starred_at
         await session.commit()
         await session.refresh(row)
         return conversation_to_response(row)
@@ -497,11 +549,14 @@ async def conversation_messages(
 
     await _hydrate_event_attachments(request, all_events, conversation_id=conversation_id)
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    has_active_turn = bool(
-        turn_scheduler and turn_scheduler.has_running_turn(conversation_id)
-    )
+    has_active_turn = bool(turn_scheduler and turn_scheduler.has_running_turn(conversation_id))
     active_streams = (
         await turn_scheduler.active_stream_snapshots(conversation_id)
+        if turn_scheduler is not None
+        else []
+    )
+    active_tool_outputs = (
+        await turn_scheduler.active_tool_output_snapshots(conversation_id)
         if turn_scheduler is not None
         else []
     )
@@ -519,10 +574,170 @@ async def conversation_messages(
         has_more=has_more,
         has_active_turn=has_active_turn,
         active_streams=active_streams,
+        active_tool_outputs=active_tool_outputs,
         active_session_id=active_session_id,
         active_session_last_seq=active_session_last_seq,
         history_truncated=history_truncated,
         truncation_reason=truncation_reason,
+    )
+
+
+def _event_data(event: Any) -> dict[str, Any] | None:
+    data = event.get("data") if isinstance(event, dict) else getattr(event, "data", None)
+    return data if isinstance(data, dict) else None
+
+
+def _tool_call_belongs_to_events(
+    events: list[Any], call_id: str
+) -> tuple[dict[str, Any], str | None] | None:
+    fallback: tuple[dict[str, Any], str | None] | None = None
+    for event in events:
+        data = _event_data(event)
+        if not data or data.get("call_id") != call_id:
+            continue
+        event_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
+        if event_type == "tool_result":
+            session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else None
+            return data, session_id
+        if (
+            event_type in {"tool_call", "tool_result_chunk", "tool_output_chunk"}
+            and fallback is None
+        ):
+            session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else None
+            fallback = data, session_id
+    return fallback
+
+
+@router.get("/{conversation_id}/tool-outputs/{call_id}", response_model=ToolOutputPageResponse)
+async def conversation_tool_output_page(
+    request: Request,
+    conversation_id: str,
+    call_id: str,
+    session_id: str | None = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+    latest: bool = Query(default=False),
+) -> ToolOutputPageResponse:
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        active_session_id = row.active_session_id
+        session_rows, _ = (
+            await get_root_session_chain(session, conversation_id, active_session_id)
+            if active_session_id
+            else ([], False)
+        )
+
+    guardrails = request.app.state.providers.guardrails
+    all_events: list[Any] = []
+    for sr in session_rows:
+        result = await guardrails.read_events(
+            session_id=sr.intaris_session_id or sr.session_id,
+            after_seq=0,
+            limit=0,
+            allow_missing_stream=True,
+        )
+        events = list(result.events)
+        for event in events:
+            data = _event_data(event)
+            if data is not None and "session_id" not in data:
+                data["session_id"] = sr.session_id
+        all_events.extend(events)
+
+    ownership = _tool_call_belongs_to_events(all_events, call_id)
+    if ownership is None:
+        # Active streamed chunks can exist before the final persisted event.
+        snapshots = []
+        turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+        if turn_scheduler is not None:
+            snapshots = await turn_scheduler.active_tool_output_snapshots(conversation_id)
+        for snapshot in snapshots:
+            if snapshot.get("call_id") == call_id:
+                ownership = (snapshot, snapshot.get("session_id"))
+                break
+    if ownership is None:
+        raise api_exception(404, "not_found", "Tool output not found")
+
+    event_data, event_session_id = ownership
+    resolved_session_id = session_id or event_session_id
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    if turn_scheduler is not None and resolved_session_id:
+        live_page = turn_scheduler.read_live_tool_output_page(
+            conversation_id=conversation_id,
+            session_id=resolved_session_id,
+            call_id=call_id,
+            offset=offset,
+            limit=limit,
+            latest=latest,
+        )
+        if live_page is not None and live_page.status == "running":
+            return ToolOutputPageResponse(
+                conversation_id=conversation_id,
+                session_id=resolved_session_id,
+                call_id=call_id,
+                status=live_page.status,
+                source="live_spool",
+                content=live_page.content,
+                chunks=[
+                    ToolOutputChunkResponse(
+                        index=chunk.index,
+                        offset=chunk.offset,
+                        stream=chunk.stream,
+                        text=chunk.text,
+                    )
+                    for chunk in live_page.chunks
+                ],
+                offset=live_page.offset,
+                limit=live_page.limit,
+                next_offset=live_page.next_offset,
+                prev_offset=live_page.prev_offset,
+                has_more_before=live_page.has_more_before,
+                has_more_after=live_page.has_more_after,
+                output_size=live_page.output_size,
+                recoverable=True,
+                truncated=live_page.truncated,
+                spool_truncated=live_page.truncated,
+            )
+
+    tool_output_store = getattr(request.app.state, "tool_output_store", None)
+    if tool_output_store is not None and bool(event_data.get("has_full_output")):
+        stored = await tool_output_store.read(call_id, offset=max(1, offset or 1), limit=limit)
+        if stored is not None:
+            next_offset = stored.offset + stored.limit if stored.has_more else None
+            prev_offset = max(1, stored.offset - stored.limit) if stored.offset > 1 else None
+            return ToolOutputPageResponse(
+                conversation_id=conversation_id,
+                session_id=resolved_session_id,
+                call_id=call_id,
+                status="completed",
+                source="stored_output",
+                content=stored.content,
+                offset=stored.offset,
+                limit=stored.limit,
+                next_offset=next_offset,
+                prev_offset=prev_offset,
+                has_more_before=stored.offset > 1,
+                has_more_after=stored.has_more,
+                output_size=int(event_data.get("output_size") or len(stored.content)),
+                total_lines=stored.total_lines,
+                recoverable=True,
+                truncated=bool(
+                    event_data.get("truncated") or event_data.get("agent_visible_truncated")
+                ),
+            )
+
+    preview = str(event_data.get("result") or "")
+    return ToolOutputPageResponse(
+        conversation_id=conversation_id,
+        session_id=resolved_session_id,
+        call_id=call_id,
+        status=str(event_data.get("status") or "completed"),
+        source="event_preview",
+        content=preview,
+        offset=0,
+        limit=limit,
+        output_size=len(preview),
+        recoverable=False,
     )
 
 
@@ -706,6 +921,7 @@ async def _try_command_dispatch(
     from cognis.core.session import _to_conversation_model, _to_session_model
     from cognis.models.agent import AgentDefinition
 
+    session_manager = getattr(request.app.state, "session_manager", None)
     async with request.app.state.session_factory() as session:
         conversation_row = await get_conversation(session, conversation_id)
         if conversation_row is None:
@@ -722,8 +938,19 @@ async def _try_command_dispatch(
         )
 
     if session_row is None:
-        return None
-    session_model = _to_session_model(session_row)
+        if session_manager is None:
+            return None
+        session_model = await session_manager.ensure_root_session(
+            conversation_id=conversation_id,
+            user_email=user.email,
+            agent_id=conversation_model.agent_id,
+            intention=content,
+        )
+        conversation_model = conversation_model.model_copy(
+            update={"active_session_id": session_model.session_id}
+        )
+    else:
+        session_model = _to_session_model(session_row)
 
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
     has_active = turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
@@ -778,6 +1005,27 @@ async def active_delegations(request: Request, conversation_id: str) -> list[Ses
     return [
         item for item in sessions if item.parent_session_id is not None and item.status == "active"
     ]
+
+
+@router.get(
+    "/{conversation_id}/subsessions/{session_id}",
+    response_model=SessionResponse,
+)
+async def conversation_subsession(
+    request: Request,
+    conversation_id: str,
+    session_id: str,
+) -> SessionResponse:
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        del row
+        session_row = await get_session_row(session, session_id)
+    if session_row is None or session_row.conversation_id != conversation_id:
+        raise api_exception(404, "not_found", "Session not found in this conversation")
+    if session_row.parent_session_id is None:
+        raise api_exception(404, "not_found", "Session is not a sub-session")
+    return session_to_response(session_row, include_result_content=True)
 
 
 @router.get(

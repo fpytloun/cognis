@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -19,6 +20,9 @@ from cognis.core.executor_switching import perform_executor_switch
 class FakeConversation:
     conversation_id: str = "conv-1"
     active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
+    active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
     updated_at: Any = None
 
 
@@ -84,10 +88,21 @@ def _patch_set_active_executor(monkeypatch, factory_and_conv):
 
     factory, conv = factory_and_conv
 
-    async def _set(_session, conversation_id, active_executor_id):
+    async def _set(
+        _session,
+        conversation_id,
+        active_executor_id,
+        *,
+        assigned_at=None,
+        expires_at=None,
+        source=None,
+    ):
         if conversation_id != conv.conversation_id:
             return False
         conv.active_executor_id = active_executor_id
+        conv.active_executor_assigned_at = assigned_at
+        conv.active_executor_expires_at = expires_at
+        conv.active_executor_source = source
         return True
 
     import cognis.store.queries
@@ -110,6 +125,8 @@ async def test_switch_to_assigned_primary_succeeds(factory_and_conv) -> None:
     assert outcome.is_primary is True
     assert outcome.target.executor_id == "exec-2"
     assert conv.active_executor_id == "exec-2"
+    assert conv.active_executor_expires_at is None
+    assert conv.active_executor_source == "agent_switch"
     payload = outcome.to_tool_result()
     assert payload["status"] == "ok"
     assert payload["is_primary"] is True
@@ -132,8 +149,12 @@ async def test_switch_to_assigned_additional_succeeds(factory_and_conv) -> None:
     assert outcome.status == "ok"
     assert outcome.is_primary is False
     assert conv.active_executor_id == "exec-add"
+    assert conv.active_executor_expires_at is not None
+    assert conv.active_executor_source == "user_switch"
     msg = outcome.to_user_message()
     assert "non-primary" in msg.lower()
+    assert "not fallback capacity" in msg
+    assert "before unrelated generic work" in msg
 
 
 @pytest.mark.asyncio
@@ -162,10 +183,10 @@ async def test_switch_with_task_id_updates_task_pin(monkeypatch, factory_and_con
     factory, conv = factory_and_conv
     pool = ExecutorPool(primary=[_target("exec-1"), _target("exec-2")])
 
-    task_calls: list[tuple[str, str]] = []
+    task_calls: list[tuple[str, str, str | None]] = []
 
-    async def _set_task(_session, task_id, executor_id):
-        task_calls.append((task_id, executor_id))
+    async def _set_task(_session, task_id, executor_id, **metadata):
+        task_calls.append((task_id, executor_id, metadata.get("source")))
         return True
 
     import cognis.store.queries as store_queries
@@ -182,19 +203,17 @@ async def test_switch_with_task_id_updates_task_pin(monkeypatch, factory_and_con
     )
     assert outcome.status == "ok"
     assert conv.active_executor_id == "exec-2"
-    assert task_calls == [("task-99", "exec-2")]
+    assert task_calls == [("task-99", "exec-2", "agent_switch")]
 
 
 @pytest.mark.asyncio
-async def test_switch_with_task_id_swallows_task_pin_failure(
-    monkeypatch, factory_and_conv
-) -> None:
+async def test_switch_with_task_id_swallows_task_pin_failure(monkeypatch, factory_and_conv) -> None:
     """Task pin failure must NOT undo a successful conversation switch."""
 
     factory, conv = factory_and_conv
     pool = ExecutorPool(primary=[_target("exec-1"), _target("exec-2")])
 
-    async def _set_task_boom(_session, _task_id, _executor_id):
+    async def _set_task_boom(_session, _task_id, _executor_id, **_metadata):
         raise RuntimeError("simulated DB failure")
 
     import cognis.store.queries as store_queries

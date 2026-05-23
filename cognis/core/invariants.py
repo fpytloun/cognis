@@ -12,6 +12,13 @@ violation has:
 
 Adding a new invariant here means one place to document the contract,
 run it in tests, and observe it in production.
+
+In-process / runtime invariants
+--------------------------------
+Some invariants cannot be checked against the database because they live
+in transient in-memory state.  These are exposed as pure functions that
+accept the relevant state objects and return ``InvariantResult`` instances.
+They are intended for use in tests and debug builds, not in the hot path.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ from sqlalchemy.orm import aliased
 from cognis.logging import get_logger
 from cognis.store.models import Conversation, StepRun, Task, TaskDependency
 from cognis.store.models import Session as SessionRow
+
+# Avoid a circular import: context_projection imports nothing from invariants.
+# We import lazily inside the runtime-invariant functions below.
 
 logger = get_logger(__name__)
 
@@ -284,3 +294,68 @@ async def _reconcile_conversations_with_missing_active_session(session: Any) -> 
     if count:
         await session.commit()
     return count
+
+
+# ---------------------------------------------------------------------------
+# Runtime (in-process) invariants — pure functions, no DB access
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class InvariantResult:
+    """Result of a single runtime invariant check."""
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "passed": self.passed, "detail": self.detail}
+
+
+def check_projection_monotonicity(
+    turn_state: Any,
+    *,
+    new_preserved_anchors: set[str],
+    pressure_mode: Any,
+) -> InvariantResult:
+    """Verify that committed_preservations never shrinks under non-critical pressure.
+
+    Parameters
+    ----------
+    turn_state:
+        A ``ProjectionTurnState`` instance (typed as ``Any`` to avoid a
+        circular import at module level).
+    new_preserved_anchors:
+        The set of group anchors that were preserved in the most recent
+        ``project_messages`` call.
+    pressure_mode:
+        The ``PressureMode`` (or string) active for this projection.
+
+    Returns an ``InvariantResult`` with ``passed=False`` when a non-critical
+    projection would demote a previously committed group.
+    """
+    from cognis.core.context_projection import PressureMode  # lazy import
+
+    committed: set[str] = getattr(turn_state, "committed_preservations", set())
+    is_critical = pressure_mode == PressureMode.critical or pressure_mode == "critical"
+
+    if is_critical:
+        # Critical mode is allowed to demote anything.
+        return InvariantResult(
+            name="projection_monotonicity",
+            passed=True,
+            detail="critical mode — demotion allowed",
+        )
+
+    demoted = committed - new_preserved_anchors
+    if demoted:
+        return InvariantResult(
+            name="projection_monotonicity",
+            passed=False,
+            detail=(
+                f"Non-critical projection demoted {len(demoted)} previously committed "
+                f"group(s): {sorted(demoted)}"
+            ),
+        )
+    return InvariantResult(name="projection_monotonicity", passed=True)

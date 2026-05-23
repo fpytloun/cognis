@@ -156,16 +156,17 @@ def _build_web_fetch(
     desc = (
         "Fetch content from a URL and return it as text or markdown. "
         "Normally omit backend so the configured fetch path is used. "
-        "Direct fetches automatically retry through the headless browser, "
-        "and optionally a headed browser, when the controller is configured "
-        "to do so."
+        "Direct fetches automatically retry through a headed browser when "
+        "available, otherwise through a headless browser, when the controller "
+        "is configured to do so."
     )
     extras: list[str] = []
     if has_tavily:
         extras.append("Use 'tavily' only when you explicitly want Tavily extraction for this call.")
     if has_browser:
         extras.append(
-            "Use 'browser' only when you want every fetch rendered in the headless browser. "
+            "Use 'browser' only when you want every fetch rendered in the preferred browser mode "
+            "(headed when the executor allows it, otherwise headless). "
             "When backend='browser' is set explicitly the controller does NOT silently "
             "fall back to direct fetch."
         )
@@ -502,7 +503,9 @@ def _fetch_backend_hints(backends: list[str]) -> str:
         elif b == "tavily":
             hints.append("'tavily': Tavily extract API")
         elif b == "browser":
-            hints.append("'browser': always use headless browser rendering for this call")
+            hints.append(
+                "'browser': always use browser rendering for this call, preferring headed when available"
+            )
     return ", ".join(hints) + "." if hints else ""
 
 

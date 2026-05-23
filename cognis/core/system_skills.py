@@ -383,13 +383,12 @@ over this skill for paid users who want a turnkey multi-source report.
    artifacts, then use `artifact_read` to analyze them through the
    vision-capable model routing before embedding them in a document.
 7. **Escalate carefully.** If `web_fetch` reports both a primary failure
-   and a "headless browser fallback failed" message in the same error,
-   the controller already exhausted the headless retry. Headed
-   fallback (if enabled via `web.browser_fetch.headed_fallback_enabled`)
-   runs automatically after that. Do not manually retry with
-   `backend='browser'` to "force" a browser fetch — it will only repeat
-   the same headless attempt. Pick a different source or escalate to
-   the user instead.
+   and a browser fallback failure in the same error, the controller already
+   exhausted the configured browser retry. When
+   `web.browser_fetch.headed_fallback_enabled` and `browser.headed_allowed`
+   are both enabled, fallback and explicit `backend='browser'` prefer a
+   headed browser; otherwise they use headless. Pick a different source or
+   escalate to the user instead of retrying mechanically.
 8. **Stop at "enough".** Quit when adding another source would be
    redundant. Five high-quality citations beat fifteen low-quality ones.
 

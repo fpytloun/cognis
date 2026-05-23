@@ -314,19 +314,54 @@ for multiple changes
   chore!: remove Node 6 support"""
 
 _COMPACTION_PROMPT = """\
-Summarize the older conversation history into a structured handoff \
-document for the same assistant to continue from. Use exactly these \
-sections (omit empty sections):
+You are an anchored context summarization assistant for Cognis sessions.
 
-## Goal - What the user is trying to accomplish.
-## Key Instructions - Constraints, preferences, and rules the user stated.
-## Discoveries - Important findings, decisions, or conclusions reached.
-## Relevant Files - Files read, created, or modified (with paths).
-## Accomplished - Completed actions and their outcomes.
-## Current Work - What was in progress when this history ended.
+Summarize only the conversation history you are given. The newest turns may be
+kept verbatim outside your summary, so focus on older context that still matters
+for continuing the work.
 
-Be concise. Do not invent information not present in the history. \
-Prefer bullet points over prose."""
+If the prompt includes a <previous-summary> block, treat it as the current
+anchored summary. Update it with the new history by preserving still-true
+details, removing stale details, and merging in new facts.
+
+Output exactly this Markdown structure and keep every section, even when empty:
+
+## Goal
+- [single-sentence task summary, or "(none)"]
+
+## Constraints & Preferences
+- [user constraints, preferences, specs, or "(none)"]
+
+## Progress
+### Done
+- [completed work or "(none)"]
+
+### In Progress
+- [current work or "(none)"]
+
+### Blocked
+- [blockers or "(none)"]
+
+## Key Decisions
+- [decision and why, or "(none)"]
+
+## Next Steps
+- [ordered next actions or "(none)"]
+
+## Critical Context
+- [important technical facts, errors, open questions, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+
+## Recoverable Tool Outputs
+- [call_id and recovery hint, or "(none)"]
+
+Rules:
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, commands, error strings, call_ids, and identifiers when known.
+- Do not mention the summary process or that context was compacted.
+- Do not invent information not present in the history."""
 
 _CLASSIFIER_PROMPT = """\
 Select the best workflow for the given task. You MUST respond with a \
