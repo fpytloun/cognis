@@ -1,4 +1,4 @@
-"""Ephemeral storage for full tool outputs, keyed by call_id.
+"""TTL-bound artifact storage for full tool outputs, keyed by call_id.
 
 Stores the complete executor output so the LLM can later explore it via
 ``read_tool_output`` and ``search_tool_output`` built-in tools.  Files
@@ -6,12 +6,12 @@ are automatically cleaned up based on a configurable TTL and a
 directory-wide size cap.
 
 Supports two backends:
-- **filesystem** (default): local controller filesystem.
-- **s3**: MinIO/S3-compatible object storage for shared/persistent access.
+- **filesystem** (default): local controller artifact filesystem.
+- **s3**: MinIO/S3-compatible artifact object storage for shared access.
 
 The store is backend-agnostic at the API level.  ``read()`` and
 ``search()`` load the full content into memory for line-based operations
-— acceptable for ephemeral tool outputs (typically < 1 MB).
+— acceptable for TTL-bound tool outputs (typically < 1 MB).
 """
 
 from __future__ import annotations
@@ -507,7 +507,7 @@ class S3ToolOutputBackend:
 
 
 class ToolOutputStore:
-    """Ephemeral storage for full tool outputs.
+    """TTL-bound storage for full tool outputs.
 
     Delegates to a pluggable backend (filesystem or S3).
     """
@@ -522,6 +522,12 @@ class ToolOutputStore:
         self._backend = backend
         self._ttl_seconds = ttl_hours * 3600
         self._max_size_bytes = max_size_mb * 1024 * 1024
+
+    @property
+    def ttl_seconds(self) -> int:
+        """Configured retention window for saved tool outputs."""
+
+        return self._ttl_seconds
 
     # ------------------------------------------------------------------
     # Write

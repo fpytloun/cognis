@@ -31,6 +31,7 @@ def middle_truncate(
     token_counter: Callable[[str], int] | None = None,
     max_tokens: int | None = None,
     anchors: Sequence[str] | None = None,
+    anchors_available: bool | None = None,
 ) -> tuple[str, bool]:
     """Truncate *text* preserving head and tail, removing the middle.
 
@@ -62,6 +63,7 @@ def middle_truncate(
                 call_id=call_id,
                 head_ratio=head_ratio,
                 anchors=anchors,
+                anchors_available=anchors_available,
             )
 
     return _middle_truncate_chars(
@@ -70,6 +72,7 @@ def middle_truncate(
         call_id=call_id,
         head_ratio=head_ratio,
         anchors=anchors,
+        anchors_available=anchors_available,
     )
 
 
@@ -80,11 +83,12 @@ def _middle_truncate_chars(
     call_id: str | None = None,
     head_ratio: float = 0.5,
     anchors: Sequence[str] | None = None,
+    anchors_available: bool | None = None,
 ) -> tuple[str, bool]:
     """Char-budget middle truncation helper."""
 
     # Reserve space for the marker line
-    marker = _build_marker(len(text), call_id, anchors=anchors)
+    marker = _build_marker(len(text), call_id, anchors=anchors, anchors_available=anchors_available)
     available = max_chars - len(marker)
     if available < 100:
         # Not enough room for meaningful head+tail — fall back to head-only
@@ -105,6 +109,7 @@ def _middle_truncate_by_tokens(
     call_id: str | None,
     head_ratio: float,
     anchors: Sequence[str] | None = None,
+    anchors_available: bool | None = None,
 ) -> tuple[str, bool]:
     """Approximate token-budget truncation using iterative char scaling."""
 
@@ -117,6 +122,7 @@ def _middle_truncate_by_tokens(
             call_id=call_id,
             head_ratio=head_ratio,
             anchors=anchors,
+            anchors_available=anchors_available,
         )
 
     scaled_chars = int(len(text) * (max_tokens / total_tokens))
@@ -127,6 +133,7 @@ def _middle_truncate_by_tokens(
         call_id=call_id,
         head_ratio=head_ratio,
         anchors=anchors,
+        anchors_available=anchors_available,
     )
 
     for _ in range(4):
@@ -144,6 +151,7 @@ def _middle_truncate_by_tokens(
             call_id=call_id,
             head_ratio=head_ratio,
             anchors=anchors,
+            anchors_available=anchors_available,
         )
 
     return truncated, True
@@ -154,21 +162,26 @@ def _build_marker(
     call_id: str | None,
     *,
     anchors: Sequence[str] | None = None,
+    anchors_available: bool | None = None,
 ) -> str:
     parts = [f"\n\n... [middle truncated: {total_chars:,} chars total"]
     if call_id:
-        # Pick a concrete anchor example: prefer a real one if any were
-        # detected for this output, otherwise fall back to the generic
-        # "result:1" placeholder so the model still sees the call shape.
         anchor_names = [name for name in (anchors or []) if isinstance(name, str) and name.strip()]
-        example_anchor = anchor_names[0] if anchor_names else "result:1"
-        parts.append(
-            ", use "
-            f"list_tool_output_anchors(call_id='{call_id}'), "
-            f"read_tool_output_anchor(call_id='{call_id}', anchor='{example_anchor}'), "
-            f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword'), "
-            f"or read_tool_output(call_id='{call_id}')"
+        has_anchors = bool(anchor_names) or bool(anchors_available)
+        recovery_calls = []
+        if has_anchors:
+            recovery_calls.append(f"list_tool_output_anchors(call_id='{call_id}')")
+        if anchor_names:
+            recovery_calls.append(
+                f"read_tool_output_anchor(call_id='{call_id}', anchor='{anchor_names[0]}')"
+            )
+        recovery_calls.extend(
+            [
+                f"search_tool_output(call_id='{call_id}', pattern='error|timeout|keyword')",
+                f"read_tool_output(call_id='{call_id}')",
+            ]
         )
+        parts.append(", use " + ", ".join(recovery_calls))
         if anchor_names:
             preview = anchor_names[:_MAX_INLINE_ANCHORS]
             suffix = (

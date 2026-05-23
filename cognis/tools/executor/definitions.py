@@ -68,9 +68,11 @@ _EXECUTOR_SOURCE = ToolSource(type="executor")
 READ_TOOL = ToolDefinition(
     name="read",
     description=(
-        "Read a file or directory from the filesystem. Text files return line-numbered "
-        "content; offset and limit apply to text files only. Supported binary files are "
-        "routed through attachment analysis."
+        "Preferred tool for reading files and directories from the filesystem, especially "
+        "source files, configs, logs, and structured text. Use this instead of bash commands "
+        "such as cat, head, tail, sed -n, or ls for file/code inspection. Text files return "
+        "line-numbered content; offset and limit apply to text files only. Supported binary "
+        "files are routed through attachment analysis."
     ),
     parameters={
         "type": "object",
@@ -262,7 +264,10 @@ MULTIEDIT_TOOL = ToolDefinition(
 
 LIST_DIRECTORY_TOOL = ToolDefinition(
     name="list_directory",
-    description="List files and subdirectories in a directory.",
+    description=(
+        "Preferred tool for listing files and subdirectories in a directory. Use this instead "
+        "of bash ls when available."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -333,7 +338,10 @@ LSP_TOOL = ToolDefinition(
 
 GLOB_TOOL = ToolDefinition(
     name="glob",
-    description="Find files matching a glob pattern. Returns paths sorted by modification time.",
+    description=(
+        "Preferred tool for discovering files by name/path patterns. Use this instead of bash "
+        "commands such as find or ls when available. Returns paths sorted by modification time."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -353,7 +361,11 @@ GLOB_TOOL = ToolDefinition(
 
 GREP_TOOL = ToolDefinition(
     name="grep",
-    description="Search file contents using regex. Returns matching file paths and line numbers.",
+    description=(
+        "Preferred tool for searching file contents using regex. Use this instead of bash "
+        "commands such as grep or rg when available. Returns matching file paths and line "
+        "numbers."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -380,12 +392,16 @@ GREP_TOOL = ToolDefinition(
 BASH_TOOL = ToolDefinition(
     name="bash",
     description=(
-        "Execute a shell command and return its output. Use for terminal-native "
-        "operations such as git, build/test/package-manager commands, and atomic "
-        "filesystem operations like mv, cp, rm, and mkdir. Prefer dedicated file "
-        "tools for reading and editing file contents. Commands are parsed by the "
-        "shell, so quote literal paths containing spaces, parentheses, globs, $, "
-        "or other shell metacharacters."
+        "Execute a shell command and return its output. Use for shell-native operations: git, "
+        "build/test/package-manager commands, process management, permissions, background "
+        "processes, and atomic filesystem operations such as mv, cp, rm, mkdir, and chmod. Do "
+        "not use for routine file/code inspection when dedicated tools are visible: use read "
+        "instead of cat/head/tail/sed -n, grep instead of grep/rg, glob instead of find, and "
+        "list_directory instead of ls. Commands are parsed by the shell, so quote literal paths "
+        "containing spaces, parentheses, globs, $, or other shell metacharacters. For background "
+        "commands, provide a concise description so completion follow-ups and per-turn reminders "
+        "identify the job; running jobs are summarized in prompt reminders and completion triggers "
+        "a follow-up turn."
     ),
     parameters={
         "type": "object",
@@ -396,7 +412,11 @@ BASH_TOOL = ToolDefinition(
             },
             "description": {
                 "type": "string",
-                "description": "Brief description of what this command does",
+                "description": (
+                    "Brief description of what this command does and why shell execution is "
+                    "needed instead of a dedicated tool. For background commands this is used "
+                    "as the human-readable job identifier in reminders and completion follow-ups."
+                ),
             },
             "timeout": {
                 "type": "integer",
@@ -412,7 +432,7 @@ BASH_TOOL = ToolDefinition(
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "Start the command in the background and return a shell_id for later polling. Background commands continue until completion, bash_kill, or executor cleanup.",
+                "description": "Start the command in the background and return a shell_id for later inspection. Background commands continue until completion, bash_kill, or executor cleanup. While running, brief status is injected on later turns; when the command completes, the conversation receives a follow-up event.",
             },
         },
         "required": ["command"],
@@ -426,7 +446,7 @@ BASH_TOOL = ToolDefinition(
 
 BASH_OUTPUT_TOOL = ToolDefinition(
     name="bash_output",
-    description="Read new output from a background bash session created with bash(run_in_background=true).",
+    description="Read new output from a background bash session created with bash(run_in_background=true). Use the shell_id from the start result, reminder, or completion follow-up. If the job is on a non-active executor, include target_executor when available.",
     parameters={
         "type": "object",
         "properties": {
@@ -446,7 +466,7 @@ BASH_OUTPUT_TOOL = ToolDefinition(
 
 BASH_KILL_TOOL = ToolDefinition(
     name="bash_kill",
-    description="Stop a background bash session created with bash(run_in_background=true).",
+    description="Stop a background bash session created with bash(run_in_background=true). If the job is on a non-active executor, include target_executor when available.",
     parameters={
         "type": "object",
         "properties": {

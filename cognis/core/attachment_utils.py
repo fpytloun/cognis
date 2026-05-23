@@ -59,13 +59,43 @@ def normalize_attachment_ref(attachment: dict[str, Any]) -> dict[str, Any] | Non
     return normalized
 
 
+def attachment_ref_to_dict(
+    attachment: dict[str, Any] | Any,
+    *,
+    include_url: bool = True,
+) -> dict[str, Any] | None:
+    """Return a canonical attachment dict from either a model or a raw dict."""
+
+    if isinstance(attachment, dict):
+        raw = attachment
+    elif hasattr(attachment, "model_dump"):
+        exclude = None if include_url else {"url"}
+        raw = attachment.model_dump(mode="json", exclude=exclude)
+    else:
+        return None
+    if not include_url:
+        raw = {key: value for key, value in raw.items() if key != "url"}
+    return normalize_attachment_ref(raw)
+
+
+def attachment_refs_to_dicts(
+    attachments: Iterable[dict[str, Any] | Any],
+    *,
+    include_url: bool = True,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for attachment in attachments:
+        item = attachment_ref_to_dict(attachment, include_url=include_url)
+        if item is not None:
+            normalized.append(item)
+    return normalized
+
+
 def normalize_attachment_refs(attachments: Iterable[dict[str, Any] | Any]) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        item = normalize_attachment_ref(attachment)
+        item = attachment_ref_to_dict(attachment)
         if item is None:
             continue
         dedupe_key = (
@@ -85,13 +115,7 @@ def strip_attachment_payload_bytes(
 ) -> list[dict[str, Any]]:
     safe: list[dict[str, Any]] = []
     for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        normalized = normalize_attachment_ref(
-            {
-                **{k: v for k, v in attachment.items() if k in _CANONICAL_ATTACHMENT_KEYS},
-            }
-        )
+        normalized = attachment_ref_to_dict(attachment)
         if normalized is not None and {
             "kind",
             "mime_type",

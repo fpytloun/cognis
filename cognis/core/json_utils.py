@@ -72,6 +72,24 @@ def extract_text_from_response(response: dict[str, Any]) -> str:
     return content
 
 
+def extract_visible_text_from_response(response: dict[str, Any]) -> str:
+    """Extract assistant-visible text without promoting reasoning fields.
+
+    Some providers expose extended thinking in ``reasoning`` or
+    ``reasoning_content`` while leaving ``message.content`` empty.  That
+    reasoning is useful for structured internal calls, but it must never be
+    treated as user-facing assistant text.
+    """
+
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    return _extract_text_payload(message.get("content"), serialize_objects=False)
+
+
 def _extract_text_payload(value: Any, *, serialize_objects: bool) -> str:
     if value is None:
         return ""

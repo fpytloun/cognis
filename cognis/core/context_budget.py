@@ -14,6 +14,7 @@ class ContextBudget:
     """Resolved prompt budget for one model/context window."""
 
     max_context_tokens: int
+    max_input_tokens: int
     reserve_output_tokens: int
     effective_reserve_output_tokens: int
     available_prompt_tokens: int
@@ -36,6 +37,7 @@ def requested_output_tokens(
 def resolve_context_budget(
     *,
     max_context_tokens: int,
+    max_input_tokens: int | None = None,
     agent_max_tokens: int | None,
     model_max_output_tokens: int | None,
 ) -> ContextBudget:
@@ -47,6 +49,7 @@ def resolve_context_budget(
     """
 
     max_context_tokens = max(0, int(max_context_tokens or 0))
+    max_input_tokens = max(0, int(max_input_tokens or 0))
     reserve_output_tokens = requested_output_tokens(agent_max_tokens, model_max_output_tokens)
     effective_reserve_output_tokens = reserve_output_tokens
     reserve_clamped = False
@@ -59,9 +62,13 @@ def resolve_context_budget(
             effective_reserve_output_tokens = max(1, max_context_tokens // 4)
         reserve_clamped = effective_reserve_output_tokens != reserve_output_tokens
 
-    available_prompt_tokens = max(0, max_context_tokens - effective_reserve_output_tokens)
+    total_prompt_tokens = max(0, max_context_tokens - effective_reserve_output_tokens)
+    available_prompt_tokens = total_prompt_tokens
+    if max_input_tokens > 0:
+        available_prompt_tokens = min(max_input_tokens, total_prompt_tokens)
     return ContextBudget(
         max_context_tokens=max_context_tokens,
+        max_input_tokens=max_input_tokens,
         reserve_output_tokens=reserve_output_tokens,
         effective_reserve_output_tokens=effective_reserve_output_tokens,
         available_prompt_tokens=available_prompt_tokens,

@@ -1,0 +1,119 @@
+"""Event-to-text formatting helpers for compaction prompts."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from cognis.core.attachment_utils import merge_content_and_attachment_note
+
+_TOOL_CALL_ARGUMENT_MAX_CHARS = 1_000
+_TOOL_RESULT_MAX_CHARS = 2_000
+
+
+def format_events_for_compaction(events: list[Any]) -> str:
+    """Render a list of session events as a compact text block for the LLM."""
+    lines: list[str] = []
+    for event in events:
+        etype = event.type
+        data = event.data
+
+        if etype in ("user_message", "assistant_message"):
+            payload = merge_content_and_attachment_note(
+                str(data.get("content", "")),
+                [a for a in data.get("attachments", []) if isinstance(a, dict)],
+            )
+        elif etype == "tool_call":
+            name = data.get("name", "unknown")
+            args = data.get("arguments", "")
+            args_text = _stringify(args)
+            args_text = _truncate(args_text, _TOOL_CALL_ARGUMENT_MAX_CHARS)
+            metadata = _tool_event_metadata(data)
+            payload = f"{name}{metadata} args={args_text}"
+        elif etype == "tool_result":
+            name = data.get("name", "")
+            result = data.get("result") or data.get("output", "")
+            is_error = data.get("is_error", False)
+            prefix = f"[ERROR] {name}" if is_error else str(name)
+            recovery_hint = tool_result_recovery_hint(data)
+            result_text = _truncate(
+                _stringify(result),
+                _TOOL_RESULT_MAX_CHARS,
+                recovery_hint=recovery_hint,
+            )
+            payload = f"{prefix}{_tool_event_metadata(data)}: {result_text}"
+        elif etype == "delegation":
+            status = data.get("status", "")
+            mode = data.get("mode", "")
+            summary = data.get("result_summary", "")
+            payload = f"[{mode}/{status}] {summary}"
+        else:
+            content = data.get("content")
+            payload = content if isinstance(content, str) else str(data)
+
+        lines.append(f"[{event.seq}] {etype}: {payload}")
+    return "\n".join(lines)
+
+
+def _stringify(value: Any) -> str:
+    """Return a stable text representation for compaction prompts."""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _truncate(
+    text: str,
+    max_chars: int,
+    *,
+    recovery_hint: str | None = None,
+) -> str:
+    """Truncate text for compaction while preserving recovery instructions."""
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = f"[truncated for compaction: omitted {omitted:,} chars"
+    if recovery_hint:
+        marker += f"; {recovery_hint}"
+    marker += "]"
+    return text[:max_chars].rstrip() + "\n" + marker
+
+
+def _tool_event_metadata(data: dict[str, Any]) -> str:
+    """Return compact tool metadata that helps summaries retain recovery handles."""
+    fields: list[str] = []
+    for key in ("call_id", "recovery_call_id", "source_call_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            fields.append(f"{key}={value!r}")
+    output_size = data.get("output_size")
+    if isinstance(output_size, int) and output_size > 0:
+        fields.append(f"output_size={output_size}")
+    if data.get("has_full_output") is True:
+        fields.append("has_full_output=true")
+    if data.get("agent_visible") is True:
+        fields.append("agent_visible=true")
+    if data.get("agent_visible_truncated") is True:
+        fields.append("agent_visible_truncated=true")
+    artifact_id = data.get("tool_output_artifact_id")
+    if isinstance(artifact_id, str) and artifact_id.strip():
+        fields.append(f"tool_output_artifact_id={artifact_id!r}")
+    return "" if not fields else " " + " ".join(fields)
+
+
+def tool_result_recovery_hint(data: dict[str, Any]) -> str | None:
+    """Return concrete recovery calls for a saved tool result, if available."""
+    recovery_call_id = data.get("recovery_call_id")
+    call_id = recovery_call_id
+    if not isinstance(call_id, str) or not call_id.strip():
+        call_id = data.get("call_id") if data.get("has_full_output") is True else None
+    if not isinstance(call_id, str) or not call_id.strip():
+        return None
+    quoted = repr(call_id)
+    return (
+        f"recover with read_tool_output(call_id={quoted}) or "
+        f"search_tool_output(call_id={quoted}, pattern='keyword')"
+    )

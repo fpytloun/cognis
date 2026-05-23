@@ -8,7 +8,14 @@ from typing import Any
 
 import pytest
 
-from cognis.core.agent_loop import CHAT_POLICY, AgentLoop, PauseWaiter, SessionLock, StepContext
+from cognis.core.agent_loop import (
+    CHAT_POLICY,
+    AgentLoop,
+    CompactionRunContext,
+    PauseWaiter,
+    SessionLock,
+    StepContext,
+)
 from cognis.core.compaction import CompactionResult
 from cognis.core.events import Event, EventBus
 from cognis.core.session_cache import CachedEvent, CachedSessionState
@@ -40,14 +47,44 @@ class _FakeCompactionStrategy:
         )
         self._fail = fail
         self._slow = slow
+        self.fallback_calls: list[tuple[str, str]] = []
 
-    async def compact(self, session: SessionModel, *, trigger: str = "manual") -> CompactionResult:
+    async def compact(
+        self,
+        session: SessionModel,
+        *,
+        trigger: str = "manual",
+        model_context: object | None = None,
+    ) -> CompactionResult:
+        del model_context
         self.calls.append((session.session_id, trigger))
         if self._slow:
             await asyncio.sleep(self._slow)
         if self._fail:
             raise RuntimeError("compaction failed")
         return self._result
+
+    async def compact_with_fallback(
+        self,
+        session: SessionModel,
+        *,
+        trigger: str = "manual",
+        model_context: object | None = None,
+    ) -> CompactionResult:
+        del model_context
+        self.fallback_calls.append((session.session_id, trigger))
+        return CompactionResult(
+            compacted=True,
+            method="mechanical",
+            summary="Mechanical fallback summary",
+            compaction_seq=20,
+            turns_compacted=5,
+        )
+
+
+class _FakeGuardrails:
+    async def record_events(self, *, session_id: str, events: list, **_: Any) -> Any:
+        return type("AppendResult", (), {"ok": True, "first_seq": 1, "last_seq": len(events)})()
 
 
 class _FakeSessionManager:
@@ -63,7 +100,9 @@ class _FakeSessionManager:
         intention: str,
         completion_reason: str = "compacted",
         compaction_summary: str | None = None,
+        tail_events: list[Any] | None = None,
     ) -> SessionModel:
+        del compaction_summary, tail_events
         self.rotations.append(
             {
                 "conversation_id": conversation_id,
@@ -182,7 +221,7 @@ def _minimal_agent_loop(
 ) -> AgentLoop:
     """Create an AgentLoop with only the fields needed for _auto_compact."""
     loop = AgentLoop(
-        providers=type("P", (), {"llm": None, "guardrails": None})(),
+        providers=type("P", (), {"llm": None, "guardrails": _FakeGuardrails()})(),
         session_manager=session_manager or _FakeSessionManager(),
         session_cache=session_cache or _FakeSessionCache(),
         context_assembler=None,
@@ -232,7 +271,9 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     )
 
     ctx = _step_context()
-    await loop._auto_compact(ctx)
+    result = await loop._auto_compact(ctx)
+    assert result is not None
+    await loop._rotate_after_compaction(ctx, result, trigger="automatic")
 
     # Compaction was called with trigger="automatic"
     assert len(compaction.calls) == 1
@@ -243,12 +284,12 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     assert session_mgr.rotations[0]["old_session_id"] == "session-1"
     assert session_mgr.rotations[0]["completion_reason"] == "compacted"
 
-    # Cache was pre-populated for new session
-    assert len(cache.compactions) == 1
-    assert cache.compactions[0][0] == "new-session-1"
-    assert "Auto-compaction summary" in cache.compactions[0][1]
+    # Cache was refreshed for the new session; the durable summary event is
+    # recorded by SessionManager during rotation.
+    assert cache.refreshed == ["new-session-1"]
+    assert cache.compactions == []
 
-    # Event was published
+    # Event was published by rotation.
     assert len(published) == 1
     assert published[0].type.value == "session_compacted"
     assert published[0].data["previous_session_id"] == "session-1"
@@ -264,9 +305,10 @@ async def test_auto_compact_skips_when_few_events() -> None:
 
     loop = _minimal_agent_loop(compaction=compaction, session_cache=cache)
     ctx = _step_context()
-    await loop._auto_compact(ctx)
+    result = await loop._auto_compact(ctx)
 
     # Compaction should not be called
+    assert result is None
     assert len(compaction.calls) == 0
 
 
@@ -285,15 +327,22 @@ async def test_auto_compact_skips_when_noop() -> None:
         session_cache=cache,
     )
     ctx = _step_context()
-    await loop._auto_compact(ctx)
+    result = await loop._auto_compact(ctx)
 
+    assert result is not None
+    assert result.compacted is False
     assert len(compaction.calls) == 1
     assert len(session_mgr.rotations) == 0
 
 
 @pytest.mark.asyncio
-async def test_auto_compact_compaction_failure_is_graceful() -> None:
-    """Compaction failure should not raise — just log and return."""
+async def test_auto_compact_compaction_failure_returns_none() -> None:
+    """Compaction failure should return None.
+
+    compact() now handles its own retry and mechanical fallback internally.
+    When compact() raises, _auto_compact surfaces the failure cleanly by
+    returning None rather than attempting a second fallback call.
+    """
     compaction = _FakeCompactionStrategy(fail=True)
     session_mgr = _FakeSessionManager()
     cache = _FakeSessionCache(entry=_cache_entry_with_events(5))
@@ -305,10 +354,12 @@ async def test_auto_compact_compaction_failure_is_graceful() -> None:
     )
     ctx = _step_context()
 
-    # Should not raise
-    await loop._auto_compact(ctx)
+    # Should not raise; compact() already handled its own fallback internally.
+    result = await loop._auto_compact(ctx)
 
+    assert result is None
     assert len(compaction.calls) == 1
+    # No rotation attempted when compaction failed.
     assert len(session_mgr.rotations) == 0
 
 
@@ -327,9 +378,12 @@ async def test_auto_compact_rotation_failure_is_graceful() -> None:
     ctx = _step_context()
 
     # Should not raise
-    await loop._auto_compact(ctx)
+    result = await loop._auto_compact(ctx)
+    assert result is not None
+    rotated = await loop._rotate_after_compaction(ctx, result, trigger="automatic")
 
     assert len(compaction.calls) == 1
+    assert rotated is None
     assert len(session_mgr.rotations) == 1
     assert len(cache.compactions) == 0  # Cache not populated after rotation failure
 
@@ -340,8 +394,16 @@ async def test_auto_compact_timeout_is_graceful() -> None:
     compaction = _FakeCompactionStrategy(slow=20.0)  # > AUTO_COMPACTION_TIMEOUT_SECONDS
     cache = _FakeSessionCache(entry=_cache_entry_with_events(5))
 
-    loop = _minimal_agent_loop(compaction=compaction, session_cache=cache)
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(event: Event) -> None:
+        published.append(event)
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(compaction=compaction, session_cache=cache, event_bus=bus)
     ctx = _step_context()
+    run = CompactionRunContext(trigger="automatic", reason="test_timeout")
 
     # Monkey-patch timeout to be very short for test speed
     import cognis.core.agent_loop as agent_loop_mod
@@ -349,12 +411,18 @@ async def test_auto_compact_timeout_is_graceful() -> None:
     original_timeout = agent_loop_mod.AUTO_COMPACTION_TIMEOUT_SECONDS
     agent_loop_mod.AUTO_COMPACTION_TIMEOUT_SECONDS = 0.05
     try:
-        await loop._auto_compact(ctx)
+        result = await loop._auto_compact(ctx, run=run)
     finally:
         agent_loop_mod.AUTO_COMPACTION_TIMEOUT_SECONDS = original_timeout
 
-    # Compaction was attempted but timed out — no rotation
+    # Compaction was attempted, timed out, then used fallback.
+    assert result is not None
+    # The fake strategy returns "mechanical"; real strategy returns "mechanical_sliding_window".
+    assert result.method in ("mechanical", "mechanical_sliding_window")
+    assert run.used_timeout_fallback is True
     assert len(compaction.calls) == 1
+    assert compaction.fallback_calls == [("session-1", "automatic_timeout_fallback")]
+    assert any(event.type.value == "system_notice" for event in published)
 
 
 @pytest.mark.asyncio
@@ -370,7 +438,9 @@ async def test_auto_compact_no_cache_entry_runs_normally() -> None:
         session_cache=cache,
     )
     ctx = _step_context()
-    await loop._auto_compact(ctx)
+    result = await loop._auto_compact(ctx)
+    assert result is not None
+    await loop._rotate_after_compaction(ctx, result, trigger="automatic")
 
     # Should still run compaction (no early-exit)
     assert len(compaction.calls) == 1

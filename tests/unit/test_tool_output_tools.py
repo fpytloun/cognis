@@ -79,6 +79,46 @@ async def test_read_tool_output_anchor_returns_only_requested_section(
 
 
 @pytest.mark.asyncio
+async def test_delegate_assistant_message_anchors_can_be_listed_and_read(
+    store: ToolOutputStore,
+) -> None:
+    content = "[assistant_message:1]\nFull report\n\n---\n\n[assistant_message:2]\nCleanup"
+    anchors = [
+        {
+            "anchor": "assistant_message:1",
+            "label": "Assistant message 1",
+            "kind": "assistant_message",
+            "start_line": 1,
+            "end_line": 2,
+        },
+        {
+            "anchor": "assistant_message:2",
+            "label": "Assistant message 2",
+            "kind": "assistant_message",
+            "start_line": 6,
+            "end_line": 7,
+        },
+    ]
+    await store.save("delegate_call", content, anchors=anchors)
+
+    listed = await handle_tool_output_tool(
+        "list_tool_output_anchors", {"call_id": "delegate_call"}, store
+    )
+    assert not listed.is_error
+    assert "assistant_message:1" in listed.output
+    assert "assistant_message" in listed.output
+
+    section = await handle_tool_output_tool(
+        "read_tool_output_anchor",
+        {"call_id": "delegate_call", "anchor": "assistant_message:1"},
+        store,
+    )
+    assert not section.is_error
+    assert "Full report" in section.output
+    assert "Cleanup" not in section.output
+
+
+@pytest.mark.asyncio
 async def test_read_tool_output_anchor_reports_available_anchors(store: ToolOutputStore) -> None:
     await store.save(
         "call_3",

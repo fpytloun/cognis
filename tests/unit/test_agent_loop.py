@@ -11,12 +11,14 @@ from typing import Any
 import pytest
 
 from cognis.core.agent_loop import (
+    _DELEGATION_RESULT_MAX_CHARS,
     CHAT_POLICY,
     DELEGATION_POLICY,
     SECONDARY_AGENT_DELEGATION_POLICY,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
+    LLMStreamIdleStats,
     PauseResolution,
     PauseWaiter,
     PendingPause,
@@ -24,14 +26,22 @@ from cognis.core.agent_loop import (
     SessionLock,
     StepContext,
     StreamAccumulator,
+    _append_tool_result_event,
     _bounded_tool_arguments,
+    _build_delegation_message_result,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
     _iterate_llm_stream_with_idle_timeout,
     _PreparedRegularToolCall,
+    _result_sections_from_content,
+    _should_auto_continue_after_mid_stream_failure,
+    _should_run_pre_turn_auto_compaction,
     _validate_step_completion_notification,
 )
+from cognis.core.context_projection import ProjectionPolicy, ProjectionResult, ProjectionTurnState
+from cognis.core.events import EventType
 from cognis.core.project_context import ProjectContextEntry
+from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
 from cognis.models.agent import AgentDefinition, AgentPermissions
@@ -54,7 +64,10 @@ from cognis.models.workflow import (
     StepOutput,
     WorkflowState,
 )
+from cognis.providers.llm.errors import ToolArgumentParseFailure
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
+from cognis.providers.llm.retry import LLMContextOverflowError
+from cognis.runtime_context import scoped_runtime_context
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -86,6 +99,67 @@ async def test_llm_stream_idle_timeout_resets_on_meaningful_activity() -> None:
     ]
 
     assert len(chunks) == 4
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_idle_timeout_tracks_provider_liveness_without_activity() -> None:
+    async def _stream():
+        await asyncio.sleep(0)
+        yield {"provider_event": "responses", "provider_event_type": "response.created"}
+        await asyncio.sleep(0.02)
+        yield {"provider_event": "responses", "provider_event_type": "response.in_progress"}
+
+    stats = LLMStreamIdleStats()
+    chunks = [
+        chunk
+        async for chunk in _iterate_llm_stream_with_idle_timeout(
+            _stream(),
+            idle_timeout_seconds=1,
+            stats=stats,
+        )
+    ]
+
+    assert len(chunks) == 2
+    assert stats.raw_chunks == 2
+    assert stats.meaningful_chunks == 0
+    assert stats.timeout_phase == "activity"
+
+
+def test_idle_timeout_failure_can_start_auto_continuation() -> None:
+    assert _should_auto_continue_after_mid_stream_failure(
+        "LLM stream produced no meaningful activity for 90s"
+    )
+    assert _should_auto_continue_after_mid_stream_failure(
+        "LLM stream produced provider reasoning events but no meaningful output for 270s"
+    )
+    assert _should_auto_continue_after_mid_stream_failure("Provider disconnected while streaming")
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_idle_timeout_uses_reasoning_phase() -> None:
+    async def _stream():
+        await asyncio.sleep(0)
+        yield {
+            "provider_event": "responses",
+            "provider_event_type": "response.reasoning_summary_part.added",
+            "choices": [{"delta": {"reasoning_part_boundary": {"part_index": 0}}}],
+        }
+
+    stats = LLMStreamIdleStats()
+    chunks = [
+        chunk
+        async for chunk in _iterate_llm_stream_with_idle_timeout(
+            _stream(),
+            idle_timeout_seconds=1,
+            stats=stats,
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert stats.raw_chunks == 1
+    assert stats.reasoning_chunks == 1
+    assert stats.meaningful_chunks == 0
+    assert stats.timeout_phase == "reasoning"
 
 
 def test_stream_accumulator_collects_tool_calls() -> None:
@@ -132,6 +206,34 @@ def test_stream_accumulator_collects_tool_calls() -> None:
     assert tool_calls[0].name == "step_complete"
     assert tool_calls[0].arguments == {"summary": "done"}
     assert tool_calls[0].call_id == "call_123"
+
+
+def test_stream_accumulator_rejects_unparseable_tool_arguments() -> None:
+    acc = StreamAccumulator()
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_bad",
+                                "function": {"name": "write_file", "arguments": '{"path": "x"'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    tool_calls = acc.get_tool_calls()
+
+    assert len(tool_calls) == 1
+    assert isinstance(tool_calls[0], ToolArgumentParseFailure)
+    assert tool_calls[0].name == "write_file"
+    assert tool_calls[0].call_id == "call_bad"
 
 
 def test_stream_accumulator_handles_multiple_tool_calls() -> None:
@@ -249,7 +351,7 @@ def test_bounded_tool_arguments_remain_json_safe() -> None:
     assert bounded["_truncated"] is True
     assert bounded["_original_size"] > 20_000
     assert isinstance(json.dumps(bounded), str)
-    assert "... (truncated," in str(bounded["_preview"])
+    assert "..." in str(bounded["_preview"])
 
 
 def test_stream_accumulator_collects_usage() -> None:
@@ -356,6 +458,54 @@ async def test_run_step_prefers_agent_timeout_override(monkeypatch: pytest.Monke
 
     assert output is not None
     assert captured["timeout"] == 42
+
+
+@pytest.mark.asyncio
+async def test_run_step_continues_once_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    async def _fake_wait_for(awaitable: object, timeout: float) -> StepOutput:
+        nonlocal calls
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        calls += 1
+        if calls == 1:
+            raise TimeoutError
+        return StepOutput(summary="continued")
+
+    monkeypatch.setattr("cognis.core.agent_loop.asyncio.wait_for", _fake_wait_for)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_step_timeout_seconds=3600,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.summary == "continued"
+    assert calls == 2
+    assert ctx.timeout_continuation_count == 1
+    assert "verify that your current work is still aligned" in (
+        ctx.timeout_continuation_message or ""
+    )
 
 
 def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
@@ -1159,6 +1309,38 @@ def test_filter_model_inventory_tools_excludes_controller_and_denied_tools() -> 
     assert [tool.name for tool in filtered] == ["read"]
 
 
+def test_filter_model_inventory_tools_keeps_write_tools_visible_for_plan_mode() -> None:
+    agent = AgentDefinition(
+        agent_id="agent-a",
+        owner_email="user@example.com",
+        name="Agent A",
+        tools={},
+        permissions=AgentPermissions(tool_permissions={"*": Permission.EVALUATE}),
+    )
+    tools = [
+        ToolDefinition(
+            name="write",
+            description="write file",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="executor"),
+            category="filesystem",
+            read_only=False,
+        ),
+        ToolDefinition(
+            name="read",
+            description="read file",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="executor"),
+            category="filesystem",
+            read_only=True,
+        ),
+    ]
+
+    filtered = _filter_model_inventory_tools(agent, tools)
+
+    assert [tool.name for tool in filtered] == ["write", "read"]
+
+
 def test_controller_builtin_enabled_honors_disabled_tools() -> None:
     agent = AgentDefinition(
         agent_id="agent-a",
@@ -1278,6 +1460,254 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_child_session_ignores_implicit_runtime_workdir() -> None:
+    captured_contexts: list[object] = []
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del agent, user_email, executor_agent
+
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _SessionManager:
+        def session_factory(self) -> _SessionContextManager:
+            return _SessionContextManager()
+
+    class _Guardrails:
+        async def record_events(self, **_: object) -> None:
+            return None
+
+    class _EventBus:
+        async def publish(self, _: object) -> None:
+            return None
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_SessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
+        captured_contexts.append(ctx)
+        return StepOutput(summary="done", content="done", outputs={}, claims=[])
+
+    async def _fake_set_session_status(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+    monkeypatch.setattr("cognis.store.queries.set_session_status", _fake_set_session_status)
+    try:
+        with scoped_runtime_context(
+            workspace_root="/home/user/src/codex",
+            effective_working_directory="/home/user/src/codex/codex-rs/protocol/src",
+        ):
+            output = await agent_loop._run_child_session(
+                child_session=SimpleNamespace(
+                    session_id="child",
+                    user_email="user@example.com",
+                    agent_id="agent-a",
+                    intaris_session_id="child",
+                ),
+                conversation=SimpleNamespace(conversation_id="conv-1"),
+                agent=AgentDefinition(
+                    agent_id="agent-a",
+                    owner_email="user@example.com",
+                    name="Agent A",
+                ),
+                task_description="Do the thing",
+                parent_intaris_session_id="parent-intaris",
+            )
+    finally:
+        monkeypatch.undo()
+
+    assert output is not None
+    assert captured_contexts[0].workspace_root is None
+    assert captured_contexts[0].working_directory is None
+
+
+@pytest.mark.asyncio
+async def test_run_child_session_uses_explicit_runtime_workdir() -> None:
+    captured_contexts: list[object] = []
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del agent, user_email, executor_agent
+
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _SessionManager:
+        def session_factory(self) -> _SessionContextManager:
+            return _SessionContextManager()
+
+    class _Guardrails:
+        async def record_events(self, **_: object) -> None:
+            return None
+
+    class _EventBus:
+        async def publish(self, _: object) -> None:
+            return None
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_SessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> StepOutput:
+        captured_contexts.append(ctx)
+        return StepOutput(summary="done", content="done", outputs={}, claims=[])
+
+    async def _fake_set_session_status(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+    monkeypatch.setattr("cognis.store.queries.set_session_status", _fake_set_session_status)
+    try:
+        output = await agent_loop._run_child_session(
+            child_session=SimpleNamespace(
+                session_id="child",
+                user_email="user@example.com",
+                agent_id="agent-a",
+                intaris_session_id="child",
+            ),
+            conversation=SimpleNamespace(conversation_id="conv-1"),
+            agent=AgentDefinition(
+                agent_id="agent-a",
+                owner_email="user@example.com",
+                name="Agent A",
+            ),
+            task_description="Do the thing",
+            parent_intaris_session_id="parent-intaris",
+            workspace_root="/home/user/src/cognis",
+            working_directory="/home/user/src/cognis/cognis/core",
+            workspace_root_explicit=True,
+            working_directory_explicit=True,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert output is not None
+    assert captured_contexts[0].workspace_root == "/home/user/src/cognis"
+    assert captured_contexts[0].working_directory == "/home/user/src/cognis/cognis/core"
+    assert captured_contexts[0].workspace_root_explicit is True
+    assert captured_contexts[0].working_directory_explicit is True
+
+
+@pytest.mark.asyncio
+async def test_run_child_session_async_preserves_explicit_workspace_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+    published_events: list[object] = []
+
+    class _EventBus:
+        async def publish(self, event: object) -> None:
+            published_events.append(event)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    async def _fake_run_child_session(**kwargs: object) -> StepOutput:
+        captured_kwargs.update(kwargs)
+        return StepOutput(summary="done", content="done", outputs={}, claims=[])
+
+    async def _fake_untrack_child(parent_session_id: str, child_session_id: str) -> None:
+        captured_kwargs["untracked"] = (parent_session_id, child_session_id)
+
+    monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
+    monkeypatch.setattr(agent_loop, "_untrack_child", _fake_untrack_child)
+
+    await agent_loop._run_child_session_async(
+        child_session=SimpleNamespace(
+            session_id="child",
+            parent_session_id="parent",
+            user_email="user@example.com",
+            agent_id="agent-a",
+            intaris_session_id="child",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-a",
+            owner_email="user@example.com",
+            name="Agent A",
+        ),
+        task_description="Do the thing",
+        parent_intaris_session_id="parent-intaris",
+        workspace_root="/home/user/src/cognis",
+        working_directory="/home/user/src/cognis/cognis/core",
+        workspace_root_explicit=True,
+        working_directory_explicit=True,
+    )
+
+    assert captured_kwargs["workspace_root"] == "/home/user/src/cognis"
+    assert captured_kwargs["working_directory"] == "/home/user/src/cognis/cognis/core"
+    assert captured_kwargs["workspace_root_explicit"] is True
+    assert captured_kwargs["working_directory_explicit"] is True
+    assert captured_kwargs["untracked"] == ("parent", "child")
+    assert published_events
+
+
+@pytest.mark.asyncio
 async def test_run_child_session_returns_selected_assistant_output_without_deliverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1374,8 +1804,10 @@ async def test_run_child_session_returns_selected_assistant_output_without_deliv
 
     assert output is not None
     assert output.deliverable_id is None
-    assert output.content == substantive
-    assert output.summary == substantive[:500]
+    assert substantive in output.content
+    assert stale_tail in output.content
+    assert output.content.index(substantive) < output.content.index(stale_tail)
+    assert substantive in output.summary
 
 
 @pytest.mark.asyncio
@@ -1469,12 +1901,162 @@ async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch
 
     assert output is None
     assert completed == []
-    assert failed == [("child", "Delegation failed")]
-    assert len(published) == 1
+    assert failed == [
+        (
+            "child",
+            "Delegation failed: RuntimeError: Delegation step failed: IntegrityError: duplicate key",
+        )
+    ]
+    assert len(published) == 2
+    assert getattr(published[0], "type", None) == EventType.SYSTEM_NOTICE
+    assert getattr(published[0], "data", {}).get("child_session_id") == "child"
     assert any(
         getattr(event, "type", None) == "delegation"
         and getattr(event, "data", {}).get("status") == "failed"
         for event in recorded_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed: list[tuple[str, str | None, str | None]] = []
+    failed: list[str] = []
+    published: list[object] = []
+    recorded_events: list[object] = []
+
+    async def _runtime_factory(
+        *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
+    ) -> ResolvedStepRuntime:
+        del agent, user_email, executor_agent
+
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="child-registry",
+            executor_connection="child-executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _SessionManager:
+        def session_factory(self) -> _SessionContextManager:
+            return _SessionContextManager()
+
+        async def mark_completed(
+            self,
+            session_id: str,
+            *,
+            result_summary: str | None = None,
+            result_content: str | None = None,
+        ) -> None:
+            completed.append((session_id, result_summary, result_content))
+
+        async def mark_failed(self, session_id: str, **_: object) -> None:
+            failed.append(session_id)
+
+    class _Guardrails:
+        async def record_events(self, **kwargs: object) -> None:
+            recorded_events.extend(kwargs.get("events", []))
+
+        async def read_events(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "tool_call",
+                        "data": {
+                            "name": "grep",
+                            "call_id": "call_saved",
+                            "arguments": {"pattern": "retry"},
+                        },
+                    },
+                    {
+                        "seq": 2,
+                        "type": "tool_result",
+                        "data": {
+                            "name": "grep",
+                            "call_id": "call_saved",
+                            "is_error": False,
+                            "result": "cognis/core/agent_loop.py:3144: no step output",
+                            "has_full_output": True,
+                            "recovery_call_id": "call_saved",
+                        },
+                    },
+                ],
+                last_seq=2,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    class _EventBus:
+        async def publish(self, event: object) -> None:
+            published.append(event)
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        session_manager=_SessionManager(),
+        session_cache=SimpleNamespace(),
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=_EventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    async def _fake_run_step(ctx: object, **_: object) -> None:
+        del ctx
+        return None
+
+    monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
+
+    output = await agent_loop._run_child_session(
+        child_session=SimpleNamespace(
+            session_id="child",
+            user_email="user@example.com",
+            agent_id="system:explore",
+            intaris_session_id="child-intaris",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            is_system=True,
+        ),
+        task_description="Investigate retry handling",
+        parent_intaris_session_id="parent-intaris",
+    )
+
+    assert output is not None
+    assert output.outputs["recovered_from_saved_tool_results"] is True
+    assert "Partial delegated result recovered from saved tool outputs" in output.content
+    assert "cognis/core/agent_loop.py:3144: no step output" in output.content
+    assert "read_tool_output(call_id='call_saved')" in output.content
+    assert completed and completed[0][0] == "child"
+    assert completed[0][2] and "call_saved" in completed[0][2]
+    assert failed == []
+    assert any(
+        getattr(event, "type", None) == "delegation"
+        and getattr(event, "data", {}).get("status") == "completed"
+        and getattr(event, "data", {}).get("result_source") == "saved_tool_results"
+        for event in recorded_events
+    )
+    assert any(
+        getattr(event, "type", None) == EventType.DELEGATION_COMPLETED for event in published
     )
 
 
@@ -1503,14 +2085,23 @@ class _FakeReminderLLM:
     def count_tokens(self, text: str, model: str | None = None) -> int:
         return len(text)
 
-    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
         del model
         return _test_model_info()
 
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         self.calls.append([dict(message) for message in messages])
         if len(self.calls) >= 2:
-            raise _ReminderStop()
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "Captured reminder.",
+                        }
+                    }
+                ]
+            }
+            return
         if False:
             yield {}
         return
@@ -1524,7 +2115,7 @@ class _EmptyThenTextDirectLLM:
         del model
         return len(text)
 
-    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
         del model
         return _test_model_info()
 
@@ -1556,24 +2147,164 @@ class _AlwaysEmptyDirectLLM:
         return
 
 
-class _FakeContextAssembler:
+class _TodoCleanupOnlyDirectLLM:
     def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            if False:
+                yield {}
+            return
+        if len(self.calls) == 2:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_todos_done",
+                                    "function": {
+                                        "name": "step_todo_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "todos": [
+                                                    {
+                                                        "content": "keep working",
+                                                        "status": "completed",
+                                                    }
+                                                ]
+                                            }
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        if False:
+            yield {}
+        return
+
+
+class _SilentThenRecoveredDirectLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            while True:
+                await asyncio.sleep(60)
+                yield {"choices": []}
+        yield {"choices": [{"delta": {"content": "Recovered after silence."}}]}
+
+
+class _ModelErrorThenRecoveredDirectLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) <= 2:
+            if len(self.calls) == 2:
+                assert "report.pdf" in str(messages)
+                assert (
+                    "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+                    not in str(messages)
+                )
+            raise RuntimeError(
+                'BadRequestError: {"error":{"message":"Timeout while downloading '
+                'https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf.",'
+                '"param": "url"}}'
+            )
+        yield {"choices": [{"delta": {"content": "Recovered after model error."}}]}
+
+
+class _FakeContextAssembler:
+    def __init__(self, *, max_context_tokens: int = 0) -> None:
         self.calls: list[dict[str, object]] = []
+        self.max_context_tokens = max_context_tokens
 
     async def assemble(self, **kwargs: object) -> SimpleNamespace:
         self.calls.append(dict(kwargs))
         role = kwargs.get("user_message_role", "user")
         user_message = kwargs.get("user_message", "")
+        disabled_urls = set(kwargs.get("disabled_artifact_urls") or [])
+        disabled_ids = set(kwargs.get("disabled_artifact_ids") or [])
+        attachment_parts = []
+        for attachment in kwargs.get("user_attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_parts.append({"type": "text", "text": str(attachment.get("filename"))})
+            artifact_id = attachment.get("artifact_id")
+            if isinstance(artifact_id, str) and artifact_id in disabled_ids:
+                continue
+            url = attachment.get("url")
+            if isinstance(url, str) and url not in disabled_urls:
+                attachment_parts.append(
+                    {
+                        "type": "file",
+                        "file": {"file_url": url, "filename": attachment.get("filename")},
+                    }
+                )
+        content = (
+            [{"type": "text", "text": str(user_message)}, *attachment_parts]
+            if attachment_parts
+            else user_message
+        )
         return SimpleNamespace(
-            messages=[{"role": role, "content": user_message}],
+            messages=[{"role": role, "content": content}],
             resolved_model="test-model",
             cache_breakpoint_index=None,
             prompt_tokens=0,
             static_tokens=0,
             dynamic_tokens=0,
-            max_context_tokens=0,
+            max_context_tokens=self.max_context_tokens,
             recommend_compaction=False,
         )
+
+
+class _SingleTextLLM:
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        yield {"choices": [{"delta": {"content": "Done."}}]}
 
 
 class _StepCompleteValidationLLM:
@@ -1695,6 +2426,42 @@ class _SilentStepCompleteValidationLLM:
         }
         return
         return
+
+
+class _StepCompleteRetryLLM:
+    def __init__(self, first_arguments: dict[str, object], second_arguments: dict[str, object]):
+        self.calls: list[list[dict[str, object]]] = []
+        self._arguments = [first_arguments, second_arguments]
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        arguments = self._arguments[min(len(self.calls) - 1, len(self._arguments) - 1)]
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": f"call_step_complete_{len(self.calls)}",
+                                "function": {
+                                    "name": "step_complete",
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
 
 
 class _StepCompleteOrderingLLM:
@@ -2152,7 +2919,11 @@ class _NoopRememberQueue:
 
 
 class _NoopEventBus:
-    async def publish(self, _: object) -> None:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(event)
         return None
 
 
@@ -2176,6 +2947,9 @@ class _NoopGuardrails:
 
 
 class _NoopSessionManager:
+    def __init__(self) -> None:
+        self.rotations: list[dict[str, object]] = []
+
     def session_factory(self) -> object:
         class _Dummy:
             async def __aenter__(self) -> SimpleNamespace:
@@ -2186,12 +2960,32 @@ class _NoopSessionManager:
 
         return _Dummy()
 
+    async def rotate_session(self, **kwargs: object) -> SimpleNamespace:
+        self.rotations.append(dict(kwargs))
+        current_session = kwargs.get("current_session")
+        return SimpleNamespace(
+            session_id="sess-rotated",
+            intaris_session_id="sess-rotated",
+            conversation_id=getattr(current_session, "conversation_id", "conv-1"),
+            user_email=getattr(current_session, "user_email", "user@example.com"),
+            agent_id=getattr(current_session, "agent_id", "agent-1"),
+            mnemory_session_id=None,
+        )
+
 
 class _NoopSessionCache:
     def __init__(self) -> None:
         self.tool_runtime_info: dict[str, object] | None = None
         self.activated_skill_tool_ids: set[str] = set()
         self.skill_tool_classifications: dict[str, list[str]] = {}
+        self.entries: dict[str, SimpleNamespace] = {}
+
+    def get_entry(self, session_id: str) -> SimpleNamespace:
+        entry = self.entries.get(session_id)
+        if entry is None:
+            entry = SimpleNamespace(last_llm_usage=None)
+            self.entries[session_id] = entry
+        return entry
 
     def get_model_override(self, _: str) -> None:
         return None
@@ -2230,6 +3024,246 @@ class _NoopSessionCache:
 
     async def update_intention(self, *_: object, **__: object) -> bool:
         return False
+
+
+class _ContextOverflowThenTextLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            raise LLMContextOverflowError(
+                provider_id="provider-1",
+                model_id="model-1",
+                reason="context_length_exceeded",
+            )
+        yield {"choices": [{"delta": {"content": "Recovered after compaction."}}]}
+
+
+class _SuccessfulCompactionStrategy:
+    compaction_threshold = 0.85
+    preserve_turns = 10
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def compact(
+        self,
+        session: object,
+        *,
+        trigger: str = "manual",
+        model_context: object | None = None,
+    ) -> SimpleNamespace:
+        del model_context
+        del session
+        self.calls.append(trigger)
+        return SimpleNamespace(
+            compacted=True,
+            method="llm",
+            summary="compact summary",
+            turns_compacted=3,
+            tokens_before=100,
+            tokens_after=10,
+            preserved_tail_events=[],
+        )
+
+
+def test_retry_auto_compaction_skips_non_critical_recommendation() -> None:
+    ctx = SimpleNamespace(
+        policy=CHAT_POLICY,
+        is_retry=True,
+        runtime_info={},
+    )
+    context_result = SimpleNamespace(
+        recommend_compaction=True,
+        prompt_tokens=220_000,
+        max_context_tokens=300_000,
+        max_input_tokens=272_000,
+        available_prompt_tokens=272_000,
+        loop_pressure_threshold_prompt_tokens=258_400,
+    )
+
+    assert not _should_run_pre_turn_auto_compaction(ctx, context_result)
+
+
+def test_retry_auto_compaction_runs_when_rotated_session_still_hard_pressure() -> None:
+    ctx = SimpleNamespace(
+        policy=CHAT_POLICY,
+        is_retry=True,
+        runtime_info={},
+    )
+    context_result = SimpleNamespace(
+        recommend_compaction=True,
+        prompt_tokens=283_682,
+        max_context_tokens=300_000,
+        max_input_tokens=272_000,
+        available_prompt_tokens=272_000,
+        loop_pressure_threshold_prompt_tokens=258_400,
+    )
+
+    assert _should_run_pre_turn_auto_compaction(ctx, context_result)
+
+
+def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda messages, _model: (
+                98_000 if any(message.get("content") == "new result" for message in messages) else 0
+            ),
+            count_tokens=lambda text, _model=None: len(str(text)),
+        )
+    )
+    ctx = SimpleNamespace(
+        current_model="test-model",
+        current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
+        agent=SimpleNamespace(llm_config=None),
+        turn_id="turn-1",
+        session=SimpleNamespace(session_id="sess-1"),
+        projection_state=ProjectionTurnState(
+            turn_id="turn-1",
+            policy=ProjectionPolicy.from_budget(
+                max_context_tokens=100_000,
+                available_prompt_tokens=100_000,
+                phase="within_turn",
+                pressure_mode="normal",
+            ),
+            last_result=ProjectionResult(messages=[], mutable_start_index=0),
+            last_message_count=0,
+        ),
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-old",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-old",
+            "content": "old result",
+            "_tool_name": "bash",
+            "_recovery_call_id": "call-old",
+            "_output_size": 10,
+        },
+        {"role": "user", "content": "new turn"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-new",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-new",
+            "content": "new result",
+            "_tool_name": "read",
+            "_recovery_call_id": "call-new",
+            "_output_size": 10,
+        },
+    ]
+
+    projected = loop._project_model_messages_for_budget(
+        ctx,
+        messages=messages,
+        tool_schemas=[],
+        resolved_model="test-model",
+        max_context_tokens=100_000,
+    )
+
+    assert projected.mode == "critical"
+    assert ctx.projection_state.pressure_mode == "critical"
+    assert ctx.projection_state.forced_critical_count == 1
+    assert "Tool output omitted from prompt." in str(projected.messages[1]["content"])
+    assert projected.messages[4]["content"] == "new result"
+
+
+def test_projection_skip_reprojects_when_tool_prefix_mutates() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda _messages, _model: 0,
+            count_tokens=lambda text, _model=None: len(str(text)),
+        )
+    )
+    policy = ProjectionPolicy.from_budget(
+        max_context_tokens=100_000,
+        available_prompt_tokens=100_000,
+        phase="within_turn",
+        pressure_mode="normal",
+    )
+    ctx = SimpleNamespace(
+        current_model="test-model",
+        current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
+        agent=SimpleNamespace(llm_config=None),
+        turn_id="turn-1",
+        session=SimpleNamespace(session_id="sess-1"),
+        projection_state=ProjectionTurnState(
+            turn_id="turn-1",
+            policy=policy,
+            last_result=ProjectionResult(
+                messages=[{"role": "assistant", "content": "saved work"}],
+                mutable_start_index=0,
+            ),
+            last_message_count=1,
+        ),
+    )
+    ctx.projection_state.last_prefix_fingerprint = "stale"
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-mutated",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-mutated",
+            "content": "ok",
+            "_tool_name": "read",
+            "_recovery_call_id": "call-mutated",
+            "_output_size": 2,
+        },
+    ]
+
+    projected = loop._project_model_messages_for_budget(
+        ctx,
+        messages=messages,
+        tool_schemas=[],
+        resolved_model="test-model",
+        max_context_tokens=100_000,
+    )
+
+    assert projected.messages[0]["tool_calls"][0]["id"] == "call-mutated"
+    assert projected.messages[1]["tool_call_id"] == "call-mutated"
+    assert ctx.projection_state.reproject_count == 1
+    assert ctx.projection_state.skip_count == 0
 
 
 class _ProjectContextProbeExecutor:
@@ -2642,7 +3676,6 @@ async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
     )
     output = await agent_loop.run_step(ctx)
     assert output is not None
-    assert isinstance(output.error, str)
     assert len(fake_llm.calls) >= 2
     return fake_llm.calls
 
@@ -2784,7 +3817,8 @@ async def test_read_only_tool_continues_after_project_context_load() -> None:
     fake_llm = _ReadOnlyProjectContextLLM()
     probe_executor = _ReadOnlyProjectContextExecutor()
 
-    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+    async def execute_tool(tool_call: ToolCall, *args: object, **kwargs: object) -> ToolResult:
+        del args, kwargs
         return await probe_executor.tool_execute(tool_call)
 
     registry = ToolRegistry()
@@ -2858,7 +3892,8 @@ async def test_mutating_trailing_tool_retries_after_read_only_project_context_lo
     fake_llm = _MixedProjectContextLLM()
     probe_executor = _ReadOnlyProjectContextExecutor()
 
-    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+    async def execute_tool(tool_call: ToolCall, *args: object, **kwargs: object) -> ToolResult:
+        del args, kwargs
         return await probe_executor.tool_execute(tool_call)
 
     registry = ToolRegistry()
@@ -2956,7 +3991,8 @@ async def test_cross_project_mutating_trailing_tool_loads_own_project_context() 
     )
     probe_executor = _ReadOnlyProjectContextExecutor()
 
-    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+    async def execute_tool(tool_call: ToolCall, *args: object, **kwargs: object) -> ToolResult:
+        del args, kwargs
         return await probe_executor.tool_execute(tool_call)
 
     registry = ToolRegistry()
@@ -3054,7 +4090,8 @@ async def test_mutating_tool_retries_with_matching_earlier_project_context() -> 
     )
     probe_executor = _ReadOnlyProjectContextExecutor()
 
-    async def execute_tool(tool_call: ToolCall, *_: object) -> ToolResult:
+    async def execute_tool(tool_call: ToolCall, *args: object, **kwargs: object) -> ToolResult:
+        del args, kwargs
         return await probe_executor.tool_execute(tool_call)
 
     registry = ToolRegistry()
@@ -3223,13 +4260,29 @@ async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
 async def test_direct_todo_reprompt_is_system_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         todos=[{"content": "keep working", "status": "pending"}],
         policy=CHAT_POLICY,
         user_message="",
-        user_attachments=[],
+        user_attachments=[
+            SimpleNamespace(
+                model_dump=lambda **_: {
+                    "artifact_id": "art_1",
+                    "kind": "pdf",
+                    "mime_type": "application/pdf",
+                    "filename": "report.pdf",
+                    "url": "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf",
+                }
+            )
+        ],
         attachment_notice=None,
         prior_context=None,
         system_initiated=True,
@@ -3251,6 +4304,61 @@ async def test_direct_todo_reprompt_is_system_message() -> None:
     assert "'completed'" in content and "'cancelled'" in content
     assert "produce no assistant text" in content
     assert "Do not repeat, restate, or paraphrase" in content
+
+
+@pytest.mark.asyncio
+async def test_direct_todo_cleanup_only_can_complete_silently() -> None:
+    fake_llm = _TodoCleanupOnlyDirectLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-todo-cleanup",
+            intaris_session_id="sess-todo-cleanup",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-todo-cleanup"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[{"content": "keep working", "status": "pending"}],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id=None,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Todo cleanup completed"
+    assert output.content == ""
+    assert len(fake_llm.calls) == 3
+    assert "non-terminal todos" in str(fake_llm.calls[1][-1]["content"])
+    assert "previous response was empty" not in str(fake_llm.calls[2])
+    assert ctx.todos == [{"content": "keep working", "status": "completed"}]
 
 
 @pytest.mark.asyncio
@@ -3315,17 +4423,171 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
 
     assert output is not None
     assert isinstance(output.error, str)
-    assert consumed_reasons == ["after_assistant_message"]
+    assert "after_assistant_message" in consumed_reasons
     assert len(fake_llm.calls) >= 2
     assert fake_llm.calls[1][-1]["role"] == "user"
     assert fake_llm.calls[1][-1]["content"] == "Also include the deployment notes."
+
+
+class _ResponsesApiToolCycleLLM:
+    """Fake LLM that exposes Responses API and runs one tool cycle to a final answer.
+
+    Used to verify that with Responses API selected, every cycle uses canonical
+    projection (no continuation kwargs, no opaque provider state) and the model
+    sees tool results in the projected transcript on the next cycle.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text) // 4 + 1
+
+    def count_messages_tokens(
+        self, messages: list[dict[str, object]], model: str | None = None
+    ) -> int:
+        del model
+        return len(json.dumps(messages, default=str)) // 4 + 1
+
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
+        del model
+        info = _test_model_info()
+        info.max_input_tokens = 100_000
+        info.max_output_tokens = 8_000
+        return info
+
+    async def stream_generate(self, messages: list[dict[str, object]], **kwargs: object):
+        self.calls.append(
+            {"messages": [dict(message) for message in messages], "kwargs": dict(kwargs)}
+        )
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_lookup",
+                                    "function": {"name": "lookup", "arguments": "{}"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        yield {"choices": [{"delta": {"content": "Grounded final reply."}}]}
+
+
+class _LookupToolRouter:
+    async def execute(self, *_: object, **__: object) -> ToolResult:
+        return ToolResult(output="lookup result", is_error=False)
+
+
+@pytest.mark.asyncio
+async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
+    """Responses API must send canonical projection on every cycle.
+
+    Verifies the controller never sends opaque continuation inputs
+    (``cognis_responses_input_items``, ``previous_response_id``,
+    ``responses_continuation_items``) and that tool results appear in the
+    canonical projected transcript on the next cycle.
+    """
+    fake_llm = _ResponsesApiToolCycleLLM()
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="lookup",
+                description="Lookup evidence",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_LookupToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-responses-canonical",
+            intaris_session_id="sess-responses-canonical",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-responses-canonical",
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Use lookup before answering.",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=False,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id=None,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-responses-canonical",
+            executor_type="in_process",
+            source="test",
+        ),
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=registry,
+        executor_connection=SimpleNamespace(),
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Grounded final reply."
+    assert len(fake_llm.calls) == 2
+
+    # Continuation kwargs must never reach the provider on any cycle.
+    forbidden_kwargs = (
+        "cognis_responses_input_items",
+        "cognis_responses_continuation_mode",
+        "cognis_responses_capability_decision",
+        "cognis_responses_fallback_reason",
+        "previous_response_id",
+    )
+    for call in fake_llm.calls:
+        for key in forbidden_kwargs:
+            assert key not in call["kwargs"], f"{key} must not be sent to provider"
+
+    # The model sees the tool result in canonical projection on the second cycle.
+    second_messages = fake_llm.calls[1]["messages"]
+    assert "lookup result" in str(second_messages)
 
 
 @pytest.mark.asyncio
 async def test_step_complete_reprompt_is_system_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="step-a", type="run", prompt="", allow_questions=False),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         todos=[],
@@ -3453,6 +4715,318 @@ async def test_direct_repeated_empty_responses_fail_gracefully() -> None:
     assert output.content == ""
     assert output.error == "Model returned an empty response without tool calls."
     assert len(fake_llm.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_direct_idle_timeout_auto_continues_without_llm_call_retry() -> None:
+    fake_llm = _SilentThenRecoveredDirectLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=0,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-idle",
+            intaris_session_id="sess-idle",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-idle"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-idle",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after silence."
+    assert output.content == "Recovered after silence."
+    assert len(fake_llm.calls) == 2
+    assert any(
+        message["role"] == "system" and "previous model stream failed" in str(message["content"])
+        for message in fake_llm.calls[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_model_error_auto_continues_after_retry_budget() -> None:
+    fake_llm = _ModelErrorThenRecoveredDirectLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-model-error",
+            intaris_session_id="sess-model-error",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-model-error"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-model-error",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after model error."
+    assert output.content == "Recovered after model error."
+    assert len(fake_llm.calls) == 3
+    assert any(
+        message["role"] == "system" and "previous model stream failed" in str(message["content"])
+        for message in fake_llm.calls[2]
+    )
+    assert any(
+        'artifact_read artifact_id="doc_1"' in str(message["content"])
+        for message in fake_llm.calls[2]
+    )
+
+
+@pytest.mark.asyncio
+async def test_mid_stream_retry_emits_recovery_system_notice() -> None:
+    fake_llm = _ModelErrorThenRecoveredDirectLLM()
+    event_bus = _NoopEventBus()
+    guardrails = _NoopGuardrails()
+    persisted_events: list[SessionEvent] = []
+
+    async def record_events(**kwargs: object) -> EventAppendResult:
+        persisted_events.extend(kwargs.get("events", []))  # type: ignore[arg-type]
+        return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
+
+    guardrails.record_events = record_events  # type: ignore[method-assign]
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=guardrails),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=event_bus,
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-model-retry-notice",
+            intaris_session_id="sess-model-retry-notice",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-model-retry-notice"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-model-retry-notice",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    notices = [
+        getattr(event, "data", {})
+        for event in event_bus.events
+        if getattr(event, "type", None) == EventType.SYSTEM_NOTICE
+    ]
+    assert any(notice.get("kind") == "model_retry" for notice in notices)
+    assert any(notice.get("kind") == "model_recovery" for notice in notices)
+    persisted_notice_events = [
+        event
+        for event in persisted_events
+        if event.type == "lifecycle" and event.data.get("event") == "system_notice"
+    ]
+    assert len(persisted_notice_events) == 1
+    persisted_notice = persisted_notice_events[0].data
+    assert persisted_notice["kind"] == "model_recovery"
+    assert persisted_notice["scope"] == "continuation"
+    assert persisted_notice["notice_id"].endswith(":model_recovery:continuation")
+    assert persisted_notice["tool_results_saved"] is True
+
+
+@pytest.mark.asyncio
+async def test_direct_context_overflow_compacts_rotates_and_replays() -> None:
+    fake_llm = _ContextOverflowThenTextLLM()
+    session_manager = _NoopSessionManager()
+    compaction_strategy = _SuccessfulCompactionStrategy()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=session_manager,
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=compaction_strategy,
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-overflow",
+            intaris_session_id="sess-overflow",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-overflow"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-overflow",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after compaction."
+    assert fake_llm.calls == 2
+    assert compaction_strategy.calls == ["provider_context_overflow"]
+    assert len(session_manager.rotations) == 1
+    assert ctx.session.session_id == "sess-rotated"
+    assert ctx.runtime_info["provider_overflow_recoveries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_token_callback_errors_are_not_retried_as_model_errors() -> None:
+    fake_llm = _EmptyThenTextDirectLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-token-error",
+            intaris_session_id="sess-token-error",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-token-error"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-token-error",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    async def _on_token(_token: str) -> None:
+        raise RuntimeError("websocket send failed")
+
+    output = await agent_loop.run_step(ctx, on_token=_on_token)
+
+    assert output is not None
+    assert output.error == "RuntimeError: websocket send failed"
+    assert len(fake_llm.calls) == 2
 
 
 def test_get_incomplete_todos_treats_done_as_completed() -> None:
@@ -3718,18 +5292,16 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
     assert "Required Completion Actions" not in prompt
 
 
-def test_select_delegation_result_uses_step_output_when_substantive() -> None:
-    """When StepOutput.content is substantive (>= 80 chars and not a meta-complaint),
-    it is used as-is without walking Intaris events."""
+def test_select_delegation_result_falls_back_to_step_output_when_no_messages() -> None:
+    """When no assistant messages exist, use StepOutput.content as fallback."""
     agent_loop = object.__new__(AgentLoop)
-    # No event read should be needed; supply a guardrails that would error if called
-    agent_loop.providers = SimpleNamespace(  # type: ignore[attr-defined]
+    agent_loop.providers = SimpleNamespace(
         guardrails=SimpleNamespace(
-            read_events=lambda **_: (_ for _ in ()).throw(
-                AssertionError("read_events should not be called")
+            read_events=lambda **_: SimpleNamespace(
+                events=[], last_seq=0, has_more=False, missing_stream_fallback_used=False
             )
         )
-    )
+    )  # type: ignore[attr-defined]
     child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
     substantive = (
         "Investigated the queued chat handling code. "
@@ -3737,18 +5309,18 @@ def test_select_delegation_result_uses_step_output_when_substantive() -> None:
         "but the optimistic id from the form is not the same as the persisted id."
     )
 
-    async def _run() -> str:
+    async def _run() -> object:
         return await agent_loop._select_delegation_result_content(
-            child_session=child, step_output_content=substantive
+            child_session=child, step_output=StepOutput(summary="done", content=substantive)
         )
 
     result = asyncio.run(_run())
-    assert result == substantive
+    assert result.content == substantive
+    assert result.source == "step_output"
 
 
 def test_select_delegation_result_walks_events_when_step_output_is_meta_complaint() -> None:
-    """When StepOutput.content looks like a meta-complaint, walk the child's
-    assistant_message events in reverse and pick the last substantive one.
+    """Aggregate child assistant messages chronologically so cleanup tails do not replace reports.
 
     This regresses the 'tool budget reached' bug where the parent received
     only the budget-exhaustion message, despite the substantive findings being
@@ -3787,19 +5359,88 @@ def test_select_delegation_result_walks_events_when_step_output_is_meta_complain
     agent_loop.providers = SimpleNamespace(guardrails=_FakeGuardrails())  # type: ignore[attr-defined]
     child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
 
-    async def _run() -> str:
+    async def _run() -> object:
         return await agent_loop._select_delegation_result_content(
-            child_session=child, step_output_content=meta_complaint
+            child_session=child, step_output=StepOutput(summary="done", content=meta_complaint)
         )
 
     result = asyncio.run(_run())
-    assert result == substantive
-    assert "tool budget" not in result.lower()
+    assert result.source == "assistant_messages"
+    assert substantive in result.content
+    assert meta_complaint in result.content
+    assert result.content.index(substantive) < result.content.index(meta_complaint)
+    assert "--- Assistant message 1 ---" in result.content
+    assert "--- Assistant message 2 ---" in result.content
+    assert [anchor["anchor"] for anchor in result.anchors] == ["message:1", "message:2"]
 
 
-def test_select_delegation_result_falls_back_to_longest_when_all_messages_meta() -> None:
-    """If every assistant_message looks like a meta-complaint, pick the longest
-    rather than returning empty. Belt-and-suspenders for pathological runs."""
+def test_select_delegation_result_reads_paginated_child_events() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    first_page_events = [
+        {"seq": index, "type": "tool_call", "data": {"name": "read"}} for index in range(1, 501)
+    ]
+    report = "Full report from the second page must survive pagination."
+    cleanup = "Todo cleanup finalization message."
+    second_page_events = [
+        {"seq": 501, "type": "assistant_message", "data": {"content": report}},
+        {"seq": 502, "type": "assistant_message", "data": {"content": cleanup}},
+    ]
+
+    class _FakeGuardrails:
+        def __init__(self) -> None:
+            self.after_seqs: list[int] = []
+
+        async def read_events(self, **kwargs: object) -> SimpleNamespace:
+            after_seq = int(kwargs["after_seq"])
+            self.after_seqs.append(after_seq)
+            if after_seq == 0:
+                return SimpleNamespace(
+                    events=first_page_events,
+                    last_seq=500,
+                    has_more=True,
+                    missing_stream_fallback_used=False,
+                )
+            return SimpleNamespace(
+                events=second_page_events,
+                last_seq=502,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    guardrails = _FakeGuardrails()
+    agent_loop.providers = SimpleNamespace(guardrails=guardrails)  # type: ignore[attr-defined]
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+
+    async def _run() -> object:
+        return await agent_loop._select_delegation_result_content(
+            child_session=child, step_output=StepOutput(summary="done", content=cleanup)
+        )
+
+    result = asyncio.run(_run())
+    assert guardrails.after_seqs == [0, 500]
+    assert report in result.content
+    assert cleanup in result.content
+    assert result.content.index(report) < result.content.index(cleanup)
+
+
+def test_delegation_result_anchors_match_truncated_content() -> None:
+    first = "A" * (_DELEGATION_RESULT_MAX_CHARS + 1_000)
+    second = "This second message is omitted by truncation."
+
+    result = _build_delegation_message_result([first, second])
+
+    assert result.truncated
+    assert second not in result.content
+    assert "message:1" in result.content
+    assert "message:2" not in result.content
+    assert [anchor["anchor"] for anchor in result.anchors] == ["message:1"]
+    sections = _result_sections_from_content(result.content, result.anchors)
+    assert [section["anchor"] for section in sections] == ["message:1"]
+    assert sections[0]["content"].startswith("[[message:1]]")
+
+
+def test_select_delegation_result_aggregates_all_meta_messages() -> None:
+    """Even meta-only messages are preserved in chronological order."""
     agent_loop = object.__new__(AgentLoop)
 
     short_meta = "Tool budget reached."
@@ -3825,13 +5466,15 @@ def test_select_delegation_result_falls_back_to_longest_when_all_messages_meta()
     agent_loop.providers = SimpleNamespace(guardrails=_FakeGuardrails())  # type: ignore[attr-defined]
     child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
 
-    async def _run() -> str:
+    async def _run() -> object:
         return await agent_loop._select_delegation_result_content(
-            child_session=child, step_output_content=short_meta
+            child_session=child, step_output=StepOutput(summary="done", content=short_meta)
         )
 
     result = asyncio.run(_run())
-    assert result == longer_meta
+    assert short_meta in result.content
+    assert longer_meta in result.content
+    assert result.content.index(short_meta) < result.content.index(longer_meta)
 
 
 def test_select_delegation_result_handles_read_events_failure() -> None:
@@ -3847,13 +5490,111 @@ def test_select_delegation_result_handles_read_events_failure() -> None:
     child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
     fallback = "I cannot call tools."  # short meta-complaint
 
-    async def _run() -> str:
+    async def _run() -> object:
         return await agent_loop._select_delegation_result_content(
-            child_session=child, step_output_content=fallback
+            child_session=child, step_output=StepOutput(summary="done", content=fallback)
         )
 
     result = asyncio.run(_run())
-    assert result == fallback
+    assert result.content == fallback
+    assert result.source == "step_output"
+
+
+def test_select_delegation_result_prefers_deliverable_content() -> None:
+    agent_loop = object.__new__(AgentLoop)
+
+    class _SessionFactory:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    agent_loop.session_manager = SimpleNamespace(  # type: ignore[attr-defined]
+        session_factory=lambda: _SessionFactory()
+    )
+    agent_loop.providers = SimpleNamespace(  # type: ignore[attr-defined]
+        guardrails=SimpleNamespace(
+            read_events=lambda **_: SimpleNamespace(
+                events=[{"type": "assistant_message", "data": {"content": "assistant chatter"}}],
+                last_seq=1,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+        )
+    )
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+
+    async def _get_deliverable(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(content="Canonical deliverable body", status="approved")
+
+    async def _run(monkeypatch: pytest.MonkeyPatch) -> object:
+        monkeypatch.setattr("cognis.core.agent_loop.get_deliverable", _get_deliverable)
+        return await agent_loop._select_delegation_result_content(
+            child_session=child,
+            step_output=StepOutput(
+                summary="summary",
+                content="assistant chatter",
+                deliverable_id="dlv_real",
+                deliverable_title="Report",
+            ),
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        result = asyncio.run(_run(monkeypatch))
+    finally:
+        monkeypatch.undo()
+    assert result.content == "Canonical deliverable body"
+    assert result.source == "deliverable"
+
+
+def test_get_subsession_returns_durable_result_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_loop = object.__new__(AgentLoop)
+
+    class _SessionFactory:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    agent_loop.session_manager = SimpleNamespace(session_factory=lambda: _SessionFactory())  # type: ignore[attr-defined]
+    ctx = SimpleNamespace(session=SimpleNamespace(session_id="parent-1"))
+    row = SimpleNamespace(
+        session_id="child-1",
+        parent_session_id="parent-1",
+        agent_id="system:explore",
+        status="completed",
+        delegation_task="Investigate",
+        result_summary="Done",
+        result_content="[assistant_message:1]\nFull report",
+        started_at=None,
+        completed_at=None,
+    )
+
+    async def _fake_get_session_row(_db: object, session_id: str) -> object:
+        assert session_id == "child-1"
+        return row
+
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _fake_get_session_row)
+
+    async def _run():
+        return await agent_loop._handle_subsession_management(
+            ToolCall(
+                call_id="call-get",
+                name="get_subsession",
+                arguments={"session_id": "child-1"},
+            ),
+            ctx=ctx,  # type: ignore[arg-type]
+        )
+
+    tool_result = asyncio.run(_run())
+    payload = json.loads(tool_result.output)
+    assert payload["result_content"] == "[assistant_message:1]\nFull report"
+    assert payload["result_anchors"][0]["anchor"] == "assistant_message:1"
+    assert payload["result_sections"][0]["content"].startswith("[assistant_message:1]")
 
 
 def test_looks_like_meta_complaint_detects_known_patterns() -> None:
@@ -3863,9 +5604,7 @@ def test_looks_like_meta_complaint_detects_known_patterns() -> None:
         "I can't call tools anymore in this sub-session because the tool budget "
         "is exhausted, so I can't update the stale todo state."
     )
-    assert AgentLoop._looks_like_meta_complaint(
-        "Tool budget reached. Tools are disabled."
-    )
+    assert AgentLoop._looks_like_meta_complaint("Tool budget reached. Tools are disabled.")
     assert AgentLoop._looks_like_meta_complaint(
         "Already provided the final findings above. No additional user-facing information remains; "
         "the remaining todo state is stale."
@@ -3948,6 +5687,60 @@ async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_t
     assert output.deliverable_id == "dlv-limit"
     assert output.content == "Deliverable output from delegated run."
     assert output.outputs == {"source": "deliverable"}
+
+
+@pytest.mark.asyncio
+async def test_delegation_prompt_uses_user_message_role() -> None:
+    """Delegated task text must enter the child prompt as a user message.
+
+    The child session itself is system-initiated for lifecycle/audit purposes,
+    but the delegated task is the active task input. Passing it as a system
+    message makes language and instruction precedence ambiguous for secondary
+    agents.
+    """
+
+    context_assembler = _FakeContextAssembler()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_SingleTextLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=context_assembler,
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
+        session=SimpleNamespace(
+            session_id="child-role",
+            intaris_session_id="child-role",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="system:explore",
+            parent_session_id="parent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(
+            agent_id="system:explore",
+            owner_email="system",
+            name="Explore",
+            agent_type="secondary",
+            execution={"steps": 1},
+            is_system=True,
+        ),
+        policy=SECONDARY_AGENT_DELEGATION_POLICY,
+        user_message="Investigate.",
+        system_initiated=True,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert context_assembler.calls[-1]["prompt_context"] is PromptContext.DELEGATION
+    assert context_assembler.calls[-1]["user_message_role"] == "user"
 
 
 @pytest.mark.asyncio
@@ -4097,6 +5890,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
         _fake_handle_delegate_tool_call,
     )
     monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
+
     # Avoid network/persistence for the started event recording
     async def _noop_record(*args: Any, **kwargs: Any) -> bool:
         return True
@@ -4931,10 +6725,14 @@ async def test_cached_discovered_tool_is_revalidated_against_permissions() -> No
 @pytest.mark.asyncio
 async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -> None:
     class _ClassifierLLM:
+        def __init__(self) -> None:
+            self.kwargs: list[dict[str, object]] = []
+
         async def generate(
-            self, messages: list[dict[str, object]], **_: object
+            self, messages: list[dict[str, object]], **kwargs: object
         ) -> dict[str, object]:
             del messages
+            self.kwargs.append(dict(kwargs))
             return {
                 "choices": [
                     {
@@ -4976,8 +6774,9 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     registry.register(RegisteredTool(definition=hidden_tool, handler=None))
     registry.register(RegisteredTool(definition=visible_tool, handler=None))
     session_cache = _NoopSessionCache()
+    llm = _ClassifierLLM()
     agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_ClassifierLLM(), guardrails=_NoopGuardrails()),
+        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
         session_cache=session_cache,
         context_assembler=_FakeContextAssembler(),
@@ -5027,6 +6826,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
     assert next(iter(session_cache.skill_tool_classifications.values())) == [
         stable_tool_id(hidden_tool)
     ]
+    assert llm.kwargs[0]["cognis_session_id"] == "sess-skill"
     # Promoted tool ids must also include the activated tool so it surfaces next turn.
     assert stable_tool_id(hidden_tool) in promoted_tool_ids
 
@@ -5539,6 +7339,154 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
     assert "outcome.reason" in second_prompt
 
 
+def _step_complete_test_loop(fake_llm: object) -> AgentLoop:
+    return AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+
+def _step_complete_test_context(step_definition: StepDefinition) -> StepContext:
+    return StepContext(
+        step_definition=step_definition,
+        session=SimpleNamespace(
+            session_id="sess-step-complete-metadata",
+            intaris_session_id="sess-step-complete-metadata",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-step-complete-metadata",
+            title=None,
+            title_source="unset",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="complete the step",
+        user_attachments=[],
+        system_initiated=False,
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="default",
+            allow_silent_completion=False,
+        ),
+    )
+
+
+def _first_tool_result_payload(fake_llm: _StepCompleteRetryLLM) -> dict[str, object]:
+    second_prompt = fake_llm.calls[1]
+    tool_message = next(message for message in second_prompt if message.get("role") == "tool")
+    return json.loads(str(tool_message["content"]))
+
+
+def _lifecycle_strategy_step() -> StepDefinition:
+    return StepDefinition(
+        name="plan",
+        type="run",
+        prompt="",
+        require_deliverable=False,
+        metadata_contract=StepCompletionContract(
+            fields=[
+                StepCompletionMetadataField(
+                    name="lifecycle_strategy",
+                    type="object",
+                    required=True,
+                )
+            ]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_step_complete_missing_required_metadata_reports_metadata_reason() -> None:
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={"summary": "done"},
+        second_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+    )
+    output = await _step_complete_test_loop(fake_llm).run_step(
+        _step_complete_test_context(_lifecycle_strategy_step())
+    )
+
+    payload = _first_tool_result_payload(fake_llm)
+    assert output is not None
+    assert output.metadata["lifecycle_strategy"] == {}
+    assert payload["reason"] == "invalid_step_complete_metadata"
+    assert "lifecycle_strategy" in str(payload["message"])
+    assert payload["example"]["metadata"]["lifecycle_strategy"] == {}
+
+
+@pytest.mark.asyncio
+async def test_step_complete_wrong_metadata_object_type_reports_metadata_reason() -> None:
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={"summary": "done", "metadata": {"lifecycle_strategy": "manual"}},
+        second_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+    )
+    output = await _step_complete_test_loop(fake_llm).run_step(
+        _step_complete_test_context(_lifecycle_strategy_step())
+    )
+
+    payload = _first_tool_result_payload(fake_llm)
+    assert output is not None
+    assert payload["reason"] == "invalid_step_complete_metadata"
+    assert "must be object" in str(payload["message"])
+    assert payload["example"]["metadata"]["lifecycle_strategy"] == {}
+
+
+@pytest.mark.asyncio
+async def test_step_complete_no_contract_validation_error_keeps_generic_example() -> None:
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={"summary": "done", "outcome": {"status": "failed"}},
+        second_arguments={
+            "summary": "done",
+            "outcome": {"status": "failed", "reason": "upstream failed"},
+        },
+    )
+    output = await _step_complete_test_loop(fake_llm).run_step(
+        _step_complete_test_context(
+            StepDefinition(name="no-contract", type="run", prompt="", require_deliverable=False)
+        )
+    )
+
+    payload = _first_tool_result_payload(fake_llm)
+    assert output is not None
+    assert payload["reason"] == "invalid_step_complete_arguments"
+    assert "metadata" not in payload["example"]
+
+
+def test_step_complete_runtime_notification_error_payload_is_notification_reason() -> None:
+    ctx = _step_complete_test_context(
+        StepDefinition(name="notify", type="run", prompt="", require_deliverable=False)
+    )
+    arguments = {
+        "summary": "done",
+        "notification": {"mode": "silent", "reason": "Nothing actionable happened."},
+    }
+    step_output = StepOutput(
+        summary=arguments["summary"],
+        notification=arguments["notification"],
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        _validate_step_completion_notification(ctx, step_output)
+
+    payload = {
+        "status": "rejected",
+        "reason": "invalid_step_complete_notification",
+        "message": str(exc_info.value),
+        "received": arguments,
+    }
+    assert payload["reason"] == "invalid_step_complete_notification"
+    assert payload["reason"] != "invalid_step_complete_metadata"
+
+
 @pytest.mark.asyncio
 async def test_step_complete_must_be_last_tool_call_in_response() -> None:
     fake_llm = _StepCompleteOrderingLLM()
@@ -5689,7 +7637,7 @@ async def test_terminal_todos_still_allow_todo_write() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
+async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None:
     class _HangingAfterTodoLLM:
         def __init__(self) -> None:
             self.calls = 0
@@ -5703,7 +7651,6 @@ async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
             return _test_model_info()
 
         async def stream_generate(self, messages: list[dict[str, object]], **_: object):
-            del messages
             self.calls += 1
             if self.calls == 1:
                 yield {
@@ -5739,9 +7686,55 @@ async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
                 }
                 return
 
-            await asyncio.sleep(30)
-            if False:  # pragma: no cover - keep this an async generator
-                yield {}
+            if self.calls == 2:
+                await asyncio.sleep(30)
+                if False:  # pragma: no cover - keep this an async generator
+                    yield {}
+                return
+            if self.calls == 3:
+                assert any(
+                    message["role"] == "system"
+                    and "previous model stream failed" in str(message["content"])
+                    for message in messages
+                )
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_todos_done",
+                                        "function": {
+                                            "name": "step_todo_write",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "todos": [
+                                                        {
+                                                            "content": "Save each Reddit comment memory",
+                                                            "status": "completed",
+                                                        },
+                                                        {
+                                                            "content": "Attach source URL artifact",
+                                                            "status": "completed",
+                                                        },
+                                                    ]
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return
+            if self.calls == 4:
+                yield {"choices": [{"delta": {"content": "Recovered after idle timeout."}}]}
+                return
+            while True:
+                await asyncio.sleep(30)
+                yield {"choices": []}
 
     fake_llm = _HangingAfterTodoLLM()
     agent_loop = AgentLoop(
@@ -5783,11 +7776,38 @@ async def test_llm_stream_idle_timeout_after_todo_write_settles_turn() -> None:
     async def _on_token(token: str) -> None:
         tokens.append(token)
 
+    recorded_events: list[SessionEvent] = []
+
+    async def _record_events_strict(
+        _ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object = None,
+    ) -> bool:
+        del reason, on_token
+        recorded_events.extend(events)
+        events.clear()
+        return True
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+
     output = await agent_loop.run_step(ctx, on_token=_on_token)
 
-    assert output is None
-    assert fake_llm.calls == 3
-    assert "model did not produce output" in "".join(tokens)
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after idle timeout."
+    assert fake_llm.calls == 4
+    streamed_text = "".join(tokens)
+    assert "Recovered after idle timeout." in streamed_text
+    assert "model did not produce output" not in streamed_text
+    system_notices = [
+        str(event.data.get("message", ""))
+        for event in recorded_events
+        if event.type == "lifecycle" and event.data.get("event") == "system_notice"
+    ]
+    assert any("continuing from the saved state" in notice for notice in system_notices)
+    assert not any("model did not produce output" in notice for notice in system_notices)
     assert "sess-hung-llm" in agent_loop.session_lock.stale_unlocked_session_ids(max_idle_seconds=0)
 
 
@@ -7038,6 +9058,312 @@ async def test_controller_tool_output_store_persists_anchored_outputs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_output_artifact_uses_store_ttl_and_records_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ArtifactStore:
+        def __init__(self) -> None:
+            self.saved: list[tuple[str, str, str, bytes, str, str | None]] = []
+            self.deleted: list[tuple[str, str]] = []
+
+        @staticmethod
+        def generate_id(prefix: str) -> str:
+            return f"{prefix}_123"
+
+        async def async_save(
+            self,
+            namespace: str,
+            object_id: str,
+            filename: str,
+            content: bytes,
+            content_type: str,
+            owner_email: str | None = None,
+        ) -> None:
+            self.saved.append((namespace, object_id, filename, content, content_type, owner_email))
+
+        async def async_delete_object(self, namespace: str, object_id: str) -> None:
+            self.deleted.append((namespace, object_id))
+
+    class _ToolOutputStore:
+        ttl_seconds = 3600
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def commit(self) -> None:
+            return None
+
+    records: list[dict[str, object]] = []
+
+    async def _create_record(session: object, **kwargs: object) -> object:
+        del session
+        records.append(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("cognis.store.queries.create_artifact_record", _create_record)
+    artifact_store = _ArtifactStore()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(artifact_store=artifact_store),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        session_factory=lambda: _Session(),
+        tool_output_store=_ToolOutputStore(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    artifact_id = await agent_loop._save_tool_output_artifact_if_available(
+        ctx,
+        "call-1",
+        ToolResult(output="preview", metadata={"_raw_output": "full output"}),
+    )
+
+    assert artifact_id == "toolout_123"
+    assert artifact_store.saved[0][:4] == (
+        "tool-outputs",
+        "toolout_123",
+        "call-1.txt",
+        b"full output",
+    )
+    record = records[0]
+    assert record["artifact_id"] == "toolout_123"
+    assert record["purpose"] == "tool_output"
+    assert record["session_id"] == "sess-1"
+    assert record["conversation_id"] == "conv-1"
+    assert record["message_role"] == "tool"
+    expires_in = (record["expires_at"] - datetime.now(UTC)).total_seconds()
+    assert 0 < expires_in <= 3600
+
+
+@pytest.mark.asyncio
+async def test_tool_output_artifact_cleanup_on_record_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted: list[tuple[str, str]] = []
+
+    class _ArtifactStore:
+        @staticmethod
+        def generate_id(prefix: str) -> str:
+            return f"{prefix}_orphan"
+
+        async def async_save(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def async_delete_object(self, namespace: str, object_id: str) -> None:
+            deleted.append((namespace, object_id))
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def commit(self) -> None:
+            return None
+
+    async def _create_record(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr("cognis.store.queries.create_artifact_record", _create_record)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(artifact_store=_ArtifactStore()),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        session_factory=lambda: _Session(),
+        tool_output_store=SimpleNamespace(ttl_seconds=3600),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    artifact_id = await agent_loop._save_tool_output_artifact_if_available(
+        ctx,
+        "call-1",
+        ToolResult(output="preview", metadata={"_raw_output": "full output"}),
+    )
+
+    assert artifact_id is None
+    assert deleted == [("tool-outputs", "toolout_orphan")]
+
+
+def test_append_tool_result_event_stores_exact_agent_visible_result() -> None:
+    output = "HEAD" + ("M" * 60_000) + "TAIL"
+    tc = ToolCall(call_id="call-visible", name="bash", arguments={"command": "generate"})
+    events: list[SessionEvent] = []
+
+    _append_tool_result_event(
+        events,
+        tc,
+        output,
+        False,
+        tool_id="builtin:bash",
+        output_size=120_000,
+        has_full_output=True,
+        recovery_call_id="call-visible",
+        agent_visible_truncated=True,
+    )
+
+    data = events[0].data
+    assert data["result"] == output
+    assert data["agent_visible"] is True
+    assert data["view_kind"] == "model_tool_result"
+    assert data["agent_visible_truncated"] is True
+    assert data["output_size"] == 120_000
+
+
+@pytest.mark.asyncio
+async def test_finalize_regular_tool_result_stores_agent_visible_output_and_artifact_id() -> None:
+    class _Store:
+        ttl_seconds = 3600
+
+        def __init__(self) -> None:
+            self.saved: list[tuple[str, str]] = []
+
+        async def save(
+            self,
+            call_id: str,
+            output: str,
+            *,
+            anchors: list[dict[str, object]] | None = None,
+        ) -> None:
+            del anchors
+            self.saved.append((call_id, output))
+
+    class _ArtifactStore:
+        @staticmethod
+        def generate_id(prefix: str) -> str:
+            return f"{prefix}_final"
+
+        async def async_save(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+        async def async_delete_object(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            del args
+
+        async def commit(self) -> None:
+            return None
+
+    async def _create_record(session: object, **kwargs: object) -> object:
+        del session, kwargs
+        return SimpleNamespace()
+
+    import cognis.store.queries as queries
+
+    original_create_record = queries.create_artifact_record
+    queries.create_artifact_record = _create_record
+    recorded_events: list[SessionEvent] = []
+
+    class _SessionCache(_NoopSessionCache):
+        async def append_recorded_events(
+            self,
+            session: object,
+            events: list[SessionEvent],
+            append_result: EventAppendResult,
+        ) -> None:
+            del session, append_result
+            recorded_events.extend(events)
+
+    try:
+        store = _Store()
+        agent_loop = AgentLoop(
+            providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+            session_manager=_NoopSessionManager(),
+            session_cache=_SessionCache(),
+            context_assembler=_FakeContextAssembler(),
+            compaction_strategy=SimpleNamespace(),
+            tool_router=SimpleNamespace(artifact_store=_ArtifactStore()),
+            remember_queue=_NoopRememberQueue(),
+            event_bus=_NoopEventBus(),
+            session_lock=SessionLock(),
+            pause_waiter=PauseWaiter(),
+            session_factory=lambda: _Session(),
+            tool_output_store=store,
+        )
+        ctx = StepContext(
+            step_definition=StepDefinition(name="direct", type="run", prompt=""),
+            session=SimpleNamespace(
+                session_id="sess-1",
+                intaris_session_id="sess-1",
+                user_email="user@example.com",
+                agent_id="agent-1",
+            ),
+            conversation=SimpleNamespace(conversation_id="conv-1"),
+            agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+            policy=CHAT_POLICY,
+        )
+        raw_output = "RAW" * 30_000
+        result = ToolResult(
+            output="VISIBLE" * 20_000,
+            metadata={"_raw_output": raw_output, "original_size": len(raw_output)},
+        )
+        events: list[SessionEvent] = []
+        messages: list[dict[str, object]] = []
+
+        await agent_loop._finalize_regular_tool_result(
+            ctx,
+            tc=ToolCall(call_id="call-final", name="bash", arguments={"command": "huge"}),
+            tool_id="builtin:bash",
+            result=result,
+            events_to_record=events,
+            messages=messages,
+            collected_attachments=[],
+            pending_assistant_attachments=[],
+            promoted_tool_ids=set(),
+            activated_tool_ids=set(),
+            on_token=None,
+            on_tool_result=None,
+        )
+    finally:
+        queries.create_artifact_record = original_create_record
+
+    event_data = recorded_events[-1].data
+    assert event_data["result"] == messages[-1]["content"]
+    assert event_data["result"] != raw_output
+    assert "middle truncated" in event_data["result"]
+    assert event_data["agent_visible"] is True
+    assert event_data["agent_visible_truncated"] is True
+    assert event_data["tool_output_artifact_id"] == "toolout_final"
+    assert messages[-1]["_tool_output_artifact_id"] == "toolout_final"
+    assert store.saved == [("call-final", raw_output)]
+
+
+@pytest.mark.asyncio
 async def test_tool_output_helper_results_recover_via_helper_call_id() -> None:
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
@@ -7164,7 +9490,7 @@ async def test_finalize_regular_tool_result_records_file_diffs() -> None:
     )
 
     assert guardrails.events[-1].data["file_diffs"] == file_diffs
-    assert observed[0][-1] == file_diffs
+    assert observed[0][-2] == file_diffs
 
 
 @pytest.mark.asyncio

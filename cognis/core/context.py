@@ -28,6 +28,7 @@ from cognis.core.attachment_utils import (
 )
 from cognis.core.context_budget import resolve_context_budget
 from cognis.core.context_projection import (
+    ProjectionPolicy,
     build_compacted_tool_result_placeholder,
     clear_large_tool_call_arguments,
     project_messages,
@@ -44,13 +45,23 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
     sort_prefix_entries,
 )
+from cognis.core.message_markers import (
+    ALL_INTERNAL_MARKERS,
+    IMMUTABLE_PREFIX,
+    TURN_BOUNDARY,
+)
 from cognis.core.prompts import PromptContext, build_critical_rules, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
-from cognis.core.title_policy import sync_intaris_title
+from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
-from cognis.models.session import ConversationModel, SessionModel, with_session_events_turn_id
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    SessionModel,
+    with_session_events_turn_id,
+)
 from cognis.models.tool import Permission, ToolDefinition
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
@@ -79,6 +90,7 @@ EVENT_TYPES_FOR_CONTEXT = [
 ]
 
 _MAX_PROJECT_INSTRUCTION_BYTES = 32000
+_NON_CHANNEL_CONTEXT_TYPES = frozenset({"api", "chat", "direct", "task", "web"})
 _VISIBLE_HISTORY_EVENT_TYPES = {
     "system_message",
     "developer_message",
@@ -119,6 +131,11 @@ class ContextAssemblyResult(BaseModel):
     dynamic_tokens: int = 0
     prompt_tokens: int = 0
     max_context_tokens: int = 0
+    max_input_tokens: int = 0
+    available_prompt_tokens: int = 0
+    compaction_threshold_prompt_tokens: int = 0
+    loop_pressure_threshold_prompt_tokens: int = 0
+    compaction_threshold: float = 0.0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
 
@@ -148,14 +165,22 @@ def _filter_attachments_by_names(
 def _native_attachment_blocks(
     attachments: list[dict[str, Any]],
     model_info: Any,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     blocks: list[dict[str, Any]] = []
     unsupported: list[str] = []
+    disabled_artifact_urls = disabled_artifact_urls or set()
+    disabled_artifact_ids = disabled_artifact_ids or set()
     for attachment in attachments:
         kind = str(attachment.get("kind") or ArtifactKind.FILE.value)
         url = attachment.get("url")
+        artifact_id = attachment.get("artifact_id")
         filename = str(attachment.get("filename") or attachment.get("artifact_id") or "attachment")
-        if not isinstance(url, str) or not url:
+        if isinstance(artifact_id, str) and artifact_id in disabled_artifact_ids:
+            unsupported.append(filename)
+            continue
+        if not isinstance(url, str) or not url or url in disabled_artifact_urls:
             unsupported.append(filename)
             continue
         if kind == ArtifactKind.IMAGE.value and getattr(model_info, "supports_vision", False):
@@ -189,6 +214,8 @@ def _current_turn_attachment_message(
     user_attachments: list[dict[str, Any]] | None,
     model_info: Any,
     include_user_message: bool,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
     attachments = user_attachments or []
     if not attachments:
@@ -198,7 +225,12 @@ def _current_turn_attachment_message(
             return {"role": user_message_role, "content": user_message}
         return None
 
-    attachment_blocks, unsupported = _native_attachment_blocks(attachments, model_info)
+    attachment_blocks, unsupported = _native_attachment_blocks(
+        attachments,
+        model_info,
+        disabled_artifact_urls=disabled_artifact_urls,
+        disabled_artifact_ids=disabled_artifact_ids,
+    )
     if attachment_blocks:
         blocks: list[dict[str, Any]] = []
         if include_user_message:
@@ -295,6 +327,59 @@ def _build_environment_info(
     return base + pool_block
 
 
+def _build_channel_context_info(context: ConversationContext | None) -> str | None:
+    """Build channel-specific mutable context for channel-bound conversations only."""
+
+    if context is None:
+        return None
+    context_type = str(context.type or "").strip()
+    if not context_type or context_type.lower() in _NON_CHANNEL_CONTEXT_TYPES:
+        return None
+
+    platform_data = context.platform_data or {}
+    channel_type = _string_value(platform_data.get("channel_type")) or context_type
+    lines = [
+        "Conversation channel context:",
+        f"- Channel: {channel_type}",
+    ]
+    chat_type = _string_value(platform_data.get("chat_type"))
+    if chat_type:
+        lines.append(f"- Chat type: {chat_type}")
+    chat_name = _string_value(platform_data.get("chat_name"))
+    if chat_name:
+        lines.append(f"- Chat name: {chat_name}")
+    if context.ref:
+        lines.append(f"- Channel conversation ref: {context.ref}")
+    thread_id = _string_value(platform_data.get("thread_id"))
+    if thread_id:
+        lines.append("- Thread-bound: yes")
+    elif "thread_id" in platform_data:
+        lines.append("- Thread-bound: no")
+
+    lines.extend(
+        [
+            "",
+            "Channel behavior:",
+            "- This guidance applies only because the current conversation is channel-bound.",
+            "- Keep the channel unblocked. For non-trivial exploration, research, "
+            "implementation, or other long-running work, prefer delegate(wait=false) "
+            "or create_task so work continues asynchronously and a follow-up turn can "
+            "deliver the result when complete.",
+            "- Use inline work only for quick answers or very small actions that can "
+            "finish without noticeably blocking the channel.",
+            "- Keep channel replies concise and suitable for the channel medium.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _string_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _format_executor_pool(
     executor_pool: Any,
     *,
@@ -334,9 +419,16 @@ def _format_executor_pool(
             line += f" — {description}"
         lines.append(line)
     lines.append(
-        "Pass target_executor=<id> on a tool call to route a single call to a "
-        "specific executor (without changing the active one). Call switch_executor "
-        "to change the conversation's active executor."
+        "Use primary executors for normal work. Additional executors are "
+        "special-purpose targets (for example remote hosts or attached devices); "
+        "do not use them as fallback capacity when a primary executor is down. "
+        "Route to an additional executor only when the task explicitly requires "
+        "that specific machine or the user asks for it. After completing that "
+        "specific work, switch back to a primary executor before unrelated or "
+        "generic follow-up work. Pass target_executor=<id> on a tool call to route "
+        "a single call without changing the active executor. Call switch_executor "
+        "only when you intentionally want subsequent tool calls to stay on that "
+        "specific executor."
     )
     return "\n".join(lines)
 
@@ -369,9 +461,12 @@ def _format_compaction_summary(compaction_summary: str | None) -> str | None:
         return None
     return (
         "This is a continuation from a previous session. "
-        "Here is a summary of what was discussed:\n\n"
+        "Here is the compacted handoff summary from the older session history:\n\n"
         f"{compaction_summary}\n\n"
-        "Use this summary as background context for the continuation that follows."
+        "Use this summary as background context only. The current user request that "
+        "follows this summary is authoritative. If the summary references recoverable "
+        "tool-output handles or says details were truncated, use the recovery tools "
+        "with the recorded call_id before claiming those details are unavailable."
     )
 
 
@@ -520,6 +615,8 @@ class ContextAssembler:
         include_project_context: bool = True,
         executor_pool: Any = None,
         active_executor_id: str | None = None,
+        disabled_artifact_urls: set[str] | None = None,
+        disabled_artifact_ids: set[str] | None = None,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -567,6 +664,8 @@ class ContextAssembler:
                 include_project_context=include_project_context,
                 executor_pool=executor_pool,
                 active_executor_id=active_executor_id,
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -686,10 +785,19 @@ class ContextAssembler:
                 try:
                     async with self.session_factory() as db_session:
                         ok = await sync_intaris_title(
-                            db_session, conversation, intention_result.title
+                            db_session,
+                            conversation,
+                            intention_result.title,
+                            updated_at=intention_result.updated_at,
                         )
                         if ok:
                             await db_session.commit()
+                            if conversation.title:
+                                await publish_conversation_title_updated(
+                                    self.session_manager.event_bus,
+                                    conversation_id=conversation.conversation_id,
+                                    title=conversation.title,
+                                )
                 except Exception:
                     logger.debug(
                         "context: failed to sync title from Intaris",
@@ -708,24 +816,23 @@ class ContextAssembler:
         # replaces it with an empty payload).
         recall_payload: dict[str, Any] = recall_result
         recall_session_id = str(recall_payload.get("session_id") or "").strip()
-        if (
-            recall_session_id
-            and session.mnemory_session_id is not None
-            and recall_session_id != session.mnemory_session_id
-        ):
-            logger.warning(
-                "context: per-turn recall returned unexpected Mnemory session id",
-                extra={
-                    "extra_data": {
-                        "session_id": session.session_id,
-                        "expected_mnemory_session_id": session.mnemory_session_id,
-                        "returned_mnemory_session_id": recall_session_id,
-                    }
-                },
-            )
-            adopted = await self._adopt_mnemory_session(session, recall_session_id)
-            if adopted:
-                await self.session_cache.mark_prefix_repair_needed(session.session_id)
+        if recall_session_id:
+            if session.mnemory_session_id is None:
+                await self._adopt_mnemory_session(session, recall_session_id)
+            elif recall_session_id != session.mnemory_session_id:
+                logger.warning(
+                    "context: per-turn recall returned unexpected Mnemory session id",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "expected_mnemory_session_id": session.mnemory_session_id,
+                            "returned_mnemory_session_id": recall_session_id,
+                        }
+                    },
+                )
+                adopted = await self._adopt_mnemory_session(session, recall_session_id)
+                if adopted:
+                    await self.session_cache.mark_prefix_repair_needed(session.session_id)
 
         # Format mutable search results
         mutable_search_results = _format_search_results(recall_payload.get("search_results"))
@@ -741,6 +848,7 @@ class ContextAssembler:
                     explicit_model=explicit_model,
                     task_type="default",
                     explicit_provider_id=explicit_provider_id,
+                    acting_user_email=session.user_email,
                 )
             except TypeError:
                 resolved_model, provider_id = await self.llm.resolve_model_target(
@@ -753,6 +861,7 @@ class ContextAssembler:
                     explicit_model=explicit_model,
                     task_type="default",
                     explicit_provider_id=explicit_provider_id,
+                    acting_user_email=session.user_email,
                 )
             except TypeError:
                 resolved_model = await self.llm.resolve_model(
@@ -761,21 +870,30 @@ class ContextAssembler:
                 )
         if provider_id is not None:
             try:
-                model_info = await self.llm.get_model_info(resolved_model, provider_id=provider_id)
+                model_info = await self.llm.get_model_info(
+                    resolved_model,
+                    provider_id=provider_id,
+                    acting_user_email=session.user_email,
+                )
             except TypeError:
                 model_info = await self.llm.get_model_info(resolved_model)
         else:
-            model_info = await self.llm.get_model_info(resolved_model)
+            try:
+                model_info = await self.llm.get_model_info(
+                    resolved_model, acting_user_email=session.user_email
+                )
+            except TypeError:
+                model_info = await self.llm.get_model_info(resolved_model)
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 
         budget = resolve_context_budget(
             max_context_tokens=model_info.context_window,
+            max_input_tokens=model_info.max_input_tokens,
             agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
             model_max_output_tokens=model_info.max_output_tokens,
         )
         max_context_tokens = budget.max_context_tokens
-        reserve_output_tokens = budget.effective_reserve_output_tokens
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
             prompt_context=prompt_context,
@@ -788,7 +906,7 @@ class ContextAssembler:
             immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
-        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+        max_prompt_tokens = budget.available_prompt_tokens
         if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
             immutable_prefix = self._cap_prefix_section(
                 immutable_prefix,
@@ -801,7 +919,7 @@ class ContextAssembler:
                 tool_definitions=tool_definitions or [],
             )
         static_tokens = system_prompt_tokens + tool_schema_tokens
-        dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
+        dynamic_tokens = max(0, budget.available_prompt_tokens - static_tokens)
 
         # ----- Build messages: immutable prefix first, then mutable suffix -----
         messages: list[dict[str, Any]] = []
@@ -830,6 +948,15 @@ class ContextAssembler:
                 "_audit_role": "system",
             }
         )
+        if channel_context_info := _build_channel_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": channel_context_info,
+                    "_audit_source": "channel_context",
+                    "_audit_role": "developer",
+                }
+            )
 
         # History messages (append-only)
         history_messages = await self._events_to_messages(
@@ -839,6 +966,8 @@ class ContextAssembler:
             model_info=model_info,
             owner_email=session.user_email,
             pruned_call_ids=self._resolve_pruned_call_ids(session),
+            disabled_artifact_urls=disabled_artifact_urls,
+            disabled_artifact_ids=disabled_artifact_ids,
         )
         messages.extend(history_messages)
 
@@ -945,6 +1074,8 @@ class ContextAssembler:
                 user_attachments=user_attachments,
                 model_info=model_info,
                 include_user_message=True,
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
             )
             if current_turn_message is not None:
                 messages.append(current_turn_message)
@@ -991,11 +1122,21 @@ class ContextAssembler:
                     user_attachments=user_attachments,
                     model_info=model_info,
                     include_user_message=False,
+                    disabled_artifact_urls=disabled_artifact_urls,
+                    disabled_artifact_ids=disabled_artifact_ids,
                 )
                 if current_turn_attachments is not None:
                     messages.append(current_turn_attachments)
 
-        projection = project_messages(messages)
+        projection = project_messages(
+            messages,
+            policy=ProjectionPolicy.from_budget(
+                max_context_tokens=max_context_tokens,
+                available_prompt_tokens=budget.available_prompt_tokens,
+                phase="cross_turn",
+                pressure_mode="normal",
+            ),
+        )
         messages = self._prune_messages(
             messages=projection.messages,
             resolved_model=resolved_model,
@@ -1010,13 +1151,8 @@ class ContextAssembler:
 
         # Strip internal markers before sending to LLM
         for msg in messages:
-            msg.pop("_immutable_prefix", None)
-            msg.pop("_project_context", None)
-            msg.pop("_prior_context", None)
-            msg.pop("_follow_up_context", None)
-            msg.pop("_routing_reminder", None)
-            msg.pop("_audit_source", None)
-            msg.pop("_audit_role", None)
+            for _marker in ALL_INTERNAL_MARKERS:
+                msg.pop(_marker, None)
 
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
@@ -1049,6 +1185,13 @@ class ContextAssembler:
             dynamic_tokens=dynamic_tokens,
             prompt_tokens=prompt_tokens,
             max_context_tokens=max_context_tokens,
+            max_input_tokens=budget.max_input_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
+            compaction_threshold_prompt_tokens=int(
+                budget.available_prompt_tokens * self.compaction_threshold
+            ),
+            loop_pressure_threshold_prompt_tokens=int(budget.available_prompt_tokens * 0.95),
+            compaction_threshold=self.compaction_threshold,
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
         )
@@ -1077,6 +1220,8 @@ class ContextAssembler:
         include_project_context: bool = True,
         executor_pool: Any = None,
         active_executor_id: str | None = None,
+        disabled_artifact_urls: set[str] | None = None,
+        disabled_artifact_ids: set[str] | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -1107,6 +1252,7 @@ class ContextAssembler:
                     explicit_model=explicit_model,
                     task_type="default",
                     explicit_provider_id=explicit_provider_id,
+                    acting_user_email=session.user_email,
                 )
             except TypeError:
                 resolved_model, provider_id = await self.llm.resolve_model_target(
@@ -1119,6 +1265,7 @@ class ContextAssembler:
                     explicit_model=explicit_model,
                     task_type="default",
                     explicit_provider_id=explicit_provider_id,
+                    acting_user_email=session.user_email,
                 )
             except TypeError:
                 resolved_model = await self.llm.resolve_model(
@@ -1127,21 +1274,30 @@ class ContextAssembler:
                 )
         if provider_id is not None:
             try:
-                model_info = await self.llm.get_model_info(resolved_model, provider_id=provider_id)
+                model_info = await self.llm.get_model_info(
+                    resolved_model,
+                    provider_id=provider_id,
+                    acting_user_email=session.user_email,
+                )
             except TypeError:
                 model_info = await self.llm.get_model_info(resolved_model)
         else:
-            model_info = await self.llm.get_model_info(resolved_model)
+            try:
+                model_info = await self.llm.get_model_info(
+                    resolved_model, acting_user_email=session.user_email
+                )
+            except TypeError:
+                model_info = await self.llm.get_model_info(resolved_model)
         if model_info.model_id == "unknown":
             degraded_sources.append("model_info")
 
         budget = resolve_context_budget(
             max_context_tokens=model_info.context_window,
+            max_input_tokens=model_info.max_input_tokens,
             agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
             model_max_output_tokens=model_info.max_output_tokens,
         )
         max_context_tokens = budget.max_context_tokens
-        reserve_output_tokens = budget.effective_reserve_output_tokens
         prefix_entries = await self._ensure_immutable_prefix(
             session=session,
             agent=agent,
@@ -1162,7 +1318,7 @@ class ContextAssembler:
             immutable_prefix=immutable_prefix,
             tool_definitions=tool_definitions or [],
         )
-        max_prompt_tokens = max(0, max_context_tokens - reserve_output_tokens)
+        max_prompt_tokens = budget.available_prompt_tokens
         if immutable_prefix and system_prompt_tokens + tool_schema_tokens > max_prompt_tokens:
             immutable_prefix = self._cap_prefix_section(
                 immutable_prefix,
@@ -1175,7 +1331,7 @@ class ContextAssembler:
                 tool_definitions=tool_definitions or [],
             )
         static_tokens = system_prompt_tokens + tool_schema_tokens
-        dynamic_tokens = max(0, max_context_tokens - static_tokens - reserve_output_tokens)
+        dynamic_tokens = max(0, budget.available_prompt_tokens - static_tokens)
 
         # Build messages: immutable prefix + env + history
         messages: list[dict[str, Any]] = []
@@ -1202,6 +1358,15 @@ class ContextAssembler:
                 "_audit_role": "system",
             }
         )
+        if channel_context_info := _build_channel_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": channel_context_info,
+                    "_audit_source": "channel_context",
+                    "_audit_role": "developer",
+                }
+            )
 
         history_messages = await self._events_to_messages(
             self.session_cache.get_events_since_compaction(
@@ -1210,6 +1375,8 @@ class ContextAssembler:
             model_info=model_info,
             owner_email=session.user_email,
             pruned_call_ids=self._resolve_pruned_call_ids(session),
+            disabled_artifact_urls=disabled_artifact_urls,
+            disabled_artifact_ids=disabled_artifact_ids,
         )
         messages.extend(history_messages)
 
@@ -1285,6 +1452,8 @@ class ContextAssembler:
                 user_attachments=user_attachments,
                 model_info=model_info,
                 include_user_message=True,
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
             )
             if current_turn_message is not None:
                 messages.append(current_turn_message)
@@ -1324,11 +1493,21 @@ class ContextAssembler:
                     user_attachments=user_attachments,
                     model_info=model_info,
                     include_user_message=False,
+                    disabled_artifact_urls=disabled_artifact_urls,
+                    disabled_artifact_ids=disabled_artifact_ids,
                 )
                 if current_turn_attachments is not None:
                     messages.append(current_turn_attachments)
 
-        projection = project_messages(messages)
+        projection = project_messages(
+            messages,
+            policy=ProjectionPolicy.from_budget(
+                max_context_tokens=max_context_tokens,
+                available_prompt_tokens=budget.available_prompt_tokens,
+                phase="cross_turn",
+                pressure_mode="normal",
+            ),
+        )
         messages = self._prune_messages(
             messages=projection.messages,
             resolved_model=resolved_model,
@@ -1340,13 +1519,8 @@ class ContextAssembler:
         cache_breakpoint_index = _find_cache_breakpoint(messages)
 
         for msg in messages:
-            msg.pop("_immutable_prefix", None)
-            msg.pop("_project_context", None)
-            msg.pop("_prior_context", None)
-            msg.pop("_follow_up_context", None)
-            msg.pop("_routing_reminder", None)
-            msg.pop("_audit_source", None)
-            msg.pop("_audit_role", None)
+            for _marker in ALL_INTERNAL_MARKERS:
+                msg.pop(_marker, None)
         prompt_tokens = (
             self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
         )
@@ -1374,6 +1548,13 @@ class ContextAssembler:
             dynamic_tokens=dynamic_tokens,
             prompt_tokens=prompt_tokens,
             max_context_tokens=max_context_tokens,
+            max_input_tokens=budget.max_input_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
+            compaction_threshold_prompt_tokens=int(
+                budget.available_prompt_tokens * self.compaction_threshold
+            ),
+            loop_pressure_threshold_prompt_tokens=int(budget.available_prompt_tokens * 0.95),
+            compaction_threshold=self.compaction_threshold,
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
         )
@@ -1405,7 +1586,21 @@ class ContextAssembler:
         allow_empty_memory: bool = False,
     ) -> list[ImmutablePrefixEntry]:
         cached_entries = self.session_cache.get_prefix_entries(session.session_id)
-        if cached_entries and not self.session_cache.needs_prefix_repair(session.session_id):
+        if allow_empty_memory:
+            cached_entries = [
+                entry
+                for entry in cached_entries
+                if entry.source not in {"memory_instructions", "core_memories"}
+            ]
+            cached_identity = self._prefix_content(cached_entries, "identity")
+            current_identity = _compose_identity_prompt(agent)
+            if cached_identity != current_identity:
+                cached_entries = [entry for entry in cached_entries if entry.source != "identity"]
+        if (
+            cached_entries
+            and not self.session_cache.needs_prefix_repair(session.session_id)
+            and (allow_empty_memory or session.mnemory_session_id is not None)
+        ):
             return cached_entries
 
         repair_needed = self.session_cache.needs_prefix_repair(session.session_id)
@@ -1707,11 +1902,32 @@ class ContextAssembler:
         return audit_messages
 
     def _project_context_messages(self, session_id: str) -> list[dict[str, Any]]:
+        get_project_metadata_contexts = getattr(
+            self.session_cache, "get_project_metadata_contexts", None
+        )
         get_project_contexts = getattr(self.session_cache, "get_project_contexts", None)
-        if not callable(get_project_contexts):
+        if not callable(get_project_metadata_contexts) and not callable(get_project_contexts):
             return []
         messages: list[dict[str, Any]] = []
-        for entry in get_project_contexts(session_id):
+        if callable(get_project_metadata_contexts):
+            metadata_contexts = get_project_metadata_contexts(session_id)
+            if isinstance(metadata_contexts, list):
+                for entry in metadata_contexts:
+                    if not getattr(entry, "content", None):
+                        continue
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": str(entry.content),
+                            "_project_context": True,
+                        }
+                    )
+        if not callable(get_project_contexts):
+            return messages
+        project_contexts = get_project_contexts(session_id)
+        if not isinstance(project_contexts, list):
+            return messages
+        for entry in project_contexts:
             if not getattr(entry, "content", None):
                 continue
             messages.append(
@@ -1886,6 +2102,8 @@ class ContextAssembler:
         model_info: Any | None,
         owner_email: str | None,
         pruned_call_ids: set[str] | None = None,
+        disabled_artifact_urls: set[str] | None = None,
+        disabled_artifact_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         hydrated_events = await self._hydrate_history_attachment_urls(
             events,
@@ -1895,6 +2113,8 @@ class ContextAssembler:
             hydrated_events,
             model_info=model_info,
             pruned_call_ids=pruned_call_ids,
+            disabled_artifact_urls=disabled_artifact_urls,
+            disabled_artifact_ids=disabled_artifact_ids,
         )
 
     async def _hydrate_history_attachment_urls(
@@ -2052,6 +2272,8 @@ def _attachment_content_message(
     content: str,
     attachments: list[dict[str, Any]],
     model_info: Any | None,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if model_info is None:
         if role == "assistant":
@@ -2061,7 +2283,12 @@ def _attachment_content_message(
             }
         return {"role": role, "content": f"{content}\n\n{_attachment_note(attachments)}"}
 
-    attachment_blocks, unsupported = _native_attachment_blocks(attachments, model_info)
+    attachment_blocks, unsupported = _native_attachment_blocks(
+        attachments,
+        model_info,
+        disabled_artifact_urls=disabled_artifact_urls,
+        disabled_artifact_ids=disabled_artifact_ids,
+    )
     if not attachment_blocks:
         HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_unsupported").inc(
             len(attachments)
@@ -2111,6 +2338,8 @@ def events_to_messages(
     *,
     model_info: Any | None = None,
     pruned_call_ids: set[str] | None = None,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Convert session events to LLM message dicts.
 
@@ -2211,16 +2440,18 @@ def events_to_messages(
             if isinstance(content, str):
                 attachments = event_data.get("attachments")
                 if isinstance(attachments, list) and attachments:
-                    messages.append(
-                        _attachment_content_message(
-                            role="user",
-                            content=content,
-                            attachments=[a for a in attachments[:20] if isinstance(a, dict)],
-                            model_info=model_info,
-                        )
+                    msg = _attachment_content_message(
+                        role="user",
+                        content=content,
+                        attachments=[a for a in attachments[:20] if isinstance(a, dict)],
+                        model_info=model_info,
+                        disabled_artifact_urls=disabled_artifact_urls,
+                        disabled_artifact_ids=disabled_artifact_ids,
                     )
+                    msg[TURN_BOUNDARY] = True
+                    messages.append(msg)
                 else:
-                    messages.append({"role": "user", "content": content})
+                    messages.append({"role": "user", "content": content, TURN_BOUNDARY: True})
         elif event_type == "assistant_message":
             _append_orphan_placeholders()
             content = event_data.get("content")
@@ -2232,14 +2463,6 @@ def events_to_messages(
                     messages.append(
                         {"role": "assistant", "content": f"{content}\n\n{assistant_context}"}
                     )
-                    native_context = _attachment_content_message(
-                        role="user",
-                        content="Assistant attached the following artifacts in the previous message.",
-                        attachments=safe_attachments,
-                        model_info=model_info,
-                    )
-                    if isinstance(native_context.get("content"), list):
-                        messages.append(native_context)
                 else:
                     messages.append({"role": "assistant", "content": content})
         elif event_type == "tool_result":
@@ -2264,6 +2487,13 @@ def events_to_messages(
 
                     rendered_output = cleared_tool_result_marker(call_id)
                     pruned_view = True
+                presentation = event_data.get("tool_output_presentation")
+                if not isinstance(presentation, dict):
+                    presentation = {}
+                anchors_available = event_data.get(
+                    "anchors_available", presentation.get("anchors_available")
+                )
+                anchor_count = event_data.get("anchor_count", presentation.get("anchor_count"))
                 messages.append(
                     {
                         "role": "tool",
@@ -2274,8 +2504,13 @@ def events_to_messages(
                         "_protected_tool_output": bool(event_data.get("protect_from_pruning")),
                         "_has_full_output": bool(event_data.get("has_full_output")),
                         "_recovery_call_id": event_data.get("recovery_call_id"),
+                        "_tool_output_artifact_id": event_data.get("tool_output_artifact_id"),
                         "_source_call_id": event_data.get("source_call_id"),
                         "_output_size": event_data.get("output_size"),
+                        "_agent_visible_truncated": bool(event_data.get("agent_visible_truncated")),
+                        "_tool_output_presentation": presentation,
+                        "_anchors_available": bool(anchors_available),
+                        "_anchor_count": anchor_count if isinstance(anchor_count, int) else None,
                         "_pruned_view": pruned_view,
                     }
                 )
@@ -2591,7 +2826,9 @@ def _compact_oldest_droppable_tool_group(
         changed = compacted[index] != message
         for result_index in result_indices:
             tool_message = messages[result_index]
-            if tool_message.get("_protected_tool_output") or tool_message.get("_projected_compacted"):
+            if tool_message.get("_protected_tool_output") or tool_message.get(
+                "_projected_compacted"
+            ):
                 continue
             content = tool_message.get("content")
             if not isinstance(content, str) or not content:
@@ -2700,8 +2937,9 @@ def _is_immutable_prefix_message(message: dict[str, Any]) -> bool:
 
     The assembled immutable prefix is emitted as a single marked system
     message so cache-breakpoint detection does not need content heuristics.
+    Uses the ``IMMUTABLE_PREFIX`` marker constant from ``message_markers``.
     """
-    return message.get("role") == "system" and bool(message.get("_immutable_prefix"))
+    return message.get("role") == "system" and bool(message.get(IMMUTABLE_PREFIX))
 
 
 def _is_protected_context_message(message: dict[str, Any]) -> bool:

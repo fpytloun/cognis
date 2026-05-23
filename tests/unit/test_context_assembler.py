@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from time import monotonic
 
@@ -8,10 +9,12 @@ import pytest
 
 from cognis.core.context import (
     ContextAssembler,
+    _build_channel_context_info,
     _build_environment_info,
     _load_project_instructions,
 )
 from cognis.core.errors import ImmutablePrefixUnavailable
+from cognis.core.executor_pool import ExecutorAvailability, ExecutorPool, ResolvedExecutorTarget
 from cognis.core.followups import (
     FollowUpMode,
     FollowUpOriginKind,
@@ -51,6 +54,7 @@ class _SessionCache:
         self.refresh_calls = 0
         self.prefix_entries: list[ImmutablePrefixEntry] = []
         self.prefix_entries_after_refresh: list[ImmutablePrefixEntry] = []
+        self.history_events: list[dict[str, object]] = []
         self.prefix_repair_needed = False
         self.last_repair_attempt_at: float | None = None
         self.mark_prefix_repair_calls = 0
@@ -82,7 +86,7 @@ class _SessionCache:
 
     def get_events_since_compaction(self, session_id: str, types: list[str] | None = None) -> list:
         del session_id, types
-        return []
+        return list(self.history_events)
 
     def get_prefix_entries(self, session_id: str) -> list[ImmutablePrefixEntry]:
         del session_id
@@ -254,6 +258,44 @@ class _LLM:
         return sum(max(1, len(str(message.get("content", ""))) // 4) for message in messages)
 
 
+class _ScopedLLM(_LLM):
+    def __init__(self) -> None:
+        self.resolve_calls: list[dict[str, object]] = []
+        self.info_calls: list[dict[str, object]] = []
+
+    async def resolve_model_target(
+        self,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
+        acting_user_email: str | None = None,
+    ) -> tuple[str, str | None]:
+        self.resolve_calls.append(
+            {
+                "explicit_model": explicit_model,
+                "task_type": task_type,
+                "explicit_provider_id": explicit_provider_id,
+                "acting_user_email": acting_user_email,
+            }
+        )
+        return explicit_model or "test-model", explicit_provider_id
+
+    async def get_model_info(
+        self,
+        model_id: str,
+        provider_id: str | None = None,
+        acting_user_email: str | None = None,
+    ) -> ModelInfo:
+        self.info_calls.append(
+            {
+                "model_id": model_id,
+                "provider_id": provider_id,
+                "acting_user_email": acting_user_email,
+            }
+        )
+        return ModelInfo(model_id=model_id, context_window=20000, max_output_tokens=256)
+
+
 class _VisionLLM(_LLM):
     async def get_model_info(self, model_id: str) -> ModelInfo:
         del model_id
@@ -262,6 +304,18 @@ class _VisionLLM(_LLM):
             context_window=20000,
             max_output_tokens=256,
             supports_vision=True,
+        )
+
+
+class _FileLLM(_LLM):
+    async def get_model_info(self, model_id: str) -> ModelInfo:
+        del model_id
+        return ModelInfo(
+            model_id="test-model",
+            context_window=20000,
+            max_output_tokens=256,
+            supports_pdf_input=True,
+            supports_file_input=True,
         )
 
 
@@ -329,6 +383,24 @@ def _conversation() -> ConversationModel:
     )
 
 
+def _signal_conversation() -> ConversationModel:
+    return ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="signal",
+            ref="signal:acct:+420",
+            platform_data={
+                "channel_type": "signal",
+                "chat_type": "group",
+                "chat_name": "Ops",
+                "thread_id": "thread-1",
+            },
+        ),
+    )
+
+
 def _session(mnemory_session_id: str | None = None) -> SessionModel:
     return SessionModel(
         session_id="session-1",
@@ -338,6 +410,101 @@ def _session(mnemory_session_id: str | None = None) -> SessionModel:
         intaris_session_id="session-1",
         mnemory_session_id=mnemory_session_id,
     )
+
+
+def test_build_channel_context_info_is_channel_only() -> None:
+    assert _build_channel_context_info(ConversationContext(type="web")) is None
+    assert _build_channel_context_info(ConversationContext(type="task", ref="task-1")) is None
+    assert _build_channel_context_info(ConversationContext(type="direct")) is None
+
+    content = _build_channel_context_info(
+        ConversationContext(
+            type="signal",
+            ref="signal:acct:+420",
+            platform_data={
+                "channel_type": "signal",
+                "chat_type": "group",
+                "chat_name": "Ops",
+                "thread_id": "thread-1",
+            },
+        )
+    )
+
+    assert content is not None
+    assert "Conversation channel context:" in content
+    assert "- Channel: signal" in content
+    assert "- Chat type: group" in content
+    assert "- Chat name: Ops" in content
+    assert "- Thread-bound: yes" in content
+    assert "delegate(wait=false)" in content
+    assert "create_task" in content
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_injects_channel_context_only_for_channel_conversations() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    signal_result = await assembler.assemble(
+        session=_session(),
+        conversation=_signal_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[],
+    )
+    signal_messages = [str(message.get("content", "")) for message in signal_result.messages]
+
+    assert any("Conversation channel context:" in message for message in signal_messages)
+    assert any("delegate(wait=false)" in message for message in signal_messages)
+
+    web_result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[],
+    )
+    web_messages = [str(message.get("content", "")) for message in web_result.messages]
+
+    assert not any("Conversation channel context:" in message for message in web_messages)
+    assert not any("Keep the channel unblocked" in message for message in web_messages)
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_passes_actor_scope_to_model_resolution() -> None:
+    llm = _ScopedLLM()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    agent = _agent().model_copy(
+        update={"llm_config": AgentLLMConfig(model=None, provider_id="user-claude")}
+    )
+
+    await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=agent,
+        user_message="please help",
+        tool_definitions=[],
+    )
+
+    assert llm.resolve_calls[0]["explicit_provider_id"] == "user-claude"
+    assert llm.resolve_calls[0]["acting_user_email"] == "user@example.com"
+    assert llm.info_calls[0]["provider_id"] == "user-claude"
+    assert llm.info_calls[0]["acting_user_email"] == "user@example.com"
 
 
 @pytest.mark.asyncio
@@ -377,6 +544,168 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
     assert memory.recall_calls[0]["session_id"] == "mem-1"
     assert session_manager.attached == [("session-1", "mem-1")]
     assert any('trust="untrusted"' in str(message["content"]) for message in result.messages)
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skips_disabled_artifact_urls() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_FileLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Read this",
+        user_attachments=[
+            {
+                "artifact_id": "art_1",
+                "kind": "pdf",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+                "url": blocked_url,
+            }
+        ],
+        disabled_artifact_urls={blocked_url},
+        tool_definitions=[],
+    )
+
+    serialized = json.dumps(result.messages)
+    assert blocked_url not in serialized
+    assert "report.pdf" in serialized
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skips_disabled_artifact_urls_from_history() -> None:
+    cache = _SessionCache()
+    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    cache.history_events = [
+        {
+            "type": "user_message",
+            "data": {
+                "content": "Read this",
+                "attachments": [
+                    {
+                        "artifact_id": "art_1",
+                        "kind": "pdf",
+                        "mime_type": "application/pdf",
+                        "filename": "report.pdf",
+                        "url": blocked_url,
+                    }
+                ],
+            },
+        }
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_FileLLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Read this",
+        disabled_artifact_urls={blocked_url},
+        tool_definitions=[],
+    )
+
+    serialized = json.dumps(result.messages)
+    assert blocked_url not in serialized
+    assert "report.pdf" in serialized
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skips_disabled_artifact_ids_from_history() -> None:
+    cache = _SessionCache()
+    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    cache.history_events = [
+        {
+            "type": "user_message",
+            "data": {
+                "content": "Read this",
+                "attachments": [
+                    {
+                        "artifact_id": "doc_1",
+                        "kind": "pdf",
+                        "mime_type": "application/pdf",
+                        "filename": "report.pdf",
+                        "url": artifact_url,
+                    }
+                ],
+            },
+        }
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_FileLLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Read this",
+        disabled_artifact_ids={"doc_1"},
+        tool_definitions=[],
+    )
+
+    serialized = json.dumps(result.messages)
+    assert artifact_url not in serialized
+    assert "report.pdf" in serialized
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skips_disabled_artifact_ids_from_current_turn() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_FileLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Read this",
+        user_attachments=[
+            {
+                "artifact_id": "doc_1",
+                "kind": "pdf",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+                "url": artifact_url,
+            }
+        ],
+        disabled_artifact_ids={"doc_1"},
+        tool_definitions=[],
+    )
+
+    serialized = json.dumps(result.messages)
+    assert artifact_url not in serialized
+    assert "report.pdf" in serialized
 
 
 @pytest.mark.asyncio
@@ -648,6 +977,54 @@ async def test_context_assembler_adopts_forged_per_turn_mnemory_session_and_mark
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_rebuilds_mnemory_session_after_rotation_with_cached_prefix() -> (
+    None
+):
+    memory = _Memory()
+    cache = _SessionCache()
+    cache.prefix_entries = [
+        ImmutablePrefixEntry(role="system", source="identity", content="Stale identity", seq=1),
+        ImmutablePrefixEntry(
+            role="developer",
+            source="memory_instructions",
+            content="Stale memory instructions",
+            seq=2,
+        ),
+        ImmutablePrefixEntry(
+            role="developer", source="core_memories", content="stale core memories", seq=3
+        ),
+    ]
+    session_manager = _SessionManager()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=session_manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    session = _session(mnemory_session_id=None)
+
+    result = await assembler.assemble(
+        session=session,
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="after compaction turn",
+        tool_definitions=[],
+    )
+
+    assert memory.identity_calls == [
+        {"session_id": None, "labels": {"project": "cognis"}, "context": "cached intention"}
+    ]
+    assert memory.recall_calls[0]["session_id"] == "mem-1"
+    assert session_manager.attached == [("session-1", "mem-1")]
+    assert session.mnemory_session_id == "mem-1"
+    assert "prefers Python" in str(result.messages[0]["content"])
+    assert "stale core memories" not in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_degrades_on_mnemory_failure() -> None:
     """Mnemory recall failure must degrade gracefully, not abort the turn.
 
@@ -837,6 +1214,43 @@ def test_build_environment_info_marks_unavailable_remote_environment() -> None:
     assert "unavailable" in info
     assert "Do not guess controller paths" in info
     assert "get_current_datetime" in info
+
+
+def test_build_environment_info_warns_additional_executors_are_not_fallback() -> None:
+    pool = ExecutorPool(
+        primary=[
+            ResolvedExecutorTarget(
+                executor_id="exec-primary",
+                executor_type="websocket",
+                is_primary=True,
+                selection_source="explicit",
+                description=None,
+                state=ExecutorAvailability.USABLE,
+            )
+        ],
+        additional=[
+            ResolvedExecutorTarget(
+                executor_id="raspi-camera",
+                executor_type="websocket",
+                is_primary=False,
+                selection_source="additional_explicit",
+                description="camera host",
+                state=ExecutorAvailability.USABLE,
+            )
+        ],
+    )
+
+    info = _build_environment_info(
+        ExecutorEnvironmentSnapshot(available=True, executor_id="exec-primary"),
+        executor_pool=pool,
+        active_executor_id="exec-primary",
+    )
+
+    assert "Assigned executors" in info
+    assert "Use primary executors for normal work" in info
+    assert "do not use them as fallback capacity" in info
+    assert "only when the task explicitly requires that specific machine" in info
+    assert "switch back to a primary executor before unrelated or generic" in info
 
 
 @pytest.mark.asyncio
@@ -1148,6 +1562,59 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "Recalled memories:" not in content
     assert result.cache_breakpoint_index == 0
     assert "Home directory:" in str(result.messages[1]["content"])
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_skip_memory_ignores_forked_owner_prefix() -> None:
+    cache = _SessionCache()
+    cache.prefix_entries = [
+        ImmutablePrefixEntry(
+            role="system",
+            source="identity",
+            content="You are Riker, the main owner agent.",
+            seq=1,
+        ),
+        ImmutablePrefixEntry(
+            role="developer",
+            source="core_memories",
+            content="## Agent Identity\n- Riker owner identity",
+            seq=2,
+        ),
+    ]
+    memory = _Memory()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session().model_copy(update={"agent_id": "system:architect"}),
+        conversation=_conversation().model_copy(update={"agent_id": "system:architect"}),
+        agent=AgentDefinition(
+            agent_id="system:architect",
+            owner_email="system@cognis.local",
+            name="Architect",
+            system_prompt="Review architecture risks only.",
+            agent_type="secondary",
+            is_system=True,
+            llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+        ),
+        user_message="review the plan",
+        tool_definitions=[],
+        skip_memory=True,
+        prompt_context=PromptContext.TASK_STEP,
+    )
+
+    content = str(result.messages[0]["content"])
+    assert "Review architecture risks only." in content
+    assert "You are Riker" not in content
+    assert "Riker owner identity" not in content
+    assert memory.identity_calls == []
 
 
 @pytest.mark.asyncio

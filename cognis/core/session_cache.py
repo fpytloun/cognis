@@ -31,8 +31,10 @@ from cognis.core.immutable_prefix import (
 from cognis.core.project_context import (
     PROJECT_CONTEXT_STATUS_LOADED,
     ProjectContextEntry,
+    ProjectMetadataEntry,
     normalize_project_path,
     project_context_from_event_data,
+    project_metadata_from_event_data,
 )
 from cognis.logging import get_logger
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
@@ -87,6 +89,10 @@ class ActiveThinkingBlock:
     content: str = ""
     source: str = "summary"
     complete: bool = False
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    provider_block_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -123,11 +129,14 @@ class CachedSessionState:
     # Context usage from last context assembly
     last_prompt_tokens: int = 0
     max_context_tokens: int = 0
+    max_input_tokens: int = 0
+    available_prompt_tokens: int = 0
     context_model: str = ""
     context_provider_id: str | None = None
     reserve_output_tokens: int = 0
     effective_reserve_output_tokens: int = 0
     last_llm_usage: dict[str, int] = field(default_factory=dict)
+    context_metadata: dict[str, Any] = field(default_factory=dict)
     context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
@@ -146,6 +155,7 @@ class CachedSessionState:
     # store retains the original for ``read_tool_output`` recovery).
     pruned_tool_call_ids: set[str] = field(default_factory=set)
     discovered_tool_handles: dict[str, DiscoveredToolHandle] = field(default_factory=dict)
+    project_metadata_contexts: dict[str, ProjectMetadataEntry] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
 
 
@@ -194,11 +204,14 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "last_repair_attempt_at": entry.last_repair_attempt_at,
             "last_prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
+            "max_input_tokens": entry.max_input_tokens,
+            "available_prompt_tokens": entry.available_prompt_tokens,
             "context_model": entry.context_model,
             "context_provider_id": entry.context_provider_id,
             "reserve_output_tokens": entry.reserve_output_tokens,
             "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
             "last_llm_usage": entry.last_llm_usage,
+            "context_metadata": entry.context_metadata,
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "reasoning_effort_override": entry.reasoning_effort_override,
@@ -220,6 +233,22 @@ def _serialize_entry(entry: CachedSessionState) -> str:
                 }
                 for item in sorted(
                     entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
+                )
+            ],
+            "project_metadata_contexts": [
+                {
+                    "project_id": item.project_id,
+                    "project_name": item.project_name,
+                    "project_root": item.project_root,
+                    "source_id": item.source_id,
+                    "content": item.content,
+                    "content_hash": item.content_hash,
+                    "working_directory": item.working_directory,
+                    "seq": item.seq,
+                }
+                for item in sorted(
+                    entry.project_metadata_contexts.values(),
+                    key=lambda item: (item.seq, item.project_id),
                 )
             ],
         },
@@ -255,6 +284,8 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         last_repair_attempt_at=data.get("last_repair_attempt_at"),
         last_prompt_tokens=data.get("last_prompt_tokens", 0),
         max_context_tokens=data.get("max_context_tokens", 0),
+        max_input_tokens=data.get("max_input_tokens", 0),
+        available_prompt_tokens=data.get("available_prompt_tokens", 0),
         context_model=data.get("context_model", ""),
         context_provider_id=data.get("context_provider_id"),
         reserve_output_tokens=data.get("reserve_output_tokens", 0),
@@ -264,6 +295,11 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             for key, value in data.get("last_llm_usage", {}).items()
             if isinstance(key, str) and isinstance(value, int | float)
         },
+        context_metadata=(
+            dict(data.get("context_metadata", {}))
+            if isinstance(data.get("context_metadata"), dict)
+            else {}
+        ),
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
@@ -298,6 +334,34 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
                 if isinstance(item, dict) and isinstance(item.get("project_root"), str)
             )
             if entry.project_root
+        },
+        project_metadata_contexts={
+            entry.project_id: entry
+            for entry in (
+                ProjectMetadataEntry(
+                    project_id=str(item.get("project_id") or ""),
+                    project_name=str(item.get("project_name") or ""),
+                    project_root=normalize_project_path(item.get("project_root")),
+                    source_id=(
+                        str(item.get("source_id"))
+                        if isinstance(item.get("source_id"), str)
+                        else None
+                    ),
+                    content=(
+                        str(item.get("content")) if isinstance(item.get("content"), str) else None
+                    ),
+                    content_hash=(
+                        str(item.get("content_hash"))
+                        if isinstance(item.get("content_hash"), str)
+                        else None
+                    ),
+                    working_directory=normalize_project_path(item.get("working_directory")),
+                    seq=int(item.get("seq") or 0),
+                )
+                for item in data.get("project_metadata_contexts", [])
+                if isinstance(item, dict) and isinstance(item.get("project_id"), str)
+            )
+            if entry.project_id
         },
     )
     for raw_event in data.get("events", []):
@@ -429,6 +493,11 @@ class SessionCache:
         title: str | None,
         complete: bool,
         content: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        duration_ms: int | None = None,
+        source: str | None = None,
+        provider_block_index: int | None = None,
     ) -> None:
         """Store an in-memory thinking delta for live, unpersisted session logs."""
 
@@ -442,7 +511,13 @@ class SessionCache:
             self._active_thinking[session_id] = state
         block = state.blocks.get(block_id)
         if block is None:
-            block = ActiveThinkingBlock(block_id=block_id, title=title or "Thinking")
+            block = ActiveThinkingBlock(
+                block_id=block_id,
+                title=title or "Thinking",
+                started_at=started_at,
+                source=source or "summary",
+                provider_block_index=provider_block_index,
+            )
             state.blocks[block_id] = block
         if content is not None:
             block.content = content
@@ -450,6 +525,16 @@ class SessionCache:
             block.content += delta
         if title:
             block.title = title
+        if started_at:
+            block.started_at = started_at
+        if completed_at:
+            block.completed_at = completed_at
+        if duration_ms is not None:
+            block.duration_ms = duration_ms
+        if source:
+            block.source = source
+        if provider_block_index is not None:
+            block.provider_block_index = provider_block_index
         block.complete = complete
         state.updated_at = datetime.now(UTC).isoformat()
         if complete:
@@ -471,6 +556,10 @@ class SessionCache:
                 "content": block.content,
                 "source": block.source,
                 "complete": block.complete,
+                "started_at": block.started_at,
+                "completed_at": block.completed_at,
+                "duration_ms": block.duration_ms,
+                "provider_block_index": block.provider_block_index,
             }
             for block in state.blocks.values()
             if block.content
@@ -770,9 +859,13 @@ class SessionCache:
         prompt_tokens: int,
         max_context_tokens: int,
         model: str,
+        max_input_tokens: int | None = None,
+        available_prompt_tokens: int | None = None,
         provider_id: str | None = None,
         reserve_output_tokens: int | None = None,
         effective_reserve_output_tokens: int | None = None,
+        compaction_threshold: float | None = None,
+        projection_policy: dict[str, Any] | None = None,
     ) -> None:
         """Store the latest prompt-usage snapshot for a session."""
 
@@ -780,12 +873,20 @@ class SessionCache:
         if entry is not None:
             entry.last_prompt_tokens = prompt_tokens
             entry.max_context_tokens = max_context_tokens
+            if max_input_tokens is not None:
+                entry.max_input_tokens = max_input_tokens
+            if available_prompt_tokens is not None:
+                entry.available_prompt_tokens = available_prompt_tokens
             entry.context_model = model
             entry.context_provider_id = provider_id
             if reserve_output_tokens is not None:
                 entry.reserve_output_tokens = reserve_output_tokens
             if effective_reserve_output_tokens is not None:
                 entry.effective_reserve_output_tokens = effective_reserve_output_tokens
+            if compaction_threshold is not None:
+                entry.context_metadata["compaction_threshold"] = float(compaction_threshold)
+            if projection_policy is not None:
+                entry.context_metadata["projection_policy"] = dict(projection_policy)
 
     def get_context_usage(self, session_id: str) -> dict[str, Any] | None:
         """Get the cached context usage for a session.
@@ -797,12 +898,16 @@ class SessionCache:
         entry = self.get_entry(session_id)
         if entry is None or entry.max_context_tokens <= 0:
             return None
-        effective_prompt_budget = max(
-            0, entry.max_context_tokens - entry.effective_reserve_output_tokens
-        )
+        effective_prompt_budget = entry.available_prompt_tokens
+        if effective_prompt_budget <= 0:
+            effective_prompt_budget = max(
+                0, entry.max_context_tokens - entry.effective_reserve_output_tokens
+            )
         return {
             "prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
+            "max_input_tokens": entry.max_input_tokens,
+            "available_prompt_tokens": effective_prompt_budget,
             "percentage": round(entry.last_prompt_tokens / entry.max_context_tokens * 100, 1),
             "model": entry.context_model,
             "provider_id": entry.context_provider_id,
@@ -814,6 +919,8 @@ class SessionCache:
             ),
             "effective_prompt_budget": effective_prompt_budget,
             "loop_pressure_threshold": int(effective_prompt_budget * 0.95),
+            "compaction_threshold": entry.context_metadata.get("compaction_threshold"),
+            "projection_policy": entry.context_metadata.get("projection_policy"),
             "last_llm_usage": dict(entry.last_llm_usage),
         }
 
@@ -1037,6 +1144,61 @@ class SessionCache:
             entry.project_contexts.values(), key=lambda item: (item.seq, item.project_root)
         )
 
+    def get_project_metadata_contexts(self, session_id: str) -> list[ProjectMetadataEntry]:
+        """Return frozen DB project metadata contexts in stable load order."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return []
+        return sorted(
+            entry.project_metadata_contexts.values(), key=lambda item: (item.seq, item.project_id)
+        )
+
+    def get_project_metadata_context(
+        self, session_id: str, project_id: str | None
+    ) -> ProjectMetadataEntry | None:
+        """Return one frozen DB project metadata context by project id."""
+
+        if not isinstance(project_id, str) or not project_id.strip():
+            return None
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return None
+        return entry.project_metadata_contexts.get(project_id)
+
+    async def store_project_metadata_context(
+        self,
+        session_id: str,
+        project_metadata: ProjectMetadataEntry,
+    ) -> ProjectMetadataEntry:
+        """Persist one frozen DB project metadata context in cache state."""
+
+        if (
+            not isinstance(project_metadata.project_id, str)
+            or not project_metadata.project_id.strip()
+        ):
+            raise ValueError("project_id is required")
+        entry = self.get_entry(session_id)
+        if entry is None:
+            raise KeyError(f"Unknown session cache entry: {session_id}")
+        normalized_context = ProjectMetadataEntry(
+            project_id=project_metadata.project_id,
+            project_name=project_metadata.project_name,
+            project_root=normalize_project_path(project_metadata.project_root),
+            source_id=project_metadata.source_id,
+            content=project_metadata.content,
+            content_hash=project_metadata.content_hash,
+            working_directory=normalize_project_path(project_metadata.working_directory),
+            seq=int(project_metadata.seq or 0),
+        )
+        async with entry.lock:
+            existing = entry.project_metadata_contexts.get(project_metadata.project_id)
+            if existing is None or existing.seq <= 0:
+                entry.project_metadata_contexts[project_metadata.project_id] = normalized_context
+            entry.touched_at = monotonic()
+        await self._redis_set(entry)
+        return entry.project_metadata_contexts[project_metadata.project_id]
+
     def get_project_context(
         self, session_id: str, project_root: str | None
     ) -> ProjectContextEntry | None:
@@ -1249,6 +1411,7 @@ class SessionCache:
         entry.prefix_repair_needed = False
         entry.discovered_tool_handles = {}
         entry.project_contexts = {}
+        entry.project_metadata_contexts = {}
         self._apply_intaris_events(entry, raw_events)
         self._rebuild_prefix_from_raw_events(entry, raw_events)
 
@@ -1440,6 +1603,11 @@ class SessionCache:
 
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
         if event.type in PREFIX_EVENT_TYPES:
+            project_metadata = project_metadata_from_event_data(event.data, seq=event.seq)
+            if project_metadata is not None:
+                existing_metadata = entry.project_metadata_contexts.get(project_metadata.project_id)
+                if existing_metadata is None or existing_metadata.seq <= 0:
+                    entry.project_metadata_contexts[project_metadata.project_id] = project_metadata
             project_context = project_context_from_event_data(event.data, seq=event.seq)
             if project_context is not None:
                 existing = entry.project_contexts.get(project_context.project_root)

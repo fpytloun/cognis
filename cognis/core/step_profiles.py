@@ -111,7 +111,6 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
             matrix={
                 "datetime": _caps(ToolCapability.READ),
                 "filesystem": _caps(ToolCapability.READ),
-                "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "conversations": _caps(ToolCapability.READ),
                 "system": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),
@@ -136,7 +135,6 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
                     ToolCapability.READ, ToolCapability.WRITE, ToolCapability.PRIVILEGED
                 ),
                 "filesystem": _caps(ToolCapability.READ, ToolCapability.WRITE),
-                "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "conversations": _caps(ToolCapability.READ),
                 "shell": _caps(ToolCapability.WRITE, ToolCapability.PRIVILEGED),
                 "system": _caps(ToolCapability.READ),
@@ -158,7 +156,6 @@ STEP_PROFILES: dict[str, StepProfileDefinition] = {
         config=StepProfileConfig(
             matrix={
                 "filesystem": _caps(ToolCapability.READ),
-                "memory": _caps(ToolCapability.READ, ToolCapability.WRITE),
                 "conversations": _caps(ToolCapability.READ),
                 "system": _caps(ToolCapability.READ),
                 "web": _caps(ToolCapability.READ),

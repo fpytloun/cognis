@@ -501,7 +501,7 @@ def test_events_to_messages_replays_historic_user_image_natively() -> None:
     }
 
 
-def test_events_to_messages_replays_historic_assistant_image_natively() -> None:
+def test_events_to_messages_replays_historic_assistant_attachment_as_metadata_only() -> None:
     events = [
         {
             "type": "assistant_message",
@@ -533,14 +533,9 @@ def test_events_to_messages_replays_historic_assistant_image_natively() -> None:
 
     assert messages[0]["role"] == "assistant"
     assert "<assistant_attachments>" in messages[0]["content"]
-    assert messages[1]["role"] == "user"
-    content = messages[1]["content"]
-    assert isinstance(content, list)
-    assert "Assistant attached" in content[0]["text"]
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "https://cognis.example.com/artifacts/img_1/banner.png"},
-    }
+    assert len(messages) == 1
+    assert "banner.png" in messages[0]["content"]
+    assert "https://cognis.example.com/artifacts/img_1/banner.png" not in str(messages)
 
 
 def test_events_to_messages_escapes_assistant_attachment_context() -> None:

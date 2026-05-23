@@ -56,7 +56,8 @@ def test_call_id_included_in_marker() -> None:
     result, was_truncated = middle_truncate(text, 500, call_id="call_abc123")
     assert was_truncated is True
     assert "list_tool_output_anchors(call_id='call_abc123')" in result
-    assert "read_tool_output_anchor(call_id='call_abc123', anchor='result:1')" in result
+    assert "read_tool_output_anchor" not in result
+    assert "anchor='result:1'" not in result
     assert "search_tool_output(call_id='call_abc123', pattern='error|timeout|keyword')" in result
     assert "read_tool_output(call_id='call_abc123')" in result
 
@@ -122,8 +123,9 @@ def test_marker_caps_inline_anchor_list() -> None:
     assert "section:9" not in result.split("Available anchors:")[1]
 
 
-def test_marker_falls_back_to_placeholder_when_no_anchors() -> None:
+def test_marker_does_not_invent_anchor_when_no_anchors() -> None:
     text = "x" * 5000
     result, _ = middle_truncate(text, 800, call_id="call_xyz", anchors=[])
-    assert "anchor='result:1'" in result
+    assert "read_tool_output_anchor" not in result
+    assert "anchor='result:1'" not in result
     assert "Available anchors:" not in result

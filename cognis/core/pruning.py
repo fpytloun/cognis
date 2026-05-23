@@ -5,7 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from cognis.core.context_projection import default_token_estimate, prune_projected_messages
+from cognis.core.context_projection import (
+    ProjectionPolicy,
+    ProjectionPressureMode,
+    default_token_estimate,
+    prune_projected_messages,
+)
 
 PRUNE_PROTECT_TOKENS = 40_000
 PRUNE_MINIMUM_TOKENS = 20_000
@@ -20,8 +25,16 @@ def prune_tool_outputs(
     min_index_to_modify: int = 0,
     arg_clear_threshold: int = _ARG_CLEAR_THRESHOLD,
     token_counter: Callable[[str], int] | None = None,
+    pressure_mode: ProjectionPressureMode = "normal",
+    policy: ProjectionPolicy | None = None,
 ) -> list[dict[str, Any]]:
     """Fallback pruning for the mutable tail of a projected transcript."""
+
+    if policy is not None:
+        protect_tokens = policy.prune_protect_tokens
+        minimum_savings = policy.prune_minimum_savings_tokens
+        arg_clear_threshold = policy.arg_clear_threshold
+        pressure_mode = policy.pressure_mode
 
     return prune_projected_messages(
         messages,
@@ -30,4 +43,5 @@ def prune_tool_outputs(
         min_index_to_modify=min_index_to_modify,
         arg_clear_threshold=arg_clear_threshold,
         token_counter=token_counter or default_token_estimate,
+        pressure_mode=pressure_mode,
     )

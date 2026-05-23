@@ -95,6 +95,8 @@ class ToolExposureContract:
     discovery_mode: ToolDiscoveryMode
     native_apply_patch: bool = False
     native_apply_patch_reason: str | None = None
+    native_apply_patch_tool_type: str | None = None
+    anthropic_defer_loading: bool = True
 
 
 def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
@@ -122,7 +124,9 @@ def preferred_edit_tool_mode(model_id: str | None) -> EditToolMode:
     return EditToolMode.EXACT
 
 
-def filter_edit_tools_for_model(tools: list[ToolDefinition], model_id: str | None) -> list[ToolDefinition]:
+def filter_edit_tools_for_model(
+    tools: list[ToolDefinition], model_id: str | None
+) -> list[ToolDefinition]:
     """Drop mutually-exclusive edit tools when both surfaces are available."""
 
     tool_names = {tool.name for tool in tools}
@@ -215,12 +219,12 @@ def prepare_tool_exposure(
     # ``promoted_tool_ids`` — provider packing and ``_unique_tools`` handle
     # dedup against ``policy_visible_tools`` below.
     promoted_visible = [
-        tool
-        for tool in sorted_inventory
-        if stable_tool_id(tool) in promoted_tool_ids
+        tool for tool in sorted_inventory if stable_tool_id(tool) in promoted_tool_ids
     ]
     policy_visible_tools = filter_edit_tools_for_model(policy_visible_tools, effective_model_id)
-    hidden_searchable_tools = filter_edit_tools_for_model(hidden_searchable_tools, effective_model_id)
+    hidden_searchable_tools = filter_edit_tools_for_model(
+        hidden_searchable_tools, effective_model_id
+    )
     promoted_visible = filter_edit_tools_for_model(promoted_visible, effective_model_id)
 
     # search_tools lives in the controller schemas, not the inventory.
@@ -239,14 +243,12 @@ def prepare_tool_exposure(
     use_anthropic_defer = bool(
         not use_responses_api
         and discovery_enabled
+        and contract.anthropic_defer_loading
         and model_info.supports_defer_loading
         and has_hidden
     )
     use_openai_controller_search_fallback = bool(
-        use_responses_api
-        and discovery_enabled
-        and search_tool_schema_present
-        and has_hidden
+        use_responses_api and discovery_enabled and search_tool_schema_present and has_hidden
     )
 
     if not allow_tool_search:
@@ -275,9 +277,7 @@ def prepare_tool_exposure(
         deferred_tool_ids = {stable_tool_id(tool) for tool in hidden_searchable_tools}
         deferred_tool_ids -= promoted_tool_ids
         promoted_non_policy = [
-            tool
-            for tool in hidden_searchable_tools
-            if stable_tool_id(tool) in promoted_tool_ids
+            tool for tool in hidden_searchable_tools if stable_tool_id(tool) in promoted_tool_ids
         ]
         remaining_hidden = [
             tool
@@ -371,9 +371,13 @@ def prepare_tool_exposure(
     }
     promoted_inventory_ids = {stable_tool_id(tool) for tool in promoted_visible}
     promoted_visible_ids = visible_tool_ids & promoted_inventory_ids
-    final_tool_schemas = _strip_internal_schema_metadata(tool_schemas)
+    final_tool_schemas = _strip_internal_schema_metadata(
+        [*filtered_controller_tool_schemas, *tool_schemas]
+    )
+    if not use_anthropic_defer:
+        final_tool_schemas = _sort_model_facing_tool_schemas(final_tool_schemas)
     return ToolExposureResult(
-        tools=[*filtered_controller_tool_schemas, *final_tool_schemas],
+        tools=final_tool_schemas,
         alias_map=alias_map,
         request_kwargs=request_kwargs,
         visible_tool_ids=visible_tool_ids,
@@ -531,6 +535,47 @@ def _strip_internal_schema_metadata(tool_schemas: list[dict[str, Any]]) -> list[
             sanitized_schema["function"] = function
         sanitized.append(sanitized_schema)
     return sanitized
+
+
+def _sort_model_facing_tool_schemas(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return provider-facing tool schemas sorted by model-visible tool name.
+
+    Tool arrays are part of provider prompt-cache prefixes.  Sorting only object
+    keys during diagnostics is not enough: equivalent tools in a different list
+    order produce a different schema hash and can miss provider caches.  Keep
+    Anthropic deferred-loading order separate because cache_control placement
+    encodes a provider-specific cache boundary there.
+    """
+
+    return sorted(tool_schemas, key=_model_facing_tool_schema_sort_key)
+
+
+def _model_facing_tool_schema_sort_key(schema: dict[str, Any]) -> tuple[str, str, str]:
+    name = _model_facing_tool_schema_name(schema)
+    schema_type = schema.get("type")
+    return (
+        name.casefold(),
+        str(schema_type) if isinstance(schema_type, str) else "",
+        name,
+    )
+
+
+def _model_facing_tool_schema_name(schema: dict[str, Any]) -> str:
+    function = schema.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str):
+            return name
+
+    name = schema.get("name")
+    if isinstance(name, str):
+        return name
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type
+
+    return ""
 
 
 def _build_openai_deferred_namespaces(
