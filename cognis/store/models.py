@@ -8,6 +8,7 @@ it lives in the session cache layer.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -343,6 +344,14 @@ class Conversation(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     active_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     active_executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_executor_assigned_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    active_executor_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    active_executor_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    starred_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -387,6 +396,7 @@ class Session(Base):
     idle_since: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
@@ -410,11 +420,18 @@ class LLMProvider(Base):
     """LLM provider configurations."""
 
     __tablename__ = "llm_providers"
+    __table_args__ = (
+        Index("ix_llm_providers_owner_provider", "owner_email", "provider_id"),
+        Index("ix_llm_providers_owner_default", "owner_email", "is_default"),
+    )
 
     provider_id: Mapped[str] = mapped_column(String, primary_key=True)
     display_name: Mapped[str] = mapped_column(String, nullable=False)
     location: Mapped[str] = mapped_column(String, nullable=False)
     backend: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str] = mapped_column(
+        String, nullable=False, default="system@cognis.local", server_default="system@cognis.local"
+    )
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     is_default: Mapped[bool] = mapped_column(default=False, nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
@@ -430,8 +447,18 @@ class ModelRouting(Base):
     """Model routing policy — which model for which task type."""
 
     __tablename__ = "model_routing"
+    __table_args__ = (
+        UniqueConstraint("owner_email", "task_type", name="uq_model_routing_owner_task"),
+        Index("ix_model_routing_owner_task", "owner_email", "task_type"),
+    )
 
-    task_type: Mapped[str] = mapped_column(String, primary_key=True)
+    route_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"route_{uuid.uuid4().hex[:12]}"
+    )
+    task_type: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str] = mapped_column(
+        String, nullable=False, default="system@cognis.local", server_default="system@cognis.local"
+    )
     provider_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("llm_providers.provider_id"), nullable=True
     )
@@ -501,6 +528,33 @@ class CredentialRow(Base):
     )
 
 
+class LLMProviderAuthSession(Base):
+    """Durable executor-routed provider auth/setup session state."""
+
+    __tablename__ = "llm_provider_auth_sessions"
+    __table_args__ = (Index("ix_llm_provider_auth_owner_provider", "owner_email", "provider_id"),)
+
+    setup_id: Mapped[str] = mapped_column(String, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String, nullable=False)
+    owner_email: Mapped[str] = mapped_column(String, nullable=False)
+    actor_email: Mapped[str] = mapped_column(String, nullable=False)
+    executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="created")
+    credential_id: Mapped[str] = mapped_column(String, nullable=False)
+    credential_version_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
 class Task(Base):
     """Durable work items with queue semantics and workflow state.
 
@@ -544,6 +598,13 @@ class Task(Base):
     # conversation so all steps of a task run on the same executor unless
     # the agent explicitly switches.
     active_executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_executor_assigned_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    active_executor_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    active_executor_source: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -793,7 +854,9 @@ class ExecutorRow(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     runtime_state: Mapped[str] = mapped_column(String, nullable=False, default="offline")
-    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     is_default: Mapped[bool] = mapped_column(nullable=False, default=False, server_default="0")
     owner_email: Mapped[str | None] = mapped_column(
         String, ForeignKey("users.email"), nullable=True
@@ -1349,8 +1412,12 @@ class ArtifactRecordRow(Base):
     mime_type: Mapped[str] = mapped_column(String, nullable=False)
     size_bytes: Mapped[int] = mapped_column(nullable=False, default=0)
     status: Mapped[str] = mapped_column(String, nullable=False, default="temporary")
+    content_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
     expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
@@ -1359,4 +1426,129 @@ class ArtifactRecordRow(Base):
         Index("ix_artifacts_owner_status", "owner_email", "status"),
         Index("ix_artifacts_conversation", "conversation_id"),
         Index("ix_artifacts_expiry", "expires_at"),
+    )
+
+
+class KnowledgebaseRow(Base):
+    """User-owned artifact-backed knowledgebase."""
+
+    __tablename__ = "knowledgebases"
+
+    knowledgebase_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    metadata_schema: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_knowledgebases_owner_status", "owner_email", "status"),
+        Index("ix_knowledgebases_owner_name", "owner_email", "name"),
+    )
+
+
+class KnowledgebaseArtifactRow(Base):
+    """Artifact attachment and indexing status for a knowledgebase."""
+
+    __tablename__ = "knowledgebase_artifacts"
+
+    kb_artifact_id: Mapped[str] = mapped_column(String, primary_key=True)
+    knowledgebase_id: Mapped[str] = mapped_column(
+        String, ForeignKey("knowledgebases.knowledgebase_id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
+    source_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_filename: Mapped[str | None] = mapped_column(String, nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    embedding_model: Mapped[str | None] = mapped_column(String, nullable=True)
+    embedding_provider_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    vector_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_job_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_diagnostics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    attached_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    indexed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    stale_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    removed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_kb_artifacts_kb_status", "knowledgebase_id", "status"),
+        Index("ix_kb_artifacts_artifact", "artifact_id"),
+    )
+
+
+class KnowledgebaseChunkRow(Base):
+    """Disposable indexed chunk derived from a canonical artifact."""
+
+    __tablename__ = "knowledgebase_chunks"
+
+    chunk_id: Mapped[str] = mapped_column(String, primary_key=True)
+    knowledgebase_id: Mapped[str] = mapped_column(String, nullable=False)
+    kb_artifact_id: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_id: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    text_hash: Mapped[str] = mapped_column(String, nullable=False)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    locator: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    vector_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_kb_chunks_kb_artifact", "knowledgebase_id", "artifact_id"),
+        Index("ix_kb_chunks_attachment_index", "kb_artifact_id", "chunk_index"),
+    )
+
+
+class KnowledgebaseIndexJobRow(Base):
+    """Persistent background indexing job."""
+
+    __tablename__ = "knowledgebase_index_jobs"
+
+    job_id: Mapped[str] = mapped_column(String, primary_key=True)
+    knowledgebase_id: Mapped[str] = mapped_column(String, nullable=False)
+    kb_artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    job_type: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    diagnostics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    chunks_indexed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chunks_deleted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    queued_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_kb_jobs_status_queue", "status", "priority", "queued_at"),
+        Index("ix_kb_jobs_kb_status", "knowledgebase_id", "status"),
     )

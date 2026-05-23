@@ -39,13 +39,14 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
     "session.step_timeout_seconds": ("session", 3600),
-    "session.llm_stream_idle_timeout_seconds": ("session", 60),
+    "session.llm_stream_idle_timeout_seconds": ("session", 300),
     "session.llm_stream_max_retries": ("session", 3),
     "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.max_session_age_seconds": ("session", 86400),
     "session.max_delegation_depth": ("session", 5),
-    "session.max_queued_messages": ("session", 5),
+    "session.max_active_turns_per_user": ("session", 20),
+    "session.max_queued_messages": ("session", 20),
     "session.escalation_timeout_seconds": ("session", 300),
     "session.cache_max_entries": ("session", 200),
     "search.display_min_score": ("search", 0.2),
@@ -86,6 +87,9 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "web.rate_limit.searxng_qps": ("web", 5.0),
     "executors.allow_in_process": ("executors", True),
     "executors.allow_subprocess": ("executors", True),
+    "executors.secondary_assignment_ttl_seconds": ("executors", 3600),
+    "executors.secondary_disconnect_retry_seconds": ("executors", 15),
+    "executors.secondary_disconnect_retry_interval_seconds": ("executors", 3),
     "tts.enabled": ("tts", True),
     "tts.default_voice": ("tts", "alloy"),
     "tts.cache_ttl_days": ("tts", 30),
@@ -204,6 +208,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
         await conn.run_sync(_ensure_provider_is_default_column)
+        await conn.run_sync(_ensure_llm_provider_owner_schema)
         await conn.run_sync(_ensure_active_session_id_column)
         await conn.run_sync(_ensure_task_expected_output_column)
         await conn.run_sync(_ensure_step_run_conversation_id_column)
@@ -212,6 +217,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_last_read_at)
         await conn.run_sync(_ensure_conversation_active_executor_id)
         await conn.run_sync(_ensure_task_active_executor_id)
+        await conn.run_sync(_ensure_active_executor_lifecycle_columns)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_executor_token_version_column)
@@ -221,6 +227,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_skill_system_column)
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
+        await conn.run_sync(_ensure_conversation_starred_at_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
         await conn.run_sync(_ensure_system_override_tables)
         await conn.run_sync(_ensure_task_execution_paths)
@@ -245,6 +252,36 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_step_history_columns)
         await conn.run_sync(_ensure_task_comments_table)
         await conn.run_sync(_ensure_tts_cache_table)
+        await conn.run_sync(_ensure_knowledgebase_schema)
+
+
+def _ensure_knowledgebase_schema(sync_conn: object) -> None:
+    """Create optional knowledgebase tables and additive artifact columns."""
+
+    from cognis.store.models import (
+        KnowledgebaseArtifactRow,
+        KnowledgebaseChunkRow,
+        KnowledgebaseIndexJobRow,
+        KnowledgebaseRow,
+    )
+
+    KnowledgebaseRow.__table__.create(bind=sync_conn, checkfirst=True)
+    KnowledgebaseArtifactRow.__table__.create(bind=sync_conn, checkfirst=True)
+    KnowledgebaseChunkRow.__table__.create(bind=sync_conn, checkfirst=True)
+    KnowledgebaseIndexJobRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+    inspector = cast(Any, inspect(sync_conn))
+    artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "content_hash" not in artifact_columns:
+        execute(text("ALTER TABLE artifacts ADD COLUMN content_hash VARCHAR"))
+    if "updated_at" not in artifact_columns:
+        execute(
+            text(
+                "ALTER TABLE artifacts ADD COLUMN updated_at TIMESTAMP WITH TIME ZONE "
+                "DEFAULT CURRENT_TIMESTAMP"
+            )
+        )
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -272,6 +309,8 @@ def _ensure_session_compaction_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE sessions ADD COLUMN previous_session_id VARCHAR"))
     if "completion_reason" not in session_columns:
         execute(text("ALTER TABLE sessions ADD COLUMN completion_reason VARCHAR"))
+    if "result_content" not in session_columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN result_content TEXT"))
 
 
 def _ensure_api_key_columns(sync_conn: object) -> None:
@@ -456,6 +495,108 @@ def _ensure_provider_is_default_column(sync_conn: object) -> None:
         execute(text("ALTER TABLE llm_providers ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT 0"))
 
 
+def _ensure_llm_provider_owner_schema(sync_conn: object) -> None:
+    """Add owner-scoped LLM provider/routing columns for existing databases."""
+
+    from cognis.store.models import LLMProviderAuthSession
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    dialect = sync_conn.dialect.name  # type: ignore[attr-defined]
+    system_owner = SYSTEM_USER_EMAIL.replace("'", "''")
+
+    try:
+        provider_columns = {column["name"] for column in inspector.get_columns("llm_providers")}
+    except Exception:
+        provider_columns = set()
+    if provider_columns and "owner_email" not in provider_columns:
+        execute(
+            text(
+                "ALTER TABLE llm_providers "
+                f"ADD COLUMN owner_email VARCHAR NOT NULL DEFAULT '{system_owner}'"
+            )
+        )
+
+    try:
+        routing_columns = {column["name"] for column in inspector.get_columns("model_routing")}
+    except Exception:
+        routing_columns = set()
+    if routing_columns:
+        if "route_id" not in routing_columns:
+            execute(text("ALTER TABLE model_routing ADD COLUMN route_id VARCHAR"))
+            execute(
+                text(
+                    "UPDATE model_routing SET route_id = 'route_' || task_type "
+                    "WHERE route_id IS NULL"
+                )
+            )
+            routing_columns.add("route_id")
+        if "owner_email" not in routing_columns:
+            execute(
+                text(
+                    "ALTER TABLE model_routing "
+                    f"ADD COLUMN owner_email VARCHAR NOT NULL DEFAULT '{system_owner}'"
+                )
+            )
+            routing_columns.add("owner_email")
+        if dialect == "postgresql":
+            execute(
+                text(
+                    "UPDATE model_routing SET route_id = 'route_' || task_type "
+                    "WHERE route_id IS NULL"
+                )
+            )
+            execute(text("ALTER TABLE model_routing ALTER COLUMN route_id SET NOT NULL"))
+            pk = inspector.get_pk_constraint("model_routing")
+            if pk.get("constrained_columns") != ["route_id"]:
+                preparer = sync_conn.dialect.identifier_preparer  # type: ignore[attr-defined]
+                pk_name = pk.get("name")
+                if pk_name:
+                    execute(
+                        text(
+                            "ALTER TABLE model_routing DROP CONSTRAINT "
+                            f"{preparer.quote(str(pk_name))}"
+                        )
+                    )
+                execute(text("ALTER TABLE model_routing ADD PRIMARY KEY (route_id)"))
+            execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_routing_owner_task "
+                    "ON model_routing (owner_email, task_type)"
+                )
+            )
+
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_llm_providers_owner_email ON llm_providers (owner_email)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_llm_providers_owner_provider "
+            "ON llm_providers (owner_email, provider_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_llm_providers_owner_default "
+            "ON llm_providers (owner_email, is_default)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_model_routing_owner_email ON model_routing (owner_email)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_model_routing_owner_task "
+            "ON model_routing (owner_email, task_type)"
+        )
+    )
+    LLMProviderAuthSession.__table__.create(bind=sync_conn, checkfirst=True)
+
+
 def _ensure_active_session_id_column(sync_conn: object) -> None:
     """Rename root_session_id → active_session_id on conversations table."""
     inspector = cast(Any, inspect(sync_conn))
@@ -505,6 +646,18 @@ def _ensure_conversation_title_source_column(sync_conn: object) -> None:
                 "WHEN title IS NULL OR TRIM(title) = '' THEN 'unset' "
                 "ELSE 'manual' END"
             )
+        )
+
+
+def _ensure_conversation_starred_at_column(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        conversation_columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return
+    if "starred_at" not in conversation_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE conversations ADD COLUMN starred_at TIMESTAMP WITH TIME ZONE")
         )
 
 
@@ -601,6 +754,35 @@ def _ensure_task_active_executor_id(sync_conn: object) -> None:
 
     if "active_executor_id" not in columns:
         execute(text("ALTER TABLE tasks ADD COLUMN active_executor_id VARCHAR"))
+
+
+def _ensure_active_executor_lifecycle_columns(sync_conn: object) -> None:
+    """Add active-executor assignment metadata for conversations and tasks."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    for table_name in ("conversations", "tasks"):
+        try:
+            columns = {column["name"] for column in inspector.get_columns(table_name)}
+        except Exception:
+            continue
+        if "active_executor_assigned_at" not in columns:
+            execute(
+                text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN active_executor_assigned_at TIMESTAMP WITH TIME ZONE"
+                )
+            )
+        if "active_executor_expires_at" not in columns:
+            execute(
+                text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN active_executor_expires_at TIMESTAMP WITH TIME ZONE"
+                )
+            )
+        if "active_executor_source" not in columns:
+            execute(text(f"ALTER TABLE {table_name} ADD COLUMN active_executor_source VARCHAR"))
 
 
 def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:
@@ -772,7 +954,11 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
             )
         )
     if "interaction_mode_override" not in columns:
-        execute(text("ALTER TABLE schedules ADD COLUMN interaction_mode_override VARCHAR DEFAULT 'none'"))
+        execute(
+            text(
+                "ALTER TABLE schedules ADD COLUMN interaction_mode_override VARCHAR DEFAULT 'none'"
+            )
+        )
     if "suppress_empty" in columns:
         execute(
             text(

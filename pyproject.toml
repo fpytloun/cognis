@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.5.0"
+version = "0.6.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }
@@ -54,6 +54,7 @@ dependencies = [
     "w3lib>=2.4.1",
     "beautifulsoup4>=4.14.3",
     "readability-lxml>=0.8.4.1",
+    "tiktoken>=0.8.0",
 ]
 
 [project.optional-dependencies]
@@ -76,14 +77,17 @@ s3 = [
 redis = [
     "redis[hiredis]>=5.0.0",
 ]
-
+knowledgebase = [
+    "qdrant-client>=1.18.0",
+    "python-docx>=1.1.0",
+]
 [project.scripts]
 cognis-controller = "cognis.main:app"
 cognis-executor = "cognis.executor.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognis"]
-include = ["cognis/ui_dist/**/*"]
+include = ["cognis/ui_dist/**/*", "cognis/providers/llm/data/*.json"]
 
 [tool.hatch.build.targets.sdist]
 include = [

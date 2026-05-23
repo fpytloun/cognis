@@ -13,6 +13,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import (
@@ -30,7 +31,12 @@ from cognis.store.models import (
     CredentialRow,
     DeliverableRow,
     ExecutorRow,
+    KnowledgebaseArtifactRow,
+    KnowledgebaseChunkRow,
+    KnowledgebaseIndexJobRow,
+    KnowledgebaseRow,
     LLMProvider,
+    LLMProviderAuthSession,
     MCPServerRow,
     ModelRouting,
     ProjectGrantRow,
@@ -477,9 +483,27 @@ async def delete_setting(session: AsyncSession, key: str) -> bool:
 # --- LLM Providers ---
 
 
-async def list_llm_providers(session: AsyncSession) -> list[LLMProvider]:
+def _visible_llm_provider_clause(user_email: str | None) -> Any:
+    if user_email is None or user_email == SYSTEM_USER_EMAIL:
+        return _shared_owner_clause(LLMProvider.owner_email)
+    return sa.or_(
+        LLMProvider.owner_email == user_email, _shared_owner_clause(LLMProvider.owner_email)
+    )
+
+
+async def list_llm_providers(
+    session: AsyncSession,
+    acting_user_email: str | None = None,
+    *,
+    include_inactive: bool = False,
+) -> list[LLMProvider]:
     """List all LLM provider configurations."""
-    result = await session.execute(select(LLMProvider).where(LLMProvider.status == "active"))
+    stmt = select(LLMProvider)
+    if not include_inactive:
+        stmt = stmt.where(LLMProvider.status == "active")
+    if acting_user_email is not None:
+        stmt = stmt.where(_visible_llm_provider_clause(acting_user_email))
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -491,6 +515,7 @@ async def create_llm_provider(
     location: str,
     backend: str,
     config: dict[str, Any],
+    owner_email: str = SYSTEM_USER_EMAIL,
     status: str = "active",
 ) -> LLMProvider:
     """Create a new LLM provider row."""
@@ -499,6 +524,7 @@ async def create_llm_provider(
         display_name=display_name,
         location=location,
         backend=backend,
+        owner_email=owner_email,
         config=config,
         status=status,
     )
@@ -514,6 +540,7 @@ async def update_llm_provider(
     display_name: str | None = None,
     location: str | None = None,
     backend: str | None = None,
+    owner_email: str | None = None,
     config: dict[str, Any] | None = None,
     status: str | None = None,
 ) -> bool:
@@ -527,6 +554,8 @@ async def update_llm_provider(
         row.location = location
     if backend is not None:
         row.backend = backend
+    if owner_email is not None:
+        row.owner_email = owner_email
     if config is not None:
         row.config = config
     if status is not None:
@@ -963,6 +992,20 @@ async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvid
     return result.scalar_one_or_none()
 
 
+async def get_visible_llm_provider(
+    session: AsyncSession, provider_id: str, acting_user_email: str | None
+) -> LLMProvider | None:
+    """Get a provider only if it is visible to the acting user."""
+
+    stmt = select(LLMProvider).where(
+        LLMProvider.provider_id == provider_id,
+    )
+    if acting_user_email is not None:
+        stmt = stmt.where(_visible_llm_provider_clause(acting_user_email))
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 # --- Conversations ---
 
 
@@ -1325,21 +1368,19 @@ async def list_conversations(
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
 
-    Ordered by the latest conversation activity timestamp so new conversations
-    and metadata changes surface immediately, even before the first message is
-    sent.
+    Ordered by the latest accepted conversation activity. Conversations with
+    no messages fall back to creation time and deterministic ID ordering.
     """
-    latest_activity = case(
-        (Conversation.last_message_at.is_(None), Conversation.updated_at),
-        (Conversation.updated_at > Conversation.last_message_at, Conversation.updated_at),
-        else_=Conversation.last_message_at,
+    ordering_activity = sa.func.coalesce(
+        Conversation.last_message_at,
+        Conversation.created_at,
     )
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
         .order_by(
-            latest_activity.desc(),
-            Conversation.updated_at.desc(),
+            ordering_activity.desc(),
+            Conversation.created_at.desc(),
             Conversation.conversation_id.asc(),
         )
     )
@@ -1347,6 +1388,11 @@ async def list_conversations(
         query = query.where(Conversation.status == "active")
     elif status == "archived":
         query = query.where(Conversation.status == "archived")
+    elif status == "starred":
+        query = query.where(
+            Conversation.starred_at.is_not(None),
+            Conversation.status == "active",
+        )
     elif status != "all":
         raise ValueError(f"Unsupported conversation status filter: {status}")
     if context_type is not None:
@@ -1372,10 +1418,9 @@ async def get_latest_active_conversation_for_agent(
     conversations with a matching ``context_type`` column.
     """
 
-    latest_activity = case(
-        (Conversation.last_message_at.is_(None), Conversation.updated_at),
-        (Conversation.updated_at > Conversation.last_message_at, Conversation.updated_at),
-        else_=Conversation.last_message_at,
+    ordering_activity = sa.func.coalesce(
+        Conversation.last_message_at,
+        Conversation.created_at,
     )
     query = (
         select(Conversation)
@@ -1386,8 +1431,8 @@ async def get_latest_active_conversation_for_agent(
     if context_type is not None:
         query = query.where(Conversation.context_type == context_type)
     query = query.order_by(
-        latest_activity.desc(),
-        Conversation.updated_at.desc(),
+        ordering_activity.desc(),
+        Conversation.created_at.desc(),
         Conversation.conversation_id.asc(),
     ).limit(1)
     result = await session.execute(query)
@@ -1429,6 +1474,46 @@ async def update_conversation_context_data(
     if row is None:
         return False
     row.context_data = dict(context_data)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+HISTORY_REBASE_CONTEXT_KEY = "history_rebase"
+
+
+async def set_conversation_history_rebase_metadata(
+    session: AsyncSession,
+    conversation_id: str,
+    metadata: dict[str, object],
+) -> bool:
+    """Set redo metadata while preserving unrelated conversation context data."""
+
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    context_data = dict(row.context_data or {})
+    context_data[HISTORY_REBASE_CONTEXT_KEY] = dict(metadata)
+    row.context_data = context_data
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def clear_conversation_history_rebase_metadata(
+    session: AsyncSession,
+    conversation_id: str,
+) -> bool:
+    """Clear redo metadata while preserving unrelated conversation context data."""
+
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    context_data = dict(row.context_data or {})
+    if HISTORY_REBASE_CONTEXT_KEY not in context_data:
+        return True
+    context_data.pop(HISTORY_REBASE_CONTEXT_KEY, None)
+    row.context_data = context_data
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
@@ -1506,6 +1591,10 @@ async def set_conversation_active_executor(
     session: AsyncSession,
     conversation_id: str,
     active_executor_id: str | None,
+    *,
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    source: str | None = None,
 ) -> bool:
     """Set the conversation-level active executor ID (Stage 36).
 
@@ -1517,8 +1606,12 @@ async def set_conversation_active_executor(
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         return False
+    timestamp = assigned_at or datetime.now(UTC)
     conversation.active_executor_id = active_executor_id
-    conversation.updated_at = datetime.now(UTC)
+    conversation.active_executor_assigned_at = timestamp if active_executor_id else None
+    conversation.active_executor_expires_at = expires_at if active_executor_id else None
+    conversation.active_executor_source = source if active_executor_id else None
+    conversation.updated_at = timestamp
     await session.flush()
     return True
 
@@ -1527,6 +1620,10 @@ async def initialize_conversation_active_executor(
     session: AsyncSession,
     conversation_id: str,
     active_executor_id: str,
+    *,
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    source: str = "initial",
 ) -> bool:
     """Set the active executor only if it is currently unset (Stage 36).
 
@@ -1535,6 +1632,7 @@ async def initialize_conversation_active_executor(
     may change the binding.
     """
 
+    timestamp = assigned_at or datetime.now(UTC)
     result = await session.execute(
         update(Conversation)
         .where(
@@ -1543,10 +1641,22 @@ async def initialize_conversation_active_executor(
         )
         .values(
             active_executor_id=active_executor_id,
-            updated_at=datetime.now(UTC),
+            active_executor_assigned_at=timestamp,
+            active_executor_expires_at=expires_at,
+            active_executor_source=source,
+            updated_at=timestamp,
         )
     )
     return bool(result.rowcount)
+
+
+async def reset_conversation_active_executor(
+    session: AsyncSession,
+    conversation_id: str,
+) -> bool:
+    """Clear the active executor pin and lifecycle metadata for a conversation."""
+
+    return await set_conversation_active_executor(session, conversation_id, None)
 
 
 async def touch_conversation(
@@ -1768,6 +1878,7 @@ async def set_session_status(
     idle_since: datetime | None = None,
     completed_at: datetime | None = None,
     result_summary: str | None = None,
+    result_content: str | None = None,
     completion_reason: str | None = None,
 ) -> bool:
     """Update session lifecycle state and timestamps."""
@@ -1780,6 +1891,8 @@ async def set_session_status(
     session_row.completed_at = completed_at
     if result_summary is not None:
         session_row.result_summary = result_summary
+    if result_content is not None:
+        session_row.result_content = result_content
     if completion_reason is not None:
         session_row.completion_reason = completion_reason
     session_row.updated_at = datetime.now(UTC)
@@ -1988,6 +2101,10 @@ async def set_task_active_executor(
     session: AsyncSession,
     task_id: str,
     active_executor_id: str | None,
+    *,
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    source: str | None = None,
 ) -> bool:
     """Set the task-level active executor ID (Stage 36).
 
@@ -1999,8 +2116,12 @@ async def set_task_active_executor(
     task = await get_task(session, task_id)
     if task is None:
         return False
+    timestamp = assigned_at or datetime.now(UTC)
     task.active_executor_id = active_executor_id
-    task.updated_at = datetime.now(UTC)
+    task.active_executor_assigned_at = timestamp if active_executor_id else None
+    task.active_executor_expires_at = expires_at if active_executor_id else None
+    task.active_executor_source = source if active_executor_id else None
+    task.updated_at = timestamp
     await session.flush()
     return True
 
@@ -2009,6 +2130,10 @@ async def initialize_task_active_executor(
     session: AsyncSession,
     task_id: str,
     active_executor_id: str,
+    *,
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    source: str = "initial",
 ) -> bool:
     """Set the task active executor only if it is currently unset (Stage 36).
 
@@ -2016,6 +2141,7 @@ async def initialize_task_active_executor(
     After that, only ``switch_executor`` / ``/executor`` may change it.
     """
 
+    timestamp = assigned_at or datetime.now(UTC)
     result = await session.execute(
         update(Task)
         .where(
@@ -2024,7 +2150,10 @@ async def initialize_task_active_executor(
         )
         .values(
             active_executor_id=active_executor_id,
-            updated_at=datetime.now(UTC),
+            active_executor_assigned_at=timestamp,
+            active_executor_expires_at=expires_at,
+            active_executor_source=source,
+            updated_at=timestamp,
         )
     )
     return bool(result.rowcount)
@@ -2627,6 +2756,9 @@ async def create_step_run(
     deliverable_id: str | None = None,
     require_deliverable: bool | None = None,
     runtime_info: dict[str, object] | None = None,
+    status: str = "pending",
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
 ) -> StepRun:
     """Create a new step run record."""
     row = StepRun(
@@ -2643,6 +2775,9 @@ async def create_step_run(
         deliverable_id=deliverable_id,
         require_deliverable=require_deliverable,
         runtime_info=runtime_info,
+        status=status,
+        started_at=started_at,
+        completed_at=completed_at,
     )
     session.add(row)
     await session.flush()
@@ -3049,15 +3184,29 @@ async def delete_system_workflow_override(
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
 
-async def list_model_routing(session: AsyncSession) -> list[ModelRouting]:
+async def list_model_routing(
+    session: AsyncSession, owner_email: str | None = None
+) -> list[ModelRouting]:
     """List all model routing rows."""
-    result = await session.execute(select(ModelRouting).order_by(ModelRouting.task_type.asc()))
+    stmt = select(ModelRouting)
+    if owner_email is not None:
+        stmt = stmt.where(ModelRouting.owner_email == owner_email)
+    result = await session.execute(
+        stmt.order_by(ModelRouting.owner_email.asc(), ModelRouting.task_type.asc())
+    )
     return list(result.scalars().all())
 
 
-async def get_model_routing(session: AsyncSession, task_type: str) -> ModelRouting | None:
+async def get_model_routing(
+    session: AsyncSession, task_type: str, owner_email: str = SYSTEM_USER_EMAIL
+) -> ModelRouting | None:
     """Get a model routing row by task type."""
-    result = await session.execute(select(ModelRouting).where(ModelRouting.task_type == task_type))
+    result = await session.execute(
+        select(ModelRouting).where(
+            ModelRouting.task_type == task_type,
+            ModelRouting.owner_email == owner_email,
+        )
+    )
     return result.scalar_one_or_none()
 
 
@@ -3067,10 +3216,11 @@ async def upsert_model_routing(
     task_type: str,
     provider_id: str | None,
     model: str,
+    owner_email: str = SYSTEM_USER_EMAIL,
     config: dict[str, Any] | None = None,
 ) -> ModelRouting:
     """Create or update a model routing row."""
-    existing = await get_model_routing(session, task_type)
+    existing = await get_model_routing(session, task_type, owner_email)
     if existing is not None:
         existing.provider_id = provider_id
         existing.model = model
@@ -3078,17 +3228,89 @@ async def upsert_model_routing(
         existing.updated_at = datetime.now(UTC)
         await session.flush()
         return existing
-    row = ModelRouting(task_type=task_type, provider_id=provider_id, model=model, config=config)
+    row = ModelRouting(
+        route_id=f"route_{uuid.uuid4().hex[:12]}",
+        task_type=task_type,
+        owner_email=owner_email,
+        provider_id=provider_id,
+        model=model,
+        config=config,
+    )
     session.add(row)
     await session.flush()
     return row
 
 
-async def delete_model_routing(session: AsyncSession, task_type: str) -> bool:
+async def delete_model_routing(
+    session: AsyncSession, task_type: str, owner_email: str = SYSTEM_USER_EMAIL
+) -> bool:
     """Delete a model routing row."""
-    result = await session.execute(delete(ModelRouting).where(ModelRouting.task_type == task_type))
+    result = await session.execute(
+        delete(ModelRouting).where(
+            ModelRouting.task_type == task_type,
+            ModelRouting.owner_email == owner_email,
+        )
+    )
     await session.flush()
     return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def create_llm_provider_auth_session(
+    session: AsyncSession,
+    *,
+    setup_id: str,
+    provider_id: str,
+    owner_email: str,
+    actor_email: str,
+    executor_id: str | None,
+    credential_id: str,
+    expires_at: datetime,
+    status_payload: dict[str, Any] | None = None,
+) -> LLMProviderAuthSession:
+    row = LLMProviderAuthSession(
+        setup_id=setup_id,
+        provider_id=provider_id,
+        owner_email=owner_email,
+        actor_email=actor_email,
+        executor_id=executor_id,
+        state="awaiting_user",
+        credential_id=credential_id,
+        expires_at=expires_at,
+        status_payload=status_payload or {},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def get_active_llm_provider_auth_session(
+    session: AsyncSession, provider_id: str, owner_email: str
+) -> LLMProviderAuthSession | None:
+    result = await session.execute(
+        select(LLMProviderAuthSession)
+        .where(
+            LLMProviderAuthSession.provider_id == provider_id,
+            LLMProviderAuthSession.owner_email == owner_email,
+            LLMProviderAuthSession.state.in_(
+                [
+                    "created",
+                    "executor_starting",
+                    "awaiting_user",
+                    "authorizing",
+                    "code_submitted",
+                ]
+            ),
+        )
+        .order_by(LLMProviderAuthSession.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_llm_provider_auth_session(
+    session: AsyncSession, setup_id: str
+) -> LLMProviderAuthSession | None:
+    return await session.get(LLMProviderAuthSession, setup_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3632,6 +3854,28 @@ async def get_skill_asset(session: AsyncSession, asset_id: str) -> SkillAssetRow
     """Get a skill asset by ID."""
 
     result = await session.execute(select(SkillAssetRow).where(SkillAssetRow.asset_id == asset_id))
+    return result.scalar_one_or_none()
+
+
+async def get_skill_asset_by_artifact_object(
+    session: AsyncSession,
+    *,
+    artifact_namespace: str,
+    artifact_object_id: str,
+    filename: str,
+) -> SkillAssetRow | None:
+    """Get a skill asset by its artifact-store object reference."""
+
+    result = await session.execute(
+        select(SkillAssetRow)
+        .where(
+            SkillAssetRow.artifact_namespace == artifact_namespace,
+            SkillAssetRow.artifact_object_id == artifact_object_id,
+            SkillAssetRow.filename == filename,
+        )
+        .order_by(SkillAssetRow.created_at.desc())
+        .limit(1)
+    )
     return result.scalar_one_or_none()
 
 
@@ -4597,6 +4841,7 @@ async def create_artifact_record(
     conversation_id: str | None = None,
     session_id: str | None = None,
     message_role: str | None = None,
+    content_hash: str | None = None,
 ) -> ArtifactRecordRow:
     row = ArtifactRecordRow(
         artifact_id=artifact_id,
@@ -4613,6 +4858,7 @@ async def create_artifact_record(
         size_bytes=size_bytes,
         status=status,
         expires_at=expires_at,
+        content_hash=content_hash,
     )
     session.add(row)
     await session.flush()
@@ -4639,6 +4885,7 @@ def _artifact_discovery_stmt(
     stmt = select(ArtifactRecordRow).where(
         ArtifactRecordRow.owner_email == owner_email,
         ArtifactRecordRow.status != "deleted",
+        sa.or_(ArtifactRecordRow.expires_at.is_(None), ArtifactRecordRow.expires_at > _utcnow()),
     )
     if kind is not None:
         stmt = stmt.where(ArtifactRecordRow.kind == kind)
@@ -4807,6 +5054,7 @@ async def mark_artifact_deleted(session: AsyncSession, artifact_id: str) -> bool
         return False
     row.status = "deleted"
     row.deleted_at = _utcnow()
+    await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     await session.flush()
     return True
 
@@ -4815,8 +5063,589 @@ async def delete_artifact_record(session: AsyncSession, artifact_id: str) -> boo
     row = await get_artifact_record(session, artifact_id)
     if row is None:
         return False
+    await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     await session.delete(row)
     return True
+
+
+# --- Knowledgebases ---
+
+
+def _kb_id() -> str:
+    return f"kb_{uuid.uuid4().hex[:16]}"
+
+
+def _kb_artifact_id() -> str:
+    return f"kba_{uuid.uuid4().hex[:16]}"
+
+
+def _kb_job_id() -> str:
+    return f"kbj_{uuid.uuid4().hex[:16]}"
+
+
+async def mark_knowledgebase_artifact_removed(
+    session: AsyncSession, *, artifact_id: str
+) -> list[KnowledgebaseArtifactRow]:
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    rows = list(result.scalars().all())
+    for row in rows:
+        row.status = "removed"
+        row.removed_at = _utcnow()
+        row.last_error = "canonical_artifact_removed"
+        job = await enqueue_knowledgebase_job(
+            session,
+            knowledgebase_id=row.knowledgebase_id,
+            kb_artifact_id=row.kb_artifact_id,
+            artifact_id=artifact_id,
+            job_type="delete_artifact_index",
+            priority=5,
+        )
+        row.last_job_id = job.job_id
+    await session.flush()
+    return rows
+
+
+async def create_knowledgebase(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    name: str,
+    description: str | None = None,
+    metadata_schema: dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
+) -> KnowledgebaseRow:
+    row = KnowledgebaseRow(
+        knowledgebase_id=_kb_id(),
+        owner_email=owner_email,
+        name=name,
+        description=description,
+        metadata_schema=metadata_schema or {},
+        settings=settings or {},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def delete_knowledgebase(
+    session: AsyncSession, *, owner_email: str, knowledgebase_id: str
+) -> bool:
+    row = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if row is None:
+        return False
+    row.status = "deleted"
+    row.deleted_at = _utcnow()
+    attachments = await list_knowledgebase_artifacts(session, knowledgebase_id=knowledgebase_id)
+    for attachment in attachments:
+        if attachment.status in {"detached", "removed"}:
+            continue
+        attachment.status = "removed"
+        attachment.removed_at = _utcnow()
+        job = await enqueue_knowledgebase_job(
+            session,
+            knowledgebase_id=knowledgebase_id,
+            kb_artifact_id=attachment.kb_artifact_id,
+            artifact_id=attachment.artifact_id,
+            job_type="delete_artifact_index",
+            priority=5,
+        )
+        attachment.last_job_id = job.job_id
+    await session.flush()
+    return True
+
+
+async def update_knowledgebase(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    updates: dict[str, Any],
+) -> KnowledgebaseRow | None:
+    row = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if row is None:
+        return None
+    if "name" in updates:
+        row.name = updates["name"]
+    if "description" in updates:
+        row.description = updates["description"]
+    if "metadata_schema" in updates:
+        row.metadata_schema = updates["metadata_schema"] or {}
+    if "settings" in updates:
+        row.settings = updates["settings"] or {}
+    if "status" in updates:
+        status = str(updates["status"])
+        if status == "deleted":
+            raise ValueError("Use delete_knowledgebase for deletion")
+        row.status = status
+        row.archived_at = _utcnow() if status == "archived" else None
+    await session.flush()
+    return row
+
+
+async def list_knowledgebases(session: AsyncSession, *, owner_email: str) -> list[KnowledgebaseRow]:
+    result = await session.execute(
+        select(KnowledgebaseRow)
+        .where(KnowledgebaseRow.owner_email == owner_email, KnowledgebaseRow.status != "deleted")
+        .order_by(KnowledgebaseRow.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def list_knowledgebases_by_ids(
+    session: AsyncSession, *, owner_email: str, knowledgebase_ids: list[str]
+) -> list[KnowledgebaseRow]:
+    if not knowledgebase_ids:
+        return []
+    result = await session.execute(
+        select(KnowledgebaseRow)
+        .where(
+            KnowledgebaseRow.owner_email == owner_email,
+            KnowledgebaseRow.knowledgebase_id.in_(knowledgebase_ids),
+            KnowledgebaseRow.status != "deleted",
+        )
+        .order_by(KnowledgebaseRow.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_knowledgebase(
+    session: AsyncSession, *, owner_email: str, knowledgebase_id: str
+) -> KnowledgebaseRow | None:
+    result = await session.execute(
+        select(KnowledgebaseRow).where(
+            KnowledgebaseRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseRow.owner_email == owner_email,
+            KnowledgebaseRow.status != "deleted",
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_knowledgebase_by_id(
+    session: AsyncSession, *, knowledgebase_id: str
+) -> KnowledgebaseRow | None:
+    result = await session.execute(
+        select(KnowledgebaseRow).where(
+            KnowledgebaseRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseRow.status != "deleted",
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def assign_knowledgebase_to_agent(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    agent_id: str,
+) -> bool:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    agent = await get_agent(session, agent_id)
+    if kb is None or agent is None or agent.owner_email != owner_email:
+        return False
+    permissions = dict(agent.permissions or {})
+    allowed = list(permissions.get("allowed_knowledgebases") or [])
+    if knowledgebase_id not in allowed:
+        allowed.append(knowledgebase_id)
+    permissions["allowed_knowledgebases"] = allowed
+    agent.permissions = permissions
+    flag_modified(agent, "permissions")
+    agent.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def unassign_knowledgebase_from_agent(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    agent_id: str,
+) -> bool:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    agent = await get_agent(session, agent_id)
+    if kb is None or agent is None or agent.owner_email != owner_email:
+        return False
+    permissions = dict(agent.permissions or {})
+    allowed = [
+        value
+        for value in permissions.get("allowed_knowledgebases") or []
+        if value != knowledgebase_id
+    ]
+    permissions["allowed_knowledgebases"] = allowed
+    agent.permissions = permissions
+    flag_modified(agent, "permissions")
+    agent.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def list_knowledgebase_agent_assignments(
+    session: AsyncSession, *, owner_email: str, knowledgebase_id: str
+) -> list[str] | None:
+    if (
+        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
+        is None
+    ):
+        return None
+    agents = await list_agents(session, owner_email=owner_email)
+    assigned: list[str] = []
+    for agent in agents:
+        permissions = agent.permissions or {}
+        if knowledgebase_id in (permissions.get("allowed_knowledgebases") or []):
+            assigned.append(agent.agent_id)
+    return assigned
+
+
+async def enqueue_knowledgebase_job(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    job_type: str,
+    kb_artifact_id: str | None = None,
+    artifact_id: str | None = None,
+    priority: int = 100,
+) -> KnowledgebaseIndexJobRow:
+    job = KnowledgebaseIndexJobRow(
+        job_id=_kb_job_id(),
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=kb_artifact_id,
+        artifact_id=artifact_id,
+        job_type=job_type,
+        status="queued",
+        priority=priority,
+    )
+    session.add(job)
+    await session.flush()
+    return job
+
+
+async def attach_artifact_to_knowledgebase(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    artifact_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> KnowledgebaseArtifactRow | None:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    artifact = await get_artifact_record(session, artifact_id)
+    if (
+        kb is None
+        or artifact is None
+        or artifact.owner_email != owner_email
+        or artifact.status == "deleted"
+    ):
+        return None
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        existing.status = "queued"
+        existing.metadata_json = metadata or existing.metadata_json or {}
+        existing.last_error = None
+        await enqueue_knowledgebase_job(
+            session,
+            knowledgebase_id=knowledgebase_id,
+            kb_artifact_id=existing.kb_artifact_id,
+            artifact_id=artifact_id,
+            job_type="reindex_artifact",
+        )
+        await session.flush()
+        return existing
+    artifact.status = "attached"
+    artifact.expires_at = None
+    row = KnowledgebaseArtifactRow(
+        kb_artifact_id=_kb_artifact_id(),
+        knowledgebase_id=knowledgebase_id,
+        artifact_id=artifact_id,
+        status="queued",
+        source_hash=artifact.content_hash,
+        source_size_bytes=artifact.size_bytes,
+        source_mime_type=artifact.mime_type,
+        source_filename=artifact.filename,
+        metadata_json=metadata or {},
+    )
+    session.add(row)
+    await session.flush()
+    job = await enqueue_knowledgebase_job(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=row.kb_artifact_id,
+        artifact_id=artifact_id,
+        job_type="index_artifact",
+    )
+    row.last_job_id = job.job_id
+    await session.flush()
+    return row
+
+
+async def list_knowledgebase_artifacts(
+    session: AsyncSession, *, knowledgebase_id: str
+) -> list[KnowledgebaseArtifactRow]:
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow)
+        .where(KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id)
+        .order_by(KnowledgebaseArtifactRow.attached_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def detach_knowledgebase_artifact(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    artifact_id: str,
+) -> KnowledgebaseArtifactRow | None:
+    if (
+        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
+        is None
+    ):
+        return None
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "detached"
+    row.removed_at = _utcnow()
+    job = await enqueue_knowledgebase_job(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=row.kb_artifact_id,
+        artifact_id=artifact_id,
+        job_type="delete_artifact_index",
+        priority=10,
+    )
+    row.last_job_id = job.job_id
+    await session.flush()
+    return row
+
+
+async def list_knowledgebase_jobs(
+    session: AsyncSession, *, knowledgebase_id: str, limit: int = 100
+) -> list[KnowledgebaseIndexJobRow]:
+    result = await session.execute(
+        select(KnowledgebaseIndexJobRow)
+        .where(KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id)
+        .order_by(KnowledgebaseIndexJobRow.queued_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_knowledgebase_job(
+    session: AsyncSession, *, knowledgebase_id: str, job_id: str
+) -> KnowledgebaseIndexJobRow | None:
+    result = await session.execute(
+        select(KnowledgebaseIndexJobRow).where(
+            KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseIndexJobRow.job_id == job_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def enqueue_knowledgebase_artifact_reindex(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    artifact_id: str,
+) -> KnowledgebaseIndexJobRow | None:
+    if (
+        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
+        is None
+    ):
+        return None
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None or row.artifact_id is None:
+        return None
+    row.status = "queued"
+    row.last_error = None
+    job = await enqueue_knowledgebase_job(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=row.kb_artifact_id,
+        artifact_id=row.artifact_id,
+        job_type="reindex_artifact",
+    )
+    row.last_job_id = job.job_id
+    await session.flush()
+    return job
+
+
+async def enqueue_knowledgebase_reindex(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+) -> list[KnowledgebaseIndexJobRow] | None:
+    if (
+        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
+        is None
+    ):
+        return None
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    jobs: list[KnowledgebaseIndexJobRow] = []
+    for row in result.scalars().all():
+        if row.artifact_id is None:
+            continue
+        row.status = "queued"
+        row.last_error = None
+        job = await enqueue_knowledgebase_job(
+            session,
+            knowledgebase_id=knowledgebase_id,
+            kb_artifact_id=row.kb_artifact_id,
+            artifact_id=row.artifact_id,
+            job_type="reindex_artifact",
+        )
+        row.last_job_id = job.job_id
+        jobs.append(job)
+    await session.flush()
+    return jobs
+
+
+async def enqueue_retry_knowledgebase_job(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    job_id: str,
+) -> KnowledgebaseIndexJobRow | None:
+    if (
+        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
+        is None
+    ):
+        return None
+    job = await get_knowledgebase_job(session, knowledgebase_id=knowledgebase_id, job_id=job_id)
+    if job is None or job.status not in {"failed", "cancelled"}:
+        return None
+    new_job = await enqueue_knowledgebase_job(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=job.kb_artifact_id,
+        artifact_id=job.artifact_id,
+        job_type=job.job_type,
+        priority=job.priority,
+    )
+    if job.kb_artifact_id is not None:
+        attachment = (
+            await session.execute(
+                select(KnowledgebaseArtifactRow).where(
+                    KnowledgebaseArtifactRow.kb_artifact_id == job.kb_artifact_id
+                )
+            )
+        ).scalar_one_or_none()
+        if attachment is not None and attachment.status not in {"detached", "removed"}:
+            attachment.status = "queued"
+            attachment.last_error = None
+            attachment.last_job_id = new_job.job_id
+    await session.flush()
+    return new_job
+
+
+async def claim_next_knowledgebase_job(session: AsyncSession) -> KnowledgebaseIndexJobRow | None:
+    result = await session.execute(
+        select(KnowledgebaseIndexJobRow)
+        .where(KnowledgebaseIndexJobRow.status == "queued")
+        .order_by(KnowledgebaseIndexJobRow.priority.asc(), KnowledgebaseIndexJobRow.queued_at.asc())
+        .limit(1)
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        return None
+    job.status = "running"
+    job.started_at = _utcnow()
+    job.updated_at = _utcnow()
+    job.attempts += 1
+    await session.flush()
+    return job
+
+
+async def delete_knowledgebase_chunks(session: AsyncSession, *, kb_artifact_id: str) -> list[str]:
+    result = await session.execute(
+        select(KnowledgebaseChunkRow.vector_id).where(
+            KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id
+        )
+    )
+    vector_ids = [value for value in result.scalars().all() if value]
+    await session.execute(
+        delete(KnowledgebaseChunkRow).where(KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id)
+    )
+    await session.flush()
+    return vector_ids
+
+
+async def insert_knowledgebase_chunks(
+    session: AsyncSession,
+    *,
+    rows: list[KnowledgebaseChunkRow],
+) -> None:
+    session.add_all(rows)
+    await session.flush()
+
+
+async def list_knowledgebase_chunks(
+    session: AsyncSession, *, knowledgebase_id: str
+) -> list[KnowledgebaseChunkRow]:
+    result = await session.execute(
+        select(KnowledgebaseChunkRow).where(
+            KnowledgebaseChunkRow.knowledgebase_id == knowledgebase_id
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def get_knowledgebase_chunk(
+    session: AsyncSession, *, knowledgebase_id: str, chunk_id: str
+) -> KnowledgebaseChunkRow | None:
+    result = await session.execute(
+        select(KnowledgebaseChunkRow).where(
+            KnowledgebaseChunkRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseChunkRow.chunk_id == chunk_id,
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 async def get_pairing_request_by_code(
