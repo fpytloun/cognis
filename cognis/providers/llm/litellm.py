@@ -90,6 +90,7 @@ from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
     auxiliary_reasoning_effort_for_model,
+    looks_like_embedding_model,
     reasoning_efforts_for_model,
 )
 from cognis.providers.llm.responses_bridge import (
@@ -1045,7 +1046,66 @@ def _normalized_json_mode_response(
 
 def _supports_image_response_format(model: str) -> bool:
     normalized = model.rsplit("/", 1)[-1].lower()
-    return normalized != "gpt-image-1"
+    return not normalized.startswith("gpt-image-")
+
+
+def _iter_gemini_image_content_parts(content: Any) -> list[Any]:
+    if isinstance(content, list):
+        return content
+    if isinstance(content, dict):
+        return [content]
+    if isinstance(content, str) and content.startswith("data:image/"):
+        return [content]
+    return []
+
+
+def _generated_image_from_content_part(part: Any) -> GeneratedImage | None:
+    if isinstance(part, str):
+        return _generated_image_from_url(part)
+    if not isinstance(part, dict):
+        return None
+
+    image_url = part.get("image_url")
+    if isinstance(image_url, str):
+        return _generated_image_from_url(image_url)
+    if isinstance(image_url, dict):
+        url = image_url.get("url")
+        if isinstance(url, str):
+            return _generated_image_from_url(url)
+
+    inline_data = part.get("inline_data") or part.get("inlineData")
+    if isinstance(inline_data, dict):
+        data = inline_data.get("data")
+        if isinstance(data, str) and data:
+            mime_type = inline_data.get("mime_type") or inline_data.get("mimeType")
+            return GeneratedImage(
+                b64_json=data,
+                content_type=str(mime_type) if isinstance(mime_type, str) else "image/png",
+            )
+
+    if part.get("type") in {"image", "image_url"}:
+        data = part.get("data") or part.get("b64_json") or part.get("base64")
+        if isinstance(data, str) and data:
+            content_type = part.get("mime_type") or part.get("mimeType") or "image/png"
+            return GeneratedImage(b64_json=data, content_type=str(content_type))
+        url = part.get("url")
+        if isinstance(url, str):
+            return _generated_image_from_url(url)
+
+    return None
+
+
+def _generated_image_from_url(url: str) -> GeneratedImage | None:
+    if not url:
+        return None
+    if url.startswith("data:"):
+        header, separator, data = url.partition(",")
+        if separator and data:
+            content_type = "image/png"
+            if header.startswith("data:") and ";" in header:
+                content_type = header.split(":", 1)[1].split(";", 1)[0] or content_type
+            return GeneratedImage(b64_json=data, content_type=content_type)
+    return GeneratedImage(url=url, content_type="image/png")
 
 
 def _metadata_floor_for_model(model_id: str) -> dict[str, int] | None:
@@ -1542,22 +1602,6 @@ def _looks_like_image_generation_model(model_name: str) -> bool:
             "dall-e",
             "image-generation",
             "imagen",
-        )
-    )
-
-
-def _looks_like_embedding_model(model_name: str) -> bool:
-    normalized = model_name.strip().lower().replace("_", "-")
-    return any(
-        token in normalized
-        for token in (
-            "embedding",
-            "embed-",
-            "-embed",
-            "e5-",
-            "bge-",
-            "gte-",
-            "nomic-embed",
         )
     )
 
@@ -2857,6 +2901,12 @@ class LiteLLMProvider:
                                 merged,
                                 "supports_image_generation",
                             ),
+                            "supports_embedding": _merge_live_bool(
+                                live_dict,
+                                merged,
+                                "supports_embedding",
+                                fallback=looks_like_embedding_model(model_id),
+                            ),
                             "supported_audio_mime_types": list(
                                 live_dict.get("supported_audio_mime_types")
                                 or merged.get("supported_audio_mime_types")
@@ -3042,7 +3092,7 @@ class LiteLLMProvider:
             and _looks_like_openai_apply_patch_model(model_name)
         )
         supports_image_generation = _looks_like_image_generation_model(model_name)
-        supports_embedding = _looks_like_embedding_model(model_name)
+        supports_embedding = looks_like_embedding_model(model_name)
         return {
             "supports_defer_loading": is_anthropic,
             "supports_prompt_caching": is_anthropic,
@@ -5964,7 +6014,7 @@ class LiteLLMProvider:
         )
 
         if strategy == "acompletion_modalities":
-            return await self._image_generate_via_completion(
+            result = await self._image_generate_via_completion(
                 prefixed_model,
                 prompt,
                 request_kwargs,
@@ -5973,17 +6023,23 @@ class LiteLLMProvider:
                 image=image,
                 **kwargs,
             )
-        return await self._image_generate_via_api(
-            prefixed_model,
-            prompt,
-            request_kwargs,
-            n=n,
-            size=size,
-            quality=quality,
-            response_format=response_format,
-            image=image,
-            **kwargs,
-        )
+        else:
+            result = await self._image_generate_via_api(
+                prefixed_model,
+                prompt,
+                request_kwargs,
+                n=n,
+                size=size,
+                quality=quality,
+                response_format=response_format,
+                image=image,
+                **kwargs,
+            )
+        if not result.images:
+            raise RuntimeError(
+                f"Image generation returned no image data for model {result.model!r}"
+            )
+        return result
 
     async def _image_generate_via_api(
         self,
@@ -6116,9 +6172,14 @@ class LiteLLMProvider:
         images: list[GeneratedImage] = []
         data = getattr(response, "data", []) or []
         for item in data:
-            b64 = getattr(item, "b64_json", None) or None
-            url = getattr(item, "url", None) or None
-            revised = getattr(item, "revised_prompt", None)
+            if isinstance(item, dict):
+                b64 = item.get("b64_json") or None
+                url = item.get("url") or None
+                revised = item.get("revised_prompt")
+            else:
+                b64 = getattr(item, "b64_json", None) or None
+                url = getattr(item, "url", None) or None
+                revised = getattr(item, "revised_prompt", None)
             if b64 or url:
                 images.append(
                     GeneratedImage(
@@ -6182,6 +6243,16 @@ class LiteLLMProvider:
                             content_type=content_type,
                         )
                     )
+
+            # LiteLLM/Gemini image previews may return generated media as
+            # content parts instead of message.images.  Accept the common
+            # OpenAI-ish image_url shape, Gemini inline_data shape, and direct
+            # data URLs so a valid image response is not silently normalized to
+            # an empty result.
+            for part in _iter_gemini_image_content_parts(message.get("content")):
+                generated = _generated_image_from_content_part(part)
+                if generated is not None:
+                    images.append(generated)
 
         usage_dict = response_dict.get("usage", {})
         usage = None

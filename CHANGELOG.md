@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-05-24
+
+### Fixed
+
+- Auto-continued chat turns after the tool-call ceiling is reached so tool-heavy turns can finish instead of stopping early.
+- Allowed task creator agents to manage delegated tasks they created, preserving delegated task ownership metadata through APIs and queues.
+- Inferred routing model capabilities more accurately for provider/model settings and routing UI.
+- Hardened executor image generation and structured image tool results, including fallback image result URLs and provider-compatible output handling.
+- Cleaned up implementation-stage tracking documentation.
+
 ## [0.6.2] - 2026-05-24
 
 ### Fixed

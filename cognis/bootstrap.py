@@ -233,6 +233,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_execution_paths)
         await conn.run_sync(_ensure_task_completion_delivery_columns)
         await conn.run_sync(_ensure_task_interaction_override_columns)
+        await conn.run_sync(_ensure_task_creator_agent_column)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
@@ -253,6 +254,17 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_comments_table)
         await conn.run_sync(_ensure_tts_cache_table)
         await conn.run_sync(_ensure_knowledgebase_schema)
+
+
+def _ensure_task_creator_agent_column(sync_conn: object) -> None:
+    """Add the optional task author-agent marker for delegated task control."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    if "created_by_agent_id" not in task_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE tasks ADD COLUMN created_by_agent_id VARCHAR")
+        )
 
 
 def _ensure_knowledgebase_schema(sync_conn: object) -> None:

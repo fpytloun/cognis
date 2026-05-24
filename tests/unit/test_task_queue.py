@@ -25,6 +25,7 @@ from cognis.store.queries import (
     get_task,
     get_task_dependencies,
     list_tasks_by_status,
+    list_tasks_for_agent,
     pick_ready_task,
     set_current_version,
     update_step_run,
@@ -76,6 +77,36 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_for_agent_includes_creator_agent_tasks(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            session.add(
+                Agent(
+                    agent_id="agent-2",
+                    owner_email="user@test.com",
+                    name="Agent 2",
+                )
+            )
+            await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                created_by_agent_id="agent-2",
+                title="Delegated task",
+                status="draft",
+            )
+            await session.commit()
+
+        async with factory() as session:
+            tasks = await list_tasks_for_agent(session, "agent-2")
+
+        assert [task.title for task in tasks] == ["Delegated task"]
     finally:
         await engine.dispose()
 
@@ -252,12 +283,14 @@ async def test_select_workflow_for_task_can_materialize_attached_skill(tmp_path:
     engine, factory = await _bootstrap_db(tmp_path)
 
     class _LLM:
-        async def generate(self, _messages: list[dict[str, object]], **_kwargs: object) -> dict[str, object]:
+        async def generate(
+            self, _messages: list[dict[str, object]], **_kwargs: object
+        ) -> dict[str, object]:
             return {
                 "choices": [
                     {
                         "message": {
-                            "content": '{"workflow_id":"skill:skill_release","confidence":0.9,"reason":"Attached release skill fits"}'
+                            "content": '{"workflow_id":"skill:skill_release","confidence":0.99,"exact_skill_domain_match":true,"reason":"Attached release skill fits"}'
                         }
                     }
                 ]

@@ -55,7 +55,14 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
+    ContinuationFollowUp,
     FollowUpMetadata,
+    FollowUpMode,
+    FollowUpOriginKind,
+    FollowUpRelevanceHint,
+    FollowUpRequiredAction,
+    FollowUpStatus,
+    build_follow_up_id,
     parse_follow_up_metadata,
 )
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
@@ -111,6 +118,7 @@ DEFAULT_MAX_ACTIVE_TURNS_PER_USER = 20
 DEFAULT_MAX_QUEUED_MESSAGES = 20
 _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
+MAX_AUTOMATIC_CONTINUATION_ATTEMPTS = 3
 
 
 def _utcnow() -> datetime:
@@ -448,6 +456,43 @@ def _user_message_event_payload(
         "event_id": event_id,
         "message_id": event_id,
     }
+
+
+def _tool_call_ceiling_metadata(step_output: Any | None) -> dict[str, Any] | None:
+    metadata = getattr(step_output, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("continuation_reason") != "tool_call_ceiling_reached":
+        return None
+    return metadata
+
+
+def _pending_todos_from_metadata(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    todos = metadata.get("pending_todos")
+    if not isinstance(todos, list):
+        return []
+    pending: list[dict[str, str]] = []
+    for todo in todos:
+        if not isinstance(todo, dict):
+            continue
+        content = str(todo.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(todo.get("status") or "pending").strip() or "pending"
+        if status in {"completed", "cancelled"}:
+            continue
+        pending.append({"content": content, "status": status})
+    return pending
+
+
+def _positive_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 class SessionCreationFailedError(Exception):
@@ -1690,6 +1735,130 @@ class TurnScheduler:
         except Exception:
             logger.debug("turn_scheduler: durable follow-up clear unavailable", exc_info=True)
 
+    def _build_tool_call_ceiling_follow_up(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        metadata: dict[str, Any],
+        prior_follow_up: FollowUpMetadata | None,
+    ) -> ContinuationFollowUp | None:
+        if (
+            isinstance(prior_follow_up, ContinuationFollowUp)
+            and prior_follow_up.reason == "tool_call_ceiling_reached"
+        ):
+            attempt = prior_follow_up.attempt + 1
+        else:
+            attempt = 1
+        if attempt > MAX_AUTOMATIC_CONTINUATION_ATTEMPTS:
+            return None
+
+        pending_todos = _pending_todos_from_metadata(metadata)
+        tool_call_count = _positive_optional_int(metadata.get("tool_call_count"))
+        max_tool_calls = _positive_optional_int(metadata.get("max_tool_calls"))
+        follow_up = ContinuationFollowUp(
+            follow_up_id=build_follow_up_id(
+                kind=FollowUpOriginKind.CONTINUATION.value,
+                conversation_id=conversation_id,
+                parts={
+                    "reason": "tool_call_ceiling_reached",
+                    "turn_id": turn_id,
+                    "attempt": attempt,
+                },
+            ),
+            mode=FollowUpMode.INTEGRATE,
+            origin_kind=FollowUpOriginKind.CONTINUATION,
+            relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+            required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
+            topic_ref=turn_id,
+            status=FollowUpStatus.COMPLETED,
+            reason="tool_call_ceiling_reached",
+            attempt=attempt,
+            max_attempts=MAX_AUTOMATIC_CONTINUATION_ATTEMPTS,
+            tool_call_count=tool_call_count,
+            max_tool_calls=max_tool_calls,
+            pending_todos=pending_todos,
+        )
+        return follow_up
+
+    async def _schedule_tool_call_ceiling_continuation(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        turn_id: str,
+        user_email: str,
+        metadata: dict[str, Any],
+        prior_follow_up: FollowUpMetadata | None,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
+    ) -> None:
+        follow_up = self._build_tool_call_ceiling_follow_up(
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            metadata=metadata,
+            prior_follow_up=prior_follow_up,
+        )
+        tool_call_count = _positive_optional_int(metadata.get("tool_call_count"))
+        max_tool_calls = _positive_optional_int(metadata.get("max_tool_calls"))
+        if follow_up is None:
+            message = (
+                "Automatic continuation stopped after repeated tool-call ceilings. "
+                "Send a new message to continue manually."
+            )
+            await self._notify_observers_system_message(
+                conversation_id,
+                message,
+                turn_observers=turn_observers,
+            )
+            logger.warning(
+                "turn_scheduler: automatic continuation ceiling exhausted",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "tool_call_count": tool_call_count,
+                        "max_tool_calls": max_tool_calls,
+                    }
+                },
+            )
+            return
+
+        count_text = (
+            f" ({tool_call_count}/{max_tool_calls} tool calls)"
+            if tool_call_count is not None and max_tool_calls is not None
+            else ""
+        )
+        await self._notify_observers_system_message(
+            conversation_id,
+            f"Tool-call limit reached{count_text}. Continuing automatically.",
+            turn_observers=turn_observers,
+        )
+        self._queued_messages[conversation_id].append(
+            _QueuedMessage(
+                content="",
+                user_email=user_email,
+                system_initiated=True,
+                follow_up=follow_up,
+                turn_observers=tuple(turn_observers),
+            )
+        )
+        logger.info(
+            "turn_scheduler: queued automatic continuation after tool-call ceiling",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "attempt": follow_up.attempt,
+                    "tool_call_count": tool_call_count,
+                    "max_tool_calls": max_tool_calls,
+                    "pending_todo_count": len(follow_up.pending_todos),
+                }
+            },
+        )
+        await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
+
     # ------------------------------------------------------------------
     # Follow-up turn handling (EventBus subscriber)
     # ------------------------------------------------------------------
@@ -2165,6 +2334,7 @@ class TurnScheduler:
                     agent_id=agent.agent_id,
                     title=content[:80],
                     description=content,
+                    created_by_agent_id=agent.agent_id,
                     source_type="chat",
                     source_ref=conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
@@ -2242,6 +2412,21 @@ class TurnScheduler:
                     reason=reason,
                 ),
             )
+            ceiling_metadata = _tool_call_ceiling_metadata(step_output)
+            if (
+                ceiling_metadata is not None
+                and not channel_deliverable
+                and getattr(conversation, "status", "active") == "active"
+            ):
+                await self._schedule_tool_call_ceiling_continuation(
+                    conversation_id=conversation_id,
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    user_email=user_email,
+                    metadata=ceiling_metadata,
+                    prior_follow_up=follow_up,
+                    turn_observers=turn_observers,
+                )
 
             # Post-turn housekeeping
             completed_at = datetime.now(UTC)

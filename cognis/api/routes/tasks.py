@@ -221,6 +221,12 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             "validation_error",
             "Specify either workflow_id or skill_id, not both",
         )
+    if payload.created_by_agent_id is not None:
+        raise api_exception(
+            400,
+            "validation_error",
+            "created_by_agent_id is assigned automatically from agent-created tasks",
+        )
     if payload.source_type == "chat" and payload.source_ref is None:
         raise api_exception(
             400,
@@ -1398,6 +1404,7 @@ def _row_to_task(row: Any) -> TaskModel:
         priority=row.priority,
         created_by=row.created_by,
         agent_id=row.agent_id,
+        created_by_agent_id=getattr(row, "created_by_agent_id", None),
         source_type=row.source_type,
         source_ref=row.source_ref,
         delivery=TaskDelivery(mode=row.delivery_mode, target=row.delivery_target),

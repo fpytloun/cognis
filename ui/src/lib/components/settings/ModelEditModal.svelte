@@ -54,6 +54,7 @@
     { key: 'supports_audio_input', label: 'Audio input' },
     { key: 'supports_pdf_input', label: 'PDF input' },
     { key: 'supports_file_input', label: 'File input' },
+    { key: 'supports_embedding', label: 'Embedding' },
     { key: 'supports_extended_thinking', label: 'Ext. thinking' },
     { key: 'supports_prompt_caching', label: 'Prompt caching' },
     { key: 'supports_responses_api', label: 'Responses API' },

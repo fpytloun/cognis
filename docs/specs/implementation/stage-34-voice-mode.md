@@ -519,7 +519,7 @@ Tests:
 
 ## Stage exit
 
-Update the tracker in [implementation/README.md](README.md): Stage 34
-DONE. Add a follow-up note that `voice_resolution.resolve_voice` is the
-canonical voice resolver going forward and that any new voice-aware
-surface (e.g. notifications, channel adapters) must route through it.
+Mark this stage file DONE. Add a follow-up note that
+`voice_resolution.resolve_voice` is the canonical voice resolver going
+forward and that any new voice-aware surface (e.g. notifications, channel
+adapters) must route through it.

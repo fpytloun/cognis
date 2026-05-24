@@ -2027,6 +2027,7 @@ async def create_task(
     expected_output: str | None = None,
     status: str = "draft",
     priority: int = 0,
+    created_by_agent_id: str | None = None,
     source_type: str = "api",
     source_ref: str | None = None,
     delivery_mode: str = "same_conversation",
@@ -2058,6 +2059,7 @@ async def create_task(
         priority=priority,
         created_by=created_by,
         agent_id=agent_id,
+        created_by_agent_id=created_by_agent_id,
         source_type=source_type,
         source_ref=source_ref,
         delivery_mode=delivery_mode,
@@ -2377,10 +2379,13 @@ async def list_tasks_for_agent(
     statuses: list[str] | None = None,
     limit: int = 50,
 ) -> list[Task]:
-    """List tasks for a specific agent, optionally filtered by status."""
+    """List tasks owned by or created from a specific agent.
+
+    Optionally filters by task status.
+    """
     query = (
         select(Task)
-        .where(Task.agent_id == agent_id)
+        .where(sa.or_(Task.agent_id == agent_id, Task.created_by_agent_id == agent_id))
         .order_by(Task.priority.desc(), Task.created_at.desc())
         .limit(limit)
     )

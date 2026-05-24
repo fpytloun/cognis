@@ -54,6 +54,7 @@ class FollowUpOriginKind(StrEnum):
     BACKGROUND_TOOL_RESULT = "background_tool_result"
     GATE = "gate"
     SCHEDULE = "schedule"
+    CONTINUATION = "continuation"
     OTHER = "other"
 
 
@@ -132,8 +133,22 @@ class GateFollowUp(FollowUpBase):
         return self
 
 
+class ContinuationFollowUp(FollowUpBase):
+    origin_kind: Literal[FollowUpOriginKind.CONTINUATION]
+    reason: str = Field(min_length=1, max_length=120)
+    attempt: int = Field(ge=1)
+    max_attempts: int = Field(ge=1)
+    tool_call_count: int | None = Field(default=None, ge=0)
+    max_tool_calls: int | None = Field(default=None, ge=1)
+    pending_todos: list[dict[str, Any]] = Field(default_factory=list)
+
+
 FollowUpMetadata = (
-    TaskResultFollowUp | DelegationResultFollowUp | BackgroundToolResultFollowUp | GateFollowUp
+    TaskResultFollowUp
+    | DelegationResultFollowUp
+    | BackgroundToolResultFollowUp
+    | GateFollowUp
+    | ContinuationFollowUp
 )
 
 
@@ -152,6 +167,8 @@ def parse_follow_up_metadata(payload: dict[str, Any]) -> FollowUpMetadata:
         return BackgroundToolResultFollowUp.model_validate(payload)
     if origin is FollowUpOriginKind.GATE:
         return GateFollowUp.model_validate(payload)
+    if origin is FollowUpOriginKind.CONTINUATION:
+        return ContinuationFollowUp.model_validate(payload)
     raise ValueError(f"Unsupported follow-up origin: {origin.value}")
 
 
@@ -255,6 +272,37 @@ def render_follow_up_block(follow_up: FollowUpMetadata) -> str:
             )
             if labels:
                 lines.append(f"options: {labels}")
+    elif isinstance(follow_up, ContinuationFollowUp):
+        lines.extend(
+            [
+                f"reason: {_xml_safe(follow_up.reason)}",
+                f"attempt: {follow_up.attempt}/{follow_up.max_attempts}",
+            ]
+        )
+        if follow_up.tool_call_count is not None:
+            ceiling = (
+                f"{follow_up.tool_call_count}/{follow_up.max_tool_calls}"
+                if follow_up.max_tool_calls is not None
+                else str(follow_up.tool_call_count)
+            )
+            lines.append(f"tool_calls: {ceiling}")
+        if follow_up.pending_todos:
+            lines.append("pending_todos:")
+            for todo in follow_up.pending_todos:
+                if not isinstance(todo, dict):
+                    continue
+                content = str(todo.get("content") or "").strip()
+                if not content:
+                    continue
+                status = str(todo.get("status") or "pending").strip() or "pending"
+                lines.append(f"- [{_xml_safe(status)}] {_xml_safe(content)}")
+        lines.extend(
+            [
+                "Continue the same user request from recent conversation history.",
+                "Do not repeat completed work or already executed tool calls unless needed to verify state.",
+                "Before continuing, inspect and reconcile active todos. If only todo cleanup remains, update todos and finish.",
+            ]
+        )
     lines.append("</follow_up_event>")
     return "\n".join(lines)
 

@@ -819,6 +819,7 @@ class TaskCreateRequest(BaseModel):
     start_immediately: bool | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
+    created_by_agent_id: str | None = None
 
     @field_validator("workflow_id", "project_id", "skill_id", mode="before")
     @classmethod
@@ -949,6 +950,7 @@ class TaskResponse(BaseModel):
     priority: int = 0
     created_by: str
     agent_id: str
+    created_by_agent_id: str | None = None
     source_type: str
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
@@ -1083,6 +1085,7 @@ class CreateScheduleRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
+        self.task_template.pop("created_by_agent_id", None)
         if self.schedule_type == "cron" and not self.cron_expr:
             raise PydanticCustomError("missing_cron_expr", "cron_expr required for cron schedules")
         if self.schedule_type == "interval" and not self.interval_seconds:
@@ -1117,6 +1120,12 @@ class UpdateScheduleRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+
+    @model_validator(mode="after")
+    def _strip_reserved_task_template_fields(self) -> UpdateScheduleRequest:
+        if self.task_template is not None:
+            self.task_template.pop("created_by_agent_id", None)
+        return self
 
 
 class ScheduleResponse(BaseModel):

@@ -21,6 +21,7 @@ from cognis.api.models import (
     ActiveThinkingSnapshotResponse,
     AgentGrantResponse,
     AgentResponse,
+    CreateScheduleRequest,
     DeliverableResponse,
     EffectiveToolItemResponse,
     ExecutorTokenResponse,
@@ -41,6 +42,7 @@ from cognis.api.models import (
     ToolClassificationOverrideRequest,
     ToolClassificationRequeueRequest,
     ToolResponse,
+    UpdateScheduleRequest,
     WorkflowResponse,
 )
 from cognis.api.routes.push import PushSubscriptionStatusResponse
@@ -440,6 +442,37 @@ class TestTaskResponseRoundTrip:
         assert response.description == ""
         assert response.workflow_state is None
         assert response.completion_mode_family == "default"
+        assert response.created_by_agent_id is None
+
+
+class TestTaskCreateRequest:
+    """TaskCreateRequest preserves optional creator-agent marker."""
+
+    def test_created_by_agent_id_defaults_to_none(self) -> None:
+        create = TaskCreateRequest(agent_id="agent-1", title="Task")
+        assert create.created_by_agent_id is None
+
+
+class TestScheduleRequests:
+    """Schedule requests strip reserved task template fields."""
+
+    def test_create_strips_task_creator_agent_marker(self) -> None:
+        request = CreateScheduleRequest(
+            name="Daily",
+            agent_id="agent-1",
+            schedule_type="interval",
+            interval_seconds=60,
+            task_template={"title": "Task", "created_by_agent_id": "agent-2"},
+        )
+
+        assert request.task_template == {"title": "Task"}
+
+    def test_update_strips_task_creator_agent_marker(self) -> None:
+        request = UpdateScheduleRequest(
+            task_template={"title": "Task", "created_by_agent_id": "agent-2"}
+        )
+
+        assert request.task_template == {"title": "Task"}
 
 
 def test_task_rerun_response_round_trip() -> None:

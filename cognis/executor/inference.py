@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 
 def _supports_image_response_format(model: str) -> bool:
     normalized = model.rsplit("/", 1)[-1].lower()
-    return normalized != "gpt-image-1"
+    return not normalized.startswith("gpt-image-")
 
 
 class InferenceHandler:

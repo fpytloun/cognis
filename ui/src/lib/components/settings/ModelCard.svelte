@@ -29,6 +29,7 @@
     { key: 'supports_vision', label: 'vision' },
     { key: 'supports_streaming', label: 'streaming' },
     { key: 'supports_reasoning', label: 'reasoning' },
+    { key: 'supports_embedding', label: 'embedding' },
     { key: 'supports_prompt_caching', label: 'prompt-caching' },
     { key: 'supports_responses_api', label: 'responses-api' },
     { key: 'supports_tool_search', label: 'tool-search' },

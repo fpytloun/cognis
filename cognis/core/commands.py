@@ -766,6 +766,7 @@ class CommandDispatcher:
             agent_id=agent.agent_id,
             title=description[:80],
             description=description,
+            created_by_agent_id=agent.agent_id,
             source_type="chat",
             source_ref=conversation.conversation_id,
             delivery=TaskDelivery(mode="same_conversation"),

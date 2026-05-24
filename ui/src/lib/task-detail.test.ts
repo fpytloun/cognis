@@ -17,6 +17,7 @@ const taskDetail = {
   status: 'running',
   created_by: 'user@example.com',
   agent_id: 'agent-1',
+  created_by_agent_id: null,
   source_type: 'scheduler',
   source_ref: 'sched-1',
   delivery: { mode: 'same_conversation', target: null },

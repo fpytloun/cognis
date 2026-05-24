@@ -33,6 +33,7 @@ from cognis.providers.llm.litellm import (
 )
 from cognis.providers.llm.reasoning import (
     apply_reasoning_config,
+    enrich_model_entry,
     reasoning_efforts_for_model,
     remap_reasoning_effort_to_available,
 )
@@ -1925,6 +1926,43 @@ async def test_litellm_provider_image_generate_omits_response_format_for_gpt_ima
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_image_generate_omits_response_format_for_gpt_image_2(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-image-2"},
+                status="active",
+            )
+        )
+        await session.commit()
+    provider = LiteLLMProvider(session_factory)
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        data = [{"b64_json": "YWJj"}]
+        usage = None
+
+    async def fake_with_llm_retry(_func: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.retry.with_llm_retry", fake_with_llm_retry)
+
+    await provider.image_generate(prompt="draw", model="gpt-image-2")
+
+    assert "response_format" not in captured
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_image_generate_keeps_response_format_for_other_models(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1959,6 +1997,32 @@ async def test_litellm_provider_image_generate_keeps_response_format_for_other_m
 
     assert captured["response_format"] == "b64_json"
     await engine.dispose()
+
+
+def test_litellm_provider_normalizes_gemini_content_part_images() -> None:
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64,YWJj"},
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+
+    result = LiteLLMProvider._normalize_gemini_image_response(_Response(), "gemini-image")
+
+    assert len(result.images) == 1
+    assert result.images[0].b64_json == "YWJj"
+    assert result.images[0].content_type == "image/png"
 
 
 @pytest.mark.asyncio
@@ -2275,6 +2339,31 @@ def test_reasoning_efforts_for_generic_reasoning_model_include_none() -> None:
         provider_preset="openrouter",
         supports_reasoning=True,
     ) == ["default", "none", "low", "medium", "high"]
+
+
+def test_enrich_model_entry_infers_embedding_capability() -> None:
+    entry = enrich_model_entry({"model_id": "text-embedding-3-small"}, provider_preset="openai")
+
+    assert entry["supports_embedding"] is True
+
+
+def test_enrich_model_entry_preserves_explicit_embedding_false() -> None:
+    entry = enrich_model_entry(
+        {"model_id": "text-embedding-3-small", "supports_embedding": False},
+        provider_preset="openai",
+    )
+
+    assert entry["supports_embedding"] is False
+
+
+def test_enrich_model_entry_infers_reasoning_efforts() -> None:
+    entry = enrich_model_entry(
+        {"model_id": "claude-sonnet-4-5"},
+        provider_preset="openai_compatible",
+    )
+
+    assert entry["supports_reasoning"] is True
+    assert "none" in entry["reasoning_efforts"]
 
 
 def test_remap_reasoning_effort_to_available_prefers_closest_supported_level() -> None:

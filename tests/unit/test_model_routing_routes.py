@@ -886,6 +886,53 @@ def test_model_routing_put_accepts_only_declared_embedding_models(
         }
 
 
+def test_model_routing_put_accepts_inferred_embedding_models(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'routing.db'}")  # type: ignore[attr-defined]
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="openai",
+                    display_name="OpenAI",
+                    location="controller",
+                    backend="litellm",
+                    config={
+                        "preset": "openai",
+                        "default_model": "gpt-5.4",
+                        "models": [{"model_id": "text-embedding-3-small"}],
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
+
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        response = client.put(
+            "/api/v1/model-routing",
+            headers=headers,
+            json={"embedding": {"model": "text-embedding-3-small", "reasoning_effort": None}},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["embedding"] == {
+            "model": "text-embedding-3-small",
+            "reasoning_effort": None,
+        }
+
+
 def test_model_routing_put_accepts_same_session_model_for_compaction_only(
     monkeypatch: object, tmp_path: Path
 ) -> None:

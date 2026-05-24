@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNED
+DONE
 
 ## Goal
 
@@ -460,8 +460,7 @@ Tests:
 
 ## Stage exit
 
-Update the tracker in
-[implementation/README.md](README.md): Stage 33 DONE. Add a follow-up
-note that `check_project_access` is the canonical resolver going
-forward and that workflow editors must surface step revision and
-metadata fields from this stage onward.
+Mark this stage file DONE. Add a follow-up note that
+`check_project_access` is the canonical resolver going forward and that
+workflow editors must surface step revision and metadata fields from this
+stage onward.

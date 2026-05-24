@@ -87,7 +87,9 @@ def enrich_model_entry(
     return consistent values without requiring admins to re-save their
     provider configurations. Currently fills:
 
-    - ``reasoning_efforts`` — computed from ``supports_reasoning`` + model id
+    - ``supports_embedding`` — inferred from known embedding model names
+    - ``supports_reasoning`` — inferred from known reasoning model names
+    - ``reasoning_efforts`` — computed from model id/provider family
 
     Explicitly-configured values are preserved: the helper only fills fields
     that are missing or empty.
@@ -100,7 +102,15 @@ def enrich_model_entry(
     if not isinstance(model_id, str) or not model_id:
         return entry
 
-    supports_reasoning = bool(entry.get("supports_reasoning"))
+    if "supports_embedding" not in entry and looks_like_embedding_model(model_id):
+        entry["supports_embedding"] = True
+
+    inferred_reasoning = "supports_reasoning" not in entry and _looks_like_reasoning_model(
+        model_id, provider_preset
+    )
+    supports_reasoning = bool(entry.get("supports_reasoning")) or inferred_reasoning
+    if inferred_reasoning:
+        entry["supports_reasoning"] = True
     existing_efforts = entry.get("reasoning_efforts")
     if supports_reasoning and (not isinstance(existing_efforts, list) or not existing_efforts):
         try:
@@ -118,6 +128,22 @@ def enrich_model_entry(
             supports_reasoning=True,
         )
     return entry
+
+
+def looks_like_embedding_model(model_name: str) -> bool:
+    normalized = model_name.strip().lower().replace("_", "-")
+    return any(
+        token in normalized
+        for token in (
+            "embedding",
+            "embed-",
+            "-embed",
+            "e5-",
+            "bge-",
+            "gte-",
+            "nomic-embed",
+        )
+    )
 
 
 def remap_reasoning_effort_to_available(

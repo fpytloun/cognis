@@ -9009,6 +9009,82 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
 
 
 @pytest.mark.asyncio
+async def test_get_task_tool_allows_exact_creator_agent_for_delegated_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _TaskSessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            self.session_factory = super().session_factory
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_TaskSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-2", owner_email="user@example.com", name="Creator"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            task_id="task-1",
+            title="Delegated task",
+            description="Desc",
+            expected_output=None,
+            status="paused",
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            created_by_agent_id="agent-2",
+            source_type="agent",
+            source_ref="conv-1",
+            delivery_mode="same_conversation",
+            delivery_target=None,
+            workflow_id=None,
+            workflow_state=None,
+            queue_name="default",
+            scheduled_for=None,
+            created_at=None,
+            started_at=None,
+            completed_at=None,
+            result_summary=None,
+            result_data=None,
+        )
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return []
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(call_id="call-1", name="get_task", arguments={"task_id": "task-1"}),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    assert result.is_error is False
+    body = json.loads(result.output)
+    assert body["task_id"] == "task-1"
+    assert body["created_by_agent_id"] == "agent-2"
+
+
+@pytest.mark.asyncio
 async def test_get_task_tool_still_rejects_unrelated_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

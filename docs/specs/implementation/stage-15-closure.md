@@ -8,8 +8,8 @@
 ## Objective
 
 Close remaining backend TODOs, fill test coverage gaps, and align the
-implementation tracker with the polished product. No new features — only
-closure of known debt and final stabilization.
+documentation with the polished product. No new features — only closure of
+known debt and final stabilization.
 
 ## Context
 
@@ -103,13 +103,10 @@ Fill the identified gaps in the test suite. Target: 30+ new test functions.
   - Step evaluation (approved, revise, timeout)
   - Task result delivery to conversation
 
-### 4. Implementation Tracker Alignment
+### 4. Documentation Alignment
 
-Update all tracking documents to reflect the polished product.
+Update user-facing documentation to reflect the polished product.
 
-- **`docs/specs/implementation/README.md`**: add Stages 10-15 to the
-  progress tracker table and dependency graph. Mark completed stages
-  as DONE with implementation notes.
 - **Stage files**: update each completed stage file with implementation
   notes documenting any deviations, follow-ups, or decisions made during
   implementation.
@@ -149,7 +146,6 @@ Tighten validation and handling for known edge cases.
 - [x] Circuit breaker has dedicated unit tests
 - [x] CLI commands have dedicated tests
 - [x] Workflow engine orchestration has unit tests (not just domain models)
-- [x] Implementation tracker accurately reflects the polished MVP
 - [x] AGENTS.md and README.md are up to date
 - [x] No known paper-cut regressions in core flows
 - [x] All stage files have implementation notes
@@ -164,7 +160,6 @@ Tighten validation and handling for known edge cases.
 - `cognis/api/middleware.py` — rate limiting target
 - `cognis/api/websocket.py` — heartbeat and test targets
 - `ui/src/lib/ws/client.ts` — client-side ping target
-- `docs/specs/implementation/README.md` — tracker to update
 - `AGENTS.md` — architecture reference to update
 
 ## Implementation Notes

@@ -175,6 +175,15 @@ async def handle_image_tool(
     except Exception as exc:
         return ToolResult(output=f"Image generation failed: {exc}", is_error=True)
 
+    if not result.images:
+        return ToolResult(
+            output=(
+                "Image generation failed: provider returned no image data "
+                f"for model {result.model!r}."
+            ),
+            is_error=True,
+        )
+
     # Save generated images to artifact store and return IDs
     output_images: list[dict[str, Any]] = []
     outbound_attachments: list[dict[str, Any]] = []

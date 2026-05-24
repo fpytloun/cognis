@@ -341,6 +341,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         priority=task.priority,
         created_by=task.created_by,
         agent_id=task.agent_id,
+        created_by_agent_id=task.created_by_agent_id,
         source_type=task.source_type,
         source_ref=task.source_ref,
         delivery=task.delivery,

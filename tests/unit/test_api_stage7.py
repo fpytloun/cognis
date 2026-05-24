@@ -3,11 +3,17 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.api.middleware import AuthenticatedUser
+from cognis.api.models import TaskCreateRequest
+from cognis.api.routes.tasks import task_create
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketConnectionManager,
@@ -547,6 +553,28 @@ def test_task_create_allows_non_chat_source_refs(monkeypatch: object, tmp_path: 
         assert body["source_type"] == "scheduler"
         assert body["source_ref"] == "sched_daily_review"
         assert body["delivery"]["mode"] == "preferred_channel"
+
+
+def test_task_create_rejects_explicit_creator_agent_without_side_effects() -> None:
+    async def _fail(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("task_create should reject before opening a task transaction")
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=_fail,
+            user=AuthenticatedUser(email="user@example.com", role="user"),
+        )
+    )
+    payload = TaskCreateRequest(
+        agent_id="agent-1",
+        created_by_agent_id="agent-1",
+        title="Invalid explicit creator",
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(task_create(request, payload))
+
+    assert exc_info.value.status_code == 400
 
 
 def test_task_create_rejects_same_conversation_outside_chat(

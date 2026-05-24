@@ -64,6 +64,7 @@ class TaskModel(BaseModel):
     priority: int = 0
     created_by: str
     agent_id: str
+    created_by_agent_id: str | None = None
     source_type: str = "api"  # "chat" | "api" | "scheduler" | "webhook"
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)

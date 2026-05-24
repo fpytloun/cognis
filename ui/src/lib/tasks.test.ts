@@ -13,6 +13,7 @@ function makeTask(overrides: Partial<Task>): Task {
     priority: overrides.priority ?? 0,
     created_by: overrides.created_by ?? 'user@example.com',
     agent_id: overrides.agent_id ?? 'agent-1',
+    created_by_agent_id: overrides.created_by_agent_id ?? null,
     source_type: overrides.source_type ?? 'chat',
     source_ref: overrides.source_ref ?? 'conv_1',
     delivery: overrides.delivery ?? { mode: 'same_conversation', target: null },

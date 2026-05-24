@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNED
+DONE
 
 ## Goal
 
@@ -660,8 +660,7 @@ Tests:
 
 ## Stage exit
 
-Update the tracker in [implementation/README.md](README.md): Stage 35
-DONE. Add a follow-up note that any new event types added to Intaris
-must explicitly opt into indexing (deny-list by default) and that
-`runtime_metadata["conversation_id"]` is the canonical way for tool
-handlers to know the active conversation going forward.
+Mark this stage file DONE. Add a follow-up note that any new event types
+added to Intaris must explicitly opt into indexing (deny-list by default)
+and that `runtime_metadata["conversation_id"]` is the canonical way for
+tool handlers to know the active conversation going forward.

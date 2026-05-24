@@ -174,9 +174,7 @@ async def test_stream_complete_responses_projects_messages_to_responses_input(
             "response": {
                 "status": "completed",
                 "usage": {"total_tokens": 4},
-                "output": [
-                    {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}
-                ],
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
             },
         }
 
@@ -583,6 +581,36 @@ async def test_image_generate_method_still_available(monkeypatch: pytest.MonkeyP
     result = await handler.image_generate(
         prompt="draw",
         model="gpt-image-1",
+        request_kwargs={},
+    )
+
+    assert result["data"][0]["b64_json"] == "abc"
+    assert "response_format" not in captured
+
+
+@pytest.mark.asyncio
+async def test_image_generate_omits_response_format_for_gpt_image_2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"data": [{"b64_json": "abc"}]}
+
+    async def fake_aimage_generation(**kwargs: object):
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(
+        "cognis.executor.inference.litellm.aimage_generation", fake_aimage_generation
+    )
+
+    result = await handler.image_generate(
+        prompt="draw",
+        model="openai/gpt-image-2",
         request_kwargs={},
     )
 

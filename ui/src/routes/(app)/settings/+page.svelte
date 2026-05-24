@@ -477,6 +477,54 @@ import { onMount, tick } from 'svelte';
     );
   }
 
+  function looksLikeEmbeddingModel(value: string): boolean {
+    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+    return (
+      normalized.includes('embedding') ||
+      normalized.includes('embed-') ||
+      normalized.includes('-embed') ||
+      normalized.includes('e5-') ||
+      normalized.includes('bge-') ||
+      normalized.includes('gte-') ||
+      normalized.includes('nomic-embed')
+    );
+  }
+
+  function looksLikeReasoningModel(value: string): boolean {
+    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+    return (
+      normalized.includes('claude-3-7') ||
+      normalized.includes('sonnet-4') ||
+      normalized.includes('opus-4') ||
+      normalized.startsWith('gpt-5') ||
+      normalized.startsWith('o1') ||
+      normalized.startsWith('o3') ||
+      normalized.startsWith('o4') ||
+      normalized.includes('gemini-2.5') ||
+      normalized.includes('reason') ||
+      normalized.includes('think') ||
+      normalized.includes('deepseek-r1') ||
+      normalized.includes('qwq') ||
+      normalized.includes('qwen3') ||
+      normalized.includes('grok-4') ||
+      normalized.includes('kimi-k2')
+    );
+  }
+
+  function inferredReasoningEfforts(modelId: string, entry: ModelEntry | null): string[] {
+    if (!looksLikeReasoningModel(modelId) && !looksLikeReasoningModel(entry?.display_name ?? '')) {
+      return [];
+    }
+    const normalized = `${modelId} ${entry?.display_name ?? ''}`.trim().toLowerCase().replaceAll('_', '-');
+    if (normalized.includes('claude') || normalized.includes('gemini-2.5')) {
+      return ['none', 'low', 'medium', 'high', 'max'];
+    }
+    if (normalized.startsWith('gpt-5') || normalized.includes(' gpt-5')) {
+      return ['none', 'low', 'medium', 'high', 'xhigh'];
+    }
+    return ['none', 'low', 'medium', 'high'];
+  }
+
   function preferredProviderIdForModel(modelId: string): string | null {
     const normalized = modelId.trim();
     if (!normalized) {
@@ -507,11 +555,16 @@ import { onMount, tick } from 'svelte';
   }
 
   function modelSupportsEmbedding(entry: unknown): boolean {
+    if (!entry || typeof entry !== 'object') {
+      return false;
+    }
+    const model = entry as { display_name?: string; model_id?: string; supports_embedding?: boolean };
+    if ('supports_embedding' in model) {
+      return model.supports_embedding === true;
+    }
     return Boolean(
-      entry &&
-        typeof entry === 'object' &&
-        'supports_embedding' in entry &&
-        (entry as { supports_embedding?: boolean }).supports_embedding
+      looksLikeEmbeddingModel(model.model_id ?? '') ||
+        looksLikeEmbeddingModel(model.display_name ?? '')
     );
   }
 
@@ -552,7 +605,8 @@ import { onMount, tick } from 'svelte';
       return [];
     }
     const modelEntry = findModelEntry(modelId, preferredProviderIdForModel(modelId));
-    return (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
+    const explicitEfforts = (modelEntry?.reasoning_efforts ?? []).filter((value) => value !== 'default');
+    return explicitEfforts.length > 0 ? explicitEfforts : inferredReasoningEfforts(modelId, modelEntry);
   }
 
   function routeModelOptions(routeKey: RoutingKey): ProviderModelOption[] {
@@ -598,6 +652,13 @@ import { onMount, tick } from 'svelte';
       ];
     }
     return options;
+  }
+
+  function defaultModelOptionLabel(routeKey: RoutingKey): string {
+    if (routeKey === 'embedding') {
+      return 'Select embedding model';
+    }
+    return 'Use provider default';
   }
 
   function syncRouteThinkingEffort(routeKey: RoutingKey): void {
@@ -2567,7 +2628,7 @@ import { onMount, tick } from 'svelte';
               <div class="space-y-2">
                 <span>{route.label}</span>
                 <select bind:value={routingForm[route.key].model} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" onchange={() => syncRouteThinkingEffort(route.key)}>
-                  <option value="">Use provider default</option>
+                  <option value="">{defaultModelOptionLabel(route.key)}</option>
                   {#each routeModelOptions(route.key) as option}
                     <option value={option.value}>{option.label}</option>
                   {/each}

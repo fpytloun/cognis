@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cognis.models.config import GeneratedImage, ImageGenerationResult
 from cognis.providers.llm.inference_router import InferenceRouter
 
 
@@ -34,7 +35,10 @@ class _Connection:
     async def rpc_call(self, method: str, params: dict[str, object], timeout: float | None = None):
         del timeout
         if method == "llm.image_generate":
-            return {"created": 1, "data": [], "usage": None, "provider": "test", "model": "img"}
+            return ImageGenerationResult(
+                images=[GeneratedImage(b64_json="abc", content_type="image/png")],
+                model="img",
+            )
         if method == "llm.transcribe":
             assert params["model"] == "whisper-1"
             return {"text": "hello from audio", "model": "whisper-1"}

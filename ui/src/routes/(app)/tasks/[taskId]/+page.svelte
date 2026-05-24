@@ -1054,6 +1054,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   });
 
   let taskAgent = $derived(agentFor(task?.agent_id ?? null));
+  let creatorAgent = $derived(agentFor(task?.created_by_agent_id ?? null));
 
   let activePause = $derived.by(() => {
     if (!task?.pending_pause || task.status !== 'paused') return null;
@@ -2032,6 +2033,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                 {#if sourceConversation}
                   <div class="flex justify-between gap-3"><dt class="text-slate-500">Conversation</dt><dd><a href="/chat/{sourceConversation.conversation_id}" class="text-sky-400 hover:text-sky-300 hover:underline">{sourceConversation.title ?? 'Untitled'}</a></dd></div>
                 {/if}
+                {#if task.created_by_agent_id}
+                  <div class="flex justify-between gap-3"><dt class="text-slate-500">Creator agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd></div>
+                {/if}
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Agent</dt><dd class="inline-flex items-center gap-2"><AgentAvatar name={agentName(task.agent_id)} avatarUrl={taskAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.agent_id)}</dd></div>
                 <div class="flex justify-between gap-3"><dt class="text-slate-500">Workflow</dt><dd>{workflowName(task.workflow_id)}</dd></div>
               </dl>
@@ -2106,6 +2110,12 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
               <div class="flex justify-between gap-3">
                 <dt class="text-slate-500">Created by</dt>
                 <dd class="truncate text-slate-300" title={task.created_by}>{task.created_by}</dd>
+              </div>
+            {/if}
+            {#if task.created_by_agent_id}
+              <div class="flex justify-between gap-3">
+                <dt class="text-slate-500">Creator agent</dt>
+                <dd class="inline-flex items-center gap-2 text-slate-300"><AgentAvatar name={agentName(task.created_by_agent_id)} avatarUrl={creatorAgent?.avatar_url ?? null} class="h-5 w-5 rounded-lg" />{agentName(task.created_by_agent_id)}</dd>
               </div>
             {/if}
             <div class="flex justify-between gap-3">

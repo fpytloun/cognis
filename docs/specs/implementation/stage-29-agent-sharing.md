@@ -2,7 +2,7 @@
 
 ## Status
 
-PLANNED
+DONE
 
 ## Goal
 
@@ -373,7 +373,6 @@ stage can be merged and rolled out independently.
 
 ## Stage exit
 
-Update the tracker in
-[implementation/README.md](README.md): Stage 29 DONE. Flag
-`FEATURE_AGENT_SHARING=on`. Add a follow-up note in later stages that
-`check_agent_access` is the canonical resolver going forward.
+Mark this stage file DONE. Flag `FEATURE_AGENT_SHARING=on`. Add a
+follow-up note in later stages that `check_agent_access` is the canonical
+resolver going forward.

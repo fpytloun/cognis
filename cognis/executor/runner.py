@@ -273,6 +273,9 @@ class ExecutorRunner:
             elif method == "llm.complete":
                 logger.debug("Received llm.complete")
                 asyncio.create_task(self._handle_llm_complete(ws, msg_id, params))
+            elif method == "llm.image_generate":
+                logger.debug("Received llm.image_generate")
+                asyncio.create_task(self._handle_llm_image_generate(ws, msg_id, params))
             elif method == "llm.transcribe":
                 logger.debug("Received llm.transcribe")
                 asyncio.create_task(self._handle_llm_transcribe(ws, msg_id, params))
@@ -964,6 +967,30 @@ class ExecutorRunner:
                 request_kwargs=request_kwargs,
                 prompt=params.get("prompt"),
                 language=params.get("language"),
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_llm_image_generate(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._inference_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
+            return
+
+        try:
+            request_kwargs = dict(params.get("request_kwargs") or {})
+            result = await self._inference_handler.image_generate(
+                prompt=str(params.get("prompt", "")),
+                model=str(params.get("model", "")),
+                strategy=str(params.get("strategy", "aimage_generation")),
+                n=int(params.get("n", 1) or 1),
+                size=params.get("size"),
+                quality=params.get("quality"),
+                response_format=str(params.get("response_format", "b64_json")),
+                image=params.get("image"),
+                request_kwargs=request_kwargs,
             )
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:

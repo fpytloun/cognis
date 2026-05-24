@@ -1181,6 +1181,7 @@ export interface Task {
   priority: number;
   created_by: string;
   agent_id: string;
+  created_by_agent_id: string | null;
   source_type: string;
   source_ref: string | null;
   delivery: TaskDelivery;

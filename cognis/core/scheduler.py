@@ -238,6 +238,7 @@ class Scheduler:
             skill_id = getattr(sched, "skill_id", None)
             workspace_root = template.pop("workspace_root", None)
             working_directory = template.pop("working_directory", None)
+            template.pop("created_by_agent_id", None)
             created_workflow_id: str | None = None
             created_task_id: str | None = None
 
@@ -284,7 +285,8 @@ class Scheduler:
                 source_ref=schedule_id,
                 delivery=delivery,
                 completion_delivery=completion_delivery,
-                interaction_mode_override=getattr(sched, "interaction_mode_override", None) or "none",
+                interaction_mode_override=getattr(sched, "interaction_mode_override", None)
+                or "none",
                 workflow_id=workflow_id,
                 project_id=getattr(sched, "project_id", None),
                 workspace_root=workspace_root,

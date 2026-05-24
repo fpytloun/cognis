@@ -627,6 +627,21 @@ def _delegation_progress_todos(ctx: StepContext) -> list[dict[str, Any]]:
     ]
 
 
+def _pending_todos_snapshot(ctx: StepContext) -> list[dict[str, str]]:
+    """Return a compact snapshot of non-terminal todos for continuation context."""
+
+    snapshot: list[dict[str, str]] = []
+    for todo in _normalize_todos(ctx.todos or []):
+        content = str(todo.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(todo.get("status") or "pending")
+        if status in {"completed", "cancelled"}:
+            continue
+        snapshot.append({"content": content, "status": status})
+    return snapshot
+
+
 def _positive_int(value: Any, default: int) -> int:
     if isinstance(value, bool):
         return default
@@ -1343,6 +1358,7 @@ def _task_row_to_model(task_row: Any) -> Any:
             "priority": getattr(task_row, "priority", 0),
             "created_by": getattr(task_row, "created_by", "unknown@example.com"),
             "agent_id": task_row.agent_id,
+            "created_by_agent_id": getattr(task_row, "created_by_agent_id", None),
             "source_type": getattr(task_row, "source_type", "agent"),
             "source_ref": getattr(task_row, "source_ref", None),
             "delivery": {
@@ -8253,6 +8269,13 @@ class AgentLoop:
                         "Partial work was preserved for evaluation."
                     ),
                     content="\n\n".join(assistant_content_parts),
+                    metadata={
+                        "interrupted": True,
+                        "continuation_reason": "tool_call_ceiling_reached",
+                        "tool_call_count": tool_call_count,
+                        "max_tool_calls": max_tool_calls,
+                        "pending_todos": _pending_todos_snapshot(ctx),
+                    },
                     attachments=list(collected_attachments),
                 )
                 break
@@ -9246,6 +9269,7 @@ class AgentLoop:
                     description=tc.arguments.get("description", ""),
                     expected_output=tc.arguments.get("expected_output"),
                     priority=tc.arguments.get("priority", 0),
+                    created_by_agent_id=ctx.agent.agent_id,
                     source_type="agent",
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
@@ -9397,6 +9421,8 @@ class AgentLoop:
                         "expected_output": task_row.expected_output,
                         "status": task_row.status,
                         "priority": task_row.priority,
+                        "agent_id": task_row.agent_id,
+                        "created_by_agent_id": getattr(task_row, "created_by_agent_id", None),
                         "workflow_id": task_row.workflow_id,
                         "created_at": str(task_row.created_at) if task_row.created_at else None,
                         "started_at": str(task_row.started_at) if task_row.started_at else None,
@@ -9866,6 +9892,8 @@ class AgentLoop:
 
         task_agent_id = getattr(task_row, "agent_id", None)
         current_agent_id = ctx.agent.agent_id
+        if getattr(task_row, "created_by_agent_id", None) == current_agent_id:
+            return True
         if not task_agent_id:
             return False
         if task_agent_id == current_agent_id:
@@ -11050,6 +11078,7 @@ class AgentLoop:
                         "description": args.context or args.intent,
                         "expected_output": expected_output,
                         "priority": args.priority or 0,
+                        "created_by_agent_id": ctx.agent.agent_id,
                         "workflow_id": persisted_workflow_id,
                         "delivery": task_delivery.model_dump(mode="json"),
                         "workspace_root": ctx.workspace_root,
@@ -11083,6 +11112,7 @@ class AgentLoop:
                     description=args.context or args.intent,
                     expected_output=expected_output,
                     priority=args.priority or 0,
+                    created_by_agent_id=ctx.agent.agent_id,
                     source_type="agent",
                     source_ref=ctx.conversation.conversation_id,
                     delivery=task_delivery,

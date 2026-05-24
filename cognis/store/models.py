@@ -572,6 +572,7 @@ class Task(Base):
     priority: Mapped[int] = mapped_column(nullable=False, default=0)
     created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    created_by_agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
     source_type: Mapped[str] = mapped_column(String, nullable=False, default="api")
     source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     delivery_mode: Mapped[str] = mapped_column(String, nullable=False, default="same_conversation")

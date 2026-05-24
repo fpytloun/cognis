@@ -14,6 +14,7 @@ from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
+    ContinuationFollowUp,
     FollowUpMode,
     FollowUpOriginKind,
     FollowUpRelevanceHint,
@@ -2421,6 +2422,219 @@ async def test_run_turn_merges_absorbed_delivery_metadata() -> None:
     assert result.delivery_id == "reply-2"
     assert result.delivery_fallback_text == "fallback text"
     assert result.attachments == [{"artifact_id": "art-2", "filename": "image.png"}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_queues_automatic_continuation_after_tool_call_ceiling() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(
+                return_value=SimpleNamespace(
+                    content="partial",
+                    attachments=[],
+                    metadata={
+                        "continuation_reason": "tool_call_ceiling_reached",
+                        "tool_call_count": 200,
+                        "max_tool_calls": 200,
+                        "pending_todos": [
+                            {"content": "finish validation", "status": "in_progress"},
+                            {"content": "done", "status": "completed"},
+                        ],
+                    },
+                )
+            )
+        ),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    control = _TurnControl(turn_observers=[observer])
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            status="active",
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
+        content="work",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=control,
+        turn_observers=(observer,),
+    )
+
+    assert observer.system_messages == [
+        "Tool-call limit reached (200/200 tool calls). Continuing automatically."
+    ]
+    scheduler.submit_turn.assert_awaited_once()
+    assert scheduler.submit_turn.await_args.args[:2] == ("conv-1", "")
+    follow_up = scheduler.submit_turn.await_args.kwargs["follow_up"]
+    assert scheduler.submit_turn.await_args.kwargs["system_initiated"] is True
+    assert isinstance(follow_up, ContinuationFollowUp)
+    assert follow_up.reason == "tool_call_ceiling_reached"
+    assert follow_up.attempt == 1
+    assert follow_up.pending_todos == [{"content": "finish validation", "status": "in_progress"}]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_ceiling_continuation_preserves_existing_queue_order() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(content="user correction", user_email="user@example.com")
+    )
+
+    await scheduler._schedule_tool_call_ceiling_continuation(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        turn_id="turn-1",
+        user_email="user@example.com",
+        metadata={
+            "continuation_reason": "tool_call_ceiling_reached",
+            "tool_call_count": 200,
+            "max_tool_calls": 200,
+        },
+        prior_follow_up=None,
+        turn_observers=(),
+    )
+
+    queued = list(scheduler._queued_messages["conv-1"])
+    assert [item.content for item in queued] == ["user correction", ""]
+    assert queued[0].follow_up is None
+    assert isinstance(queued[1].follow_up, ContinuationFollowUp)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_stops_automatic_continuation_after_attempt_limit() -> None:
+    prior_follow_up = ContinuationFollowUp(
+        follow_up_id="fup_prior",
+        mode=FollowUpMode.INTEGRATE,
+        origin_kind=FollowUpOriginKind.CONTINUATION,
+        relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+        required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
+        topic_ref="turn-prior",
+        status=FollowUpStatus.COMPLETED,
+        reason="tool_call_ceiling_reached",
+        attempt=3,
+        max_attempts=3,
+    )
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(
+                return_value=SimpleNamespace(
+                    content="partial",
+                    attachments=[],
+                    metadata={
+                        "continuation_reason": "tool_call_ceiling_reached",
+                        "tool_call_count": 200,
+                        "max_tool_calls": 200,
+                    },
+                )
+            )
+        ),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            status="active",
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
+        content="",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=True,
+        follow_up=prior_follow_up,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_observers=(observer,),
+    )
+
+    assert list(scheduler._queued_messages["conv-1"]) == []
+    assert observer.system_messages == [
+        "Automatic continuation stopped after repeated tool-call ceilings. "
+        "Send a new message to continue manually."
+    ]
 
 
 @pytest.mark.asyncio

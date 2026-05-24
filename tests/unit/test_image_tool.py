@@ -194,7 +194,10 @@ async def test_handle_image_tool_returns_error_when_artifact_registration_fails(
 async def test_image_edit_accepts_inline_base64_source() -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
-        return_value=ImageGenerationResult(images=[], model="gpt-image-1")
+        return_value=ImageGenerationResult(
+            images=[GeneratedImage(b64_json="YWJj", content_type="image/png")],
+            model="gpt-image-1",
+        )
     )
 
     result = await handle_image_tool(
@@ -240,7 +243,10 @@ async def test_image_edit_rejects_source_path_with_helpful_error(tmp_path: Path)
 async def test_image_edit_accepts_source_artifact_id() -> None:
     provider = MagicMock()
     provider.image_generate = AsyncMock(
-        return_value=ImageGenerationResult(images=[], model="gpt-image-1")
+        return_value=ImageGenerationResult(
+            images=[GeneratedImage(b64_json="YWJj", content_type="image/png")],
+            model="gpt-image-1",
+        )
     )
     artifact_store = MagicMock()
     artifact_store.async_load = AsyncMock(return_value=(b"artifact-bytes", "image/png"))
@@ -273,3 +279,21 @@ async def test_image_edit_accepts_source_artifact_id() -> None:
     assert provider.image_generate.await_args.kwargs["image"] == base64.b64encode(
         b"artifact-bytes"
     ).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_image_generate_returns_error_when_provider_returns_no_images() -> None:
+    provider = MagicMock()
+    provider.image_generate = AsyncMock(
+        return_value=ImageGenerationResult(images=[], model="gemini-image")
+    )
+
+    result = await handle_image_tool(
+        "image_generate",
+        {"prompt": "banner"},
+        provider,
+        artifact_store=None,
+    )
+
+    assert result.is_error
+    assert "no image data" in result.output

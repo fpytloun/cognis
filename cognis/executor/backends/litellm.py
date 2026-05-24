@@ -30,7 +30,7 @@ def _apply_executor_responses_defaults(request_kwargs: dict[str, Any]) -> dict[s
 
 def _supports_image_response_format(model: str) -> bool:
     normalized = model.rsplit("/", 1)[-1].lower()
-    return normalized != "gpt-image-1"
+    return not normalized.startswith("gpt-image-")
 
 
 class LiteLLMExecutorBackend:

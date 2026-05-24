@@ -41,6 +41,7 @@ from cognis.models.tool import (
     tool_matches_identifier,
 )
 from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
+from cognis.providers.base import ImageGenerationProvider
 from cognis.runtime_context import (
     RuntimeAccessContext,
     current_effective_working_directory,
@@ -670,6 +671,89 @@ def select_static_tools(
     return selected
 
 
+async def enrich_image_tool_model_descriptions(
+    tools: list[ToolDefinition],
+    image_generation_provider: ImageGenerationProvider | None,
+) -> list[ToolDefinition]:
+    """Annotate image tools with configured image-generation models."""
+
+    if image_generation_provider is None:
+        return tools
+    try:
+        default_model = await image_generation_provider.resolve_model(task_type="image_generation")  # type: ignore[attr-defined]
+        models = await image_generation_provider.list_models()  # type: ignore[attr-defined]
+    except Exception:
+        logger.debug("Failed to enrich image tool model descriptions", exc_info=True)
+        return tools
+
+    image_models = sorted(
+        {
+            str(model.get("model_id"))
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("model_id"), str)
+            and (
+                model.get("supports_image_generation") is True
+                or _looks_like_image_model_id(str(model.get("model_id")))
+            )
+        }
+    )
+    if default_model and default_model not in image_models:
+        image_models.insert(0, default_model)
+    if not image_models and not default_model:
+        return tools
+
+    model_description = _image_model_parameter_description(
+        default_model=default_model,
+        image_models=image_models,
+    )
+    enriched: list[ToolDefinition] = []
+    for tool in tools:
+        if tool.name not in {"image_generate", "image_edit"}:
+            enriched.append(tool)
+            continue
+        parameters = dict(tool.parameters or {})
+        properties = dict(parameters.get("properties") or {})
+        model_property = dict(properties.get("model") or {})
+        model_property["description"] = model_description
+        if image_models:
+            model_property["enum"] = image_models
+        properties["model"] = model_property
+        parameters["properties"] = properties
+        enriched.append(tool.model_copy(update={"parameters": parameters}))
+    return enriched
+
+
+def _looks_like_image_model_id(model_id: str) -> bool:
+    normalized = model_id.lower().replace("_", "-")
+    return any(
+        token in normalized
+        for token in ("gpt-image", "dall-e", "image-generation", "imagen", "image-preview")
+    )
+
+
+def _image_model_parameter_description(
+    *,
+    default_model: str | None,
+    image_models: list[str],
+) -> str:
+    if image_models:
+        allowed = ", ".join(image_models)
+        if default_model:
+            return (
+                f"Optional image-generation model. Default: {default_model}. "
+                f"Allowed configured models: {allowed}. Omit this unless the user asks "
+                "for a specific model."
+            )
+        return f"Optional image-generation model. Allowed configured models: {allowed}."
+    if default_model:
+        return (
+            f"Optional image-generation model. Default: {default_model}. "
+            "Omit this unless the user asks for a specific model."
+        )
+    return "Optional image-generation model. Omit to use the configured default."
+
+
 def _build_handler_map(
     session_factory: Any,
     status_provider: Any,
@@ -941,6 +1025,10 @@ def build_step_runtime_factory(
             )
             if t.category != "web"
         ]
+        agent_tools = await enrich_image_tool_model_descriptions(
+            agent_tools,
+            getattr(providers, "image_generation", None),
+        )
 
         # Add dynamic web tool definitions based on available backends
         from cognis.tools.executor.web.definitions import web_tool_definitions
