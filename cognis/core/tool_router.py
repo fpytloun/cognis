@@ -22,6 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.chat_modes import is_plan_hidden_tool
+from cognis.core.content_refs import (
+    continuation_scope_task_id,
+    get_accessible_deliverable_ref,
+    is_deliverable_ref,
+)
 from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
@@ -579,6 +584,7 @@ class ToolRouter:
                     if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
                     else None
                 ),
+                runtime_metadata=tool_call.runtime_metadata,
             )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -870,6 +876,15 @@ class ToolRouter:
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
+        except ValueError as exc:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+            return self._sanitize_result(
+                tool_call.name,
+                ToolResult(output=str(exc), is_error=True),
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
 
         decision = await self.evaluate_tool_call(guardrails_tool_call, agent, session, registry)
         eval_meta: dict[str, Any] = {
@@ -918,6 +933,15 @@ class ToolRouter:
             return self._sanitize_result(
                 tool_call.name,
                 self._credential_error_result(exc),
+                _tool_max_size(registry, tool_call.name),
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+        except ValueError as exc:
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+            return self._sanitize_result(
+                tool_call.name,
+                ToolResult(output=str(exc), is_error=True),
                 _tool_max_size(registry, tool_call.name),
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
@@ -1147,12 +1171,14 @@ class ToolRouter:
         if tool_call.name == "artifact_save":
             arguments.pop("source_artifact_content_b64", None)
             if artifact_id := arguments.get("source_artifact_id"):
-                row = await self._get_accessible_artifact_record(
-                    str(artifact_id), session.user_email
+                metadata = await self._get_accessible_content_ref_metadata(
+                    str(artifact_id),
+                    session.user_email,
+                    scope_task_id=self._content_ref_scope_task_id(tool_call),
                 )
-                arguments.setdefault("source_artifact_filename", row.filename)
-                arguments.setdefault("source_artifact_mime_type", row.mime_type)
-                arguments.setdefault("source_artifact_size_bytes", row.size_bytes)
+                arguments.setdefault("source_artifact_filename", metadata["filename"])
+                arguments.setdefault("source_artifact_mime_type", metadata["mime_type"])
+                arguments.setdefault("source_artifact_size_bytes", metadata["size_bytes"])
         if tool_call.name == "browser_upload":
             arguments.pop("source_artifacts", None)
             artifact_ids = arguments.get("source_artifact_ids")
@@ -1166,10 +1192,12 @@ class ToolRouter:
                 for artifact_id in artifact_ids:
                     if not isinstance(artifact_id, str) or not artifact_id.strip():
                         continue
-                    row = await self._get_accessible_artifact_record(
-                        artifact_id, session.user_email
+                    metadata = await self._get_accessible_content_ref_metadata(
+                        artifact_id,
+                        session.user_email,
+                        scope_task_id=self._content_ref_scope_task_id(tool_call),
                     )
-                    total_bytes += int(row.size_bytes or 0)
+                    total_bytes += int(metadata["size_bytes"] or 0)
                     if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
                         raise ValueError(
                             "browser_upload artifact payload is too large: "
@@ -1178,9 +1206,9 @@ class ToolRouter:
                     source_artifacts.append(
                         {
                             "artifact_id": artifact_id,
-                            "filename": row.filename,
-                            "mime_type": row.mime_type,
-                            "size_bytes": row.size_bytes,
+                            "filename": metadata["filename"],
+                            "mime_type": metadata["mime_type"],
+                            "size_bytes": metadata["size_bytes"],
                         }
                     )
                 arguments["source_artifacts"] = source_artifacts
@@ -1193,12 +1221,14 @@ class ToolRouter:
                 item = dict(raw)
                 item.pop("content_b64", None)
                 if artifact_id := item.get("artifact_id"):
-                    row = await self._get_accessible_artifact_record(
-                        str(artifact_id), session.user_email
+                    metadata = await self._get_accessible_content_ref_metadata(
+                        str(artifact_id),
+                        session.user_email,
+                        scope_task_id=self._content_ref_scope_task_id(tool_call),
                     )
-                    item.setdefault("filename", row.filename)
-                    item.setdefault("mime_type", row.mime_type)
-                    item.setdefault("size_bytes", row.size_bytes)
+                    item.setdefault("filename", metadata["filename"])
+                    item.setdefault("mime_type", metadata["mime_type"])
+                    item.setdefault("size_bytes", metadata["size_bytes"])
                 sanitized_assets.append(item)
             arguments["assets"] = sanitized_assets
         arguments = self._sanitize_sensitive_refs_for_guardrails(arguments, root=True)
@@ -1211,8 +1241,10 @@ class ToolRouter:
         if tool_call.name == "artifact_save" and (
             artifact_id := arguments.get("source_artifact_id")
         ):
-            content, mime_type, filename = await self._load_binary_artifact(
-                str(artifact_id), session.user_email
+            content, mime_type, filename = await self._load_binary_content_ref(
+                str(artifact_id),
+                session.user_email,
+                scope_task_id=self._content_ref_scope_task_id(tool_call),
             )
             arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
             arguments.setdefault("source_artifact_filename", filename)
@@ -1220,8 +1252,10 @@ class ToolRouter:
         if tool_call.name == "document_generate" and (
             artifact_id := arguments.get("source_artifact_id")
         ):
-            arguments["source_artifact_content"] = await self._load_text_artifact(
-                str(artifact_id), session.user_email
+            arguments["source_artifact_content"] = await self._load_text_content_ref(
+                str(artifact_id),
+                session.user_email,
+                scope_task_id=self._content_ref_scope_task_id(tool_call),
             )
         if tool_call.name == "browser_upload":
             arguments.pop("source_artifacts", None)
@@ -1236,8 +1270,10 @@ class ToolRouter:
                 for artifact_id in artifact_ids:
                     if not isinstance(artifact_id, str) or not artifact_id.strip():
                         continue
-                    content, mime_type, filename = await self._load_binary_artifact(
-                        artifact_id, session.user_email
+                    content, mime_type, filename = await self._load_binary_content_ref(
+                        artifact_id,
+                        session.user_email,
+                        scope_task_id=self._content_ref_scope_task_id(tool_call),
                     )
                     total_bytes += len(content)
                     if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
@@ -1262,8 +1298,10 @@ class ToolRouter:
                     continue
                 item = dict(raw)
                 if artifact_id := item.get("artifact_id"):
-                    content, mime_type, filename = await self._load_binary_artifact(
-                        str(artifact_id), session.user_email
+                    content, mime_type, filename = await self._load_binary_content_ref(
+                        str(artifact_id),
+                        session.user_email,
+                        scope_task_id=self._content_ref_scope_task_id(tool_call),
                     )
                     item.setdefault("content_b64", base64.b64encode(content).decode("ascii"))
                     item.setdefault("mime_type", mime_type)
@@ -1272,6 +1310,9 @@ class ToolRouter:
             arguments["assets"] = resolved_assets
         arguments = await self._resolve_sensitive_refs(arguments, session, agent, tool_call)
         return tool_call.model_copy(update={"arguments": arguments})
+
+    def _content_ref_scope_task_id(self, tool_call: ToolCall) -> str | None:
+        return continuation_scope_task_id(tool_call.runtime_metadata)
 
     def _sanitize_sensitive_refs_for_guardrails(self, value: Any, *, root: bool = False) -> Any:
         if isinstance(value, dict):
@@ -1651,6 +1692,72 @@ class ToolRouter:
             else None,
             workflow_step=bool(raw.get("workflow_step")),
         )
+
+    async def _load_text_content_ref(
+        self,
+        artifact_id: str,
+        user_email: str,
+        *,
+        scope_task_id: str | None = None,
+    ) -> str:
+        if is_deliverable_ref(artifact_id):
+            if self._session_factory is None:
+                raise ValueError("Artifact support not available")
+            async with self._session_factory() as db_session:
+                ref = await get_accessible_deliverable_ref(
+                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                )
+            if ref is None:
+                raise ValueError(f"Artifact not found: {artifact_id}")
+            return ref.deliverable.content
+        return await self._load_text_artifact(artifact_id, user_email)
+
+    async def _load_binary_content_ref(
+        self,
+        artifact_id: str,
+        user_email: str,
+        *,
+        scope_task_id: str | None = None,
+    ) -> tuple[bytes, str, str]:
+        if is_deliverable_ref(artifact_id):
+            if self._session_factory is None:
+                raise ValueError("Artifact support not available")
+            async with self._session_factory() as db_session:
+                ref = await get_accessible_deliverable_ref(
+                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                )
+            if ref is None:
+                raise ValueError(f"Artifact not found: {artifact_id}")
+            return ref.content_bytes, ref.mime_type, ref.filename
+        return await self._load_binary_artifact(artifact_id, user_email)
+
+    async def _get_accessible_content_ref_metadata(
+        self,
+        artifact_id: str,
+        user_email: str,
+        *,
+        scope_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        if is_deliverable_ref(artifact_id):
+            if self._session_factory is None:
+                raise ValueError("Artifact support not available")
+            async with self._session_factory() as db_session:
+                ref = await get_accessible_deliverable_ref(
+                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                )
+            if ref is None:
+                raise ValueError(f"Artifact not found: {artifact_id}")
+            return {
+                "filename": ref.filename,
+                "mime_type": ref.mime_type,
+                "size_bytes": ref.size_bytes,
+            }
+        row = await self._get_accessible_artifact_record(artifact_id, user_email)
+        return {
+            "filename": row.filename,
+            "mime_type": row.mime_type,
+            "size_bytes": row.size_bytes,
+        }
 
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
         if self.artifact_store is None:

@@ -1296,12 +1296,13 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
+                agent_owner_email = (
+                    await self._require_agent(db_session, current_session.agent_id)
+                ).owner_email
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
-                    agent_owner_email=(
-                        await self._require_agent(db_session, current_session.agent_id)
-                    ).owner_email,
+                    agent_owner_email=agent_owner_email,
                 ):
                     await self.providers.guardrails.create_session(
                         session_id=new_session_row.session_id,
@@ -1333,6 +1334,7 @@ class SessionManager:
         await self._sync_intaris_status(
             current_session.intaris_session_id or current_session.session_id,
             "completed",
+            user_email=current_session.user_email,
             completion_reason=completion_reason,
         )
 
@@ -1368,77 +1370,108 @@ class SessionManager:
             else []
         )
         summary_result: Any | None = None
-        if durable_summary_events:
-            summary_result = await self.providers.guardrails.record_events(
-                session_id=new_session.intaris_session_id or new_session.session_id,
-                events=durable_summary_events,
-                source="cognis",
-                idempotency_key=f"{new_session.session_id}:compaction_summary:rotation",
-            )
-            if not summary_result.ok:
-                raise RuntimeError("failed to persist rotated compaction summary")
-
-        if rotated_prefix:
-            message_events = with_session_events_turn_id(
-                build_prefix_message_events(rotated_prefix),
-                None,
-            )
-            append_result = await self.providers.guardrails.record_events(
-                session_id=new_session.intaris_session_id or new_session.session_id,
-                events=message_events,
-                source="cognis",
-                idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:messages",
-            )
-            if append_result.ok:
-                resolved_entries = [
-                    ImmutablePrefixEntry(
-                        role=entry.role,
-                        source=entry.source,
-                        content=entry.content,
-                        seq=append_result.first_seq + index,
+        try:
+            with scoped_runtime_context(
+                user_email=current_session.user_email,
+                agent_id=current_session.agent_id,
+                agent_owner_email=agent_owner_email,
+            ):
+                if durable_summary_events:
+                    summary_result = await self.providers.guardrails.record_events(
+                        session_id=new_session.intaris_session_id or new_session.session_id,
+                        events=durable_summary_events,
+                        source="cognis",
+                        idempotency_key=f"{new_session.session_id}:compaction_summary:rotation",
+                        retry_missing_session=True,
+                        user_email=current_session.user_email,
+                        agent_id=current_session.agent_id,
+                        agent_owner_email=agent_owner_email,
                     )
-                    for index, entry in enumerate(rotated_prefix)
-                ]
-                snapshot_event = build_context_snapshot_event(
-                    resolved_entries,
-                    snapshot_source="compaction",
-                    extras={"parent_session_id": current_session.session_id},
-                )
-                snapshot_events = with_session_events_turn_id([snapshot_event], None)
-                snapshot_result = await self.providers.guardrails.record_events(
-                    session_id=new_session.intaris_session_id or new_session.session_id,
-                    events=snapshot_events,
-                    source="cognis",
-                    idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:snapshot",
-                )
-                if snapshot_result.ok:
-                    append_recorded_events = getattr(
-                        self.session_cache, "append_recorded_events", None
-                    )
-                    if callable(append_recorded_events):
-                        await append_recorded_events(new_session, message_events, append_result)
-                        await append_recorded_events(new_session, snapshot_events, snapshot_result)
-                    store_prefix_snapshot = getattr(
-                        self.session_cache, "store_prefix_snapshot", None
-                    )
-                    if callable(store_prefix_snapshot):
-                        await store_prefix_snapshot(
-                            new_session.session_id,
-                            resolved_entries,
-                            snapshot_seq=snapshot_result.last_seq,
-                            snapshot_source="compaction",
+                    if not summary_result.ok:
+                        logger.warning(
+                            "session: failed to persist rotated compaction summary",
+                            extra={"extra_data": {"session_id": new_session.session_id}},
                         )
-                else:
-                    logger.warning(
-                        "session: failed to persist compaction snapshot event",
-                        extra={"extra_data": {"session_id": new_session.session_id}},
+
+                if rotated_prefix:
+                    message_events = with_session_events_turn_id(
+                        build_prefix_message_events(rotated_prefix),
+                        None,
                     )
-            else:
-                logger.warning(
-                    "session: failed to persist compaction prefix messages",
-                    extra={"extra_data": {"session_id": new_session.session_id}},
-                )
-        if durable_summary_events and summary_result is not None:
+                    append_result = await self.providers.guardrails.record_events(
+                        session_id=new_session.intaris_session_id or new_session.session_id,
+                        events=message_events,
+                        source="cognis",
+                        idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:messages",
+                        retry_missing_session=True,
+                        user_email=current_session.user_email,
+                        agent_id=current_session.agent_id,
+                        agent_owner_email=agent_owner_email,
+                    )
+                    if append_result.ok:
+                        resolved_entries = [
+                            ImmutablePrefixEntry(
+                                role=entry.role,
+                                source=entry.source,
+                                content=entry.content,
+                                seq=append_result.first_seq + index,
+                            )
+                            for index, entry in enumerate(rotated_prefix)
+                        ]
+                        snapshot_event = build_context_snapshot_event(
+                            resolved_entries,
+                            snapshot_source="compaction",
+                            extras={"parent_session_id": current_session.session_id},
+                        )
+                        snapshot_events = with_session_events_turn_id([snapshot_event], None)
+                        snapshot_result = await self.providers.guardrails.record_events(
+                            session_id=new_session.intaris_session_id or new_session.session_id,
+                            events=snapshot_events,
+                            source="cognis",
+                            idempotency_key=f"{new_session.session_id}:immutable_prefix:compaction:snapshot",
+                            retry_missing_session=True,
+                            user_email=current_session.user_email,
+                            agent_id=current_session.agent_id,
+                            agent_owner_email=agent_owner_email,
+                        )
+                        if snapshot_result.ok:
+                            append_recorded_events = getattr(
+                                self.session_cache, "append_recorded_events", None
+                            )
+                            if callable(append_recorded_events):
+                                await append_recorded_events(
+                                    new_session, message_events, append_result
+                                )
+                                await append_recorded_events(
+                                    new_session, snapshot_events, snapshot_result
+                                )
+                            store_prefix_snapshot = getattr(
+                                self.session_cache, "store_prefix_snapshot", None
+                            )
+                            if callable(store_prefix_snapshot):
+                                await store_prefix_snapshot(
+                                    new_session.session_id,
+                                    resolved_entries,
+                                    snapshot_seq=snapshot_result.last_seq,
+                                    snapshot_source="compaction",
+                                )
+                        else:
+                            logger.warning(
+                                "session: failed to persist compaction snapshot event",
+                                extra={"extra_data": {"session_id": new_session.session_id}},
+                            )
+                    else:
+                        logger.warning(
+                            "session: failed to persist compaction prefix messages",
+                            extra={"extra_data": {"session_id": new_session.session_id}},
+                        )
+        except Exception:
+            logger.warning(
+                "session: failed to persist rotated compaction seed events",
+                extra={"extra_data": {"session_id": new_session.session_id}},
+                exc_info=True,
+            )
+        if durable_summary_events and summary_result is not None and summary_result.ok:
             append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
             if callable(append_recorded_events):
                 await append_recorded_events(new_session, durable_summary_events, summary_result)
@@ -1503,12 +1536,19 @@ class SessionManager:
         if not cloned_events:
             return
         try:
-            append_result = await self.providers.guardrails.record_events(
-                session_id=session_id,
-                events=cloned_events,
-                source="cognis",
-                idempotency_key=f"{new_session.session_id}:compaction_tail:{previous_session_id}",
-            )
+            with scoped_runtime_context(
+                user_email=new_session.user_email,
+                agent_id=new_session.agent_id,
+            ):
+                append_result = await self.providers.guardrails.record_events(
+                    session_id=session_id,
+                    events=cloned_events,
+                    source="cognis",
+                    idempotency_key=f"{new_session.session_id}:compaction_tail:{previous_session_id}",
+                    retry_missing_session=True,
+                    user_email=new_session.user_email,
+                    agent_id=new_session.agent_id,
+                )
             append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
             if append_result.ok and callable(append_recorded_events):
                 await append_recorded_events(new_session, cloned_events, append_result)

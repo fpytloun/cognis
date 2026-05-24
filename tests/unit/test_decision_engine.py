@@ -281,8 +281,20 @@ async def test_select_workflow_classifier_accepts_plain_json_text() -> None:
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_uses_research_metadata_before_classifier() -> None:
-    llm = _LLM()
+async def test_select_workflow_uses_llm_for_research_selection() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:research", "confidence": 0.91, "reason": "research request"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
 
     result = await select_workflow(
         llm=llm,
@@ -303,12 +315,27 @@ async def test_select_workflow_uses_research_metadata_before_classifier() -> Non
     )
 
     assert result.workflow_id == "system:research"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_select_workflow_uses_expected_output_for_investigation_report() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:research", "confidence": 0.92, "reason": "investigation report"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
     result = await select_workflow(
-        llm=_CountingWorkflowLLM(),
+        llm=llm,
         task_description=(
             "Title: Investigate cross-user MCP data leakage in scheduled daily brief\n"
             "Expected output: Technical incident report with: confirmed vs rejected hypotheses; "
@@ -337,6 +364,7 @@ async def test_select_workflow_uses_expected_output_for_investigation_report() -
     )
 
     assert result.workflow_id == "system:research"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
@@ -385,8 +413,107 @@ async def test_select_workflow_rejects_weak_skill_workflow_classifier_pick() -> 
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_uses_candidate_metadata_before_classifier() -> None:
-    llm = _CountingWorkflowLLM()
+async def test_select_workflow_rejects_skill_workflow_without_exact_domain_match() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "skill:contact-lens-shopping", "confidence": 0.99, "reason": "comparison research"}'
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = await select_workflow(
+        llm=llm,
+        task_description=(
+            "Title: Cognis competitive comparison research\n"
+            "Expected output: Compare Cognis with Hermes, OpenClaw, and other agent platforms."
+        ),
+        available_workflows=[
+            {
+                "workflow_id": "system:research",
+                "name": "Research",
+                "description": "Plan, research, and synthesize findings.",
+                "criteria": "Information gathering and analysis requests.",
+                "tags": ["research", "analysis"],
+            },
+            {
+                "workflow_id": "skill:contact-lens-shopping",
+                "name": "Skill: contact-lens-shopping",
+                "description": "Buy contact lenses from a known vendor.",
+                "criteria": "Tasks explicitly matching the skill domain: contact-lens-shopping. Tags: shopping, contact-lenses. Do not use for unrelated tasks that only share generic action verbs.",
+                "tags": ["shopping", "contact-lenses"],
+                "candidate_type": "skill_workflow",
+            },
+        ],
+        default_workflow_id="system:research",
+    )
+
+    assert result.workflow_id == "system:research"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_accepts_skill_workflow_with_exact_domain_match() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "skill:contact-lens-shopping", "confidence": 0.97, "exact_skill_domain_match": true, "reason": "repeat contact lens order"}'
+                        }
+                    }
+                ]
+            }
+        ]
+    )
+
+    result = await select_workflow(
+        llm=llm,
+        task_description="Buy my repeat contact lens order from cocky-kontaktni.cz.",
+        available_workflows=[
+            {
+                "workflow_id": "system:general-task",
+                "name": "General Task",
+                "criteria": "Generic background tasks that need direct execution.",
+            },
+            {
+                "workflow_id": "skill:contact-lens-shopping",
+                "name": "Skill: contact-lens-shopping",
+                "description": "Buy contact lenses from a known vendor.",
+                "criteria": "Tasks explicitly matching the skill domain: contact-lens-shopping. Tags: shopping, contact-lenses. Do not use for unrelated tasks that only share generic action verbs.",
+                "tags": ["shopping", "contact-lenses"],
+                "candidate_type": "skill_workflow",
+            },
+        ],
+        default_workflow_id="system:general-task",
+    )
+
+    assert result.workflow_id == "skill:contact-lens-shopping"
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_select_workflow_uses_llm_instead_of_candidate_metadata() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:software-development", "confidence": 0.9, "reason": "implementation task"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
 
     result = await select_workflow(
         llm=llm,
@@ -411,14 +538,28 @@ async def test_select_workflow_uses_candidate_metadata_before_classifier() -> No
     )
 
     assert result.workflow_id == "system:software-development"
-    assert result.reason == "Workflow metadata match"
-    assert llm.calls == 0
+    assert result.reason == "implementation task"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_select_workflow_prefers_matching_project_bound_workflow() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "project:onboarding-report", "confidence": 0.94, "reason": "project workflow match"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
     result = await select_workflow(
-        llm=_CountingWorkflowLLM(),
+        llm=llm,
         task_description="Create the customer onboarding report from usage metrics",
         available_workflows=[
             {
@@ -441,12 +582,27 @@ async def test_select_workflow_prefers_matching_project_bound_workflow() -> None
     )
 
     assert result.workflow_id == "project:onboarding-report"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_select_workflow_strongly_prefers_meaningful_project_bound_workflow() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "project:onboarding-report", "confidence": 0.94, "reason": "project workflow match"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
     result = await select_workflow(
-        llm=_CountingWorkflowLLM(),
+        llm=llm,
         task_description="Create the customer onboarding report from usage metrics",
         available_workflows=[
             {
@@ -469,12 +625,27 @@ async def test_select_workflow_strongly_prefers_meaningful_project_bound_workflo
     )
 
     assert result.workflow_id == "project:onboarding-report"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
 async def test_select_workflow_ignores_nonmatching_project_bound_workflow() -> None:
+    llm = _SequenceWorkflowLLM(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"workflow_id": "system:research", "confidence": 0.92, "reason": "research task"}'
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
     result = await select_workflow(
-        llm=_CountingWorkflowLLM(),
+        llm=llm,
         task_description="Research storage engine tradeoffs for vector search",
         available_workflows=[
             {
@@ -497,17 +668,18 @@ async def test_select_workflow_ignores_nonmatching_project_bound_workflow() -> N
     )
 
     assert result.workflow_id == "system:research"
+    assert llm.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_uses_software_development_metadata_before_research() -> None:
+async def test_select_workflow_respects_llm_software_development_selection() -> None:
     llm = _SequenceWorkflowLLM(
         [
             {
                 "choices": [
                     {
                         "message": {
-                            "content": '{"workflow_id": "system:research", "confidence": 0.8, "reason": "research"}'
+                            "content": '{"workflow_id": "system:software-development", "confidence": 0.9, "reason": "implementation with tests"}'
                         }
                     }
                 ]
@@ -542,5 +714,5 @@ async def test_select_workflow_uses_software_development_metadata_before_researc
         default_workflow_id="system:general-task",
     )
 
-    assert llm.calls == 0
+    assert llm.calls == 1
     assert result.workflow_id == "system:software-development"

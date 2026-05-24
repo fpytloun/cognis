@@ -24,6 +24,8 @@ from cognis.models.tool import (
 )
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
+pytest_plugins = ("tests.unit.test_task_continuation_tools",)
+
 
 class _Guardrails:
     def __init__(self) -> None:
@@ -441,7 +443,7 @@ async def test_plan_mode_denies_routed_schedule_write_before_execution() -> None
             arguments={"action": "create", "name": "x"},
             runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
         ),
-        _session(),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
         _agent(),
         _registry(),
         _Executor(),
@@ -465,7 +467,7 @@ async def test_plan_mode_allows_read_like_local_tool_with_schema_visible() -> No
             arguments={},
             runtime_metadata={"read_only_required": True, "chat_mode": "plan"},
         ),
-        _session(),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
         _agent(),
         registry,
         executor,
@@ -488,7 +490,7 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
 
     result = await router.execute(
         ToolCall(call_id="1", name=sanitize_mcp_tool_name("github", "search"), arguments={}),
-        _session(),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
         _agent(),
         _registry(),
         _Executor(),
@@ -2469,6 +2471,196 @@ async def test_tool_router_resolves_artifact_save_content_for_executor(
     assert (
         base64.b64decode(executor.seen_call.arguments["source_artifact_content_b64"])
         == b"png-bytes"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_deliverable_artifact_save_content_for_executor(
+    task_continuation_db,
+) -> None:
+    class _CapturingExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(ToolResult(output="saved"))
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
+        ) -> ToolResult:
+            del timeout_seconds, output_chunk_callback
+            self.seen_call = tool_call
+            return self.result
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="artifact_save",
+                description="save artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    guardrails = _Guardrails()
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=task_continuation_db,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="artifact-save-dlv",
+            name="artifact_save",
+            arguments={"file_path": "/tmp/report.md", "source_artifact_id": "dlv_owner"},
+        ),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert evaluate_arguments == {
+        "file_path": "/tmp/report.md",
+        "source_artifact_id": "dlv_owner",
+        "source_artifact_filename": "Full-report.md",
+        "source_artifact_mime_type": "text/markdown",
+        "source_artifact_size_bytes": len(b"# Full report\n\nComplete deliverable body."),
+    }
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["source_artifact_filename"] == "Full-report.md"
+    assert executor.seen_call.arguments["source_artifact_mime_type"] == "text/markdown"
+    assert (
+        base64.b64decode(executor.seen_call.arguments["source_artifact_content_b64"])
+        == b"# Full report\n\nComplete deliverable body."
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_preserves_task_scope_for_deliverable_content_refs(
+    task_continuation_db,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="artifact_save",
+                description="save artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=task_continuation_db,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="artifact-save-out-of-scope-dlv",
+            name="artifact_save",
+            arguments={"file_path": "/tmp/report.md", "source_artifact_id": "dlv_sibling"},
+            runtime_metadata={
+                "conversation_context": {
+                    "platform_data": {"forked_from": "task", "task_id": "task-owner"}
+                }
+            },
+        ),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        _RemoteExecutor(ToolResult(output="saved")),
+    )
+
+    assert result.is_error is True
+    assert "Artifact not found: dlv_sibling" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_deliverable_browser_upload_guardrails_and_payload(
+    task_continuation_db,
+) -> None:
+    class _CapturingExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(ToolResult(output="uploaded"))
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
+        ) -> ToolResult:
+            del timeout_seconds, output_chunk_callback
+            self.seen_call = tool_call
+            return self.result
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="browser_upload",
+                description="upload artifact",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+                non_bypassable=True,
+            )
+        )
+    )
+    guardrails = _Guardrails()
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=task_continuation_db,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="browser-upload-dlv",
+            name="browser_upload",
+            arguments={
+                "session_id": "browser-1",
+                "ref": "e1",
+                "source_artifact_ids": ["dlv_owner"],
+            },
+        ),
+        _session().model_copy(update={"user_email": "owner@example.com"}),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert evaluate_arguments["source_artifacts"] == [
+        {
+            "artifact_id": "dlv_owner",
+            "filename": "Full-report.md",
+            "mime_type": "text/markdown",
+            "size_bytes": len(b"# Full report\n\nComplete deliverable body."),
+        }
+    ]
+    assert "content_b64" not in str(evaluate_arguments)
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["source_artifacts"][0]["filename"] == "Full-report.md"
+    assert executor.seen_call.arguments["source_artifacts"][0]["mime_type"] == "text/markdown"
+    assert (
+        base64.b64decode(executor.seen_call.arguments["source_artifacts"][0]["content_b64"])
+        == b"# Full report\n\nComplete deliverable body."
     )
 
 

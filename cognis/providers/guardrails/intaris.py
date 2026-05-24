@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import Awaitable, Callable
 from time import perf_counter
@@ -101,12 +102,17 @@ class IntarisProvider:
             return await breaker.call(_with_retries)
         return await _with_retries()
 
-    def _headers(self, agent_id: str = "system", user_email: str | None = None) -> dict[str, str]:
+    def _headers(
+        self,
+        agent_id: str = "system",
+        user_email: str | None = None,
+        agent_owner_email: str | None = None,
+    ) -> dict[str, str]:
         subject = user_email or current_user_email.get() or self.user_email
         resolved_agent_id = (
             agent_id if agent_id != "system" else (current_agent_id.get() or "system")
         )
-        resolved_agent_owner = current_agent_owner_email.get() or subject
+        resolved_agent_owner = agent_owner_email or current_agent_owner_email.get() or subject
         return {
             "Authorization": f"Bearer {self.auth_provider.sign_service_jwt(subject, resolved_agent_id, ['intaris'], agent_owner_email=resolved_agent_owner)}",
             "X-Agent-Id": resolved_agent_id,
@@ -436,12 +442,26 @@ class IntarisProvider:
         events: list[SessionEvent],
         source: str = "cognis",
         idempotency_key: str | None = None,
+        retry_missing_session: bool = False,
+        user_email: str | None = None,
+        agent_id: str | None = None,
+        agent_owner_email: str | None = None,
     ) -> EventAppendResult:
-        headers = {**self._headers(user_email=current_user_email.get()), "X-Intaris-Source": source}
+        headers = {
+            **self._headers(
+                agent_id=agent_id or "system",
+                user_email=user_email or current_user_email.get(),
+                agent_owner_email=agent_owner_email,
+            ),
+            "X-Intaris-Source": source,
+        }
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
+        missing_session_delays = (0.05, 0.1, 0.25) if retry_missing_session else ()
+        missing_session_attempt = 0
 
         async def _do() -> EventAppendResult:
+            nonlocal missing_session_attempt
             response = await self.client.post(
                 f"/api/v1/session/{session_id}/events",
                 json=[event.model_dump() for event in events],
@@ -449,6 +469,22 @@ class IntarisProvider:
                 timeout=30.0,
             )
             if response.status_code == 404:
+                if missing_session_attempt < len(missing_session_delays):
+                    delay = missing_session_delays[missing_session_attempt]
+                    missing_session_attempt += 1
+                    logger.warning(
+                        "intaris: record_events 404 — session not found, retrying",
+                        extra={
+                            "extra_data": {
+                                "session_id": session_id,
+                                "event_count": len(events),
+                                "attempt": missing_session_attempt,
+                                "delay_seconds": delay,
+                            }
+                        },
+                    )
+                    await asyncio.sleep(delay)
+                    return await _do()
                 logger.warning(
                     "intaris: record_events 404 — session not found",
                     extra={"extra_data": {"session_id": session_id, "event_count": len(events)}},

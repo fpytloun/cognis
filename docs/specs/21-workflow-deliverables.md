@@ -271,6 +271,28 @@ The existing `_deliver_task_result*` path is refactored to route through deliver
 
 Deliverables are Cognis-owned because they are the controller's typed artifact. Intaris still sees the `write_deliverable` tool call in session events so session replay remains faithful.
 
+### Artifact-compatible virtual refs
+
+Deliverables are durable workflow outputs, not physical artifact blobs. A
+deliverable ID (`dlv_<hex>`) can nevertheless be used as an
+artifact-compatible content ref by artifact tools that read, inspect, save, or
+download content:
+
+- `artifact_get_metadata(dlv_*)` returns artifact-shaped virtual metadata for
+  the deliverable.
+- `artifact_read(dlv_*)` reads the deliverable content directly from the
+  deliverables table.
+- `artifact_save(source_artifact_id="dlv_*", ...)` streams the deliverable to
+  the executor filesystem without creating a copied artifact.
+- `artifact_get_url(dlv_*)` returns a signed virtual deliverable download URL
+  backed by the deliverable endpoint.
+
+These operations must reuse deliverable authorization checks. Artifact tools
+must not bypass task ownership, fork scope, or step visibility restrictions.
+Deliverables also remain intentionally absent from artifact list/search
+surfaces unless a future explicit export tool creates a derived physical
+artifact, such as a PDF.
+
 ## Assistant Free Text in Workflow Steps
 
 Free-text assistant messages during a workflow step are reasoning/progress, never the user-facing deliverable. UI renders them as a demoted subpanel (`"Reasoning"`) distinct from the deliverable panel. Channel adapters never send them.
@@ -317,7 +339,7 @@ See [`09-ui-ux.md`](09-ui-ux.md) for the general UX spec. Additions for delivera
 
 - Streaming deliverables. A deliverable is authored in a single tool call; partial writes are not supported.
 - Editing a delivered deliverable. Once a deliverable is `delivered`, it is immutable. A new workflow run produces a new deliverable.
-- Binary deliverables. `format` is `markdown | plain | html`. Attach binary artifacts through existing attachment mechanisms.
+- Binary deliverables. `format` is `markdown | plain | html`. Attach binary artifacts through existing attachment mechanisms. Artifact-compatible `dlv_*` refs expose the text deliverable virtually; they do not turn deliverables into stored binary artifact blobs.
 
 ## Open Questions (for follow-up specs)
 

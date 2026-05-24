@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-05-24
+
+### Fixed
+
+- Hardened compaction session rotation so provider identity and guardrail context survive rotated sessions.
+- Preserved provider identity metadata through guardrail calls and added regression coverage for session rotation behavior.
+
 ## [0.6.1] - 2026-05-23
 
 ### Added

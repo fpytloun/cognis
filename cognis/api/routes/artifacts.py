@@ -13,6 +13,12 @@ from fastapi.responses import Response
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.content_refs import (
+    build_deliverable_public_url,
+    get_accessible_deliverable_ref,
+    get_deliverable_ref_unscoped,
+    is_deliverable_ref,
+)
 from cognis.models.artifact import ArtifactKind
 from cognis.store.queries import (
     create_artifact_record,
@@ -123,6 +129,27 @@ async def get_signed_url(
 ) -> dict[str, object]:
     user = require_current_user(request)
     artifact_store = request.app.state.artifact_store
+    if is_deliverable_ref(artifact_id):
+        async with request.app.state.session_factory() as session:
+            ref = await get_accessible_deliverable_ref(session, artifact_id, user.email)
+        if ref is None:
+            raise api_exception(404, "not_found", "Artifact not found")
+        url = build_deliverable_public_url(
+            artifact_store,
+            ref,
+            ttl_seconds=ttl_seconds,
+        )
+        return {
+            "artifact_id": artifact_id,
+            "deliverable_id": artifact_id,
+            "source": "deliverable",
+            "virtual": True,
+            "url": url,
+            "filename": ref.filename,
+            "mime_type": ref.mime_type,
+            "size_bytes": ref.size_bytes,
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
+        }
     async with request.app.state.session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted" or _is_expired(row):
@@ -141,6 +168,40 @@ async def get_signed_url(
         "url": url,
         "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
     }
+
+
+@router.get("/virtual/deliverables/{deliverable_id}/{filename:path}")
+async def serve_signed_deliverable(
+    request: Request,
+    deliverable_id: str,
+    filename: str,
+    exp: int,
+    sig: str,
+) -> Response:
+    artifact_store = request.app.state.artifact_store
+    if not artifact_store.verify_signed_request(
+        "deliverables",
+        deliverable_id,
+        filename,
+        exp=exp,
+        sig=sig,
+    ):
+        raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
+    async with request.app.state.session_factory() as session:
+        ref = await get_deliverable_ref_unscoped(session, deliverable_id)
+    if ref is None or ref.filename != filename:
+        raise api_exception(404, "not_found", "Artifact not found")
+    headers = {
+        "Cache-Control": "private, max-age=60",
+        "Content-Length": str(ref.size_bytes),
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(ref.filename, safe='')}",
+    }
+    return Response(
+        content=ref.content_bytes,
+        media_type=ref.mime_type,
+        headers=headers,
+    )
 
 
 @router.get("/content/{namespace}/{object_id}/{filename:path}")

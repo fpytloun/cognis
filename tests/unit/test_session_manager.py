@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
-from cognis.models.session import ConversationContext, SessionEvent, SessionModel
+from cognis.models.session import ConversationContext, EventAppendResult, SessionEvent, SessionModel
+from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
 from cognis.store.queries import get_conversation, get_session_row, list_conversation_sessions
@@ -22,6 +23,7 @@ class _Guardrails:
         self.last_policy: dict | None = None
         self.policy_updates: list[tuple[str, dict | None, dict | None]] = []
         self.recorded_events: list[tuple[str, list[SessionEvent], str | None]] = []
+        self.record_event_contexts: list[tuple[str | None, str | None, str | None]] = []
 
     async def create_session(
         self,
@@ -77,11 +79,31 @@ class _Guardrails:
     ) -> object:
         del source
         self.recorded_events.append((session_id, events, idempotency_key))
+        self.record_event_contexts.append(
+            (current_user_email.get(), current_agent_id.get(), current_agent_owner_email.get())
+        )
         return type(
             "_AppendResult",
             (),
             {"ok": True, "count": len(events), "first_seq": 1, "last_seq": len(events)},
         )()
+
+
+class _NonAppendingGuardrails(_Guardrails):
+    async def record_events(
+        self,
+        session_id: str,
+        events: list[SessionEvent],
+        source: str = "cognis",
+        idempotency_key: str | None = None,
+        **_: object,
+    ) -> object:
+        del source
+        self.recorded_events.append((session_id, events, idempotency_key))
+        self.record_event_contexts.append(
+            (current_user_email.get(), current_agent_id.get(), current_agent_owner_email.get())
+        )
+        return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
 
 
 class _SlowGuardrails(_Guardrails):
@@ -373,6 +395,55 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
         for session_id, events, key in providers.guardrails.recorded_events
         if session_id == new_session.session_id
     )
+    assert (
+        "user@example.com",
+        "agent-1",
+        "user@example.com",
+    ) in providers.guardrails.record_event_contexts
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_keeps_new_root_when_compaction_summary_append_fails(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _NonAppendingGuardrails()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Rotation append failure test",
+    )
+
+    new_session = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Continued after compaction",
+        completion_reason="compacted",
+        compaction_summary="Summary of older turns.",
+    )
+
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        old_row = await db.get(Session, root_session.session_id)
+        new_row = await db.get(Session, new_session.session_id)
+
+    assert conv is not None
+    assert conv.active_session_id == new_session.session_id
+    assert old_row is not None
+    assert old_row.status == "completed"
+    assert old_row.completion_reason == "compacted"
+    assert new_row is not None
+    assert new_row.status == "active"
+    assert new_row.previous_session_id == root_session.session_id
+    assert providers.guardrails.recorded_events
+    assert cache.appended_events == []
 
     await engine.dispose()
 

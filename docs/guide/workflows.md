@@ -103,6 +103,9 @@ Workflow steps use deliverables by default.
 - Deliverables are used for evaluator review, downstream step context, task detail UI, and final workflow output.
 - A workflow can produce many step deliverables, but only one final deliverable is externally delivered for the run.
 - Free-text assistant messages during workflow execution are reasoning or progress, not the canonical artifact.
+- Deliverable IDs (`dlv_*`) are artifact-compatible virtual refs for tools that
+  read, save, or download content, without copying the deliverable into artifact
+  storage.
 
 This makes deliverables useful for more than just the final user-facing message. They are the stable artifacts that let multi-step workflows stay inspectable and evaluable.
 

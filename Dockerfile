@@ -12,11 +12,11 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 WORKDIR /app
 
+ENV COGNIS_SKIP_UI_BUILD=1
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-ENV COGNIS_SKIP_UI_BUILD=1
 
 COPY pyproject.toml README.md build.py ./
 COPY cognis/ ./cognis/

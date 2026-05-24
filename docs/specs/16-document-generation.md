@@ -212,6 +212,13 @@ write, debug, and revise. Markdown mode should support at least:
 7. inline images via asset references,
 8. inline asset references for rendered diagrams and screenshots.
 
+For `template: "research_report"`, Markdown mode also supports fenced Mermaid
+diagram blocks. The renderer should convert `mermaid` fences to embedded SVG
+diagrams when the executor environment provides Mermaid CLI. If Mermaid
+rendering is unavailable or a diagram fails to render, the PDF must preserve a
+readable fallback box containing the Mermaid source and the tool result must
+include an explicit warning.
+
 ### HTML/CSS
 
 HTML is the advanced mode for high-fidelity layouts. The tool must support raw
@@ -276,11 +283,19 @@ The executor-side pipeline is:
 1. normalize arguments,
 2. load source from `content`, `source_path`, or `source_artifact_id`,
 3. resolve all assets,
-4. convert Markdown to HTML if needed,
-5. apply template CSS and optional custom CSS,
-6. render HTML to PDF with WeasyPrint,
-7. save output bundle to Cognis artifact storage,
-8. return attachment metadata and a structured textual result.
+4. apply template-specific Markdown preprocessing when needed, such as Mermaid
+   rendering for `research_report`,
+5. convert Markdown to HTML if needed,
+6. apply template CSS and optional custom CSS,
+7. render HTML to PDF with WeasyPrint,
+8. save output bundle to Cognis artifact storage,
+9. return attachment metadata and a structured textual result.
+
+The `research_report` template is optimized for long technical reports. Its
+built-in CSS should keep wide Markdown tables and code blocks within the
+printable page width by using full-width controlled table layout, wrapping long
+URLs/source IDs, styled header rows, borders, padding, zebra rows, and
+PDF-safe wrapping for preformatted code.
 
 ## Internal Artifact Publish Path
 
@@ -479,6 +494,13 @@ V1 requires:
 1. WeasyPrint,
 2. a Markdown parser suitable for tables and fenced blocks.
 
+Research-report Mermaid rendering additionally requires a Mermaid renderer in
+the executor runtime, currently Mermaid CLI (`mmdc`) discoverable on `PATH` or
+through `COGNIS_MERMAID_CLI`, with Chromium configured for container execution.
+The document tool should pass Chromium no-sandbox settings where required.
+Missing or failing Mermaid dependencies must degrade to the fallback-and-warning
+behavior described above rather than dropping diagrams.
+
 These dependencies belong on the executor environment used for document
 generation.
 
@@ -516,6 +538,10 @@ generation.
 8. public Cognis URL generation.
 9. attachment metadata returned.
 10. task result attachment persistence.
+11. `research_report` Markdown fixtures with UTF-8 punctuation/diacritics,
+    Mermaid fences, wide tables, long URLs/source IDs, and fenced code blocks.
+12. Mermaid success and fallback-warning paths for `research_report` without
+    changing default-template Markdown behavior.
 
 ### Integration Tests
 

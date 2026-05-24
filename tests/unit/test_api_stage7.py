@@ -29,10 +29,12 @@ from cognis.store.queries import (
     create_agent,
     create_artifact_record,
     create_conversation,
+    create_deliverable,
     create_session,
     create_skill,
     create_skill_asset,
     create_skill_version,
+    create_step_run,
     create_task,
     create_user,
     get_conversation,
@@ -2636,6 +2638,78 @@ def test_signed_artifact_route_serves_skill_assets_without_artifact_record(
         assert response.status_code == 200
         assert response.content == b"print('hi')\n"
         assert response.headers["content-type"].startswith("text/x-python")
+
+
+def test_signed_virtual_deliverable_route_serves_exact_content(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent",
+                )
+                task = await create_task(
+                    session,
+                    task_id="task-virtual-url",
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    title="Task",
+                )
+                step_run = await create_step_run(
+                    session,
+                    step_run_id="sr-virtual-url",
+                    task_id=task.task_id,
+                    step_name="execute",
+                    step_type="direct",
+                    agent_id="agent-1",
+                    status="completed",
+                )
+                await create_deliverable(
+                    session,
+                    deliverable_id="dlv_virtual_url",
+                    step_run_id=step_run.step_run_id,
+                    title="Virtual URL",
+                    content="# Virtual\n\nExact content.",
+                    format="markdown",
+                )
+                await session.commit()
+
+                from cognis.core.content_refs import (
+                    build_deliverable_public_url,
+                    get_accessible_deliverable_ref,
+                )
+
+                async with app.state.session_factory() as session:
+                    ref = await get_accessible_deliverable_ref(
+                        session, "dlv_virtual_url", "user@example.com"
+                    )
+                assert ref is not None
+                return build_deliverable_public_url(
+                    app.state.artifact_store,
+                    ref,
+                    ttl_seconds=3600,
+                )
+
+        signed_url = client.portal.call(_seed)
+        response = client.get(signed_url)
+
+        assert response.status_code == 200
+        assert response.content == b"# Virtual\n\nExact content."
+        assert response.headers["content-type"].startswith("text/markdown")
+        assert "Virtual-URL.md" in response.headers["content-disposition"]
 
 
 def test_websocket_queues_second_message_while_turn_active(

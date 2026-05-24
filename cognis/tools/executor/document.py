@@ -6,7 +6,11 @@ import asyncio
 import base64
 import html
 import mimetypes
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -20,7 +24,15 @@ from cognis.tools.registry import ToolExecutionContext
 _SOURCE = ToolSource(type="executor")
 _REMOTE_TIMEOUT = 20.0
 _MAX_REMOTE_BYTES = 10 * 1024 * 1024
+_MERMAID_TIMEOUT_SECONDS = 30
+_MAX_MERMAID_SOURCE_BYTES = 200_000
 _MARKDOWN_IMAGE_ASSET_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\(asset:(?P<name>[^)]+)\)")
+_MERMAID_FENCE_RE = re.compile(
+    r"(?P<fence>^[ \t]*(?P<marker>`{3,}|~{3,})[ \t]*mermaid(?:[ \t].*)?[ \t]*\n)"
+    r"(?P<source>.*?)"
+    r"(?P<closing>^[ \t]*(?P=marker)[ \t]*$)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
 
 
 DOCUMENT_GENERATE_TOOL = ToolDefinition(
@@ -158,16 +170,21 @@ async def handle_document_generate(
             arguments.get("assets") or [],
             append_pdf_assets=append_pdf_assets,
         )
-        title = str(arguments.get("title") or _derive_title(source_text) or "Document")
-
-        if input_format == "markdown":
-            html_body = await _markdown_to_html(source_text, assets)
-        else:
-            html_body = _replace_html_asset_refs(source_text, assets)
-
         template = str(arguments.get("template") or "default")
         page_size = str(arguments.get("page_size") or "A4")
         orientation = str(arguments.get("orientation") or "portrait")
+        title = str(arguments.get("title") or _derive_title(source_text) or "Document")
+
+        if input_format == "markdown":
+            html_body = await _markdown_to_html(
+                source_text,
+                assets,
+                warnings=warnings,
+                render_mermaid=template == "research_report",
+            )
+        else:
+            html_body = _replace_html_asset_refs(source_text, assets)
+
         css = _compose_css(template=template, page_size=page_size, orientation=orientation)
         if custom_css := arguments.get("css"):
             css += f"\n\n{custom_css}"
@@ -369,7 +386,13 @@ async def _fetch_remote_bytes(url: str) -> tuple[bytes, str]:
         return content, mime_type
 
 
-async def _markdown_to_html(markdown_text: str, assets: dict[str, dict[str, str]]) -> str:
+async def _markdown_to_html(
+    markdown_text: str,
+    assets: dict[str, dict[str, str]],
+    *,
+    warnings: list[str] | None = None,
+    render_mermaid: bool = False,
+) -> str:
     try:
         import markdown as markdown_lib
     except ImportError as exc:
@@ -378,6 +401,8 @@ async def _markdown_to_html(markdown_text: str, assets: dict[str, dict[str, str]
         ) from exc
 
     markdown_text = _replace_markdown_asset_refs(markdown_text, assets)
+    if render_mermaid:
+        markdown_text = await _replace_mermaid_fences(markdown_text, warnings=warnings)
     return markdown_lib.markdown(
         markdown_text,
         extensions=["fenced_code", "tables", "toc"],
@@ -398,6 +423,133 @@ def _replace_markdown_asset_refs(
         return f"![{alt}]({asset['data_url']})"
 
     return _MARKDOWN_IMAGE_ASSET_RE.sub(repl, markdown_text)
+
+
+async def _replace_mermaid_fences(markdown_text: str, *, warnings: list[str] | None) -> str:
+    matches = list(_MERMAID_FENCE_RE.finditer(markdown_text))
+    if not matches:
+        return markdown_text
+
+    rendered: list[str] = []
+    last_end = 0
+    for index, match in enumerate(matches, start=1):
+        rendered.append(markdown_text[last_end : match.start()])
+        source = match.group("source").strip()
+        try:
+            svg = await _render_mermaid_to_svg(source)
+        except DocumentGenerationError as exc:
+            reason = str(exc)
+            if warnings is not None:
+                warnings.append(f"Mermaid diagram {index} could not be rendered: {reason}")
+            rendered.append(_mermaid_fallback_html(source, reason=reason, index=index))
+        else:
+            rendered.append(_mermaid_svg_html(svg, index=index))
+        last_end = match.end()
+    rendered.append(markdown_text[last_end:])
+    return "".join(rendered)
+
+
+async def _render_mermaid_to_svg(source: str) -> bytes:
+    if not source:
+        raise DocumentGenerationError("diagram source is empty")
+    if len(source.encode("utf-8")) > _MAX_MERMAID_SOURCE_BYTES:
+        raise DocumentGenerationError("diagram source exceeds size limit")
+    return await asyncio.to_thread(_render_mermaid_to_svg_sync, source)
+
+
+def _render_mermaid_to_svg_sync(source: str) -> bytes:
+    mmdc = os.environ.get("COGNIS_MERMAID_CLI") or shutil.which("mmdc")
+    if not mmdc:
+        raise DocumentGenerationError("mmdc executable was not found")
+
+    with tempfile.TemporaryDirectory(prefix="cognis-mermaid-") as tmpdir:
+        tmp = Path(tmpdir)
+        input_path = tmp / "diagram.mmd"
+        output_path = tmp / "diagram.svg"
+        puppeteer_config = tmp / "puppeteer.json"
+        input_path.write_text(source, encoding="utf-8")
+        puppeteer_config.write_text(
+            ('{"args":["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]}'),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env.setdefault("PUPPETEER_SKIP_DOWNLOAD", "true")
+        if "PUPPETEER_EXECUTABLE_PATH" not in env:
+            chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+            if chromium:
+                env["PUPPETEER_EXECUTABLE_PATH"] = chromium
+
+        try:
+            completed = subprocess.run(
+                [
+                    mmdc,
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                    "--puppeteerConfigFile",
+                    str(puppeteer_config),
+                    "--backgroundColor",
+                    "transparent",
+                ],
+                check=False,
+                capture_output=True,
+                env=env,
+                shell=False,
+                timeout=_MERMAID_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DocumentGenerationError("mmdc timed out") from exc
+        except OSError as exc:
+            raise DocumentGenerationError(
+                f"mmdc failed to start: {_truncate_warning(str(exc))}"
+            ) from exc
+
+        if completed.returncode != 0:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            reason = _truncate_warning(stderr or f"mmdc exited with {completed.returncode}")
+            raise DocumentGenerationError(reason)
+        if not output_path.is_file():
+            raise DocumentGenerationError("mmdc did not produce SVG output")
+        svg = output_path.read_bytes()
+        if not svg.strip():
+            raise DocumentGenerationError("mmdc produced empty SVG output")
+        return _sanitize_svg(svg)
+
+
+def _sanitize_svg(svg: bytes) -> bytes:
+    text = svg.decode("utf-8", errors="replace")
+    text = re.sub(r"<script\b[^>]*>.*?</script>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\s+on[a-zA-Z]+\s*=\s*(['\"]).*?\1", "", text, flags=re.DOTALL)
+    text = re.sub(r"\s+(?:href|xlink:href)\s*=\s*(['\"])(?:https?:|//).*?\1", "", text)
+    return text.encode("utf-8")
+
+
+def _mermaid_svg_html(svg: bytes, *, index: int) -> str:
+    data_url = _to_data_url(svg, "image/svg+xml")
+    return (
+        f'\n<figure class="mermaid-diagram">'
+        f'<img src="{data_url}" alt="Mermaid diagram {index}">'
+        f"</figure>\n"
+    )
+
+
+def _mermaid_fallback_html(source: str, *, reason: str, index: int) -> str:
+    return (
+        '\n<figure class="mermaid-fallback">'
+        f"<figcaption>Mermaid diagram {index} could not be rendered: "
+        f"{html.escape(_truncate_warning(reason))}</figcaption>"
+        f"<pre><code>{html.escape(source)}</code></pre>"
+        "</figure>\n"
+    )
+
+
+def _truncate_warning(message: str, *, limit: int = 300) -> str:
+    cleaned = " ".join(message.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 1]}…"
 
 
 def _replace_html_asset_refs(html_text: str, assets: dict[str, dict[str, str]]) -> str:
@@ -431,9 +583,31 @@ def _compose_css(*, template: str, page_size: str, orientation: str) -> str:
         )
     if template == "research_report":
         return base + (
-            "h1 { font-size: 28px; } h2 { margin-top: 1.8rem; }"
-            " p, li { font-size: 11pt; }"
-            " .summary { background: #eff6ff; border: 1px solid #bfdbfe; padding: 12px; border-radius: 8px; }"
+            "body { font-size: 10.5pt; }"
+            "h1 { font-size: 28px; line-height: 1.15; margin-bottom: 0.8rem; }"
+            "h2 { margin-top: 1.8rem; padding-top: 0.35rem; border-top: 1px solid #e2e8f0; }"
+            "h3 { margin-top: 1.2rem; }"
+            "p, li { font-size: 10.5pt; }"
+            "a { color: #1d4ed8; text-decoration: underline; overflow-wrap: anywhere; word-break: break-word; }"
+            "table { width: 100%; max-width: 100%; table-layout: fixed; border-collapse: collapse; "
+            "font-size: 8.5pt; margin: 0.9rem 0 1.2rem; }"
+            "thead { display: table-header-group; }"
+            "th { background: #1e3a8a; color: #ffffff; font-weight: 700; }"
+            "th, td { border: 1px solid #cbd5e1; padding: 5px 6px; vertical-align: top; "
+            "overflow-wrap: anywhere; word-break: break-word; hyphens: auto; }"
+            "tbody tr:nth-child(even) { background: #f8fafc; }"
+            "pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; "
+            "word-break: break-word; font-size: 8.5pt; line-height: 1.35; }"
+            "pre code { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }"
+            "code { overflow-wrap: anywhere; word-break: break-word; }"
+            "img { max-width: 100%; height: auto; }"
+            ".summary { background: #eff6ff; border: 1px solid #bfdbfe; padding: 12px; border-radius: 8px; }"
+            ".mermaid-diagram { margin: 1.2rem 0; text-align: center; page-break-inside: avoid; }"
+            ".mermaid-diagram img { display: block; max-width: 100%; height: auto; margin: 0 auto; }"
+            ".mermaid-fallback { margin: 1.2rem 0; padding: 10px 12px; border: 1px solid #f59e0b; "
+            "border-radius: 8px; background: #fffbeb; page-break-inside: avoid; }"
+            ".mermaid-fallback figcaption { color: #92400e; font-weight: 700; margin-bottom: 0.5rem; }"
+            ".mermaid-fallback pre { background: #fff7ed; color: #7c2d12; border: 1px solid #fed7aa; }"
         )
     if template == "incident_report":
         return base + (

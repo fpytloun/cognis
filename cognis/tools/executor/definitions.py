@@ -122,8 +122,10 @@ WRITE_TOOL = ToolDefinition(
 ARTIFACT_SAVE_TOOL = ToolDefinition(
     name="artifact_save",
     description=(
-        "Save a Cognis artifact to a local executor file path. Use this when you need a saved "
-        "image, PDF, or other artifact as a real filesystem file for subsequent tools."
+        "Save an artifact-compatible content ref, including saved artifact IDs and task "
+        "deliverable IDs (dlv_*), to a local executor file path. Use this when you need "
+        "a saved image, PDF, deliverable, or other artifact-like source as a real "
+        "filesystem file for subsequent tools."
     ),
     parameters={
         "type": "object",
@@ -134,7 +136,7 @@ ARTIFACT_SAVE_TOOL = ToolDefinition(
             },
             "source_artifact_id": {
                 "type": "string",
-                "description": "Cognis artifact id to save to the executor filesystem.",
+                "description": "Saved artifact ID or task deliverable ID (dlv_*) to save to the executor filesystem.",
             },
         },
         "required": ["file_path", "source_artifact_id"],

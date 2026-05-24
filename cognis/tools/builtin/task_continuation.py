@@ -6,8 +6,9 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.content_refs import continuation_scope_task_id, get_accessible_deliverable_ref
 from cognis.models.tool import ToolDefinition, ToolSource
-from cognis.store.queries import get_deliverable, get_task, list_step_runs_for_task
+from cognis.store.queries import get_task, list_step_runs_for_task
 from cognis.tools.registry import ToolExecutionContext
 
 _SOURCE = ToolSource(type="builtin")
@@ -69,16 +70,7 @@ def _user_email(context: ToolExecutionContext) -> str | None:
 
 
 def _continuation_task_id(context: ToolExecutionContext) -> str | None:
-    conversation_context = context.runtime_metadata.get("conversation_context")
-    if not isinstance(conversation_context, dict):
-        return None
-    platform_data = conversation_context.get("platform_data")
-    if not isinstance(platform_data, dict):
-        return None
-    if platform_data.get("forked_from") not in {"task", "task_step"}:
-        return None
-    task_id = platform_data.get("task_id")
-    return task_id if isinstance(task_id, str) and task_id else None
+    return continuation_scope_task_id(context.runtime_metadata)
 
 
 def build_task_continuation_tool_handlers(
@@ -92,17 +84,22 @@ def build_task_continuation_tool_handlers(
         user_email = _user_email(context)
         scope_task_id = _continuation_task_id(context)
         deliverable_id = str(arguments.get("deliverable_id") or "").strip()
-        if not user_email or not scope_task_id or not deliverable_id:
+        if not user_email or not deliverable_id:
             return {"ok": False, "error": "missing_user_or_deliverable_id"}
         async with session_factory() as session:
-            deliverable = await get_deliverable(session, deliverable_id)
-            if deliverable is None:
+            ref = await get_accessible_deliverable_ref(
+                session,
+                deliverable_id,
+                user_email,
+                scope_task_id=scope_task_id,
+            )
+            if ref is None:
                 return {"ok": False, "error": "not_found"}
-            task = await _task_for_step_run(session, deliverable.step_run_id)
-            if task is None or task.created_by != user_email or task.task_id != scope_task_id:
-                return {"ok": False, "error": "not_found"}
+            deliverable = ref.deliverable
+            task = ref.task
             return {
                 "ok": True,
+                "task_id": task.task_id,
                 "deliverable_id": deliverable.deliverable_id,
                 "step_run_id": deliverable.step_run_id,
                 "version": deliverable.version,
@@ -119,9 +116,9 @@ def build_task_continuation_tool_handlers(
         user_email = _user_email(context)
         scope_task_id = _continuation_task_id(context)
         task_id = str(arguments.get("task_id") or "").strip()
-        if not user_email or not scope_task_id or not task_id:
+        if not user_email or not task_id:
             return {"ok": False, "error": "missing_user_or_task_id"}
-        if task_id != scope_task_id:
+        if scope_task_id is not None and task_id != scope_task_id:
             return {"ok": False, "error": "outside_continuation_scope"}
         async with session_factory() as session:
             task = await get_task(session, task_id)
@@ -153,17 +150,3 @@ def build_task_continuation_tool_handlers(
         READ_TASK_DELIVERABLE_TOOL.name: read_task_deliverable_handler,
         LIST_TASK_STEP_RUNS_TOOL.name: list_task_step_runs_handler,
     }
-
-
-async def _task_for_step_run(session: AsyncSession, step_run_id: str) -> Any | None:
-    from sqlalchemy import select
-
-    from cognis.store.models import StepRun
-
-    result = await session.execute(
-        select(StepRun.task_id).where(StepRun.step_run_id == step_run_id)
-    )
-    task_id = result.scalar_one_or_none()
-    if not isinstance(task_id, str):
-        return None
-    return await get_task(session, task_id)

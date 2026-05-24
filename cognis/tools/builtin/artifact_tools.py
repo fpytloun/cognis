@@ -8,6 +8,13 @@ from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
 
+from cognis.core.content_refs import (
+    build_deliverable_public_url,
+    continuation_scope_task_id,
+    deliverable_metadata_item,
+    get_accessible_deliverable_ref,
+    is_deliverable_ref,
+)
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
@@ -57,16 +64,17 @@ def _is_expired_artifact_row(row: object, *, now: datetime | None = None) -> boo
 ARTIFACT_READ_TOOL = ToolDefinition(
     name="artifact_read",
     description=(
-        "Read a saved Cognis artifact by artifact_id. Text artifacts return line-numbered "
-        "content. Images, PDFs, audio, and supported files are analyzed with the current "
-        "model when possible and fall back to the configured attachment_analysis route."
+        "Read an artifact-compatible content ref by artifact_id, including saved Cognis "
+        "artifact IDs and task deliverable IDs (dlv_*). Text content returns line-numbered "
+        "content. Images, PDFs, audio, and supported saved artifacts are analyzed with the "
+        "current model when possible and fall back to the configured attachment_analysis route."
     ),
     parameters={
         "type": "object",
         "properties": {
             "artifact_id": {
                 "type": "string",
-                "description": "Artifact id to inspect.",
+                "description": "Artifact-compatible content ref to inspect (saved artifact ID or task deliverable ID dlv_*).",
             },
             "prompt": {
                 "type": "string",
@@ -185,16 +193,17 @@ ARTIFACT_SEARCH_TOOL = ToolDefinition(
 ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
     name="artifact_get_metadata",
     description=(
-        "Get metadata for one saved Cognis artifact by artifact_id. Use this after artifact_search "
-        "or artifact_list_recent when you need the full stored metadata before reading the file. "
-        "Call artifact_get_url when the user asks for a download URL or wants to view the artifact."
+        "Get metadata for one artifact-compatible content ref by artifact_id, including saved "
+        "Cognis artifact IDs and task deliverable IDs (dlv_*). Use this after artifact_search "
+        "or artifact_list_recent when you need full stored metadata before reading a saved "
+        "artifact. Call artifact_get_url when the user asks for a download URL or wants to view the content."
     ),
     parameters={
         "type": "object",
         "properties": {
             "artifact_id": {
                 "type": "string",
-                "description": "Artifact id to inspect.",
+                "description": "Artifact-compatible content ref to inspect (saved artifact ID or task deliverable ID dlv_*).",
             }
         },
         "required": ["artifact_id"],
@@ -209,16 +218,17 @@ ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
 ARTIFACT_GET_URL_TOOL = ToolDefinition(
     name="artifact_get_url",
     description=(
-        "Generate a short-lived download URL for a saved Cognis artifact by artifact_id. Use this "
-        "when the user asks for download links, wants to view artifacts, or wants images/files "
-        "returned as direct UI attachments."
+        "Generate a short-lived download URL for an artifact-compatible content ref by "
+        "artifact_id, including saved Cognis artifact IDs and task deliverable IDs (dlv_*). "
+        "Use this when the user asks for download links, wants to view artifacts, or wants "
+        "images/files returned as direct UI attachments."
     ),
     parameters={
         "type": "object",
         "properties": {
             "artifact_id": {
                 "type": "string",
-                "description": "Artifact id to download or attach.",
+                "description": "Artifact-compatible content ref to download or attach (saved artifact ID or task deliverable ID dlv_*).",
             },
             "ttl_seconds": {
                 "type": "integer",
@@ -294,9 +304,11 @@ async def handle_artifact_tool(
     current_model: str | None = None,
     current_provider_id: str | None = None,
     owner_email: str | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> ToolResult:
     """Handle artifact inspection tools."""
 
+    scope_task_id = continuation_scope_task_id(runtime_metadata)
     if tool_name == ARTIFACT_READ_TOOL.name:
         return await _handle_artifact_read(
             arguments,
@@ -307,6 +319,7 @@ async def handle_artifact_tool(
             current_model=current_model,
             current_provider_id=current_provider_id,
             owner_email=owner_email or user_email,
+            scope_task_id=scope_task_id,
         )
     if tool_name == ARTIFACT_LIST_RECENT_TOOL.name:
         return await _handle_artifact_list_recent(
@@ -325,6 +338,7 @@ async def handle_artifact_tool(
             arguments,
             session_factory=session_factory,
             user_email=user_email,
+            scope_task_id=scope_task_id,
         )
     if tool_name == ARTIFACT_GET_URL_TOOL.name:
         return await _handle_artifact_get_url(
@@ -332,6 +346,7 @@ async def handle_artifact_tool(
             artifact_store=artifact_store,
             session_factory=session_factory,
             user_email=user_email,
+            scope_task_id=scope_task_id,
         )
     return ToolResult(output=f"Unknown artifact tool: {tool_name}", is_error=True)
 
@@ -346,6 +361,7 @@ async def _handle_artifact_read(
     current_model: str | None,
     current_provider_id: str | None,
     owner_email: str | None = None,
+    scope_task_id: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -357,6 +373,26 @@ async def _handle_artifact_read(
     offset = max(1, int(arguments.get("offset", 1)))
     limit = int(arguments.get("limit", _MAX_READ_LINES))
     prompt = str(arguments.get("prompt") or "").strip() or None
+
+    if is_deliverable_ref(artifact_id):
+        async with session_factory() as session:
+            ref = await get_accessible_deliverable_ref(
+                session, artifact_id, user_email, scope_task_id=scope_task_id
+            )
+        if ref is None:
+            return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        return ToolResult(
+            output=_render_text_excerpt(ref.deliverable.content, offset, limit),
+            metadata={
+                "artifact_id": ref.artifact_id,
+                "deliverable_id": ref.artifact_id,
+                "filename": ref.filename,
+                "mime_type": ref.mime_type,
+                "kind": "file",
+                "source": "deliverable",
+                "virtual": True,
+            },
+        )
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
@@ -534,6 +570,7 @@ async def _handle_artifact_get_metadata(
     *,
     session_factory: Any | None,
     user_email: str | None,
+    scope_task_id: str | None = None,
 ) -> ToolResult:
     if session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -541,6 +578,17 @@ async def _handle_artifact_get_metadata(
     artifact_id = str(arguments.get("artifact_id") or "").strip()
     if not artifact_id:
         return ToolResult(output="artifact_id is required.", is_error=True)
+
+    if is_deliverable_ref(artifact_id):
+        async with session_factory() as session:
+            ref = await get_accessible_deliverable_ref(
+                session, artifact_id, user_email, scope_task_id=scope_task_id
+            )
+        if ref is None:
+            return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        item = deliverable_metadata_item(ref)
+        item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
+        return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
@@ -560,6 +608,7 @@ async def _handle_artifact_get_url(
     artifact_store: Any | None,
     session_factory: Any | None,
     user_email: str | None,
+    scope_task_id: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -569,6 +618,42 @@ async def _handle_artifact_get_url(
         return ToolResult(output="artifact_id is required.", is_error=True)
     ttl_seconds = _coerce_limit(arguments.get("ttl_seconds"), default=3600, maximum=604800)
     ttl_seconds = max(60, ttl_seconds)
+
+    if is_deliverable_ref(artifact_id):
+        async with session_factory() as session:
+            ref = await get_accessible_deliverable_ref(
+                session, artifact_id, user_email, scope_task_id=scope_task_id
+            )
+        if ref is None:
+            return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        try:
+            url = build_deliverable_public_url(
+                artifact_store,
+                ref,
+                ttl_seconds=ttl_seconds,
+            )
+        except Exception as exc:
+            return ToolResult(
+                output=f"Failed to create download URL for artifact {artifact_id}: {exc}",
+                is_error=True,
+            )
+        item = {
+            "artifact_id": ref.artifact_id,
+            "deliverable_id": ref.artifact_id,
+            "content_ref": ref.artifact_id,
+            "source": "deliverable",
+            "virtual": True,
+            "url": url,
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
+            "filename": ref.filename,
+            "kind": "file",
+            "mime_type": ref.mime_type,
+            "size_bytes": ref.size_bytes,
+        }
+        return ToolResult(
+            output=json.dumps(item, indent=2, sort_keys=True),
+            metadata=item,
+        )
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)

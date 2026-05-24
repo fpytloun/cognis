@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from cognis.models.session import SessionEvent
 from cognis.providers.guardrails.intaris import IntarisProvider
 from cognis.providers.memory.mnemory import MnemoryProvider
 from cognis.runtime_context import current_user_email
@@ -98,6 +99,7 @@ async def test_intaris_call_mcp_tool_uses_server_and_tool_fields() -> None:
         "server": "github",
         "tool": "search/issues",
         "arguments": {"q": "bug"},
+        "context": {},
     }
 
 
@@ -242,3 +244,62 @@ async def test_intaris_report_reasoning_omits_wait_timeout_without_bootstrap_wai
     assert captured["from_events"] is True
     assert "wait_for_intention" not in captured
     assert "wait_timeout_ms" not in captured
+
+
+@pytest.mark.asyncio
+async def test_intaris_record_events_retries_missing_session_when_requested() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+    calls = 0
+
+    class _Response:
+        def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.request = httpx.Request(
+                "POST", "http://localhost:8060/api/v1/session/sess-1/events"
+            )
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise httpx.HTTPStatusError(
+                    "boom",
+                    request=self.request,
+                    response=httpx.Response(self.status_code, request=self.request),
+                )
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    async def _fake_post(*_: object, **__: object) -> _Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _Response(404)
+        return _Response(200, {"ok": True, "count": 1, "first_seq": 1, "last_seq": 1})
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    token = current_user_email.set("user@example.com")
+    try:
+        intaris.client.post = _fake_post  # type: ignore[method-assign]
+        import cognis.providers.guardrails.intaris as intaris_module
+
+        original_sleep = intaris_module.asyncio.sleep
+        intaris_module.asyncio.sleep = _no_sleep
+        try:
+            result = await intaris.record_events(
+                session_id="sess-1",
+                events=[SessionEvent(type="user_message", data={"content": "hello"})],
+                retry_missing_session=True,
+            )
+        finally:
+            intaris_module.asyncio.sleep = original_sleep
+    finally:
+        current_user_email.reset(token)
+        await intaris.client.aclose()
+
+    assert calls == 2
+    assert result.ok is True
+    assert result.last_seq == 1

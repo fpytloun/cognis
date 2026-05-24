@@ -163,6 +163,10 @@ class GuardrailsProvider(Protocol):
         events: list[SessionEvent],
         source: str = "cognis",
         idempotency_key: str | None = None,
+        retry_missing_session: bool = False,
+        user_email: str | None = None,
+        agent_id: str | None = None,
+        agent_owner_email: str | None = None,
     ) -> EventAppendResult: ...
     async def read_events(
         self,
