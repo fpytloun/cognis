@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-06-01
+
+### Added
+
+- Added MCP OAuth authorization support with dynamic client registration, OAuth settings in the tools UI, and persistent MCP OAuth storage.
+- Added sticky agent-direct chats, cached conversation switching, chat forking during active turns, and long-lived chat idle checkpoint compaction.
+- Added UI affordances for selected-agent chat shortcuts, degraded executor visibility, native patch preparation, backing-session counts, and step todo summaries.
+- Added session policy propagation to Intaris and new task session policy metadata.
+
+### Changed
+
+- Improved direct chat lifecycle handling, sidebar history refresh behavior, notification state synchronization, and conversation attention indicators.
+- Tuned Codex and ChatGPT streaming, provider retry diagnostics, context projection, compaction, and runtime recovery behavior.
+- Improved executor reconnect handling, MCP transport isolation, browser session behavior configuration, and schedule/runtime routing.
+- Expanded API, workflow, runtime, and UI test coverage for recent chat, executor, MCP, scheduler, and workflow behavior.
+
+### Fixed
+
+- Hardened native apply-patch retry handling, malformed empty patch rejection, custom tool input streaming, and degenerate response stream diagnostics.
+- Fixed orphan live tool-output buffering, stale active tool snapshots, history chronology, cached refresh banners, and direct conversation session recovery.
+- Fixed Intaris title waits for adoptable conversations, task/session policy typing, weighted todo progress calculations, and browser/web extraction edge cases.
+- Restored release validation tests and improved release-blocking regression coverage.
+
 ## [0.6.3] - 2026-05-24
 
 ### Fixed

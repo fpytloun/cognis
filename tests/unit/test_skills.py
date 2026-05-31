@@ -86,7 +86,7 @@ def test_extract_agent_skill_refs_new_style() -> None:
             "items": [
                 {"skill_id": "skill-a", "enabled": True},
                 {"skill_id": "skill-b", "enabled": False},
-                {"skill_id": "skill-c"},  # default enabled
+                {"skill_id": "skill-c", "auto_load_instructions": True},
             ]
         }
     )
@@ -94,7 +94,11 @@ def test_extract_agent_skill_refs_new_style() -> None:
     assert len(refs) == 3
     assert refs[0] == AgentSkillRef(skill_id="skill-a", enabled=True)
     assert refs[1] == AgentSkillRef(skill_id="skill-b", enabled=False)
-    assert refs[2] == AgentSkillRef(skill_id="skill-c", enabled=True)
+    assert refs[2] == AgentSkillRef(
+        skill_id="skill-c",
+        enabled=True,
+        auto_load_instructions=True,
+    )
 
 
 def test_extract_agent_skill_refs_skips_legacy_entries() -> None:
@@ -602,6 +606,27 @@ def test_build_available_skills_metadata_attach_to_all_agents() -> None:
     )
     metadata = build_available_skills_metadata(skill_set)
     assert "<attach_to_all_agents>true</attach_to_all_agents>" in metadata
+
+
+def test_build_available_skills_metadata_marks_auto_loaded_skills_loaded() -> None:
+    skill_set = ResolvedSkillSet(
+        skills=[
+            ResolvedSkill(
+                skill_id="coding",
+                name="Coding",
+                version_id="v1",
+                version_number=1,
+                content_hash="h1",
+                instructions="Coding discipline.",
+                attached=True,
+                auto_load_instructions=True,
+            ),
+        ]
+    )
+
+    metadata = build_available_skills_metadata(skill_set)
+    assert "<loaded>true</loaded>" in metadata
+    assert "<auto_load_instructions>true</auto_load_instructions>" in metadata
 
 
 # ---------------------------------------------------------------------------

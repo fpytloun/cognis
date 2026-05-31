@@ -29,6 +29,7 @@ from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
 from cognis.api.routes.knowledgebases import router as knowledgebases_router
+from cognis.api.routes.mcp_oauth import router as mcp_oauth_router
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
@@ -55,6 +56,7 @@ from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
 from cognis.core.events import EventBus
+from cognis.core.mcp_oauth import MCPOAuthService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
@@ -530,6 +532,13 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             providers=providers,
         )
+        mcp_oauth_service = MCPOAuthService(
+            session_factory=session_factory,
+            key_path=str(config_runtime.secrets_key_path),
+            public_base_url=config_runtime.public_base_url,
+            notification_service=notification_service,
+        )
+        providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
         tool_router.notification_service = notification_service
         tool_router.pause_waiter = pause_waiter
         agent_loop.notification_service = notification_service
@@ -686,6 +695,7 @@ def create_app() -> FastAPI:
         app.state.startup_invariant_reports = [report.as_dict() for report in invariant_reports]
 
         app.state.notification_service = notification_service
+        app.state.mcp_oauth_service = mcp_oauth_service
         app.state.web_push_service = web_push_service
         app.state.turn_scheduler = turn_scheduler
         app.state.tool_output_store = tool_output_store
@@ -791,7 +801,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.6.3", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.7.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -824,6 +834,7 @@ def create_app() -> FastAPI:
     app.include_router(secrets_router)
     app.include_router(search_router)
     app.include_router(tools_router)
+    app.include_router(mcp_oauth_router)
     app.include_router(skills_router)
     app.include_router(executors_router)
     app.include_router(escalations_router)

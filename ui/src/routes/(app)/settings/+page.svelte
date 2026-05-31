@@ -38,7 +38,7 @@ import { onMount, tick } from 'svelte';
     reconcileWebPushSubscription
   } from '$lib/notifications';
   import {
-    executorMcpFailureDetails,
+    executorDegradedDetails,
     executorObservedNote,
     executorRuntimeBadgeStatus,
     executorRuntimeLabel,
@@ -64,6 +64,7 @@ import { onMount, tick } from 'svelte';
     Setting,
     SettingsCategory,
     SystemDiagnostics,
+    MCPAuthConfig,
     MCPServerConfigResponse,
     StepProfileDefinition,
     ToolDefinitionSummary,
@@ -74,6 +75,39 @@ import { onMount, tick } from 'svelte';
 
   type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
   type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
+  type MCPAuthType = 'none' | 'static_headers' | 'oauth2';
+  type MCPOAuthStatus = {
+    connected: boolean;
+    issuer?: string | null;
+    resource?: string | null;
+    scopes?: string[];
+    expires_at?: string | null;
+    refreshable?: boolean;
+    status?: string;
+  };
+  type MCPServerFormState = {
+    name: string;
+    transport: string;
+    command: string;
+    url: string;
+    args: string;
+    envVars: MCPEnvVar[];
+    headers: MCPEnvVar[];
+    timeout_seconds: number;
+    description: string;
+    shared: boolean;
+    authType: MCPAuthType;
+    oauthIssuer: string;
+    oauthAuthorizationServer: string;
+    oauthResource: string;
+    oauthScopes: string;
+    oauthClientId: string;
+    oauthClientSecretRef: string;
+    oauthRedirectUri: string;
+    oauthDynamicClientRegistration: boolean;
+    oauthClientMetadataDocumentUrl: string;
+    oauthAuthorizationParams: MCPEnvVar[];
+  };
 
   const CREDENTIAL_PAYLOAD_TEMPLATES: Record<CredentialKind, string> = {
     token: '{\n  "token": ""\n}',
@@ -275,7 +309,8 @@ import { onMount, tick } from 'svelte';
   let newStepProfileForm = $state({ profile_id: '', name: '', mode: 'soft' as 'soft' | 'hard' });
   let showMcpForm = $state(false);
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
-  let mcpForm = $state({ name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [] as MCPEnvVar[], headers: [] as MCPEnvVar[], timeout_seconds: 30, description: '', shared: false });
+  let mcpForm = $state<MCPServerFormState>(createEmptyMcpForm());
+  let mcpOAuthStatuses = $state<Record<string, MCPOAuthStatus>>({});
   let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : USER_TABS);
   let selectedProviderId = $state('');
@@ -940,6 +975,130 @@ import { onMount, tick } from 'svelte';
         .filter((entry) => entry.key.trim() && entry.value.trim())
         .map((entry) => [entry.key.trim(), entry.type === 'secret' ? `$secret:${entry.value.trim()}` : entry.value.trim()])
     );
+  }
+
+  function createEmptyMcpForm(): MCPServerFormState {
+    return {
+      name: '',
+      transport: 'stdio',
+      command: '',
+      url: '',
+      args: '',
+      envVars: [],
+      headers: [],
+      timeout_seconds: 30,
+      description: '',
+      shared: false,
+      authType: 'none',
+      oauthIssuer: '',
+      oauthAuthorizationServer: '',
+      oauthResource: '',
+      oauthScopes: '',
+      oauthClientId: '',
+      oauthClientSecretRef: '',
+      oauthRedirectUri: '',
+      oauthDynamicClientRegistration: false,
+      oauthClientMetadataDocumentUrl: '',
+      oauthAuthorizationParams: []
+    };
+  }
+
+  function mcpAuthType(config: MCPAuthConfig | null | undefined): MCPAuthType {
+    const type = config?.type;
+    return type === 'static_headers' || type === 'oauth2' ? type : 'none';
+  }
+
+  function mcpFormFromServer(server: MCPServerConfigResponse): MCPServerFormState {
+    const authConfig = server.auth_config;
+    return {
+      ...createEmptyMcpForm(),
+      name: server.name,
+      transport: server.transport,
+      command: server.command || '',
+      url: server.url || '',
+      args: (server.args || []).join('\n'),
+      envVars: parseMcpEntries(server.env || {}),
+      headers: parseMcpEntries(server.headers || {}),
+      timeout_seconds: server.timeout_seconds,
+      description: server.description || '',
+      shared: !!server.shared,
+      authType: mcpAuthType(authConfig),
+      oauthIssuer: authConfig?.issuer || '',
+      oauthAuthorizationServer: authConfig?.authorization_server || '',
+      oauthResource: authConfig?.resource || '',
+      oauthScopes: (authConfig?.scopes || []).join(' '),
+      oauthClientId: authConfig?.client_id || '',
+      oauthClientSecretRef: authConfig?.client_secret_ref?.startsWith('$secret:')
+        ? authConfig.client_secret_ref.slice('$secret:'.length)
+        : authConfig?.client_secret_ref || '',
+      oauthRedirectUri: authConfig?.redirect_uri || '',
+      oauthDynamicClientRegistration: authConfig?.dynamic_client_registration === true,
+      oauthClientMetadataDocumentUrl: authConfig?.client_metadata_document_url || '',
+      oauthAuthorizationParams: parseMcpEntries(authConfig?.authorization_params || {})
+    };
+  }
+
+  function mcpAuthConfigFromForm(): MCPAuthConfig {
+    if (mcpForm.authType !== 'oauth2') {
+      return { type: mcpForm.authType };
+    }
+    const scopes = mcpForm.oauthScopes.split(/\s+/).map((scope) => scope.trim()).filter(Boolean);
+    const clientSecretRef = mcpForm.oauthClientSecretRef.trim();
+    return {
+      type: 'oauth2',
+      issuer: mcpForm.oauthIssuer.trim() || null,
+      authorization_server: mcpForm.oauthAuthorizationServer.trim() || null,
+      resource: mcpForm.oauthResource.trim() || null,
+      scopes,
+      client_id: mcpForm.oauthClientId.trim() || null,
+      client_secret_ref: clientSecretRef
+        ? (clientSecretRef.startsWith('$secret:') ? clientSecretRef : `$secret:${clientSecretRef}`)
+        : null,
+      redirect_uri: mcpForm.oauthRedirectUri.trim() || null,
+      dynamic_client_registration: mcpForm.oauthDynamicClientRegistration,
+      client_metadata_document_url: mcpForm.oauthClientMetadataDocumentUrl.trim() || null,
+      authorization_params: serializeMcpEntries(mcpForm.oauthAuthorizationParams)
+    };
+  }
+
+  async function refreshMcpOAuthStatus(serverId: string): Promise<void> {
+    try {
+      const status = await api.tools.mcpOAuthStatus(serverId);
+      mcpOAuthStatuses = { ...mcpOAuthStatuses, [serverId]: status };
+    } catch {
+      mcpOAuthStatuses = { ...mcpOAuthStatuses, [serverId]: { connected: false, status: 'unavailable' } };
+    }
+  }
+
+  async function startMcpOAuth(server: MCPServerConfigResponse): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      const started = await api.tools.startMcpOAuth(server.server_id);
+      openUrlInNewTab(started.authorization_url);
+      addToast('MCP OAuth authorization opened in a new tab.', 'success');
+      await refreshMcpOAuthStatus(server.server_id);
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to start MCP OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function disconnectMcpOAuth(server: MCPServerConfigResponse): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      await api.tools.disconnectMcpOAuth(server.server_id);
+      await refreshMcpOAuthStatus(server.server_id);
+      addToast('MCP OAuth disconnected.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to disconnect MCP OAuth');
+    } finally {
+      busy = false;
+    }
   }
 
   async function saveSecretFromModal(): Promise<void> {
@@ -3220,10 +3379,11 @@ import { onMount, tick } from 'svelte';
             {#if executorRuntimeSummary(exec)}
               <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-sky-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
             {/if}
-            {#if executorMcpFailureDetails(exec).length > 0}
+            {#if executorDegradedDetails(exec).length > 0}
               <div class="space-y-1 rounded-xl border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
-                {#each executorMcpFailureDetails(exec) as failure}
-                  <p>{failure}</p>
+                <p class="font-medium text-sky-100">Degraded executor details</p>
+                {#each executorDegradedDetails(exec) as detail}
+                  <p>{detail}</p>
                 {/each}
               </div>
             {/if}
@@ -4310,7 +4470,7 @@ import { onMount, tick } from 'svelte';
             </p>
           </div>
           <Button variant="primary" size="sm" onclick={() => {
-            mcpForm = { name: '', transport: 'stdio', command: '', url: '', args: '', envVars: [], headers: [], timeout_seconds: 30, description: '', shared: false };
+            mcpForm = createEmptyMcpForm();
             editingMcpServer = null;
             showMcpForm = true;
           }}>New MCP server</Button>
@@ -4384,6 +4544,87 @@ import { onMount, tick } from 'svelte';
                 onCreateSecret={openMcpSecretModal}
               />
             </div>
+            {#if mcpForm.transport !== 'stdio'}
+              <div class="space-y-4 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+                <div class="grid gap-4 md:grid-cols-2">
+                  <label class="space-y-1 text-sm text-slate-200">
+                    <span>Authentication</span>
+                    <select bind:value={mcpForm.authType} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                      <option value="none">None</option>
+                      <option value="static_headers">Static headers</option>
+                      <option value="oauth2">OAuth 2.1 / MCP authorization</option>
+                    </select>
+                  </label>
+                  <div class="text-xs text-slate-500">
+                    {#if mcpForm.authType === 'oauth2'}
+                      Cognis will open a browser authorization URL when this MCP server needs access and store OAuth tokens encrypted per user.
+                    {:else if mcpForm.authType === 'static_headers'}
+                      Use HTTP headers above for manually managed tokens.
+                    {:else}
+                      No MCP authentication metadata will be configured.
+                    {/if}
+                  </div>
+                </div>
+                {#if mcpForm.authType === 'oauth2'}
+                  <div class="grid gap-4 md:grid-cols-2">
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Resource</span>
+                      <Input bind:value={mcpForm.oauthResource} placeholder="Defaults to MCP server URL" />
+                    </label>
+                    <label class="space-y-1 text-sm text-slate-200">
+                      <span>Scopes</span>
+                      <Input bind:value={mcpForm.oauthScopes} placeholder="Optional space separated scopes" />
+                    </label>
+                  </div>
+                  <details class="rounded-2xl border border-slate-800 bg-slate-900/40 p-4">
+                    <summary class="cursor-pointer text-sm font-semibold text-slate-200">
+                      Advanced OAuth settings
+                    </summary>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Issuer</span>
+                        <Input bind:value={mcpForm.oauthIssuer} placeholder="Discovered automatically when empty" />
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Authorization server</span>
+                        <Input bind:value={mcpForm.oauthAuthorizationServer} placeholder="Optional explicit issuer URL" />
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Client ID</span>
+                        <Input bind:value={mcpForm.oauthClientId} placeholder="Optional static client ID" />
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Client secret reference</span>
+                        <Input bind:value={mcpForm.oauthClientSecretRef} placeholder="secret name or $secret:name" />
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Redirect URI</span>
+                        <Input bind:value={mcpForm.oauthRedirectUri} placeholder="Optional override" />
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>Client metadata document URL</span>
+                        <Input bind:value={mcpForm.oauthClientMetadataDocumentUrl} placeholder="Optional" />
+                      </label>
+                    </div>
+                    <div class="mt-4">
+                      <EnvVarEditor
+                        envVars={mcpForm.oauthAuthorizationParams}
+                        {secrets}
+                        title="Extra authorization parameters"
+                        emptyMessage="No extra authorization parameters configured."
+                        addLabel="Add parameter"
+                        keyPlaceholder="audience"
+                        valuePlaceholder="value"
+                        onChange={(next) => {
+                          mcpForm.oauthAuthorizationParams = next;
+                        }}
+                        onCreateSecret={openMcpSecretModal}
+                      />
+                    </div>
+                  </details>
+                {/if}
+              </div>
+            {/if}
             <label class="space-y-1 text-sm text-slate-200">
               <span>Description</span>
               <Input bind:value={mcpForm.description} placeholder="Optional description" />
@@ -4404,6 +4645,7 @@ import { onMount, tick } from 'svelte';
                       args: mcpForm.transport === 'stdio' ? args : [],
                       env: mcpForm.transport === 'stdio' ? env : {},
                       headers: mcpForm.transport !== 'stdio' ? headers : {},
+                      auth_config: mcpForm.transport !== 'stdio' ? mcpAuthConfigFromForm() : { type: 'none' },
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || null,
                       shared: isAdmin ? mcpForm.shared : false,
@@ -4417,6 +4659,7 @@ import { onMount, tick } from 'svelte';
                       args: mcpForm.transport === 'stdio' ? args : [],
                       env: mcpForm.transport === 'stdio' ? env : {},
                       headers: mcpForm.transport !== 'stdio' ? headers : {},
+                      auth_config: mcpForm.transport !== 'stdio' ? mcpAuthConfigFromForm() : { type: 'none' },
                       timeout_seconds: mcpForm.timeout_seconds,
                       description: mcpForm.description || undefined,
                       shared: isAdmin ? mcpForm.shared : false,
@@ -4447,18 +4690,7 @@ import { onMount, tick } from 'svelte';
                 {#if canManageMcp}
                 <Button variant="secondary" size="sm" onclick={() => {
                   editingMcpServer = srv;
-                  mcpForm = {
-                    name: srv.name,
-                    transport: srv.transport,
-                    command: srv.command || '',
-                    url: srv.url || '',
-                    args: (srv.args || []).join('\n'),
-                    envVars: parseMcpEntries(srv.env || {}),
-                    headers: parseMcpEntries(srv.headers || {}),
-                    timeout_seconds: srv.timeout_seconds,
-                    description: srv.description || '',
-                    shared: !!srv.shared,
-                  };
+                  mcpForm = mcpFormFromServer(srv);
                   showMcpForm = true;
                 }}>Edit</Button>
                 <Button variant="danger" size="sm" onclick={async () => {
@@ -4481,6 +4713,28 @@ import { onMount, tick } from 'svelte';
             {/if}
             {#if srv.description}
               <p class="text-sm text-slate-400">{srv.description}</p>
+            {/if}
+            {#if srv.auth_config?.type === 'oauth2'}
+              {@const oauthStatus = mcpOAuthStatuses[srv.server_id]}
+              <div class="rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p class="font-medium">OAuth authorization</p>
+                    <p class="text-xs text-sky-100/80">
+                      {oauthStatus
+                        ? (oauthStatus.connected ? `Connected${oauthStatus.expires_at ? ` until ${new Date(oauthStatus.expires_at).toLocaleString()}` : ''}` : `Not connected${oauthStatus.status ? ` (${oauthStatus.status})` : ''}`)
+                        : 'Status not loaded'}
+                    </p>
+                  </div>
+                  <div class="flex gap-2">
+                    <Button variant="secondary" size="sm" onclick={() => refreshMcpOAuthStatus(srv.server_id)}>Check</Button>
+                    <Button variant="primary" size="sm" onclick={() => startMcpOAuth(srv)}>Authorize</Button>
+                    {#if oauthStatus?.connected}
+                      <Button variant="secondary" size="sm" onclick={() => disconnectMcpOAuth(srv)}>Disconnect</Button>
+                    {/if}
+                  </div>
+                </div>
+              </div>
             {/if}
             {#if srv.invalid_reason}
               <p class="text-sm text-sky-300">{srv.invalid_reason}</p>

@@ -282,6 +282,13 @@ CREATE_TASK_TOOL = ToolDefinition(
                     "requested fully autonomous execution; otherwise omit to use the workflow default."
                 ),
             },
+            "session_policy": {
+                "type": "object",
+                "description": (
+                    "Optional Intaris session policy with allow_policies and deny_policies. "
+                    "Prefer plain English strings for policy entries."
+                ),
+            },
         },
         "required": ["title", "description"],
     },
@@ -403,6 +410,13 @@ UPDATE_TASK_TOOL = ToolDefinition(
             "project_id": {
                 "type": "string",
                 "description": "Optional project ID. Only use when there is an exact project match.",
+            },
+            "session_policy": {
+                "type": "object",
+                "description": (
+                    "Optional replacement Intaris session policy with allow_policies "
+                    "and deny_policies."
+                ),
             },
         },
         "required": ["task_id"],
@@ -787,6 +801,10 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                         "enum": ["none", "explicit_gates", "step_requests"],
                         "description": "Optional interaction policy for tasks created by this schedule. Defaults to none for scheduled tasks.",
                     },
+                    "session_policy": {
+                        "type": "object",
+                        "description": "Optional Intaris session policy for tasks created by this schedule.",
+                    },
                 },
                 "required": ["schedule_type"],
             },
@@ -816,6 +834,10 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                 "type": "string",
                 "enum": ["none", "explicit_gates", "step_requests"],
                 "description": "Optional interaction policy for the created task. Omit to use the workflow default; use none only for fully autonomous work.",
+            },
+            "session_policy": {
+                "type": "object",
+                "description": "Optional Intaris session policy with allow_policies and deny_policies.",
             },
             "persist": {"type": "boolean", "default": False},
             "agent_id": {

@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { DelegationTimelineItem, TodoSnapshotItem } from '$lib/chat';
+  import type { DelegationTimelineItem } from '$lib/chat';
+  import { visibleTodos as activeVisibleTodos } from '$lib/todos';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import Button from '$lib/components/ui/Button.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
@@ -23,11 +24,7 @@
   let isSessionDelegation = $derived(item.taskId.startsWith('sess_'));
   let cardLabel = $derived(isTaskDelegation ? 'Task' : 'Delegation');
   let agentLabel = $derived(item.usedAgentId ?? item.agentId ?? null);
-  function activeTodos(todos: TodoSnapshotItem[] | undefined): TodoSnapshotItem[] {
-    return (todos ?? []).filter((todo) => todo.status !== 'cancelled');
-  }
-
-  let visibleTodos = $derived(activeTodos(item.todos));
+  let visibleTodos = $derived(activeVisibleTodos(item.todos));
   let showTodos = $derived(visibleTodos.length > 0);
 </script>
 

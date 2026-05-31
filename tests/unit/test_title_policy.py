@@ -35,6 +35,14 @@ def test_manual_and_channel_titles_are_protected() -> None:
     )
 
 
+def test_blank_agent_direct_title_can_adopt_intaris_title() -> None:
+    assert can_adopt_intaris_title(_conversation(title_source="agent_direct")) is True
+    assert (
+        can_adopt_intaris_title(_conversation(title="Existing title", title_source="agent_direct"))
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_sync_intaris_title_updates_only_unprotected_conversations(
     monkeypatch: pytest.MonkeyPatch,
@@ -147,7 +155,7 @@ async def test_turn_scheduler_reloads_persisted_title_for_change_detection(
         assert conversation_id == "conv-1"
         return _Row()
 
-    monkeypatch.setattr("cognis.core.turn_scheduler.get_conversation", _get_conversation)
+    monkeypatch.setattr("cognis.core.turn_scheduler.queries.get_conversation", _get_conversation)
 
     scheduler = cast(Any, TurnScheduler.__new__(TurnScheduler))
     scheduler._session_factory = _Factory()

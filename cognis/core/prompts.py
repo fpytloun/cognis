@@ -42,7 +42,8 @@ class PromptContext(Enum):
 
 _CRITICAL_RULES = """\
 - IMPORTANT: If the task names a skill shown in <available_skills>, call \
-skill_load for that skill before any other discovery or tool exploration.
+skill_load for that skill before any other discovery or tool exploration \
+unless the skill is already marked as loaded.
 - IMPORTANT: Never invent placeholder identifiers. Values like "noop", \
 "dummy", "invalid", "example", "...", or bare URLs where an ID is expected \
 are always wrong. Use real IDs returned by prior tool calls, or discover \
@@ -208,10 +209,14 @@ Always specify `agent_id`:
 - `system:explore` for any non-trivial codebase exploration, tracing, \
   or "where is X implemented" questions. Anything requiring more than \
   2-3 file reads should go here. \
-  Call shape: `delegate(agent_id='system:explore', wait=True, task='...')`. \
-  Run multiple calls in parallel for broad explorations.
+  Split independent read-only questions into multiple delegate calls for \
+  broad explorations. Use `wait=true` only when this turn must join the \
+  results before replying; use `wait=false` only when explicit context or \
+  the user asks for background/asynchronous work.
 - `system:research` for external research or multi-source comparison. \
-  Call shape: `delegate(agent_id='system:research', wait=True, task='...')`.
+  Use `wait=true` only when this turn must join the results before replying; \
+  use `wait=false` only when explicit context or the user asks for \
+  background/asynchronous work.
 - `system:code-review` for findings-first code review.
 - `system:architect` for architecture critique and design review.
 - `system:implement` for focused implementation work.
@@ -253,13 +258,9 @@ Use `wait=true` when:
 - you are joining multiple delegated results in the same turn
 - the next decision depends on the delegated result
 
-Use `wait=false` when:
-- the work may take time
-- it is desirable not to block the current conversation
-- the delegated work can finish independently and report back later
-
-With `wait=false`, the conversation remains responsive and you will be \
-notified when the sub-session finishes.
+Use `wait=false` only when explicit context or the user asks for \
+background/asynchronous work and the delegated work can finish independently \
+and report back later.
 
 ### Rules
 - Do not keep non-trivial work inline just to avoid delegation.
@@ -267,6 +268,19 @@ notified when the sub-session finishes.
   generic implementation. If you are about to read or grep more than a \
   handful of files to investigate something, delegate to `system:explore` \
   instead.
+- For broad read-only exploration or research, split independent questions \
+  into multiple delegate calls when useful. Use multiple `wait=true` calls \
+  when this turn must synthesize the results before replying. Use \
+  `wait=false` only when explicit context or the user asks for \
+  background/asynchronous work.
+- For substantial implementation that can be split into independent, \
+  non-conflicting slices, prefer `create_task` for structured background \
+  execution. Use `wait=true` implementation delegation only for bounded work \
+  whose result must be integrated immediately in this turn; use \
+  `delegate(wait=false)` only when explicit context or the user asks for \
+  background/asynchronous work.
+- Do not try to fan out from secondary or delegated sub-sessions. They may \
+  be unable or forbidden to delegate further; that is expected.
 - For software engineering work, inspect the relevant code first, prefer the \
   smallest correct change, and update docs only when directly affected.
 - If the user asks for a review, prioritize findings first: bugs, risks, \
@@ -277,7 +291,9 @@ notified when the sub-session finishes.
 - Do not use `wait=true` by default. Use it only when the current turn \
   cannot continue without the delegated result.
 - Multiple `delegate(wait=true)` calls run in parallel — use this only for \
-  independent sub-problems you must join before replying.
+  independent sub-problems you must join before replying. Use async \
+  delegation only when explicit context or the user asks for \
+  background/asynchronous work.
 - When you delegate, tell the user what you're doing and that they can \
   continue chatting.
 
@@ -314,12 +330,17 @@ current throughout the step.
 your work in real time. The deliverable (if required) is the canonical \
 user-facing artifact, but assistant text alongside tool calls is the way \
 to keep the user in the loop while the step runs.
-- For non-trivial codebase exploration in this step use \
-`delegate(agent_id='system:explore', wait=True, task='...')` rather than \
-reading many files directly. The sub-session runs with a slim read-only \
-prompt and returns a focused report, keeping your context budget free for \
-synthesis. Run multiple `delegate(wait=True)` calls in one turn for \
-parallel broad explorations.
+- Workflow steps are execution contexts, not live/main chat. Do not use \
+`delegate(wait=false)` from a workflow step; if the work is too large for \
+the current step, report the decomposition or blocking issue according to \
+the workflow rather than spawning detached asynchronous work.
+- When this step is running as an orchestrating/primary step and `delegate` \
+is available, use `delegate(agent_id='system:explore', wait=True, \
+task='...')` for non-trivial codebase exploration rather than reading many \
+files directly. The sub-session runs with a slim read-only prompt and \
+returns a focused report, keeping your context budget free for synthesis. \
+Run multiple `delegate(wait=True)` calls in one turn for parallel broad \
+explorations that must be joined before completing the step.
 - When finished, write normal final/progress text as appropriate. If the step \
  requires a deliverable, call `write_deliverable` with the canonical \
  user-facing artifact before `step_complete`. Then call `step_complete` with \
@@ -365,8 +386,9 @@ summary or outcome. It is not required — your final text is sufficient.
 reports, generated files) that benefit from structured delivery.
 - Do not continue calling tools once you have enough to write the result. \
 If all todos are terminal and nothing remains, write the result now.
-- Delegate further only if the task genuinely requires it — prefer doing \
-the work directly."""
+- Do not delegate further. Secondary sub-sessions should complete the \
+assigned work directly; if the task is too broad, report the limitation in \
+the result."""
 
 _FOLLOW_UP_INTEGRATE = """\
 ## Follow-up integration

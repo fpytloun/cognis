@@ -74,6 +74,22 @@ FP_EXCLUSION_KEYS: dict[str, str] = {
 
 
 @dataclass
+class BrowserSessionSettings:
+    auto_consent: str
+    stealth_enabled: bool
+    fingerprint_hardening: bool
+    humanize_input: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "auto_consent": self.auto_consent,
+            "stealth_enabled": self.stealth_enabled,
+            "fingerprint_hardening": self.fingerprint_hardening,
+            "humanize_input": self.humanize_input,
+        }
+
+
+@dataclass
 class BrowserSession:
     session_id: str
     context: Any
@@ -93,6 +109,7 @@ class BrowserSession:
     lifecycle: str = "explicit"
     idle_timeout_seconds: float | None = None
     runtime_generation: int = 0
+    browser_settings: BrowserSessionSettings | None = None
 
 
 class BrowserManager:
@@ -249,6 +266,7 @@ class BrowserManager:
         for session in self._sessions.values():
             if self._session_is_idle(session):
                 continue
+            session_settings = getattr(session, "browser_settings", None)
             sessions.append(
                 {
                     "session_id": session.session_id,
@@ -263,6 +281,9 @@ class BrowserManager:
                     "auth_origin": session.auth_origin,
                     "console_event_count": len(getattr(session, "console_events", [])),
                     "network_event_count": len(getattr(session, "network_events", [])),
+                    "browser_settings": session_settings.as_dict()
+                    if session_settings is not None
+                    else None,
                 }
             )
         return sessions
@@ -313,14 +334,21 @@ class BrowserManager:
         navigation_timeout_seconds: float | None = None,
         wait_until: str | None = None,
         network_idle_after_dom_seconds: float | None = None,
+        browser_settings: dict[str, Any] | None = None,
     ) -> BrowserSession:
         self._ensure_idle_reaper()
         await self._cleanup_idle_sessions()
+        resolved_settings = self._resolve_session_settings(browser_settings)
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is not None and not self._session_is_idle(session):
                 session.last_used_at = datetime.now(UTC)
         if session is not None and not self._session_is_idle(session):
+            self._ensure_session_settings_compatible(
+                session,
+                requested=browser_settings,
+                resolved=resolved_settings,
+            )
             await self._goto(
                 session.page,
                 url,
@@ -354,6 +382,7 @@ class BrowserManager:
                     headless=headless,
                     auth_state=auth_state,
                     profile_id=resolved_profile_id,
+                    settings=resolved_settings,
                 )
                 session = BrowserSession(
                     session_id=session_id,
@@ -368,6 +397,7 @@ class BrowserManager:
                     lifecycle=self._normalize_lifecycle(lifecycle),
                     idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
+                    browser_settings=resolved_settings,
                 )
                 try:
                     async with self._lock:
@@ -400,8 +430,10 @@ class BrowserManager:
                     headless, self._runtime_generation
                 )
                 display = self._active_display(headless=headless)
-                context = await browser.new_context(**self._context_kwargs(auth_state=auth_state))
-                await self._apply_context_defaults(context)
+                context = await browser.new_context(
+                    **self._context_kwargs(auth_state=auth_state, settings=resolved_settings)
+                )
+                await self._apply_context_defaults(context, settings=resolved_settings)
                 page = await context.new_page()
                 session = BrowserSession(
                     session_id=session_id,
@@ -415,6 +447,7 @@ class BrowserManager:
                     lifecycle=self._normalize_lifecycle(lifecycle),
                     idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
+                    browser_settings=resolved_settings,
                 )
                 try:
                     async with self._lock:
@@ -522,7 +555,8 @@ class BrowserManager:
 
     async def storage_state(self, session_id: str) -> dict[str, Any]:
         session = await self.get_live_session(session_id)
-        return await session.context.storage_state()
+        state: dict[str, Any] = await session.context.storage_state()
+        return state
 
     async def get_console_events(
         self, session_id: str, *, level: str = "all", limit: int = 100
@@ -627,7 +661,7 @@ class BrowserManager:
         if last_used_at is None:
             return False
         cutoff = datetime.now(UTC).timestamp() - timeout_seconds
-        return last_used_at.timestamp() < cutoff
+        return bool(last_used_at.timestamp() < cutoff)
 
     def _session_idle_timeout_seconds(self, session: BrowserSession | Any) -> float:
         configured = getattr(session, "idle_timeout_seconds", None)
@@ -645,6 +679,42 @@ class BrowserManager:
         return datetime.fromtimestamp(
             last_used_at.timestamp() + timeout_seconds, tz=UTC
         ).isoformat()
+
+    def _resolve_session_settings(
+        self, overrides: dict[str, Any] | None = None
+    ) -> BrowserSessionSettings:
+        overrides = overrides or {}
+        auto_consent = str(overrides.get("auto_consent", self.auto_consent)).strip().lower()
+        if auto_consent not in SUPPORTED_AUTO_CONSENT_ACTIONS:
+            raise ValueError(
+                f"Unsupported browser_settings.auto_consent: {auto_consent!r}. "
+                f"Expected one of {', '.join(SUPPORTED_AUTO_CONSENT_ACTIONS)}."
+            )
+        return BrowserSessionSettings(
+            auto_consent=auto_consent,
+            stealth_enabled=bool(overrides.get("stealth_enabled", self.stealth_enabled)),
+            fingerprint_hardening=bool(
+                overrides.get("fingerprint_hardening", self.fingerprint_hardening)
+            ),
+            humanize_input=bool(overrides.get("humanize_input", self.humanize_input)),
+        )
+
+    def _ensure_session_settings_compatible(
+        self,
+        session: BrowserSession,
+        *,
+        requested: dict[str, Any] | None,
+        resolved: BrowserSessionSettings,
+    ) -> None:
+        if not requested:
+            return
+        current = session.browser_settings or self._resolve_session_settings()
+        if current == resolved:
+            return
+        raise ValueError(
+            "browser_settings cannot be changed for an existing browser session; "
+            "use a new session_id or close and reopen the session"
+        )
 
     def _ensure_idle_reaper(self) -> None:
         if self._idle_reaper_task is not None and not self._idle_reaper_task.done():
@@ -953,17 +1023,23 @@ class BrowserManager:
             kwargs["channel"] = self.channel
         return kwargs
 
-    def _context_kwargs(self, *, auth_state: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _context_kwargs(
+        self,
+        *,
+        auth_state: dict[str, Any] | None = None,
+        settings: BrowserSessionSettings | None = None,
+    ) -> dict[str, Any]:
+        settings = settings or self._resolve_session_settings()
         kwargs: dict[str, Any] = {
             "viewport": {"width": self.viewport_width, "height": self.viewport_height},
             "locale": self.locale,
         }
         timezone_id = self.timezone_id or (
-            self.default_timezone_id if self.stealth_enabled else None
+            self.default_timezone_id if settings.stealth_enabled else None
         )
         if timezone_id:
             kwargs["timezone_id"] = timezone_id
-        if self.stealth_enabled:
+        if settings.stealth_enabled:
             if self.realistic_user_agent:
                 kwargs["user_agent"] = BROWSER_DEFAULT_USER_AGENT
             if self.default_accept_language:
@@ -974,14 +1050,15 @@ class BrowserManager:
             kwargs["storage_state"] = auth_state
         return kwargs
 
-    def _build_stealth(self) -> Any | None:
+    def _build_stealth(self, *, settings: BrowserSessionSettings | None = None) -> Any | None:
         """Construct (and cache) the ``Stealth`` runner for this manager.
 
         Returns ``None`` when stealth is disabled or the optional dependency
         is not importable. Per-evasion exclusion list is applied by setting
         the matching ``Stealth`` boolean to ``False``.
         """
-        if not self.stealth_enabled:
+        settings = settings or self._resolve_session_settings()
+        if not settings.stealth_enabled:
             return None
         if self._stealth is not None:
             return self._stealth
@@ -1029,8 +1106,15 @@ class BrowserManager:
         )
         self._patchright_persistent_warning_emitted = True
 
-    async def _apply_context_defaults(self, context: Any, *, profile_id: str | None = None) -> None:
-        stealth = self._build_stealth()
+    async def _apply_context_defaults(
+        self,
+        context: Any,
+        *,
+        profile_id: str | None = None,
+        settings: BrowserSessionSettings | None = None,
+    ) -> None:
+        settings = settings or self._resolve_session_settings()
+        stealth = self._build_stealth(settings=settings)
         if stealth is not None:
             try:
                 await stealth.apply_stealth_async(context)
@@ -1039,19 +1123,27 @@ class BrowserManager:
                     "browser: failed to apply stealth to context (%s); continuing without",
                     type(exc).__name__,
                 )
-        await self._apply_autoconsent_init_script(context, profile_id=profile_id)
-        await self._apply_fingerprint_hardening_init_scripts(context, profile_id=profile_id)
+        await self._apply_autoconsent_init_script(context, profile_id=profile_id, settings=settings)
+        await self._apply_fingerprint_hardening_init_scripts(
+            context, profile_id=profile_id, settings=settings
+        )
 
     async def _apply_autoconsent_init_script(
-        self, context: Any, *, profile_id: str | None = None
+        self,
+        context: Any,
+        *,
+        profile_id: str | None = None,
+        settings: BrowserSessionSettings | None = None,
     ) -> None:
-        if self.auto_consent == "off":
+        del profile_id
+        settings = settings or self._resolve_session_settings()
+        if settings.auto_consent == "off":
             return
         bundle = load_asset(_AUTOCONSENT_ASSET)
         if bundle is None:
             return
         config = {
-            "action": self.auto_consent,
+            "action": settings.auto_consent,
             "delayMs": self.auto_consent_delay_ms,
             "disabledHosts": self.auto_consent_disabled_domains,
         }
@@ -1065,9 +1157,14 @@ class BrowserManager:
             )
 
     async def _apply_fingerprint_hardening_init_scripts(
-        self, context: Any, *, profile_id: str | None = None
+        self,
+        context: Any,
+        *,
+        profile_id: str | None = None,
+        settings: BrowserSessionSettings | None = None,
     ) -> None:
-        if not self.fingerprint_hardening:
+        settings = settings or self._resolve_session_settings()
+        if not settings.fingerprint_hardening:
             return
         # Per-profile deterministic seed so re-visits to the same site see a
         # consistent fingerprint. Persistent profile sessions take precedence;
@@ -1107,8 +1204,10 @@ class BrowserManager:
         headless: bool,
         auth_state: dict[str, Any] | None,
         profile_id: str | None,
+        settings: BrowserSessionSettings | None = None,
     ) -> tuple[Any, Any, Path, str | None, int]:
         user_data_dir = self.profile_base_dir / str(profile_id)
+        settings = settings or self._resolve_session_settings()
         user_data_dir.mkdir(parents=True, exist_ok=True)
         retry_count = 0
         while True:
@@ -1121,7 +1220,7 @@ class BrowserManager:
                 context = await browser_launcher.launch_persistent_context(
                     str(user_data_dir),
                     **launch_kwargs,
-                    **self._context_kwargs(),
+                    **self._context_kwargs(settings=settings),
                 )
                 break
             except Exception as exc:
@@ -1142,7 +1241,7 @@ class BrowserManager:
                         headless=headless,
                         retry_count=retry_count,
                     )
-        await self._apply_context_defaults(context, profile_id=profile_id)
+        await self._apply_context_defaults(context, profile_id=profile_id, settings=settings)
         if auth_state and isinstance(auth_state.get("cookies"), list):
             await context.add_cookies(auth_state["cookies"])
         page = context.pages[0] if context.pages else await context.new_page()

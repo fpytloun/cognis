@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import type { TodoSnapshotItem } from '$lib/chat';
+  import type { TodoSnapshotItem } from '$lib/todos';
+  import { summarizeTodoProgress, visibleTodos as activeVisibleTodos } from '$lib/todos';
 
   let {
     todos,
@@ -22,30 +23,13 @@
   let open = $state(false);
   let root = $state<HTMLSpanElement | null>(null);
   let panelStyle = $state('');
-  const visibleTodos = $derived.by(() => todos.filter((todo: TodoSnapshotItem) => todo.status !== 'cancelled'));
-  const progress = $derived.by(() => summarizeTodos(todos));
+  const visibleTodos = $derived.by(() => activeVisibleTodos(todos));
+  const progress = $derived.by(() => summarizeTodoProgress(todos));
   const dimensionClass = $derived(size === 'sm' ? 'h-4 w-4' : 'h-5 w-5');
   const statusTitle = $derived(progress.total > 0
     ? `${Math.round(progress.progress * 100)}% (${progress.completed}/${progress.total}) done`
     : 'No active todos'
   );
-
-  function summarizeTodos(items: TodoSnapshotItem[]): {
-    total: number;
-    completed: number;
-    progress: number;
-  } {
-    const activeTodos = items.filter((todo) => todo.status !== 'cancelled');
-    const total = activeTodos.length;
-    const completed = activeTodos.filter((todo) => todo.status === 'completed').length;
-    const inProgress = activeTodos.filter((todo) => todo.status === 'in_progress').length;
-    const weightedDone = completed + inProgress * 0.5;
-    return {
-      total,
-      completed,
-      progress: total > 0 ? Math.max(0, Math.min(weightedDone / total, 1)) : 0
-    };
-  }
 
   function donutDashOffset(progressValue: number): number {
     return DONUT_CIRCUMFERENCE * (1 - Math.max(0, Math.min(progressValue, 1)));

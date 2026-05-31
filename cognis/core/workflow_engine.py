@@ -58,6 +58,7 @@ from cognis.models.workflow import (
     StepOutput,
     Workflow,
     WorkflowState,
+    merge_session_policies,
     resolve_effective_input,
     resolve_source_names,
 )
@@ -70,6 +71,7 @@ from cognis.runtime_context import (
 from cognis.store.queries import (
     create_step_run,
     fail_running_step_runs_for_task,
+    get_agent_direct_conversation,
     get_conversation,
     get_conversation_channel_route,
     get_deliverable,
@@ -83,6 +85,7 @@ from cognis.store.queries import (
     list_project_sources,
     list_project_workflow_ids,
     list_step_runs_for_task,
+    mark_conversation_unread,
     update_deliverable_status,
     update_step_run,
     update_task_status,
@@ -135,6 +138,15 @@ def _resolve_task_execution_paths(
         working_directory=task.working_directory,
         executor_home=executor_home,
         executor_cwd=executor_cwd,
+    )
+
+
+def _effective_task_session_policy(task: TaskModel, workflow: Workflow | None) -> dict[str, Any]:
+    """Return the merged workflow-default and task session policy."""
+
+    return merge_session_policies(
+        getattr(getattr(workflow, "defaults", None), "session_policy", None),
+        getattr(task, "session_policy", None),
     )
 
 
@@ -221,6 +233,7 @@ class WorkflowEngine:
         on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
+        on_tool_progress: Any | None = None,
         on_tool_output_chunk: ToolOutputChunkCallback | None = None,
         cancel_event: asyncio.Event | None = None,
         bootstrap_wait_for_intention: bool = False,
@@ -241,9 +254,13 @@ class WorkflowEngine:
             agent_type=agent.agent_type,
             session_id=getattr(session, "session_id", None),
             conversation_id=conversation.conversation_id,
+            task_id=None,
+            step_name=None,
+            step_run_id=None,
             parent_session_id=getattr(session, "parent_session_id", None),
             delegation_mode=getattr(session, "delegation_mode", None),
             workflow_step=False,
+            interaction_mode="step_requests",
         )
         runtime = await self._resolve_step_runtime(
             agent=agent,
@@ -320,6 +337,7 @@ class WorkflowEngine:
                     on_thinking=on_thinking,
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
+                    on_tool_progress=on_tool_progress,
                     on_tool_output_chunk=on_tool_output_chunk,
                 )
         finally:
@@ -690,15 +708,14 @@ class WorkflowEngine:
             elif state.status == "failed" or state.skipped_steps:
                 state.status = "failed"
                 task.status = TaskStatus.FAILED
+                failure_summary = self._build_failure_result_summary(state, workflow)
                 if state.skipped_steps:
                     skipped = ", ".join(state.skipped_steps)
                     task.result_summary = (
                         f"Workflow failed: steps skipped after exhausting retries ({skipped})"
                     )
                 else:
-                    task.result_summary = (
-                        self._build_result_summary(state, workflow) or "Workflow failed"
-                    )
+                    task.result_summary = failure_summary or "Workflow failed"
                 task.completed_at = datetime.now(UTC)
             else:
                 state.status = "completed"
@@ -844,12 +861,15 @@ class WorkflowEngine:
             has_prior_run = await self._has_prior_step_session(task, step_def)
 
         seeded_from_prior = False
+        session_policy = _effective_task_session_policy(task, workflow)
         if is_retry or has_prior_run:
             conversation, session, seeded_from_prior = await self._reuse_or_create_step_session(
-                task, step_def, agent
+                task, step_def, agent, session_policy=session_policy
             )
         else:
-            conversation, session = await self._create_step_session(task, step_def, agent)
+            conversation, session = await self._create_step_session(
+                task, step_def, agent, session_policy=session_policy
+            )
 
         # For type="full" input, fork the source step's events into the new
         # session so the conversation appears as natural history.  Skipped on
@@ -926,18 +946,24 @@ class WorkflowEngine:
         # Resolve tool registry and executor for this step.
         try:
             executor_agent = self._executor_agent_for_step(primary_agent, agent)
+            interaction_mode = task.interaction_mode_override or workflow.interaction.mode
             access_context = RuntimeAccessContext(
                 user_email=task.created_by,
-                agent_id=agent.agent_id,
-                agent_owner_email=agent.owner_email,
-                agent_type=agent.agent_type,
+                agent_id=executor_agent.agent_id,
+                agent_owner_email=executor_agent.owner_email,
+                agent_type=executor_agent.agent_type,
                 session_id=session.session_id,
                 conversation_id=getattr(conversation, "conversation_id", None)
                 if conversation is not None
                 else None,
+                task_id=task.task_id,
+                step_name=step_def.name,
+                step_run_id=step_run_id,
                 parent_session_id=session.parent_session_id,
                 delegation_mode=session.delegation_mode,
                 workflow_step=True,
+                interaction_mode=interaction_mode,
+                session_policy=session_policy,
             )
             runtime_workspace_root, runtime_working_directory = _resolve_task_execution_paths(task)
             with scoped_runtime_context(
@@ -1031,8 +1057,6 @@ class WorkflowEngine:
 
         project_context = await self._build_project_context(task)
 
-        interaction_mode = task.interaction_mode_override or workflow.interaction.mode
-
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
@@ -1056,6 +1080,7 @@ class WorkflowEngine:
             user_message=step_def.prompt.replace("{user_message}", task.description or task.title),
             prior_context=prior_context,
             interaction_mode=interaction_mode,
+            session_policy=session_policy,
             tool_registry=runtime.tool_registry,
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
@@ -1100,12 +1125,30 @@ class WorkflowEngine:
                     provider_block_index=provider_block_index,
                 )
 
+        async def on_tool_progress(
+            call_id: str,
+            tool_name: str,
+            progress: dict[str, Any],
+        ) -> None:
+            if on_progress is not None:
+                phase = str(progress.get("phase") or "preparing_input")
+                input_lines = progress.get("input_lines")
+                input_chars = progress.get("input_chars")
+                if tool_name == "apply_patch" and phase == "preparing_input":
+                    details: list[str] = []
+                    if isinstance(input_lines, int) and input_lines > 0:
+                        details.append(f"{input_lines:,} lines")
+                    if isinstance(input_chars, int) and input_chars > 0:
+                        details.append(f"{input_chars:,} chars")
+                    suffix = f" ({', '.join(details)})" if details else ""
+                    await on_progress(f"\n\nPreparing apply_patch input{suffix}…")
+
         # Run agent loop
         try:
             with scoped_runtime_context(
                 user_email=session.user_email,
-                agent_id=agent.agent_id,
-                agent_owner_email=agent.owner_email,
+                agent_id=executor_agent.agent_id,
+                agent_owner_email=executor_agent.owner_email,
                 workspace_root=ctx.workspace_root,
                 effective_working_directory=ctx.working_directory,
                 executor_environment=runtime.executor_environment,
@@ -1116,6 +1159,7 @@ class WorkflowEngine:
                     ctx,
                     on_token=on_progress,
                     on_thinking=on_thinking,
+                    on_tool_progress=on_tool_progress,
                 )
         except StepInterrupted:
             current_status = await self._read_task_status(task.task_id)
@@ -2113,26 +2157,7 @@ class WorkflowEngine:
             )
             return
 
-        if applied_mode == "direct":
-            delivery_mode = task.delivery.mode
-            target_conversation_id = await self._resolve_task_delivery_conversation(task)
-            if target_conversation_id is None:
-                logger.warning(
-                    "task_delivery: explicit direct completion has no resolved target, skipping",
-                    extra={"extra_data": {"task_id": task.task_id, "delivery_mode": delivery_mode}},
-                )
-                return
-            await self._deliver_task_result_direct(task, target_conversation_id)
-            return
-
         delivery_mode = task.delivery.mode
-        if delivery_mode == "silent":
-            logger.info(
-                "task_delivery: legacy silent delivery mode, skipping",
-                extra={"extra_data": {"task_id": task.task_id}},
-            )
-            return
-
         target_conversation_id = await self._resolve_task_delivery_conversation(task)
 
         if target_conversation_id is None:
@@ -2145,6 +2170,34 @@ class WorkflowEngine:
                         "source_ref": task.source_ref,
                     }
                 },
+            )
+            return
+
+        async with self._session_factory() as db_session:
+            target_conversation = await get_conversation(db_session, target_conversation_id)
+
+        if (
+            applied_mode == "direct"
+            and target_conversation
+            and target_conversation.context_type != "web"
+        ):
+            await self._deliver_task_result_direct(task, target_conversation_id)
+            return
+        if applied_mode == "direct":
+            logger.info(
+                "task_delivery: using default web follow-up for direct completion",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "target_conversation_id": target_conversation_id,
+                    }
+                },
+            )
+
+        if delivery_mode == "silent":
+            logger.info(
+                "task_delivery: legacy silent delivery mode, skipping",
+                extra={"extra_data": {"task_id": task.task_id}},
             )
             return
 
@@ -2189,29 +2242,43 @@ class WorkflowEngine:
                 user_email=task.created_by,
                 agent_id=task.agent_id,
             )
-            if account is None:
-                return None
-            if account.default_conversation_id:
-                conversation = await get_conversation(db_session, account.default_conversation_id)
-                route = await get_conversation_channel_route(
-                    db_session, account.default_conversation_id
+            if account is not None:
+                if account.default_conversation_id:
+                    conversation = await get_conversation(
+                        db_session, account.default_conversation_id
+                    )
+                    route = await get_conversation_channel_route(
+                        db_session, account.default_conversation_id
+                    )
+                    if (
+                        conversation is not None
+                        and conversation.status == "active"
+                        and conversation.user_email == task.created_by
+                        and conversation.agent_id == task.agent_id
+                        and route is not None
+                        and route[1] == account.account_id
+                    ):
+                        return conversation.conversation_id
+                latest = await get_latest_active_conversation_for_channel_account(
+                    db_session,
+                    user_email=task.created_by,
+                    agent_id=task.agent_id,
+                    account_id=account.account_id,
                 )
-                if (
-                    conversation is not None
-                    and conversation.status == "active"
-                    and conversation.user_email == task.created_by
-                    and conversation.agent_id == task.agent_id
-                    and route is not None
-                    and route[1] == account.account_id
-                ):
-                    return conversation.conversation_id
-            latest = await get_latest_active_conversation_for_channel_account(
-                db_session,
+                if latest is not None:
+                    return latest.conversation_id
+
+            direct = await get_agent_direct_conversation(db_session, task.created_by, task.agent_id)
+            if direct is not None:
+                return direct.conversation_id
+
+        if hasattr(self._session_manager, "get_or_create_agent_direct_conversation"):
+            direct_model = await self._session_manager.get_or_create_agent_direct_conversation(
                 user_email=task.created_by,
                 agent_id=task.agent_id,
-                account_id=account.account_id,
             )
-            return latest.conversation_id if latest is not None else None
+            return direct_model.conversation_id
+        return None
 
     async def _deliver_task_result_direct(
         self, task: TaskModel, target_conversation_id: str
@@ -2453,6 +2520,10 @@ class WorkflowEngine:
                     )
 
         # Publish events for WebSocket delivery and follow-up turn
+        async with self._session_factory() as db_session:
+            await mark_conversation_unread(db_session, target_conversation_id)
+            await db_session.commit()
+
         logger.info(
             "task_delivery: publishing EventBus events",
             extra={
@@ -2482,13 +2553,8 @@ class WorkflowEngine:
                 if route is not None:
                     channel_type, account_id, chat_id, thread_id, user_email = route
                     delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
-                    delivery_fallback_text = final_content or {
-                        TaskStatus.COMPLETED: "Background work completed. I could not deliver the detailed reply, so please open the conversation for the full result.",
-                        TaskStatus.FAILED: "Background work failed. I could not deliver the detailed reply, so please open the conversation for details.",
-                        TaskStatus.CANCELLED: "Background work was cancelled. I could not deliver the detailed reply, so please open the conversation for details.",
-                    }.get(
-                        task.status,
-                        "Background work status changed. Please open the conversation for details.",
+                    delivery_fallback_text = final_content or self._build_task_delivery_fallback(
+                        task
                     )
                     await create_channel_delivery_outbox(
                         db_session,
@@ -2898,6 +2964,7 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
         agent: AgentDefinition,
+        session_policy: dict[str, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Create a conversation and session for a workflow step.
 
@@ -2944,6 +3011,17 @@ class WorkflowEngine:
         with scoped_runtime_context(
             workspace_root=workspace_root,
             effective_working_directory=working_directory,
+            access_context=RuntimeAccessContext(
+                user_email=task.created_by,
+                agent_id=agent.agent_id,
+                agent_owner_email=agent.owner_email,
+                agent_type=agent.agent_type,
+                session_id=None,
+                task_id=task.task_id,
+                step_name=step_def.name,
+                workflow_step=True,
+                session_policy=session_policy or {},
+            ),
         ):
             (
                 conversation,
@@ -2968,6 +3046,7 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
         agent: AgentDefinition,
+        session_policy: dict[str, Any] | None = None,
     ) -> tuple[Any, Any, bool]:
         """Reuse the prior step session on retry, or create a new one.
 
@@ -2998,15 +3077,30 @@ class WorkflowEngine:
                         conv_row = await get_conversation(db_session, session_row.conversation_id)
                         if conv_row is not None:
                             conversation = _to_conversation_model(conv_row)
-                            resumed_session = await self._session_manager.create_root_session(
-                                conversation_id=session_row.conversation_id,
-                                user_email=task.created_by,
-                                agent_id=agent.agent_id,
-                                intention=(
-                                    f"Task: {task.title} — Step: {step_def.name} — "
-                                    f"{step_def.description or step_def.prompt[:100]}"
-                                ),
-                            )
+                            with scoped_runtime_context(
+                                access_context=RuntimeAccessContext(
+                                    user_email=task.created_by,
+                                    agent_id=agent.agent_id,
+                                    agent_owner_email=agent.owner_email,
+                                    agent_type=agent.agent_type,
+                                    session_id=None,
+                                    conversation_id=session_row.conversation_id,
+                                    task_id=task.task_id,
+                                    step_name=step_def.name,
+                                    step_run_id=prior_run.step_run_id,
+                                    workflow_step=True,
+                                    session_policy=session_policy or {},
+                                )
+                            ):
+                                resumed_session = await self._session_manager.create_root_session(
+                                    conversation_id=session_row.conversation_id,
+                                    user_email=task.created_by,
+                                    agent_id=agent.agent_id,
+                                    intention=(
+                                        f"Task: {task.title} — Step: {step_def.name} — "
+                                        f"{step_def.description or step_def.prompt[:100]}"
+                                    ),
+                                )
                             seeded_from_prior = await self._fork_session_events(
                                 source_cognis_session_id=prior_run.session_id,
                                 source_intaris_session_id=(
@@ -3086,6 +3180,53 @@ class WorkflowEngine:
         if raw_output and isinstance(raw_output, dict):
             return str(raw_output.get("summary", ""))
         return ""
+
+    def _build_failure_result_summary(self, state: WorkflowState, workflow: Workflow) -> str:
+        """Build the most specific available summary for a failed workflow."""
+
+        if workflow.steps:
+            current_index = min(max(state.current_step_index, 0), len(workflow.steps) - 1)
+            current_step = workflow.steps[current_index]
+            raw_output = state.step_outputs.get(current_step.name)
+            if raw_output and isinstance(raw_output, dict):
+                summary = str(raw_output.get("summary", "")).strip()
+                if summary:
+                    return summary
+                error = str(raw_output.get("error", "")).strip()
+                if error:
+                    return error
+
+        return self._build_result_summary(state, workflow)
+
+    def _build_task_delivery_fallback(self, task: TaskModel) -> str:
+        """Build a bounded channel fallback that identifies the task and status."""
+
+        status_label = {
+            TaskStatus.COMPLETED: "completed",
+            TaskStatus.FAILED: "failed",
+            TaskStatus.CANCELLED: "was cancelled",
+        }.get(task.status, f"changed status to {task.status.value}")
+        title = self._truncate_channel_fallback_field(task.title, max_length=180)
+        lines = [f'Task "{title}" {status_label}.']
+
+        summary = self._truncate_channel_fallback_field(task.result_summary or "", max_length=500)
+        if summary:
+            label = (
+                "Reason" if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED} else "Summary"
+            )
+            lines.extend(["", f"{label}: {summary}"])
+
+        lines.extend(["", f"Task ID: {task.task_id}", "", "Open the conversation for details."])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _truncate_channel_fallback_field(value: str, *, max_length: int) -> str:
+        """Normalize and bound text embedded into channel fallback messages."""
+
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[: max_length - 1].rstrip() + "…"
 
     def _channel_safe_deliverable_content(self, content: str, format_name: str) -> str:
         """Render deliverable content into a channel-safe text form."""

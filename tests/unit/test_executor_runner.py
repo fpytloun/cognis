@@ -48,6 +48,14 @@ class DummyMessageWebSocket(DummyWebSocket):
         return self._messages.pop(0)
 
 
+class ClosingWebSocket(DummyWebSocket):
+    async def send(self, raw: str) -> None:
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.frames import Close
+
+        raise ConnectionClosedError(Close(1011, "test"), Close(1011, "test"), True)
+
+
 @pytest.mark.asyncio
 async def test_runner_retries_immediately_after_clean_disconnect(
     monkeypatch: pytest.MonkeyPatch,
@@ -207,6 +215,43 @@ async def test_handle_tool_execute_requires_configuration() -> None:
 
     assert ws.sent[-1]["result"]["is_error"] is True
     assert "not configured" in ws.sent[-1]["result"]["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_background_handler_closed_websocket_exception_is_consumed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    caplog.set_level(logging.DEBUG, logger="cognis.executor.runner")
+
+    task = runner._create_background_handler_task(
+        runner._send_rpc_result(ClosingWebSocket(), "rpc-1", {"ok": True}),
+        "shell.background_status",
+        msg_id="rpc-1",
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert task.done()
+    assert "could not reply because websocket closed" in caplog.text
+
+
+def test_executor_runner_uses_explicit_ping_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    import cognis.executor.runner as runner_module
+
+    original_module = runner_module
+    with monkeypatch.context() as env:
+        env.setenv("COGNIS_EXECUTOR_WS_PING_INTERVAL_SECONDS", "7")
+        env.setenv("COGNIS_EXECUTOR_WS_PING_TIMEOUT_SECONDS", "11")
+
+        reloaded = importlib.reload(runner_module)
+
+        assert reloaded._WS_PING_INTERVAL_SECONDS == 7
+        assert reloaded._WS_PING_TIMEOUT_SECONDS == 11
+
+    importlib.reload(original_module)
 
 
 @pytest.mark.asyncio
@@ -443,6 +488,95 @@ async def test_prepare_mcp_runtime_suppresses_failed_client_cleanup(
     assert warnings == ["MCP server googleworkspace failed during initialize."]
     assert statuses[0]["status"] == "failed"
     assert statuses[0]["message"] == "redirect failed"
+
+
+@pytest.mark.asyncio
+async def test_prepare_mcp_runtime_isolates_transport_base_exception_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    closed: list[bool] = []
+
+    class _BrokenClient:
+        async def connect(self) -> None:
+            raise BaseExceptionGroup("stream failure", [RuntimeError("SSE stream died")])
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            return []
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            del tool_name, arguments
+            return {}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+            closed.append(True)
+
+    monkeypatch.setattr("cognis.executor.runner.build_mcp_client", lambda *_: _BrokenClient())
+
+    clients, discovered, statuses, warnings = await runner._prepare_mcp_runtime(
+        [
+            MCPServerConfig(
+                name="googleworkspace",
+                transport="streamable_http",
+                url="http://mcp-gws.openwebui.svc.cluster.local/mcp/",
+            )
+        ],
+        {},
+    )
+
+    assert clients == {}
+    assert discovered == []
+    assert warnings == ["MCP server googleworkspace failed to initialize."]
+    assert closed == [True]
+    assert statuses == [
+        {
+            "server_id": None,
+            "name": "googleworkspace",
+            "phase": "initialize",
+            "status": "failed",
+            "error_class": "exceptiongroup",
+            "timed_out": False,
+            "message": (
+                "ExceptionGroup: stream failure (1 sub-exception); RuntimeError: SSE stream died"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_mcp_runtime_reraises_transport_cancellation_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    class _CancellingClient:
+        async def connect(self) -> None:
+            raise BaseExceptionGroup("cancelled", [asyncio.CancelledError()])
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            return []
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            del tool_name, arguments
+            return {}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+
+    monkeypatch.setattr("cognis.executor.runner.build_mcp_client", lambda *_: _CancellingClient())
+
+    with pytest.raises(BaseExceptionGroup):
+        await runner._prepare_mcp_runtime(
+            [
+                MCPServerConfig(
+                    name="googleworkspace",
+                    transport="streamable_http",
+                    url="http://mcp-gws.openwebui.svc.cluster.local/mcp/",
+                )
+            ],
+            {},
+        )
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,34 @@ describe('agent payload mapping', () => {
     });
   });
 
+  it('round-trips per-agent skill auto-load metadata', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: {},
+      skills: {
+        items: [
+          { skill_id: 'cognis-coding', enabled: true, auto_load_instructions: true },
+          { skill_id: 'research', enabled: true },
+          { skill_id: 'disabled', enabled: false, auto_load_instructions: true }
+        ]
+      }
+    } as never);
+
+    expect(form.selectedSkillIds).toEqual(['cognis-coding', 'research']);
+    expect(form.autoLoadSkillIds).toEqual(['cognis-coding']);
+
+    const payload = formStateToPayload(form);
+    expect(payload.skills).toEqual({
+      items: [
+        { skill_id: 'cognis-coding', enabled: true, auto_load_instructions: true },
+        { skill_id: 'research', enabled: true },
+        { skill_id: 'disabled', enabled: false, auto_load_instructions: true }
+      ]
+    });
+  });
+
   it('omits default-off builtin tool opt-ins for secondary agents', () => {
     const form = createEmptyAgentForm();
     form.agentType = 'secondary';

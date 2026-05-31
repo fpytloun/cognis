@@ -94,6 +94,17 @@ responds:
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
 
+Long-lived ambient chats, such as web direct chats with an agent and external
+channel conversations, can also checkpoint after an idle gap. By default, if the
+active session has been idle for 6 hours and has at least 20 uncompacted events,
+Cognis compacts and rotates the active session before handling the next user
+message. The conversation itself remains continuous; only the active session
+context is refreshed. Normal web topic conversations are not idle-checkpointed.
+
+Admins can tune or disable this behavior with
+`session.long_lived_chat_idle_compaction_seconds` (`0` disables idle checkpoint
+compaction) and `session.long_lived_chat_idle_compaction_min_events`.
+
 Use `/undo` to remove the last normal user turn and everything the assistant produced after it from the visible timeline. Cognis keeps the underlying Intaris session history for auditability, rebases the same conversation onto a new active session, and reloads the current chat in place without changing the URL or creating a sidebar row. Use `/redo` before sending another normal message to restore the undone session. Sending a new normal message after `/undo` starts a divergent branch and clears redo.
 
 ## Long-running turns

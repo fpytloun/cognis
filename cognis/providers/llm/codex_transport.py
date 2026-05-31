@@ -118,6 +118,9 @@ def _codex_error_message(status_code: int, body: dict[str, Any] | None) -> str:
         if param:
             parts.append(f"param={param}")
         return " ".join(parts)
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, str) and detail.strip():
+        return f"Direct Codex request failed: HTTP {status_code}; {detail.strip()}"
     return f"Direct Codex request failed: HTTP {status_code}"
 
 
@@ -146,7 +149,9 @@ class DirectCodexTransport:
             timeout=timeout if timeout is not None else DEFAULT_CODEX_HTTP_TIMEOUT
         )
         if stream:
-            request = client.build_request("POST", CODEX_RESPONSES_URL, json=payload, headers=headers)
+            request = client.build_request(
+                "POST", CODEX_RESPONSES_URL, json=payload, headers=headers
+            )
             response = await client.send(request, stream=True)
             try:
                 if response.status_code >= 400:

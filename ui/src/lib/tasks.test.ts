@@ -20,6 +20,7 @@ function makeTask(overrides: Partial<Task>): Task {
     completion_mode_family: overrides.completion_mode_family ?? 'default',
     allow_silent_completion: overrides.allow_silent_completion ?? false,
     interaction_mode_override: overrides.interaction_mode_override ?? null,
+    session_policy: overrides.session_policy ?? null,
     workflow_id: overrides.workflow_id ?? null,
     project_id: overrides.project_id ?? null,
     attempt_number: overrides.attempt_number ?? 1,

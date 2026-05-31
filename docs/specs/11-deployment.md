@@ -489,6 +489,8 @@ The SvelteKit UI reads browser-visible environment variables:
 | session | `session.max_context_tokens` | 128000 | Context window budget |
 | session | `session.compaction_threshold` | 0.85 | Trigger compaction at this % |
 | session | `session.compaction_preserve_turns` | 10 | Turns to keep uncompacted |
+| session | `session.long_lived_chat_idle_compaction_seconds` | 21600 | Idle age before ambient web direct/channel chats checkpoint into a fresh session; `0` disables |
+| session | `session.long_lived_chat_idle_compaction_min_events` | 20 | Minimum uncompacted events before idle checkpoint compaction can run |
 | session | `session.max_tool_calls_per_turn` | 50 | Max tool calls per turn |
 | session | `session.idle_timeout_seconds` | 1800 | 30 min idle → mark idle |
 | session | `session.max_session_age_seconds` | 86400 | 24h max session age |

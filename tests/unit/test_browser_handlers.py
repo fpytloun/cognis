@@ -35,6 +35,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_upload,
     handle_browser_wait_for,
 )
+from cognis.tools.executor.browser.manager import BrowserSessionSettings
 from cognis.tools.registry import ToolExecutionContext
 
 
@@ -377,6 +378,12 @@ class _FakeManager:
             session_id="sess-1",
             profile_mode="persistent_local",
             profile_id="www-reddit-com",
+            browser_settings=BrowserSessionSettings(
+                auto_consent="accept",
+                stealth_enabled=True,
+                fingerprint_hardening=True,
+                humanize_input=False,
+            ),
             console_events=[{"level": "error", "text": "boom"}],
             network_events=[{"resource_type": "xhr", "status": 400}],
         )
@@ -611,8 +618,61 @@ async def test_browser_open_uses_default_profile_mode_and_reports_profile(
     )
     assert manager.open_calls[0]["profile_mode"] == "default"
     assert manager.open_calls[0]["profile_id"] is None
+    assert manager.open_calls[0]["browser_settings"] is None
     assert '"profile_mode": "persistent_local"' in result.output
     assert '"profile_id": "www-reddit-com"' in result.output
+    assert '"auto_consent": "accept"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_open_passes_browser_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    await handle_browser_open(
+        {
+            "session_id": "sess-1",
+            "url": "https://login.microsoftonline.com/",
+            "browser_settings": {
+                "auto_consent": "off",
+                "stealth_enabled": False,
+                "fingerprint_hardening": False,
+                "humanize_input": True,
+            },
+        },
+        _context(),
+    )
+    assert manager.open_calls[0]["browser_settings"] == {
+        "auto_consent": "off",
+        "stealth_enabled": False,
+        "fingerprint_hardening": False,
+        "humanize_input": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_open_rejects_invalid_browser_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    with pytest.raises(ValueError, match="browser_settings must be an object"):
+        await handle_browser_open(
+            {
+                "session_id": "sess-1",
+                "url": "https://example.com",
+                "browser_settings": "off",
+            },
+            _context(),
+        )
+    with pytest.raises(ValueError, match="auto_consent"):
+        await handle_browser_open(
+            {
+                "session_id": "sess-1",
+                "url": "https://example.com",
+                "browser_settings": {"auto_consent": "maybe"},
+            },
+            _context(),
+        )
 
 
 @pytest.mark.asyncio

@@ -560,6 +560,11 @@ Likely follow-ups:
 - creates or reuses a browser session in a lease
 - defaults to headless mode
 - may accept `auth_state_ref`
+- may accept `browser_settings` with context-creation-only overrides:
+  `auto_consent` (`accept` / `reject` / `off`), `stealth_enabled`,
+  `fingerprint_hardening`, and `humanize_input`
+- rejects attempts to reuse an existing session with conflicting
+  `browser_settings`; callers must use a new session or close/reopen
 - must fail if the selected executor does not support the requested mode
 
 ### `browser_fill`

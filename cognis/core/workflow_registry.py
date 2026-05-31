@@ -165,8 +165,12 @@ RESEARCH_WORKFLOW = Workflow(
                     StepCompletionMetadataField(
                         name="source_strategy", type="array", required=False
                     ),
-                    StepCompletionMetadataField(name="research_depth", type="string", required=True),
-                    StepCompletionMetadataField(name="media_strategy", type="string", required=False),
+                    StepCompletionMetadataField(
+                        name="research_depth", type="string", required=True
+                    ),
+                    StepCompletionMetadataField(
+                        name="media_strategy", type="string", required=False
+                    ),
                     StepCompletionMetadataField(name="open_questions", type="array", required=True),
                 ]
             ),
@@ -282,7 +286,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 "calls in a single turn to parallelise broad explorations; wait for "
                 "all before synthesising. Reach for direct read/grep only for "
                 "narrow, targeted lookups (1-2 files). This is a read-only "
-                "planning step: do not edit files, create worktrees, run tests or "
+                "planning step: identify whether later implementation could be "
+                "safely split into independent slices with clear ownership and "
+                "integration boundaries, but do not fan out implementation from "
+                "this planning step, and do not edit files, create worktrees, run tests or "
                 "builds, commit, open pull requests, or implement changes. Later "
                 "workflow steps handle implementation, verification, commit, and PR "
                 "work.\n\n"
@@ -353,7 +360,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 OutcomeRoute(
                     status="rejected",
                     action="revise(plan)",
-                    max_loop_iterations=3,
+                    max_loop_iterations=5,
                     on_exhausted="gate",
                 ),
                 OutcomeRoute(status="failed", action="gate"),
@@ -459,7 +466,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 OutcomeRoute(
                     status="rejected",
                     action="revise(implement)",
-                    max_loop_iterations=3,
+                    max_loop_iterations=5,
                     on_exhausted="gate",
                 ),
                 OutcomeRoute(status="failed", action="gate"),

@@ -13,6 +13,8 @@
   import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
+  import { skillLoadDisplayName, stepTodoWriteStatusSummary } from '$lib/tool-call-summary';
+  import { displayToolName } from '$lib/tools-display';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
 
@@ -176,12 +178,28 @@
   }
 
   function subtitle(): string {
+    // Normalize: strip underscores for matching (web_fetch -> webfetch)
+    const name = normalizedToolName();
+
+    if (name === 'skillload') {
+      const skillName = skillLoadDisplayName(item);
+      if (skillName) return truncate(skillName, 120);
+    }
+
+    if (name === 'steptodowrite') {
+      const todoSummary = stepTodoWriteStatusSummary(item);
+      if (todoSummary) return truncate(todoSummary, 120);
+    }
+
     if (!item.arguments) {
       return '';
     }
     const args = item.arguments;
-    // Normalize: strip underscores for matching (web_fetch -> webfetch)
-    const name = normalizedToolName();
+
+    if (name === 'skillload') {
+      if (typeof args.skill === 'string') return truncate(args.skill);
+      if (typeof args.skill_id === 'string') return truncate(args.skill_id);
+    }
 
     // File operations
     if (name.includes('read') || name.includes('write') || name.includes('edit') || name.includes('patch') || name.includes('multiedit') || name === 'listdirectory') {
@@ -254,6 +272,22 @@
     if (item.durationMs == null) return '';
     if (item.durationMs < 1000) return `${item.durationMs}ms`;
     return `${(item.durationMs / 1000).toFixed(1)}s`;
+  }
+
+  function isPreparingPatch(): boolean {
+    return isApplyPatchTool()
+      && item.status === 'started'
+      && item.progressPhase === 'preparing_input'
+      && !item.arguments?.patchText;
+  }
+
+  function preparingPatchText(): string {
+    const lines = item.progressInputLines;
+    const chars = item.progressInputChars;
+    const parts: string[] = [];
+    if (typeof lines === 'number' && lines > 0) parts.push(`${lines.toLocaleString()} lines`);
+    if (typeof chars === 'number' && chars > 0) parts.push(`${chars.toLocaleString()} chars`);
+    return parts.length > 0 ? `Preparing patch (${parts.join(', ')})` : 'Preparing patch';
   }
 
   function formatArguments(): string {
@@ -445,7 +479,7 @@
   >
     <span class="text-xs text-slate-500">{expanded ? '\u25BC' : '\u25B6'}</span>
     <span class="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
-      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]">{item.toolName}</span>
+      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]" title={item.toolName}>{displayToolName(item.toolName)}</span>
       {#if subtitle()}
         <span class="min-w-0 text-xs text-slate-400 sm:flex-1 sm:truncate">{subtitle()}</span>
       {/if}
@@ -453,7 +487,7 @@
     <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
       {#if item.status === 'started'}
         <span class="inline-block h-3 w-3 animate-spin rounded-full border border-sky-400 border-t-transparent"></span>
-        <span>running</span>
+        <span>{isPreparingPatch() ? 'preparing' : 'running'}</span>
       {:else}
         <span>{statusIcon()}</span>
         <span>{item.status}</span>
@@ -518,6 +552,15 @@
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Diff</p>
             <FileDiffViewer diffs={item.fileDiffs} />
+          </div>
+        {/if}
+
+        {#if isPreparingPatch()}
+          <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
+            <LiveDots label={preparingPatchText()} size="sm" inline={true} />
+            <p class="mt-2 text-xs text-sky-100/70">
+              Codex is streaming a native patch input. This will turn into the normal apply_patch call once the patch is complete.
+            </p>
           </div>
         {/if}
 

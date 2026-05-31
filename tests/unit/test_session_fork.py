@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.session_cache import CachedEvent
 from cognis.core.session_fork import fork_session_events
+from cognis.models.session import SessionEvent
 
 
 class _SessionCache:
     def __init__(self) -> None:
-        self.events = [
+        self.events: list[CachedEvent] = [
             CachedEvent(seq=1, type="system_message", data={"content": "old identity"}),
             CachedEvent(seq=2, type="user_message", data={"content": "source input"}),
         ]
-        self.prefix_entries = [
+        self.prefix_entries: list[ImmutablePrefixEntry] = [
             ImmutablePrefixEntry(role="system", source="identity", content="old identity", seq=1),
             ImmutablePrefixEntry(
                 role="developer",
@@ -25,6 +27,7 @@ class _SessionCache:
             ),
         ]
         self.seeded_events: list[CachedEvent] = []
+        self.seed_last_seqs: list[int] = []
         self.stored_prefix: list[ImmutablePrefixEntry] = []
 
     def get_entry(self, session_id: str) -> object:
@@ -36,8 +39,9 @@ class _SessionCache:
         return list(self.prefix_entries)
 
     async def seed_events(self, session: object, events: list[CachedEvent], last_seq: int) -> None:
-        del session, last_seq
+        del session
         self.seeded_events.extend(events)
+        self.seed_last_seqs.append(last_seq)
 
     async def append_recorded_events(
         self, session: object, events: list[object], result: object
@@ -58,12 +62,15 @@ class _SessionCache:
 
 class _Guardrails:
     def __init__(self) -> None:
-        self.recorded_events: list[object] = []
+        self.recorded_events: list[SessionEvent] = []
+        self.recorded_batches: list[list[SessionEvent]] = []
 
     async def record_events(self, **kwargs: object) -> object:
-        events = list(kwargs.get("events", []))
+        events = cast(list[SessionEvent], kwargs.get("events", []))
+        first_seq = len(self.recorded_events) + 1
+        self.recorded_batches.append(events)
         self.recorded_events.extend(events)
-        return SimpleNamespace(ok=True, first_seq=1, last_seq=len(self.recorded_events))
+        return SimpleNamespace(ok=True, first_seq=first_seq, last_seq=len(self.recorded_events))
 
 
 @pytest.mark.asyncio
@@ -120,6 +127,36 @@ async def test_fork_session_events_preserves_copied_event_payloads() -> None:
         {"content": "with turn", "turn_id": "turn-1"},
     ]
     assert "turn_id" not in guardrails.recorded_events[0].model_dump()["data"]
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_copies_source_events_in_intaris_sized_batches() -> None:
+    cache = _SessionCache()
+    cache.events = [
+        CachedEvent(seq=index, type="user_message", data={"content": f"message {index}"})
+        for index in range(1, 1003)
+    ]
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="conversation_fork",
+        copy_prefix=False,
+    )
+
+    assert copied is True
+    assert [len(batch) for batch in guardrails.recorded_batches] == [1000, 2]
+    assert len(cache.seeded_events) == 1002
+    assert [event.seq for event in cache.seeded_events] == list(range(1, 1003))
+    assert cache.seed_last_seqs == [1000, 1002]
+    assert guardrails.recorded_events[0].data == {"content": "message 1"}
+    assert guardrails.recorded_events[-1].data == {"content": "message 1002"}
 
 
 @pytest.mark.asyncio

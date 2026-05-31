@@ -594,6 +594,7 @@ CREATE TABLE mcp_servers (
     args              JSON,
     env               JSON,              -- stdio only: {"KEY": "value"} or {"KEY": "$secret:name"}
     headers           JSON,              -- http only: {"Authorization": "value"} or "$secret:name"
+    auth_config       JSON,              -- {"type":"none"|"static_headers"|"oauth2", ...}
     timeout_seconds   INTEGER NOT NULL DEFAULT 30,
     description       TEXT,
     owner_email       TEXT REFERENCES users(email),
@@ -621,6 +622,49 @@ Executor calls local MCP server → result back to Controller.
 ``streamable_http`` across websocket, subprocess, and in-process executor
 modes. Transport-specific configuration is strict: ``stdio`` uses ``env`` and
 HTTP transports use ``headers``.
+
+HTTP MCP servers support three authentication modes:
+
+- ``none``: no controller-managed authentication.
+- ``static_headers``: legacy/static HTTP headers. Static ``Authorization`` is
+  still accepted in this mode for backwards compatibility.
+- ``oauth2``: OAuth 2.1 authorization-code + PKCE. This mode is valid only for
+  ``sse`` and ``streamable_http`` transports. Static ``Authorization`` headers
+  are rejected when OAuth is enabled; non-auth headers remain allowed.
+
+MCP OAuth tokens are encrypted and scoped by
+``user_email + mcp_server_id + issuer + resource_key`` where a missing resource
+uses a deterministic empty resource key. The controller stores refresh/access
+tokens and PKCE transaction state; executors receive only an injected
+``Authorization: Bearer <access_token>`` header during configuration. OAuth
+authorization challenges reuse ``auth_challenge`` notifications with
+``kind="oauth_authorization"`` and carry the available runtime routing metadata
+(``conversation_id``, ``session_id``, ``task_id``, and step identifiers when the
+caller supplies them). They are callback-only: channel replies and generic
+notification resolution must not complete them. ``delivery_mode="silent"``
+persists the challenge without outward notification; an interaction override of
+``none`` should report structured ``authorization_required`` instead of pausing.
+First-use challenges created from executor configuration paths may not have a
+user-visible conversation yet; they are still persisted with internal routing
+metadata and suppressed from outward delivery until a routed challenge can be
+shown.
+
+Discovery follows protected-resource metadata / ``WWW-Authenticate`` hints,
+authorization-server metadata with OIDC fallback, issuer consistency checks,
+PKCE S256, and the OAuth resource parameter. User-provided
+``authorization_params`` may add provider-specific non-reserved parameters but
+cannot override controller-owned OAuth fields such as ``state``,
+``redirect_uri``, ``client_id``, ``response_type``, ``code_challenge``, or
+``code_challenge_method``. Metadata/token endpoints are bounded by
+HTTPS/localhost rules, manually validated redirect limits, DNS-based private
+address rejection, short timeouts, and token redaction. Callback failures after
+state consumption mark the transaction and linked notification failed instead
+of leaving a pending challenge. Runtime MCP 401/403 failures are represented as
+structured MCP auth errors so one unavailable OAuth MCP server does not crash
+the executor. Automatic retry after callback is conservative:
+configuration/list retries can be retried when still resumable; already-failed
+tool calls should be retried by the agent after the callback unless their
+original call is still safely owned by the current waiter.
 
 Note: Common developer tools (filesystem, shell, search) are executor-native
 and do not require MCP server configuration.  Local MCP is for specialized

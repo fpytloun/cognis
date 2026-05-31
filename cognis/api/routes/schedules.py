@@ -136,6 +136,7 @@ def _row_to_response(
         completion_mode_family=getattr(row, "completion_mode_family", "default"),
         allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
+        session_policy=(row.task_template or {}).get("session_policy") or {},
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=_effective_last_run_status(row, latest_task_run),
@@ -318,6 +319,8 @@ async def create_schedule_route(
     task_template = dict(body.task_template)
     task_template.pop("workflow_id", None)
     task_template.pop("skill_id", None)
+    if body.session_policy:
+        task_template["session_policy"] = body.session_policy.model_dump()
 
     async with request.app.state.session_factory() as db:
         row = await create_schedule(
@@ -485,6 +488,10 @@ async def update_schedule_route(
             task_template = dict(fields["task_template"])
             task_template.pop("workflow_id", None)
             task_template.pop("skill_id", None)
+            fields["task_template"] = task_template
+        if body.session_policy is not None:
+            task_template = dict(fields.get("task_template") or existing.task_template or {})
+            task_template["session_policy"] = body.session_policy.model_dump()
             fields["task_template"] = task_template
         if "completion_mode_family" in fields or "allow_silent_completion" in fields:
             CompletionDeliveryPolicy(

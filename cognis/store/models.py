@@ -584,6 +584,7 @@ class Task(Base):
         Boolean, nullable=False, default=False, server_default="0"
     )
     interaction_mode_override: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     attempt_number: Mapped[int] = mapped_column(
@@ -883,6 +884,7 @@ class MCPServerRow(Base):
     args: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     env: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     headers: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    auth_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     owner_email: Mapped[str] = mapped_column(
@@ -897,6 +899,95 @@ class MCPServerRow(Base):
     )
 
     __table_args__ = (UniqueConstraint("name", "owner_email", name="uq_mcp_server_name_owner"),)
+
+
+class MCPOAuthTokenRow(Base):
+    """Encrypted per-user OAuth tokens for HTTP MCP servers."""
+
+    __tablename__ = "mcp_oauth_tokens"
+
+    token_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    mcp_server_id: Mapped[str] = mapped_column(
+        String, ForeignKey("mcp_servers.server_id"), nullable=False
+    )
+    issuer: Mapped[str] = mapped_column(Text, nullable=False)
+    resource: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resource_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    client_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scopes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    token_type: Mapped[str] = mapped_column(String, nullable=False, default="Bearer")
+    expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_refresh_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    encrypted_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_email",
+            "mcp_server_id",
+            "issuer",
+            "resource_key",
+            name="uq_mcp_oauth_token_scope",
+        ),
+        Index("ix_mcp_oauth_tokens_user_server", "user_email", "mcp_server_id"),
+    )
+
+
+class MCPOAuthTransactionRow(Base):
+    """Pending OAuth authorization transactions with PKCE state."""
+
+    __tablename__ = "mcp_oauth_transactions"
+
+    transaction_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    mcp_server_id: Mapped[str] = mapped_column(
+        String, ForeignKey("mcp_servers.server_id"), nullable=False
+    )
+    issuer: Mapped[str] = mapped_column(Text, nullable=False)
+    authorization_server: Mapped[str] = mapped_column(Text, nullable=False)
+    resource: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resource_key: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    scopes: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    code_challenge: Mapped[str] = mapped_column(Text, nullable=False)
+    state_hash: Mapped[str] = mapped_column(String, nullable=False)
+    encrypted_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    step_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    step_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    notification_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    used_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index("ix_mcp_oauth_transactions_user_server", "user_email", "mcp_server_id"),
+        Index("ix_mcp_oauth_transactions_status_expiry", "status", "expires_at"),
+    )
 
 
 class ToolClassificationRow(Base):

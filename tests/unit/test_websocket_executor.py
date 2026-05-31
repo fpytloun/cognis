@@ -13,6 +13,7 @@ from cognis.providers.executor.websocket import (
     ExecutorDisconnectedError,
     WebSocketExecutorConnection,
     WebSocketExecutorProvider,
+    executor_reconnect_retry_budget_seconds,
 )
 
 
@@ -389,3 +390,88 @@ async def test_provider_reconnect_closes_old_connection() -> None:
     assert old_conn.closed is True, "Old connection must be closed on reconnect"
     assert new_conn is not old_conn
     assert provider._connections["exec-1"] is new_conn
+
+
+@pytest.mark.asyncio
+async def test_tool_execute_disconnected_returns_retryable_metadata() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(tools=["read"]),
+        breaker=CircuitBreaker(failure_threshold=10, recovery_timeout=1),
+    )
+    conn._connected = False
+
+    result = await conn.tool_execute(
+        ToolCall(call_id="tc-1", name="read", arguments={"file_path": "/tmp/x"}),
+        timeout_seconds=5,
+    )
+
+    assert result.is_error is True
+    assert result.metadata == {
+        "code": "executor_disconnected",
+        "executor_id": "exec-1",
+        "retryable": True,
+        "same_executor_only": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_execute_cancelled_is_not_retryable_disconnect() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(tools=["read"]),
+        breaker=CircuitBreaker(failure_threshold=10, recovery_timeout=1),
+    )
+
+    async def respond() -> None:
+        while not ws.sent:
+            await asyncio.sleep(0)
+        task.cancel()
+
+    task = asyncio.create_task(
+        conn.tool_execute(
+            ToolCall(call_id="tc-1", name="read", arguments={"file_path": "/tmp/x"}),
+            timeout_seconds=5,
+        )
+    )
+    asyncio.create_task(respond())
+
+    result = await task
+
+    assert result.is_error is True
+    assert result.metadata == {"code": "tool_execution_cancelled", "retryable": False}
+
+
+@pytest.mark.asyncio
+async def test_provider_wait_for_connection_returns_same_executor_reconnect() -> None:
+    provider = WebSocketExecutorProvider()
+
+    wait_task = asyncio.create_task(provider.wait_for_connection("exec-1", timeout=1.0))
+    await asyncio.sleep(0)
+
+    new_conn = provider.register_connection("exec-1", FakeWebSocket(), ExecutorCapabilities())
+
+    assert await wait_task is new_conn
+
+
+@pytest.mark.asyncio
+async def test_provider_wait_for_connection_times_out() -> None:
+    provider = WebSocketExecutorProvider()
+
+    assert await provider.wait_for_connection("exec-never", timeout=0.01) is None
+
+
+def test_reconnect_retry_budget_has_sixty_second_floor(monkeypatch) -> None:
+    monkeypatch.setenv("COGNIS_EXECUTOR_RECONNECT_RETRY_BUDGET_SECONDS", "5")
+
+    assert executor_reconnect_retry_budget_seconds() == 60.0
+
+
+def test_reconnect_retry_budget_can_be_configured_above_floor(monkeypatch) -> None:
+    monkeypatch.setenv("COGNIS_EXECUTOR_RECONNECT_RETRY_BUDGET_SECONDS", "90")
+
+    assert executor_reconnect_retry_budget_seconds() == 90.0

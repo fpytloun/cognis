@@ -9,6 +9,7 @@ import { api } from '$lib/api/client';
 
 const PERMISSION_KEY = 'cognis_notification_permission_asked';
 const WEB_PUSH_ENABLED_KEY = 'cognis_web_push_enabled';
+const WEB_PUSH_PROMPT_DISMISSED_KEY = 'cognis_web_push_prompt_dismissed';
 
 /** Whether the browser supports the Notification API. */
 export function isSupported(): boolean {
@@ -65,10 +66,21 @@ export function hasEnabledWebPush(): boolean {
   return localStorage.getItem(WEB_PUSH_ENABLED_KEY) === 'true';
 }
 
+export function hasDismissedWebPushPrompt(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  return localStorage.getItem(WEB_PUSH_PROMPT_DISMISSED_KEY) === 'true';
+}
+
 function setWebPushEnabled(enabled: boolean): void {
   if (typeof localStorage === 'undefined') return;
   if (enabled) localStorage.setItem(WEB_PUSH_ENABLED_KEY, 'true');
   else localStorage.removeItem(WEB_PUSH_ENABLED_KEY);
+}
+
+export function setWebPushPromptDismissed(dismissed: boolean): void {
+  if (typeof localStorage === 'undefined') return;
+  if (dismissed) localStorage.setItem(WEB_PUSH_PROMPT_DISMISSED_KEY, 'true');
+  else localStorage.removeItem(WEB_PUSH_PROMPT_DISMISSED_KEY);
 }
 
 /** Whether the user is not actively focused on this browser context. */
@@ -178,7 +190,17 @@ export async function enableWebPush(): Promise<EnableWebPushResult> {
       keys: { p256dh, auth },
       platform: isStandaloneDisplay() ? 'pwa' : 'browser'
     });
+    const verifiedSubscription = await registration.pushManager.getSubscription();
+    if (!verifiedSubscription) {
+      setWebPushEnabled(false);
+      return {
+        ok: false,
+        status: 'error',
+        message: 'Browser did not retain the push subscription. Try reloading Cognis and enabling notifications again.'
+      };
+    }
     setWebPushEnabled(true);
+    setWebPushPromptDismissed(true);
     return { ok: true, status: 'enabled', message: 'Native notifications are enabled.' };
   } catch (error) {
     return {
@@ -231,8 +253,7 @@ export async function reconcileWebPushSubscription(): Promise<boolean> {
     setWebPushEnabled(true);
     return true;
   } catch {
-    setWebPushEnabled(false);
-    return false;
+    return hasEnabledWebPush();
   }
 }
 
@@ -255,6 +276,7 @@ export async function disableWebPushForCurrentDevice(): Promise<boolean> {
     const removed = await subscription.unsubscribe();
     if (removed) {
       setWebPushEnabled(false);
+      setWebPushPromptDismissed(false);
     }
     return removed;
   } catch {

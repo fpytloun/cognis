@@ -145,6 +145,34 @@ def test_normalize_streamable_http_url_removes_mcp_trailing_slash() -> None:
     )
 
 
+def test_sanitize_mcp_tool_name_does_not_suffix_simple_normalization() -> None:
+    assert (
+        sanitize_mcp_tool_name("mfg-portal", "alertmanager.alerts")
+        == "mcp_mfg-portal__alertmanager_alerts"
+    )
+
+
+def test_mcp_tools_to_definitions_suffixes_actual_normalized_name_collisions() -> None:
+    definitions = mcp_tools_to_definitions(
+        "github",
+        [
+            {"name": "search/issues", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "search_issues", "inputSchema": {"type": "object", "properties": {}}},
+        ],
+        timeout_seconds=2,
+    )
+
+    names = {definition.name for definition in definitions}
+    assert names == {
+        "mcp_github__search_issues_9287b261",
+        "mcp_github__search_issues_28fc1708",
+    }
+    assert {definition.source.raw_tool_name for definition in definitions} == {
+        "search/issues",
+        "search_issues",
+    }
+
+
 @pytest.mark.asyncio
 async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
     monkeypatch: pytest.MonkeyPatch,

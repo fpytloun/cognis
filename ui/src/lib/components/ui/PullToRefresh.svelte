@@ -27,6 +27,13 @@
   let tracking = false;
   let pull = $state(0);
   let refreshing = $state(false);
+  let activePointerId: number | null = null;
+
+  function resetPullState(): void {
+    tracking = false;
+    activePointerId = null;
+    pull = 0;
+  }
 
   function onPointerDown(event: PointerEvent): void {
     if (disabled || refreshing) return;
@@ -34,24 +41,31 @@
     if (!scroller || scroller.scrollTop > 0) return;
     tracking = true;
     startY = event.clientY;
+    activePointerId = event.pointerId;
+    scroller.setPointerCapture?.(event.pointerId);
   }
 
   function onPointerMove(event: PointerEvent): void {
     if (!tracking) return;
+    if (activePointerId !== null && event.pointerId !== activePointerId) return;
     const dy = event.clientY - startY;
     if (dy <= 0) {
       pull = 0;
       return;
     }
+    event.preventDefault();
     // Rubber-band: cap at ~1.5x threshold.
     pull = Math.min(threshold * 1.5, dy);
   }
 
-  async function onPointerUp(): Promise<void> {
+  async function onPointerUp(event: PointerEvent): Promise<void> {
     if (!tracking) return;
+    if (activePointerId !== null && event.pointerId !== activePointerId) return;
+    scroller?.releasePointerCapture?.(event.pointerId);
     tracking = false;
     const hit = pull >= threshold;
     pull = 0;
+    activePointerId = null;
     if (hit) {
       refreshing = true;
       try {
@@ -66,11 +80,11 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   bind:this={scroller}
-  class={`relative overflow-y-auto overscroll-contain ${className}`}
+  class={`relative overflow-y-auto overscroll-contain touch-pan-y ${className}`}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
-  onpointercancel={onPointerUp}
+  onpointercancel={resetPullState}
 >
   <div
     aria-hidden="true"

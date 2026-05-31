@@ -137,6 +137,44 @@ def test_chatgpt_responses_defaults_omit_prompt_cache_key_by_default(
 
     assert "prompt_cache_key" not in result
     assert "prompt_cache_retention" not in result
+    assert result["store"] is False
+
+
+def test_direct_codex_responses_defaults_force_store_false() -> None:
+    provider = LLMProvider(
+        provider_id="codex",
+        display_name="Codex",
+        location="controller",
+        backend="litellm",
+        config={"preset": "chatgpt", "chatgpt_transport": "direct_codex"},
+        status="active",
+    )
+
+    result = _apply_responses_request_defaults(
+        {"store": True}, provider=provider, resolved_model="gpt-5.5", instructions="stable prefix"
+    )
+
+    assert result["store"] is False
+    assert result["instructions"] == "stable prefix"
+
+
+def test_direct_codex_responses_defaults_supply_instructions_when_missing() -> None:
+    provider = LLMProvider(
+        provider_id="codex",
+        display_name="Codex",
+        location="controller",
+        backend="litellm",
+        config={"preset": "chatgpt", "chatgpt_transport": "direct_codex"},
+        status="active",
+    )
+
+    result = _apply_responses_request_defaults(
+        {}, provider=provider, resolved_model="gpt-5.5", instructions=None
+    )
+
+    assert result["store"] is False
+    assert "instructions" in result
+    assert "helpful assistant" in result["instructions"]
 
 
 def test_chatgpt_responses_defaults_allow_explicit_prompt_cache_key_opt_in() -> None:
@@ -425,7 +463,7 @@ async def test_chatgpt_generate_uses_direct_codex_transport_by_default(
     assert captured["auth_provider_id"] == "chatgpt"
     assert captured["model"] == "gpt-5.3-codex"
     assert captured["input"] == [{"role": "user", "content": "hi"}]
-    assert "store" not in captured
+    assert captured["store"] is False
     assert result["choices"][0]["message"]["content"] == "hello"
     await engine.dispose()
 
@@ -674,7 +712,7 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
     assert captured["model"] == "gpt-5.3-codex"
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert captured["stream"] is True
-    assert "store" not in captured
+    assert captured["store"] is False
     assert chunks[0]["choices"][0]["delta"]["content"] == "hello"
     await engine.dispose()
 
@@ -1511,7 +1549,7 @@ async def test_litellm_provider_uses_bounded_chatgpt_stream_idle_defaults(
         model_id="gpt-5.5",
         default_idle_timeout_seconds=300,
         default_max_retries=3,
-    ) == {"idle_timeout_seconds": 45, "max_retries": 1}
+    ) == {"idle_timeout_seconds": 90, "max_retries": 3}
     await engine.dispose()
 
 
@@ -3552,6 +3590,82 @@ async def test_litellm_provider_prompt_cache_rejection_updates_diagnostics(
     assert payload["prompt_cache_key_present"] is False
     assert payload["prompt_cache_key_status"] == "disabled_after_backend_rejection"
     assert "prompt_cache_key_hash" not in payload
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_logs_responses_event_diagnostics(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="codex",
+                display_name="Codex",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "chatgpt",
+                    "default_model": "gpt-5.5",
+                    "codex_transport": "litellm",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "response.created", "response": {"status": "in_progress"}}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "thinking"}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            },
+        }
+
+    async def _fake_aresponses(**kwargs: object) -> object:
+        return _fake_stream()
+
+    caplog.set_level(logging.INFO, logger="cognis.providers.llm.litellm")
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm._looks_like_chatgpt_oauth_provider",
+        lambda provider: provider is not None and provider.provider_id == "codex",
+    )
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.LiteLLMProvider._provider_oauth_token_context",
+        lambda self, provider: contextlib.nullcontext(),
+    )
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.5",
+            max_tokens=32,
+        )
+    ]
+
+    assert chunks
+    completion_records = [
+        record for record in caplog.records if record.message == "LLM stream request completed"
+    ]
+    assert completion_records
+    payload = completion_records[-1].__dict__["extra_data"]
+    assert payload["provider_event_counts"]["response.completed"] == 1
+    assert payload["provider_event_counts"]["response.reasoning_summary_text.delta"] == 1
+    assert payload["recent_provider_event_types"][-1] == "response.completed"
+    assert payload["response_completed_seen"] is True
+    assert payload["response_failed_seen"] is False
+    assert payload["reasoning_chunk_count"] == 1
     await engine.dispose()
 
 

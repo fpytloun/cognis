@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '$lib/api/client';
   import { renderTerminalOutput } from '$lib/syntax/terminal-output';
+  import { displayToolName } from '$lib/tools-display';
   import type { ToolOutputPageResponse } from '$lib/types/api';
 
   let {
@@ -60,7 +61,7 @@
   <aside class="fixed right-0 top-0 z-50 flex h-full w-full max-w-4xl flex-col border-l border-slate-700 bg-slate-950 text-slate-100 shadow-2xl" aria-label="Tool output drawer">
     <header class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
       <div>
-        <p class="text-sm font-semibold">{toolName}</p>
+        <p class="text-sm font-semibold" title={toolName}>{displayToolName(toolName)}</p>
         <p class="text-xs text-slate-400">{callId}{#if page} · {page.source} · {page.status}{/if}</p>
       </div>
       <button class="rounded-lg border border-slate-700 px-3 py-1 text-sm text-slate-200 hover:bg-slate-800" type="button" onclick={onClose}>Close</button>

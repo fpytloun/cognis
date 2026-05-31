@@ -17,25 +17,61 @@ from cognis.tools.executor.browser.manager import (
     BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS,
     BROWSER_DEFAULT_MAX_SESSIONS,
     BROWSER_MANAGER_KEY,
+    SUPPORTED_AUTO_CONSENT_ACTIONS,
     BrowserManager,
+    BrowserSession,
 )
 from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
 
-def _resolve_intensity(arguments: dict[str, Any], manager: BrowserManager) -> str:
+def _resolve_intensity(
+    arguments: dict[str, Any], manager: BrowserManager, session: BrowserSession | Any | None = None
+) -> str:
     """Resolve humanizer intensity for a single tool call.
 
     Falls back to ``off`` when the executor disables humanization globally;
     otherwise uses the per-call ``intensity`` argument if present and valid,
     else the executor's configured default.
     """
-    if not manager.humanize_input:
+    humanize_input = manager.humanize_input
+    session_settings = getattr(session, "browser_settings", None) if session is not None else None
+    if session_settings is not None:
+        humanize_input = bool(session_settings.humanize_input)
+    if not humanize_input:
         return "off"
     raw = arguments.get("intensity")
     if isinstance(raw, str) and raw.strip():
         return humanizer.normalize_intensity(raw)
     return manager.humanize_intensity
+
+
+def _parse_browser_settings(arguments: dict[str, Any]) -> dict[str, Any] | None:
+    raw = arguments.get("browser_settings")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("browser_settings must be an object")
+    allowed = {"auto_consent", "stealth_enabled", "fingerprint_hardening", "humanize_input"}
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported browser_settings field(s): {', '.join(unknown)}")
+    parsed: dict[str, Any] = {}
+    if "auto_consent" in raw:
+        action = str(raw["auto_consent"]).strip().lower()
+        if action not in SUPPORTED_AUTO_CONSENT_ACTIONS:
+            raise ValueError(
+                "browser_settings.auto_consent must be one of "
+                + ", ".join(SUPPORTED_AUTO_CONSENT_ACTIONS)
+            )
+        parsed["auto_consent"] = action
+    for key in ("stealth_enabled", "fingerprint_hardening", "humanize_input"):
+        if key not in raw:
+            continue
+        if not isinstance(raw[key], bool):
+            raise ValueError(f"browser_settings.{key} must be a boolean")
+        parsed[key] = raw[key]
+    return parsed
 
 
 _FOCUS_DISCOVERY_SCRIPT = r"""
@@ -844,6 +880,7 @@ async def handle_browser_open(
     if isinstance(result_or_manager, ToolResult):
         return result_or_manager
     manager = result_or_manager
+    browser_settings = _parse_browser_settings(arguments)
     session = await manager.open_session(
         session_id=str(arguments.get("session_id", "")),
         url=str(arguments.get("url", "")),
@@ -853,7 +890,10 @@ async def handle_browser_open(
         ),
         profile_mode=str(arguments.get("profile_mode", "default") or "default"),
         profile_id=(str(arguments.get("profile_id")) if arguments.get("profile_id") else None),
+        browser_settings=browser_settings,
     )
+    session_settings = getattr(session, "browser_settings", None)
+    resolved_settings = session_settings.as_dict() if session_settings is not None else None
     return ToolResult(
         output=json.dumps(
             {
@@ -863,6 +903,7 @@ async def handle_browser_open(
                 "headless": bool(arguments.get("headless", True)),
                 "profile_mode": session.profile_mode,
                 "profile_id": session.profile_id,
+                "browser_settings": resolved_settings,
             }
         )
     )
@@ -1041,7 +1082,7 @@ async def handle_browser_click(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    intensity = _resolve_intensity(arguments, manager)
+    intensity = _resolve_intensity(arguments, manager, session)
     await humanizer.humanize_click(session.page, chosen, intensity=intensity)
     await _wait_after(session.page, arguments)
     return ToolResult(
@@ -1075,7 +1116,7 @@ async def handle_browser_fill(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    intensity = _resolve_intensity(arguments, manager)
+    intensity = _resolve_intensity(arguments, manager, session)
     await humanizer.humanize_fill(session.page, chosen, value, intensity=intensity)
     await _wait_after(session.page, arguments)
     return ToolResult(
@@ -1136,7 +1177,7 @@ async def handle_browser_type(
         source = "selector"
     else:
         raise ValueError("Provide either ref or selector")
-    intensity = _resolve_intensity(arguments, manager)
+    intensity = _resolve_intensity(arguments, manager, session)
     delay = int(arguments.get("delay_ms", 0) or 0)
     if intensity == "off":
         # Preserve the legacy behaviour exactly when humanization is off so
@@ -1277,7 +1318,7 @@ async def handle_browser_upload(
     else:
         async with session.page.expect_file_chooser() as chooser_info:
             await humanizer.humanize_click(
-                session.page, chosen, intensity=_resolve_intensity(arguments, manager)
+                session.page, chosen, intensity=_resolve_intensity(arguments, manager, session)
             )
         chooser = await chooser_info.value
         await chooser.set_files(files)
@@ -1317,7 +1358,7 @@ async def handle_browser_download_wait(
     )
     async with session.page.expect_download(timeout=timeout_ms) as download_info:
         await humanizer.humanize_click(
-            session.page, chosen, intensity=_resolve_intensity(arguments, manager)
+            session.page, chosen, intensity=_resolve_intensity(arguments, manager, session)
         )
     download = await download_info.value
     filename = _safe_filename(getattr(download, "suggested_filename", None), "download.bin")
@@ -1480,7 +1521,7 @@ async def handle_browser_press(
         text = arguments.get("value")
     key = arguments.get("key")
     if isinstance(text, str):
-        intensity = _resolve_intensity(arguments, manager)
+        intensity = _resolve_intensity(arguments, manager, session)
         delay = int(arguments.get("delay_ms", 0) or 0)
         await _type_focused_text(session.page, text, delay_ms=delay, intensity=intensity)
         await _wait_after(session.page, arguments)

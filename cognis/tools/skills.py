@@ -106,7 +106,13 @@ def extract_agent_skill_refs(agent: AgentDefinition | None) -> list[AgentSkillRe
         if "tool_names" in item:
             continue
         enabled = item.get("enabled", True)
-        refs.append(AgentSkillRef(skill_id=skill_id, enabled=bool(enabled)))
+        refs.append(
+            AgentSkillRef(
+                skill_id=skill_id,
+                enabled=bool(enabled),
+                auto_load_instructions=bool(item.get("auto_load_instructions", False)),
+            )
+        )
     return refs
 
 
@@ -142,6 +148,9 @@ async def resolve_skills_for_agent(
     # Get agent-specified skill refs
     agent_refs = extract_agent_skill_refs(agent)
     enabled_ids = [ref.skill_id for ref in agent_refs if ref.enabled]
+    auto_load_instruction_ids = {
+        ref.skill_id for ref in agent_refs if ref.enabled and ref.auto_load_instructions
+    }
 
     # Fetch all visible skills for this owner
     stmt = select(SkillRow).order_by(SkillRow.name)
@@ -248,6 +257,7 @@ async def resolve_skills_for_agent(
                         asset_manifest=asset_manifest,
                         auto_load=skill_row.auto_load,
                         attached=attached,
+                        auto_load_instructions=skill_id in auto_load_instruction_ids,
                     )
                 )
                 version_snapshot[skill_id] = version_row.version_id
@@ -275,6 +285,7 @@ async def resolve_skills_for_agent(
                 ],
                 auto_load=skill_row.auto_load,
                 attached=attached,
+                auto_load_instructions=skill_id in auto_load_instruction_ids,
             )
         )
 
@@ -369,6 +380,9 @@ def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
             lines.append(f"    <linked_tools>{linked_tool_names}</linked_tools>")
         if skill.attached:
             lines.append("    <attached>true</attached>")
+        if skill.auto_load_instructions:
+            lines.append("    <loaded>true</loaded>")
+            lines.append("    <auto_load_instructions>true</auto_load_instructions>")
         if skill.auto_load:
             lines.append("    <attach_to_all_agents>true</attach_to_all_agents>")
         lines.append("  </skill>")
@@ -505,7 +519,4 @@ def attached_skill_tool_ids_by_skill(resolved: ResolvedSkillSet) -> dict[str, li
             continue
         attached_tool_ids_by_skill.setdefault(skill_id, set()).add(stable_tool_id(tool))
 
-    return {
-        skill_id: sorted(tool_ids)
-        for skill_id, tool_ids in attached_tool_ids_by_skill.items()
-    }
+    return {skill_id: sorted(tool_ids) for skill_id, tool_ids in attached_tool_ids_by_skill.items()}

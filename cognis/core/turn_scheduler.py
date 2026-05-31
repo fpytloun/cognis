@@ -65,6 +65,7 @@ from cognis.core.followups import (
     build_follow_up_id,
     parse_follow_up_metadata,
 )
+from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
 from cognis.core.tool_output_presentation import build_transport_tool_output_preview
 from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
@@ -116,6 +117,8 @@ FOLLOW_UP_DEDUPE_TOTAL = Counter(
 
 DEFAULT_MAX_ACTIVE_TURNS_PER_USER = 20
 DEFAULT_MAX_QUEUED_MESSAGES = 20
+DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_SECONDS = 21600
+DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_MIN_EVENTS = 20
 _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
 MAX_AUTOMATIC_CONTINUATION_ATTEMPTS = 3
@@ -133,6 +136,16 @@ def _positive_int_setting(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _non_negative_int_setting(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _normalize_utc(value: datetime | None) -> datetime | None:
@@ -162,6 +175,15 @@ def _utf16_code_units(value: str) -> int:
     """Return the string length in JavaScript-compatible UTF-16 code units."""
 
     return len(value.encode("utf-16-le")) // 2
+
+
+def _model_copy_or_self(value: Any) -> Any:
+    """Return a defensive model copy when the runtime object supports it."""
+
+    model_copy = getattr(value, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(deep=True)
+    return value
 
 
 def _trim_callback_args(callback: Any, args: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -385,6 +407,9 @@ class _TurnControl:
 
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     settled: bool = False
+    turn_id: str | None = None
+    chat_mode: ChatMode = "default"
+    chat_mode_source: str = "system_default"
     turn_observers: list[TurnObserver] = field(default_factory=list)
     absorbed_follow_up_ids: set[str] = field(default_factory=set)
     absorbed_outbound_attachments: list[dict[str, Any]] = field(default_factory=list)
@@ -467,6 +492,20 @@ def _tool_call_ceiling_metadata(step_output: Any | None) -> dict[str, Any] | Non
     return metadata
 
 
+def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
+    error_text = str(getattr(step_output, "error", "") or "").strip()
+    if not error_text:
+        return None
+    summary = str(getattr(step_output, "summary", "") or "").strip()
+    message = summary or error_text
+    return TurnError(
+        code="step_failed",
+        message=message[:500],
+        recoverable=True,
+        detail={"error_detail": error_text[:2000]},
+    )
+
+
 def _pending_todos_from_metadata(metadata: dict[str, Any]) -> list[dict[str, str]]:
     todos = metadata.get("pending_todos")
     if not isinstance(todos, list):
@@ -535,6 +574,16 @@ class TurnObserver(Protocol):
         tool_name: str,
         arguments: dict[str, Any] | None,
         turn_id: str | None,
+    ) -> None: ...
+
+    async def on_tool_progress(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        progress: dict[str, Any],
+        turn_id: str | None = None,
     ) -> None: ...
 
     async def on_tool_result(
@@ -650,6 +699,7 @@ class TurnScheduler:
         self._active_turns: dict[str, asyncio.Task[None]] = {}
         self._turn_controls: dict[str, _TurnControl] = {}
         self._turn_sessions: dict[str, str] = {}
+        self._turn_locks: dict[str, asyncio.Lock] = {}
         self._queued_messages: dict[str, deque[_QueuedMessage]] = defaultdict(deque)
         self._escalation_notice_pause_ids: dict[str, str] = {}
         self._pending_follow_ups: set[tuple[str, str]] = set()
@@ -671,12 +721,22 @@ class TurnScheduler:
 
         # Per-conversation session creation locks (bootstrap + compaction recovery)
         self._deferred_creation_locks: dict[str, asyncio.Lock] = {}
+        self._idle_checkpoint_locks: dict[str, asyncio.Lock] = {}
 
         # Register for follow-up turn events
         event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, self._handle_follow_up_event)
         event_bus.subscribe(EventType.CONVERSATION_UPDATED, self._handle_conversation_updated)
         logger.info("turn_scheduler: registered on EventBus")
         logger.info("turn_scheduler: follow-up dedupe backed by durable store when available")
+
+    def _turn_lock(self, conversation_id: str) -> asyncio.Lock:
+        """Return the per-conversation lock protecting active-turn ownership."""
+
+        lock = self._turn_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._turn_locks[conversation_id] = lock
+        return lock
 
     # ------------------------------------------------------------------
     # Observer management
@@ -723,13 +783,41 @@ class TurnScheduler:
         """Return volatile bounded streamed tool-output snapshots."""
 
         await self._load_active_tool_output_l2(conversation_id)
+        control = self._turn_controls.get(conversation_id)
+        active_turn_id = (
+            control.turn_id
+            if control is not None
+            and not control.settled
+            and self.has_running_turn(conversation_id)
+            else None
+        )
+        should_persist = False
         async with self._active_tool_outputs_lock:
-            self._prune_active_tool_outputs_locked()
-            return [
-                snapshot.snapshot()
-                for (cid, _, _), snapshot in self._active_tool_outputs.items()
-                if cid == conversation_id and snapshot.result and not snapshot.expired()
-            ]
+            if active_turn_id is None:
+                stale_keys = [key for key in self._active_tool_outputs if key[0] == conversation_id]
+                for key in stale_keys:
+                    self._active_tool_outputs.pop(key, None)
+                should_persist = bool(stale_keys)
+                snapshots: list[dict[str, Any]] = []
+            else:
+                self._prune_active_tool_outputs_locked()
+                stale_keys: list[tuple[str, str, str]] = []
+                snapshots = []
+                for key, snapshot in self._active_tool_outputs.items():
+                    cid, _, _ = key
+                    if cid != conversation_id:
+                        continue
+                    if snapshot.turn_id != active_turn_id:
+                        stale_keys.append(key)
+                        continue
+                    if snapshot.result and not snapshot.expired():
+                        snapshots.append(snapshot.snapshot())
+                for key in stale_keys:
+                    self._active_tool_outputs.pop(key, None)
+                should_persist = bool(stale_keys)
+        if should_persist:
+            await self._persist_active_tool_output_l2(conversation_id)
+        return snapshots
 
     def _active_tool_output_cache_key(self, conversation_id: str) -> str:
         return f"active_tool_outputs:{conversation_id}"
@@ -1172,108 +1260,133 @@ class TurnScheduler:
 
         max_active_turns, max_queued_messages = await self._load_turn_limits()
 
-        # Per-user concurrent turn limit
-        if not system_initiated:
-            user_active = self._user_turn_counts.get(user_email, 0)
-            if user_active >= max_active_turns:
-                return TurnError(
-                    code="rate_limited",
-                    message="Too many concurrent turns. Wait for a turn to finish.",
-                    recoverable=True,
-                )
-
-        # Queue if a turn is already active
-        active = self._active_turns.get(conversation_id)
-        if active is not None and not active.done():
-            queue = self._queued_messages[conversation_id]
-            if client_message_id and any(
-                queued.client_message_id == client_message_id for queued in queue
-            ):
-                await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
-                return None
-            if len(queue) >= max_queued_messages:
-                return TurnError(
-                    code="queue_full",
-                    message="Message queue is full. Wait for the current turn to finish.",
-                    recoverable=True,
-                )
+        async with self._turn_lock(conversation_id):
+            # Per-user concurrent turn limit
             if not system_initiated:
-                await self._touch_conversation(conversation_id)
-            queue.append(
-                _QueuedMessage(
-                    queue_id=self._new_queue_id(),
-                    content=content,
-                    user_email=user_email,
-                    client_message_id=client_message_id,
-                    attachments=[item.model_dump(mode="json") for item in normalized_attachments],
-                    attachment_notice=attachment_notice,
-                    attachment_context=attachment_context,
-                    outbound_attachments=outbound_attachments,
-                    system_initiated=system_initiated,
-                    follow_up=follow_up,
-                    channel_deliverable=channel_deliverable,
-                    delivery_id=delivery_id,
-                    delivery_fallback_text=delivery_fallback_text,
-                    turn_observers=tuple(turn_observers or ()),
-                    one_shot_chat_mode=one_shot_chat_mode,
+                user_active = self._user_turn_counts.get(user_email, 0)
+                if user_active >= max_active_turns:
+                    return TurnError(
+                        code="rate_limited",
+                        message="Too many concurrent turns. Wait for a turn to finish.",
+                        recoverable=True,
+                    )
+
+            # Queue if a turn is already active or still cancelling.  This lock is
+            # the hard per-conversation serialization boundary: a new turn must
+            # not be launched until the previous task has run its final cleanup.
+            active = self._active_turns.get(conversation_id)
+            if active is not None:
+                if active.done():
+                    self._active_turns.pop(conversation_id, None)
+                else:
+                    queue = self._queued_messages[conversation_id]
+                    if client_message_id and any(
+                        queued.client_message_id == client_message_id for queued in queue
+                    ):
+                        await self._notify_queue_updated(
+                            conversation_id, turn_observers=turn_observers
+                        )
+                        return None
+                    if len(queue) >= max_queued_messages:
+                        return TurnError(
+                            code="queue_full",
+                            message="Message queue is full. Wait for the current turn to finish.",
+                            recoverable=True,
+                        )
+                    if not system_initiated:
+                        await self._touch_conversation(conversation_id)
+                    queue.append(
+                        _QueuedMessage(
+                            queue_id=self._new_queue_id(),
+                            content=content,
+                            user_email=user_email,
+                            client_message_id=client_message_id,
+                            attachments=[
+                                item.model_dump(mode="json") for item in normalized_attachments
+                            ],
+                            attachment_notice=attachment_notice,
+                            attachment_context=attachment_context,
+                            outbound_attachments=outbound_attachments,
+                            system_initiated=system_initiated,
+                            follow_up=follow_up,
+                            channel_deliverable=channel_deliverable,
+                            delivery_id=delivery_id,
+                            delivery_fallback_text=delivery_fallback_text,
+                            turn_observers=tuple(turn_observers or ()),
+                            one_shot_chat_mode=one_shot_chat_mode,
+                        )
+                    )
+                    await self._clear_redo_on_accepted_user_turn(
+                        conversation_id,
+                        content=content,
+                        system_initiated=system_initiated,
+                    )
+                    await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
+                    return None
+
+            checkpoint_conversation = _model_copy_or_self(conversation)
+            checkpoint_session = _model_copy_or_self(session)
+
+            if session.status == SessionStatus.IDLE:
+                try:
+                    updated = await self._session_manager.mark_active(session.session_id)
+                    if updated:
+                        session.status = SessionStatus.ACTIVE
+                        session.idle_since = None
+                except Exception:
+                    logger.warning(
+                        "turn_scheduler: failed to reactivate idle session",
+                        extra={
+                            "extra_data": {
+                                "conversation_id": conversation_id,
+                                "session_id": session.session_id,
+                            }
+                        },
+                        exc_info=True,
+                    )
+
+            if not system_initiated:
+                checkpoint_result = await self._maybe_idle_checkpoint_compact(
+                    conversation=checkpoint_conversation,
+                    session=checkpoint_session,
+                    agent=agent,
                 )
-            )
+                if checkpoint_result.session_id != checkpoint_session.session_id:
+                    session = checkpoint_result
+                    conversation.active_session_id = session.session_id
+
             await self._clear_redo_on_accepted_user_turn(
                 conversation_id,
                 content=content,
                 system_initiated=system_initiated,
             )
-            await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
-            return None
 
-        if session.status == SessionStatus.IDLE:
-            try:
-                updated = await self._session_manager.mark_active(session.session_id)
-                if updated:
-                    session.status = SessionStatus.ACTIVE
-                    session.idle_since = None
-            except Exception:
-                logger.warning(
-                    "turn_scheduler: failed to reactivate idle session",
-                    extra={
-                        "extra_data": {
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                        }
-                    },
-                    exc_info=True,
-                )
-
-        await self._clear_redo_on_accepted_user_turn(
-            conversation_id,
-            content=content,
-            system_initiated=system_initiated,
-        )
-
-        # Launch the turn
-        if not system_initiated:
-            await self._touch_conversation(conversation_id)
-        self._launch_turn(
-            conversation=conversation,
-            session=session,
-            agent=agent,
-            content=content,
-            user_email=user_email,
-            attachments=normalized_attachments,
-            outbound_attachments=outbound_attachments,
-            attachment_notice=attachment_notice,
-            attachment_context=attachment_context,
-            system_initiated=system_initiated,
-            follow_up=follow_up,
-            channel_deliverable=channel_deliverable,
-            delivery_id=delivery_id,
-            delivery_fallback_text=delivery_fallback_text,
-            bootstrap_wait_for_intention=bootstrap_wait_for_intention,
-            turn_observers=tuple(turn_observers or ()),
-            client_message_id=client_message_id,
-            queue_id=queued_message_id,
-            one_shot_chat_mode=one_shot_chat_mode,
-        )
+            # Launch the turn while still holding the conversation lock so no
+            # other submitter can observe a gap between admission and ownership
+            # registration.
+            if not system_initiated:
+                await self._touch_conversation(conversation_id)
+            self._launch_turn(
+                conversation=conversation,
+                session=session,
+                agent=agent,
+                content=content,
+                user_email=user_email,
+                attachments=normalized_attachments,
+                outbound_attachments=outbound_attachments,
+                attachment_notice=attachment_notice,
+                attachment_context=attachment_context,
+                system_initiated=system_initiated,
+                follow_up=follow_up,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
+                bootstrap_wait_for_intention=bootstrap_wait_for_intention,
+                turn_observers=tuple(turn_observers or ()),
+                client_message_id=client_message_id,
+                queue_id=queued_message_id,
+                one_shot_chat_mode=one_shot_chat_mode,
+            )
         return None
 
     async def cancel_turn(self, conversation_id: str, *, clear_queue: bool = True) -> bool:
@@ -1321,8 +1434,20 @@ class TurnScheduler:
         active = self._active_turns.get(conversation_id)
         return active is not None and not active.done()
 
-    def has_running_turn(self, conversation_id: str) -> bool:
-        """Check if a turn is still visibly running for the user.
+    def active_turn_checkpoint(self, conversation_id: str) -> dict[str, str | None] | None:
+        """Return active turn identity used to fork from the last completed checkpoint."""
+
+        active = self._active_turns.get(conversation_id)
+        if active is None or active.done():
+            return None
+        control = self._turn_controls.get(conversation_id)
+        return {
+            "session_id": self._turn_sessions.get(conversation_id),
+            "turn_id": control.turn_id if control is not None else None,
+        }
+
+    def running_turn_state(self, conversation_id: str) -> dict[str, Any] | None:
+        """Return visible running-turn state for a conversation.
 
         A turn may remain internally busy for cleanup and queue draining after
         the user-visible work has settled.
@@ -1330,9 +1455,19 @@ class TurnScheduler:
 
         active = self._active_turns.get(conversation_id)
         if active is None or active.done():
-            return False
+            return None
         control = self._turn_controls.get(conversation_id)
-        return not bool(control and control.settled)
+        if control and control.settled:
+            return None
+        return {
+            "chat_mode": control.chat_mode if control else None,
+            "chat_mode_source": control.chat_mode_source if control else None,
+        }
+
+    def has_running_turn(self, conversation_id: str) -> bool:
+        """Check if a turn is still visibly running for the user."""
+
+        return self.running_turn_state(conversation_id) is not None
 
     def queued_count(self, conversation_id: str) -> int:
         """Return the number of queued messages for a conversation."""
@@ -1364,6 +1499,124 @@ class TurnScheduler:
             _positive_int_setting(max_active_turns_raw, DEFAULT_MAX_ACTIVE_TURNS_PER_USER),
             _positive_int_setting(max_queued_messages_raw, DEFAULT_MAX_QUEUED_MESSAGES),
         )
+
+    async def _load_idle_checkpoint_settings(self) -> tuple[int, int]:
+        """Load idle checkpoint compaction settings for long-lived chats."""
+
+        if not callable(self._session_factory):
+            return (
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_SECONDS,
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_MIN_EVENTS,
+            )
+        async with self._session_factory() as db_session:
+            threshold_raw = await get_setting_value(
+                db_session,
+                "session.long_lived_chat_idle_compaction_seconds",
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_SECONDS,
+            )
+            min_events_raw = await get_setting_value(
+                db_session,
+                "session.long_lived_chat_idle_compaction_min_events",
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_MIN_EVENTS,
+            )
+        return (
+            _non_negative_int_setting(
+                threshold_raw,
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_SECONDS,
+            ),
+            _positive_int_setting(
+                min_events_raw,
+                DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_MIN_EVENTS,
+            ),
+        )
+
+    def _conversation_idle_seconds(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        *,
+        now: datetime,
+    ) -> float | None:
+        """Return idle age before the incoming turn touches the conversation."""
+
+        candidates = (
+            conversation.last_message_at,
+            session.idle_since,
+            session.updated_at,
+            session.started_at,
+            conversation.updated_at,
+            conversation.created_at,
+        )
+        for candidate in candidates:
+            normalized = _normalize_utc(candidate)
+            if normalized is None:
+                continue
+            return max(0.0, (now - normalized).total_seconds())
+        return None
+
+    async def _maybe_idle_checkpoint_compact(
+        self,
+        *,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+    ) -> SessionModel:
+        """Rotate long-lived chats that have been idle before handling the new turn."""
+
+        if not is_long_lived_chat_context(getattr(conversation, "context", None)):
+            return session
+        threshold_seconds, min_events = await self._load_idle_checkpoint_settings()
+        if threshold_seconds <= 0:
+            return session
+        idle_seconds = self._conversation_idle_seconds(
+            conversation,
+            session,
+            now=datetime.now(UTC),
+        )
+        if idle_seconds is None or idle_seconds < threshold_seconds:
+            return session
+        lock = self._idle_checkpoint_locks.setdefault(conversation.conversation_id, asyncio.Lock())
+        if lock.locked():
+            return session
+        async with lock:
+            try:
+                if self._agent_loop.session_is_locked(session.session_id):
+                    return session
+            except AttributeError:
+                return session
+            try:
+                new_session = await self._agent_loop.run_idle_checkpoint_compaction(
+                    conversation=conversation,
+                    session=session,
+                    agent=agent,
+                    min_events=min_events,
+                )
+            except Exception:
+                logger.warning(
+                    "turn_scheduler: idle checkpoint compaction failed",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation.conversation_id,
+                            "session_id": session.session_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+                return session
+            if new_session is None:
+                return session
+            conversation.active_session_id = new_session.session_id
+            if len(self._idle_checkpoint_locks) > _MAX_DEFERRED_LOCKS:
+                stale_ids = [
+                    cid
+                    for cid, idle_lock in self._idle_checkpoint_locks.items()
+                    if not idle_lock.locked()
+                ]
+                for cid in stale_ids[
+                    : max(0, len(self._idle_checkpoint_locks) - _MAX_DEFERRED_LOCKS)
+                ]:
+                    self._idle_checkpoint_locks.pop(cid, None)
+            return new_session
 
     async def _load_visible_conversation_title(
         self,
@@ -2172,12 +2425,17 @@ class TurnScheduler:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
         control = _TurnControl(turn_observers=list(turn_observers))
+        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        control.turn_id = turn_id
         self._turn_controls[conversation_id] = control
         self._turn_sessions[conversation_id] = session.session_id
         if not system_initiated:
             self._user_turn_counts[user_email] = self._user_turn_counts.get(user_email, 0) + 1
-        self._active_turns[conversation_id] = asyncio.create_task(
-            self._run_turn(
+        task_holder: dict[str, asyncio.Task[None]] = {}
+
+        async def _runner() -> None:
+            owner_task = task_holder["task"]
+            await self._run_turn(
                 conversation=conversation,
                 session=session,
                 agent=agent,
@@ -2195,11 +2453,16 @@ class TurnScheduler:
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 cancel_event=control.cancel_event,
                 turn_control=control,
+                turn_id=turn_id,
                 client_message_id=client_message_id,
                 queue_id=queue_id,
                 one_shot_chat_mode=one_shot_chat_mode,
+                owner_task=owner_task,
             )
-        )
+
+        task = asyncio.create_task(_runner())
+        task_holder["task"] = task
+        self._active_turns[conversation_id] = task
 
     async def _run_turn(
         self,
@@ -2221,14 +2484,16 @@ class TurnScheduler:
         bootstrap_wait_for_intention: bool,
         cancel_event: asyncio.Event,
         turn_control: _TurnControl | None = None,
+        turn_id: str | None = None,
         turn_observers: tuple[TurnObserver, ...] = (),
         client_message_id: str | None = None,
         queue_id: str | None = None,
         one_shot_chat_mode: ChatMode | None = None,
+        owner_task: asyncio.Task[None] | None = None,
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
-        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        turn_id = turn_id or f"turn_{uuid.uuid4().hex[:12]}"
         message_id = turn_id
         _pre_turn_title = conversation.title
         start_time = asyncio.get_running_loop().time()
@@ -2236,6 +2501,7 @@ class TurnScheduler:
         turn_succeeded = False
         if turn_control is None:
             turn_control = _TurnControl(turn_observers=list(turn_observers))
+        turn_control.turn_id = turn_id
         turn_observers = turn_control.turn_observers
 
         resolved_chat_mode = ResolvedChatMode(mode="default", source="system_default")
@@ -2250,6 +2516,8 @@ class TurnScheduler:
                 agent=agent,
                 one_shot_mode=one_shot_chat_mode,
             )
+            turn_control.chat_mode = resolved_chat_mode.mode
+            turn_control.chat_mode_source = resolved_chat_mode.source
             current_workspace_root.set(platform_data.get("workspace_root"))
             current_effective_working_directory.set(platform_data.get("working_directory"))
             refresh_policy = getattr(self._session_manager, "refresh_intaris_session_policy", None)
@@ -2378,6 +2646,7 @@ class TurnScheduler:
                 on_thinking,
                 on_tool_call,
                 on_tool_result,
+                on_tool_progress,
                 on_tool_output_chunk,
             ) = self._build_callbacks(
                 conversation_id,
@@ -2402,6 +2671,7 @@ class TurnScheduler:
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
                 on_tool_result=on_tool_result,
+                on_tool_progress=on_tool_progress,
                 on_tool_output_chunk=on_tool_output_chunk,
                 cancel_event=cancel_event,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
@@ -2412,6 +2682,38 @@ class TurnScheduler:
                     reason=reason,
                 ),
             )
+            step_error = _turn_error_from_step_output(step_output)
+            if step_error is not None:
+                logger.warning(
+                    "turn_scheduler: turn step returned error",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "error_code": step_error.code,
+                        }
+                    },
+                )
+                turn_control.settled = True
+                await self._publish_turn_error(
+                    conversation_id,
+                    session.session_id,
+                    step_error,
+                    turn_id=turn_id,
+                    system_initiated=system_initiated,
+                    channel_deliverable=(
+                        channel_deliverable or turn_control.absorbed_channel_deliverable
+                    ),
+                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_fallback_text=(
+                        turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                    ),
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
+                    turn_observers=turn_observers,
+                )
+                TURNS_TOTAL.labels(outcome="error").inc()
+                return
             ceiling_metadata = _tool_call_ceiling_metadata(step_output)
             if (
                 ceiling_metadata is not None
@@ -2546,6 +2848,16 @@ class TurnScheduler:
                 turn_observers=turn_observers,
             )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
+            logger.info(
+                "turn_scheduler: turn cancelled",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "turn_id": turn_id,
+                    }
+                },
+            )
 
         except Exception as exc:
             logger.exception(
@@ -2576,6 +2888,7 @@ class TurnScheduler:
         finally:
             duration = asyncio.get_running_loop().time() - start_time
             TURN_DURATION.labels(type=turn_type).observe(duration)
+            queued_to_drain: _QueuedMessage | None = None
 
             if follow_up is not None:
                 if turn_succeeded:
@@ -2590,28 +2903,46 @@ class TurnScheduler:
                 else:
                     await self._clear_follow_up_pending(conversation_id, follow_up_id)
 
-            self._active_turns.pop(conversation_id, None)
-            self._turn_controls.pop(conversation_id, None)
-            self._turn_sessions.pop(conversation_id, None)
-            if (
-                self._pause_waiter.find_pending(
-                    pause_type="escalation",
-                    conversation_id=conversation_id,
+            current_task = owner_task or asyncio.current_task()
+            async with self._turn_lock(conversation_id):
+                registered_active = self._active_turns.get(conversation_id)
+                registered_control = self._turn_controls.get(conversation_id)
+                active_matches = registered_active is current_task or (
+                    owner_task is None and registered_active is None
                 )
-                is None
-            ):
-                self._escalation_notice_pause_ids.pop(conversation_id, None)
-            if not system_initiated:
-                count = self._user_turn_counts.get(user_email, 1)
-                if count <= 1:
-                    self._user_turn_counts.pop(user_email, None)
-                else:
-                    self._user_turn_counts[user_email] = count - 1
+                control_matches = registered_control is turn_control or (
+                    owner_task is None and registered_control is None
+                )
 
-            # Drain queued messages
-            queue = self._queued_messages.get(conversation_id)
-            if queue:
-                queued = queue.popleft()
+                if active_matches:
+                    self._active_turns.pop(conversation_id, None)
+                if control_matches:
+                    self._turn_controls.pop(conversation_id, None)
+                    self._turn_sessions.pop(conversation_id, None)
+                if (
+                    self._pause_waiter.find_pending(
+                        pause_type="escalation",
+                        conversation_id=conversation_id,
+                    )
+                    is None
+                ):
+                    self._escalation_notice_pause_ids.pop(conversation_id, None)
+                if not system_initiated:
+                    count = self._user_turn_counts.get(user_email, 1)
+                    if count <= 1:
+                        self._user_turn_counts.pop(user_email, None)
+                    else:
+                        self._user_turn_counts[user_email] = count - 1
+
+                # Only the task that still owns the active-turn slot may drain
+                # the queue.  A stale/cancelled task must never delete a newer
+                # task's ownership metadata or launch work in parallel with it.
+                queue = self._queued_messages.get(conversation_id)
+                if active_matches and control_matches and queue:
+                    queued_to_drain = queue.popleft()
+
+            if queued_to_drain is not None:
+                queued = queued_to_drain
                 try:
                     error = await self.submit_turn(
                         conversation_id,
@@ -2660,7 +2991,7 @@ class TurnScheduler:
         turn_id: str | None,
         *,
         turn_observers: tuple[TurnObserver, ...] = (),
-    ) -> tuple[Any, Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
 
         async def on_token(delta: str) -> None:
@@ -2780,6 +3111,32 @@ class TurnScheduler:
                 )
             )
 
+        async def on_tool_progress(
+            call_id: str,
+            tool_name: str,
+            progress: dict[str, Any],
+        ) -> None:
+            await self._reset_active_stream(conversation_id)
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_tool_progress,
+                        conversation_id,
+                        session_id,
+                        call_id,
+                        tool_name,
+                        progress,
+                        turn_id,
+                    )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                    if hasattr(observer, "on_tool_progress")
+                )
+            )
+
         async def on_tool_result(
             call_id: str,
             tool_name: str,
@@ -2870,7 +3227,14 @@ class TurnScheduler:
                 )
             )
 
-        return on_token, on_thinking, on_tool_call, on_tool_result, on_tool_output_chunk
+        return (
+            on_token,
+            on_thinking,
+            on_tool_call,
+            on_tool_result,
+            on_tool_progress,
+            on_tool_output_chunk,
+        )
 
     def _iter_observers(
         self,
@@ -3131,7 +3495,7 @@ class TurnScheduler:
                                 conversation_model,
                                 _to_session_model(new_row),
                                 agent_model,
-                                False,
+                                can_adopt_intaris_title(conversation_model),
                             )
 
                     intention = user_message or f"Conversation with {agent_row.name}"
@@ -3193,7 +3557,7 @@ class TurnScheduler:
                             conversation_model,
                             _to_session_model(new_row),
                             agent_model,
-                            False,
+                            can_adopt_intaris_title(conversation_model),
                         )
 
                 compaction_summary, tail_start_seq = await self._read_compaction_metadata(
@@ -3243,7 +3607,12 @@ class TurnScheduler:
                         }
                     },
                 )
-                return conversation_model, new_session, agent_model, False
+                return (
+                    conversation_model,
+                    new_session,
+                    agent_model,
+                    can_adopt_intaris_title(conversation_model),
+                )
 
         # Periodic cleanup of deferred creation locks (outside the lock block)
         if len(self._deferred_creation_locks) > _MAX_DEFERRED_LOCKS:
@@ -3253,7 +3622,12 @@ class TurnScheduler:
             for cid in to_remove:
                 self._deferred_creation_locks.pop(cid, None)
 
-        return conversation_model, session_model, agent_model, False
+        return (
+            conversation_model,
+            session_model,
+            agent_model,
+            can_adopt_intaris_title(conversation_model),
+        )
 
     async def _read_compaction_metadata(
         self, session: SessionModel

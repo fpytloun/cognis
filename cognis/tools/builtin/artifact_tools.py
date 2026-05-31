@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import ipaddress
 import json
+import socket
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
+import httpx
+
+from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.content_refs import (
     build_deliverable_public_url,
     continuation_scope_task_id,
@@ -20,6 +27,8 @@ from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
 from cognis.store.queries import (
+    create_artifact_record,
+    find_tool_artifact_record,
     get_artifact_record,
     get_model_routing,
     list_recent_artifact_records,
@@ -50,6 +59,16 @@ _TEXT_MIME_TYPES = {
 
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
+_TOOL_ARTIFACT_PREFIX = "tool_artifact:"
+_MAX_REMOTE_ARTIFACT_BYTES = 25 * 1024 * 1024
+# Tool artifact materialization intentionally avoids a new per-candidate table.
+# Only selected candidates become normal artifacts. Until artifact metadata has a
+# generic JSON provenance field, the materialized-artifact lookup stores stable
+# source identity in existing low-impact metadata columns:
+#   purpose="tool_artifact", conversation_id=<source call_id>,
+#   session_id=<source anchor>, content_hash=<source fingerprint>.
+_TOOL_ARTIFACT_PURPOSE = "tool_artifact"
+_REMOTE_ARTIFACT_MAX_REDIRECTS = 5
 
 
 def _is_expired_artifact_row(row: object, *, now: datetime | None = None) -> bool:
@@ -65,16 +84,17 @@ ARTIFACT_READ_TOOL = ToolDefinition(
     name="artifact_read",
     description=(
         "Read an artifact-compatible content ref by artifact_id, including saved Cognis "
-        "artifact IDs and task deliverable IDs (dlv_*). Text content returns line-numbered "
-        "content. Images, PDFs, audio, and supported saved artifacts are analyzed with the "
-        "current model when possible and fall back to the configured attachment_analysis route."
+        "artifact IDs, task deliverable IDs (dlv_*), and lazy tool artifact refs "
+        "(tool_artifact:<call_id>:<anchor>). Text content returns line-numbered content. "
+        "Images, PDFs, audio, and supported saved artifacts are analyzed with the current model "
+        "when possible and fall back to the configured attachment_analysis route."
     ),
     parameters={
         "type": "object",
         "properties": {
             "artifact_id": {
                 "type": "string",
-                "description": "Artifact-compatible content ref to inspect (saved artifact ID or task deliverable ID dlv_*).",
+                "description": "Artifact-compatible content ref to inspect (saved artifact ID, task deliverable ID dlv_*, or tool_artifact:<call_id>:<anchor>).",
             },
             "prompt": {
                 "type": "string",
@@ -320,6 +340,7 @@ async def handle_artifact_tool(
             current_provider_id=current_provider_id,
             owner_email=owner_email or user_email,
             scope_task_id=scope_task_id,
+            runtime_metadata=runtime_metadata,
         )
     if tool_name == ARTIFACT_LIST_RECENT_TOOL.name:
         return await _handle_artifact_list_recent(
@@ -362,6 +383,7 @@ async def _handle_artifact_read(
     current_provider_id: str | None,
     owner_email: str | None = None,
     scope_task_id: str | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -369,6 +391,39 @@ async def _handle_artifact_read(
     artifact_id = str(arguments.get("artifact_id") or "").strip()
     if not artifact_id:
         return ToolResult(output="artifact_id is required.", is_error=True)
+
+    if _is_tool_artifact_ref(artifact_id):
+        resolved = await _materialize_tool_artifact_ref(
+            artifact_id,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=owner_email or user_email,
+            runtime_metadata=runtime_metadata,
+        )
+        if resolved.is_error:
+            return resolved
+        resolved_id = str((resolved.metadata or {}).get("artifact_id") or "")
+        if not resolved_id:
+            return ToolResult(output=f"Failed to materialize {artifact_id}.", is_error=True)
+        arguments = dict(arguments)
+        arguments["artifact_id"] = resolved_id
+        nested = await _handle_artifact_read(
+            arguments,
+            llm=llm,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=user_email,
+            current_model=current_model,
+            current_provider_id=current_provider_id,
+            owner_email=owner_email,
+            scope_task_id=scope_task_id,
+            runtime_metadata=runtime_metadata,
+        )
+        metadata = dict(nested.metadata or {})
+        metadata["tool_artifact_ref"] = artifact_id
+        metadata["materialized_artifact_id"] = resolved_id
+        output = f"Materialized {artifact_id} as artifact {resolved_id}.\n\n{nested.output}"
+        return nested.model_copy(update={"output": output, "metadata": metadata})
 
     offset = max(1, int(arguments.get("offset", 1)))
     limit = int(arguments.get("limit", _MAX_READ_LINES))
@@ -426,6 +481,36 @@ async def _handle_artifact_read(
                 "url": attachment.url,
             },
         )
+
+    if current_model and attachment.url:
+        model_info = await _get_model_info(
+            llm,
+            current_model,
+            current_provider_id,
+            acting_user_email=owner_email or user_email,
+        )
+        if attachment_supports_model(attachment, model_info):
+            safe_attachment = _attachment_ref_tool_payload(attachment)
+            prompt_note = f"\nRequested analysis prompt: {prompt}" if prompt else ""
+            return ToolResult(
+                output=(
+                    f"Prepared artifact '{attachment.filename}' for native model inspection. "
+                    "The next model cycle receives it as an attachment; use the attachment "
+                    "content directly to answer the user's request."
+                    f"{prompt_note}"
+                ),
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "url": attachment.url,
+                    "native_attachment": True,
+                    "analysis_model": current_model,
+                    "analysis_provider_id": current_provider_id,
+                },
+                attachments=[safe_attachment],
+            )
 
     return await analyze_attachment_ref(
         attachment=attachment,
@@ -716,7 +801,12 @@ async def analyze_attachment_ref(
     route_error: str | None = None
 
     if current_model:
-        model_info = await _get_model_info(llm, current_model, current_provider_id)
+        model_info = await _get_model_info(
+            llm,
+            current_model,
+            current_provider_id,
+            acting_user_email=owner_email,
+        )
         if not attachment_supports_model(attachment, model_info):
             model_info = None
 
@@ -729,7 +819,12 @@ async def analyze_attachment_ref(
             selected_provider_id = route_provider_id
             selected_task_type = "attachment_analysis"
             used_fallback_route = True
-            model_info = await _get_model_info(llm, selected_model, selected_provider_id)
+            model_info = await _get_model_info(
+                llm,
+                selected_model,
+                selected_provider_id,
+                acting_user_email=owner_email,
+            )
             if not attachment_supports_model(attachment, model_info):
                 route_error = (
                     "The configured attachment_analysis model "
@@ -774,22 +869,142 @@ async def analyze_attachment_ref(
         )
 
     analysis_prompt = prompt or _default_analysis_prompt(attachment)
+    inline_messages = None
+    if attachment.kind == ArtifactKind.IMAGE and file_url is not None:
+        inline_messages = _analysis_messages(
+            prompt=analysis_prompt,
+            attachment=attachment,
+            file_url=file_url,
+            blocks=_analysis_blocks(attachment, file_url=None, content=content),
+        )
     blocks = _analysis_blocks(attachment, file_url=file_url, content=content)
-    response = await llm.generate(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": analysis_prompt},
-                    {"type": "text", "text": _analysis_artifact_context(attachment, file_url)},
-                    *blocks,
-                ],
-            }
-        ],
-        model=selected_model,
-        task_type=selected_task_type,
-        provider_id=selected_provider_id,
+    messages = _analysis_messages(
+        prompt=analysis_prompt,
+        attachment=attachment,
+        file_url=file_url,
+        blocks=blocks,
     )
+    analysis_payload = "url" if file_url is not None else "inline"
+    try:
+        response, analysis_payload = await _generate_analysis(
+            llm,
+            messages=messages,
+            inline_messages=inline_messages,
+            primary_payload=analysis_payload,
+            model=selected_model,
+            task_type=selected_task_type,
+            provider_id=selected_provider_id,
+        )
+    except Exception as exc:
+        if used_fallback_route:
+            detail = _safe_analysis_error(exc)
+            logger.warning(
+                "Attachment analysis route failed",
+                extra={
+                    "extra_data": {
+                        "artifact_id": attachment.artifact_id,
+                        "filename": attachment.filename,
+                        "kind": attachment.kind.value,
+                        "analysis_model": selected_model,
+                        "analysis_provider_id": selected_provider_id,
+                        "analysis_task_type": selected_task_type,
+                        "error": detail,
+                    }
+                },
+            )
+            return ToolResult(
+                output=(
+                    "Attachment analysis failed using the configured "
+                    f"attachment_analysis route ({selected_model}): {detail}"
+                ),
+                is_error=True,
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "analysis_model": selected_model,
+                    "analysis_task_type": selected_task_type,
+                    "analysis_error": detail,
+                    "used_attachment_analysis_route": True,
+                },
+            )
+        try:
+            fallback = await _fallback_analysis_response_after_error(
+                attachment=attachment,
+                messages=messages,
+                inline_messages=inline_messages,
+                llm=llm,
+                session_factory=session_factory,
+                owner_email=owner_email,
+                original_model=selected_model,
+                original_provider_id=selected_provider_id,
+                original_error=exc,
+            )
+        except _FallbackAnalysisFailed as fallback_exc:
+            original_detail = _safe_analysis_error(exc)
+            fallback_detail = _safe_analysis_error(fallback_exc.original_error)
+            return ToolResult(
+                output=(
+                    f"Attachment analysis failed using the current model ({selected_model}) "
+                    f"and the configured attachment_analysis route: {fallback_detail}"
+                ),
+                is_error=True,
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "analysis_model": selected_model,
+                    "analysis_task_type": selected_task_type,
+                    "fallback_analysis_model": fallback_exc.model,
+                    "fallback_analysis_provider_id": fallback_exc.provider_id,
+                    "fallback_analysis_task_type": "attachment_analysis",
+                    "analysis_error": original_detail,
+                    "fallback_analysis_error": fallback_detail,
+                    "used_attachment_analysis_route": True,
+                },
+            )
+        if fallback is None:
+            detail = _safe_analysis_error(exc)
+            logger.warning(
+                "Native attachment analysis failed and no fallback route was available",
+                extra={
+                    "extra_data": {
+                        "artifact_id": attachment.artifact_id,
+                        "filename": attachment.filename,
+                        "kind": attachment.kind.value,
+                        "analysis_model": selected_model,
+                        "analysis_provider_id": selected_provider_id,
+                        "analysis_task_type": selected_task_type,
+                        "error": detail,
+                    }
+                },
+            )
+            return ToolResult(
+                output=(
+                    f"Attachment analysis failed using the current model ({selected_model}): "
+                    f"{detail}. Configure a compatible attachment_analysis route or retry with "
+                    "a different model."
+                ),
+                is_error=True,
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "analysis_model": selected_model,
+                    "analysis_task_type": selected_task_type,
+                    "analysis_error": detail,
+                    "used_attachment_analysis_route": False,
+                },
+            )
+        response = fallback["response"]
+        selected_model = fallback["model"]
+        selected_provider_id = fallback["provider_id"]
+        selected_task_type = "attachment_analysis"
+        analysis_payload = fallback["payload"]
+        used_fallback_route = True
     output = extract_text_from_response(response).strip()
     if not output:
         diagnostics = _analysis_response_diagnostics(
@@ -831,6 +1046,7 @@ async def analyze_attachment_ref(
             "url": attachment.url,
             "analysis_model": selected_model,
             "analysis_task_type": selected_task_type,
+            "analysis_payload": analysis_payload,
             "used_attachment_analysis_route": used_fallback_route,
         },
     )
@@ -873,13 +1089,34 @@ async def _get_attachment_analysis_route(
     return model, str(provider_id) if isinstance(provider_id, str) and provider_id else None
 
 
-async def _get_model_info(llm: Any, model: str, provider_id: str | None) -> Any:
+async def _get_model_info(
+    llm: Any,
+    model: str,
+    provider_id: str | None,
+    *,
+    acting_user_email: str | None = None,
+) -> Any:
+    kwargs: dict[str, Any] = {}
+    if acting_user_email is not None:
+        kwargs["acting_user_email"] = acting_user_email
     if provider_id is not None:
+        kwargs["provider_id"] = provider_id
         try:
-            return await llm.get_model_info(model, provider_id=provider_id)
+            return await llm.get_model_info(model, **kwargs)
         except TypeError:
+            if acting_user_email is not None:
+                try:
+                    return await llm.get_model_info(
+                        model,
+                        provider_id=provider_id,
+                    )
+                except TypeError:
+                    return await llm.get_model_info(model)
             return await llm.get_model_info(model)
-    return await llm.get_model_info(model)
+    try:
+        return await llm.get_model_info(model, **kwargs)
+    except TypeError:
+        return await llm.get_model_info(model)
 
 
 def _analysis_blocks(
@@ -889,6 +1126,8 @@ def _analysis_blocks(
     content: bytes,
 ) -> list[dict[str, Any]]:
     if attachment.kind == ArtifactKind.IMAGE:
+        if file_url is not None:
+            return [{"type": "image_url", "image_url": {"url": file_url}}]
         encoded = base64.b64encode(content).decode("ascii")
         return [
             {
@@ -899,6 +1138,221 @@ def _analysis_blocks(
     if file_url is None:
         return []
     return [{"type": "file", "file": {"file_url": file_url, "filename": attachment.filename}}]
+
+
+def _analysis_messages(
+    *,
+    prompt: str,
+    attachment: AttachmentRef,
+    file_url: str | None,
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": _analysis_artifact_context(attachment, file_url)},
+                *blocks,
+            ],
+        }
+    ]
+
+
+async def _fallback_analysis_response_after_error(
+    *,
+    attachment: AttachmentRef,
+    messages: list[dict[str, Any]],
+    inline_messages: list[dict[str, Any]] | None,
+    llm: Any,
+    session_factory: Any,
+    owner_email: str | None,
+    original_model: str | None,
+    original_provider_id: str | None,
+    original_error: Exception,
+) -> dict[str, Any] | None:
+    route_model, route_provider_id = await _get_attachment_analysis_route(
+        session_factory, owner_email=owner_email
+    )
+    if not route_model:
+        return None
+    if _same_model_route(route_model, route_provider_id, original_model, original_provider_id):
+        logger.warning(
+            "Native attachment analysis failed and fallback route resolves to the same model",
+            extra={
+                "extra_data": {
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "kind": attachment.kind.value,
+                    "original_model": original_model,
+                    "original_provider_id": original_provider_id,
+                    "fallback_model": route_model,
+                    "fallback_provider_id": route_provider_id,
+                    "original_error": _safe_analysis_error(original_error),
+                }
+            },
+        )
+        return None
+    model_info = await _get_model_info(
+        llm,
+        route_model,
+        route_provider_id,
+        acting_user_email=owner_email,
+    )
+    if not attachment_supports_model(attachment, model_info):
+        logger.warning(
+            "Native attachment analysis failed and configured fallback route is incompatible",
+            extra={
+                "extra_data": {
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "kind": attachment.kind.value,
+                    "original_model": original_model,
+                    "original_provider_id": original_provider_id,
+                    "fallback_model": route_model,
+                    "fallback_provider_id": route_provider_id,
+                    "original_error": _safe_analysis_error(original_error),
+                }
+            },
+        )
+        return None
+
+    logger.info(
+        "Retrying failed native attachment analysis with attachment_analysis route",
+        extra={
+            "extra_data": {
+                "artifact_id": attachment.artifact_id,
+                "filename": attachment.filename,
+                "kind": attachment.kind.value,
+                "original_model": original_model,
+                "original_provider_id": original_provider_id,
+                "fallback_model": route_model,
+                "fallback_provider_id": route_provider_id,
+                "original_error": _safe_analysis_error(original_error),
+            }
+        },
+    )
+    try:
+        response, payload = await _generate_analysis(
+            llm,
+            messages=messages,
+            inline_messages=inline_messages,
+            primary_payload="url",
+            model=route_model,
+            task_type="attachment_analysis",
+            provider_id=route_provider_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Attachment analysis fallback route failed",
+            extra={
+                "extra_data": {
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "kind": attachment.kind.value,
+                    "original_model": original_model,
+                    "original_provider_id": original_provider_id,
+                    "fallback_model": route_model,
+                    "fallback_provider_id": route_provider_id,
+                    "original_error": _safe_analysis_error(original_error),
+                    "fallback_error": _safe_analysis_error(exc),
+                }
+            },
+        )
+        raise _FallbackAnalysisFailed(
+            exc, model=route_model, provider_id=route_provider_id
+        ) from exc
+    return {
+        "response": response,
+        "model": route_model,
+        "provider_id": route_provider_id,
+        "payload": payload,
+    }
+
+
+async def _generate_analysis(
+    llm: Any,
+    *,
+    messages: list[dict[str, Any]],
+    inline_messages: list[dict[str, Any]] | None,
+    primary_payload: str,
+    model: str | None,
+    task_type: str,
+    provider_id: str | None,
+) -> tuple[Any, str]:
+    try:
+        response = await llm.generate(
+            messages=messages,
+            model=model,
+            task_type=task_type,
+            provider_id=provider_id,
+        )
+        return response, primary_payload
+    except Exception as exc:
+        if inline_messages is None:
+            raise
+        logger.info(
+            "Retrying URL-based image analysis with inline image payload",
+            extra={
+                "extra_data": {
+                    "model": model,
+                    "provider_id": provider_id,
+                    "task_type": task_type,
+                    "error": _safe_analysis_error(exc),
+                }
+            },
+        )
+        response = await llm.generate(
+            messages=inline_messages,
+            model=model,
+            task_type=task_type,
+            provider_id=provider_id,
+        )
+        return response, "inline"
+
+
+class _FallbackAnalysisFailed(RuntimeError):
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        model: str | None,
+        provider_id: str | None,
+    ) -> None:
+        super().__init__(str(error))
+        self.original_error = error
+        self.model = model
+        self.provider_id = provider_id
+
+
+def _safe_analysis_error(error: Exception) -> str:
+    return sanitize_client_error_detail(error, fallback="provider request failed")
+
+
+def _attachment_ref_tool_payload(attachment: AttachmentRef) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "artifact_id": attachment.artifact_id,
+        "kind": attachment.kind.value,
+        "mime_type": attachment.mime_type,
+        "filename": attachment.filename,
+        "size_bytes": attachment.size_bytes,
+    }
+    if attachment.url:
+        payload["url"] = attachment.url
+    return payload
+
+
+def _same_model_route(
+    left_model: str | None,
+    left_provider_id: str | None,
+    right_model: str | None,
+    right_provider_id: str | None,
+) -> bool:
+    if (left_model or "").strip() != (right_model or "").strip():
+        return False
+    left_provider = (left_provider_id or "").strip()
+    right_provider = (right_provider_id or "").strip()
+    return not left_provider or not right_provider or left_provider == right_provider
 
 
 def _analysis_artifact_context(attachment: AttachmentRef, file_url: str | None) -> str:
@@ -1036,6 +1490,267 @@ def _kind_for_mime_type(mime_type: str) -> ArtifactKind:
     if mime_type == "application/pdf":
         return ArtifactKind.PDF
     return ArtifactKind.FILE
+
+
+def _is_tool_artifact_ref(value: str) -> bool:
+    return value.startswith(_TOOL_ARTIFACT_PREFIX)
+
+
+def _parse_tool_artifact_ref(value: str) -> tuple[str, str] | None:
+    if not _is_tool_artifact_ref(value):
+        return None
+    rest = value[len(_TOOL_ARTIFACT_PREFIX) :]
+    call_id, sep, anchor = rest.partition(":")
+    if not sep or not call_id.strip() or not anchor.strip():
+        return None
+    return call_id.strip(), anchor.strip()
+
+
+async def _materialize_tool_artifact_ref(
+    tool_artifact_ref: str,
+    *,
+    artifact_store: Any,
+    session_factory: Any,
+    user_email: str | None,
+    runtime_metadata: dict[str, Any] | None,
+) -> ToolResult:
+    owner_email = _require_user_email(user_email)
+    if owner_email is None:
+        return ToolResult(
+            output="Tool artifact lookup requires an authenticated user.", is_error=True
+        )
+    parsed = _parse_tool_artifact_ref(tool_artifact_ref)
+    if parsed is None:
+        return ToolResult(output=f"Invalid tool artifact ref: {tool_artifact_ref}", is_error=True)
+    call_id, anchor_name = parsed
+    tool_output_store = _runtime_tool_output_store(runtime_metadata)
+    if tool_output_store is None:
+        return ToolResult(output="Tool output store is not available.", is_error=True)
+    anchors = await tool_output_store.list_anchors(call_id)
+    if not anchors:
+        return ToolResult(output=f"Tool output anchors not found: {call_id}", is_error=True)
+    anchor = next(
+        (item for item in anchors if getattr(item, "anchor", None) == anchor_name),
+        None,
+    )
+    if anchor is None:
+        return ToolResult(
+            output=f"Tool output anchor not found: {tool_artifact_ref}",
+            is_error=True,
+        )
+    candidate = getattr(anchor, "artifact_candidate", None)
+    if not isinstance(candidate, dict):
+        return ToolResult(
+            output=f"Tool output anchor is not materializable: {tool_artifact_ref}",
+            is_error=True,
+        )
+    if candidate.get("source_type") != "remote_url":
+        return ToolResult(
+            output=(
+                "Unsupported tool artifact source_type: "
+                f"{candidate.get('source_type') or 'unknown'}"
+            ),
+            is_error=True,
+        )
+    url = _optional_string(candidate.get("url"))
+    if url is None:
+        return ToolResult(
+            output=f"Tool artifact source URL missing: {tool_artifact_ref}", is_error=True
+        )
+
+    source_hash = hashlib.sha256(f"{call_id}\n{anchor_name}\n{url}".encode()).hexdigest()
+    async with session_factory() as session:
+        existing = await find_tool_artifact_record(
+            session,
+            owner_email=owner_email,
+            source_tool_call_id=call_id,
+            source_anchor=anchor_name,
+            source_hash=source_hash,
+        )
+    if existing is not None:
+        return ToolResult(
+            output=f"Resolved {tool_artifact_ref} to existing artifact {existing.artifact_id}.",
+            metadata=_artifact_metadata_item(existing),
+        )
+
+    fetched = await _fetch_remote_artifact_candidate(url)
+    if fetched.is_error:
+        return fetched
+    fetch_meta = fetched.metadata or {}
+    content = fetch_meta.get("content")
+    if not isinstance(content, bytes):
+        return ToolResult(output=f"Failed to fetch {tool_artifact_ref}.", is_error=True)
+    mime_type = str(
+        fetch_meta.get("mime_type") or candidate.get("mime_hint") or "application/octet-stream"
+    )
+    filename = sanitize_tool_artifact_filename(
+        str(candidate.get("filename_hint") or fetch_meta.get("filename") or "remote-artifact")
+    )
+    kind = _kind_for_mime_type(mime_type)
+    artifact_id = artifact_store.generate_id("doc" if kind is ArtifactKind.PDF else "att")
+    namespace = "documents" if kind is ArtifactKind.PDF else "attachments"
+    await artifact_store.async_save(
+        namespace,
+        artifact_id,
+        filename,
+        content,
+        mime_type,
+        owner_email=owner_email,
+    )
+    async with session_factory() as session:
+        row = await create_artifact_record(
+            session,
+            artifact_id=artifact_id,
+            namespace=namespace,
+            object_id=artifact_id,
+            filename=filename,
+            owner_email=owner_email,
+            purpose=_TOOL_ARTIFACT_PURPOSE,
+            kind=kind.value,
+            mime_type=mime_type,
+            size_bytes=len(content),
+            status="attached",
+            expires_at=None,
+            conversation_id=call_id,
+            session_id=anchor_name,
+            message_role="assistant",
+            content_hash=source_hash,
+        )
+        await session.commit()
+    metadata = _artifact_metadata_item(row)
+    metadata.update({"tool_artifact_ref": tool_artifact_ref, "source_url": url})
+    return ToolResult(
+        output=f"Materialized {tool_artifact_ref} as artifact {artifact_id}.",
+        metadata=metadata,
+    )
+
+
+async def _fetch_remote_artifact_candidate(url: str) -> ToolResult:
+    try:
+        current_url = _validate_remote_artifact_url(url)
+        response: httpx.Response | None = None
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            for _hop in range(_REMOTE_ARTIFACT_MAX_REDIRECTS + 1):
+                request = client.build_request(
+                    "GET",
+                    current_url,
+                    headers={"User-Agent": "Cognis artifact materializer"},
+                )
+                response = await client.send(request, stream=True)
+                if response.is_redirect:
+                    redirect_url = response.headers.get("location")
+                    await response.aclose()
+                    if not redirect_url:
+                        return ToolResult(
+                            output="Remote artifact candidate redirected without Location.",
+                            is_error=True,
+                        )
+                    current_url = _validate_remote_artifact_url(
+                        urljoin(str(response.request.url), redirect_url)
+                    )
+                    continue
+
+                response.raise_for_status()
+                break
+            else:
+                return ToolResult(
+                    output="Remote artifact candidate exceeded redirect limit.",
+                    is_error=True,
+                )
+
+            if response is None:
+                return ToolResult(
+                    output="Remote artifact candidate returned no response.", is_error=True
+                )
+
+            mime_type = (
+                response.headers.get("content-type", "application/octet-stream")
+                .split(";", 1)[0]
+                .strip()
+            )
+            if not mime_type.startswith("image/") and mime_type != "application/pdf":
+                await response.aclose()
+                return ToolResult(
+                    output=f"Remote artifact candidate has unsupported content type: {mime_type}",
+                    is_error=True,
+                )
+
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > _MAX_REMOTE_ARTIFACT_BYTES:
+                    await response.aclose()
+                    return ToolResult(
+                        output="Remote artifact candidate exceeds maximum size.",
+                        is_error=True,
+                    )
+                chunks.append(chunk)
+            final_url = str(response.url)
+            await response.aclose()
+    except (httpx.HTTPError, ValueError) as exc:
+        return ToolResult(output=f"Failed to fetch remote artifact candidate: {exc}", is_error=True)
+    content = b"".join(chunks)
+    filename = urlparse(final_url).path.rstrip("/").rsplit("/", 1)[-1] or "remote-artifact"
+    return ToolResult(
+        output="Fetched remote artifact candidate.",
+        metadata={"content": content, "mime_type": mime_type, "filename": filename},
+    )
+
+
+def _validate_remote_artifact_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Only HTTP and HTTPS URLs are supported")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL must have a hostname")
+    if _host_resolves_to_blocked_address(host):
+        raise ValueError("URL resolves to a blocked network address")
+    return url
+
+
+def _host_resolves_to_blocked_address(host: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return True
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _runtime_tool_output_store(runtime_metadata: dict[str, Any] | None) -> Any | None:
+    if not isinstance(runtime_metadata, dict):
+        return None
+    store = runtime_metadata.get("tool_output_store")
+    if store is not None:
+        return store
+    shared = runtime_metadata.get("shared_runtime_metadata")
+    if isinstance(shared, dict):
+        return shared.get("tool_output_store")
+    return None
+
+
+def sanitize_tool_artifact_filename(filename: str) -> str:
+    import re
+
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename).strip("._-")
+    return safe[:160] or "remote-artifact"
 
 
 def _require_user_email(user_email: str | None) -> str | None:

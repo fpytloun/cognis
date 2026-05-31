@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from cognis.models.workflow import CompletionDeliveryPolicy
+from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy
 
 
 class ScheduleType(StrEnum):
@@ -48,6 +48,7 @@ class ScheduleModel(BaseModel):
     delete_after_run: bool = False
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     interaction_mode_override: str | None = "none"
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: ScheduleRunStatus | None = None

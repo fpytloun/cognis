@@ -17,6 +17,7 @@ from prometheus_client import Counter
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.attachment_utils import (
     attachment_label as _attachment_label,
 )
@@ -45,6 +46,7 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
     sort_prefix_entries,
 )
+from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES
 from cognis.core.message_markers import (
     ALL_INTERNAL_MARKERS,
     IMMUTABLE_PREFIX,
@@ -90,7 +92,6 @@ EVENT_TYPES_FOR_CONTEXT = [
 ]
 
 _MAX_PROJECT_INSTRUCTION_BYTES = 32000
-_NON_CHANNEL_CONTEXT_TYPES = frozenset({"api", "chat", "direct", "task", "web"})
 _VISIBLE_HISTORY_EVENT_TYPES = {
     "system_message",
     "developer_message",
@@ -333,7 +334,7 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
     if context is None:
         return None
     context_type = str(context.type or "").strip()
-    if not context_type or context_type.lower() in _NON_CHANNEL_CONTEXT_TYPES:
+    if not context_type or context_type.lower() in NON_CHANNEL_CONTEXT_TYPES:
         return None
 
     platform_data = context.platform_data or {}
@@ -371,6 +372,30 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
         ]
     )
     return "\n".join(lines)
+
+
+def _build_direct_chat_context_info(context: ConversationContext | None) -> str | None:
+    """Build mutable context for sticky web direct chats with agents."""
+
+    if context is None or not is_agent_direct_context(context.type, context.platform_data):
+        return None
+
+    return "\n".join(
+        [
+            "Direct chat context:",
+            "- Channel: web",
+            "- Direct agent chat: yes",
+            "",
+            "Direct chat behavior:",
+            "- This guidance applies only because the current web conversation is a persistent direct chat.",
+            "- Keep this direct chat responsive. For non-trivial exploration, research, "
+            "implementation, or other long-running work, prefer delegate(wait=false) "
+            "or create_task so work continues asynchronously and a follow-up turn can "
+            "deliver the result when complete.",
+            "- Use inline work only for quick answers or very small actions that can "
+            "finish without noticeably blocking the direct chat.",
+        ]
+    )
 
 
 def _string_value(value: Any) -> str | None:
@@ -957,6 +982,15 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
+        if direct_chat_context_info := _build_direct_chat_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": direct_chat_context_info,
+                    "_audit_source": "direct_chat_context",
+                    "_audit_role": "developer",
+                }
+            )
 
         # History messages (append-only)
         history_messages = await self._events_to_messages(
@@ -1367,6 +1401,15 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
+        if direct_chat_context_info := _build_direct_chat_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": direct_chat_context_info,
+                    "_audit_source": "direct_chat_context",
+                    "_audit_role": "developer",
+                }
+            )
 
         history_messages = await self._events_to_messages(
             self.session_cache.get_events_since_compaction(
@@ -1574,6 +1617,21 @@ class ContextAssembler:
         if isinstance(metadata, str) and metadata.strip():
             return metadata
         return None
+
+    def _get_auto_loaded_skill_context(self, agent: AgentDefinition) -> str | None:
+        """Get pre-materialized skill contexts for per-agent auto-loaded skills."""
+
+        if not isinstance(agent.skills, dict):
+            return None
+        contexts = agent.skills.get("_auto_loaded_skill_contexts")
+        if not isinstance(contexts, list):
+            return None
+        loaded_contexts = [
+            context.strip() for context in contexts if isinstance(context, str) and context.strip()
+        ]
+        if not loaded_contexts:
+            return None
+        return "<loaded_skills>\n" + "\n\n".join(loaded_contexts) + "\n</loaded_skills>"
 
     async def _ensure_immutable_prefix(
         self,
@@ -1999,13 +2057,16 @@ class ContextAssembler:
         skill_metadata = self._get_available_skills_metadata(agent)
         if skill_metadata:
             sections.append(skill_metadata)
+            auto_loaded_skill_context = self._get_auto_loaded_skill_context(agent)
+            if auto_loaded_skill_context:
+                sections.append(auto_loaded_skill_context)
             skill_guidance = (
                 "You have skills that extend your capabilities. Review the "
                 "list above and use skill_load only when a skill adds procedure "
-                "needed for the current task or workflow step. Skills marked as "
-                "attached are preferred defaults for this agent, but loaded skill "
-                "instructions are subordinate to workflow step contracts and "
-                "controller completion requirements."
+                "needed for the current task or workflow step and is not already "
+                "marked as loaded. Skills marked as attached are preferred defaults "
+                "for this agent, but loaded skill instructions are subordinate to "
+                "workflow step contracts and controller completion requirements."
             )
             if visible_tool_names is not None and "skill_write" in visible_tool_names:
                 skill_guidance += (

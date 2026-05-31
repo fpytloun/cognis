@@ -69,6 +69,7 @@ class OutputAnchor:
     kind: str
     start_line: int
     end_line: int
+    artifact_candidate: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -109,6 +110,7 @@ def _parse_inline_anchors(content: str) -> list[OutputAnchor]:
                 kind=_anchor_kind(anchor),
                 start_line=start_line,
                 end_line=next_start - 1,
+                artifact_candidate=None,
             )
         )
     return anchors
@@ -670,6 +672,9 @@ class ToolOutputStore:
                     kind=kind,
                     start_line=start_line,
                     end_line=end_line,
+                    artifact_candidate=item.get("artifact_candidate")
+                    if isinstance(item.get("artifact_candidate"), dict)
+                    else None,
                 )
             )
         return anchors or _parse_inline_anchors(content)

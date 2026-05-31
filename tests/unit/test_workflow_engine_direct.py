@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,16 @@ from cognis.core.followups import (
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.agent import AgentDefinition
+
+
+class _SessionFactory:
+    @asynccontextmanager
+    async def begin(self):
+        yield SimpleNamespace()
+
+
+async def _noop_refresh_policy(*_: object, **__: object) -> None:
+    return None
 
 
 @pytest.mark.asyncio
@@ -39,12 +50,12 @@ async def test_run_direct_turn_enables_questions() -> None:
         )
 
     engine = WorkflowEngine(
-        session_factory=SimpleNamespace(),
+        session_factory=_SessionFactory(),
         providers=SimpleNamespace(),
         agent_loop=_AgentLoop(),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=_noop_refresh_policy),
         event_bus=EventBus(),
         pause_waiter=PauseWaiter(),
         step_runtime_factory=_runtime_factory,
@@ -87,12 +98,12 @@ async def test_run_direct_turn_threads_follow_up_metadata() -> None:
         )
 
     engine = WorkflowEngine(
-        session_factory=SimpleNamespace(),
+        session_factory=_SessionFactory(),
         providers=SimpleNamespace(),
         agent_loop=_AgentLoop(),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
-        session_manager=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=_noop_refresh_policy),
         event_bus=EventBus(),
         pause_waiter=PauseWaiter(),
         step_runtime_factory=_runtime_factory,

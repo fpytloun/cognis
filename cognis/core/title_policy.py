@@ -21,7 +21,10 @@ def _context_platform_data(conversation: ConversationModel) -> dict[str, object]
 def can_adopt_intaris_title(conversation: ConversationModel) -> bool:
     """Return True when Cognis may update the conversation title from Intaris."""
 
-    return conversation.title_source == "unset" and not (conversation.title or "").strip()
+    return (
+        conversation.title_source in {"unset", "agent_direct"}
+        and not (conversation.title or "").strip()
+    )
 
 
 def latest_intaris_title(conversation: ConversationModel) -> str | None:

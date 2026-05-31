@@ -17,6 +17,7 @@ from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition
 from cognis.models.knowledgebase import KnowledgebaseModel
 from cognis.models.session import SessionModel
+from cognis.models.skill import ResolvedSkill, SkillToolSpec
 from cognis.models.tool import (
     ExecutorHandle,
     ToolCall,
@@ -676,6 +677,40 @@ async def test_resolve_intaris_mcp_tools_does_not_fallback_when_filtered_by_agen
 
 
 @pytest.mark.asyncio
+async def test_resolve_intaris_mcp_tools_suffixes_actual_normalized_name_collisions() -> None:
+    providers = SimpleNamespace(
+        guardrails=_Guardrails(
+            aggregated=[
+                {
+                    "server": "github",
+                    "tool": "search/issues",
+                    "description": "Search issues",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "server": "github",
+                    "tool": "search_issues",
+                    "description": "Search issues",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ]
+        )
+    )
+
+    result = await _resolve_intaris_mcp_tools(
+        providers,
+        _agent(tools={"intaris_mcp_servers": ["github"]}),
+        set(),
+        set(),
+    )
+
+    assert {tool.name for tool in result.tools} == {
+        "mcp_github__search_issues_9287b261",
+        "mcp_github__search_issues_28fc1708",
+    }
+
+
+@pytest.mark.asyncio
 async def test_merge_remote_runtime_inventory_prefers_remote_and_builtin_on_collisions() -> None:
     colliding_name = sanitize_mcp_tool_name("github", "search/issues")
     providers = SimpleNamespace(
@@ -1241,6 +1276,84 @@ async def test_runtime_factory_returns_runtime_diagnostics_for_selected_executor
     assert runtime.runtime_info["fallback_used"] is False
     assert runtime.runtime_info["executor_id"] == "alice_exec"
     assert runtime.runtime_info["environment"]["cwd"] == "/workspace"
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_materializes_auto_loaded_skill_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _policy(_: object) -> ExecutorPolicy:
+        return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
+
+    async def _eligible_executor_config(*_: object, **__: object) -> dict[str, object]:
+        return {
+            "executor_id": "alice_exec",
+            "executor_type": "websocket",
+            "enabled_tools": [],
+            "enabled_tool_groups": [],
+            "config": {},
+            "executor_owner_email": "alice@example.com",
+            "owner_email": "alice@example.com",
+            "selection_source": "explicit",
+            "runtime_state": "active",
+            "desired_config_version": 1,
+            "applied_config_version": 1,
+        }
+
+    async def _web_config(*_: object, **__: object) -> dict[str, object]:
+        return {"web_available_backends": ["direct"], "web_backend": "direct"}
+
+    async def _skills(*_: object, **__: object) -> ResolvedSkillSet:
+        return ResolvedSkillSet(
+            skills=[
+                ResolvedSkill(
+                    skill_id="cognis-coding",
+                    name="Cognis Coding",
+                    description="Coding discipline",
+                    linked_tool_ids=["builtin:bash"],
+                    version_id="sv_1",
+                    version_number=1,
+                    content_hash="hash",
+                    instructions="Use careful implementation discipline.",
+                    tools=[SkillToolSpec(name="run_check", description="Run checks")],
+                    attached=True,
+                    auto_load_instructions=True,
+                )
+            ]
+        )
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", _policy)
+    monkeypatch.setattr(
+        runtime_support, "_resolve_eligible_executor_config", _eligible_executor_config
+    )
+    monkeypatch.setattr(runtime_support, "_resolve_web_config", _web_config)
+    monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", _skills)
+
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="alice@example.com",
+        name="Agent",
+        execution={"executor_id": "alice_exec"},
+    )
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers_with_ws(_ReadyWebSocketProvider("alice_exec")),
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+
+    runtime = await factory(agent=agent, user_email="alice@example.com")
+
+    assert runtime.tool_registry.get("skill_cognis-coding__run_check") is not None
+    assert isinstance(agent.skills, dict)
+    assert agent.skills["_auto_loaded_skill_ids"] == ["cognis-coding"]
+    assert (
+        "Use careful implementation discipline." in agent.skills["_auto_loaded_skill_contexts"][0]
+    )
+    assert agent.skills["_auto_loaded_skill_tool_ids"] == [
+        "builtin:bash",
+        "skill:cognis-coding:run_check",
+    ]
 
 
 @pytest.mark.asyncio

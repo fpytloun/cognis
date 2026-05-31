@@ -452,6 +452,19 @@ class TestTaskCreateRequest:
         create = TaskCreateRequest(agent_id="agent-1", title="Task")
         assert create.created_by_agent_id is None
 
+    def test_session_policy_accepts_string_clauses(self) -> None:
+        create = TaskCreateRequest(
+            agent_id="agent-1",
+            title="Task",
+            session_policy={
+                "allow_policies": ["Session may pass AWS SSO"],
+                "deny_policies": ["Session must not write through SSM"],
+            },
+        )
+
+        assert create.session_policy.allow_policies == ["Session may pass AWS SSO"]
+        assert create.session_policy.deny_policies == ["Session must not write through SSM"]
+
 
 class TestScheduleRequests:
     """Schedule requests strip reserved task template fields."""
@@ -466,6 +479,18 @@ class TestScheduleRequests:
         )
 
         assert request.task_template == {"title": "Task"}
+
+    def test_create_accepts_session_policy(self) -> None:
+        request = CreateScheduleRequest(
+            name="Daily",
+            agent_id="agent-1",
+            schedule_type="interval",
+            interval_seconds=60,
+            task_template={"title": "Task"},
+            session_policy={"allow_policies": ["Session may pass AWS SSO"]},
+        )
+
+        assert request.session_policy.allow_policies == ["Session may pass AWS SSO"]
 
     def test_update_strips_task_creator_agent_marker(self) -> None:
         request = UpdateScheduleRequest(

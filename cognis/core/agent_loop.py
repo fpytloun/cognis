@@ -127,10 +127,12 @@ from cognis.models.session import (
 from cognis.models.tool import (
     Permission,
     ToolCall,
+    ToolCapability,
     ToolDefinition,
     ToolResult,
     ToolSource,
     stable_tool_id,
+    tool_capabilities,
     tool_display_name,
     tool_matches_identifier,
     tool_profile_group,
@@ -188,6 +190,18 @@ from cognis.tools.executor.project_context import INTERNAL_PROJECT_CONTEXT_PROBE
 
 logger = get_logger(__name__)
 
+_SAME_EXECUTOR_AUTO_RETRY_TOOL_ALLOWLIST = frozenset(
+    {
+        "glob",
+        "grep",
+        "list_directory",
+        "lsp",
+        "read",
+        "web_fetch",
+        "web_map",
+        "web_search",
+    }
+)
 _COGNIS_ARTIFACT_URL_RE = re.compile(r"https://cognis\.fpy\.cz/api/v1/artifacts/content/[^\s\"']+")
 _BACKGROUND_SHELL_STATUS_REMINDER_LIMIT = 3
 
@@ -541,6 +555,7 @@ TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
 ToolCallCallback = Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
 ToolResultCallback = Callable[..., Coroutine[Any, Any, None]]
 ToolOutputChunkCallback = Callable[..., Coroutine[Any, Any, None]]
+ToolProgressCallback = Callable[..., Coroutine[Any, Any, None]]
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
@@ -551,7 +566,6 @@ DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
 DELEGATION_MAX_STEPS_KEYS = ("steps", "delegation_max_steps", "max_steps")
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_STREAM_MAX_RETRIES = 3
-DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MAX_RETRIES = 0
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_AGENT_VISIBLE_TOOL_RESULT = 50_000
 _MAX_INTARIS_TOOL_RESULT = _MAX_AGENT_VISIBLE_TOOL_RESULT
@@ -590,6 +604,7 @@ _PARALLEL_MUTATION_TOOL_NAMES = frozenset(
         "artifact_publish",
     }
 )
+_NON_EMPTY_TOOL_ARGUMENT_NAMES = frozenset({"apply_patch"})
 
 
 def _normalize_todo_status(status: Any) -> str:
@@ -907,6 +922,7 @@ async def _iterate_llm_stream_with_idle_timeout(
     *,
     idle_timeout_seconds: int,
     stats: LLMStreamIdleStats | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield stream chunks while enforcing provider-liveness and activity timeouts."""
 
@@ -925,6 +941,8 @@ async def _iterate_llm_stream_with_idle_timeout(
     stats = stats or LLMStreamIdleStats()
     try:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise asyncio.CancelledError
             now = monotonic()
             remaining = min(raw_deadline, activity_deadline) - now
             if remaining <= 0:
@@ -943,6 +961,8 @@ async def _iterate_llm_stream_with_idle_timeout(
                 chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
             except StopAsyncIteration:
                 break
+            except asyncio.CancelledError:
+                raise
             except TimeoutError as exc:
                 message = _llm_stream_idle_timeout_message(
                     stats,
@@ -960,6 +980,8 @@ async def _iterate_llm_stream_with_idle_timeout(
                     raise
                 raise LLMStreamProviderError(f"{type(exc).__name__}: {exc}") from exc
             now = monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                raise asyncio.CancelledError
             elapsed = now - started_at
             if _llm_stream_chunk_has_provider_liveness(chunk):
                 stats.raw_chunks += 1
@@ -978,7 +1000,12 @@ async def _iterate_llm_stream_with_idle_timeout(
                 stats.last_activity_after_seconds = elapsed
                 activity_deadline = now + timeout
             yield chunk
-    except (LLMStreamIdleTimeout, LLMStreamProviderError, LLMContextOverflowError):
+    except (
+        LLMStreamIdleTimeout,
+        LLMStreamProviderError,
+        LLMContextOverflowError,
+        asyncio.CancelledError,
+    ):
         closer = getattr(iterator, "aclose", None)
         if callable(closer):
             with contextlib.suppress(Exception):
@@ -1029,6 +1056,9 @@ _RECOVERY_RETRYABLE_CATEGORIES = {
     MidStreamErrorCategory.OTHER.value,
     *_IDLE_TIMEOUT_CATEGORIES,
 }
+_RECOVERY_NON_RETRYABLE_CATEGORIES = {
+    MidStreamErrorCategory.CONTENT_POLICY.value,
+}
 
 
 def _mid_stream_reason_class(
@@ -1057,13 +1087,61 @@ def _mid_stream_retry_after_seconds(
     return retry_after if retry_after >= 0 else None
 
 
+def _mid_stream_retry_notice(
+    *,
+    provider_id: str | None,
+    model: str | None,
+    details: dict[str, Any] | MidStreamErrorPayload | None,
+    error: str,
+    delay_seconds: float,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    reason_class = _mid_stream_reason_class(details, "other")
+    provider_label = provider_id or "default provider"
+    model_label = model or "unknown model"
+    wait_text = f"{delay_seconds:.1f}s" if delay_seconds < 10 else f"{round(delay_seconds)}s"
+    if reason_class == MidStreamErrorCategory.RATE_LIMIT.value:
+        reason = f"{provider_label} rate-limited the request"
+    elif reason_class == MidStreamErrorCategory.PROVIDER_5XX.value:
+        reason = f"{provider_label} returned a transient server error"
+    elif reason_class == MidStreamErrorCategory.CONNECTION.value:
+        reason = f"{provider_label} connection failed mid-stream"
+    elif reason_class in _IDLE_TIMEOUT_CATEGORIES:
+        reason = f"{provider_label} stopped producing useful stream output"
+    else:
+        reason = f"{provider_label} stream failed mid-generation"
+    message = ""
+    if isinstance(details, dict):
+        raw_message = details.get("message")
+        if isinstance(raw_message, str) and raw_message.strip():
+            message = raw_message.strip()
+    if not message:
+        message = error.strip()
+    suffix = f" Provider message: {message[:220]}" if message else ""
+    return (
+        f"{reason} while using {model_label}. Cognis will wait {wait_text} and retry "
+        f"the LLM call ({attempt}/{max_attempts}).{suffix}"
+    )
+
+
+def _should_emit_mid_stream_retry_notice(
+    details: dict[str, Any] | MidStreamErrorPayload | None,
+) -> bool:
+    """Return true when a retry notice carries actionable provider information."""
+
+    reason_class = _mid_stream_reason_class(details, "other")
+    return reason_class not in _IDLE_TIMEOUT_CATEGORIES
+
+
 def _should_continue_after_exhausted_mid_stream_failure(
     message: str,
     details: dict[str, Any] | MidStreamErrorPayload | None,
 ) -> bool:
     if not _should_auto_continue_after_mid_stream_failure(message):
         return False
-    return _mid_stream_reason_class(details, "other") in _RECOVERY_RETRYABLE_CATEGORIES
+    reason_class = _mid_stream_reason_class(details, "other")
+    return reason_class in _RECOVERY_RETRYABLE_CATEGORIES
 
 
 _TODO_ECHO_CONTENT_MAX = 280
@@ -1826,6 +1904,36 @@ class ThinkingEvent:
         self.provider_block_index = provider_block_index
 
 
+class ToolProgressEvent:
+    """A tool-preparation progress event produced during LLM streaming."""
+
+    __slots__ = (
+        "call_id",
+        "tool_name",
+        "phase",
+        "input_chars",
+        "input_lines",
+        "complete",
+    )
+
+    def __init__(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        phase: str,
+        input_chars: int,
+        input_lines: int,
+        complete: bool,
+    ) -> None:
+        self.call_id = call_id
+        self.tool_name = tool_name
+        self.phase = phase
+        self.input_chars = input_chars
+        self.input_lines = input_lines
+        self.complete = complete
+
+
 # ---------------------------------------------------------------------------
 # Stream accumulator
 # ---------------------------------------------------------------------------
@@ -1854,6 +1962,7 @@ class StreamAccumulator:
         self._thinking_block_counter: int = 0
         self._last_reasoning_source: str | None = None
         self._pending_thinking_events: list[ThinkingEvent] = []
+        self._pending_tool_progress_events: list[ToolProgressEvent] = []
         self._block_id_prefix = (
             re.sub(r"[^a-zA-Z0-9_-]+", "_", block_id_prefix) if block_id_prefix else None
         )
@@ -1931,6 +2040,12 @@ class StreamAccumulator:
         self._pending_thinking_events.clear()
         return events
 
+    def pop_tool_progress_events(self) -> list[ToolProgressEvent]:
+        """Return and clear all pending tool progress events accumulated since last call."""
+        events = list(self._pending_tool_progress_events)
+        self._pending_tool_progress_events.clear()
+        return events
+
     def finalize_thinking(self) -> list[ThinkingBlockState]:
         """Close any open thinking block and return all completed blocks.
 
@@ -1982,6 +2097,24 @@ class StreamAccumulator:
                     provider_title=provider_title,
                 )
             # No text or tool content in boundary-only chunks
+            return None
+
+        tool_progress = delta.get("tool_progress") if isinstance(delta, dict) else None
+        if isinstance(tool_progress, dict):
+            call_id = str(tool_progress.get("id") or "").strip()
+            tool_name = str(tool_progress.get("name") or "unknown_tool")
+            if call_id:
+                self._close_thinking_block(reason="tool_progress")
+                self._pending_tool_progress_events.append(
+                    ToolProgressEvent(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        phase=str(tool_progress.get("phase") or "preparing_input"),
+                        input_chars=max(0, int(tool_progress.get("input_chars") or 0)),
+                        input_lines=max(0, int(tool_progress.get("input_lines") or 0)),
+                        complete=bool(tool_progress.get("complete", False)),
+                    )
+                )
             return None
 
         # ---------------------------------------------------------------
@@ -2087,6 +2220,25 @@ class StreamAccumulator:
         """Return finalized tool calls or structured argument parse failures."""
         result = []
         for _idx, tc in sorted(self.tool_calls.items()):
+            if not tc["arguments"] and tc["name"] in _NON_EMPTY_TOOL_ARGUMENT_NAMES:
+                logger.warning(
+                    "Empty tool call arguments; asking model to retry with valid JSON",
+                    extra={
+                        "extra_data": {
+                            "tool_name": tc["name"],
+                            "args_length": 0,
+                        }
+                    },
+                )
+                result.append(
+                    ToolArgumentParseFailure(
+                        call_id=tc["id"] or f"call_{uuid.uuid4().hex[:12]}",
+                        name=tc["name"],
+                        raw=tc["arguments"],
+                        recovery_attempts=("non_empty_arguments_required",),
+                    )
+                )
+                continue
             try:
                 args = json.loads(tc["arguments"]) if tc["arguments"] else {}
             except json.JSONDecodeError:
@@ -2157,6 +2309,7 @@ class StreamAccumulator:
         self._thinking_block_counter = 0
         self._last_reasoning_source = None
         self._pending_thinking_events.clear()
+        self._pending_tool_progress_events.clear()
 
 
 def _normalize_token_usage(usage: Any) -> dict[str, int]:
@@ -2355,6 +2508,12 @@ class SessionLock:
         if lock and lock.locked():
             lock.release()
         self._last_touched[session_id] = monotonic()
+
+    def is_locked(self, session_id: str) -> bool:
+        """Return whether a session lock is currently held."""
+
+        lock = self._locks.get(session_id)
+        return bool(lock and lock.locked())
 
     def evict(self, session_id: str, *, reason: str = "close_session") -> None:
         """Remove a session's lock entry."""
@@ -2567,6 +2726,7 @@ class StepContext:
     attachment_context: str | None = None
     prior_context: list[dict[str, Any]] | None = None  # Prior step output messages
     interaction_mode: str = "explicit_gates"
+    session_policy: dict[str, Any] = field(default_factory=dict)
     tool_registry: Any = None  # ToolRegistry instance for this step
     classified_tool_definitions: dict[str, ToolDefinition] = field(default_factory=dict)
     executor_connection: Any = None  # ExecutorConnection for this step
@@ -2616,6 +2776,7 @@ class StepContext:
     remember_assistant_event_seq: int | None = None
     turn_id: str | None = None
     chat_mode: ResolvedChatMode | None = None
+    on_tool_progress: ToolProgressCallback | None = None
     on_tool_output_chunk: ToolOutputChunkCallback | None = None
     consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
     # True after a successful write_deliverable until step_complete is called
@@ -2939,6 +3100,7 @@ class AgentLoop:
         on_thinking: Any | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
+        on_tool_progress: ToolProgressCallback | None = None,
         on_tool_output_chunk: ToolOutputChunkCallback | None = None,
     ) -> StepOutput | None:
         """Run a single step as a full agentic loop.
@@ -2949,6 +3111,7 @@ class AgentLoop:
         Returns StepOutput if the step completed, None if it failed.
         """
         start_time = datetime.now(UTC)
+        ctx.on_tool_progress = on_tool_progress
         ctx.on_tool_output_chunk = on_tool_output_chunk
         logger.info(
             "agent: step started",
@@ -3242,9 +3405,9 @@ class AgentLoop:
             child_executor_agent = self._executor_agent_for_child(agent, resolved_agent)
             child_access_context = RuntimeAccessContext(
                 user_email=child_session.user_email,
-                agent_id=resolved_agent.agent_id,
-                agent_owner_email=resolved_agent.owner_email,
-                agent_type=resolved_agent.agent_type,
+                agent_id=child_executor_agent.agent_id,
+                agent_owner_email=child_executor_agent.owner_email,
+                agent_type=child_executor_agent.agent_type,
                 session_id=child_session.session_id,
                 conversation_id=getattr(conversation, "conversation_id", None)
                 if conversation is not None
@@ -3308,8 +3471,8 @@ class AgentLoop:
             # Set runtime context for JWT headers
             with scoped_runtime_context(
                 user_email=child_session.user_email,
-                agent_id=resolved_agent.agent_id,
-                agent_owner_email=resolved_agent.owner_email,
+                agent_id=child_executor_agent.agent_id,
+                agent_owner_email=child_executor_agent.owner_email,
                 workspace_root=workspace_root,
                 effective_working_directory=working_directory,
                 access_context=child_access_context,
@@ -4632,6 +4795,7 @@ class AgentLoop:
         queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
         collected_attachments: list[dict[str, Any]] = []
         pending_assistant_attachments: list[dict[str, Any]] = []
+        retry_projected_model: ProjectedMessages | None = None
         continued_assistant_content = ""
         continuation_message_index: int | None = None
         continuation_reminder_index: int | None = None
@@ -5065,13 +5229,17 @@ class AgentLoop:
                     }
                 },
             )
-            projected_model = self._project_model_messages_for_budget(
-                ctx,
-                messages=messages,
-                tool_schemas=exposure.tools,
-                resolved_model=current_model,
-                max_context_tokens=context_result.max_context_tokens,
-            )
+            if retry_projected_model is not None:
+                projected_model = retry_projected_model
+                retry_projected_model = None
+            else:
+                projected_model = self._project_model_messages_for_budget(
+                    ctx,
+                    messages=messages,
+                    tool_schemas=exposure.tools,
+                    resolved_model=current_model,
+                    max_context_tokens=context_result.max_context_tokens,
+                )
             model_messages = projected_model.messages
             pre_call_snapshot = projected_model.snapshot
             self._store_context_usage_snapshot(
@@ -5264,6 +5432,7 @@ class AgentLoop:
                     stream,
                     idle_timeout_seconds=llm_stream_idle_timeout_seconds,
                     stats=stream_idle_stats,
+                    cancel_event=ctx.cancel_event,
                 ):
                     if not stream_activity_seen and _llm_stream_chunk_has_activity(chunk):
                         stream_activity_seen = True
@@ -5313,6 +5482,18 @@ class AgentLoop:
                                 thinking_evt.source,
                                 thinking_evt.provider_block_index,
                             )
+                    if ctx.on_tool_progress is not None:
+                        for progress_evt in accumulator.pop_tool_progress_events():
+                            await ctx.on_tool_progress(
+                                progress_evt.call_id,
+                                progress_evt.tool_name,
+                                {
+                                    "phase": progress_evt.phase,
+                                    "input_chars": progress_evt.input_chars,
+                                    "input_lines": progress_evt.input_lines,
+                                    "complete": progress_evt.complete,
+                                },
+                            )
             except OpenAIToolSearchFallbackRequired as exc:
                 if openai_tool_search_retries >= _MAX_OPENAI_TOOL_SEARCH_RETRIES:
                     raise
@@ -5334,7 +5515,6 @@ class AgentLoop:
                 llm_status = "idle_timeout"
                 mid_stream_error = str(exc)
                 mid_stream_error_details = exc.to_payload()
-                llm_stream_max_retries_for_error = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_MAX_RETRIES
                 timeout_phase = stream_idle_stats.timeout_phase
                 LLM_MID_STREAM_ERRORS_TOTAL.labels(
                     provider_id=current_provider_id or "default",
@@ -5443,10 +5623,12 @@ class AgentLoop:
             )
 
             if mid_stream_error:
+                transcript_mutated_for_retry = False
                 artifact_fetch_failures = _artifact_failures_from_error_payload(
                     mid_stream_error_details
                 ) or _artifact_failures_from_provider_fetch_error(mid_stream_error)
                 if artifact_fetch_failures:
+                    transcript_mutated_for_retry = True
                     artifact_fetch_failure_urls = {
                         failure.url for failure in artifact_fetch_failures if failure.url
                     }
@@ -5478,43 +5660,17 @@ class AgentLoop:
                     notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
                     if notice:
                         messages.append({"role": "system", "content": notice})
+                error_category = _mid_stream_reason_class(mid_stream_error_details, "other")
+                if error_category in _RECOVERY_NON_RETRYABLE_CATEGORIES:
+                    llm_stream_max_retries_for_error = 0
                 if mid_stream_retries < llm_stream_max_retries_for_error:
+                    retry_projected_model = (
+                        None if transcript_mutated_for_retry else projected_model
+                    )
                     saved_partial_tool_calls = accumulator.clone_tool_call_state()
                     mid_stream_retries += 1
                     reason_class = _mid_stream_reason_class(mid_stream_error_details, "other")
                     retry_after_seconds = _mid_stream_retry_after_seconds(mid_stream_error_details)
-                    if retry_after_seconds is not None:
-                        retry_message = (
-                            "Model provider rate-limited the request; "
-                            f"waiting {retry_after_seconds:g}s before retry "
-                            f"{mid_stream_retries}/{llm_stream_max_retries_for_error}."
-                        )
-                    else:
-                        retry_message = (
-                            "Model provider returned a transient error; retrying request "
-                            f"{mid_stream_retries}/{llm_stream_max_retries_for_error}."
-                        )
-                    await self._emit_recovery_notice(
-                        ctx,
-                        retry_message,
-                        on_token=on_token,
-                        persist=False,
-                        metadata={
-                            "kind": "model_retry",
-                            "scope": "llm_call",
-                            "notice_id": (
-                                f"{ctx.session.session_id}:{ctx.turn_id or 'none'}:"
-                                "model_retry:llm_call"
-                            ),
-                            "attempt": mid_stream_retries,
-                            "max_attempts": llm_stream_max_retries_for_error,
-                            "provider_id": current_provider_id,
-                            "model": current_model,
-                            "reason_class": reason_class,
-                            "retry_after_seconds": retry_after_seconds,
-                            "recoverable": True,
-                        },
-                    )
                     logger.warning(
                         "agent: mid-stream failure, retrying LLM call (%d/%d)",
                         mid_stream_retries,
@@ -5529,6 +5685,8 @@ class AgentLoop:
                                 "idle_timeout_seconds": llm_stream_idle_timeout_seconds,
                                 "configured_max_retries": llm_stream_max_retries,
                                 "effective_max_retries": llm_stream_max_retries_for_error,
+                                "reason_class": reason_class,
+                                "reused_projected_messages": retry_projected_model is not None,
                             }
                         },
                     )
@@ -5544,6 +5702,47 @@ class AgentLoop:
                         if retry_after_seconds is not None
                         else compute_retry_delay(retry_policy, mid_stream_retries - 1)
                     )
+                    if _should_emit_mid_stream_retry_notice(mid_stream_error_details):
+                        try:
+                            await self._emit_recovery_notice(
+                                ctx,
+                                _mid_stream_retry_notice(
+                                    provider_id=current_provider_id,
+                                    model=current_model,
+                                    details=mid_stream_error_details,
+                                    error=mid_stream_error,
+                                    delay_seconds=delay,
+                                    attempt=mid_stream_retries,
+                                    max_attempts=llm_stream_max_retries_for_error,
+                                ),
+                                on_token=on_token,
+                                persist=False,
+                                metadata={
+                                    "kind": "model_recovery",
+                                    "scope": "retry",
+                                    "provider_id": current_provider_id,
+                                    "model": current_model,
+                                    "reason_class": reason_class,
+                                    "retry_after_seconds": delay,
+                                    "attempt": mid_stream_retries,
+                                    "max_attempts": llm_stream_max_retries_for_error,
+                                    "recoverable": True,
+                                },
+                                record_reason="mid_stream_retry_notice",
+                            )
+                        except Exception:
+                            logger.warning(
+                                "agent: failed to emit mid-stream retry notice",
+                                extra={
+                                    "extra_data": {
+                                        "session_id": ctx.session.session_id,
+                                        "provider_id": current_provider_id,
+                                        "model": current_model,
+                                        "reason_class": reason_class,
+                                    }
+                                },
+                                exc_info=True,
+                            )
                     await asyncio.sleep(delay)
                     continue  # retry — keep partial tool-call state, drop partial text
 
@@ -9177,6 +9376,7 @@ class AgentLoop:
             try:
                 from cognis.core.workflow_management import get_workflow_for_user
                 from cognis.models.task import TaskDelivery
+                from cognis.models.workflow import SessionPolicy
 
                 # Resolve agent_id: LLMs sometimes pass "self" literally
                 # instead of omitting the field.  Fall back to the current
@@ -9274,6 +9474,9 @@ class AgentLoop:
                     source_ref=ctx.conversation.conversation_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     interaction_mode_override=tc.arguments.get("interaction_mode_override"),
+                    session_policy=SessionPolicy.model_validate(
+                        tc.arguments.get("session_policy") or {}
+                    ),
                     workflow_id=workflow_id,
                     project_id=str(project_id) if project_id else None,
                     workspace_root=ctx.workspace_root,
@@ -9733,6 +9936,7 @@ class AgentLoop:
         elif tc.name == "update_task":
             task_id = tc.arguments.get("task_id", "")
             from cognis.core.workflow_management import get_workflow_for_user
+            from cognis.models.workflow import SessionPolicy
 
             workflow_id = tc.arguments.get("workflow_id")
             async with self.session_manager.session_factory() as db:
@@ -9816,6 +10020,11 @@ class AgentLoop:
                     priority=tc.arguments.get("priority"),
                     workflow_id=tc.arguments.get("workflow_id"),
                     project_id=project_id_arg,
+                    session_policy=(
+                        SessionPolicy.model_validate(tc.arguments["session_policy"]).model_dump()
+                        if "session_policy" in tc.arguments
+                        else None
+                    ),
                 )
                 await db.commit()
             if ok:
@@ -11083,6 +11292,7 @@ class AgentLoop:
                         "delivery": task_delivery.model_dump(mode="json"),
                         "workspace_root": ctx.workspace_root,
                         "working_directory": ctx.working_directory,
+                        "session_policy": args.session_policy or {},
                     },
                     "completion_mode_family": completion_delivery.completion_mode_family,
                     "allow_silent_completion": completion_delivery.allow_silent_completion,
@@ -11118,6 +11328,7 @@ class AgentLoop:
                     delivery=task_delivery,
                     completion_delivery=completion_delivery,
                     interaction_mode_override=args.interaction_mode_override,
+                    session_policy=args.session_policy,
                     workflow_id=persisted_workflow_id,
                     workspace_root=ctx.workspace_root,
                     working_directory=ctx.working_directory,
@@ -12174,7 +12385,13 @@ class AgentLoop:
             # is the active executor; otherwise we look up by ID.
             ctx_active = getattr(ctx, "active_executor_id", None)
             if ctx_active and target_executor_id == ctx_active:
-                pass  # use ctx.executor_connection
+                resolved_conn = self._resolve_target_connection(
+                    target_executor_id=target_executor_id,
+                    target_executor_type=target.executor_type,
+                )
+                if resolved_conn is not None:
+                    ctx.executor_connection = resolved_conn
+                    executor_connection = resolved_conn
             else:
                 resolved_conn = self._resolve_target_connection(
                     target_executor_id=target_executor_id,
@@ -12196,6 +12413,12 @@ class AgentLoop:
             registered = registry.get(tc.name) if registry is not None else None
             if registered is not None:
                 route = str(registered.definition.source.type)
+            if (
+                target_executor_id is None
+                and registered is not None
+                and registered.definition.source.type == "executor"
+            ):
+                executor_connection = await self._refresh_active_executor_connection(ctx)
             if target_executor_id is not None:
                 route = f"{route}:target_executor"
             result = await self.tool_router.execute(
@@ -12208,6 +12431,17 @@ class AgentLoop:
                 executor_connection,
                 output_chunk_callback=output_chunk_callback,
             )
+            if self._is_same_executor_transient_failure(result):
+                retry_result = await self._retry_tool_after_same_executor_reconnect(
+                    ctx,
+                    tc=tc,
+                    registered=registered,
+                    target_executor_id=target_executor_id,
+                    output_chunk_callback=output_chunk_callback,
+                    original_result=result,
+                )
+                if retry_result is not None:
+                    result = retry_result
             if result.is_error:
                 outcome = "error"
             return result
@@ -12237,6 +12471,225 @@ class AgentLoop:
                     }
                 },
             )
+
+    async def _refresh_active_executor_connection(self, ctx: StepContext) -> Any:
+        """Refresh the turn-local active WebSocket connection without switching executors."""
+
+        active_executor_id = getattr(ctx, "active_executor_id", None)
+        if not isinstance(active_executor_id, str) or not active_executor_id.strip():
+            return self._get_executor(ctx)
+        pool = getattr(ctx, "executor_pool", None)
+        target = pool.by_id(active_executor_id) if pool is not None else None
+        target_executor_type = getattr(target, "executor_type", None)
+        if target_executor_type != "websocket":
+            return self._get_executor(ctx)
+
+        resolved_conn = self._resolve_target_connection(
+            target_executor_id=active_executor_id,
+            target_executor_type=target_executor_type,
+        )
+        if resolved_conn is not None:
+            ctx.executor_connection = resolved_conn
+            return resolved_conn
+        return self._get_executor(ctx)
+
+    def _same_executor_reconnect_provider(self) -> Any:
+        executor_provider = getattr(self.providers, "executor", None)
+        if executor_provider is None:
+            return None
+        return getattr(executor_provider, "websocket", None)
+
+    def _is_same_executor_transient_failure(self, result: ToolResult) -> bool:
+        if not result.is_error or not isinstance(result.metadata, dict):
+            return False
+        code = result.metadata.get("code")
+        return code in {"executor_disconnected", "executor_circuit_open"} and bool(
+            result.metadata.get("same_executor_only")
+        )
+
+    def _tool_safe_for_same_executor_retry(self, registered: Any | None) -> bool:
+        definition = getattr(registered, "definition", None)
+        if definition is None:
+            return False
+        if definition.name not in _SAME_EXECUTOR_AUTO_RETRY_TOOL_ALLOWLIST:
+            return False
+        try:
+            capabilities = tool_capabilities(definition)
+        except Exception:
+            return False
+        return ToolCapability.READ in capabilities and ToolCapability.WRITE not in capabilities
+
+    async def _handle_tool_after_same_executor_transient_failure(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+        registered: Any | None,
+        target_executor_id: str | None,
+        output_chunk_callback: Any,
+        original_result: ToolResult,
+    ) -> ToolResult | None:
+        safe_to_retry = registered is not None and self._tool_safe_for_same_executor_retry(
+            registered
+        )
+
+        pool = getattr(ctx, "executor_pool", None)
+        executor_id: str | None = None
+        executor_type: str | None = None
+        if target_executor_id is not None:
+            target = pool.by_id(target_executor_id) if pool is not None else None
+            executor_id = target_executor_id
+            executor_type = getattr(target, "executor_type", None)
+        else:
+            executor_id = getattr(ctx, "active_executor_id", None)
+            target = pool.by_id(executor_id) if pool is not None and executor_id else None
+            executor_type = getattr(target, "executor_type", None)
+        if not executor_id or executor_type != "websocket":
+            return None
+
+        ws_provider = self._same_executor_reconnect_provider()
+        if ws_provider is None:
+            return None
+
+        from cognis.providers.executor.websocket import executor_reconnect_retry_budget_seconds
+
+        budget = executor_reconnect_retry_budget_seconds()
+        logger.info(
+            "agent: waiting for same executor reconnect after transient tool failure",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "turn_id": ctx.turn_id,
+                    **self._step_log_metadata(ctx),
+                    "tool_name": tc.name,
+                    "call_id": tc.call_id,
+                    "executor_id": executor_id,
+                    "reconnect_retry_budget_seconds": budget,
+                    "target_executor_id": target_executor_id,
+                    "safe_to_retry": safe_to_retry,
+                }
+            },
+        )
+        try:
+            conn = await ws_provider.wait_for_connection(executor_id, timeout=budget)
+        except Exception:
+            logger.warning(
+                "agent: same executor reconnect wait failed",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
+                        **self._step_log_metadata(ctx),
+                        "tool_name": tc.name,
+                        "call_id": tc.call_id,
+                        "executor_id": executor_id,
+                    }
+                },
+                exc_info=True,
+            )
+            conn = None
+
+        metadata = dict(original_result.metadata or {})
+        metadata.update(
+            {
+                "same_executor_reconnected": conn is not None,
+                "reconnect_retry_budget_seconds": budget,
+            }
+        )
+
+        if conn is None:
+            metadata.update(
+                {
+                    "auto_retried": False,
+                    "auto_retry_skipped_reason": "same_executor_reconnect_timeout",
+                }
+            )
+            return self._same_executor_transient_result_with_metadata(
+                original_result,
+                metadata,
+            )
+
+        if target_executor_id is None:
+            ctx.executor_connection = conn
+
+        if not safe_to_retry:
+            metadata.update(
+                {
+                    "auto_retried": False,
+                    "auto_retry_skipped_reason": "tool_not_idempotent",
+                }
+            )
+            return self._same_executor_transient_result_with_metadata(
+                original_result,
+                metadata,
+            )
+
+        retry_call = tc.model_copy(
+            update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
+        )
+        retry_result = await self.tool_router.execute(
+            retry_call,
+            ctx.session,
+            ctx.agent,
+            self._get_tool_registry(ctx),
+            conn,
+            output_chunk_callback=output_chunk_callback,
+        )
+        retry_metadata = dict(retry_result.metadata or {})
+        retry_metadata.update(
+            {
+                "auto_retried": True,
+                "same_executor_reconnected": True,
+                "reconnect_retry_budget_seconds": budget,
+                "previous_error_code": metadata.get("code"),
+            }
+        )
+        return retry_result.model_copy(update={"metadata": retry_metadata})
+
+    def _same_executor_transient_result_with_metadata(
+        self,
+        result: ToolResult,
+        metadata: dict[str, Any],
+    ) -> ToolResult:
+        from cognis.providers.executor.websocket import _transient_executor_output
+
+        code = metadata.get("code")
+        executor_id = metadata.get("executor_id")
+        if isinstance(code, str) and isinstance(executor_id, str):
+            output = _transient_executor_output(
+                executor_id=executor_id,
+                code=code,
+                same_executor_reconnected=metadata.get("same_executor_reconnected")
+                if isinstance(metadata.get("same_executor_reconnected"), bool)
+                else None,
+                auto_retried=metadata.get("auto_retried")
+                if isinstance(metadata.get("auto_retried"), bool)
+                else None,
+                auto_retry_skipped_reason=metadata.get("auto_retry_skipped_reason")
+                if isinstance(metadata.get("auto_retry_skipped_reason"), str)
+                else None,
+            )
+            return result.model_copy(update={"output": output, "metadata": metadata})
+        return result.model_copy(update={"metadata": metadata})
+
+    async def _retry_tool_after_same_executor_reconnect(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+        registered: Any | None,
+        target_executor_id: str | None,
+        output_chunk_callback: Any,
+        original_result: ToolResult,
+    ) -> ToolResult | None:
+        return await self._handle_tool_after_same_executor_transient_failure(
+            ctx,
+            tc=tc,
+            registered=registered,
+            target_executor_id=target_executor_id,
+            output_chunk_callback=output_chunk_callback,
+            original_result=original_result,
+        )
 
     def _resolve_target_connection(
         self,
@@ -13536,6 +13989,9 @@ class AgentLoop:
         on_token: TokenCallback | None = None,
         trigger: str = "automatic",
         skip_few_events_check: bool = False,
+        min_relevant_events: int | None = None,
+        long_lived_chat: bool = False,
+        emit_timeout_notice: bool = True,
     ) -> CompactionResult | None:
         """Automatically compact a session and return the compaction result.
 
@@ -13555,16 +14011,27 @@ class AgentLoop:
         # created a near-empty session).
         cache_entry = self.session_cache.get_entry(ctx.session.session_id)
         if cache_entry is not None and not skip_few_events_check:
-            preserve_turns = getattr(self.compaction_strategy, "preserve_turns", 10)
-            user_event_count = sum(1 for e in cache_entry.events if e.type == "user_message")
-            if user_event_count <= preserve_turns:
+            relevant_events = self.session_cache.get_events_since_compaction(
+                ctx.session.session_id,
+                ["user_message", "assistant_message"],
+            )
+            if min_relevant_events is None:
+                preserve_turns = getattr(self.compaction_strategy, "preserve_turns", 10)
+                too_few_events = (
+                    sum(1 for e in relevant_events if e.type == "user_message") <= preserve_turns
+                )
+            else:
+                preserve_turns = None
+                too_few_events = len(relevant_events) < min_relevant_events
+            if too_few_events:
                 logger.debug(
                     "agent: auto-compact skipped — too few events",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
-                            "user_events": user_event_count,
+                            "relevant_events": len(relevant_events),
                             "preserve_turns": preserve_turns,
+                            "min_relevant_events": min_relevant_events,
                         }
                     },
                 )
@@ -13583,6 +14050,7 @@ class AgentLoop:
                         ctx.session,
                         trigger=trigger,
                         model_context=model_context,
+                        long_lived_chat=long_lived_chat,
                     ),
                     timeout=AUTO_COMPACTION_TIMEOUT_SECONDS,
                 )
@@ -13595,16 +14063,17 @@ class AgentLoop:
                     "agent: auto-compaction timed out; using mechanical fallback",
                     extra={"extra_data": {"session_id": ctx.session.session_id}},
                 )
-                await self._emit_compaction_notice(
-                    ctx,
-                    (
-                        "LLM compaction timed out; using mechanical compaction fallback "
-                        "so the conversation can continue with a smaller context."
-                    ),
-                    on_token=on_token,
-                    persist=True,
-                    metadata=(run.event_data() if run is not None else None),
-                )
+                if emit_timeout_notice:
+                    await self._emit_compaction_notice(
+                        ctx,
+                        (
+                            "LLM compaction timed out; using mechanical compaction fallback "
+                            "so the conversation can continue with a smaller context."
+                        ),
+                        on_token=on_token,
+                        persist=True,
+                        metadata=(run.event_data() if run is not None else None),
+                    )
                 try:
                     compaction_result = await self.compaction_strategy.compact_with_fallback(
                         ctx.session,
@@ -13643,6 +14112,61 @@ class AgentLoop:
             },
         )
         return compaction_result
+
+    def session_is_locked(self, session_id: str) -> bool:
+        """Return whether a session currently has an active agent-loop turn."""
+
+        return self.session_lock.is_locked(session_id)
+
+    async def run_idle_checkpoint_compaction(
+        self,
+        *,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+        min_events: int,
+    ) -> SessionModel | None:
+        """Compact and rotate an idle long-lived chat session when it is substantial."""
+
+        if self.session_is_locked(session.session_id):
+            return None
+        try:
+            await self.session_cache.refresh(session)
+        except Exception:
+            logger.warning(
+                "agent: idle checkpoint cache refresh failed",
+                extra={"extra_data": {"session_id": session.session_id}},
+                exc_info=True,
+            )
+            return None
+
+        ctx = StepContext(
+            step_definition=StepDefinition(name="direct", type="run", prompt=""),
+            session=session,
+            conversation=conversation,
+            agent=agent,
+            policy=CHAT_POLICY,
+        )
+        run = CompactionRunContext(
+            trigger="idle_checkpoint",
+            reason="long_lived_chat_idle",
+        )
+        compaction_result = await self._auto_compact(
+            ctx,
+            run=run,
+            trigger="idle_checkpoint",
+            min_relevant_events=min_events,
+            long_lived_chat=True,
+            emit_timeout_notice=False,
+        )
+        if compaction_result is None:
+            return None
+        return await self._rotate_after_compaction(
+            ctx,
+            compaction_result,
+            trigger="idle_checkpoint",
+            run=run,
+        )
 
     def _raise_if_cancelled(self, ctx: StepContext) -> None:
         """Abort the current step when external control requested interruption."""
@@ -14299,17 +14823,26 @@ class AgentLoop:
 
     def _tool_runtime_metadata(self, ctx: StepContext) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
+        runtime_agent = ctx.executor_agent or ctx.agent
         metadata["turn_id"] = ctx.turn_id
         metadata["runtime_access"] = {
             "user_email": ctx.session.user_email,
-            "agent_id": ctx.agent.agent_id,
-            "agent_owner_email": ctx.agent.owner_email,
-            "agent_type": ctx.agent.agent_type,
+            "agent_id": runtime_agent.agent_id,
+            "agent_owner_email": runtime_agent.owner_email,
+            "agent_type": runtime_agent.agent_type,
+            "tool_agent_id": ctx.agent.agent_id,
+            "tool_agent_owner_email": ctx.agent.owner_email,
+            "tool_agent_type": ctx.agent.agent_type,
             "session_id": ctx.session.session_id,
             "conversation_id": ctx.conversation.conversation_id,
+            "task_id": ctx.task_id,
+            "step_name": ctx.step_definition.name,
+            "step_run_id": ctx.step_run_id,
             "parent_session_id": getattr(ctx.session, "parent_session_id", None),
             "delegation_mode": getattr(ctx.session, "delegation_mode", None),
             "workflow_step": bool(ctx.task_id or ctx.step_run_id),
+            "interaction_mode": ctx.interaction_mode,
+            "session_policy": ctx.session_policy,
         }
         if ctx.workspace_root:
             metadata["workspace_root"] = ctx.workspace_root
@@ -15341,14 +15874,21 @@ class AgentLoop:
         """
 
         promoted: set[str] = set()
-        if not isinstance(ctx.agent.skills, dict):
-            raw_ids = []
-        else:
+        if isinstance(ctx.agent.skills, dict):
             raw_ids = ctx.agent.skills.get("_attached_skill_tool_ids")
-        if isinstance(raw_ids, list):
-            promoted.update(
-                str(tool_id) for tool_id in raw_ids if isinstance(tool_id, str) and tool_id.strip()
-            )
+            if isinstance(raw_ids, list):
+                promoted.update(
+                    str(tool_id)
+                    for tool_id in raw_ids
+                    if isinstance(tool_id, str) and tool_id.strip()
+                )
+            auto_loaded_ids = ctx.agent.skills.get("_auto_loaded_skill_tool_ids")
+            if isinstance(auto_loaded_ids, list):
+                promoted.update(
+                    str(tool_id)
+                    for tool_id in auto_loaded_ids
+                    if isinstance(tool_id, str) and tool_id.strip()
+                )
         get_discovered = getattr(self.session_cache, "get_discovered_tool_ids", None)
         if callable(get_discovered):
             promoted.update(
@@ -15359,10 +15899,20 @@ class AgentLoop:
         return promoted
 
     def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
+        activated: set[str] = set()
+        if isinstance(ctx.agent.skills, dict):
+            raw_auto_loaded_ids = ctx.agent.skills.get("_auto_loaded_skill_tool_ids")
+            if isinstance(raw_auto_loaded_ids, list):
+                activated.update(
+                    str(tool_id)
+                    for tool_id in raw_auto_loaded_ids
+                    if isinstance(tool_id, str) and tool_id.strip()
+                )
         getter = getattr(self.session_cache, "get_activated_skill_tool_ids", None)
         if not callable(getter):
-            return set()
-        return set(getter(ctx.session.session_id))
+            return activated
+        activated.update(getter(ctx.session.session_id))
+        return activated
 
     def _step_log_metadata(self, ctx: StepContext) -> dict[str, Any]:
         workflow = getattr(ctx, "workflow", None)

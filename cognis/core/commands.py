@@ -19,6 +19,7 @@ from typing import Any
 from cognis.core.agent_loop import PauseResolution
 from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
 from cognis.core.compaction import CompactionModelContext
+from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -54,6 +55,7 @@ _EXACT_SYSTEM_SLASH_COMMANDS = frozenset(
 )
 _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
     {
+        "/fork",
         "/model",
         "/thinking",
         "/executor",
@@ -213,23 +215,41 @@ class CommandDispatcher:
 
         # /new, /reset, /clear
         if stripped in ("/new", "/reset", "/clear"):
-            if has_busy_turn:
-                return CommandResult(
-                    type="error",
-                    text="Cannot reset while a turn is active. Wait for it to finish or cancel it.",
-                    data={"code": "turn_active"},
-                )
+            # /new is the recovery escape hatch for both ephemeral web
+            # conversations and sticky/channel conversations. The handler
+            # cancels any active turn before creating a fresh conversation or
+            # rotating the active session.
             return await self._handle_new(conversation, session, agent, user_email)
 
-        # /fork
-        if stripped == "/fork":
+        # /fork [message]
+        if stripped == "/fork" or stripped.startswith("/fork "):
+            fork_message = stripped.removeprefix("/fork").strip() or None
+            active_turn_checkpoint: dict[str, str | None] | None = None
             if has_busy_turn:
-                return CommandResult(
-                    type="error",
-                    text="Cannot fork while a turn is active. Wait for it to finish or cancel it.",
-                    data={"code": "turn_active"},
+                checkpoint_getter = (
+                    getattr(self._turn_scheduler, "active_turn_checkpoint", None)
+                    if self._turn_scheduler is not None
+                    else None
                 )
-            return await self._handle_fork(conversation, session, agent, user_email)
+                if checkpoint_getter is not None:
+                    active_turn_checkpoint = checkpoint_getter(conversation.conversation_id)
+                if not active_turn_checkpoint or not active_turn_checkpoint.get("turn_id"):
+                    return CommandResult(
+                        type="error",
+                        text=(
+                            "Cannot fork while the active turn checkpoint is unavailable. "
+                            "Wait for the turn to finish or cancel it."
+                        ),
+                        data={"code": "active_turn_checkpoint_unavailable"},
+                    )
+            return await self._handle_fork(
+                conversation,
+                session,
+                agent,
+                user_email,
+                fork_message=fork_message,
+                active_turn_checkpoint=active_turn_checkpoint,
+            )
 
         # /undo and /redo rebase visible history within the same conversation.
         if stripped == "/undo":
@@ -481,9 +501,13 @@ class CommandDispatcher:
     ) -> CommandResult:
         """Handle /new, /reset, or /clear."""
         conversation_id = conversation.conversation_id
+        is_sticky = is_long_lived_chat_context(conversation.context)
 
-        if conversation.context.type == "web":
-            # Web context: create a new conversation entirely
+        if self._turn_scheduler is not None:
+            await self._turn_scheduler.cancel_turn(conversation_id)
+
+        if not is_sticky:
+            # Ephemeral context: create a new conversation entirely.
             try:
                 (
                     new_conversation,
@@ -529,7 +553,9 @@ class CommandDispatcher:
                 user_email=user_email,
                 reason="user_reset",
             )
-            # Channel-bound: create new root session within same conversation
+            # Sticky/channel-bound context: create a new root session within
+            # the same conversation so older sessions remain linked read-only
+            # history.
             try:
                 new_session = await self._session_manager.rotate_session(
                     conversation_id=conversation_id,
@@ -538,13 +564,14 @@ class CommandDispatcher:
                     completion_reason="user_reset",
                 )
                 await self._clear_conversation_execution_paths(conversation)
-                async with self._session_factory() as db_session:
-                    from cognis.store import queries as store_queries
+                if self._session_factory is not None:
+                    async with self._session_factory() as db_session:
+                        from cognis.store import queries as store_queries
 
-                    await store_queries.reset_conversation_active_executor(
-                        db_session, conversation_id
-                    )
-                    await db_session.commit()
+                        await store_queries.reset_conversation_active_executor(
+                            db_session, conversation_id
+                        )
+                        await db_session.commit()
             except Exception:
                 logger.exception("Command /new failed to rotate session")
                 return CommandResult(
@@ -572,23 +599,54 @@ class CommandDispatcher:
         session: SessionModel,
         agent: AgentDefinition,
         user_email: str,
+        *,
+        fork_message: str | None = None,
+        active_turn_checkpoint: dict[str, str | None] | None = None,
     ) -> CommandResult:
-        """Handle /fork."""
+        """Handle /fork and optionally start a user turn in the fork."""
+
+        if fork_message is not None and self._turn_scheduler is None:
+            return CommandResult(
+                type="error",
+                text="Cannot fork with a message because turn scheduling is unavailable.",
+                data={"code": "turn_scheduler_unavailable"},
+            )
 
         try:
-            (
-                new_conversation,
-                new_session,
-                copied,
-            ) = await self._session_manager.fork_into_new_conversation(
-                source_session=session,
-                source_conversation=conversation,
-                agent=agent,
-                user_email=user_email,
-                title=f"Fork: {conversation.title}" if conversation.title else "Forked chat",
-                intention=f"Forked conversation with {agent.name}",
-                snapshot_extras={"trigger": "user_command:/fork"},
-            )
+            fork_kwargs = {
+                "source_session": session,
+                "source_conversation": conversation,
+                "agent": agent,
+                "user_email": user_email,
+                "title": f"Fork: {conversation.title}" if conversation.title else "Forked chat",
+                "intention": f"Forked conversation with {agent.name}",
+                "snapshot_extras": {"trigger": "user_command:/fork"},
+            }
+            if active_turn_checkpoint is not None:
+                fork_from_checkpoint = getattr(
+                    self._session_manager,
+                    "fork_active_turn_checkpoint_into_new_conversation",
+                    None,
+                )
+                if fork_from_checkpoint is not None:
+                    fork_kwargs["active_turn_id"] = active_turn_checkpoint.get("turn_id")
+                    (
+                        new_conversation,
+                        new_session,
+                        copied,
+                    ) = await fork_from_checkpoint(**fork_kwargs)
+                else:
+                    (
+                        new_conversation,
+                        new_session,
+                        copied,
+                    ) = await self._session_manager.fork_into_new_conversation(**fork_kwargs)
+            else:
+                (
+                    new_conversation,
+                    new_session,
+                    copied,
+                ) = await self._session_manager.fork_into_new_conversation(**fork_kwargs)
         except Exception:
             logger.exception(
                 "Command /fork failed",
@@ -620,18 +678,54 @@ class CommandDispatcher:
                 data={"code": "fork_copy_failed"},
             )
 
+        data: dict[str, Any] = {
+            "code": "fork_created",
+            "conversation_id": new_conversation.conversation_id,
+            "session_id": new_session.session_id,
+            "old_conversation_id": conversation.conversation_id,
+            "previous_conversation_id": conversation.conversation_id,
+            "previous_session_id": session.session_id,
+            "copied": copied,
+        }
+        if active_turn_checkpoint is not None:
+            data["checkpoint"] = "last_completed_turn"
+            if active_turn_checkpoint.get("turn_id"):
+                data["excluded_active_turn_id"] = active_turn_checkpoint["turn_id"]
+        text = (
+            "Conversation forked from the last completed turn."
+            if active_turn_checkpoint is not None
+            else "Conversation forked."
+        )
+
+        turn_scheduler = self._turn_scheduler
+        if fork_message is not None and turn_scheduler is not None:
+            turn_error = await turn_scheduler.submit_turn(
+                new_conversation.conversation_id,
+                fork_message,
+                user_email=user_email,
+            )
+            data["initial_message_submitted"] = turn_error is None
+            if turn_error is not None:
+                data["initial_message_error"] = {
+                    "code": turn_error.code,
+                    "message": turn_error.message,
+                    "recoverable": turn_error.recoverable,
+                }
+                text = (
+                    "Conversation forked, but the follow-up message could not be started: "
+                    f"{turn_error.message}"
+                )
+            else:
+                text = (
+                    "Conversation forked from the last completed turn and started with your message."
+                    if active_turn_checkpoint is not None
+                    else "Conversation forked and started with your message."
+                )
+
         return CommandResult(
             type="conversation_created",
-            text="Conversation forked.",
-            data={
-                "code": "fork_created",
-                "conversation_id": new_conversation.conversation_id,
-                "session_id": new_session.session_id,
-                "old_conversation_id": conversation.conversation_id,
-                "previous_conversation_id": conversation.conversation_id,
-                "previous_session_id": session.session_id,
-                "copied": copied,
-            },
+            text=text,
+            data=data,
         )
 
     async def _handle_undo(
@@ -1850,7 +1944,7 @@ Available commands:
   /info              Show session details and statistics
   /compact           Compact conversation history
   /summarize         Alias for /compact
-  /fork              Fork this conversation into a new chat
+  /fork [message]    Fork this conversation; optionally start the fork with message
   /task <text>       Create a background workflow task
   /research <text>   Create a background research task
   /implement <text>  Create a background implementation task

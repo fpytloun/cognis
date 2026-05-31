@@ -1,6 +1,13 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import Copy from 'lucide-svelte/icons/copy';
+  import Eye from 'lucide-svelte/icons/eye';
+  import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+  import MessageSquareText from 'lucide-svelte/icons/message-square-text';
+  import Pencil from 'lucide-svelte/icons/pencil';
+  import Plus from 'lucide-svelte/icons/plus';
+  import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
@@ -9,10 +16,10 @@
   import Card from '$lib/components/ui/Card.svelte';
   import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import { api, asApiError } from '$lib/api/client';
-  import { confirmAction } from '$lib/stores/confirm';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, Workflow } from '$lib/types/api';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
+  import type { Agent, Conversation, Workflow } from '$lib/types/api';
 
   // Expanded-group state survives tab switches via sessionStorage.
   // Falls back to expanded-by-default on first visit and when storage is
@@ -48,14 +55,21 @@
   let secondaryExpanded = readExpanded(AGENTS_SECONDARY_EXPANDED_KEY, true);
   let lightboxUrl: string | null = null;
   let lightboxAlt = '';
+  let chatAgent: Agent | null = null;
+  let chatConversations: Conversation[] = [];
+  let chatLoading = false;
+  let chatCreating = false;
+  let chatError = '';
+  let chatDialogElement: HTMLDivElement | null = null;
+  let chatLastFocusedElement: HTMLElement | null = null;
 
   // Persist expanded state whenever it changes so the next mount picks
   // it up. `$:` blocks run on every reactive update.
   $: writeExpanded(AGENTS_PRIMARY_EXPANDED_KEY, primaryExpanded);
   $: writeExpanded(AGENTS_SECONDARY_EXPANDED_KEY, secondaryExpanded);
 
-  $: primaryAgents = agents.filter((a) => a.agent_type === 'primary');
-  $: secondaryAgents = agents.filter((a) => a.agent_type === 'secondary');
+  $: primaryAgents = sortAgents(agents.filter((a) => a.agent_type === 'primary'));
+  $: secondaryAgents = sortAgents(agents.filter((a) => a.agent_type === 'secondary'));
 
   async function loadAgents(): Promise<void> {
     loading = true;
@@ -77,35 +91,155 @@
     return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId ?? 'automatic';
   }
 
-  async function toggleStatus(agent: Agent): Promise<void> {
+  function displayName(agent: Agent): string {
+    return agent.display_name ?? agent.name;
+  }
+
+  function agentStatusLabel(agent: Agent): string {
+    return agent.disabled ? 'disabled' : agent.status;
+  }
+
+  function agentStatusRank(agent: Agent): number {
+    const status = agentStatusLabel(agent);
+    if (status === 'active') return 0;
+    if (status === 'suspended') return 1;
+    if (status === 'disabled') return 2;
+    if (status === 'archived') return 3;
+    return 4;
+  }
+
+  function sortAgents(items: Agent[]): Agent[] {
+    return [...items].sort((left, right) => {
+      const statusDiff = agentStatusRank(left) - agentStatusRank(right);
+      if (statusDiff !== 0) return statusDiff;
+      return displayName(left).localeCompare(displayName(right), undefined, { sensitivity: 'base' });
+    });
+  }
+
+  function canChat(agent: Agent): boolean {
+    return agent.agent_type === 'primary' && agent.status === 'active' && !agent.disabled;
+  }
+
+  function conversationTimestamp(conversation: Conversation): string | null {
+    return conversation.last_message_at ?? conversation.updated_at ?? conversation.created_at;
+  }
+
+  function sortedConversations(conversations: Conversation[]): Conversation[] {
+    return [...conversations].sort((left, right) => {
+      const leftTime = conversationTimestamp(left);
+      const rightTime = conversationTimestamp(right);
+      return (rightTime ? Date.parse(rightTime) : 0) - (leftTime ? Date.parse(leftTime) : 0);
+    });
+  }
+
+  function conversationTitle(conversation: Conversation): string {
+    return conversation.title?.trim() || 'Untitled conversation';
+  }
+
+  async function openChatModal(agent: Agent): Promise<void> {
+    if (!canChat(agent)) return;
+    chatLastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    chatAgent = agent;
+    chatLoading = true;
+    chatCreating = false;
+    chatError = '';
+    chatConversations = [];
+    await tick();
+    chatDialogElement?.focus();
     try {
-      if (agent.status === 'active') {
-        await api.agents.suspend(agent.agent_id);
-      } else {
-        await api.agents.activate(agent.agent_id);
-      }
-      await loadAgents();
-      addToast(`Agent ${agent.status === 'active' ? 'suspended' : 'activated'}.`, 'success');
+      const conversations = await api.conversations.listAll({
+        contextType: 'web',
+        agentId: agent.agent_id,
+        status: 'active'
+      });
+      chatConversations = sortedConversations(conversations);
     } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to update agent status');
+      chatError = asApiError(caughtError).message;
+    } finally {
+      chatLoading = false;
     }
   }
 
-  async function syncPersonality(agent: Agent): Promise<void> {
-    const confirmed = await confirmAction({
-      title: 'Sync personality to Mnemory?',
-      message: 'This will re-bootstrap the agent personality in Mnemory. If the agent has evolved its identity through conversations, this may override those changes.',
-      confirmLabel: 'Sync',
-      variant: 'danger',
-    });
-    if (!confirmed) return;
+  async function closeChatModal(): Promise<void> {
+    if (chatCreating) return;
+    const elementToRestore = chatLastFocusedElement;
+    chatAgent = null;
+    chatConversations = [];
+    chatError = '';
+    chatDialogElement = null;
+    chatLastFocusedElement = null;
+    await tick();
+    elementToRestore?.focus();
+  }
+
+  function focusableChatElements(): HTMLElement[] {
+    if (!chatDialogElement) return [];
+    return Array.from(
+      chatDialogElement.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    ).filter((element) => !element.hasAttribute('disabled') && element.getAttribute('aria-hidden') !== 'true');
+  }
+
+  function handleChatModalKeydown(event: KeyboardEvent): void {
+    if (!chatAgent) return;
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      void closeChatModal();
+      return;
+    }
+
+    if (event.key !== 'Tab') return;
+
+    const focusableElements = focusableChatElements();
+    if (focusableElements.length === 0) {
+      event.preventDefault();
+      chatDialogElement?.focus();
+      return;
+    }
+
+    const firstElement = focusableElements[0];
+    const lastElement = focusableElements[focusableElements.length - 1];
+    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    if (event.shiftKey) {
+      if (!activeElement || activeElement === firstElement || !chatDialogElement?.contains(activeElement)) {
+        event.preventDefault();
+        lastElement.focus();
+      }
+      return;
+    }
+
+    if (activeElement === lastElement) {
+      event.preventDefault();
+      firstElement.focus();
+    }
+  }
+
+  async function openConversation(conversation: Conversation): Promise<void> {
+    await goto(`/chat/${conversation.conversation_id}`);
+  }
+
+  async function startNewConversation(): Promise<void> {
+    if (!chatAgent) return;
+    chatCreating = true;
+    chatError = '';
     try {
-      await api.agents.syncPersonality(agent.agent_id);
-      addToast('Personality synced.', 'success');
+      const conversation = await api.conversations.create({
+        agent_id: chatAgent.agent_id,
+        context: {
+          type: 'web',
+          ref: null,
+          platform_data: {},
+          memory_labels: {}
+        }
+      });
+      await goto(`/chat/${conversation.conversation_id}`);
     } catch (caughtError) {
-      error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to sync personality');
+      chatError = asApiError(caughtError).message;
+    } finally {
+      chatCreating = false;
     }
   }
 
@@ -148,10 +282,14 @@
   <section class="space-y-5 overflow-x-hidden">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent management</p>
-        <h1 class="mt-1 text-2xl font-semibold text-white">Agents</h1>
+        <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent inventory</p>
+        <h1 class="mt-1 text-2xl font-semibold text-white">Available agents</h1>
+        <p class="mt-1 max-w-2xl text-sm text-slate-400">Choose an agent to chat with, inspect, or configure. Active agents are listed first, then sorted alphabetically.</p>
       </div>
-      <Button onclick={() => goto('/agents/new')}>Create agent</Button>
+      <Button onclick={() => goto('/agents/new')}>
+        <Plus class="mr-2 h-4 w-4" />
+        Create agent
+      </Button>
     </div>
 
     {#if error}
@@ -176,7 +314,7 @@
 
       {#if primaryExpanded}
         <div class="mt-3 grid gap-4 lg:grid-cols-2">
-          {#each primaryAgents as agent}
+          {#each primaryAgents as agent (agent.agent_id)}
             {@render agentCard(agent)}
           {:else}
             <p class="text-sm text-slate-500">No primary agents yet. Create one to get started.</p>
@@ -203,7 +341,7 @@
 
       {#if secondaryExpanded}
         <div class="mt-3 grid gap-4 lg:grid-cols-2">
-          {#each secondaryAgents as agent}
+          {#each secondaryAgents as agent (agent.agent_id)}
             {@render agentCard(agent)}
           {:else}
             <p class="text-sm text-slate-500">No secondary agents.</p>
@@ -217,17 +355,17 @@
 {#snippet agentCard(agent: Agent)}
   <Card class="p-4 sm:p-5">
     <div class="flex flex-wrap items-start justify-between gap-4">
-      <div class="flex min-w-0 flex-1 items-start gap-4">
+      <div class="flex min-w-0 flex-1 items-start gap-5">
         {#if agent.avatar_url}
-          <button type="button" class="shrink-0 cursor-pointer" onclick={() => { lightboxUrl = agent.avatar_url; lightboxAlt = agent.display_name ?? agent.name; }}>
-            <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} />
+          <button type="button" class="shrink-0 cursor-pointer" title={`View ${displayName(agent)} avatar`} aria-label={`View ${displayName(agent)} avatar`} onclick={() => { lightboxUrl = agent.avatar_url; lightboxAlt = displayName(agent); }}>
+            <AgentAvatar name={displayName(agent)} avatarUrl={agent.avatar_url} class="h-20 w-20 rounded-3xl text-xl sm:h-24 sm:w-24" />
           </button>
         {:else}
-          <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={null} />
+          <AgentAvatar name={displayName(agent)} avatarUrl={null} class="h-20 w-20 rounded-3xl text-xl sm:h-24 sm:w-24" />
         {/if}
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
-            <h2 class="truncate text-lg font-semibold text-white">{agent.display_name ?? agent.name}</h2>
+            <h2 class="truncate text-lg font-semibold text-white">{displayName(agent)}</h2>
             {#if agent.is_system}
               <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.15em] text-sky-300">System</span>
             {/if}
@@ -243,33 +381,63 @@
         </div>
       </div>
       <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200">
-        {agent.disabled ? 'disabled' : agent.status}
+        {agentStatusLabel(agent)}
       </span>
     </div>
 
-    {#if agent.agent_type === 'primary'}
-      <dl class="mt-4 grid gap-3 text-sm text-slate-300 md:grid-cols-2">
-        <div>
-          <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Default workflow</dt>
-          <dd class="mt-1">{defaultWorkflowLabel(agent)}</dd>
-        </div>
-        <div>
-          <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
-          <dd class="mt-1">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>
-        </div>
-      </dl>
-    {:else}
-      <dl class="mt-4 grid gap-3 text-sm text-slate-300 md:grid-cols-2">
-        <div>
-          <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
-          <dd class="mt-1">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit from caller'}</dd>
-        </div>
-        <div>
-          <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Tools</dt>
-          <dd class="mt-1">{Array.isArray((agent.tools as Record<string, unknown>)?.builtin_tools) ? ((agent.tools as Record<string, unknown>).builtin_tools as string[]).join(', ') : 'default'}</dd>
-        </div>
-      </dl>
-    {/if}
+    <div class="mt-4 flex flex-wrap items-start justify-between gap-4">
+      {#if agent.agent_type === 'primary'}
+        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-slate-300 md:grid-cols-2">
+          <div class="min-w-0">
+            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Default workflow</dt>
+            <dd class="mt-1 truncate">{defaultWorkflowLabel(agent)}</dd>
+          </div>
+          <div class="min-w-0">
+            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
+            <dd class="mt-1 truncate">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>
+          </div>
+        </dl>
+      {:else}
+        <dl class="grid min-w-0 flex-1 gap-3 text-sm text-slate-300 md:grid-cols-2">
+          <div class="min-w-0">
+            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Model</dt>
+            <dd class="mt-1 truncate">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit from caller'}</dd>
+          </div>
+          <div class="min-w-0">
+            <dt class="text-xs uppercase tracking-[0.2em] text-slate-500">Tools</dt>
+            <dd class="mt-1 truncate">{Array.isArray((agent.tools as Record<string, unknown>)?.builtin_tools) ? ((agent.tools as Record<string, unknown>).builtin_tools as string[]).join(', ') : 'default'}</dd>
+          </div>
+        </dl>
+      {/if}
+
+      <div class="flex shrink-0 gap-2 sm:self-end">
+        {#if canChat(agent)}
+          <Button size="icon" variant="primary" title={`Chat with ${displayName(agent)}`} aria-label={`Chat with ${displayName(agent)}`} onclick={() => openChatModal(agent)}>
+            <MessageSquareText class="h-4 w-4" />
+          </Button>
+        {/if}
+        {#if agent.is_shared_with_me}
+          <Button size="icon" variant="secondary" title={`View ${displayName(agent)}`} aria-label={`View ${displayName(agent)}`} onclick={() => goto(`/agents/${agent.agent_id}`)}>
+            <Eye class="h-4 w-4" />
+          </Button>
+        {:else if !agent.is_system}
+          <Button size="icon" variant="secondary" title={`Edit ${displayName(agent)}`} aria-label={`Edit ${displayName(agent)}`} onclick={() => goto(`/agents/${agent.agent_id}`)}>
+            <Pencil class="h-4 w-4" />
+          </Button>
+        {:else}
+          <Button size="icon" variant="secondary" title={agent.has_overrides || agent.disabled ? `Configure ${displayName(agent)}` : `View ${displayName(agent)}`} aria-label={agent.has_overrides || agent.disabled ? `Configure ${displayName(agent)}` : `View ${displayName(agent)}`} onclick={() => goto(`/agents/${agent.agent_id}`)}>
+            {#if agent.has_overrides || agent.disabled}
+              <Pencil class="h-4 w-4" />
+            {:else}
+              <Eye class="h-4 w-4" />
+            {/if}
+          </Button>
+          <Button size="icon" variant="secondary" title={`Duplicate ${displayName(agent)}`} aria-label={`Duplicate ${displayName(agent)}`} onclick={() => duplicateAgent(agent)}>
+            <Copy class="h-4 w-4" />
+          </Button>
+        {/if}
+      </div>
+    </div>
 
     {#if !agent.personality_synced && agent.agent_type === 'primary'}
       <div class="mt-4 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
@@ -278,22 +446,87 @@
       </div>
     {/if}
 
-    <div class="mt-5 flex flex-wrap gap-2">
-      {#if agent.is_shared_with_me}
-        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>View</Button>
-      {:else if !agent.is_system}
-        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>Edit</Button>
-        <Button size="sm" variant="secondary" onclick={() => toggleStatus(agent)}>{agent.status === 'active' ? 'Suspend' : 'Activate'}</Button>
-        {#if agent.agent_type === 'primary'}
-          <Button size="sm" variant="secondary" onclick={() => syncPersonality(agent)}>Sync personality</Button>
-        {/if}
-      {:else}
-        <Button size="sm" variant="secondary" onclick={() => goto(`/agents/${agent.agent_id}`)}>{agent.has_overrides || agent.disabled ? 'Configure' : 'View'}</Button>
-        <Button size="sm" variant="secondary" onclick={() => duplicateAgent(agent)}>Duplicate</Button>
-      {/if}
-    </div>
   </Card>
 {/snippet}
+
+{#if chatAgent}
+  <div
+    class="app-viewport-overlay z-50 flex items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/80 backdrop-blur-sm sm:items-center"
+    style="padding-left: var(--app-floating-overlay-left); padding-right: var(--app-floating-overlay-right); padding-top: var(--app-overlay-gap); padding-bottom: var(--app-overlay-gap);"
+    role="presentation"
+    onkeydown={handleChatModalKeydown}
+  >
+    <button
+      type="button"
+      class="absolute inset-0 cursor-default"
+      aria-label="Close chat selector"
+      onclick={() => void closeChatModal()}
+    ></button>
+    <div
+      bind:this={chatDialogElement}
+      class="relative flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="agent-chat-title"
+      aria-describedby="agent-chat-description"
+      tabindex="-1"
+    >
+      <div class="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
+        <div class="min-w-0">
+          <p class="text-xs uppercase tracking-[0.22em] text-slate-500">Chat with agent</p>
+          <h2 id="agent-chat-title" class="mt-1 truncate text-xl font-semibold text-white">{displayName(chatAgent)}</h2>
+          <p id="agent-chat-description" class="mt-1 text-sm text-slate-400">Open a recent conversation or start a new one.</p>
+        </div>
+        <Button size="icon" variant="ghost" aria-label="Close chat selector" title="Close" onclick={() => void closeChatModal()} disabled={chatCreating}>
+          <X class="h-4 w-4" />
+        </Button>
+      </div>
+
+      <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+        {#if chatError}
+          <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{chatError}</p>
+        {/if}
+
+        <Button class="w-full justify-center" disabled={chatCreating || chatLoading} onclick={() => void startNewConversation()}>
+          {#if chatCreating}
+            <LoaderCircle class="mr-2 h-4 w-4 animate-spin" />
+            Creating conversation...
+          {:else}
+            <Plus class="mr-2 h-4 w-4" />
+            Start new conversation
+          {/if}
+        </Button>
+
+        <div>
+          <h3 class="text-sm font-medium text-slate-200">Latest conversations</h3>
+          {#if chatLoading}
+            <div class="mt-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-5 text-sm text-slate-400">Loading conversations...</div>
+          {:else if chatConversations.length > 0}
+            <div class="mt-3 max-h-[50vh] space-y-2 overflow-y-auto pr-1">
+              {#each chatConversations as conversation (conversation.conversation_id)}
+                <button type="button" class="w-full rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-left transition hover:border-sky-500/50 hover:bg-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400" onclick={() => void openConversation(conversation)}>
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
+                      <p class="mt-1 break-all text-xs text-slate-500">{conversation.conversation_id}</p>
+                    </div>
+                    {#if conversationTimestamp(conversation)}
+                      <span class="shrink-0 text-xs text-slate-500" title={formatAbsoluteTime(conversationTimestamp(conversation))}>
+                        {formatRelativeTime(conversationTimestamp(conversation))}
+                      </span>
+                    {/if}
+                  </div>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="mt-3 rounded-2xl border border-dashed border-slate-800 px-4 py-5 text-sm text-slate-500">No active web conversations for this agent yet.</p>
+          {/if}
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if lightboxUrl}
   <ImageLightbox src={lightboxUrl} alt={lightboxAlt} onClose={() => { lightboxUrl = null; }} />

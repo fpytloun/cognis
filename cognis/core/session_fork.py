@@ -20,6 +20,8 @@ from cognis.models.session import SessionEvent
 
 logger = get_logger(__name__)
 
+INTARIS_EVENT_APPEND_BATCH_SIZE = 1000
+
 
 def _prefix_entry_from_event(raw_event: dict[str, Any]) -> ImmutablePrefixEntry | None:
     event_type = str(raw_event.get("type") or "")
@@ -175,26 +177,35 @@ async def fork_session_events(
     target_intaris_id = target_session.intaris_session_id or target_session.session_id
     try:
         if source_events:
-            session_events = [
-                SessionEvent(type=event.type, data=event.data) for event in source_events
-            ]
-            append_result = await providers.guardrails.record_events(
-                session_id=target_intaris_id,
-                events=session_events,
-                source=record_source,
-            )
-            remapped_events = [
-                CachedEvent(
-                    seq=append_result.first_seq + index,
-                    type=event.type,
-                    data=event.data,
+            last_seq = 0
+            for batch_start in range(0, len(source_events), INTARIS_EVENT_APPEND_BATCH_SIZE):
+                source_batch = source_events[
+                    batch_start : batch_start + INTARIS_EVENT_APPEND_BATCH_SIZE
+                ]
+                session_events = [
+                    SessionEvent(type=event.type, data=event.data) for event in source_batch
+                ]
+                append_result = await providers.guardrails.record_events(
+                    session_id=target_intaris_id,
+                    events=session_events,
                     source=record_source,
-                    ts=event.ts,
                 )
-                for index, event in enumerate(source_events)
-            ]
-            await session_cache.seed_events(target_session, remapped_events, append_result.last_seq)
-            last_seq = append_result.last_seq
+                remapped_events = [
+                    CachedEvent(
+                        seq=append_result.first_seq + index,
+                        type=event.type,
+                        data=event.data,
+                        source=record_source,
+                        ts=event.ts,
+                    )
+                    for index, event in enumerate(source_batch)
+                ]
+                await session_cache.seed_events(
+                    target_session,
+                    remapped_events,
+                    append_result.last_seq,
+                )
+                last_seq = append_result.last_seq
         else:
             last_seq = 0
 

@@ -64,7 +64,7 @@ from cognis.core.workflow_management import (
 )
 from cognis.models.session import ConversationContext, SessionEvent
 from cognis.models.task import TaskDelivery, TaskModel
-from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
+from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
 from cognis.store.models import Task
 from cognis.store.queries import (
     add_task_dependency,
@@ -313,6 +313,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 interaction_mode_override=payload.interaction_mode_override,
+                session_policy=payload.session_policy,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
                 workspace_root=payload.workspace_root,
@@ -333,6 +334,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
                 delivery=delivery,
                 completion_delivery=completion_delivery,
                 interaction_mode_override=payload.interaction_mode_override,
+                session_policy=payload.session_policy,
                 workflow_id=resolved_workflow_id,
                 project_id=project_id,
                 workspace_root=payload.workspace_root,
@@ -705,6 +707,8 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 and payload.interaction_mode_override is None
             ):
                 row.interaction_mode_override = None
+            if "session_policy" in updates:
+                row.session_policy = updates.pop("session_policy")
             if (
                 payload.working_directory is not None
                 and payload.workspace_root is None
@@ -1413,6 +1417,7 @@ def _row_to_task(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
+        session_policy=SessionPolicy.model_validate(getattr(row, "session_policy", None) or {}),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         attempt_number=getattr(row, "attempt_number", 1),

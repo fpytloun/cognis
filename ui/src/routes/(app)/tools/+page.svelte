@@ -41,6 +41,11 @@ import Server from 'lucide-svelte/icons/server';
     isCachedObservedTool,
     mergeToolInventories
   } from '$lib/tools-registry';
+  import {
+    degradedExecutors,
+    executorDegradedDetails,
+    executorRuntimeSummary
+  } from '$lib/executors';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import type { ExecutorConfig, MCPServerConfigResponse, IntarisMCPServer, Skill, ToolDefinitionSummary, SystemDiagnostics } from '$lib/types/api';
 
@@ -328,6 +333,7 @@ import Server from 'lucide-svelte/icons/server';
 
   $: filteredExecutorMcpTools = filterMcpTools(observedLocalMcpTools, executorMcpSearch);
   $: executorMcpServerGroups = groupToolsByServer(filteredExecutorMcpTools);
+  $: degradedExecutorConfigs = degradedExecutors(executors);
 
   function toggleTool(key: string) {
     if (expandedTools.has(key)) {
@@ -564,6 +570,26 @@ import Server from 'lucide-svelte/icons/server';
         {#each registryWarnings.filter(w => w.includes('local MCP') || w.includes('MCP servers')) as warning}
           <div class="rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-2 text-sm text-sky-200">{warning}</div>
         {/each}
+      {/if}
+      {#if degradedExecutorConfigs.length > 0}
+        <div class="space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+          <div class="font-medium">{degradedExecutorConfigs.length} degraded executor(s) may affect executor-hosted tools or capabilities.</div>
+          {#each degradedExecutorConfigs as exec}
+            <div class="text-xs text-sky-100/90">
+              <span class="font-medium">{exec.name}</span>
+              {#if executorRuntimeSummary(exec)}
+                <span> — {executorRuntimeSummary(exec)}</span>
+              {/if}
+              {#if executorDegradedDetails(exec).length > 0}
+                <ul class="mt-1 list-disc pl-5">
+                  {#each executorDegradedDetails(exec) as detail}
+                    <li>{detail}</li>
+                  {/each}
+                </ul>
+              {/if}
+            </div>
+          {/each}
+        </div>
       {/if}
 
       <div class="flex gap-3 items-center flex-wrap">

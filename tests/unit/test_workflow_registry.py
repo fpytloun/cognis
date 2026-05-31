@@ -76,7 +76,10 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert implement_step.input is not None
     assert implement_step.input.type == "summary"
     assert "smallest correct change" in implement_step.prompt
-    assert "continue from that existing work instead of restarting from scratch" in implement_step.prompt
+    assert (
+        "continue from that existing work instead of restarting from scratch"
+        in implement_step.prompt
+    )
     assert "preserve valid prior changes" in implement_step.prompt
     assert "worktree, and branch setup" in implement_step.prompt
     assert "fix the issue and rerun" in implement_step.prompt
@@ -104,7 +107,7 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
         OutcomeRoute(
             status="rejected",
             action="revise(plan)",
-            max_loop_iterations=3,
+            max_loop_iterations=5,
             on_exhausted="gate",
         ),
         OutcomeRoute(status="failed", action="gate"),
@@ -123,7 +126,7 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
         OutcomeRoute(
             status="rejected",
             action="revise(implement)",
-            max_loop_iterations=3,
+            max_loop_iterations=5,
             on_exhausted="gate",
         ),
         OutcomeRoute(status="failed", action="gate"),
@@ -135,7 +138,9 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     )
     assert "use the prior review history" in code_review_step.prompt
     assert "focus on the new or changed diff since the last review" in code_review_step.prompt
-    assert "Do not re-report findings that are already fixed or unchanged" in code_review_step.prompt
+    assert (
+        "Do not re-report findings that are already fixed or unchanged" in code_review_step.prompt
+    )
     assert "Put the outcome only in step_complete" in code_review_step.prompt
     assert code_review_step.completion is not None
     assert code_review_step.completion.evaluate is False
@@ -148,6 +153,14 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     for step_name in ("plan", "implement", "update_docs", "remember"):
         step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == step_name)
         assert step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+
+
+def test_software_development_plan_step_scopes_delegation_guidance() -> None:
+    plan_step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "plan")
+
+    assert "Run multiple `delegate(wait=True)` calls" in plan_step.prompt
+    assert "identify whether later implementation could be safely split" in plan_step.prompt
+    assert "do not fan out implementation from this planning step" in plan_step.prompt
 
 
 def test_research_plan_step_uses_generic_evaluator_prompt() -> None:

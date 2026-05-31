@@ -15,6 +15,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from websockets.exceptions import ConnectionClosed
+
 from cognis.core.executor_resolution import filter_tools_by_executor
 from cognis.executor.inference_types import json_safe_inference_payload
 from cognis.models.tool import (
@@ -63,6 +65,71 @@ _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 60.0
 _MCP_PREPARE_TOTAL_TIMEOUT_SECONDS = 90.0
 _RUNTIME_METADATA_SCHEMA_VERSION = 1
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.1f", name, raw, default)
+        return default
+    if minimum is not None:
+        return max(minimum, value)
+    return value
+
+
+_WS_PING_INTERVAL_SECONDS = _env_float(
+    "COGNIS_EXECUTOR_WS_PING_INTERVAL_SECONDS",
+    30.0,
+    minimum=1.0,
+)
+_WS_PING_TIMEOUT_SECONDS = _env_float(
+    "COGNIS_EXECUTOR_WS_PING_TIMEOUT_SECONDS",
+    90.0,
+    minimum=1.0,
+)
+
+
+def _contains_process_exit_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_process_exit_exception(child) for child in exc.exceptions)
+    return False
+
+
+def _is_pure_cancellation_exception(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _is_pure_cancellation_exception(child) for child in exc.exceptions
+        )
+    return False
+
+
+def _should_reraise_isolated_exception(exc: BaseException) -> bool:
+    """Return whether isolation code must not suppress this BaseException."""
+
+    return _contains_process_exit_exception(exc) or _is_pure_cancellation_exception(exc)
+
+
+def _safe_base_exception_message(exc: BaseException, *, limit: int = 500) -> str:
+    """Build a redacted, compact message for ExceptionGroup/BaseException errors."""
+
+    if isinstance(exc, BaseExceptionGroup):
+        parts = [
+            f"{type(exc).__name__}: {_safe_message(str(exc), limit=limit)}",
+        ]
+        for child in exc.exceptions[:3]:
+            parts.append(f"{type(child).__name__}: {_safe_message(str(child), limit=limit)}")
+        if len(exc.exceptions) > 3:
+            parts.append(f"... {len(exc.exceptions) - 3} more sub-exception(s)")
+        return _safe_message("; ".join(parts), limit=limit)
+    return _safe_message(str(exc), limit=limit)
 
 
 def _build_browser_manager(browser_config: dict[str, Any]) -> BrowserManager | None:
@@ -177,7 +244,13 @@ class ExecutorRunner:
         self._configured_tool_definitions = []
 
         logger.info("Connecting to controller at %s", url)
-        async with websockets.connect(url, compression="deflate", max_size=10 * 1024 * 1024) as ws:
+        async with websockets.connect(
+            url,
+            compression="deflate",
+            max_size=10 * 1024 * 1024,
+            ping_interval=_WS_PING_INTERVAL_SECONDS,
+            ping_timeout=_WS_PING_TIMEOUT_SECONDS,
+        ) as ws:
             logger.info("WebSocket connected, sending executor.ready")
             ready_id = uuid.uuid4().hex
             await self._send_ws(
@@ -263,7 +336,11 @@ class ExecutorRunner:
             elif method == "tool.execute":
                 tool_name = params.get("tool_name", params.get("name", "?"))
                 logger.debug("Received tool.execute: %s", tool_name)
-                task = asyncio.create_task(self._handle_tool_execute(ws, msg_id, params))
+                task = self._create_background_handler_task(
+                    self._handle_tool_execute(ws, msg_id, params),
+                    "tool.execute",
+                    msg_id=msg_id,
+                )
                 self._active_calls[params.get("call_id", msg_id)] = task
             elif method == "tool.cancel":
                 call_id = params.get("call_id")
@@ -272,37 +349,81 @@ class ExecutorRunner:
                     self._active_calls[call_id].cancel()
             elif method == "llm.complete":
                 logger.debug("Received llm.complete")
-                asyncio.create_task(self._handle_llm_complete(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_llm_complete(ws, msg_id, params), "llm.complete", msg_id=msg_id
+                )
             elif method == "llm.image_generate":
                 logger.debug("Received llm.image_generate")
-                asyncio.create_task(self._handle_llm_image_generate(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_llm_image_generate(ws, msg_id, params),
+                    "llm.image_generate",
+                    msg_id=msg_id,
+                )
             elif method == "llm.transcribe":
                 logger.debug("Received llm.transcribe")
-                asyncio.create_task(self._handle_llm_transcribe(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_llm_transcribe(ws, msg_id, params),
+                    "llm.transcribe",
+                    msg_id=msg_id,
+                )
             elif method == "llm.synthesize":
                 logger.debug("Received llm.synthesize")
-                asyncio.create_task(self._handle_llm_synthesize(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_llm_synthesize(ws, msg_id, params),
+                    "llm.synthesize",
+                    msg_id=msg_id,
+                )
             elif method == "channel.start":
                 logger.info("Received channel.start for account %s", params.get("account_id", "?"))
-                asyncio.create_task(self._handle_channel_start(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_start(ws, msg_id, params),
+                    "channel.start",
+                    msg_id=msg_id,
+                )
             elif method == "channel.stop":
                 logger.info("Received channel.stop for account %s", params.get("account_id", "?"))
-                asyncio.create_task(self._handle_channel_stop(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_stop(ws, msg_id, params), "channel.stop", msg_id=msg_id
+                )
             elif method == "channel.send":
                 logger.debug("Received channel.send for account %s", params.get("account_id", "?"))
-                asyncio.create_task(self._handle_channel_send(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_send(ws, msg_id, params), "channel.send", msg_id=msg_id
+                )
             elif method == "channel.fetch_media":
-                asyncio.create_task(self._handle_channel_fetch_media(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_fetch_media(ws, msg_id, params),
+                    "channel.fetch_media",
+                    msg_id=msg_id,
+                )
             elif method == "channel.typing":
-                asyncio.create_task(self._handle_channel_typing(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_typing(ws, msg_id, params),
+                    "channel.typing",
+                    msg_id=msg_id,
+                )
             elif method == "channel.mark_read":
-                asyncio.create_task(self._handle_channel_mark_read(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_mark_read(ws, msg_id, params),
+                    "channel.mark_read",
+                    msg_id=msg_id,
+                )
             elif method == "channel.sync_profile":
-                asyncio.create_task(self._handle_channel_sync_profile(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_channel_sync_profile(ws, msg_id, params),
+                    "channel.sync_profile",
+                    msg_id=msg_id,
+                )
             elif method == "lsp.status":
-                asyncio.create_task(self._handle_lsp_status(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_lsp_status(ws, msg_id, params), "lsp.status", msg_id=msg_id
+                )
             elif method == "shell.background_status":
-                asyncio.create_task(self._handle_background_shell_status(ws, msg_id, params))
+                self._create_background_handler_task(
+                    self._handle_background_shell_status(ws, msg_id, params),
+                    "shell.background_status",
+                    msg_id=msg_id,
+                )
             elif method == "executor.cancel":
                 logger.info("Received executor.cancel, shutting down")
                 if msg_id is not None:
@@ -315,6 +436,37 @@ class ExecutorRunner:
             logger.warning("Controller websocket closed, leaving message loop")
         else:
             logger.info("Executor message loop stopped")
+
+    def _create_background_handler_task(
+        self,
+        coro: Any,
+        method: str,
+        *,
+        msg_id: str | None,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro)
+
+        def _consume_result(done: asyncio.Task[Any]) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                logger.debug(
+                    "Background handler task cancelled",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+            except ConnectionClosed:
+                logger.debug(
+                    "Background handler task could not reply because websocket closed",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+            except Exception:
+                logger.exception(
+                    "Background handler task failed",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+
+        task.add_done_callback(_consume_result)
+        return task
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         requested_version = int(params.get("config_version") or (self._config_version + 1))
@@ -370,6 +522,29 @@ class ExecutorRunner:
             self._configured = previous_configured
             self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
             await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
+            return
+        except BaseException as exc:
+            if _should_reraise_isolated_exception(exc):
+                raise
+            message = _safe_base_exception_message(exc)
+            logger.warning(
+                "Configure v%d failed during isolated MCP preparation error: %s",
+                requested_version,
+                message,
+                exc_info=True,
+            )
+            self._mcp_clients = previous_clients
+            self._tool_handlers = previous_tool_handlers
+            self._configured_tool_definitions = previous_tool_definitions
+            self._runtime_metadata = previous_runtime_metadata
+            self._configured = previous_configured
+            self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32021,
+                f"Executor configure failed during MCP preparation: {message}",
+            )
             return
 
         native_defs = filter_tools_by_executor(
@@ -850,6 +1025,20 @@ class ExecutorRunner:
             result = ToolResult(output="Tool execution timed out.", is_error=True)
         except asyncio.CancelledError:
             result = ToolResult(output="Tool execution cancelled.", is_error=True)
+        except MCPClientError as exc:
+            result = ToolResult(
+                output=f"MCP authentication failed: {exc.auth_error or exc.error_class}",
+                is_error=True,
+                duration_ms=int((perf_counter() - start) * 1000),
+                metadata={
+                    "mcp_auth_error": True,
+                    "server_name": exc.server_name,
+                    "phase": exc.phase,
+                    "status_code": exc.status_code,
+                    "auth_error": exc.auth_error,
+                    "authorization_required": exc.authorization_required,
+                },
+            )
         except Exception as exc:
             result = ToolResult(
                 output=f"Tool execution failed: {str(exc)[:500]}",
@@ -1209,26 +1398,33 @@ class ExecutorRunner:
                         "timed_out": exc.timed_out,
                         "message": str(exc),
                         "stderr_summary": exc.safe_stderr,
+                        "auth_error": exc.auth_error,
+                        "authorization_required": exc.authorization_required,
+                        "status_code": exc.status_code,
+                        "www_authenticate": exc.www_authenticate,
                     }
                 )
                 warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
                 continue
-            except Exception as exc:
+            except BaseException as exc:
+                if _should_reraise_isolated_exception(exc):
+                    raise
                 logger.warning(
-                    "MCP: server %s failed unexpectedly: %s",
+                    "MCP: server %s failed with isolated initialization error: %s",
                     server.name,
-                    exc,
+                    _safe_base_exception_message(exc),
+                    exc_info=True,
                 )
                 await self._close_failed_mcp_client(client, server.name)
                 statuses.append(
                     {
                         "server_id": server.server_id,
                         "name": server.name,
-                        "phase": "unknown",
+                        "phase": "initialize",
                         "status": "failed",
                         "error_class": exc.__class__.__name__.lower(),
                         "timed_out": False,
-                        "message": _safe_message(str(exc)),
+                        "message": _safe_base_exception_message(exc),
                     }
                 )
                 warnings.append(f"MCP server {server.name} failed to initialize.")
@@ -1346,7 +1542,11 @@ class ExecutorRunner:
 
     async def _send_ws(self, ws: Any, payload: str) -> None:
         async with self._ws_send_lock:
-            await ws.send(payload)
+            try:
+                await ws.send(payload)
+            except ConnectionClosed:
+                logger.debug("Skipping websocket send because connection is closed")
+                raise
 
 
 def _normalize_result(raw: Any, duration_ms: int) -> ToolResult:

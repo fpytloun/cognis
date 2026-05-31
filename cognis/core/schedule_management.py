@@ -34,7 +34,9 @@ async def create_user_schedule(
 
     workflow_id = request_model.workflow_id
     if isinstance(workflow_id, str) and workflow_id.strip():
-        workflow = await workflow_registry.get(workflow_id, owner_email=owner_email, include_disabled=True)
+        workflow = await workflow_registry.get(
+            workflow_id, owner_email=owner_email, include_disabled=True
+        )
         if workflow is None:
             raise ValueError("Workflow not found")
         if str(getattr(workflow, "lifecycle", "persistent")) != "persistent":
@@ -72,6 +74,9 @@ async def create_user_schedule(
         completion_mode_family=request_model.completion_mode_family,
         allow_silent_completion=bool(request_model.allow_silent_completion),
     )
+    task_template = dict(request_model.task_template)
+    if request_model.session_policy:
+        task_template["session_policy"] = request_model.session_policy.model_dump()
 
     async with session_factory() as db:
         row = await create_schedule(
@@ -85,7 +90,7 @@ async def create_user_schedule(
             timezone=request_model.timezone,
             agent_id=request_model.agent_id,
             workflow_id=request_model.workflow_id,
-            task_template=request_model.task_template,
+            task_template=task_template,
             enabled=bool(request_model.enabled),
             max_concurrent_runs=int(request_model.max_concurrent_runs),
             delete_after_run=bool(request_model.delete_after_run),

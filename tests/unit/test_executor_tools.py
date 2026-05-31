@@ -1763,11 +1763,36 @@ class TestBashTool:
         assert not result.is_error
 
     @pytest.mark.asyncio()
-    async def test_bash_rejects_shell_redirection_to_source_file(self) -> None:
-        result = await handle_bash({"command": "printf 'x' > test.py"}, _DUMMY_CONTEXT)
+    async def test_bash_warns_on_shell_redirection_to_source_file(self, tmp_path: Path) -> None:
+        result = await handle_bash(
+            {"command": "printf 'x' > test.py", "workdir": str(tmp_path)},
+            _DUMMY_CONTEXT,
+        )
 
-        assert result.is_error
-        assert "shell redirection" in result.output
+        assert not result.is_error
+        assert "Prefer dedicated edit tools for rewriting source files." in result.output
+        assert result.metadata is not None
+        assert result.metadata["advisory"] == (
+            "Prefer dedicated edit tools for rewriting source files. "
+            "Use shell redirection only when it is necessary and intentional."
+        )
+        assert (tmp_path / "test.py").read_text() == "x"
+
+    @pytest.mark.asyncio()
+    async def test_bash_warns_on_tee_to_source_file(self, tmp_path: Path) -> None:
+        result = await handle_bash(
+            {"command": "printf 'x' | tee test.py", "workdir": str(tmp_path)},
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        assert "Prefer dedicated edit tools for rewriting source files." in result.output
+        assert result.metadata is not None
+        assert result.metadata["advisory"] == (
+            "Prefer dedicated edit tools for rewriting source files. "
+            "Use shell redirection only when it is necessary and intentional."
+        )
+        assert (tmp_path / "test.py").read_text() == "x"
 
     @pytest.mark.asyncio()
     async def test_bash_defaults_to_runtime_working_directory(self, tmp_path: Path) -> None:
@@ -2120,6 +2145,55 @@ class TestBashTool:
         assert notifications[0]["description"] == "Quick background check"
         assert notifications[0]["status"] == "completed"
         assert notifications[0]["exit_code"] == 0
+
+    @pytest.mark.asyncio()
+    async def test_background_bash_status_preserves_source_rewrite_advisory(
+        self, tmp_path: Path
+    ) -> None:
+        shared_runtime_metadata: dict[str, Any] = {}
+        notifications: list[dict[str, Any]] = []
+
+        async def _completed(status: dict[str, Any]) -> None:
+            notifications.append(status)
+
+        ctx = ToolExecutionContext(
+            executor_handle=ExecutorHandle(executor_id="exec-a", executor_type="in_process"),
+            runtime_metadata={"background_shell_completion_callback": _completed},
+            shared_runtime_metadata=shared_runtime_metadata,
+        )
+
+        start = await handle_bash(
+            {
+                "command": "printf 'x' > test.py",
+                "workdir": str(tmp_path),
+                "run_in_background": True,
+            },
+            ctx,
+        )
+
+        assert not start.is_error
+        assert start.metadata is not None
+        assert start.metadata["advisory"] == (
+            "Prefer dedicated edit tools for rewriting source files. "
+            "Use shell redirection only when it is necessary and intentional."
+        )
+        shell_id = str(start.metadata.get("shell_id"))
+
+        statuses = await list_background_shell_statuses(
+            shared_runtime_metadata, include_completed=True
+        )
+        assert len(statuses) == 1
+        assert statuses[0]["shell_id"] == shell_id
+        assert statuses[0]["advisory"] == start.metadata["advisory"]
+
+        for _ in range(20):
+            if notifications:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(notifications) == 1
+        assert notifications[0]["advisory"] == start.metadata["advisory"]
+        assert (tmp_path / "test.py").read_text() == "x"
 
     @pytest.mark.asyncio()
     async def test_background_bash_kill_suppresses_completion_callback(self) -> None:

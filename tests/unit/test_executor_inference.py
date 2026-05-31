@@ -91,7 +91,19 @@ async def test_stream_complete_returns_error_on_failure(monkeypatch: pytest.Monk
         )
     ]
 
-    assert chunks == [{"done": True, "error": "Inference error: boom", "finish_reason": "error"}]
+    assert chunks == [
+        {
+            "done": True,
+            "error": "Inference error: boom",
+            "response_error": {
+                "category": "other",
+                "code": "RuntimeError",
+                "message": "boom",
+                "retry_after_seconds": None,
+            },
+            "finish_reason": "error",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -557,7 +569,19 @@ async def test_stream_complete_returns_error_for_failed_responses_event(
         )
     ]
 
-    assert chunks == [{"done": True, "error": "bridge failed", "finish_reason": "error"}]
+    assert chunks == [
+        {
+            "done": True,
+            "error": "bridge failed",
+            "response_error": {
+                "category": "other",
+                "message": "bridge failed",
+                "provider_event": "response.failed",
+                "details": {"event_type": "response.failed", "message": "bridge failed"},
+            },
+            "finish_reason": "error",
+        }
+    ]
 
 
 @pytest.mark.asyncio

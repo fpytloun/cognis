@@ -30,6 +30,7 @@ PUBLIC_ROUTES = {
     ("GET", "/api/metrics"),
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/refresh"),
+    ("GET", "/api/v1/mcp/oauth/callback"),
     ("GET", "/.well-known/agent.json"),
 }
 

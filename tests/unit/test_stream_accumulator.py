@@ -7,6 +7,7 @@ restarts and split tool calls could silently corrupt arguments.
 from __future__ import annotations
 
 from cognis.core.agent_loop import StreamAccumulator
+from cognis.providers.llm.errors import ToolArgumentParseFailure
 
 
 def _feed_tool_delta(acc: StreamAccumulator, args_fragment: str, *, name: str = "my_tool") -> None:
@@ -119,9 +120,8 @@ def test_malformed_arguments_fall_through_to_raw() -> None:
     _feed_tool_delta(acc, '{"todos":[')  # truncated JSON
     calls = acc.get_tool_calls()
     assert len(calls) == 1
-    # _raw is the signal to validators / tool handlers; it must be
-    # the only key so validate_tool_arguments can detect it.
-    assert set(calls[0].arguments.keys()) == {"_raw"}
+    assert isinstance(calls[0], ToolArgumentParseFailure)
+    assert calls[0].raw == '{"todos":['
 
 
 def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:

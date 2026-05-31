@@ -1,4 +1,10 @@
-import type { ExecutorConfig, ExecutorMCPServerRuntimeStatus } from '$lib/types/api';
+import type { ExecutorConfig, ExecutorMCPServerRuntimeStatus, ExecutorRuntimeIssue } from '$lib/types/api';
+
+export interface ExecutorDegradedIssue {
+  source: string;
+  title: string;
+  detail: string | null;
+}
 
 export function executorRuntimeBadgeStatus(executor: ExecutorConfig): 'healthy' | 'degraded' | 'unhealthy' {
   if (executor.status !== 'active') return 'degraded';
@@ -28,6 +34,10 @@ export function executorRuntimeSummary(executor: ExecutorConfig): string | null 
   if (executor.runtime_metadata.legacy_metadata) {
     return 'Legacy executor metadata: detailed MCP runtime status is unavailable.';
   }
+  const issues = executorDegradedIssues(executor);
+  if (issues.length > 0) {
+    return `${issues.length} degraded issue(s): ${issues.map((issue) => issue.title).join(', ')}`;
+  }
   const failed = (executor.runtime_metadata.mcp_servers ?? []).filter((server) => server.status !== 'ready');
   if (failed.length > 0) {
     return `${failed.length} MCP server(s) degraded: ${failed.map((server) => server.name).join(', ')}`;
@@ -42,6 +52,30 @@ function formatMcpFailure(server: ExecutorMCPServerRuntimeStatus): string {
   return summary ? `${server.name}: ${details}${details ? ' · ' : ''}${summary}` : `${server.name}: ${details || 'failed'}`;
 }
 
+function runtimeIssueTitle(issue: ExecutorRuntimeIssue, fallback: string): string {
+  return stringValue(issue.title) ?? stringValue(issue.kind) ?? stringValue(issue.source) ?? fallback;
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+function runtimeIssueDetail(issue: ExecutorRuntimeIssue): string | null {
+  return stringValue(issue.details) ?? stringValue(issue.message);
+}
+
+export function executorDegradedIssues(executor: ExecutorConfig): ExecutorDegradedIssue[] {
+  if (executor.runtime_metadata.legacy_metadata) {
+    return [];
+  }
+  const issues = (executor.runtime_metadata.degraded_issues ?? []).map((issue, index) => ({
+    source: issue.source || 'executor',
+    title: runtimeIssueTitle(issue, `runtime issue ${index + 1}`),
+    detail: runtimeIssueDetail(issue)
+  }));
+  return issues;
+}
+
 export function executorMcpFailureDetails(executor: ExecutorConfig): string[] {
   if (executor.runtime_metadata.legacy_metadata) {
     return [];
@@ -49,6 +83,27 @@ export function executorMcpFailureDetails(executor: ExecutorConfig): string[] {
   return (executor.runtime_metadata.mcp_servers ?? [])
     .filter((server) => server.status !== 'ready')
     .map(formatMcpFailure);
+}
+
+export function executorDegradedDetails(executor: ExecutorConfig): string[] {
+  return [
+    ...executorDegradedIssues(executor).map((issue) =>
+      issue.detail ? `${issue.source}: ${issue.title} · ${issue.detail}` : `${issue.source}: ${issue.title}`
+    ),
+    ...executorMcpFailureDetails(executor),
+    ...(executor.runtime_metadata.warnings ?? []).map((warning) => `warning: ${warning}`)
+  ];
+}
+
+export function degradedExecutors(executors: ExecutorConfig[]): ExecutorConfig[] {
+  return executors.filter(
+    (executor) =>
+      executor.status === 'active' &&
+      (executor.runtime_state === 'degraded'
+        || executor.runtime_state === 'blocked'
+        || executor.runtime_state === 'stale'
+        || executor.runtime_state === 'reconfiguring')
+  );
 }
 
 export function validateStdioCommand(command: string): string | null {

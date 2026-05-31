@@ -90,9 +90,13 @@ def test_fetch_formatter_exposes_metadata_and_media_anchors() -> None:
     assert "[[page:1]]" in result.output
     assert "[[media:1]]" in result.output
     assert "Published: 2026-04-27T12:00:00Z" in result.output
+    assert 'artifact_read with artifact_id="tool_artifact:<tool_call_id>:media:1"' in result.output
     anchors = result.metadata.get("output_anchors") if result.metadata else None
     assert isinstance(anchors, list)
     assert {anchor["anchor"] for anchor in anchors} >= {"metadata", "page:1", "media:1"}
+    media_anchor = next(anchor for anchor in anchors if anchor["anchor"] == "media:1")
+    assert media_anchor["artifact_candidate"]["source_type"] == "remote_url"
+    assert media_anchor["artifact_candidate"]["url"] == "https://cdn.example.com/jsonld-hero.jpg"
     stored = result.metadata.get("stored_output") if result.metadata else None
     assert isinstance(stored, str)
     assert "An oil tanker crosses a busy shipping route." in stored

@@ -28,7 +28,11 @@ from cognis.models.tool import (
     ToolDefinition,
     ToolResult,
     ToolSource,
+    effective_mcp_auth_config,
+    mcp_headers_have_authorization,
     sanitize_mcp_tool_name,
+    sanitize_mcp_tool_name_with_suffix,
+    stable_tool_id,
 )
 from cognis.tools.argument_normalization import strip_empty_optional_values
 
@@ -58,6 +62,9 @@ class MCPClientError(RuntimeError):
         error_class: str,
         timed_out: bool = False,
         safe_stderr: str | None = None,
+        status_code: int | None = None,
+        auth_error: str | None = None,
+        www_authenticate: str | None = None,
     ) -> None:
         super().__init__(message)
         self.server_name = server_name
@@ -65,6 +72,10 @@ class MCPClientError(RuntimeError):
         self.error_class = error_class
         self.timed_out = timed_out
         self.safe_stderr = safe_stderr
+        self.status_code = status_code
+        self.auth_error = auth_error
+        self.www_authenticate = www_authenticate
+        self.authorization_required = status_code in {401, 403} or auth_error is not None
 
 
 class MCPClient(Protocol):
@@ -431,7 +442,42 @@ def mcp_tools_to_definitions(
                 timeout_seconds=timeout_seconds,
             )
         )
-    return definitions
+    return disambiguate_mcp_tool_name_collisions(definitions)
+
+
+def disambiguate_mcp_tool_name_collisions(
+    definitions: Sequence[ToolDefinition],
+) -> list[ToolDefinition]:
+    """Suffix MCP tool names only when distinct tools resolve to the same runtime name."""
+
+    identities_by_name: dict[str, set[str]] = {}
+    for definition in definitions:
+        if definition.source.type not in {"local_mcp", "intaris_mcp"}:
+            continue
+        identities_by_name.setdefault(definition.name, set()).add(stable_tool_id(definition))
+
+    collision_names = {
+        name for name, identities in identities_by_name.items() if len(identities) > 1
+    }
+    if not collision_names:
+        return list(definitions)
+
+    resolved: list[ToolDefinition] = []
+    for definition in definitions:
+        if definition.name not in collision_names:
+            resolved.append(definition)
+            continue
+        server_name = definition.source.server_name
+        raw_tool_name = definition.source.raw_tool_name
+        if not server_name or not raw_tool_name:
+            resolved.append(definition)
+            continue
+        resolved.append(
+            definition.model_copy(
+                update={"name": sanitize_mcp_tool_name_with_suffix(server_name, raw_tool_name)}
+            )
+        )
+    return resolved
 
 
 def resolve_secret_refs(env: dict[str, str], secrets: dict[str, str]) -> dict[str, str]:
@@ -489,22 +535,28 @@ def invalid_mcp_config_reason(
     url: str | None,
     env: dict[str, str] | None,
     headers: dict[str, str] | None,
+    auth_config: dict[str, Any] | None = None,
 ) -> str | None:
     """Return a user-visible invalidity reason for persisted config."""
 
     env = env or {}
     headers = headers or {}
+    effective_auth = effective_mcp_auth_config(auth_config, headers)
     if transport == "stdio":
         if not command:
             return "Stdio MCP servers must define a command."
         if headers:
             return "Stdio MCP servers cannot define HTTP headers."
+        if effective_auth.type == "oauth2":
+            return "OAuth is only supported for HTTP MCP transports."
         return None
     if transport in HTTP_MCP_TRANSPORTS:
         if not url:
             return "HTTP MCP servers must define a URL."
         if env:
             return "HTTP MCP servers must use headers instead of environment variables."
+        if effective_auth.type == "oauth2" and mcp_headers_have_authorization(headers):
+            return "Authorization headers are not allowed when OAuth is enabled."
         return None
     return f"Unsupported MCP transport: {transport}"
 
@@ -703,10 +755,27 @@ def _error_class(exc: Exception) -> str:
 def _coerce_client_error(server_name: str, phase: str, exc: Exception) -> MCPClientError:
     if isinstance(exc, MCPClientError):
         return exc
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    www_authenticate = None
+    if response is not None:
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            www_authenticate = headers.get("www-authenticate")
+    auth_error = None
+    if status_code == 401:
+        auth_error = "authorization_required"
+    elif status_code == 403:
+        auth_error = "insufficient_scope" if www_authenticate else "forbidden"
     return MCPClientError(
         server_name,
         phase,
         _safe_message(str(exc)),
         error_class=_error_class(exc),
         timed_out=_is_timeout(exc),
+        status_code=status_code if isinstance(status_code, int) else None,
+        auth_error=auth_error,
+        www_authenticate=_safe_message(www_authenticate) if www_authenticate else None,
     )

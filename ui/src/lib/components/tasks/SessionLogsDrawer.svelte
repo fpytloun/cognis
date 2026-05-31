@@ -14,6 +14,7 @@
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
   import { applyActiveThinkingSnapshots, latestTodoSnapshot, normalizeHistory, type ThinkingTimelineItem, type TimelineItem, type TodoSnapshotItem } from '$lib/chat';
+  import { incompleteTodos } from '$lib/todos';
   import ChatMessage from '$lib/components/ChatMessage.svelte';
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
@@ -64,8 +65,6 @@
 
   type SessionTodo = TodoSnapshotItem;
 
-  const terminalTodoStatuses = new Set(['completed', 'cancelled']);
-
   function todoStatusDot(status: string): string {
     if (status === 'completed') return 'bg-emerald-400';
     if (status === 'cancelled') return 'bg-slate-600';
@@ -80,7 +79,7 @@
   }
 
   let sessionTodos = $derived.by(() => latestTodoSnapshot(timeline));
-  let activeSessionTodos = $derived.by(() => sessionTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
+  let activeSessionTodos = $derived.by(() => incompleteTodos(sessionTodos));
   let shouldShowTodoDrawer = $derived(sessionTodos.length > 0);
   let todoCounts = $derived.by(() => ({
     inProgress: activeSessionTodos.filter((todo) => todo.status === 'in_progress').length,

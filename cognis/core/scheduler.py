@@ -238,6 +238,7 @@ class Scheduler:
             skill_id = getattr(sched, "skill_id", None)
             workspace_root = template.pop("workspace_root", None)
             working_directory = template.pop("working_directory", None)
+            session_policy = template.pop("session_policy", None)
             template.pop("created_by_agent_id", None)
             created_workflow_id: str | None = None
             created_task_id: str | None = None
@@ -266,7 +267,7 @@ class Scheduler:
 
             # Delivery config from template
             delivery_raw = template.pop("delivery", None)
-            delivery: TaskDelivery | None = None
+            delivery: TaskDelivery | None = TaskDelivery(mode="preferred_channel")
             if isinstance(delivery_raw, dict):
                 delivery = TaskDelivery(**delivery_raw)
             completion_delivery = CompletionDeliveryPolicy(
@@ -287,6 +288,7 @@ class Scheduler:
                 completion_delivery=completion_delivery,
                 interaction_mode_override=getattr(sched, "interaction_mode_override", None)
                 or "none",
+                session_policy=session_policy if isinstance(session_policy, dict) else None,
                 workflow_id=workflow_id,
                 project_id=getattr(sched, "project_id", None),
                 workspace_root=workspace_root,
@@ -327,7 +329,7 @@ class Scheduler:
                 )
             )
 
-        except Exception:
+        except Exception as exc:
             if created_workflow_id is not None and created_task_id is None:
                 with contextlib.suppress(Exception):
                     await delete_materialized_workflow(
@@ -367,6 +369,10 @@ class Scheduler:
                         data={
                             "schedule_id": schedule_id,
                             "reason": f"Auto-disabled after {errors} consecutive errors",
+                            "created_by": sched.created_by,
+                            "agent_id": sched.agent_id,
+                            "schedule_name": sched.name,
+                            "error": f"{type(exc).__name__}: {exc}",
                         },
                     )
                 )
@@ -378,6 +384,10 @@ class Scheduler:
                             "schedule_id": schedule_id,
                             "consecutive_errors": errors,
                             "next_retry_seconds": backoff,
+                            "created_by": sched.created_by,
+                            "agent_id": sched.agent_id,
+                            "schedule_name": sched.name,
+                            "error": f"{type(exc).__name__}: {exc}",
                         },
                     )
                 )

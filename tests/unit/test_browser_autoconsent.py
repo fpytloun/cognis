@@ -188,6 +188,30 @@ def test_stage_c_defaults_for_patchright_disabled_by_default() -> None:
 
 
 @pytest.mark.asyncio
+async def test_per_session_autoconsent_off_skips_script_without_mutating_default() -> None:
+    manager = BrowserManager(auto_consent="accept")
+    ctx = _FakeContext()
+    settings = manager._resolve_session_settings({"auto_consent": "off"})  # noqa: SLF001
+
+    await manager._apply_autoconsent_init_script(ctx, settings=settings)  # noqa: SLF001
+
+    assert ctx.scripts == []
+    assert manager.auto_consent == "accept"
+
+
+@pytest.mark.asyncio
+async def test_per_session_fingerprint_hardening_off_skips_without_mutating_default() -> None:
+    manager = BrowserManager(fingerprint_hardening=True)
+    ctx = _FakeContext()
+    settings = manager._resolve_session_settings({"fingerprint_hardening": False})  # noqa: SLF001
+
+    await manager._apply_fingerprint_hardening_init_scripts(ctx, settings=settings)  # noqa: SLF001
+
+    assert ctx.scripts == []
+    assert manager.fingerprint_hardening is True
+
+
+@pytest.mark.asyncio
 async def test_autoconsent_bundle_includes_multilingual_heuristics() -> None:
     manager = BrowserManager(auto_consent="accept")
     ctx = _FakeContext()
@@ -201,6 +225,20 @@ async def test_autoconsent_bundle_includes_multilingual_heuristics() -> None:
     assert "tout accepter" in payload
     assert "aceptar todo" in payload
     assert "acceptar" in payload
+
+
+@pytest.mark.asyncio
+async def test_autoconsent_heuristic_avoids_footer_legal_global_accept() -> None:
+    manager = BrowserManager(auto_consent="accept")
+    ctx = _FakeContext()
+    await manager._apply_autoconsent_init_script(ctx)  # noqa: SLF001
+    payload = ctx.scripts[0]
+
+    assert "aside, footer, dialog" not in payload
+    assert "privacy & cookies" in payload
+    assert "third party cookie" in payload
+    assert "social media cookies" in payload
+    assert "heuristic global accept" not in payload
 
 
 @pytest.mark.asyncio

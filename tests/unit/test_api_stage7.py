@@ -31,6 +31,7 @@ from cognis.models.session import (
 )
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import WorkflowState
+from cognis.store.models import NotificationRow
 from cognis.store.queries import (
     create_agent,
     create_artifact_record,
@@ -45,6 +46,7 @@ from cognis.store.queries import (
     create_user,
     get_conversation,
     set_session_intaris_session_id,
+    set_session_status,
     touch_conversation,
     update_conversation_active_session,
 )
@@ -1418,6 +1420,73 @@ def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path)
         assert first_id != second_id
 
 
+def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Blocked conversation",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation.conversation_id,
+                    "user@example.com",
+                    "agent-1",
+                    status="suspended",
+                )
+                session_row.completion_reason = "safety_escalation"
+                conversation.active_session_id = session_row.session_id
+                session.add(
+                    NotificationRow(
+                        notification_id="notif_attention",
+                        notification_type="gate",
+                        user_email="user@example.com",
+                        conversation_id=conversation.conversation_id,
+                        session_id=session_row.session_id,
+                        status="pending",
+                        payload={},
+                    )
+                )
+                await session.commit()
+                return conversation.conversation_id
+
+        conversation_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/conversations",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        item = next(item for item in body["items"] if item["conversation_id"] == conversation_id)
+        assert item["active_session_status"] == "suspended"
+        assert item["active_session_completion_reason"] == "safety_escalation"
+        assert item["active_turn_chat_mode"] is None
+        assert item["active_turn_chat_mode_source"] is None
+        assert item["pending_notification_types"] == ["gate"]
+
+
 def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_filters(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -1567,6 +1636,72 @@ def test_conversation_update_sets_and_clears_starred_at(
         )
         assert unstar_response.status_code == 200
         assert unstar_response.json()["starred_at"] is None
+
+
+def test_conversation_detail_uses_scheduler_active_turn_state(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Active",
+                )
+                session_row = await create_session(
+                    session,
+                    conversation.conversation_id,
+                    "user@example.com",
+                    "agent-1",
+                )
+                await set_session_status(
+                    session,
+                    session_row.session_id,
+                    "completed",
+                    completion_reason="finished",
+                )
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    session_row.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, session_row.session_id
+
+        conversation_id, session_id = asyncio.run(_seed())
+        app.state.turn_scheduler.running_turn_state = lambda _conversation_id: None
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["active_session_id"] == session_id
+        assert body["active_session_status"] == "completed"
+        assert body["has_active_turn"] is False
+        assert body["active_turn_chat_mode"] is None
+        assert body["active_turn_chat_mode_source"] is None
 
 
 def test_conversation_list_orders_by_latest_activity_even_without_messages(
@@ -2139,6 +2274,7 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             "items": [],
             "last_seq": 0,
             "has_more": False,
+            "older_cursor": None,
             "has_active_turn": False,
             "active_streams": [],
             "active_tool_outputs": [],
@@ -2147,6 +2283,483 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             "history_truncated": False,
             "truncation_reason": None,
         }
+
+
+def test_conversation_messages_latest_page_reads_only_tail_sessions(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Long Signal conversation",
+                )
+                previous = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    session_id="sess-prev",
+                )
+                active = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    previous_session_id=previous.session_id,
+                    session_id="sess-active",
+                )
+                await set_session_intaris_session_id(
+                    session, previous.session_id, previous.session_id
+                )
+                await set_session_intaris_session_id(session, active.session_id, active.session_id)
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    active.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, previous.session_id, active.session_id
+
+        conversation_id, previous_session_id, active_session_id = client.portal.call(_seed)
+        calls: list[dict[str, object]] = []
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            last_n: int | None = None,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            calls.append(
+                {
+                    "session_id": session_id,
+                    "after_seq": after_seq,
+                    "limit": limit,
+                    "last_n": last_n,
+                    "allow_missing_stream": allow_missing_stream,
+                }
+            )
+            if session_id == active_session_id:
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 9,
+                            "type": "assistant_message",
+                            "data": {"content": "active tail"},
+                            "ts": "2026-03-28T00:00:00Z",
+                        }
+                    ],
+                    last_seq=9,
+                    has_more=True,
+                    missing_stream_fallback_used=False,
+                )
+            if session_id == previous_session_id:
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 4,
+                            "type": "assistant_message",
+                            "data": {"content": "previous tail"},
+                            "ts": "2026-03-27T00:00:00Z",
+                        }
+                    ],
+                    last_seq=4,
+                    has_more=False,
+                    missing_stream_fallback_used=False,
+                )
+            raise AssertionError(f"unexpected session read: {session_id}")
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=1",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["data"]["content"] for item in body["items"]] == ["active tail"]
+        assert body["has_more"] is True
+        assert body["older_cursor"]
+        assert body["active_session_id"] == active_session_id
+        assert body["active_session_last_seq"] == 9
+        assert calls == [
+            {
+                "session_id": active_session_id,
+                "after_seq": 0,
+                "limit": 0,
+                "last_n": 1,
+                "allow_missing_stream": True,
+            }
+        ]
+
+
+def test_conversation_messages_before_cursor_loads_previous_page(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Long Signal conversation",
+                )
+                previous = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    session_id="sess-prev",
+                )
+                active = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    previous_session_id=previous.session_id,
+                    session_id="sess-active",
+                )
+                await set_session_intaris_session_id(
+                    session, previous.session_id, previous.session_id
+                )
+                await set_session_intaris_session_id(session, active.session_id, active.session_id)
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    active.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, previous.session_id, active.session_id
+
+        conversation_id, previous_session_id, active_session_id = client.portal.call(_seed)
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            last_n: int | None = None,
+            **_: object,
+        ) -> EventReadResult:
+            if session_id == active_session_id and last_n == 1:
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 9,
+                            "type": "assistant_message",
+                            "data": {"content": "active tail"},
+                            "ts": "2026-03-28T00:00:00Z",
+                        }
+                    ],
+                    last_seq=9,
+                    has_more=True,
+                    missing_stream_fallback_used=False,
+                )
+            if session_id == active_session_id:
+                assert after_seq == 7
+                assert limit == 2
+                return EventReadResult(
+                    events=[],
+                    last_seq=9,
+                    has_more=False,
+                    missing_stream_fallback_used=False,
+                )
+            if session_id == previous_session_id:
+                assert last_n == 1
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 4,
+                            "type": "assistant_message",
+                            "data": {"content": "previous tail"},
+                            "ts": "2026-03-27T00:00:00Z",
+                        }
+                    ],
+                    last_seq=4,
+                    has_more=False,
+                    missing_stream_fallback_used=False,
+                )
+            raise AssertionError(f"unexpected session read: {session_id}")
+
+        async def _fake_get_last_seq(session_id: str) -> int:
+            assert session_id == active_session_id
+            return 9
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+        app.state.providers.guardrails.get_last_seq = _fake_get_last_seq
+
+        first = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=1",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert first.status_code == 200
+        cursor = first.json()["older_cursor"]
+        assert cursor
+
+        second = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=1&before={cursor}",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert second.status_code == 200
+        body = second.json()
+        assert [item["data"]["content"] for item in body["items"]] == ["previous tail"]
+        assert body["active_session_id"] == active_session_id
+        assert body["active_session_last_seq"] == 9
+        assert body["has_more"] is False
+        assert body["older_cursor"] is None
+
+
+def test_conversation_messages_latest_page_preserves_seq_order_despite_timestamps(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Long Signal conversation",
+                )
+                active = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    session_id="sess-active",
+                )
+                await set_session_intaris_session_id(session, active.session_id, active.session_id)
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    active.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, active.session_id
+
+        conversation_id, active_session_id = client.portal.call(_seed)
+
+        async def _fake_read_events(
+            session_id: str,
+            last_n: int | None = None,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id == active_session_id
+            assert last_n == 4
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 4,
+                        "type": "assistant_message",
+                        "data": {"content": "done"},
+                        "ts": "2026-03-28T00:00:01Z",
+                    },
+                    {
+                        "seq": 2,
+                        "type": "tool_call",
+                        "data": {"call_id": "call-1", "name": "bash"},
+                        "ts": "2026-03-28T00:00:04Z",
+                    },
+                    {
+                        "seq": 3,
+                        "type": "tool_result",
+                        "data": {"call_id": "call-1", "content": "output"},
+                        "ts": "2026-03-28T00:00:05Z",
+                    },
+                    {
+                        "seq": 1,
+                        "type": "user_message",
+                        "data": {"content": "run"},
+                        "ts": "2026-03-28T00:00:03Z",
+                    },
+                ],
+                last_seq=4,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=4",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert [item["type"] for item in response.json()["items"]] == [
+            "user_message",
+            "tool_call",
+            "tool_result",
+            "assistant_message",
+        ]
+
+
+def test_conversation_messages_latest_page_drops_orphan_tool_results(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Long Signal conversation",
+                )
+                active = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    session_id="sess-active",
+                )
+                await set_session_intaris_session_id(session, active.session_id, active.session_id)
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    active.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, active.session_id
+
+        conversation_id, active_session_id = client.portal.call(_seed)
+
+        async def _fake_read_events(
+            session_id: str,
+            last_n: int | None = None,
+            **_: object,
+        ) -> EventReadResult:
+            assert session_id == active_session_id
+            assert last_n == 4
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 20,
+                        "type": "tool_result",
+                        "data": {"call_id": "older-call", "result": "stale output"},
+                        "ts": "2026-03-28T00:00:20Z",
+                    },
+                    {
+                        "seq": 21,
+                        "type": "user_message",
+                        "data": {"content": "current"},
+                        "ts": "2026-03-28T00:00:21Z",
+                    },
+                    {
+                        "seq": 22,
+                        "type": "tool_call",
+                        "data": {"call_id": "current-call", "name": "read"},
+                        "ts": "2026-03-28T00:00:22Z",
+                    },
+                    {
+                        "seq": 23,
+                        "type": "tool_result",
+                        "data": {"call_id": "current-call", "result": "current output"},
+                        "ts": "2026-03-28T00:00:23Z",
+                    },
+                    {
+                        "seq": 24,
+                        "type": "assistant_message",
+                        "data": {"content": "done"},
+                        "ts": "2026-03-28T00:00:24Z",
+                    },
+                ],
+                last_seq=24,
+                has_more=True,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=4",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [item["type"] for item in items] == [
+            "user_message",
+            "tool_call",
+            "tool_result",
+            "assistant_message",
+        ]
+        assert all(item["data"].get("call_id") != "older-call" for item in items)
 
 
 def test_conversation_session_events_skip_malformed_rows(

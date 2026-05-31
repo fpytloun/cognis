@@ -26,6 +26,46 @@ correlation key across persisted history, replay, and live transport frames.
 Out-of-band events that are not part of a specific turn still include the field
 with a `null` value so the event schema stays uniform.
 
+Session events also carry a context-lane envelope in their event data. Historical
+pre-lane events are interpreted as `lane="main"`.
+
+```python
+class EventContextLane(BaseModel):
+    lane: Literal["main", "side"] = "main"
+    side_thread_id: str | None = None
+    anchor_turn_id: str | None = None
+    prompt_visibility: Literal["main", "side_only", "excluded"] = "main"
+    tool_policy: Literal["normal", "none", "read_only", "safe_tools"] = "normal"
+```
+
+Lane rules:
+
+- `main` is the canonical conversation lane. Normal user turns, assistant
+  responses, tool calls/results, delegation events, task delivery events, and
+  compaction summaries are main-lane unless explicitly marked otherwise.
+- `side` is for side-question interactions such as `/btw`. Side-lane messages
+  are stored in the same Intaris session for auditability and UI replay, but are
+  not model-visible to ordinary main turns by default.
+- `side_thread_id` scopes side history. `/btw` uses one side thread per active or
+  anchored main turn so mid-turn side questions can have follow-ups without
+  creating a conversation-wide side transcript that leaks into unrelated side
+  questions.
+- `anchor_turn_id` points at the main turn the side thread is about. For
+  mid-turn `/btw`, it is the currently active `turn_id`; after completion it may
+  point at the most recent completed turn or at an explicitly selected side
+  thread.
+- `prompt_visibility="side_only"` means included in side-question prompts for
+  the matching side thread, excluded from main-turn prompts. `excluded` is for
+  operational/audit events that should never be projected unless explicitly
+  requested by an inspector.
+- `tool_policy="none"` forbids tool execution for the side turn. Future side
+  lanes may allow `read_only` or `safe_tools`, but `/btw` starts with `none`.
+
+All context assembly, compaction, memory extraction, title/intention updates,
+undo/redo, and delivery logic must consume events through a lane-aware selector.
+No code path may treat every `user_message` or `assistant_message` event as
+main-context history solely because of its event type.
+
 For external runtimes, see `18-runtime-contract.md` for the distinction
 between raw runtime trace, runtime session identity, and normalized transcript
 projection.
@@ -272,7 +312,10 @@ Conversation: "Help me refactor the auth system"
        - Read intention from Intaris (read-through)
        - Recall from Mnemory (query, labels, context=cached intention)
     c. On partial failure: continue with available results, flag degraded
-    d. Build messages: system prompt + memories + compacted + recent + user msg
+    d. Select events with a lane-aware context policy (`main` for normal turns;
+       `main` plus matching side thread for `/btw` side turns)
+    e. Build messages: system prompt + memories + compacted + selected recent +
+       current user/side question
 
 4. LLM call (streaming):
    a. Derive the projection policy for the current model/context budget
@@ -468,6 +511,40 @@ in the web UI. Resetting ``mnemory_session_id`` ensures the new context window
 gets a complete immutable prefix rebuild; the old Mnemory session's dedup set
 is stale after compaction anyway.
 
+### Side-question lanes and `/btw`
+
+`/btw` is a side-question command that asks a quick question without interrupting
+or queueing behind the active main turn. It uses the same Cognis session and
+same Intaris stream, but persists its user/assistant records on `lane="side"`
+with `prompt_visibility="side_only"` and a `side_thread_id` anchored to the
+active or selected main turn.
+
+The `/btw` model-facing context is:
+
+1. the normal main-lane durable context, assembled through the standard cached
+   context path so immutable-prefix prompt caching can still apply;
+2. prior `lane="side"` user/assistant messages from the same `side_thread_id`;
+3. volatile active-turn context when the side thread is anchored to a running
+   turn: the current assistant stream snapshot and bounded active tool-output
+   snapshots, inserted as plain controller context blocks rather than provider
+   protocol-level assistant/tool messages;
+4. the current side question wrapped in strict side-question instructions.
+
+Side turns are one-shot and non-mutating in the initial implementation:
+
+- they use `tool_policy="none"`;
+- the LLM request exposes no executable tools unless a future cache-preserving
+  provider path can set `tool_choice="none"` and hard-reject returned tool
+  calls;
+- any returned tool call is recorded as rejected diagnostics and never executed;
+- side turns do not affect main title generation, intention updates, normal
+  memory extraction, undo/redo branch calculations, queued-message processing,
+  or automatic compaction input except through explicit promotion.
+
+Main turns exclude side-lane messages by default. A later explicit promotion
+flow may summarize a side thread into a main-visible event, but raw side
+transcripts are not promoted automatically.
+
 ### Context Assembly
 
 ```python
@@ -529,7 +606,12 @@ class ContextAssembler:
             types=["user_message", "assistant_message",
                    "tool_call", "tool_result", "delegation"],
         )
-        messages.extend(self._events_to_messages(cached_events))
+        selected_events = self.context_selector.select(
+            cached_events,
+            lane="main",
+            side_thread_id=None,
+        )
+        messages.extend(self._events_to_messages(selected_events))
 
         # 6. Active delegation statuses
         active = await self._get_active_delegations(session)
@@ -723,6 +805,31 @@ simultaneously after ``/compact``.
 
 Old conversations: all events preserved in Intaris, Mnemory memories persist,
 conversation marked `archived`.
+
+## Side Threads
+
+Side threads are lightweight lanes inside a normal Intaris session. They are not
+child sessions and do not create a new Mnemory session. Their durable records use
+normal `user_message` and `assistant_message` event types with side-lane metadata
+so the UI can render them with the same message primitives and future tool-aware
+side turns can reuse normal tool-call sequencing.
+
+Selection rules:
+
+- A mid-turn `/btw` creates or resumes `side_thread_id=btw:<active_turn_id>`.
+- A follow-up `/btw` from an open side panel resumes that panel's
+  `side_thread_id`.
+- A post-turn `/btw` without an explicit side-thread selection starts a new side
+  thread anchored to the most recent completed main turn.
+- `/btw` side turns see main-lane history plus only their own side-thread
+  history. Other side threads are hidden unless explicitly inspected.
+- Main turns see no side-thread history unless a side thread is explicitly
+  promoted into a main-visible summary event.
+
+Compaction must keep side and main lanes separate. Main compaction input excludes
+side-lane raw messages. A future side-thread compaction may summarize long side
+threads independently, and explicit promotion should prefer a compact summary
+over raw transcript injection.
 
 ## Message Queuing
 

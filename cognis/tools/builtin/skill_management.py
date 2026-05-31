@@ -11,7 +11,13 @@ import base64
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.skill import ImportProvenance, ResolvedSkill, ResolvedSkillSet, SkillToolSpec
+from cognis.models.skill import (
+    ImportProvenance,
+    ResolvedSkill,
+    ResolvedSkillSet,
+    SkillAssetRef,
+    SkillToolSpec,
+)
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource, stable_tool_id
 from cognis.tools.skill_service import (
     asset_refs_to_inputs,
@@ -183,7 +189,12 @@ SKILL_WRITE_TOOL = ToolDefinition(
             },
             "attach_to_all_agents": {
                 "type": "boolean",
-                "description": "Attach this skill to all agents by default (default false)",
+                "description": (
+                    "Globally attach this skill to every agent by default. "
+                    "Use rarely for universal platform skills only. This does not "
+                    "preload the skill's full instructions; configure per-agent "
+                    "auto_load_instructions for that behavior."
+                ),
             },
         },
         "required": ["name", "instructions"],
@@ -474,6 +485,118 @@ def _resolved_skill_tool_ids(
     return resolved_tool_ids
 
 
+def materialize_loaded_skill_context(
+    *,
+    skill_id: str,
+    name: str,
+    description: str | None,
+    instructions: str,
+    tools: list[dict[str, Any]] | dict[str, Any] | None,
+    templates: dict[str, Any] | None,
+    asset_refs: list[SkillAssetRef],
+    steps: list[dict[str, Any]] | None,
+    tags: list[str] | None,
+    linked_tool_ids: list[str] | None,
+    attach_to_all_agents: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the protected context and activation metadata for a loaded skill."""
+
+    import json
+
+    asset_manifest = _skill_asset_llm_manifest(asset_refs)
+    available_skill_tools = _skill_tool_runtime_summaries(skill_id, tools)
+
+    protected_context_parts = [
+        "<loaded_skill>",
+        f"<skill_id>{skill_id}</skill_id>",
+        f"<name>{name}</name>",
+    ]
+    if description:
+        protected_context_parts.append(f"<description>{description}</description>")
+    if isinstance(instructions, str) and instructions.strip():
+        protected_context_parts.append(f"<instructions>\n{instructions}\n</instructions>")
+    if tools:
+        protected_context_parts.append(
+            "<tool_summaries>\n" + json.dumps(tools, indent=2, default=str) + "\n</tool_summaries>"
+        )
+    if available_skill_tools:
+        protected_context_parts.append(
+            "<available_skill_tools>\n"
+            + json.dumps(available_skill_tools, indent=2, default=str)
+            + "\n</available_skill_tools>"
+        )
+    if asset_manifest:
+        protected_context_parts.append(
+            "<asset_manifest>\n"
+            + json.dumps(asset_manifest, indent=2, default=str)
+            + "\n</asset_manifest>"
+        )
+        protected_context_parts.append(
+            "<asset_guidance>Prefer available_skill_tools for runnable skill behavior. "
+            "Use skill_asset_materialize only when you need an asset-only script or "
+            "need to inspect an asset as an executor-local file.</asset_guidance>"
+        )
+    if templates:
+        protected_context_parts.append(
+            "<prompt_templates>\n"
+            + json.dumps(templates, indent=2, default=str)
+            + "\n</prompt_templates>"
+        )
+    if steps:
+        protected_context_parts.append(
+            "<workflow_steps>\n" + json.dumps(steps, indent=2, default=str) + "\n</workflow_steps>"
+        )
+    protected_context_parts.append("</loaded_skill>")
+
+    declared_tool_ids = sorted(
+        _resolved_skill_tool_ids(
+            skill_id,
+            name,
+            description,
+            attach_to_all_agents,
+            instructions,
+            tools,
+            linked_tool_ids,
+        )
+    )
+
+    result = {
+        "skill_id": skill_id,
+        "name": name,
+        "description": description,
+        "loaded": True,
+        "tool_count": len(tools or []),
+        "step_count": len(steps or []),
+        "template_count": len(templates or {}),
+        "asset_count": len(asset_refs),
+        "available_skill_tools": available_skill_tools,
+        "asset_manifest": asset_manifest,
+        "asset_guidance": (
+            "Prefer available_skill_tools for runnable behavior. Use "
+            "skill_asset_materialize(skill_id, asset_id) only for asset-only scripts "
+            "or asset inspection."
+            if asset_manifest
+            else None
+        ),
+        "message": "Skill loaded into working context for this turn.",
+        "tags": tags or [],
+        "linked_tool_ids": linked_tool_ids or [],
+    }
+    metadata = {
+        "protected_context": "\n".join(protected_context_parts),
+        "discovered_tool_ids": declared_tool_ids,
+        "legacy_skill_tool_fallback": linked_tool_ids is None and not declared_tool_ids,
+        "skill_activation": {
+            "skill_id": skill_id,
+            "name": name,
+            "description": description,
+            "instructions": instructions,
+            "tags": tags or [],
+        },
+    }
+    return result, metadata
+
+
 # ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
@@ -715,62 +838,27 @@ async def _handle_skill_load(
         )
         steps = getattr(version_row, "steps", None) if version_row is not None else None
 
-    asset_manifest = _skill_asset_llm_manifest(asset_refs)
-    available_skill_tools = _skill_tool_runtime_summaries(row.skill_id, tools)
-
-    protected_context_parts = [
-        "<loaded_skill>",
-        f"<skill_id>{row.skill_id}</skill_id>",
-        f"<name>{row.name}</name>",
-    ]
-    if row.description:
-        protected_context_parts.append(f"<description>{row.description}</description>")
-    if isinstance(instructions, str) and instructions.strip():
-        protected_context_parts.append(f"<instructions>\n{instructions}\n</instructions>")
-    if tools:
-        protected_context_parts.append(
-            "<tool_summaries>\n" + json.dumps(tools, indent=2, default=str) + "\n</tool_summaries>"
-        )
-    if available_skill_tools:
-        protected_context_parts.append(
-            "<available_skill_tools>\n"
-            + json.dumps(available_skill_tools, indent=2, default=str)
-            + "\n</available_skill_tools>"
-        )
-    if asset_manifest:
-        protected_context_parts.append(
-            "<asset_manifest>\n"
-            + json.dumps(asset_manifest, indent=2, default=str)
-            + "\n</asset_manifest>"
-        )
-        protected_context_parts.append(
-            "<asset_guidance>Prefer available_skill_tools for runnable skill behavior. "
-            "Use skill_asset_materialize only when you need an asset-only script or "
-            "need to inspect an asset as an executor-local file.</asset_guidance>"
-        )
-    if templates:
-        protected_context_parts.append(
-            "<prompt_templates>\n"
-            + json.dumps(templates, indent=2, default=str)
-            + "\n</prompt_templates>"
-        )
-    if steps:
-        protected_context_parts.append(
-            "<workflow_steps>\n" + json.dumps(steps, indent=2, default=str) + "\n</workflow_steps>"
-        )
-    protected_context_parts.append("</loaded_skill>")
-
-    declared_tool_ids = sorted(
-        _resolved_skill_tool_ids(
-            row.skill_id,
-            row.name,
-            row.description,
-            row.auto_load,
-            instructions,
-            tools,
-            row.linked_tool_ids,
-        )
+    result, metadata = materialize_loaded_skill_context(
+        skill_id=row.skill_id,
+        name=row.name,
+        description=row.description,
+        instructions=instructions,
+        tools=tools,
+        templates=templates,
+        asset_refs=asset_refs,
+        steps=steps,
+        tags=row.tags or [],
+        linked_tool_ids=row.linked_tool_ids,
+        attach_to_all_agents=row.auto_load,
     )
+    declared_tool_ids = metadata.get("discovered_tool_ids", [])
+    skill_activation = metadata.get("skill_activation")
+    if isinstance(skill_activation, dict):
+        skill_activation["content_hash"] = (
+            version_row.content_hash
+            if version_row is not None and isinstance(version_row.content_hash, str)
+            else ""
+        )
     logger.info(
         "skill loaded",
         extra={
@@ -792,47 +880,9 @@ async def _handle_skill_load(
         },
     )
 
-    result = {
-        "skill_id": row.skill_id,
-        "name": row.name,
-        "description": row.description,
-        "loaded": True,
-        "tool_count": len(tools or []),
-        "step_count": len(steps or []),
-        "template_count": len(templates or {}),
-        "asset_count": len(asset_refs),
-        "available_skill_tools": available_skill_tools,
-        "asset_manifest": asset_manifest,
-        "asset_guidance": (
-            "Prefer available_skill_tools for runnable behavior. Use "
-            "skill_asset_materialize(skill_id, asset_id) only for asset-only scripts "
-            "or asset inspection."
-            if asset_manifest
-            else None
-        ),
-        "message": "Skill loaded into working context for this turn.",
-        "tags": row.tags or [],
-        "linked_tool_ids": row.linked_tool_ids or [],
-    }
     return ToolResult(
         output=json.dumps(result, indent=2, default=str),
-        metadata={
-            "protected_context": "\n".join(protected_context_parts),
-            "discovered_tool_ids": declared_tool_ids,
-            "legacy_skill_tool_fallback": row.linked_tool_ids is None and not declared_tool_ids,
-            "skill_activation": {
-                "skill_id": row.skill_id,
-                "name": row.name,
-                "description": row.description,
-                "instructions": instructions,
-                "tags": row.tags or [],
-                "content_hash": (
-                    version_row.content_hash
-                    if version_row is not None and isinstance(version_row.content_hash, str)
-                    else ""
-                ),
-            },
-        },
+        metadata=metadata,
     )
 
 

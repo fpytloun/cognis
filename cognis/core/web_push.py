@@ -153,9 +153,11 @@ def _push_label(value: str | None) -> str:
 
 
 def _agent_notification_title(agent: Agent | None) -> str:
-    return _push_label(agent.display_name if agent else None) or _push_label(
-        agent.name if agent else None
-    ) or "Cognis"
+    return (
+        _push_label(agent.display_name if agent else None)
+        or _push_label(agent.name if agent else None)
+        or "Cognis"
+    )
 
 
 def _is_same_origin_relative_icon(value: str) -> bool:
@@ -472,7 +474,9 @@ class WebPushService:
             rows = list(result.scalars().all())
 
         if not rows:
-            logger.debug("web_push: send skipped with no enabled subscriptions", extra={"kind": kind})
+            logger.debug(
+                "web_push: send skipped with no enabled subscriptions", extra={"kind": kind}
+            )
             return {"sent_to": 0, "errors": 0}
 
         logger.info(
@@ -507,7 +511,9 @@ class WebPushService:
     async def _handle_event(self, event: Event) -> None:
         payload = await self._event_payload(event)
         if payload is None:
-            logger.debug("web_push: event produced no push payload", extra={"event_type": event.type.value})
+            logger.debug(
+                "web_push: event produced no push payload", extra={"event_type": event.type.value}
+            )
             return
         logger.debug("web_push: dispatching event push", extra={"event_type": event.type.value})
         task = asyncio.create_task(self.send_to_user(**payload))
@@ -522,22 +528,20 @@ class WebPushService:
             logger.exception("web_push: background delivery failed")
 
     async def _event_payload(self, event: Event) -> dict[str, str] | None:
-        conversation_id = event.data.get("conversation_id")
-        if not isinstance(conversation_id, str):
-            return None
-        async with self._session_factory() as session:
-            conversation = await get_conversation(session, conversation_id)
-            agent = await get_agent(session, conversation.agent_id) if conversation else None
-        if conversation is None or conversation.context_type != "web":
-            return None
-
-        url = f"/chat/{conversation_id}"
-        tag = conversation_id
-        user_email = conversation.user_email
-        title = _agent_notification_title(agent)
-        icon = await self._agent_notification_icon(agent)
-
         if event.type == EventType.TURN_COMPLETED:
+            conversation_id = event.data.get("conversation_id")
+            if not isinstance(conversation_id, str):
+                return None
+            async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                agent = await get_agent(session, conversation.agent_id) if conversation else None
+            if conversation is None or conversation.context_type != "web":
+                return None
+            url = f"/chat/{conversation_id}"
+            tag = conversation_id
+            user_email = conversation.user_email
+            title = _agent_notification_title(agent)
+            icon = await self._agent_notification_icon(agent)
             if event.data.get("task_id") or event.data.get("channel_deliverable"):
                 return None
             return {
@@ -556,6 +560,18 @@ class WebPushService:
             EventType.TASK_FAILED,
             EventType.TASK_CANCELLED,
         }:
+            conversation_id = event.data.get("conversation_id")
+            if not isinstance(conversation_id, str):
+                return None
+            async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                agent = await get_agent(session, conversation.agent_id) if conversation else None
+            if conversation is None or conversation.context_type != "web":
+                return None
+            url = f"/chat/{conversation_id}"
+            user_email = conversation.user_email
+            title = _agent_notification_title(agent)
+            icon = await self._agent_notification_icon(agent)
             status = {
                 EventType.TASK_COMPLETED: "Task completed.",
                 EventType.TASK_FAILED: "Task failed.",
@@ -572,7 +588,47 @@ class WebPushService:
                 **({"icon": icon} if icon else {}),
             }
 
+        if event.type in {EventType.SCHEDULE_ERROR, EventType.SCHEDULE_DISABLED}:
+            user_email = event.data.get("created_by")
+            if not isinstance(user_email, str) or not user_email:
+                return None
+            agent_id = event.data.get("agent_id")
+            agent = None
+            if isinstance(agent_id, str) and agent_id:
+                async with self._session_factory() as session:
+                    agent = await get_agent(session, agent_id)
+            title = _agent_notification_title(agent)
+            icon = await self._agent_notification_icon(agent)
+            schedule_id = str(event.data.get("schedule_id") or "schedule")
+            schedule_name = str(event.data.get("schedule_name") or "Scheduled task")
+            if event.type == EventType.SCHEDULE_DISABLED:
+                body = f'Schedule "{schedule_name}" was disabled after repeated failures.'
+            else:
+                body = f'Schedule "{schedule_name}" failed to start.'
+            return {
+                "user_email": user_email,
+                "title": title,
+                "body": body,
+                "url": "/tasks",
+                "tag": f"schedule:{schedule_id}",
+                "kind": "schedule",
+                "conversation_id": "",
+                **({"icon": icon} if icon else {}),
+            }
+
         if event.type == EventType.NOTIFICATION_CREATED:
+            conversation_id = event.data.get("conversation_id")
+            if not isinstance(conversation_id, str):
+                return None
+            async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                agent = await get_agent(session, conversation.agent_id) if conversation else None
+            if conversation is None or conversation.context_type != "web":
+                return None
+            url = f"/chat/{conversation_id}"
+            user_email = conversation.user_email
+            title = _agent_notification_title(agent)
+            icon = await self._agent_notification_icon(agent)
             notification_type = str(event.data.get("notification_type") or "notification")
             body = {
                 "escalation": "Tool approval required.",
@@ -614,7 +670,9 @@ class WebPushService:
                     ttl_seconds=3600,
                 )
             except Exception:
-                logger.debug("web_push: unable to sign agent avatar for notification", exc_info=True)
+                logger.debug(
+                    "web_push: unable to sign agent avatar for notification", exc_info=True
+                )
         if agent.avatar_url and _is_same_origin_relative_icon(agent.avatar_url):
             return agent.avatar_url
         return None

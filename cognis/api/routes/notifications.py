@@ -121,6 +121,15 @@ async def resolve_notification(
     notification = await svc.get(notification_id)
     if notification is None or notification.user_email != user.email:
         raise HTTPException(status_code=404, detail="Notification not found")
+    if (
+        notification.notification_type == "auth_challenge"
+        and isinstance(notification.payload, dict)
+        and notification.payload.get("kind") == "oauth_authorization"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth authorization challenges are completed by callback only",
+        )
 
     if notification.notification_type == "step_question" and notification.task_id is None:
         pause = request.app.state.pause_waiter.get(notification_id)

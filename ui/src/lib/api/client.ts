@@ -14,6 +14,7 @@ import type {
     ChannelMeta,
   ApiErrorResponse,
   ApiKeyMetadata,
+  AgentDirectChat,
   BootstrapStatusResponse,
   Conversation,
   ConversationFlatSearchResponse,
@@ -109,6 +110,24 @@ export class ApiError extends Error {
     this.status = options.status;
     this.details = options.details ?? null;
   }
+}
+
+interface ConversationMessagesOptions {
+  anchor?: 'oldest' | 'latest';
+  before?: string | null;
+}
+
+function conversationMessagesQuery(
+  afterSeq = 0,
+  limit = 200,
+  params: ConversationMessagesOptions = {}
+): Record<string, string | number | boolean | null | undefined> {
+  return {
+    after_seq: afterSeq,
+    limit,
+    anchor: params.anchor,
+    before: params.before
+  };
 }
 
 type RequestOptions = RequestInit & {
@@ -381,7 +400,7 @@ export const api = {
 
     list(
       cursor: string | null = null,
-      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
+      filters: { contextType?: string | null; agentId?: string | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
     ): Promise<CursorPage<Conversation>> {
       return request<CursorPage<Conversation>>(
         `/api/v1/conversations${encodeQuery({
@@ -389,15 +408,25 @@ export const api = {
           limit: 50,
           context_type: filters.contextType,
           agent_id: filters.agentId,
-          status: filters.status
+          status: filters.status,
+          include_agent_direct: filters.includeAgentDirect
         })}`
       );
     },
 
     async listAll(
-      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
+      filters: { contextType?: string | null; agentId?: string | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
     ): Promise<Conversation[]> {
       return collectCursorPages((cursor) => this.list(cursor, filters));
+    },
+
+    agentDirect(params: { agentId?: string | null; status?: string | null } = {}): Promise<AgentDirectChat[]> {
+      return request<AgentDirectChat[]>(
+        `/api/v1/conversations/agent-direct${encodeQuery({
+          agent_id: params.agentId,
+          status: params.status
+        })}`
+      );
     },
 
     create(payload: { agent_id: string; title?: string | null; context?: Record<string, unknown> }): Promise<Conversation> {
@@ -435,7 +464,16 @@ export const api = {
 
     messages(conversationId: string, afterSeq = 0, limit = 200): Promise<MessageHistoryResponse> {
       return request<MessageHistoryResponse>(
-        `/api/v1/conversations/${conversationId}/messages${encodeQuery({ after_seq: afterSeq, limit })}`
+        `/api/v1/conversations/${conversationId}/messages${encodeQuery(conversationMessagesQuery(afterSeq, limit))}`
+      );
+    },
+
+    historyPage(conversationId: string, limit = 200, before: string | null = null): Promise<MessageHistoryResponse> {
+      return request<MessageHistoryResponse>(
+        `/api/v1/conversations/${conversationId}/messages${encodeQuery(conversationMessagesQuery(0, limit, {
+          anchor: 'latest',
+          before
+        }))}`
       );
     },
 
@@ -454,15 +492,23 @@ export const api = {
       );
     },
 
-    sessions(conversationId: string): Promise<Session[]> {
-      return request<Session[]>(`/api/v1/conversations/${conversationId}/sessions`);
+    sessions(
+      conversationId: string,
+      params: { rootOnly?: boolean; activeOnly?: boolean; limit?: number; order?: 'asc' | 'desc' } = {}
+    ): Promise<Session[]> {
+      return request<Session[]>(`/api/v1/conversations/${conversationId}/sessions${encodeQuery({
+        root_only: params.rootOnly,
+        active_only: params.activeOnly,
+        limit: params.limit,
+        order: params.order
+      })}`);
     },
 
     delegations(conversationId: string): Promise<Session[]> {
       return request<Session[]>(`/api/v1/conversations/${conversationId}/delegations`);
     },
 
-    resolve(payload: { agent_id: string; context_type?: string }): Promise<Conversation> {
+    resolve(payload: { agent_id: string; context_type?: string; scope?: 'latest' | 'agent_direct' }): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations/resolve', {
         method: 'POST',
         body: JSON.stringify(payload)
@@ -746,6 +792,37 @@ export const api = {
 
     deleteMcpServer(serverId: string): Promise<void> {
       return request<void>(`/api/v1/mcp-servers/${serverId}`, { method: 'DELETE' });
+    },
+
+    startMcpOAuth(serverId: string): Promise<{
+      authorization_url: string;
+      transaction_id: string;
+      expires_at: string;
+      issuer?: string | null;
+      authorization_server?: string | null;
+      scopes?: string[];
+    }> {
+      return request(`/api/v1/mcp-servers/${serverId}/oauth/start`, {
+        method: 'POST'
+      });
+    },
+
+    mcpOAuthStatus(serverId: string): Promise<{
+      connected: boolean;
+      issuer?: string | null;
+      resource?: string | null;
+      scopes?: string[];
+      expires_at?: string | null;
+      refreshable?: boolean;
+      status?: string;
+    }> {
+      return request(`/api/v1/mcp-servers/${serverId}/oauth/status`);
+    },
+
+    disconnectMcpOAuth(serverId: string): Promise<{ status: string }> {
+      return request(`/api/v1/mcp-servers/${serverId}/oauth/disconnect`, {
+        method: 'POST'
+      });
     }
   },
 

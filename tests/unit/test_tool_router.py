@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import socket
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -307,6 +308,18 @@ def _registry() -> ToolRegistry:
     registry.register(
         RegisteredTool(
             definition=ToolDefinition(
+                name="skill_load",
+                description="Load a skill by ID",
+                parameters={"type": "object", "properties": {"skill_id": {"type": "string"}}},
+                source=ToolSource(type="builtin"),
+                category="system",
+                read_only=True,
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
                 name="skill_asset_materialize",
                 description="materialize skill asset",
                 parameters={"type": "object", "properties": {}},
@@ -596,8 +609,10 @@ def test_decision_cache_key_separates_read_only_by_executor_runtime() -> None:
     assert key_a != key_b
 
 
-def test_evaluation_context_infers_executor_home_from_workspace_root() -> None:
-    context = ToolRouter._evaluation_context(
+@pytest.mark.asyncio
+async def test_evaluation_context_infers_executor_home_from_workspace_root() -> None:
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    context = await router._evaluation_context(
         ToolCall(
             call_id="r1",
             name="read",
@@ -681,6 +696,49 @@ async def test_tool_router_passes_executor_runtime_to_guardrails() -> None:
     _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
     assert context["working_directory"] == "/home/riker"
     assert context["executor_environment"]["cwd"] == "/home/riker"
+    assert context["tool"]["description"] == "memory search"
+    assert context["tool"]["read_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_tool_router_passes_skill_load_metadata_to_guardrails(monkeypatch) -> None:
+    async def _fake_get_skill_scoped(db, skill_id: str, *, owner_email=None):
+        del db, owner_email
+        return SimpleNamespace(
+            skill_id=skill_id,
+            name="lumilens-loki-query",
+            description="Safe procedure for querying Lumilens production Loki.",
+            tags=["lumilens"],
+        )
+
+    import cognis.store.queries as queries
+
+    monkeypatch.setattr(queries, "get_skill_scoped", _fake_get_skill_scoped)
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        non_bypassable_patterns=[],
+        session_factory=_session_factory(),
+    )
+
+    await router.evaluate_tool_call(
+        ToolCall(
+            call_id="skill-1",
+            name="skill_load",
+            arguments={"skill_id": "skill_bbff42a5255b"},
+        ),
+        _agent({"*": Permission.EVALUATE}),
+        _session(),
+        _registry(),
+    )
+
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
+    assert context["tool"]["description"] == "Load a skill by ID"
+    assert context["tool"]["read_only"] is True
+    assert context["skill"]["skill_id"] == "skill_bbff42a5255b"
+    assert context["skill"]["name"] == "lumilens-loki-query"
+    assert "Loki" in context["skill"]["description"]
 
 
 @pytest.mark.asyncio
@@ -995,7 +1053,10 @@ async def test_tool_router_passes_merged_runtime_metadata_to_registered_handler(
         captured.update(context.runtime_metadata)
         runtime_access = context.runtime_metadata.get("runtime_access", {})
         user_email = runtime_access.get("user_email") if isinstance(runtime_access, dict) else None
-        return {"user_email": user_email}
+        interaction_mode = (
+            runtime_access.get("interaction_mode") if isinstance(runtime_access, dict) else None
+        )
+        return {"user_email": user_email, "interaction_mode": interaction_mode}
 
     router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
     executor = _RemoteExecutor()
@@ -1022,7 +1083,10 @@ async def test_tool_router_passes_merged_runtime_metadata_to_registered_handler(
             arguments={},
             runtime_metadata={
                 "tool_key": "tool",
-                "runtime_access": {"user_email": "user@example.com"},
+                "runtime_access": {
+                    "user_email": "user@example.com",
+                    "interaction_mode": "none",
+                },
             },
         ),
         _session(),
@@ -1033,10 +1097,14 @@ async def test_tool_router_passes_merged_runtime_metadata_to_registered_handler(
 
     assert executor.calls == 0
     assert result.is_error is False
+    assert '"interaction_mode": "none"' in str(result.output)
     assert captured["user_email"] == "user@example.com"
     assert captured["executor_key"] == "executor"
     assert captured["tool_key"] == "tool"
-    assert captured["runtime_access"] == {"user_email": "user@example.com"}
+    assert captured["runtime_access"] == {
+        "user_email": "user@example.com",
+        "interaction_mode": "none",
+    }
 
 
 @pytest.mark.asyncio
@@ -1231,6 +1299,8 @@ async def test_tool_router_times_out_and_cancels() -> None:
 
     assert executor.cancelled == ["4"]
     assert "Tool execution timed" in result.output
+    assert result.metadata["code"] == "tool_execution_timeout"
+    assert result.metadata["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -1561,9 +1631,21 @@ async def test_tool_router_handles_artifact_read_with_current_model(
     class _Llm:
         def __init__(self) -> None:
             self.messages: list[dict[str, object]] | None = None
+            self.model_info_calls: list[dict[str, object]] = []
 
-        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
-            del model_id, provider_id
+        async def get_model_info(
+            self,
+            model_id: str,
+            provider_id: str | None = None,
+            acting_user_email: str | None = None,
+        ) -> object:
+            self.model_info_calls.append(
+                {
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "acting_user_email": acting_user_email,
+                }
+            )
             return SimpleNamespace(
                 supports_vision=True,
                 supports_pdf_input=False,
@@ -1627,22 +1709,182 @@ async def test_tool_router_handles_artifact_read_with_current_model(
 
     assert result.is_error is False
     assert result.metadata is not None
-    assert result.metadata["_raw_output"] == "It is a blue square."
-    assert llm.messages is not None
-    content = llm.messages[0]["content"]
-    assert isinstance(content, list)
-    assert content[1] == {
-        "type": "text",
-        "text": (
-            "Artifact metadata: artifact_id=img_1, filename=image.png, kind=image, "
-            "mime_type=image/png, size_bytes=8, "
-            "url=https://cognis.example.com/images/img_1/image.png"
+    assert (
+        "Prepared artifact 'image.png' for native model inspection"
+        in result.metadata["_raw_output"]
+    )
+    assert result.metadata["native_attachment"] is True
+    assert llm.model_info_calls == [
+        {
+            "model_id": "gpt-4o-mini",
+            "provider_id": None,
+            "acting_user_email": "user@example.com",
+        }
+    ]
+    assert result.attachments == [
+        {
+            "artifact_id": "img_1",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "image.png",
+            "size_bytes": 8,
+            "url": "https://cognis.example.com/images/img_1/image.png",
+        }
+    ]
+    assert llm.messages is None
+
+
+@pytest.mark.asyncio
+async def test_artifact_read_materializes_tool_artifact_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    class _Anchor:
+        anchor = "media:1"
+        artifact_candidate = {
+            "source_type": "remote_url",
+            "url": "https://cdn.example.com/product.svg",
+            "mime_hint": "image/svg+xml",
+            "filename_hint": "product.svg",
+        }
+
+    class _ToolOutputStore:
+        async def list_anchors(self, call_id: str) -> list[_Anchor]:
+            assert call_id == "call-web"
+            return [_Anchor()]
+
+    class _Session:
+        async def commit(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    row = SimpleNamespace(
+        artifact_id="att_1",
+        namespace="attachments",
+        object_id="att_1",
+        filename="product.svg",
+        owner_email="user@example.com",
+        conversation_id="call-web",
+        session_id="media:1",
+        message_role="assistant",
+        purpose="tool_artifact",
+        kind="file",
+        mime_type="image/svg+xml",
+        size_bytes=7,
+        status="attached",
+        created_at=None,
+        expires_at=None,
+        deleted_at=None,
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.find_tool_artifact_record",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.create_artifact_record",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools._fetch_remote_artifact_candidate",
+        AsyncMock(
+            return_value=ToolResult(
+                output="fetched",
+                metadata={
+                    "content": b"<svg></svg>",
+                    "mime_type": "image/svg+xml",
+                    "filename": "product.svg",
+                },
+            )
         ),
-    }
-    assert content[2] == {
-        "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,cG5nLWJ5dGVz"},
-    }
+    )
+
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "tool_artifact:call-web:media:1"},
+        llm=None,
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+        user_email="user@example.com",
+        current_model=None,
+        current_provider_id=None,
+        runtime_metadata={"tool_output_store": _ToolOutputStore()},
+    )
+
+    assert result.is_error is False
+    assert "Materialized tool_artifact:call-web:media:1 as artifact att_1" in result.output
+    assert result.metadata is not None
+    assert result.metadata["materialized_artifact_id"] == "att_1"
+
+
+@pytest.mark.asyncio
+async def test_tool_artifact_remote_fetch_blocks_private_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import _fetch_remote_artifact_candidate
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.socket.getaddrinfo",
+        lambda *_, **__: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443))],
+    )
+
+    result = await _fetch_remote_artifact_candidate("https://example.com/image.png")
+
+    assert result.is_error is True
+    assert "blocked network address" in result.output
+
+
+@pytest.mark.asyncio
+async def test_tool_artifact_remote_fetch_blocks_redirect_to_private_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import _fetch_remote_artifact_candidate
+
+    def fake_getaddrinfo(host: str, *_args: object, **_kwargs: object) -> list[object]:
+        ip = "127.0.0.1" if host == "127.0.0.1" else "93.184.216.34"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (ip, 443))]
+
+    class _Response:
+        is_redirect = True
+        headers = {"location": "http://127.0.0.1/private.png"}
+        request = SimpleNamespace(url="https://example.com/image.png")
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Client:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def build_request(self, *_args: object, **_kwargs: object) -> object:
+            return object()
+
+        async def send(self, *_args: object, **_kwargs: object) -> _Response:
+            return _Response()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.socket.getaddrinfo",
+        fake_getaddrinfo,
+    )
+    monkeypatch.setattr("cognis.tools.builtin.artifact_tools.httpx.AsyncClient", _Client)
+
+    result = await _fetch_remote_artifact_candidate("https://example.com/image.png")
+
+    assert result.is_error is True
+    assert "blocked network address" in result.output
 
 
 @pytest.mark.asyncio
@@ -1681,7 +1923,6 @@ async def test_tool_router_handles_artifact_read_with_owner_email_kwarg(
             )
         ),
     )
-
     router = ToolRouter(
         guardrails=_Guardrails(),
         llm=None,
@@ -1811,6 +2052,105 @@ async def test_artifact_read_uses_effective_owner_for_attachment_analysis_route(
 
 
 @pytest.mark.asyncio
+async def test_artifact_read_returns_native_attachment_for_capable_current_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"jpeg-bytes", "image/jpeg"
+
+    class _Llm:
+        def __init__(self) -> None:
+            self.generate_calls = 0
+
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            del model_id, provider_id
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
+            del messages, kwargs
+            self.generate_calls += 1
+            raise RuntimeError("provider rejected image input")
+
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    async def fake_get_model_routing(
+        session: object, task_type: str, owner_email: str | None = None
+    ) -> object | None:
+        del session, owner_email
+        assert task_type == "attachment_analysis"
+        return SimpleNamespace(model="gpt-5.5", provider_id=None)
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="images",
+                object_id="img_1",
+                filename="image.jpg",
+                mime_type="image/jpeg",
+                kind="image",
+                size_bytes=10,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        fake_get_model_routing,
+    )
+
+    llm = _Llm()
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "img_1", "prompt": "Describe the image briefly."},
+        llm=llm,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+        user_email="user@example.com",
+        current_model="gpt-5.5",
+        current_provider_id="codex",
+    )
+
+    assert result.is_error is False
+    assert llm.generate_calls == 0
+    assert "Prepared artifact 'image.jpg' for native model inspection" in result.output
+    assert "Requested analysis prompt: Describe the image briefly." in result.output
+    assert result.attachments == [
+        {
+            "artifact_id": "img_1",
+            "kind": "image",
+            "mime_type": "image/jpeg",
+            "filename": "image.jpg",
+            "size_bytes": 10,
+            "url": "https://cognis.example.com/images/img_1/image.jpg",
+        }
+    ]
+    assert result.metadata is not None
+    assert result.metadata["native_attachment"] is True
+    assert result.metadata["analysis_model"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
 async def test_tool_router_postprocesses_binary_read_with_current_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1824,9 +2164,21 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
     class _Llm:
         def __init__(self) -> None:
             self.messages: list[dict[str, object]] | None = None
+            self.model_info_calls: list[dict[str, object]] = []
 
-        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
-            del model_id, provider_id
+        async def get_model_info(
+            self,
+            model_id: str,
+            provider_id: str | None = None,
+            acting_user_email: str | None = None,
+        ) -> object:
+            self.model_info_calls.append(
+                {
+                    "model_id": model_id,
+                    "provider_id": provider_id,
+                    "acting_user_email": acting_user_email,
+                }
+            )
             return SimpleNamespace(
                 supports_vision=True,
                 supports_pdf_input=False,
@@ -1925,19 +2277,248 @@ async def test_tool_router_postprocesses_binary_read_with_current_model(
     )
 
     assert result.is_error is False
-    assert result.attachments is None
+    assert result.attachments is not None
+    assert result.attachments[0]["artifact_id"] == "att_1"
     assert result.metadata is not None
-    assert result.metadata["_raw_output"] == "It is a generated banner."
+    assert (
+        "Prepared binary file 'photo.jpg' for native model inspection"
+        in result.metadata["_raw_output"]
+    )
     assert result.metadata["analysis_model"] == "gpt-5.4"
-    assert result.metadata["used_attachment_analysis_route"] is False
+    assert result.metadata["native_attachment"] is True
+    assert llm.model_info_calls == [
+        {
+            "model_id": "gpt-5.4",
+            "provider_id": "openai",
+            "acting_user_email": "user@example.com",
+        }
+    ]
     assert session.attachment_analysis_lookups == 0
-    assert llm.messages is not None
-    content = llm.messages[0]["content"]
-    assert isinstance(content, list)
-    assert content[2] == {
-        "type": "image_url",
-        "image_url": {"url": "data:image/jpeg;base64,anBlZy1ieXRlcw=="},
-    }
+    assert llm.messages is None
+
+
+@pytest.mark.asyncio
+async def test_tool_router_retries_artifact_read_with_attachment_route_after_native_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    class _Llm:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            self.calls.append(
+                {"operation": "get_model_info", "model": model_id, "provider_id": provider_id}
+            )
+            if model_id == "gpt-5.5":
+                return SimpleNamespace(
+                    supports_vision=False,
+                    supports_pdf_input=False,
+                    supports_audio_input=False,
+                    supports_file_input=False,
+                )
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
+            self.calls.append({"operation": "generate", **kwargs, "messages": messages})
+            content = messages[0]["content"]
+            assert isinstance(content, list)
+            image = content[2]
+            assert isinstance(image, dict)
+            image_url = image["image_url"]
+            assert isinstance(image_url, dict)
+            if kwargs["task_type"] == "default":
+                raise RuntimeError("Direct Codex request failed: HTTP 400")
+            return {"choices": [{"message": {"content": "Fallback route analyzed it."}}]}
+
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    async def fake_get_model_routing(
+        session: object, task_type: str, owner_email: str | None = None
+    ) -> object | None:
+        del session, owner_email
+        assert task_type == "attachment_analysis"
+        return SimpleNamespace(model="vision-route", provider_id="route-provider")
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="images",
+                object_id="img_1",
+                filename="image.png",
+                mime_type="image/png",
+                kind="image",
+                size_bytes=8,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        fake_get_model_routing,
+    )
+
+    llm = _Llm()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=llm,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-fallback",
+            name="artifact_read",
+            arguments={"artifact_id": "img_1"},
+            runtime_metadata={"resolved_model": "gpt-5.5"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["_raw_output"] == "Fallback route analyzed it."
+    assert result.metadata["analysis_model"] == "vision-route"
+    assert result.metadata["analysis_task_type"] == "attachment_analysis"
+    assert result.metadata["used_attachment_analysis_route"] is True
+    generate_calls = [call for call in llm.calls if call["operation"] == "generate"]
+    assert [call["model"] for call in generate_calls] == ["vision-route"]
+    assert [call["task_type"] for call in generate_calls] == ["attachment_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_retries_image_url_payload_inline_before_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    class _Llm:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
+            del provider_id
+            if model_id == "gpt-5.5":
+                return SimpleNamespace(
+                    supports_vision=False,
+                    supports_pdf_input=False,
+                    supports_audio_input=False,
+                    supports_file_input=False,
+                )
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+        async def generate(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> dict[str, object]:
+            del kwargs
+            content = messages[0]["content"]
+            assert isinstance(content, list)
+            image = content[2]
+            assert isinstance(image, dict)
+            image_url = image["image_url"]
+            assert isinstance(image_url, dict)
+            url = image_url["url"]
+            assert isinstance(url, str)
+            self.calls.append(url)
+            if url.startswith("https://"):
+                raise RuntimeError("provider could not fetch signed URL")
+            return {"choices": [{"message": {"content": "Inline image worked."}}]}
+
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="img_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="images",
+                object_id="img_1",
+                filename="image.png",
+                mime_type="image/png",
+                kind="image",
+                size_bytes=8,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        AsyncMock(return_value=SimpleNamespace(model="vision-route", provider_id="route-provider")),
+    )
+
+    llm = _Llm()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        llm=llm,
+        artifact_store=_Store(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-inline-retry",
+            name="artifact_read",
+            arguments={"artifact_id": "img_1"},
+            runtime_metadata={"resolved_model": "gpt-5.5"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["_raw_output"] == "Inline image worked."
+    assert result.metadata["analysis_model"] == "vision-route"
+    assert result.metadata["analysis_task_type"] == "attachment_analysis"
+    assert result.metadata["analysis_payload"] == "inline"
+    assert result.metadata["used_attachment_analysis_route"] is True
+    assert llm.calls == [
+        "https://cognis.example.com/images/img_1/image.png",
+        "data:image/png;base64,cG5nLWJ5dGVz",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2080,7 +2661,6 @@ async def test_tool_router_handles_artifact_get_metadata(
             )
         ),
     )
-
     router = ToolRouter(
         guardrails=_Guardrails(),
         artifact_store=_ArtifactStore(),
@@ -2140,7 +2720,6 @@ async def test_tool_router_handles_artifact_get_url(
             )
         ),
     )
-
     router = ToolRouter(
         guardrails=_Guardrails(),
         artifact_store=_ArtifactStore(),
@@ -2202,7 +2781,6 @@ async def test_tool_router_rejects_expired_artifact_tools(
             )
         ),
     )
-
     router = ToolRouter(
         guardrails=_Guardrails(),
         artifact_store=_ArtifactStore(),
@@ -2238,7 +2816,14 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
 
     class _Llm:
         async def get_model_info(self, model_id: str, provider_id: str | None = None) -> object:
-            del model_id, provider_id
+            del provider_id
+            if model_id == "gpt-4o-mini":
+                return SimpleNamespace(
+                    supports_vision=False,
+                    supports_pdf_input=False,
+                    supports_audio_input=False,
+                    supports_file_input=False,
+                )
             return SimpleNamespace(
                 supports_vision=True,
                 supports_pdf_input=False,
@@ -2280,6 +2865,10 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
             )
         ),
     )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_model_routing",
+        AsyncMock(return_value=SimpleNamespace(model="vision-route", provider_id="route-provider")),
+    )
 
     router = ToolRouter(
         guardrails=_Guardrails(),
@@ -2305,12 +2894,13 @@ async def test_tool_router_reports_attachment_analysis_diagnostics_on_empty_resp
     assert result.metadata is not None
     assert (
         result.metadata["_raw_output"]
-        == "Current model 'gpt-4o-mini' returned no content while inspecting 'image.png'."
+        == "Attachment analysis route model 'vision-route' returned no content for 'image.png'."
     )
     assert result.metadata["response_status"] == "completed"
     assert result.metadata["finish_reason"] == "stop"
     assert result.metadata["has_content"] is False
-    assert result.metadata["analysis_model"] == "gpt-4o-mini"
+    assert result.metadata["analysis_model"] == "vision-route"
+    assert result.metadata["analysis_task_type"] == "attachment_analysis"
 
 
 @pytest.mark.asyncio

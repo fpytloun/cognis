@@ -623,6 +623,11 @@ class InboundPipeline:
             for notif in pending
             if notif.notification_type in {"step_question", "auth_challenge"}
             and notif.task_id is None
+            and not (
+                notif.notification_type == "auth_challenge"
+                and isinstance(notif.payload, dict)
+                and notif.payload.get("kind") == "oauth_authorization"
+            )
         ]
         if not direct_questions:
             return None
@@ -852,6 +857,23 @@ class ChannelTurnObserver:
                 self._accumulated_text = ""
                 return  # typing indicator is implicit after a sent message
 
+        adapter = self._get_adapter()
+        if adapter is not None:
+            with contextlib.suppress(Exception):
+                await adapter.send_typing(self._chat_id)
+
+    async def on_tool_progress(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        progress: dict[str, Any],
+        turn_id: str | None = None,
+    ) -> None:
+        """Send typing indicator while a tool input is being prepared."""
+        del conversation_id, session_id, call_id, tool_name, progress, turn_id
+        self._turn_active = True
         adapter = self._get_adapter()
         if adapter is not None:
             with contextlib.suppress(Exception):

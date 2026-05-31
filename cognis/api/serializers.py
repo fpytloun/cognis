@@ -101,7 +101,14 @@ def _session_result_sections(
     return sections
 
 
-def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> ConversationResponse:
+def conversation_to_response(
+    row: Any,
+    *,
+    has_active_turn: bool = False,
+    active_session: Any | None = None,
+    active_turn_state: dict[str, Any] | None = None,
+    pending_notification_types: list[str] | None = None,
+) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
     has_unread = last_message_at is not None and (
@@ -129,12 +136,17 @@ def conversation_to_response(row: Any, *, has_active_turn: bool = False) -> Conv
         active_executor_assigned_at=getattr(row, "active_executor_assigned_at", None),
         active_executor_expires_at=getattr(row, "active_executor_expires_at", None),
         active_executor_source=getattr(row, "active_executor_source", None),
+        active_session_status=getattr(active_session, "status", None),
+        active_session_completion_reason=getattr(active_session, "completion_reason", None),
+        active_turn_chat_mode=(active_turn_state or {}).get("chat_mode"),
+        active_turn_chat_mode_source=(active_turn_state or {}).get("chat_mode_source"),
+        pending_notification_types=pending_notification_types or [],
         starred_at=getattr(row, "starred_at", None),
         status=row.status,
         last_message_at=last_message_at,
         last_read_at=last_read_at,
         has_unread=has_unread,
-        has_active_turn=has_active_turn or bool(getattr(row, "has_active_turn", False)),
+        has_active_turn=has_active_turn,
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
     )
@@ -348,6 +360,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         completion_mode_family=task.completion_delivery.completion_mode_family,
         allow_silent_completion=task.completion_delivery.allow_silent_completion,
         interaction_mode_override=task.interaction_mode_override,
+        session_policy=task.session_policy,
         workflow_id=task.workflow_id,
         project_id=task.project_id,
         attempt_number=task.attempt_number,

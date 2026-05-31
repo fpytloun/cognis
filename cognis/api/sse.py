@@ -129,6 +129,31 @@ class SSETurnObserver:
             }
         )
 
+    async def on_tool_progress(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        progress: dict[str, Any],
+        turn_id: str | None = None,
+    ) -> None:
+        if conversation_id != self._conversation_id or self._done:
+            return
+        await self._queue.put(
+            {
+                "event": "tool_progress",
+                "data": {
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "progress": progress,
+                    "turn_id": turn_id,
+                },
+            }
+        )
+
     async def on_tool_result(
         self,
         conversation_id: str,

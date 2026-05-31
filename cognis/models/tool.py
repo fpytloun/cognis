@@ -6,7 +6,7 @@ import hashlib
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_core import PydanticCustomError
@@ -169,21 +169,25 @@ _MAX_TOOL_NAME_LENGTH = 64
 def sanitize_mcp_tool_name(server_name: str, raw_tool_name: str) -> str:
     """Return a provider-safe MCP tool name.
 
-    The base shape follows the spec (`mcp_<server>__<tool>`). When the raw
-    values need normalization or the result would be too long, append a stable
-    short hash to keep names deterministic and collision-resistant.
+    The base shape follows the spec (`mcp_<server>__<tool>`). Simple segment
+    normalization does not add a suffix by itself; callers that discover an
+    actual normalized-name collision should request a suffixed variant.
     """
 
     safe_server = _sanitize_tool_segment(server_name)
     safe_tool = _sanitize_tool_segment(raw_tool_name)
     base_name = f"mcp_{safe_server}__{safe_tool}"
-    needs_suffix = (
-        safe_server != server_name
-        or safe_tool != raw_tool_name
-        or len(base_name) > _MAX_TOOL_NAME_LENGTH
-    )
-    if not needs_suffix:
+    if len(base_name) <= _MAX_TOOL_NAME_LENGTH:
         return base_name
+    return sanitize_mcp_tool_name_with_suffix(server_name, raw_tool_name)
+
+
+def sanitize_mcp_tool_name_with_suffix(server_name: str, raw_tool_name: str) -> str:
+    """Return a provider-safe MCP tool name with a stable disambiguating suffix."""
+
+    safe_server = _sanitize_tool_segment(server_name)
+    safe_tool = _sanitize_tool_segment(raw_tool_name)
+    base_name = f"mcp_{safe_server}__{safe_tool}"
     suffix = hashlib.sha1(f"{server_name}:{raw_tool_name}".encode()).hexdigest()[:8]
     trimmed = base_name[: _MAX_TOOL_NAME_LENGTH - len(suffix) - 1].rstrip("_")
     return f"{trimmed}_{suffix}"
@@ -204,6 +208,65 @@ class ToolCall(BaseModel):
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MCPOAuth2Config(BaseModel):
+    """OAuth 2.1 configuration for HTTP MCP servers."""
+
+    type: Literal["oauth2"] = "oauth2"
+    issuer: str | None = None
+    authorization_server: str | None = None
+    resource: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    client_id: str | None = None
+    client_secret_ref: str | None = None
+    redirect_uri: str | None = None
+    dynamic_client_registration: bool = False
+    client_metadata_document_url: str | None = None
+    authorization_params: dict[str, str] = Field(default_factory=dict)
+
+
+class MCPAuthConfig(BaseModel):
+    """MCP auth mode configuration."""
+
+    type: Literal["none", "static_headers", "oauth2"] = "none"
+    issuer: str | None = None
+    authorization_server: str | None = None
+    resource: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    client_id: str | None = None
+    client_secret_ref: str | None = None
+    redirect_uri: str | None = None
+    dynamic_client_registration: bool = False
+    client_metadata_document_url: str | None = None
+    authorization_params: dict[str, str] = Field(default_factory=dict)
+
+
+def effective_mcp_auth_config(
+    auth_config: dict[str, Any] | MCPAuthConfig | None,
+    headers: dict[str, str] | None = None,
+) -> MCPAuthConfig:
+    """Return explicit auth config or legacy static-header compatibility mode."""
+
+    if isinstance(auth_config, MCPAuthConfig):
+        return auth_config
+    if isinstance(auth_config, dict) and auth_config:
+        return MCPAuthConfig.model_validate(auth_config)
+    return MCPAuthConfig(type="static_headers" if headers else "none")
+
+
+def mcp_headers_have_authorization(headers: dict[str, str] | None) -> bool:
+    return any(str(key).lower() == "authorization" for key in (headers or {}))
+
+
+_RESERVED_OAUTH_AUTHORIZATION_PARAMS = {
+    "client_id",
+    "code_challenge",
+    "code_challenge_method",
+    "redirect_uri",
+    "response_type",
+    "state",
+}
+
+
 class MCPServerConfig(BaseModel):
     """Configuration for a local MCP server."""
 
@@ -215,10 +278,12 @@ class MCPServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    auth_config: MCPAuthConfig | None = Field(default_factory=MCPAuthConfig)
     timeout_seconds: int = 30
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> MCPServerConfig:
+        self.auth_config = effective_mcp_auth_config(self.auth_config, self.headers)
         if self.transport == "stdio":
             if not self.command:
                 raise PydanticCustomError(
@@ -229,6 +294,11 @@ class MCPServerConfig(BaseModel):
                 raise PydanticCustomError(
                     "mcp_stdio_headers_forbidden",
                     "headers are not allowed for stdio transport",
+                )
+            if self.auth_config.type == "oauth2":
+                raise PydanticCustomError(
+                    "mcp_oauth_http_transport_required",
+                    "OAuth is only supported for HTTP MCP transports",
                 )
             self.url = None
         elif self.transport in ("sse", "streamable_http"):
@@ -248,6 +318,25 @@ class MCPServerConfig(BaseModel):
             raise PydanticCustomError(
                 "mcp_transport_invalid",
                 f"unsupported MCP transport: {self.transport}",
+            )
+        if self.auth_config.type == "oauth2" and mcp_headers_have_authorization(self.headers):
+            raise PydanticCustomError(
+                "mcp_oauth_authorization_header_forbidden",
+                "Authorization headers are not allowed when OAuth is enabled",
+            )
+        if self.auth_config.type == "oauth2":
+            forbidden_params = _RESERVED_OAUTH_AUTHORIZATION_PARAMS.intersection(
+                {str(key).lower() for key in self.auth_config.authorization_params}
+            )
+            if forbidden_params:
+                raise PydanticCustomError(
+                    "mcp_oauth_reserved_authorization_param",
+                    "authorization_params cannot override reserved OAuth parameters",
+                )
+        if self.auth_config.type != "oauth2" and self.auth_config.dynamic_client_registration:
+            raise PydanticCustomError(
+                "mcp_dynamic_client_registration_requires_oauth",
+                "dynamic client registration is only valid for OAuth MCP auth",
             )
         return self
 

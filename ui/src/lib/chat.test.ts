@@ -73,6 +73,42 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('keeps history messages with duplicate seq values from different sessions distinct', () => {
+    const items = normalizeHistory([
+      {
+        seq: 1,
+        session_id: 'sess_prev',
+        type: 'assistant_message',
+        data: { content: 'previous session', session_id: 'sess_prev' },
+        timestamp: '2026-03-27T00:00:00Z'
+      },
+      {
+        seq: 1,
+        session_id: 'sess_active',
+        type: 'assistant_message',
+        data: { content: 'active session', session_id: 'sess_active' },
+        timestamp: '2026-03-28T00:00:00Z'
+      }
+    ]);
+
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'previous session',
+      sessionId: 'sess_prev',
+      seq: 1
+    });
+    expect(items[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'active session',
+      sessionId: 'sess_active',
+      seq: 1
+    });
+    expect(items[0]?.id).not.toEqual(items[1]?.id);
+  });
+
   it('settles queued optimistic user messages by client id without duplicating', () => {
     const initial = appendOptimisticUserMessage([], 'queued hello', [], 'cmsg_test');
 
@@ -779,6 +815,57 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('merges tool progress into the final tool call card', () => {
+    const withProgress = applyWebSocketEvent([], {
+      type: 'tool_progress',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_patch',
+      tool_name: 'apply_patch',
+      progress: {
+        phase: 'preparing_input',
+        input_chars: 12000,
+        input_lines: 400,
+        complete: false,
+      },
+      turn_id: 'turn_1',
+      timestamp: '2026-04-09T00:00:01Z',
+    });
+
+    expect(withProgress).toHaveLength(1);
+    expect(withProgress[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_patch',
+      toolName: 'apply_patch',
+      status: 'started',
+      progressPhase: 'preparing_input',
+      progressInputChars: 12000,
+      progressInputLines: 400,
+    });
+
+    const withToolCall = applyWebSocketEvent(withProgress, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_patch',
+      tool_name: 'apply_patch',
+      status: 'started',
+      arguments: { patchText: '*** Begin Patch\n*** End Patch\n' },
+      turn_id: 'turn_1',
+      timestamp: '2026-04-09T00:00:02Z',
+    });
+
+    expect(withToolCall).toHaveLength(1);
+    expect(withToolCall[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_patch',
+      arguments: { patchText: '*** Begin Patch\n*** End Patch\n' },
+      progressPhase: 'preparing_input',
+      progressInputChars: 12000,
+      progressInputLines: 400,
+    });
+  });
+
   it('keeps thinking above assistant within the same phase and splits on tool calls', () => {
     const timeline = [
       {
@@ -1094,7 +1181,19 @@ describe('chat timeline helpers', () => {
       content_offset: 10
     });
 
-    expect(items[0]).toMatchObject({
+    expect(items).toHaveLength(0);
+
+    const withCall = applyWebSocketEvent(items, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_live',
+      tool_name: 'bash',
+      status: 'started',
+      arguments: { command: 'npm test' }
+    });
+
+    expect(withCall[0]).toMatchObject({
       kind: 'tool_call',
       callId: 'call_live',
       streamedOutput: '😀',
@@ -1103,6 +1202,97 @@ describe('chat timeline helpers', () => {
       sessionId: 'sess_1',
       liveOutputAvailable: true
     });
+  });
+
+  it('buffers live tool results until the matching tool call arrives', () => {
+    const resultOnly = applyWebSocketEvent([], {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_result_first',
+      tool_name: 'read',
+      result: 'late result',
+      is_error: false,
+      duration_ms: 42,
+      turn_id: 'turn_1',
+      attachments: []
+    });
+
+    expect(resultOnly).toHaveLength(0);
+
+    const withCall = applyWebSocketEvent(resultOnly, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_result_first',
+      tool_name: 'read',
+      status: 'started',
+      arguments: { file_path: '/tmp/file.txt' },
+      turn_id: 'turn_1'
+    });
+
+    expect(withCall).toHaveLength(1);
+    expect(withCall[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_result_first',
+      toolName: 'read',
+      arguments: { file_path: '/tmp/file.txt' },
+      status: 'completed',
+      result: 'late result',
+      durationMs: 42
+    });
+  });
+
+  it('keeps replayed orphan tool results hidden without creating output-only cards', () => {
+    const items = applyWebSocketEvent([], {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'old_call',
+      tool_name: 'read',
+      result: 'old output',
+      is_error: false,
+      duration_ms: 1,
+      turn_id: 'old_turn',
+      attachments: []
+    });
+
+    expect(items).toHaveLength(0);
+  });
+
+  it('does not attach buffered orphan tool results across turns with the same call id', () => {
+    const orphan = applyWebSocketEvent([], {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_reused',
+      tool_name: 'read',
+      result: 'old output',
+      is_error: false,
+      duration_ms: 1,
+      turn_id: 'old_turn',
+      attachments: []
+    });
+
+    const withLaterCall = applyWebSocketEvent(orphan, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_reused',
+      tool_name: 'read',
+      status: 'started',
+      arguments: { file_path: '/tmp/new.txt' },
+      turn_id: 'new_turn'
+    });
+
+    expect(withLaterCall).toHaveLength(1);
+    expect(withLaterCall[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_reused',
+      status: 'started',
+      arguments: { file_path: '/tmp/new.txt' }
+    });
+    expect((withLaterCall[0] as ToolCallTimelineItem).result).toBeUndefined();
   });
 
   it('preserves file diffs from persisted tool results', () => {

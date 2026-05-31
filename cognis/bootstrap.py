@@ -43,6 +43,8 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.llm_stream_max_retries": ("session", 3),
     "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
+    "session.long_lived_chat_idle_compaction_seconds": ("session", 21600),
+    "session.long_lived_chat_idle_compaction_min_events": ("session", 20),
     "session.max_session_age_seconds": ("session", 86400),
     "session.max_delegation_depth": ("session", 5),
     "session.max_active_turns_per_user": ("session", 20),
@@ -229,11 +231,13 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_conversation_starred_at_column)
         await conn.run_sync(_ensure_mcp_server_headers_column)
+        await conn.run_sync(_ensure_mcp_oauth_schema)
         await conn.run_sync(_ensure_system_override_tables)
         await conn.run_sync(_ensure_task_execution_paths)
         await conn.run_sync(_ensure_task_completion_delivery_columns)
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_creator_agent_column)
+        await conn.run_sync(_ensure_task_session_policy_column)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
@@ -264,6 +268,17 @@ def _ensure_task_creator_agent_column(sync_conn: object) -> None:
     if "created_by_agent_id" not in task_columns:
         sync_conn.execute(  # type: ignore[attr-defined]
             text("ALTER TABLE tasks ADD COLUMN created_by_agent_id VARCHAR")
+        )
+
+
+def _ensure_task_session_policy_column(sync_conn: object) -> None:
+    """Add optional task session policy storage."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    if "session_policy" not in task_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE tasks ADD COLUMN session_policy JSON")
         )
 
 
@@ -999,6 +1014,23 @@ def _ensure_mcp_server_headers_column(sync_conn: object) -> None:
 
     if "headers" not in columns:
         execute(text("ALTER TABLE mcp_servers ADD COLUMN headers JSON"))
+
+
+def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
+    """Add MCP OAuth config column and encrypted token/transaction tables."""
+
+    from cognis.store.models import MCPOAuthTokenRow, MCPOAuthTransactionRow
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("mcp_servers")}
+    except Exception:
+        columns = set()
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if columns and "auth_config" not in columns:
+        execute(text("ALTER TABLE mcp_servers ADD COLUMN auth_config JSON"))
+    MCPOAuthTokenRow.__table__.create(sync_conn, checkfirst=True)
+    MCPOAuthTransactionRow.__table__.create(sync_conn, checkfirst=True)
 
 
 def _ensure_system_override_tables(sync_conn: object) -> None:

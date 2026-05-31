@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import BaseModel, field_serializer
 
 from cognis.core.agent_loop import StreamAccumulator
+from cognis.providers.llm.errors import ToolArgumentParseFailure
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     response_model_dump,
@@ -91,6 +94,93 @@ async def test_responses_stream_failed_event_includes_safe_error_details() -> No
     assert chunk["response_error"]["response_status"] == "failed"
     assert chunk["response_error"]["code"] == "internal_error"
     assert "<truncated" in chunk["response_error"]["details"]["details"]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_accumulates_custom_apply_patch_input() -> None:
+    patch_text = "*** Begin Patch\n*** Add File: /tmp/a.txt\n+hello\n*** End Patch\n"
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "custom_tool_call",
+                "id": "item_patch",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "",
+            },
+        }
+        yield {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "item_patch",
+            "delta": patch_text[:24],
+        }
+        yield {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "item_patch",
+            "delta": patch_text[24:],
+        }
+        yield {
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "item_patch",
+            "input": patch_text,
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "custom_tool_call",
+                "id": "item_patch",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": patch_text,
+            },
+        }
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "apply_patch"
+    assert calls[0].arguments == {"patchText": patch_text}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_accumulates_generic_custom_tool_input() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "custom_tool_call",
+                "id": "item_custom",
+                "call_id": "call_custom",
+                "name": "custom_tool",
+                "input": "",
+            },
+        }
+        yield {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "item_custom",
+            "delta": "abc",
+        }
+        yield {
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "item_custom",
+            "input": "abc",
+        }
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "custom_tool"
+    assert calls[0].arguments == {"input": "abc"}
 
 
 def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
@@ -441,9 +531,7 @@ def test_responses_to_chat_response_normalizes_apply_patch_call() -> None:
     tool_call = result["choices"][0]["message"]["tool_calls"][0]
     assert tool_call["id"] == "call_patch"
     assert tool_call["function"]["name"] == "apply_patch"
-    assert tool_call["function"]["arguments"] == (
-        '{"operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\\n-x\\n+y\\n"}}'
-    )
+    assert tool_call["function"]["arguments"] == "{}"
 
 
 def test_responses_to_chat_response_drops_incomplete_apply_patch_arguments() -> None:
@@ -464,6 +552,28 @@ def test_responses_to_chat_response_drops_incomplete_apply_patch_arguments() -> 
     tool_call = result["choices"][0]["message"]["tool_calls"][0]
     assert tool_call["function"]["name"] == "apply_patch"
     assert tool_call["function"]["arguments"] == "{}"
+
+
+def test_responses_to_chat_response_maps_native_create_file_apply_patch_call() -> None:
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "apply_patch_call",
+                "id": "apc_1",
+                "call_id": "call_patch",
+                "operation": {"type": "create_file", "path": "/tmp/a.txt", "content": "hi\n"},
+            }
+        ],
+    }
+
+    result = responses_to_chat_response(payload)
+
+    tool_call = result["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "apply_patch"
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        "patchText": "*** Begin Patch\n*** Add File: /tmp/a.txt\n+hi\n*** End Patch\n"
+    }
 
 
 def test_messages_to_responses_input_drops_tool_messages_without_tool_call_id() -> None:
@@ -928,9 +1038,7 @@ async def test_responses_stream_to_chat_chunks_emits_apply_patch_call() -> None:
     assert len(calls) == 1
     assert calls[0].name == "apply_patch"
     assert calls[0].call_id == "call_patch"
-    assert calls[0].arguments == {
-        "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"}
-    }
+    assert isinstance(calls[0], ToolArgumentParseFailure)
 
 
 @pytest.mark.asyncio
@@ -957,6 +1065,55 @@ async def test_responses_stream_to_chat_chunks_emits_custom_apply_patch_call() -
     assert len(calls) == 1
     assert calls[0].name == "apply_patch"
     assert calls[0].call_id == "call_patch"
+    assert calls[0].arguments == {"patchText": patch_text}
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_custom_apply_patch_progress() -> None:
+    patch_text = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch\n"
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": "",
+                "call_id": "call_patch",
+            },
+        }
+        yield {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "call_patch",
+            "delta": patch_text[:20],
+        }
+        yield {
+            "type": "response.custom_tool_call_input.delta",
+            "item_id": "call_patch",
+            "delta": patch_text[20:],
+        }
+        yield {
+            "type": "response.custom_tool_call_input.done",
+            "item_id": "call_patch",
+            "input": patch_text,
+        }
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    progress_events: list[dict[str, object]] = []
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+        delta = chunk.get("choices", [{}])[0].get("delta", {})
+        if isinstance(delta, dict) and isinstance(delta.get("tool_progress"), dict):
+            progress_events.append(delta["tool_progress"])
+
+    assert progress_events
+    assert progress_events[-1]["name"] == "apply_patch"
+    assert progress_events[-1]["input_chars"] == len(patch_text)
+    assert progress_events[-1]["input_lines"] == patch_text.count("\n") + 1
+    assert progress_events[-1]["complete"] is True
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
     assert calls[0].arguments == {"patchText": patch_text}
 
 

@@ -48,6 +48,49 @@ class CompletionDeliveryPolicy(BaseModel):
     allow_silent_completion: bool = False
 
 
+class SessionPolicy(BaseModel):
+    """Operator-provided Intaris session policy clauses.
+
+    Clauses may be plain strings for ergonomic task/workflow/schedule setup or
+    structured objects for future UI/API support.
+    """
+
+    allow_policies: list[str | dict[str, Any]] = Field(default_factory=list)
+    deny_policies: list[str | dict[str, Any]] = Field(default_factory=list)
+
+    @classmethod
+    def empty(cls) -> SessionPolicy:
+        return cls()
+
+
+def normalize_session_policy(value: Any) -> dict[str, list[str | dict[str, Any]]]:
+    """Return a compact session policy dict containing only supported keys."""
+
+    if value is None:
+        return {}
+    policy = value if isinstance(value, SessionPolicy) else SessionPolicy.model_validate(value)
+    result: dict[str, list[str | dict[str, Any]]] = {}
+    if policy.allow_policies:
+        result["allow_policies"] = policy.allow_policies
+    if policy.deny_policies:
+        result["deny_policies"] = policy.deny_policies
+    return result
+
+
+def merge_session_policies(*policies: Any) -> dict[str, list[str | dict[str, Any]]]:
+    """Merge session policies in precedence order without interpreting text."""
+
+    merged: dict[str, list[str | dict[str, Any]]] = {
+        "allow_policies": [],
+        "deny_policies": [],
+    }
+    for policy in policies:
+        normalized = normalize_session_policy(policy)
+        merged["allow_policies"].extend(normalized.get("allow_policies", []))
+        merged["deny_policies"].extend(normalized.get("deny_policies", []))
+    return {key: value for key, value in merged.items() if value}
+
+
 def resolve_completion_delivery_policy(
     workflow_defaults: WorkflowDefaults | None,
     *,
@@ -69,6 +112,7 @@ class WorkflowDefaults(BaseModel):
     evaluate: bool = True
     on_exhausted: Literal["continue", "fail", "gate"] = "gate"
     delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
 
 
 class GateOption(BaseModel):

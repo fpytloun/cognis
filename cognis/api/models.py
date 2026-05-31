@@ -10,7 +10,7 @@ from pydantic_core import PydanticCustomError
 
 from cognis.models.artifact import AttachmentRef
 from cognis.models.task import TaskDelivery
-from cognis.models.workflow import WorkflowState
+from cognis.models.workflow import SessionPolicy, WorkflowState
 
 InteractionModeOverride = Literal["none", "explicit_gates", "step_requests"]
 
@@ -200,6 +200,7 @@ class ConversationResolveRequest(BaseModel):
 
     agent_id: str
     context_type: str = "web"
+    scope: Literal["latest", "agent_direct"] = "latest"
 
 
 class ConversationCreateRequest(BaseModel):
@@ -229,6 +230,11 @@ class ConversationResponse(BaseModel):
     active_executor_assigned_at: datetime | None = None
     active_executor_expires_at: datetime | None = None
     active_executor_source: str | None = None
+    active_session_status: str | None = None
+    active_session_completion_reason: str | None = None
+    active_turn_chat_mode: str | None = None
+    active_turn_chat_mode_source: str | None = None
+    pending_notification_types: list[str] = Field(default_factory=list)
     starred_at: datetime | None = None
     status: str
     last_message_at: datetime | None = None
@@ -341,6 +347,10 @@ class MessageHistoryResponse(BaseModel):
     items: list[MessageEventResponse]
     last_seq: int = 0
     has_more: bool = False
+    older_cursor: str | None = Field(
+        default=None,
+        description="Opaque cursor for loading older conversation history before this page.",
+    )
     has_active_turn: bool = Field(
         default=False,
         description="Whether the controller currently has user-visible work running for this conversation.",
@@ -604,6 +614,11 @@ class AgentResponse(BaseModel):
     updated_at: datetime | None = None
 
 
+class AgentDirectChatResponse(BaseModel):
+    agent: AgentResponse
+    conversation: ConversationResponse
+
+
 class AgentCardResponse(BaseModel):
     name: str
     description: str | None = None
@@ -812,6 +827,7 @@ class TaskCreateRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     source_type: str = "api"
     source_ref: str | None = None
     status: str = "draft"
@@ -851,6 +867,7 @@ class TaskUpdateRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+    session_policy: SessionPolicy | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
 
@@ -957,6 +974,7 @@ class TaskResponse(BaseModel):
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = None
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     workflow_id: str | None = None
     project_id: str | None = None
     attempt_number: int = 1
@@ -1082,6 +1100,7 @@ class CreateScheduleRequest(BaseModel):
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = "none"
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
 
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
@@ -1120,6 +1139,7 @@ class UpdateScheduleRequest(BaseModel):
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
+    session_policy: SessionPolicy | None = None
 
     @model_validator(mode="after")
     def _strip_reserved_task_template_fields(self) -> UpdateScheduleRequest:
@@ -1148,6 +1168,7 @@ class ScheduleResponse(BaseModel):
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = "none"
+    session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     last_fired_at: datetime | None = None
     next_fire_at: datetime | None = None
     last_run_status: str | None = None
@@ -1607,6 +1628,7 @@ class MCPServerConfigResponse(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    auth_config: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = 30
     description: str | None = None
     shared: bool = False
@@ -1626,39 +1648,26 @@ class MCPServerCreateRequest(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    auth_config: dict[str, Any] | None = None
     timeout_seconds: int = 30
     description: str | None = None
     shared: bool = False
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> MCPServerCreateRequest:
-        if self.transport == "stdio":
-            if not self.command:
-                raise PydanticCustomError(
-                    "mcp_stdio_command_required",
-                    "command is required for stdio transport",
-                )
-            if self.headers:
-                raise PydanticCustomError(
-                    "mcp_stdio_headers_forbidden",
-                    "headers are not allowed for stdio transport",
-                )
-        elif self.transport in ("sse", "streamable_http"):
-            if not self.url:
-                raise PydanticCustomError(
-                    "mcp_url_required",
-                    f"url is required for {self.transport} transport",
-                )
-            if self.env:
-                raise PydanticCustomError(
-                    "mcp_http_env_forbidden",
-                    f"env is not allowed for {self.transport} transport; use headers",
-                )
-        else:
-            raise PydanticCustomError(
-                "mcp_transport_invalid",
-                f"unsupported MCP transport: {self.transport}",
-            )
+        from cognis.models.tool import MCPServerConfig
+
+        MCPServerConfig(
+            name=self.name,
+            transport=self.transport,
+            command=self.command,
+            url=self.url,
+            args=self.args,
+            env=self.env,
+            headers=self.headers,
+            auth_config=self.auth_config,
+            timeout_seconds=self.timeout_seconds,
+        )
         return self
 
 
@@ -1670,6 +1679,7 @@ class MCPServerUpdateRequest(BaseModel):
     args: list[str] | None = None
     env: dict[str, str] | None = None
     headers: dict[str, str] | None = None
+    auth_config: dict[str, Any] | None = None
     timeout_seconds: int | None = None
     description: str | None = None
     status: str | None = None

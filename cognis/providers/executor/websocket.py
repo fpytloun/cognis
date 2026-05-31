@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -63,6 +64,64 @@ _RPC_TIMEOUT_SECONDS = 300  # default per-call timeout
 _HEARTBEAT_INTERVAL = 15  # seconds between executor heartbeats
 _HEARTBEAT_TIMEOUT = 45  # mark unhealthy after this many seconds
 _LSP_STATUS_TIMEOUT_SECONDS = 5.0
+_MIN_RECONNECT_RETRY_BUDGET_SECONDS = 60.0
+_RECONNECT_RETRY_BUDGET_ENV = "COGNIS_EXECUTOR_RECONNECT_RETRY_BUDGET_SECONDS"
+
+
+def executor_reconnect_retry_budget_seconds() -> float:
+    """Return the same-executor reconnect wait budget for transient drops."""
+
+    raw = os.environ.get(_RECONNECT_RETRY_BUDGET_ENV)
+    if raw is None or not raw.strip():
+        return _MIN_RECONNECT_RETRY_BUDGET_SECONDS
+    try:
+        configured = float(raw)
+    except ValueError:
+        _logger.warning(
+            "executor_ws: invalid reconnect retry budget, using minimum",
+            extra={
+                "extra_data": {
+                    "env_var": _RECONNECT_RETRY_BUDGET_ENV,
+                    "value": raw,
+                    "minimum_seconds": _MIN_RECONNECT_RETRY_BUDGET_SECONDS,
+                }
+            },
+        )
+        return _MIN_RECONNECT_RETRY_BUDGET_SECONDS
+    return max(_MIN_RECONNECT_RETRY_BUDGET_SECONDS, configured)
+
+
+def _transient_executor_output(
+    *,
+    executor_id: str,
+    code: str,
+    same_executor_reconnected: bool | None = None,
+    auto_retried: bool | None = None,
+    auto_retry_skipped_reason: str | None = None,
+) -> str:
+    if code == "executor_circuit_open":
+        base = f"Executor '{executor_id}' circuit breaker is open."
+    else:
+        base = f"Executor '{executor_id}' disconnected during tool execution."
+    details: list[str] = []
+    if same_executor_reconnected is True:
+        details.append("The same executor reconnected.")
+    elif same_executor_reconnected is False:
+        details.append("The same executor did not reconnect within the retry budget.")
+    if auto_retried is True:
+        details.append("The controller retried the call on the same executor.")
+    elif auto_retried is False:
+        if auto_retry_skipped_reason == "tool_not_idempotent":
+            details.append(
+                "The tool was not retried automatically because it may have side effects."
+            )
+        elif auto_retry_skipped_reason == "same_executor_reconnect_timeout":
+            details.append("The tool was not retried automatically because reconnect timed out.")
+        else:
+            details.append("The tool was not retried automatically.")
+    if not details:
+        details.append("The controller may retry this call on the same executor if it is safe.")
+    return f"{base} {' '.join(details)}"
 
 
 class ExecutorDisconnectedError(RuntimeError):
@@ -238,12 +297,42 @@ class WebSocketExecutorConnection:
                 else None,
                 attachments=result.get("attachments"),
             )
-        except (TimeoutError, asyncio.CancelledError):
-            return ToolResult(output="Tool execution timed out.", is_error=True)
+        except TimeoutError:
+            return ToolResult(
+                output="Tool execution timed out.",
+                is_error=True,
+                metadata={"code": "tool_execution_timeout", "retryable": False},
+            )
+        except asyncio.CancelledError:
+            return ToolResult(
+                output="Tool execution cancelled.",
+                is_error=True,
+                metadata={"code": "tool_execution_cancelled", "retryable": False},
+            )
         except ExecutorDisconnectedError:
-            return ToolResult(output="Executor disconnected during tool execution.", is_error=True)
+            code = "executor_disconnected"
+            return ToolResult(
+                output=_transient_executor_output(executor_id=self.executor_id, code=code),
+                is_error=True,
+                metadata={
+                    "code": code,
+                    "executor_id": self.executor_id,
+                    "retryable": True,
+                    "same_executor_only": True,
+                },
+            )
         except CircuitBreakerError:
-            return ToolResult(output="Executor circuit breaker is open.", is_error=True)
+            code = "executor_circuit_open"
+            return ToolResult(
+                output=_transient_executor_output(executor_id=self.executor_id, code=code),
+                is_error=True,
+                metadata={
+                    "code": code,
+                    "executor_id": self.executor_id,
+                    "retryable": True,
+                    "same_executor_only": True,
+                },
+            )
         except ExecutorRPCError as exc:
             return ToolResult(output=f"Executor RPC error: {exc}", is_error=True)
         except Exception as exc:
@@ -301,13 +390,26 @@ class WebSocketExecutorConnection:
                     yield chunk
                     break
                 if chunk.get("error"):
-                    yield {"error": chunk["error"], "mid_stream_failure": True}
+                    error_chunk = {
+                        "error": chunk["error"],
+                        "mid_stream_failure": True,
+                    }
+                    response_error = chunk.get("response_error")
+                    if isinstance(response_error, dict):
+                        error_chunk["response_error"] = response_error
+                    yield error_chunk
                     break
                 yield chunk
         except TimeoutError:
-            yield {"error": "LLM inference timed out", "mid_stream_failure": True}
+            yield {
+                "error": "LLM inference timed out",
+                "mid_stream_failure": True,
+            }
         except ExecutorDisconnectedError:
-            yield {"error": "Executor disconnected during inference", "mid_stream_failure": True}
+            yield {
+                "error": "Executor disconnected during inference",
+                "mid_stream_failure": True,
+            }
         finally:
             self._inference_queues.pop(request_id, None)
 
@@ -519,6 +621,7 @@ class WebSocketExecutorProvider:
         self._connections: dict[str, WebSocketExecutorConnection] = {}
         self._handles: dict[str, ExecutorHandle] = {}
         self._ready_events: dict[str, asyncio.Event] = {}
+        self._connection_waiters: dict[str, set[asyncio.Event]] = {}
         self._background_shell_completed_callback: Any | None = None
 
     # ------------------------------------------------------------------
@@ -607,6 +710,8 @@ class WebSocketExecutorProvider:
         event = self._ready_events.get(executor_id)
         if event is not None:
             event.set()
+        for waiter in self._connection_waiters.pop(executor_id, set()):
+            waiter.set()
 
     def unregister_connection(
         self,
@@ -741,6 +846,38 @@ class WebSocketExecutorProvider:
         if conn is not None and conn.connected:
             return conn
         return None
+
+    async def wait_for_connection(
+        self,
+        executor_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> WebSocketExecutorConnection | None:
+        """Wait for the same executor ID to reconnect and become ready."""
+
+        conn = self.get_connection(executor_id)
+        if conn is not None:
+            return conn
+
+        event = asyncio.Event()
+        self._connection_waiters.setdefault(executor_id, set()).add(event)
+        try:
+            await asyncio.wait_for(
+                event.wait(),
+                timeout=timeout
+                if timeout is not None
+                else executor_reconnect_retry_budget_seconds(),
+            )
+        except TimeoutError:
+            return None
+        finally:
+            waiters = self._connection_waiters.get(executor_id)
+            if waiters is not None:
+                waiters.discard(event)
+                if not waiters:
+                    self._connection_waiters.pop(executor_id, None)
+
+        return self.get_connection(executor_id)
 
     async def get_lsp_status(
         self,

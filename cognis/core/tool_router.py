@@ -39,9 +39,21 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.session import SessionModel
-from cognis.models.tool import ExecutorHandle, Permission, ToolCall, ToolResult, stable_tool_id
-from cognis.runtime_context import RuntimeAccessContext
-from cognis.store.queries import create_artifact_record, get_artifact_record, get_setting_value
+from cognis.models.tool import (
+    ExecutorHandle,
+    Permission,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    stable_tool_id,
+    tool_capabilities,
+)
+from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+from cognis.store.queries import (
+    create_artifact_record,
+    get_artifact_record,
+    get_setting_value,
+)
 from cognis.tools.argument_normalization import strip_empty_optional_values
 from cognis.tools.builtin.agent_management import (
     handle_agent_management_tool,
@@ -49,6 +61,7 @@ from cognis.tools.builtin.agent_management import (
 )
 from cognis.tools.builtin.artifact_tools import (
     analyze_attachment_ref,
+    attachment_supports_model,
     handle_artifact_tool,
     is_artifact_tool,
 )
@@ -238,7 +251,7 @@ class ToolRouter:
         registered_tool = registry.get(tool_call.name)
         if registered_tool is None:
             return PermissionDecision(decision="deny", reasoning="Unknown tool", source="registry")
-        evaluation_context = self._evaluation_context(tool_call)
+        evaluation_context = await self._evaluation_context(tool_call, registered_tool.definition)
         if evaluation_context.get("read_only_required") is True and is_plan_hidden_tool(
             registered_tool.definition
         ):
@@ -318,8 +331,11 @@ class ToolRouter:
         )
         return decision_result
 
-    @staticmethod
-    def _evaluation_context(tool_call: ToolCall) -> dict[str, Any]:
+    async def _evaluation_context(
+        self,
+        tool_call: ToolCall,
+        tool_definition: ToolDefinition | None = None,
+    ) -> dict[str, Any]:
         """Build non-content runtime context for Intaris tool evaluation."""
 
         runtime = tool_call.runtime_metadata or {}
@@ -335,12 +351,72 @@ class ToolRouter:
             value = runtime.get(key)
             if value is not None:
                 context[key] = value
+        runtime_access = current_runtime_access_context.get()
+        if runtime_access and runtime_access.interaction_mode:
+            context["interaction_mode"] = runtime_access.interaction_mode
         executor_env = context.get("executor_environment")
         if isinstance(executor_env, dict) and not executor_env.get("home"):
             inferred_home = executor_home_from_workspace_root(context.get("workspace_root"))
             if inferred_home:
                 context["executor_environment"] = {**executor_env, "home": inferred_home}
+        if tool_definition is not None:
+            source = getattr(tool_definition, "source", None)
+            tool_context = {
+                "name": getattr(tool_definition, "name", tool_call.name),
+                "description": getattr(tool_definition, "description", None),
+                "read_only": getattr(tool_definition, "read_only", None),
+                "capabilities": [
+                    str(capability) for capability in tool_capabilities(tool_definition)
+                ],
+                "category": getattr(tool_definition, "category", None),
+                "profile_group": getattr(tool_definition, "profile_group", None),
+                "risk_level": getattr(tool_definition, "risk_level", None),
+                "source": {
+                    key: value
+                    for key, value in {
+                        "type": getattr(source, "type", None),
+                        "server_name": getattr(source, "server_name", None),
+                        "raw_tool_name": getattr(source, "raw_tool_name", None),
+                    }.items()
+                    if value is not None
+                }
+                if source is not None
+                else None,
+            }
+            context["tool"] = {k: v for k, v in tool_context.items() if v is not None}
+        skill_context = await self._skill_evaluation_context(tool_call)
+        if skill_context:
+            context["skill"] = skill_context
         return context
+
+    async def _skill_evaluation_context(self, tool_call: ToolCall) -> dict[str, Any] | None:
+        if tool_call.name != "skill_load":
+            return None
+        skill_id = tool_call.arguments.get("skill_id")
+        if not isinstance(skill_id, str) or not skill_id:
+            return None
+        try:
+            from cognis.store.queries import get_skill_scoped
+
+            if self._session_factory is None:
+                return {"skill_id": skill_id}
+            async with self._session_factory() as db:
+                skill = await get_skill_scoped(db, skill_id, owner_email=None)
+        except Exception:
+            logger.debug("Failed to resolve skill metadata for evaluation", exc_info=True)
+            return {"skill_id": skill_id}
+        if skill is None:
+            return {"skill_id": skill_id}
+        return {
+            key: value
+            for key, value in {
+                "skill_id": getattr(skill, "skill_id", skill_id),
+                "name": getattr(skill, "name", None),
+                "description": getattr(skill, "description", None),
+                "tags": getattr(skill, "tags", None),
+            }.items()
+            if value is not None
+        }
 
     def _get_cached_decision(
         self,
@@ -567,6 +643,9 @@ class ToolRouter:
         if route is ToolRoute.ARTIFACT:
             from cognis.runtime_context import current_user_email
 
+            artifact_runtime_metadata = dict(tool_call.runtime_metadata)
+            if self.tool_output_store is not None:
+                artifact_runtime_metadata["tool_output_store"] = self.tool_output_store
             result = await handle_artifact_tool(
                 tool_name=tool_call.name,
                 arguments=dict(tool_call.arguments),
@@ -575,16 +654,16 @@ class ToolRouter:
                 session_factory=self._session_factory,
                 user_email=current_user_email.get() or session.user_email,
                 current_model=(
-                    str(tool_call.runtime_metadata.get("resolved_model"))
-                    if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)
+                    str(artifact_runtime_metadata.get("resolved_model"))
+                    if isinstance(artifact_runtime_metadata.get("resolved_model"), str)
                     else None
                 ),
                 current_provider_id=(
-                    str(tool_call.runtime_metadata.get("resolved_provider_id"))
-                    if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
+                    str(artifact_runtime_metadata.get("resolved_provider_id"))
+                    if isinstance(artifact_runtime_metadata.get("resolved_provider_id"), str)
                     else None
                 ),
-                runtime_metadata=tool_call.runtime_metadata,
+                runtime_metadata=artifact_runtime_metadata,
             )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -1002,7 +1081,11 @@ class ToolRouter:
             result = self._credential_error_result(exc)
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
-            result = ToolResult(output="Tool execution timed out.", is_error=True)
+            result = ToolResult(
+                output="Tool execution timed out.",
+                is_error=True,
+                metadata={"code": "tool_execution_timeout", "retryable": False},
+            )
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="timeout").inc()
             return self._sanitize_result(
                 tool_call.name,
@@ -1064,6 +1147,52 @@ class ToolRouter:
                 is_error=True,
                 metadata={k: v for k, v in metadata.items() if k != "attachment_analysis_request"},
             )
+        next_metadata = {k: v for k, v in metadata.items() if k != "attachment_analysis_request"}
+        resolved_model = (
+            str(tool_call.runtime_metadata.get("resolved_model"))
+            if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)
+            else None
+        )
+        resolved_provider_id = (
+            str(tool_call.runtime_metadata.get("resolved_provider_id"))
+            if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
+            else None
+        )
+        if resolved_model:
+            try:
+                model_info = await self.llm.get_model_info(
+                    resolved_model,
+                    provider_id=resolved_provider_id,
+                    acting_user_email=session.user_email,
+                )
+            except TypeError:
+                model_info = await self.llm.get_model_info(
+                    resolved_model,
+                    resolved_provider_id,
+                )
+            if attachment_supports_model(attachment, model_info):
+                next_metadata.update(
+                    {
+                        "artifact_id": attachment.artifact_id,
+                        "filename": attachment.filename,
+                        "mime_type": attachment.mime_type,
+                        "kind": attachment.kind.value,
+                        "url": attachment.url,
+                        "native_attachment": True,
+                        "analysis_model": resolved_model,
+                        "analysis_provider_id": resolved_provider_id,
+                    }
+                )
+                return result.model_copy(
+                    update={
+                        "output": (
+                            f"Prepared binary file '{attachment.filename}' for native model "
+                            "inspection. The next model cycle receives it as an attachment; "
+                            "use the attachment content directly to answer the user's request."
+                        ),
+                        "metadata": next_metadata,
+                    }
+                )
         try:
             content, _content_type, _filename = await self._load_binary_artifact(
                 attachment.artifact_id,
@@ -1073,7 +1202,7 @@ class ToolRouter:
             return ToolResult(
                 output=f"Failed to load binary artifact for analysis: {exc}",
                 is_error=True,
-                metadata={k: v for k, v in metadata.items() if k != "attachment_analysis_request"},
+                metadata=next_metadata,
             )
         analysis = await analyze_attachment_ref(
             attachment=attachment,
@@ -1082,22 +1211,15 @@ class ToolRouter:
             llm=self.llm,
             artifact_store=self.artifact_store,
             session_factory=self._session_factory,
-            current_model=(
-                str(tool_call.runtime_metadata.get("resolved_model"))
-                if isinstance(tool_call.runtime_metadata.get("resolved_model"), str)
-                else None
-            ),
-            current_provider_id=(
-                str(tool_call.runtime_metadata.get("resolved_provider_id"))
-                if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
-                else None
-            ),
+            current_model=resolved_model,
+            current_provider_id=resolved_provider_id,
             owner_email=session.user_email,
         )
-        next_metadata = {k: v for k, v in metadata.items() if k != "attachment_analysis_request"}
         if analysis.metadata:
             next_metadata.update(analysis.metadata)
-        return analysis.model_copy(update={"metadata": next_metadata, "attachments": None})
+        return analysis.model_copy(
+            update={"metadata": next_metadata, "attachments": analysis.attachments}
+        )
 
     async def _execute_local_handler(
         self,
@@ -1684,6 +1806,9 @@ class ToolRouter:
             conversation_id=raw.get("conversation_id")
             if isinstance(raw.get("conversation_id"), str)
             else None,
+            task_id=raw.get("task_id") if isinstance(raw.get("task_id"), str) else None,
+            step_name=raw.get("step_name") if isinstance(raw.get("step_name"), str) else None,
+            step_run_id=raw.get("step_run_id") if isinstance(raw.get("step_run_id"), str) else None,
             parent_session_id=raw.get("parent_session_id")
             if isinstance(raw.get("parent_session_id"), str)
             else None,
@@ -1691,6 +1816,12 @@ class ToolRouter:
             if isinstance(raw.get("delegation_mode"), str)
             else None,
             workflow_step=bool(raw.get("workflow_step")),
+            interaction_mode=raw.get("interaction_mode")
+            if isinstance(raw.get("interaction_mode"), str)
+            else None,
+            session_policy=raw.get("session_policy")
+            if isinstance(raw.get("session_policy"), dict)
+            else None,
         )
 
     async def _load_text_content_ref(
@@ -1999,7 +2130,7 @@ class ToolRouter:
             server_name=source.server_name,
             tool_name=raw_tool_name,
             arguments=tool_call.arguments,
-            context=self._evaluation_context(tool_call),
+            context=await self._evaluation_context(tool_call, registered_tool.definition),
         )
         if isinstance(result, ToolResult):
             return result
@@ -2028,6 +2159,25 @@ class ToolRouter:
                 return self.llm.count_tokens(text, _model)
 
             max_tokens = max(256, max_size // 4)
+        if call_id and _has_artifact_candidate_anchor(result.metadata):
+            raw_output = raw_output.replace("tool_artifact:<call_id>:", f"tool_artifact:{call_id}:")
+            raw_output = raw_output.replace(
+                "tool_artifact:<tool_call_id>:", f"tool_artifact:{call_id}:"
+            )
+            if isinstance(result.metadata, dict) and isinstance(
+                result.metadata.get("stored_output"), str
+            ):
+                stored_output = result.metadata["stored_output"]
+                result = result.model_copy(
+                    update={
+                        "metadata": {
+                            **result.metadata,
+                            "stored_output": stored_output.replace(
+                                "tool_artifact:<call_id>:", f"tool_artifact:{call_id}:"
+                            ).replace("tool_artifact:<tool_call_id>:", f"tool_artifact:{call_id}:"),
+                        }
+                    }
+                )
         anchor_names = _extract_output_anchor_names(result.metadata, raw_output)
         presentation = present_tool_output(
             raw_output,
@@ -2094,6 +2244,18 @@ def _extract_output_anchor_names(
                 _add(stripped[2:-2])
 
     return names
+
+
+def _has_artifact_candidate_anchor(metadata: dict[str, Any] | None) -> bool:
+    if metadata is None:
+        return False
+    raw_anchors = metadata.get("output_anchors")
+    if not isinstance(raw_anchors, list):
+        return False
+    return any(
+        isinstance(entry, dict) and isinstance(entry.get("artifact_candidate"), dict)
+        for entry in raw_anchors
+    )
 
 
 def _guardrails_session_id(session: SessionModel) -> str:

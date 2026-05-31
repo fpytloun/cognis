@@ -38,6 +38,7 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolDefinition,
+    effective_mcp_auth_config,
     tool_matches_identifier,
 )
 from cognis.ownership import SYSTEM_USER_EMAIL, normalize_executor_scope
@@ -62,7 +63,10 @@ from cognis.tools.builtin.knowledgebase import (
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.projects import build_project_tool_handlers, project_tools
-from cognis.tools.builtin.skill_management import skill_management_tools
+from cognis.tools.builtin.skill_management import (
+    materialize_loaded_skill_context,
+    skill_management_tools,
+)
 from cognis.tools.builtin.system import build_system_tool_handlers, system_tools
 from cognis.tools.builtin.task_continuation import (
     build_task_continuation_tool_handlers,
@@ -71,7 +75,7 @@ from cognis.tools.builtin.task_continuation import (
 from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
 from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
-from cognis.tools.mcp import invalid_mcp_config_reason
+from cognis.tools.mcp import disambiguate_mcp_tool_name_collisions, invalid_mcp_config_reason
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import (
     attached_skill_tool_ids,
@@ -1085,6 +1089,36 @@ def build_step_runtime_factory(
                     if not isinstance(tool_agent.skills, dict):
                         tool_agent.skills = {}
                     attached_tool_ids_by_skill = attached_skill_tool_ids_by_skill(resolved_skills)
+                    auto_loaded_skill_contexts: list[str] = []
+                    auto_loaded_skill_tool_ids: set[str] = set()
+                    auto_loaded_skill_ids: list[str] = []
+                    for skill in resolved_skills.skills:
+                        if not skill.auto_load_instructions:
+                            continue
+                        _, load_metadata = materialize_loaded_skill_context(
+                            skill_id=skill.skill_id,
+                            name=skill.name,
+                            description=skill.description,
+                            instructions=skill.instructions,
+                            tools=[tool.model_dump(mode="json") for tool in skill.tools],
+                            templates=skill.prompt_templates,
+                            asset_refs=skill.asset_manifest,
+                            steps=skill.steps,
+                            tags=skill.tags,
+                            linked_tool_ids=skill.linked_tool_ids,
+                            attach_to_all_agents=skill.auto_load,
+                        )
+                        protected_context = load_metadata.get("protected_context")
+                        if isinstance(protected_context, str) and protected_context.strip():
+                            auto_loaded_skill_contexts.append(protected_context)
+                            auto_loaded_skill_ids.append(skill.skill_id)
+                        discovered_ids = load_metadata.get("discovered_tool_ids")
+                        if isinstance(discovered_ids, list):
+                            auto_loaded_skill_tool_ids.update(
+                                str(tool_id)
+                                for tool_id in discovered_ids
+                                if isinstance(tool_id, str) and tool_id.strip()
+                            )
                     tool_agent.skills["_available_skills_metadata"] = metadata
                     tool_agent.skills["_attached_skill_tool_ids"] = sorted(
                         attached_skill_tool_ids(resolved_skills)
@@ -1092,6 +1126,15 @@ def build_step_runtime_factory(
                     tool_agent.skills["_attached_skill_tool_ids_by_skill"] = (
                         attached_tool_ids_by_skill
                     )
+                    if auto_loaded_skill_contexts:
+                        tool_agent.skills["_auto_loaded_skill_contexts"] = (
+                            auto_loaded_skill_contexts
+                        )
+                        tool_agent.skills["_auto_loaded_skill_ids"] = auto_loaded_skill_ids
+                    if auto_loaded_skill_tool_ids:
+                        tool_agent.skills["_auto_loaded_skill_tool_ids"] = sorted(
+                            auto_loaded_skill_tool_ids
+                        )
                     tool_agent.skills["_runtime_skill_summaries"] = [
                         {
                             "skill_id": skill.skill_id,
@@ -1099,6 +1142,7 @@ def build_step_runtime_factory(
                             "description": skill.description,
                             "attached": skill.attached,
                             "auto_load": skill.auto_load,
+                            "auto_load_instructions": skill.auto_load_instructions,
                             "tags": list(getattr(skill, "tags", []) or []),
                             "linked_tool_ids": list(getattr(skill, "linked_tool_ids", []) or []),
                         }
@@ -1160,7 +1204,18 @@ def build_step_runtime_factory(
         # here to avoid controller fallback.
         mcp_servers: list[MCPServerConfig] = []
         if resolved_type == "in_process":
-            mcp_servers = await _resolve_executor_mcp_servers(executor_config, session_factory)
+            mcp_servers = await _resolve_executor_mcp_servers(
+                executor_config,
+                session_factory,
+                providers=providers,
+                user_email=user_email,
+                conversation_id=conversation_id or getattr(access_context, "conversation_id", None),
+                task_id=task_id,
+                session_id=getattr(access_context, "session_id", None),
+                step_name=getattr(access_context, "step_name", None),
+                step_run_id=getattr(access_context, "step_run_id", None),
+                delivery_mode="default" if task_id else "silent",
+            )
             secret_owner_email = executor_config.get("executor_owner_email", user_email)
             secrets = await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
             handler_map = _build_handler_map(
@@ -1618,6 +1673,15 @@ async def _resolve_web_config(
 async def _resolve_executor_mcp_servers(
     executor_config: dict[str, Any] | None,
     session_factory: Any,
+    *,
+    providers: Any | None = None,
+    user_email: str | None = None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    step_name: str | None = None,
+    step_run_id: str | None = None,
+    session_id: str | None = None,
+    delivery_mode: str | None = "silent",
 ) -> list[MCPServerConfig]:
     """Resolve MCP servers assigned to an executor via config.mcp_server_ids."""
     from cognis.store.queries import get_mcp_server
@@ -1654,6 +1718,7 @@ async def _resolve_executor_mcp_servers(
                 url=row.url,
                 env=row.env,
                 headers=row.headers,
+                auth_config=row.auth_config,
             )
             if invalid_reason is not None:
                 logger.warning(
@@ -1661,6 +1726,39 @@ async def _resolve_executor_mcp_servers(
                     extra={"extra_data": {"server_id": sid, "reason": invalid_reason}},
                 )
                 continue
+            headers = row.headers or {}
+            auth_config = effective_mcp_auth_config(row.auth_config, headers)
+            oauth_service = None
+            if providers is not None:
+                oauth_service = getattr(providers, "mcp_oauth_service", None) or getattr(
+                    providers, "_mcp_oauth_service", None
+                )
+            if auth_config.type == "oauth2" and oauth_service is not None and user_email:
+                result = await oauth_service.inject_authorization_header(
+                    user_email=user_email,
+                    server=row,
+                    headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    step_name=step_name,
+                    step_run_id=step_run_id,
+                    session_id=session_id,
+                    delivery_mode=delivery_mode,
+                )
+                if result.authorization_required:
+                    logger.warning(
+                        "OAuth MCP server requires authorization",
+                        extra={
+                            "extra_data": {
+                                "server_id": sid,
+                                "reason": result.reason,
+                                "transaction_id": result.transaction_id,
+                            }
+                        },
+                    )
+                headers = result.headers
+                if not result.authorization_required:
+                    auth_config = {"type": "static_headers"}
             servers.append(
                 MCPServerConfig(
                     server_id=row.server_id,
@@ -1670,7 +1768,8 @@ async def _resolve_executor_mcp_servers(
                     url=row.url,
                     args=row.args or [],
                     env=row.env or {},
-                    headers=row.headers or {},
+                    headers=headers,
+                    auth_config=auth_config,
                     timeout_seconds=row.timeout_seconds,
                 )
             )
@@ -1894,7 +1993,7 @@ def _dedupe_intaris_tools(
     deduped: list[ToolDefinition] = []
     seen: set[str] = set()
     for tool in sorted(
-        tools,
+        disambiguate_mcp_tool_name_collisions(tools),
         key=lambda item: (
             item.source.server_name or "",
             item.source.raw_tool_name or item.name,

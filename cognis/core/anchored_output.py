@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -17,6 +18,7 @@ class OutputAnchor:
     kind: str
     start_line: int
     end_line: int
+    artifact_candidate: dict[str, Any] | None = None
 
 
 class AnchoredTextBuilder:
@@ -29,7 +31,15 @@ class AnchoredTextBuilder:
     def add_line(self, line: str = "") -> None:
         self._lines.append(line)
 
-    def add_section(self, anchor: str, *, kind: str, label: str | None, lines: list[str]) -> None:
+    def add_section(
+        self,
+        anchor: str,
+        *,
+        kind: str,
+        label: str | None,
+        lines: list[str],
+        artifact_candidate: dict[str, Any] | None = None,
+    ) -> None:
         if not lines:
             return
         start_line = len(self._lines) + 1
@@ -43,22 +53,25 @@ class AnchoredTextBuilder:
                 kind=kind,
                 start_line=start_line,
                 end_line=end_line,
+                artifact_candidate=artifact_candidate,
             )
         )
         self._lines.append("")
 
     def build(self) -> tuple[str, list[dict[str, object]]]:
         text = "\n".join(self._lines).rstrip()
-        anchors = [
-            {
+        anchors = []
+        for item in self._anchors:
+            anchor = {
                 "anchor": item.anchor,
                 "label": item.label,
                 "kind": item.kind,
                 "start_line": item.start_line,
                 "end_line": item.end_line,
             }
-            for item in self._anchors
-        ]
+            if item.artifact_candidate:
+                anchor["artifact_candidate"] = item.artifact_candidate
+            anchors.append(anchor)
         return text, anchors
 
 

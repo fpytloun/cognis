@@ -12,6 +12,7 @@ _POSITIVE_INT_KEYS = {
     "session.step_timeout_seconds",
     "session.llm_stream_idle_timeout_seconds",
     "session.llm_stream_max_retries",
+    "session.long_lived_chat_idle_compaction_min_events",
     "session.max_active_turns_per_user",
     "session.max_queued_messages",
     "evaluator.timeout_ms",
@@ -28,6 +29,7 @@ _POSITIVE_INT_KEYS = {
 }
 
 _NON_NEGATIVE_INT_KEYS = {
+    "session.long_lived_chat_idle_compaction_seconds",
     "web.browser_fetch.network_idle_after_dom_seconds",
 }
 

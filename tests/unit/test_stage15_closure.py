@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.events import EventBus, EventType
 from cognis.core.session import SessionManager
 from cognis.models.agent import AgentDefinition
@@ -18,7 +19,10 @@ from cognis.store.queries import (
     create_conversation,
     create_session,
     create_user,
+    get_agent_direct_conversation,
     get_latest_active_conversation_for_agent,
+    list_conversations,
+    mark_conversation_agent_direct,
     set_session_intaris_session_id,
     update_conversation_active_session,
 )
@@ -361,6 +365,164 @@ def test_latest_active_conversation_for_agent_prefers_recent_active(tmp_path: Pa
         return latest.title if latest is not None else None
 
     assert asyncio.run(_run()) == "Fresh"
+
+
+def test_agent_direct_conversations_are_hidden_from_default_history(tmp_path: Path) -> None:
+    async def _run() -> tuple[list[str], list[str], str | None]:
+        engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_factory = create_session_factory(engine)
+        async with session_factory() as session:
+            await create_user(
+                session, email="user@example.com", name="User", password_hash="hash", role="user"
+            )
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent 1",
+                status="active",
+            )
+            normal = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                title="Normal",
+            )
+            await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                context_data={"kind": "topic"},
+                title="Topic",
+            )
+            direct = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                context_ref=agent_direct_context_ref("user@example.com", "agent-1"),
+                context_data={"kind": AGENT_DIRECT_KIND},
+                title=None,
+                title_source="agent_direct",
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            default_rows = await list_conversations(
+                session,
+                "user@example.com",
+                context_type="web",
+                include_agent_direct=False,
+            )
+            all_rows = await list_conversations(
+                session,
+                "user@example.com",
+                context_type="web",
+                include_agent_direct=True,
+            )
+            found_direct = await get_agent_direct_conversation(
+                session,
+                "user@example.com",
+                "agent-1",
+            )
+
+        await engine.dispose()
+        assert normal.conversation_id != direct.conversation_id
+        return (
+            [row.conversation_id for row in default_rows],
+            [row.conversation_id for row in all_rows],
+            found_direct.conversation_id if found_direct else None,
+        )
+
+    default_ids, all_ids, direct_id = asyncio.run(_run())
+    assert len(default_ids) == 2
+    assert direct_id not in default_ids
+    assert direct_id in all_ids
+
+
+def test_agent_direct_lookup_canonicalizes_legacy_direct_context(tmp_path: Path) -> None:
+    async def _run() -> tuple[str | None, str | None, list[str], str | None]:
+        engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_factory = create_session_factory(engine)
+        async with session_factory() as session:
+            await create_user(
+                session, email="user@example.com", name="User", password_hash="hash", role="user"
+            )
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent 1",
+                status="active",
+            )
+            await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                title="Normal",
+            )
+            legacy = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                context_data={"kind": AGENT_DIRECT_KIND},
+                title_source="agent_direct",
+            )
+            await create_session(
+                session,
+                conversation_id=legacy.conversation_id,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                session_id="sess-legacy",
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            found = await get_agent_direct_conversation(session, "user@example.com", "agent-1")
+            assert found is not None
+            await mark_conversation_agent_direct(
+                session,
+                found.conversation_id,
+                user_email="user@example.com",
+                agent_id="agent-1",
+            )
+            await session.commit()
+            canonical = await get_agent_direct_conversation(session, "user@example.com", "agent-1")
+            default_rows = await list_conversations(
+                session,
+                "user@example.com",
+                context_type="web",
+                include_agent_direct=False,
+            )
+            latest = await get_latest_active_conversation_for_agent(
+                session,
+                "user@example.com",
+                "agent-1",
+                context_type="web",
+            )
+
+        await engine.dispose()
+        assert found.conversation_id == legacy.conversation_id
+        return (
+            canonical.conversation_id if canonical else None,
+            canonical.context_ref if canonical else None,
+            [row.conversation_id for row in default_rows],
+            latest.conversation_id if latest else None,
+        )
+
+    conversation_id, context_ref, default_ids, latest_id = asyncio.run(_run())
+    assert conversation_id is not None
+    assert context_ref == agent_direct_context_ref("user@example.com", "agent-1")
+    assert conversation_id not in default_ids
+    assert latest_id != conversation_id
 
 
 def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) -> None:

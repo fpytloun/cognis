@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+import base64
+import json
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -17,6 +20,7 @@ from cognis.api.common import (
     require_resource_owner,
 )
 from cognis.api.models import (
+    AgentDirectChatResponse,
     ConversationCreateRequest,
     ConversationResolveRequest,
     ConversationResponse,
@@ -35,6 +39,7 @@ from cognis.api.models import (
     UpdateQueuedMessageRequest,
 )
 from cognis.api.serializers import (
+    agent_to_response,
     conversation_to_response,
     serialize_event_rows,
     session_to_response,
@@ -46,19 +51,105 @@ from cognis.logging import get_logger
 from cognis.models.session import ConversationContext
 from cognis.store.queries import (
     get_agent,
+    get_agent_direct_conversation,
     get_conversation,
     get_latest_active_conversation_for_agent,
     get_latest_root_session_for_conversation,
     get_project,
     get_root_session_chain,
+    get_root_session_chain_page,
     get_session_row,
     list_conversation_sessions,
     list_conversations,
+    list_pending_notification_types_by_conversation,
+    list_sessions_by_ids,
+    list_visible_agents,
     mark_artifacts_attached,
     mark_conversation_read,
 )
 
 logger = get_logger(__name__)
+
+_CONVERSATION_MESSAGES_CURSOR_VERSION = 1
+
+
+def _encode_messages_cursor(session_id: str, seq: int) -> str:
+    payload = {
+        "v": _CONVERSATION_MESSAGES_CURSOR_VERSION,
+        "sid": session_id,
+        "seq": max(0, seq),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_messages_cursor(cursor: str) -> tuple[str, int]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except Exception as exc:
+        raise api_exception(400, "invalid_cursor", "Invalid history cursor") from exc
+    if not isinstance(payload, dict) or payload.get("v") != _CONVERSATION_MESSAGES_CURSOR_VERSION:
+        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
+    session_id = payload.get("sid")
+    seq = payload.get("seq")
+    if not isinstance(session_id, str) or not session_id:
+        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
+    return session_id, seq
+
+
+def _event_seq(event: dict[str, Any]) -> int:
+    seq = event.get("seq")
+    return seq if isinstance(seq, int) else 0
+
+
+def _event_timestamp(event: dict[str, Any]) -> datetime:
+    raw = event.get("ts") or event.get("timestamp")
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min.replace(tzinfo=UTC)
+    return datetime.min.replace(tzinfo=UTC)
+
+
+def _sort_session_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(events, key=lambda event: (_event_seq(event), _event_timestamp(event)))
+
+
+def _filter_orphan_tool_results(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen_tool_calls: set[str] = set()
+    filtered: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("type") == "tool_call":
+            data = event.get("data")
+            if isinstance(data, dict):
+                call_id = data.get("call_id")
+                if isinstance(call_id, str) and call_id:
+                    seen_tool_calls.add(call_id)
+            filtered.append(event)
+            continue
+        if event.get("type") == "tool_result":
+            data = event.get("data")
+            call_id = data.get("call_id") if isinstance(data, dict) else None
+            if isinstance(call_id, str) and call_id and call_id not in seen_tool_calls:
+                continue
+        filtered.append(event)
+    return filtered
+
+
+def _tag_session_events(session_row: Any, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if isinstance(data, dict) and "session_id" not in data:
+            data["session_id"] = session_row.session_id
+    return events
 
 
 def _require_visible_conversation(request: Request, row: Any) -> Any:
@@ -66,6 +157,55 @@ def _require_visible_conversation(request: Request, row: Any) -> Any:
         raise api_exception(404, "not_found", "Conversation not found")
     require_resource_owner(request, row.user_email)
     return row
+
+
+async def _conversation_attention_context(
+    session: Any,
+    rows: list[Any],
+    user_email: str,
+) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    conversation_ids = [row.conversation_id for row in rows]
+    active_session_ids = [
+        row.active_session_id for row in rows if getattr(row, "active_session_id", None)
+    ]
+    active_sessions = await list_sessions_by_ids(session, active_session_ids)
+    pending_notifications = await list_pending_notification_types_by_conversation(
+        session,
+        user_email,
+        conversation_ids,
+    )
+    return active_sessions, pending_notifications
+
+
+async def _conversation_response(
+    request: Request,
+    row: Any,
+    *,
+    has_active_turn: bool | None = None,
+) -> ConversationResponse:
+    active_session = None
+    pending_notifications: list[str] = []
+    active_turn_state = request.app.state.turn_scheduler.running_turn_state(row.conversation_id)
+    resolved_has_active_turn = (
+        active_turn_state is not None if has_active_turn is None else has_active_turn
+    )
+    async with request.app.state.session_factory() as session:
+        if getattr(row, "active_session_id", None):
+            active_session = await get_session_row(session, row.active_session_id)
+        pending_notifications = (
+            await list_pending_notification_types_by_conversation(
+                session,
+                row.user_email,
+                [row.conversation_id],
+            )
+        ).get(row.conversation_id, [])
+    return conversation_to_response(
+        row,
+        has_active_turn=resolved_has_active_turn,
+        active_turn_state=active_turn_state,
+        active_session=active_session,
+        pending_notification_types=pending_notifications,
+    )
 
 
 async def _require_mutable_conversation(request: Request, conversation_id: str) -> Any:
@@ -89,6 +229,15 @@ async def _require_mutable_conversation(request: Request, conversation_id: str) 
 def _queued_messages_response(messages: list[dict[str, Any]]) -> QueuedMessagesResponse:
     items = [QueuedMessageResponse.model_validate(item) for item in messages]
     return QueuedMessagesResponse(messages=items, queued_count=len(items))
+
+
+def _agent_direct_sort_key(item: AgentDirectChatResponse) -> datetime:
+    return (
+        item.conversation.last_message_at
+        or item.conversation.updated_at
+        or item.conversation.created_at
+        or datetime.min.replace(tzinfo=UTC)
+    )
 
 
 async def _hydrate_event_attachments(
@@ -128,6 +277,7 @@ async def conversation_list(
     agent_id: str | None = Query(default=None),
     project_id: str | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+    include_agent_direct: bool = Query(default=False),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
@@ -138,17 +288,30 @@ async def conversation_list(
             agent_id=agent_id,
             project_id=project_id,
             status=status,
+            include_agent_direct=include_agent_direct,
+        )
+        active_sessions, pending_notifications = await _conversation_attention_context(
+            session,
+            rows,
+            user.email,
         )
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    items = [
-        conversation_to_response(
-            row,
-            has_active_turn=bool(
-                turn_scheduler and turn_scheduler.has_running_turn(row.conversation_id)
-            ),
+    items: list[ConversationResponse] = []
+    for row in rows:
+        active_turn_state = (
+            turn_scheduler.running_turn_state(row.conversation_id)
+            if turn_scheduler is not None
+            else None
         )
-        for row in rows
-    ]
+        items.append(
+            conversation_to_response(
+                row,
+                has_active_turn=active_turn_state is not None,
+                active_session=active_sessions.get(row.active_session_id),
+                active_turn_state=active_turn_state,
+                pending_notification_types=pending_notifications.get(row.conversation_id, []),
+            )
+        )
     page_items, next_cursor, has_more = paginate_items(
         items,
         limit=limit,
@@ -156,6 +319,67 @@ async def conversation_list(
         get_item_id=lambda item: item.conversation_id,
     )
     return CursorPage(items=page_items, cursor=next_cursor, has_more=has_more)
+
+
+@router.get("/agent-direct", response_model=list[AgentDirectChatResponse])
+async def agent_direct_chats(
+    request: Request,
+    agent_id: str | None = Query(default=None),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+) -> list[AgentDirectChatResponse]:
+    """Return sticky web direct chats for visible primary agents."""
+
+    user = require_current_user(request)
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    rows: list[tuple[Any, Any]] = []
+    async with request.app.state.session_factory() as session:
+        visible_agents = await list_visible_agents(session, user.email)
+        for agent, _grant in visible_agents:
+            if agent.agent_type != "primary" or agent.status != "active":
+                continue
+            if agent_id is not None and agent.agent_id != agent_id:
+                continue
+            existing = await get_agent_direct_conversation(session, user.email, agent.agent_id)
+            rows.append((agent, existing))
+        active_sessions, pending_notifications = await _conversation_attention_context(
+            session,
+            [conversation for _agent, conversation in rows if conversation is not None],
+            user.email,
+        )
+
+    responses: list[AgentDirectChatResponse] = []
+    for agent, conversation in rows:
+        if conversation is None:
+            continue
+        if status == "active" and conversation.status != "active":
+            continue
+        if status == "archived" and conversation.status != "archived":
+            continue
+        if status == "starred" and not conversation.starred_at:
+            continue
+        active_turn_state = (
+            turn_scheduler.running_turn_state(conversation.conversation_id)
+            if turn_scheduler is not None
+            else None
+        )
+        responses.append(
+            AgentDirectChatResponse(
+                agent=agent_to_response(agent),
+                conversation=conversation_to_response(
+                    conversation,
+                    has_active_turn=active_turn_state is not None,
+                    active_session=active_sessions.get(conversation.active_session_id),
+                    active_turn_state=active_turn_state,
+                    pending_notification_types=pending_notifications.get(
+                        conversation.conversation_id,
+                        [],
+                    ),
+                ),
+            )
+        )
+
+    responses.sort(key=_agent_direct_sort_key, reverse=True)
+    return responses
 
 
 @router.post("/resolve", response_model=ConversationResponse)
@@ -175,27 +399,45 @@ async def resolve_conversation(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
-        existing = await get_latest_active_conversation_for_agent(
-            session,
-            user.email,
-            payload.agent_id,
-            context_type=payload.context_type,
-        )
+        if payload.scope == "agent_direct":
+            if payload.context_type != "web":
+                raise api_exception(
+                    400,
+                    "invalid_request",
+                    "Agent direct conversations are only supported for web context.",
+                )
+            existing = None
+        else:
+            existing = await get_latest_active_conversation_for_agent(
+                session,
+                user.email,
+                payload.agent_id,
+                context_type=payload.context_type,
+            )
     if existing is not None:
-        return conversation_to_response(existing)
-    context_ref = f"{payload.context_type}:user:{user.email}:default"
-    conversation = await request.app.state.session_manager.create_conversation(
-        user_email=user.email,
-        agent_id=payload.agent_id,
-        context=ConversationContext(
-            type=payload.context_type,
-            ref=context_ref,
-            platform_data={},
-            memory_labels={},
-        ),
-        title=None,
-    )
-    return conversation_to_response(conversation)
+        return await _conversation_response(request, existing)
+    if payload.scope == "agent_direct":
+        conversation = (
+            await request.app.state.session_manager.get_or_create_agent_direct_conversation(
+                user_email=user.email,
+                agent_id=payload.agent_id,
+            )
+        )
+    else:
+        context_ref = f"{payload.context_type}:user:{user.email}:default"
+        conversation = await request.app.state.session_manager.create_conversation(
+            user_email=user.email,
+            agent_id=payload.agent_id,
+            context=ConversationContext(
+                type=payload.context_type,
+                ref=context_ref,
+                platform_data={},
+                memory_labels={},
+            ),
+            title=None,
+            title_source="unset",
+        )
+    return await _conversation_response(request, conversation)
 
 
 @router.post("", response_model=ConversationResponse)
@@ -224,7 +466,7 @@ async def create_conversation(
         title_source="manual" if payload.title else "unset",
         project_id=payload.project_id,
     )
-    return conversation_to_response(conversation)
+    return await _conversation_response(request, conversation)
 
 
 @router.get("/{conversation_id}", response_model=ConversationResponse)
@@ -232,7 +474,7 @@ async def conversation_detail(request: Request, conversation_id: str) -> Convers
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
     row = _require_visible_conversation(request, row)
-    return conversation_to_response(row)
+    return await _conversation_response(request, row)
 
 
 @router.get(
@@ -310,7 +552,24 @@ async def update_conversation(
             row.starred_at = payload.starred_at
         await session.commit()
         await session.refresh(row)
-        return conversation_to_response(row)
+        active_session = (
+            await get_session_row(session, row.active_session_id) if row.active_session_id else None
+        )
+        pending_notifications = (
+            await list_pending_notification_types_by_conversation(
+                session,
+                row.user_email,
+                [row.conversation_id],
+            )
+        ).get(row.conversation_id, [])
+        active_turn_state = request.app.state.turn_scheduler.running_turn_state(row.conversation_id)
+        return conversation_to_response(
+            row,
+            has_active_turn=active_turn_state is not None,
+            active_turn_state=active_turn_state,
+            active_session=active_session,
+            pending_notification_types=pending_notifications,
+        )
 
 
 @router.post("/{conversation_id}/read", response_model=dict)
@@ -388,6 +647,8 @@ async def conversation_messages(
     conversation_id: str,
     after_seq: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
+    anchor: Literal["oldest", "latest"] = Query(default="oldest"),
+    before: str | None = Query(default=None),
 ) -> MessageHistoryResponse:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
@@ -400,13 +661,38 @@ async def conversation_messages(
         if history_anchor_id is None:
             return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
 
+        before_session_id: str | None = None
+        before_seq: int | None = None
+        if before:
+            if after_seq > 0:
+                raise api_exception(
+                    400,
+                    "invalid_request",
+                    "History cursor cannot be combined with active-session incremental replay.",
+                )
+            before_session_id, before_seq = _decode_messages_cursor(before)
+            cursor_row = await get_session_row(session, before_session_id)
+            if cursor_row is None or cursor_row.conversation_id != conversation_id:
+                raise api_exception(400, "invalid_cursor", "Invalid history cursor")
+            if cursor_row.parent_session_id is not None:
+                raise api_exception(400, "invalid_cursor", "Invalid history cursor")
+
         # Incremental fetch (after_seq > 0): read only the active session.
-        # Full load (after_seq == 0): walk the root-session lineage and
-        # merge events from all root sessions (oldest first).
+        # Latest-page fetch: walk the root-session lineage but read only as
+        # many tail events as the client requested.
+        # Legacy full load (after_seq == 0, anchor=oldest): keep historical
+        # behavior for existing clients.
         lineage_truncated = False
         if after_seq > 0:
             session_row = await get_session_row(session, history_anchor_id)
             session_rows = [session_row] if session_row is not None else []
+        elif anchor == "latest" or before:
+            session_rows, lineage_truncated = await get_root_session_chain_page(
+                session,
+                conversation_id,
+                history_anchor_id,
+                before_session_id=before_session_id,
+            )
         else:
             session_rows, lineage_truncated = await get_root_session_chain(
                 session, conversation_id, history_anchor_id
@@ -418,13 +704,14 @@ async def conversation_messages(
     guardrails = request.app.state.providers.guardrails
 
     # Read events from each session in the chain (parallel for full load)
-    all_events: list[dict[str, Any]] = []
+    all_events: list[Any] = []
     last_seq_value = 0
     has_more = False
-    active_session_id = session_rows[-1].session_id if session_rows else None
+    active_session_id = history_anchor_id
     active_session_last_seq = 0
     history_truncated = False
     truncation_reason: str | None = None
+    older_cursor: str | None = None
 
     if after_seq > 0:
         # Incremental: single session read
@@ -446,10 +733,108 @@ async def conversation_messages(
                     }
                 },
             )
-        all_events = list(event_result.events)
+        all_events = _tag_session_events(sr, list(event_result.events))
         last_seq_value = event_result.last_seq
         has_more = event_result.has_more
         active_session_last_seq = event_result.last_seq
+    elif anchor == "latest" or before:
+        # Latest-first bootstrap / older-page fetch across root-session
+        # lineage. Read only enough events to fill the requested page, moving
+        # backwards across compacted root sessions when necessary.
+        remaining = limit
+        page_events: list[tuple[Any, list[dict[str, Any]]]] = []
+        has_older = False
+        for index in range(len(session_rows) - 1, -1, -1):
+            if remaining <= 0:
+                has_older = True
+                break
+            sr = session_rows[index]
+            result_last_seq = 0
+            result_missing_stream = False
+            if before_session_id == sr.session_id and before_seq is not None and before_seq > 0:
+                read_limit = remaining + 1
+                read_after_seq = max(0, before_seq - read_limit)
+                result = await guardrails.read_events(
+                    session_id=sr.intaris_session_id or sr.session_id,
+                    after_seq=read_after_seq,
+                    limit=read_limit,
+                    allow_missing_stream=True,
+                )
+                row_events = [
+                    event for event in list(result.events) if _event_seq(event) < before_seq
+                ]
+                if row_events and _event_seq(row_events[0]) > 1:
+                    has_older = True
+                if len(row_events) > remaining:
+                    row_events = row_events[-remaining:]
+                    has_older = True
+                result_last_seq = result.last_seq
+                result_missing_stream = result.missing_stream_fallback_used
+            else:
+                result = await guardrails.read_events(
+                    session_id=sr.intaris_session_id or sr.session_id,
+                    last_n=remaining,
+                    allow_missing_stream=True,
+                )
+                row_events = list(result.events)
+                if result.has_more:
+                    has_older = True
+                result_last_seq = result.last_seq
+                result_missing_stream = result.missing_stream_fallback_used
+            if result_missing_stream:
+                logger.warning(
+                    "Session stream missing in Intaris during paginated lineage read",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "session_id": sr.session_id,
+                        }
+                    },
+                )
+                row_events = [
+                    {
+                        "type": "history_gap",
+                        "data": {"reason": "stream_missing", "session_id": sr.session_id},
+                        "seq": 0,
+                        "ts": None,
+                    }
+                ]
+            row_events = _filter_orphan_tool_results(
+                _sort_session_events(_tag_session_events(sr, row_events))
+            )
+            if sr.session_id == active_session_id:
+                active_session_last_seq = result_last_seq
+            page_events.insert(0, (sr, row_events))
+            remaining -= len(row_events)
+            if result_missing_stream:
+                break
+        all_events = [event for _, events in page_events for event in events]
+        if active_session_last_seq == 0 and active_session_id:
+            active_row = next(
+                (item for item in session_rows if item.session_id == active_session_id),
+                None,
+            )
+            if active_row is None:
+                async with request.app.state.session_factory() as session:
+                    active_row = await get_session_row(session, active_session_id)
+            if active_row is not None:
+                active_session_last_seq = await guardrails.get_last_seq(
+                    active_row.intaris_session_id or active_row.session_id
+                )
+        last_seq_value = active_session_last_seq
+        has_more = has_older or lineage_truncated
+        if has_more and all_events:
+            first_event = all_events[0]
+            first_session_id = None
+            data = first_event.get("data")
+            if isinstance(data, dict) and isinstance(data.get("session_id"), str):
+                first_session_id = data["session_id"]
+            first_seq = _event_seq(first_event)
+            if first_session_id:
+                older_cursor = _encode_messages_cursor(first_session_id, first_seq)
+        if lineage_truncated:
+            history_truncated = True
+            truncation_reason = "lineage_truncated"
     else:
         # Full load: read all sessions in parallel
         import asyncio as _asyncio
@@ -487,7 +872,7 @@ async def conversation_messages(
                         ],
                         result.last_seq,
                     )
-                return sr, list(result.events), result.last_seq
+                return sr, _sort_session_events(list(result.events)), result.last_seq
             except Exception:
                 logger.warning(
                     "Failed to read session events during lineage walk",
@@ -535,11 +920,7 @@ async def conversation_messages(
             sid = sr.session_id
             if sid == active_session_id:
                 active_session_last_seq = session_last_seq
-            for event in events:
-                if isinstance(event, dict):
-                    data = event.get("data")
-                    if isinstance(data, dict) and "session_id" not in data:
-                        data["session_id"] = sid
+            _tag_session_events(sr, events)
             all_events.extend(events)
 
         # For full loads, return the full lineage history and let the
@@ -563,7 +944,7 @@ async def conversation_messages(
 
     return MessageHistoryResponse(
         items=serialize_event_rows(
-            all_events,
+            list(all_events),
             log_label="conversation_messages",
             log_context={
                 "conversation_id": conversation_id,
@@ -572,6 +953,7 @@ async def conversation_messages(
         ),
         last_seq=last_seq_value,
         has_more=has_more,
+        older_cursor=older_cursor,
         has_active_turn=has_active_turn,
         active_streams=active_streams,
         active_tool_outputs=active_tool_outputs,
@@ -991,20 +1373,42 @@ def _turn_error_to_http(error: TurnError) -> Exception:
 
 
 @router.get("/{conversation_id}/sessions", response_model=list[SessionResponse])
-async def conversation_sessions(request: Request, conversation_id: str) -> list[SessionResponse]:
+async def conversation_sessions(
+    request: Request,
+    conversation_id: str,
+    root_only: bool = Query(default=False),
+    active_only: bool = Query(default=False),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    order: Literal["asc", "desc"] = Query(default="asc"),
+) -> list[SessionResponse]:
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
         row = _require_visible_conversation(request, row)
-        sessions = await list_conversation_sessions(session, conversation_id)
+        sessions = await list_conversation_sessions(
+            session,
+            conversation_id,
+            root_only=root_only,
+            statuses=["active"] if active_only else None,
+            order=order,
+            limit=limit,
+        )
     return [session_to_response(item) for item in sessions]
 
 
 @router.get("/{conversation_id}/delegations", response_model=list[SessionResponse])
 async def active_delegations(request: Request, conversation_id: str) -> list[SessionResponse]:
-    sessions = await conversation_sessions(request, conversation_id)
-    return [
-        item for item in sessions if item.parent_session_id is not None and item.status == "active"
-    ]
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        sessions = await list_conversation_sessions(
+            session,
+            conversation_id,
+            parent_only=True,
+            statuses=["active"],
+            order="asc",
+            limit=200,
+        )
+    return [session_to_response(item) for item in sessions]
 
 
 @router.get(

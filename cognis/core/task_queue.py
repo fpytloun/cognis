@@ -28,7 +28,7 @@ from cognis.core.workflow_management import (
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
-from cognis.models.workflow import CompletionDeliveryPolicy, WorkflowState
+from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
     add_task_dependency,
@@ -251,6 +251,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         interaction_mode_override: str | None = None,
+        session_policy: SessionPolicy | dict[str, Any] | None = None,
         workflow_id: str | None = None,
         project_id: str | None = None,
         workspace_root: str | None = None,
@@ -292,6 +293,11 @@ class TaskQueue:
                 completion_mode_family=completion_delivery.completion_mode_family,
                 allow_silent_completion=completion_delivery.allow_silent_completion,
                 interaction_mode_override=interaction_mode_override,
+                session_policy=(
+                    session_policy.model_dump()
+                    if isinstance(session_policy, SessionPolicy)
+                    else session_policy
+                ),
                 workflow_id=workflow_id,
                 project_id=project_id,
                 workspace_root=workspace_root,
@@ -365,6 +371,7 @@ class TaskQueue:
         delivery: TaskDelivery | None = None,
         completion_delivery: CompletionDeliveryPolicy | None = None,
         interaction_mode_override: str | None = None,
+        session_policy: SessionPolicy | dict[str, Any] | None = None,
         workflow_id: str | None = None,
         project_id: str | None = None,
         workspace_root: str | None = None,
@@ -384,6 +391,7 @@ class TaskQueue:
             delivery=delivery,
             completion_delivery=completion_delivery,
             interaction_mode_override=interaction_mode_override,
+            session_policy=session_policy,
             workflow_id=workflow_id,
             project_id=project_id,
             workspace_root=workspace_root,
@@ -1179,6 +1187,7 @@ class TaskQueue:
                     workflow_id, owner_email=task.created_by, project_id=task.project_id
                 )
                 if workflow is None:
+                    result_summary = f"Unknown workflow: {workflow_id}"
                     logger.warning(
                         "Unknown workflow for task",
                         extra={"extra_data": {"task_id": task.task_id, "workflow_id": workflow_id}},
@@ -1188,10 +1197,14 @@ class TaskQueue:
                             db_session,
                             task.task_id,
                             "failed",
-                            result_summary=f"Unknown workflow: {workflow_id}",
+                            result_summary=result_summary,
                             completed_at=datetime.now(UTC),
                         )
                         await db_session.commit()
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now(UTC)
+                    task.result_summary = result_summary
+                    await self._deliver_terminal_task_failure(task)
                     return
 
                 # Initialize workflow state
@@ -1249,19 +1262,25 @@ class TaskQueue:
                         final_status=step_run_status,
                     )
                     await db_session.commit()
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Task execution failed",
                     extra={"extra_data": {"task_id": task.task_id}},
                 )
+                result_summary = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
                 async with self._session_factory() as db_session:
                     await update_task_status(
                         db_session,
                         task.task_id,
                         "failed",
+                        result_summary=result_summary,
                         completed_at=datetime.now(UTC),
                     )
                     await db_session.commit()
+                task.status = TaskStatus.FAILED
+                task.completed_at = datetime.now(UTC)
+                task.result_summary = result_summary
+                await self._deliver_terminal_task_failure(task)
             finally:
                 self._active_runs.pop(task.task_id, None)
                 self._run_controls.pop(task.task_id, None)
@@ -1269,6 +1288,18 @@ class TaskQueue:
                 async with self._session_factory() as db_session:
                     queued = await list_tasks_by_status(db_session, ["queued", "ready"])
                 QUEUE_DEPTH.labels(queue="default").set(len(queued))
+
+    async def _deliver_terminal_task_failure(self, task: TaskModel) -> None:
+        """Deliver failures that happen before WorkflowEngine owns completion."""
+
+        try:
+            await self._workflow_engine._deliver_task_result(task)  # noqa: SLF001
+        except Exception:
+            logger.warning(
+                "Task failure delivery failed",
+                extra={"extra_data": {"task_id": task.task_id}},
+                exc_info=True,
+            )
 
     async def _has_capacity(self, agent_id: str | None = None) -> bool:
         """Check if there's capacity to run another step.
@@ -1353,6 +1384,7 @@ def _row_to_task_model(row: Any) -> TaskModel:
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
+        session_policy=SessionPolicy.model_validate(getattr(row, "session_policy", None) or {}),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         attempt_number=getattr(row, "attempt_number", 1),

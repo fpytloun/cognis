@@ -94,6 +94,7 @@ class ComposeAndRunWorkflowArgs(BaseModel):
     decompose_skills: Literal["auto", "always", "never"] = "auto"
     schedule: dict[str, Any] | None = None
     delivery: dict[str, Any] | None = None
+    session_policy: dict[str, Any] | None = None
     interaction_mode_override: Literal["none", "explicit_gates", "step_requests"] | None = None
     persist: bool = False
     agent_id: str | None = None
@@ -329,7 +330,9 @@ async def decompose_skill_material(
                     default=str,
                 )
             )
-        if previous_asset_manifest is not None and previous_asset_manifest != (asset_manifest or []):
+        if previous_asset_manifest is not None and previous_asset_manifest != (
+            asset_manifest or []
+        ):
             refresh_sections.append(
                 "Asset manifest changes:\n"
                 + json.dumps(

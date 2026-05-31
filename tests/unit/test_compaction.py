@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cognis.core.compaction import (
+    LONG_LIVED_CHAT_COMPACTION_ADDENDUM,
     CompactionModelContext,
     CompactionStrategy,
     _format_events_for_compaction,
@@ -119,6 +120,40 @@ async def test_compaction_records_summary_and_updates_cache() -> None:
     assert llm.kwargs[0]["task_type"] == "compaction"
     assert result.tail_start_seq == 3
     assert [event.seq for event in result.preserved_tail_events] == [3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_compaction_prompt_adds_long_lived_chat_addendum() -> None:
+    cache = _Cache()
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    await strategy.compact(_session(), long_lived_chat=True)
+
+    assert LONG_LIVED_CHAT_COMPACTION_ADDENDUM in str(llm.messages[0][0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_compaction_prompt_default_omits_long_lived_chat_addendum() -> None:
+    cache = _Cache()
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    await strategy.compact(_session())
+
+    assert LONG_LIVED_CHAT_COMPACTION_ADDENDUM not in str(llm.messages[0][0]["content"])
 
 
 @pytest.mark.asyncio

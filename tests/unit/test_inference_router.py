@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.models.config import GeneratedImage, ImageGenerationResult
+from cognis.providers.llm.errors import LLMStreamProviderError
 from cognis.providers.llm.inference_router import InferenceRouter
 
 
@@ -153,6 +154,71 @@ async def test_inference_router_route_generate_serializes_structured_reasoning_f
     assert '"decision": "revise"' in result["choices"][0]["message"]["reasoning_content"]
     assert result["choices"][0]["message"]["reasoning"] == '["Need tests"]'
     assert result["response_status"] == "completed"
+
+
+class _ErrorConnection:
+    async def llm_complete_stream(self, **_: object):
+        yield {
+            "error": "provider rate limit",
+            "response_error": {
+                "category": "rate_limit",
+                "message": "provider rate limit",
+                "retry_after_seconds": 23,
+            },
+        }
+
+
+class _ErrorProvider:
+    def __init__(self) -> None:
+        self.connection = _ErrorConnection()
+
+    async def list_active(self):
+        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        assert handle.executor_id == "exec-1"
+        return self.connection
+
+
+@pytest.mark.asyncio
+async def test_inference_router_preserves_structured_stream_errors() -> None:
+    router = InferenceRouter(_ErrorProvider())
+
+    chunks = [
+        chunk
+        async for chunk in router.route_stream(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+            executor_labels={"location": "local"},
+        )
+    ]
+
+    assert chunks == [
+        {
+            "error": "provider rate limit",
+            "mid_stream_failure": True,
+            "response_error": {
+                "category": "rate_limit",
+                "message": "provider rate limit",
+                "retry_after_seconds": 23,
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inference_router_generate_raises_structured_provider_error() -> None:
+    router = InferenceRouter(_ErrorProvider())
+
+    with pytest.raises(LLMStreamProviderError) as exc_info:
+        await router.route_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+            executor_labels={"location": "local"},
+        )
+
+    assert exc_info.value.to_payload()["category"] == "rate_limit"
+    assert exc_info.value.to_payload()["retry_after_seconds"] == 23
 
 
 @pytest.mark.asyncio

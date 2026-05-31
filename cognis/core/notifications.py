@@ -29,7 +29,12 @@ from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import NotificationRow
-from cognis.store.queries import get_latest_active_conversation_for_agent, get_task
+from cognis.store.queries import (
+    get_agent_direct_conversation,
+    get_latest_active_conversation_for_agent,
+    get_preferred_channel_account_for_agent,
+    get_task,
+)
 
 logger = get_logger(__name__)
 
@@ -153,13 +158,30 @@ class NotificationService:
             if delivery_mode == "specific_conversation" and task_row.delivery_target:
                 return task_row.delivery_target
 
-            if delivery_mode in ("latest_active_for_agent", "preferred_channel"):
+            if delivery_mode == "latest_active_for_agent":
                 latest = await get_latest_active_conversation_for_agent(
                     db, task_row.created_by, task_row.agent_id
                 )
                 if latest is not None:
                     return latest.conversation_id
                 # Fall back to task's own conversation if no active one found
+                return conversation_id
+
+            if delivery_mode == "preferred_channel":
+                account = await get_preferred_channel_account_for_agent(
+                    db,
+                    user_email=task_row.created_by,
+                    agent_id=task_row.agent_id,
+                )
+                if account is not None and account.default_conversation_id:
+                    return account.default_conversation_id
+                direct = await get_agent_direct_conversation(
+                    db,
+                    task_row.created_by,
+                    task_row.agent_id,
+                )
+                if direct is not None:
+                    return direct.conversation_id
                 return conversation_id
 
             if delivery_mode == "silent":
@@ -187,6 +209,7 @@ class NotificationService:
         session_id: str | None = None,
         payload: dict[str, Any] | None = None,
         notification_id: str | None = None,
+        suppress_event: bool = False,
     ) -> Notification:
         """Create a notification, persist to DB, register PauseWaiter, publish event.
 
@@ -265,21 +288,24 @@ class NotificationService:
             )
         )
 
-        # Publish to EventBus for real-time WebSocket delivery
-        await self._event_bus.publish(
-            Event(
-                type=EventType.NOTIFICATION_CREATED,
-                data={
-                    "notification_id": nid,
-                    "notification_type": notification_type,
-                    "conversation_id": resolved_conversation_id,
-                    "task_id": task_id,
-                    "step_name": step_name,
-                    "session_id": session_id,
-                    "payload": payload or {},
-                },
+        # Publish to EventBus for real-time WebSocket delivery unless the
+        # caller explicitly requested persist-only silent delivery.
+        if not suppress_event:
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.NOTIFICATION_CREATED,
+                    data={
+                        "notification_id": nid,
+                        "notification_type": notification_type,
+                        "user_email": user_email,
+                        "conversation_id": resolved_conversation_id,
+                        "task_id": task_id,
+                        "step_name": step_name,
+                        "session_id": session_id,
+                        "payload": payload or {},
+                    },
+                )
             )
-        )
 
         NOTIFICATIONS_CREATED.labels(type=notification_type).inc()
         logger.info(
@@ -406,6 +432,7 @@ class NotificationService:
                 data={
                     "notification_id": notification_id,
                     "notification_type": notification_type,
+                    "user_email": row_user_email,
                     "conversation_id": conversation_id,
                     "task_id": task_id,
                     "step_name": step_name,
@@ -438,6 +465,16 @@ class NotificationService:
             },
         )
         return True
+
+    async def resolve_internal(
+        self,
+        notification_id: str,
+        decision: str,
+        data: dict[str, Any] | None = None,
+    ) -> bool:
+        """Resolve callback-only notifications from trusted internal services."""
+
+        return await self.resolve(notification_id, decision, data, user_email=None)
 
     # ------------------------------------------------------------------
     # Query
@@ -581,6 +618,11 @@ class NotificationService:
                 data={
                     "notification_id": row.notification_id,
                     "notification_type": row.notification_type,
+                    "user_email": row.user_email,
+                    "conversation_id": row.conversation_id,
+                    "task_id": row.task_id,
+                    "step_name": row.step_name,
+                    "session_id": row.session_id,
                     "decision": decision,
                 },
             )

@@ -895,6 +895,42 @@ async def test_recover_paused_tasks_step_input_awaiting_user(tmp_path: object) -
 
 
 @pytest.mark.asyncio
+async def test_deliver_terminal_task_failure_uses_workflow_delivery_path(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    delivered: list[str] = []
+
+    class _WorkflowEngine:
+        _pause_waiter = SimpleNamespace(find_pending=lambda **_kwargs: None)
+
+        async def _deliver_task_result(self, task: TaskModel) -> None:
+            delivered.append(task.task_id)
+
+    async def _publish(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    try:
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=_WorkflowEngine(),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=_publish),
+        )
+        task = TaskModel(
+            task_id="task_fail",
+            title="Failure",
+            created_by="user@test.com",
+            agent_id="agent-1",
+            status=TaskStatus.FAILED,
+        )
+
+        await queue._deliver_terminal_task_failure(task)  # type: ignore[attr-defined]
+
+        assert delivered == ["task_fail"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_recover_paused_tasks_credential_replays_resolved_notification(
     tmp_path: object,
 ) -> None:

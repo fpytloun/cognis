@@ -2,6 +2,8 @@
   import { beforeNavigate, goto } from '$app/navigation';
   import { page } from '$app/stores';
   import { onMount, tick } from 'svelte';
+  import Pause from 'lucide-svelte/icons/pause';
+  import Play from 'lucide-svelte/icons/play';
 
   import { agentToFormState, formStateToEffectiveToolsPreviewPayload } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
@@ -350,6 +352,33 @@
     }
   }
 
+  async function toggleStatus(): Promise<void> {
+    if (!agent || agent.is_readonly_for_caller || agent.is_system) return;
+    if (agent.status === 'active') {
+      const confirmed = await confirmAction({
+        title: 'Suspend agent?',
+        message: 'Suspended agents cannot be selected for new work until they are activated again.',
+        confirmLabel: 'Suspend',
+        variant: 'danger',
+      });
+      if (!confirmed) return;
+    }
+    error = '';
+    try {
+      if (agent.status === 'active') {
+        await api.agents.suspend(agent.agent_id);
+      } else {
+        await api.agents.activate(agent.agent_id);
+      }
+      const previousStatus = agent.status;
+      await loadAgent();
+      addToast(`Agent ${previousStatus === 'active' ? 'suspended' : 'activated'}.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to update agent status');
+    }
+  }
+
   async function retrySyncPersonality(): Promise<void> {
     const confirmed = await confirmAction({
       title: 'Sync personality to Mnemory?',
@@ -443,6 +472,26 @@
         <p class="font-medium">Shared agent</p>
         <p class="mt-1 text-cyan-100/80">Shared by {agent.shared_by_email ?? agent.owner_email}. You can use this agent, but only the owner can edit or manage sharing.</p>
       </div>
+    {/if}
+    {#if agent && !agent.is_system && !agent.is_readonly_for_caller}
+      <Card class="p-4 sm:p-5">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p class="text-sm uppercase tracking-[0.22em] text-slate-500">Availability</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Agent status</h2>
+            <p class="mt-1 text-sm text-slate-400">Current status: <span class="font-medium text-slate-200">{agent.status}</span></p>
+          </div>
+          <Button size="sm" variant={agent.status === 'active' ? 'danger' : 'secondary'} onclick={toggleStatus}>
+            {#if agent.status === 'active'}
+              <Pause class="mr-2 h-4 w-4" />
+              Suspend
+            {:else}
+              <Play class="mr-2 h-4 w-4" />
+              Activate
+            {/if}
+          </Button>
+        </div>
+      </Card>
     {/if}
     {#if agent?.is_shared_with_me && myShare?.executor_scope === 'grantee_executor'}
       <Card class="p-4 sm:p-5">

@@ -12,6 +12,7 @@ import litellm
 from cognis.executor.backends.registry import ExecutorBackendRegistry, resolve_backend_name
 from cognis.executor.inference_types import CognisInferenceRequest
 from cognis.logging import get_logger
+from cognis.providers.llm.errors import build_mid_stream_error_chunk
 
 logger = get_logger(__name__)
 
@@ -64,9 +65,11 @@ class InferenceHandler:
             async for chunk in selected.stream_complete(request):
                 yield chunk
         except Exception as exc:
+            error_chunk = build_mid_stream_error_chunk(exc)
             yield {
                 "done": True,
-                "error": f"Inference error: {str(exc)[:500]}",
+                "error": f"Inference error: {str(error_chunk.get('error') or exc)[:500]}",
+                "response_error": error_chunk.get("response_error"),
                 "finish_reason": "error",
             }
             return

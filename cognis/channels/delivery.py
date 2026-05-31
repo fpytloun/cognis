@@ -24,6 +24,13 @@ from cognis.channels.protocol import (
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.channel import MediaAttachment, OutboundMessage
+from cognis.store.queries import (
+    get_agent_direct_conversation,
+    get_conversation,
+    get_conversation_channel_route,
+    get_latest_active_conversation_for_channel_account,
+    get_preferred_channel_account_for_agent,
+)
 
 logger = get_logger(__name__)
 
@@ -127,9 +134,15 @@ async def _materialize_media_attachment(
                 return (
                     MediaAttachment(
                         url=raw["url"],
-                        mime_type=raw.get("mime_type") if isinstance(raw.get("mime_type"), str) else None,
-                        filename=raw.get("filename") if isinstance(raw.get("filename"), str) else None,
-                        size_bytes=raw.get("size_bytes") if isinstance(raw.get("size_bytes"), int) else None,
+                        mime_type=raw.get("mime_type")
+                        if isinstance(raw.get("mime_type"), str)
+                        else None,
+                        filename=raw.get("filename")
+                        if isinstance(raw.get("filename"), str)
+                        else None,
+                        size_bytes=raw.get("size_bytes")
+                        if isinstance(raw.get("size_bytes"), int)
+                        else None,
                     ),
                     None,
                     True,
@@ -181,6 +194,8 @@ class ChannelDeliveryService:
         event_bus.subscribe(EventType.NOTIFICATION_CREATED, self._handle_notification_event)
         event_bus.subscribe(EventType.TURN_COMPLETED, self._handle_turn_completed_event)
         event_bus.subscribe(EventType.TURN_ERROR, self._handle_turn_error_event)
+        event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_schedule_event)
+        event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_schedule_event)
 
     async def start(self) -> None:
         """Start lightweight in-process retry loop."""
@@ -206,12 +221,15 @@ class ChannelDeliveryService:
     ) -> bool:
         """Send a message to a conversation's channel.
 
-        Looks up the conversation's channel context and delivers via
-        the appropriate adapter.  Returns True if delivered.
+        Web conversations are already updated by the workflow/event path, so
+        they count as delivered for caller fallback purposes. External channel
+        conversations are delivered via their adapter route.
         """
         channel_info = await self._resolve_channel(conversation_id)
         if channel_info is None:
-            return False
+            async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+            return bool(conversation is not None and conversation.context_type == "web")
 
         channel_type, account_id, chat_id, thread_id = channel_info
         status = await self._send_to_route(
@@ -358,7 +376,9 @@ class ChannelDeliveryService:
         return await prepare_media_attachments(
             media,
             session_factory=self._session_factory,
-            artifact_store=getattr(manager, "_artifact_store", None) if manager is not None else None,
+            artifact_store=getattr(manager, "_artifact_store", None)
+            if manager is not None
+            else None,
         )
 
     async def _materialize_media_attachment(
@@ -368,7 +388,9 @@ class ChannelDeliveryService:
         return await _materialize_media_attachment(
             raw,
             session_factory=self._session_factory,
-            artifact_store=getattr(manager, "_artifact_store", None) if manager is not None else None,
+            artifact_store=getattr(manager, "_artifact_store", None)
+            if manager is not None
+            else None,
         )
 
     # ------------------------------------------------------------------
@@ -414,6 +436,56 @@ class ChannelDeliveryService:
                 content += f"\n\nError: {result_summary}"
 
         await self.send_to_conversation(conversation_id, content, attachments=attachments)
+
+    async def _handle_schedule_event(self, event: Event) -> None:
+        """Handle schedule fire failures before a task exists."""
+
+        user_email = event.data.get("created_by")
+        agent_id = event.data.get("agent_id")
+        if not isinstance(user_email, str) or not isinstance(agent_id, str):
+            return
+
+        async with self._session_factory() as db_session:
+            account = await get_preferred_channel_account_for_agent(
+                db_session,
+                user_email=user_email,
+                agent_id=agent_id,
+            )
+            if account is None:
+                direct = await get_agent_direct_conversation(db_session, user_email, agent_id)
+                conversation_id = direct.conversation_id if direct is not None else None
+            else:
+                conversation_id = None
+                if account.default_conversation_id:
+                    route = await get_conversation_channel_route(
+                        db_session,
+                        account.default_conversation_id,
+                    )
+                    if route is not None and route[1] == account.account_id:
+                        conversation_id = account.default_conversation_id
+                if conversation_id is None:
+                    latest = await get_latest_active_conversation_for_channel_account(
+                        db_session,
+                        user_email=user_email,
+                        agent_id=agent_id,
+                        account_id=account.account_id,
+                    )
+                    conversation_id = latest.conversation_id if latest is not None else None
+
+        if conversation_id is None:
+            return
+
+        schedule_name = str(event.data.get("schedule_name") or "Scheduled task")
+        error = str(event.data.get("error") or "Unknown error")
+        if event.type == EventType.SCHEDULE_DISABLED:
+            reason = str(event.data.get("reason") or "repeated failures")
+            content = f'Schedule "{schedule_name}" was disabled after {reason}.'
+        else:
+            content = f'Schedule "{schedule_name}" failed to start.'
+        if error:
+            content += f"\n\nError: {error}"
+
+        await self.send_to_conversation(conversation_id, content)
 
     async def _handle_turn_completed_event(self, event: Event) -> None:
         delivery_id = event.data.get("delivery_id")
@@ -491,7 +563,10 @@ class ChannelDeliveryService:
 
         # Flush any buffered observer text before sending the notification
         # so the assistant's preceding message arrives before the question.
-        if notification_type in {"step_question", "auth_challenge", "credential_request"} and self._turn_scheduler is not None:
+        if (
+            notification_type in {"step_question", "auth_challenge", "credential_request"}
+            and self._turn_scheduler is not None
+        ):
             await self._flush_observer_buffers(conversation_id)
 
         if notification_type == "escalation" and isinstance(payload, dict):
@@ -545,6 +620,14 @@ class ChannelDeliveryService:
         """Render an auth challenge prompt for channel integrations."""
         label = str(payload.get("label") or "Authentication required")
         message = str(payload.get("message") or "Reply with the requested authentication code.")
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        if payload.get("kind") == "oauth_authorization" and isinstance(metadata, dict):
+            authorization_url = str(metadata.get("authorization_url") or "")
+            lines = [f"*[auth]* {label}", message]
+            if authorization_url:
+                lines.append(f"Authorize here: {authorization_url}")
+            lines.append("Replies will not complete OAuth; use the authorization link.")
+            return "\n\n".join(lines)
         lines = [f"*[auth]* {label}", message]
         required = payload.get("required_fields")
         if isinstance(required, list) and "code" in required:
@@ -688,7 +771,11 @@ class ChannelDeliveryService:
             if row.source_type == "task" and isinstance(row.source_id, str) and row.source_id:
                 async with self._session_factory() as session:
                     task_row = await get_task(session, row.source_id)
-                result_data = task_row.result_data if task_row is not None and isinstance(task_row.result_data, dict) else {}
+                result_data = (
+                    task_row.result_data
+                    if task_row is not None and isinstance(task_row.result_data, dict)
+                    else {}
+                )
                 raw_final_content = result_data.get("final_channel_content") or result_data.get(
                     "final_content"
                 )

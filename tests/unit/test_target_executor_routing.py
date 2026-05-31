@@ -26,6 +26,19 @@ def _target(executor_id: str, *, usable: bool = True) -> ResolvedExecutorTarget:
     )
 
 
+def _read_target(executor_id: str, *, usable: bool = True) -> ResolvedExecutorTarget:
+    target = _target(executor_id, usable=usable)
+    return ResolvedExecutorTarget(
+        executor_id=target.executor_id,
+        executor_type=target.executor_type,
+        is_primary=target.is_primary,
+        selection_source=target.selection_source,
+        description=target.description,
+        state=target.state,
+        observed_tools=[{"name": "read"}],
+    )
+
+
 @pytest.fixture
 def loop_with_pool():
     """Build a thin AgentLoop-shaped object exercising _execute_regular_tool."""
@@ -57,6 +70,36 @@ def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
                 },
                 source=ToolSource(type="executor"),
                 category="shell",
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="read",
+                description="Read a file",
+                parameters={
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                },
+                source=ToolSource(type="executor"),
+                category="filesystem",
+                read_only=True,
+            )
+        )
+    )
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="web_fetch",
+                description="Fetch a URL",
+                parameters={
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                },
+                source=ToolSource(type="executor"),
+                category="web",
+                read_only=True,
             )
         )
     )
@@ -296,3 +339,252 @@ async def test_no_target_after_switch_uses_rebound_connection(loop_with_pool) ->
     call = loop_with_pool.tool_router.execute.await_args
     assert call.args[4] is other_conn
     assert call.args[0].arguments == {"command": "pwd"}
+
+
+@pytest.mark.asyncio
+async def test_active_executor_connection_is_refreshed_before_same_turn_tool(
+    loop_with_pool,
+) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    stale_conn = ctx.executor_connection
+    fresh_conn = MagicMock(name="fresh_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(return_value=fresh_conn)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        return_value=ToolResult(output="ok", is_error=False)
+    )
+
+    tc = _toolcall("bash", {"command": "pwd"})
+    await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    call = loop_with_pool.tool_router.execute.await_args
+    assert call.args[4] is fresh_conn
+    assert ctx.executor_connection is fresh_conn
+    assert ctx.executor_connection is not stale_conn
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_retries_after_same_executor_reconnect(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_read_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    stale_conn = ctx.executor_connection
+    fresh_conn = MagicMock(name="fresh_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(side_effect=[None])
+    ws_provider.wait_for_connection = AsyncMock(return_value=fresh_conn)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        side_effect=[
+            ToolResult(
+                output="disconnected",
+                is_error=True,
+                metadata={
+                    "code": "executor_disconnected",
+                    "executor_id": "exec-active",
+                    "retryable": True,
+                    "same_executor_only": True,
+                },
+            ),
+            ToolResult(output="ok", is_error=False),
+        ]
+    )
+
+    tc = _toolcall("read", {"file_path": "/tmp/example"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    assert result.is_error is False
+    assert result.output == "ok"
+    assert result.metadata["auto_retried"] is True
+    assert result.metadata["same_executor_reconnected"] is True
+    assert ctx.executor_connection is fresh_conn
+    assert ctx.executor_connection is not stale_conn
+    assert loop_with_pool.tool_router.execute.await_count == 2
+    assert ws_provider.wait_for_connection.await_args.kwargs["timeout"] >= 60.0
+
+
+@pytest.mark.asyncio
+async def test_mutating_tool_is_not_automatically_retried_after_reconnect(
+    loop_with_pool,
+) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    fresh_conn = MagicMock(name="fresh_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(return_value=fresh_conn)
+    ws_provider.wait_for_connection = AsyncMock(return_value=fresh_conn)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        return_value=ToolResult(
+            output="disconnected",
+            is_error=True,
+            metadata={
+                "code": "executor_disconnected",
+                "executor_id": "exec-active",
+                "retryable": True,
+                "same_executor_only": True,
+            },
+        )
+    )
+
+    tc = _toolcall("bash", {"command": "mv a b"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    assert result.is_error is True
+    assert result.metadata["auto_retried"] is False
+    assert result.metadata["auto_retry_skipped_reason"] == "tool_not_idempotent"
+    assert result.metadata["same_executor_reconnected"] is True
+    assert "same executor reconnected" in result.output.lower()
+    assert "may have side effects" in result.output
+    loop_with_pool.tool_router.execute.assert_awaited_once()
+    ws_provider.wait_for_connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_retries_after_same_executor_reconnect(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_read_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    fresh_conn = MagicMock(name="fresh_connection")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(side_effect=[None])
+    ws_provider.wait_for_connection = AsyncMock(return_value=fresh_conn)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        side_effect=[
+            ToolResult(
+                output="disconnected",
+                is_error=True,
+                metadata={
+                    "code": "executor_disconnected",
+                    "executor_id": "exec-active",
+                    "retryable": True,
+                    "same_executor_only": True,
+                },
+            ),
+            ToolResult(output="ok", is_error=False),
+        ]
+    )
+
+    tc = _toolcall("web_fetch", {"url": "https://example.com"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    assert result.is_error is False
+    assert result.output == "ok"
+    assert result.metadata["auto_retried"] is True
+    assert loop_with_pool.tool_router.execute.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_wait_timeout_has_clear_metadata(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_read_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(side_effect=[None])
+    ws_provider.wait_for_connection = AsyncMock(return_value=None)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        return_value=ToolResult(
+            output="disconnected",
+            is_error=True,
+            metadata={
+                "code": "executor_disconnected",
+                "executor_id": "exec-active",
+                "retryable": True,
+                "same_executor_only": True,
+            },
+        )
+    )
+
+    tc = _toolcall("read", {"file_path": "/tmp/example"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    assert result.is_error is True
+    assert result.metadata["auto_retried"] is False
+    assert result.metadata["auto_retry_skipped_reason"] == "same_executor_reconnect_timeout"
+    assert result.metadata["same_executor_reconnected"] is False
+    assert "did not reconnect" in result.output
+    loop_with_pool.tool_router.execute.assert_awaited_once()
+    ws_provider.wait_for_connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_target_executor_retry_waits_same_target_not_primary(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_read_target("primary"), _read_target("secondary")])
+    ctx = _ctx(pool, active_executor_id="primary")
+    primary_conn = ctx.executor_connection
+    secondary_conn = MagicMock(name="secondary_connection")
+    secondary_reconnected = MagicMock(name="secondary_reconnected")
+
+    ws_provider = MagicMock()
+    ws_provider.get_connection = MagicMock(return_value=secondary_conn)
+    ws_provider.wait_for_connection = AsyncMock(return_value=secondary_reconnected)
+    loop_with_pool.providers.executor.websocket = ws_provider
+
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        side_effect=[
+            ToolResult(
+                output="disconnected",
+                is_error=True,
+                metadata={
+                    "code": "executor_disconnected",
+                    "executor_id": "secondary",
+                    "retryable": True,
+                    "same_executor_only": True,
+                },
+            ),
+            ToolResult(output="ok", is_error=False),
+        ]
+    )
+
+    tc = _toolcall("read", {"file_path": "/tmp/example", "target_executor": "secondary"})
+    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+
+    assert result.is_error is False
+    assert result.metadata["auto_retried"] is True
+    ws_provider.wait_for_connection.assert_awaited_once()
+    assert ws_provider.wait_for_connection.await_args.args == ("secondary",)
+    assert ctx.active_executor_id == "primary"
+    assert ctx.executor_connection is primary_conn
+    second_call = loop_with_pool.tool_router.execute.await_args_list[1]
+    assert second_call.args[4] is secondary_reconnected

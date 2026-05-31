@@ -303,7 +303,7 @@ def test_events_to_messages_handles_dict_events() -> None:
     ]
     messages = events_to_messages(events)
     assert len(messages) == 2
-    assert messages[0] == {"role": "user", "content": "hello"}
+    assert messages[0] == {"role": "user", "content": "hello", "_turn_boundary": True}
     assert messages[1] == {"role": "assistant", "content": "hi"}
 
 
@@ -456,6 +456,7 @@ def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
         {
             "role": "user",
             "content": "Tady je soubor.\n\nAttachments: report.pdf (pdf, artifact_id=file_1)",
+            "_turn_boundary": True,
         }
     ]
 
@@ -630,7 +631,7 @@ def test_events_to_messages_repairs_orphaned_tool_calls_before_next_message() ->
     assert messages[0]["role"] == "assistant"
     assert messages[1]["role"] == "tool"
     assert messages[1]["tool_call_id"] == "c1"
-    assert messages[2] == {"role": "user", "content": "continue"}
+    assert messages[2] == {"role": "user", "content": "continue", "_turn_boundary": True}
 
 
 def test_events_to_messages_ignores_late_tool_result_after_placeholder_repair() -> None:

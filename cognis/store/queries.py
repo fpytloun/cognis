@@ -15,6 +15,7 @@ from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from cognis.core.agent_direct import agent_direct_context_ref
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import (
     Agent,
@@ -37,8 +38,11 @@ from cognis.store.models import (
     KnowledgebaseRow,
     LLMProvider,
     LLMProviderAuthSession,
+    MCPOAuthTokenRow,
+    MCPOAuthTransactionRow,
     MCPServerRow,
     ModelRouting,
+    NotificationRow,
     ProjectGrantRow,
     ProjectRow,
     ProjectSourceRow,
@@ -73,6 +77,36 @@ _UNSET = object()
 
 def _shared_owner_clause(column: Any) -> Any:
     return sa.or_(column == SYSTEM_USER_EMAIL, column.is_(None))
+
+
+def _exclude_agent_direct_clause() -> sa.ColumnElement[bool]:
+    return sa.or_(
+        Conversation.context_type != "web",
+        sa.and_(
+            sa.or_(
+                Conversation.context_ref.is_(None),
+                Conversation.context_ref.not_like("web:agent_direct:%"),
+            ),
+            sa.or_(
+                Conversation.context_data.is_(None),
+                Conversation.context_data["kind"].as_string().is_(None),
+                Conversation.context_data["kind"].as_string() != "agent_direct",
+            ),
+        ),
+    )
+
+
+def _agent_direct_clause(user_email: str, agent_id: str) -> sa.ColumnElement[bool]:
+    return sa.or_(
+        sa.and_(
+            Conversation.context_type == "web",
+            Conversation.context_ref == agent_direct_context_ref(user_email, agent_id),
+        ),
+        sa.and_(
+            Conversation.context_type == "web",
+            Conversation.context_data["kind"].as_string() == "agent_direct",
+        ),
+    )
 
 
 def tool_classification_scope(owner_email: str | None) -> str:
@@ -1365,6 +1399,7 @@ async def list_conversations(
     agent_id: str | None = None,
     status: str = "active",
     project_id: str | None = None,
+    include_agent_direct: bool = True,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
 
@@ -1401,8 +1436,51 @@ async def list_conversations(
         query = query.where(Conversation.agent_id == agent_id)
     if project_id is not None:
         query = query.where(Conversation.project_id == project_id)
+    if not include_agent_direct:
+        query = query.where(_exclude_agent_direct_clause())
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_sessions_by_ids(
+    session: AsyncSession,
+    session_ids: list[str],
+) -> dict[str, Session]:
+    """Return session rows keyed by session ID."""
+
+    ids = sorted({session_id for session_id in session_ids if session_id})
+    if not ids:
+        return {}
+    result = await session.execute(select(Session).where(Session.session_id.in_(ids)))
+    return {row.session_id: row for row in result.scalars().all()}
+
+
+async def list_pending_notification_types_by_conversation(
+    session: AsyncSession,
+    user_email: str,
+    conversation_ids: list[str],
+) -> dict[str, list[str]]:
+    """Return pending notification types keyed by conversation ID."""
+
+    ids = sorted({conversation_id for conversation_id in conversation_ids if conversation_id})
+    if not ids:
+        return {}
+    result = await session.execute(
+        select(NotificationRow.conversation_id, NotificationRow.notification_type)
+        .where(NotificationRow.user_email == user_email)
+        .where(NotificationRow.conversation_id.in_(ids))
+        .where(NotificationRow.status == "pending")
+        .order_by(NotificationRow.created_at.asc(), NotificationRow.notification_id.asc())
+    )
+    pending: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
+    for conversation_id, notification_type in result.all():
+        type_seen = seen.setdefault(conversation_id, set())
+        if notification_type in type_seen:
+            continue
+        type_seen.add(notification_type)
+        pending.setdefault(conversation_id, []).append(notification_type)
+    return pending
 
 
 async def get_latest_active_conversation_for_agent(
@@ -1411,6 +1489,7 @@ async def get_latest_active_conversation_for_agent(
     agent_id: str,
     *,
     context_type: str | None = None,
+    include_agent_direct: bool = False,
 ) -> Conversation | None:
     """Return the most recent active conversation for one user/agent pair.
 
@@ -1430,12 +1509,46 @@ async def get_latest_active_conversation_for_agent(
     )
     if context_type is not None:
         query = query.where(Conversation.context_type == context_type)
+    if not include_agent_direct:
+        query = query.where(_exclude_agent_direct_clause())
     query = query.order_by(
         ordering_activity.desc(),
         Conversation.created_at.desc(),
         Conversation.conversation_id.asc(),
     ).limit(1)
     result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def get_agent_direct_conversation(
+    session: AsyncSession,
+    user_email: str,
+    agent_id: str,
+) -> Conversation | None:
+    """Return the active sticky web direct chat for one user/agent pair."""
+
+    has_sessions = (
+        select(sa.literal(1))
+        .where(Session.conversation_id == Conversation.conversation_id)
+        .limit(1)
+        .exists()
+    )
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.user_email == user_email)
+        .where(Conversation.agent_id == agent_id)
+        .where(Conversation.status == "active")
+        .where(_agent_direct_clause(user_email, agent_id))
+        .order_by(
+            case((has_sessions, 1), else_=0).desc(),
+            sa.func.coalesce(
+                Conversation.last_message_at, Conversation.updated_at, Conversation.created_at
+            ).desc(),
+            Conversation.created_at.desc(),
+            Conversation.conversation_id.asc(),
+        )
+        .limit(1)
+    )
     return result.scalar_one_or_none()
 
 
@@ -1474,6 +1587,33 @@ async def update_conversation_context_data(
     if row is None:
         return False
     row.context_data = dict(context_data)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def mark_conversation_agent_direct(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    user_email: str,
+    agent_id: str,
+) -> bool:
+    """Mark an existing web conversation as the sticky direct chat."""
+
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    existing = await get_agent_direct_conversation(session, user_email, agent_id)
+    if existing is not None and existing.conversation_id != conversation_id:
+        existing.status = "archived"
+        existing.updated_at = datetime.now(UTC)
+    context_data = dict(row.context_data or {})
+    context_data["kind"] = "agent_direct"
+    row.context_type = "web"
+    row.context_ref = agent_direct_context_ref(user_email, agent_id)
+    row.context_data = context_data
+    row.title_source = "agent_direct"
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
@@ -1674,6 +1814,21 @@ async def touch_conversation(
     return True
 
 
+async def mark_conversation_unread(
+    session: AsyncSession, conversation_id: str, when: datetime | None = None
+) -> bool:
+    """Mark a conversation as unread by advancing its activity timestamp."""
+
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        return False
+    timestamp = when or datetime.now(UTC)
+    conversation.last_message_at = timestamp
+    conversation.updated_at = timestamp
+    await session.flush()
+    return True
+
+
 async def set_conversation_status(session: AsyncSession, conversation_id: str, status: str) -> bool:
     """Set conversation lifecycle status."""
 
@@ -1686,14 +1841,35 @@ async def set_conversation_status(session: AsyncSession, conversation_id: str, s
     return True
 
 
-async def list_conversation_sessions(session: AsyncSession, conversation_id: str) -> list[Session]:
-    """List all sessions for a conversation."""
+async def list_conversation_sessions(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    parent_session_id: str | None = None,
+    parent_only: bool | None = None,
+    root_only: bool = False,
+    statuses: list[str] | None = None,
+    order: str = "asc",
+    limit: int | None = None,
+) -> list[Session]:
+    """List sessions for a conversation with optional bounded filters."""
 
-    result = await session.execute(
-        select(Session)
-        .where(Session.conversation_id == conversation_id)
-        .order_by(Session.started_at, Session.session_id)
-    )
+    stmt = select(Session).where(Session.conversation_id == conversation_id)
+    if parent_session_id is not None:
+        stmt = stmt.where(Session.parent_session_id == parent_session_id)
+    elif parent_only is True:
+        stmt = stmt.where(Session.parent_session_id.is_not(None))
+    elif root_only:
+        stmt = stmt.where(Session.parent_session_id.is_(None))
+    if statuses:
+        stmt = stmt.where(Session.status.in_(statuses))
+    if order == "desc":
+        stmt = stmt.order_by(Session.started_at.desc(), Session.session_id.desc())
+    else:
+        stmt = stmt.order_by(Session.started_at, Session.session_id)
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -1757,6 +1933,51 @@ async def get_root_session_chain(
         if row.parent_session_id is not None:
             break
         chain.append(row)
+        current_id = row.previous_session_id
+
+    if current_id and current_id not in visited:
+        truncated = True
+
+    chain.reverse()
+    return chain, truncated
+
+
+async def get_root_session_chain_page(
+    session: AsyncSession,
+    conversation_id: str,
+    active_session_id: str,
+    *,
+    before_session_id: str | None = None,
+    max_depth: int = 1000,
+) -> tuple[list[Session], bool]:
+    """Return root-session lineage up to an optional upper-bound session.
+
+    The returned chain is oldest-first and excludes ``before_session_id``.
+    This supports latest-first history pages without loading session events
+    from the whole lineage.
+    """
+
+    chain: list[Session] = []
+    visited: set[str] = set()
+    current_id: str | None = active_session_id
+    truncated = False
+    include_current = before_session_id is None
+
+    while current_id and len(chain) < max_depth:
+        if current_id in visited:
+            break
+        visited.add(current_id)
+        row = await get_session_row(session, current_id)
+        if row is None:
+            break
+        if row.conversation_id != conversation_id:
+            break
+        if row.parent_session_id is not None:
+            break
+        if before_session_id is not None and row.session_id == before_session_id:
+            include_current = True
+        if include_current:
+            chain.append(row)
         current_id = row.previous_session_id
 
     if current_id and current_id not in visited:
@@ -1900,6 +2121,17 @@ async def set_session_status(
     return True
 
 
+async def update_session_status(
+    session: AsyncSession,
+    session_id: str,
+    status: str,
+    **kwargs: object,
+) -> bool:
+    """Backward-compatible alias for updating session lifecycle state."""
+
+    return await set_session_status(session, session_id, status, **kwargs)
+
+
 async def set_session_idle(
     session: AsyncSession, session_id: str, idle_since: datetime | None = None
 ) -> bool:
@@ -2035,6 +2267,7 @@ async def create_task(
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
     interaction_mode_override: str | None = None,
+    session_policy: dict[str, Any] | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
     workspace_root: str | None = None,
@@ -2067,6 +2300,7 @@ async def create_task(
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
         interaction_mode_override=interaction_mode_override,
+        session_policy=session_policy,
         workflow_id=workflow_id,
         project_id=project_id,
         workspace_root=workspace_root,
@@ -2310,6 +2544,7 @@ async def update_task_fields(
     priority: int | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
+    session_policy: dict[str, Any] | None = None,
     clear_workflow_id: bool = False,
     clear_project_id: bool = False,
 ) -> bool:
@@ -2335,6 +2570,8 @@ async def update_task_fields(
         values["project_id"] = project_id
     elif clear_project_id:
         values["project_id"] = None
+    if session_policy is not None:
+        values["session_policy"] = session_policy
     if not values:
         return False
     stmt = (
@@ -4376,6 +4613,7 @@ async def create_mcp_server(
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     headers: dict[str, str] | None = None,
+    auth_config: dict[str, Any] | None = None,
     timeout_seconds: int = 30,
     description: str | None = None,
     owner_email: str,
@@ -4392,10 +4630,177 @@ async def create_mcp_server(
         args=args or [],
         env=env or {},
         headers=headers or {},
+        auth_config=auth_config,
         timeout_seconds=timeout_seconds,
         description=description,
         owner_email=SYSTEM_USER_EMAIL if shared else owner_email,
         status=status,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+def mcp_oauth_resource_key(resource: str | None) -> str:
+    """Normalize nullable OAuth resource into a deterministic uniqueness key."""
+
+    return (resource or "").strip()
+
+
+async def get_mcp_oauth_token(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    mcp_server_id: str,
+    issuer: str,
+    resource: str | None,
+) -> MCPOAuthTokenRow | None:
+    result = await session.execute(
+        select(MCPOAuthTokenRow).where(
+            MCPOAuthTokenRow.user_email == user_email,
+            MCPOAuthTokenRow.mcp_server_id == mcp_server_id,
+            MCPOAuthTokenRow.issuer == issuer,
+            MCPOAuthTokenRow.resource_key == mcp_oauth_resource_key(resource),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_mcp_oauth_token_for_server(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    mcp_server_id: str,
+) -> MCPOAuthTokenRow | None:
+    result = await session.execute(
+        select(MCPOAuthTokenRow)
+        .where(
+            MCPOAuthTokenRow.user_email == user_email,
+            MCPOAuthTokenRow.mcp_server_id == mcp_server_id,
+        )
+        .order_by(
+            case((MCPOAuthTokenRow.status == "active", 0), else_=1),
+            MCPOAuthTokenRow.updated_at.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_mcp_oauth_token(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    mcp_server_id: str,
+    issuer: str,
+    resource: str | None,
+    client_id: str | None,
+    scopes: list[str],
+    token_type: str,
+    expires_at: datetime | None,
+    encrypted_payload: bytes,
+    status: str = "active",
+) -> MCPOAuthTokenRow:
+    row = await get_mcp_oauth_token(
+        session,
+        user_email=user_email,
+        mcp_server_id=mcp_server_id,
+        issuer=issuer,
+        resource=resource,
+    )
+    if row is None:
+        row = MCPOAuthTokenRow(
+            token_id=f"mcptok_{uuid.uuid4().hex[:12]}",
+            user_email=user_email,
+            mcp_server_id=mcp_server_id,
+            issuer=issuer,
+            resource=resource,
+            resource_key=mcp_oauth_resource_key(resource),
+            client_id=client_id,
+            scopes=scopes,
+            token_type=token_type or "Bearer",
+            expires_at=expires_at,
+            status=status,
+            encrypted_payload=encrypted_payload,
+        )
+        session.add(row)
+    else:
+        row.client_id = client_id
+        row.scopes = scopes
+        row.token_type = token_type or "Bearer"
+        row.expires_at = expires_at
+        row.status = status
+        row.encrypted_payload = encrypted_payload
+        row.version = int(row.version or 0) + 1
+        row.updated_at = _utcnow()
+    await session.flush()
+    return row
+
+
+async def mark_mcp_oauth_token_status(
+    session: AsyncSession,
+    *,
+    token_id: str,
+    status: str,
+) -> None:
+    row = await session.get(MCPOAuthTokenRow, token_id)
+    if row is not None:
+        row.status = status
+        row.updated_at = _utcnow()
+        await session.flush()
+
+
+async def get_mcp_oauth_transaction(
+    session: AsyncSession,
+    transaction_id: str,
+) -> MCPOAuthTransactionRow | None:
+    return await session.get(MCPOAuthTransactionRow, transaction_id)
+
+
+async def create_mcp_oauth_transaction(
+    session: AsyncSession,
+    *,
+    transaction_id: str,
+    user_email: str,
+    mcp_server_id: str,
+    issuer: str,
+    authorization_server: str,
+    resource: str | None,
+    scopes: list[str],
+    redirect_uri: str,
+    client_id: str,
+    code_challenge: str,
+    state_hash: str,
+    encrypted_payload: bytes,
+    expires_at: datetime,
+    task_id: str | None = None,
+    step_name: str | None = None,
+    step_run_id: str | None = None,
+    session_id: str | None = None,
+    conversation_id: str | None = None,
+    notification_id: str | None = None,
+) -> MCPOAuthTransactionRow:
+    row = MCPOAuthTransactionRow(
+        transaction_id=transaction_id,
+        user_email=user_email,
+        mcp_server_id=mcp_server_id,
+        issuer=issuer,
+        authorization_server=authorization_server,
+        resource=resource,
+        resource_key=mcp_oauth_resource_key(resource),
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        client_id=client_id,
+        code_challenge=code_challenge,
+        state_hash=state_hash,
+        encrypted_payload=encrypted_payload,
+        expires_at=expires_at,
+        task_id=task_id,
+        step_name=step_name,
+        step_run_id=step_run_id,
+        session_id=session_id,
+        conversation_id=conversation_id,
+        notification_id=notification_id,
     )
     session.add(row)
     await session.flush()
@@ -4970,6 +5375,39 @@ async def search_artifact_records(
         ).limit(limit)
     )
     return list(result.scalars().all())
+
+
+async def find_tool_artifact_record(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    source_tool_call_id: str,
+    source_anchor: str,
+    source_hash: str,
+) -> ArtifactRecordRow | None:
+    # Tool artifact refs are lazy aliases to saved tool output anchors. We avoid
+    # one DB row per discovered candidate; only first access creates a regular
+    # artifact. Existing artifact columns carry the stable source identity:
+    # purpose=tool_artifact, conversation_id=source call_id,
+    # session_id=source anchor, content_hash=source fingerprint.
+    stmt = (
+        select(ArtifactRecordRow)
+        .where(
+            ArtifactRecordRow.owner_email == owner_email,
+            ArtifactRecordRow.status != "deleted",
+            ArtifactRecordRow.purpose == "tool_artifact",
+            ArtifactRecordRow.content_hash == source_hash,
+            ArtifactRecordRow.conversation_id == source_tool_call_id,
+            ArtifactRecordRow.session_id == source_anchor,
+            sa.or_(
+                ArtifactRecordRow.expires_at.is_(None), ArtifactRecordRow.expires_at > _utcnow()
+            ),
+        )
+        .order_by(ArtifactRecordRow.created_at.desc(), ArtifactRecordRow.artifact_id.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 async def mark_artifacts_attached(

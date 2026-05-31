@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
+    WebSocketConnectionManager,
     WebSocketTurnObserver,
     _event_to_payload,
     _handle_cancel_queued_message,
@@ -114,6 +115,14 @@ class _FakeProviders:
     guardrails: Any = field(default_factory=lambda: _FakeProvider())
     llm: Any = field(default_factory=lambda: _FakeProvider())
     memory: Any = field(default_factory=lambda: _FakeProvider())
+
+
+class _NullSession:
+    async def __aenter__(self) -> _NullSession:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +282,161 @@ async def test_classify_error_detail_is_sanitized() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Connection fanout tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connection_manager_sends_user_payload_to_all_user_connections() -> None:
+    app = SimpleNamespace(state=SimpleNamespace(event_bus=None, turn_scheduler=None))
+    manager = WebSocketConnectionManager(app)
+
+    user_ws_1 = AsyncMock()
+    user_ws_2 = AsyncMock()
+    other_ws = AsyncMock()
+    await manager.connect(user_ws_1, claims={"sub": "user@example.com", "role": "user"})
+    await manager.connect(user_ws_2, claims={"sub": "user@example.com", "role": "user"})
+    await manager.connect(other_ws, claims={"sub": "other@example.com", "role": "user"})
+
+    payload = {"type": "conversation_updated", "conversation_id": "conv-1"}
+    await manager.send_to_user("user@example.com", payload)
+
+    user_ws_1.send_json.assert_awaited_once_with(payload)
+    user_ws_2.send_json.assert_awaited_once_with(payload)
+    other_ws.send_json.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notification_events_emit_user_wide_attention_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending_calls: list[tuple[str, list[str]]] = []
+
+    async def _fake_pending_types(
+        _session: Any, user_email: str, conversation_ids: list[str]
+    ) -> dict[str, list[str]]:
+        assert user_email == "user@example.com"
+        assert conversation_ids == ["conv-1"]
+        pending_calls.append((user_email, conversation_ids))
+        return {"conv-1": ["gate"]} if len(pending_calls) == 1 else {"conv-1": []}
+
+    monkeypatch.setattr(
+        "cognis.api.websocket.list_pending_notification_types_by_conversation",
+        _fake_pending_types,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            turn_scheduler=SimpleNamespace(
+                add_observer=lambda _conversation_id, _observer: None,
+                running_turn_state=lambda _conversation_id: None,
+            ),
+            session_factory=lambda: _NullSession(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws_1 = AsyncMock()
+    user_ws_2 = AsyncMock()
+    other_ws = AsyncMock()
+    admin_ws = AsyncMock()
+    await manager.connect(user_ws_1, claims={"sub": "user@example.com", "role": "user"})
+    await manager.connect(user_ws_2, claims={"sub": "user@example.com", "role": "user"})
+    await manager.connect(other_ws, claims={"sub": "other@example.com", "role": "user"})
+    await manager.connect(admin_ws, claims={"sub": "admin@example.com", "role": "admin"})
+
+    await manager._handle_event(
+        Event(
+            type=EventType.NOTIFICATION_CREATED,
+            data={
+                "notification_id": "notif-1",
+                "notification_type": "gate",
+                "user_email": "user@example.com",
+                "conversation_id": "conv-1",
+                "payload": {"message": "Approve?"},
+            },
+        )
+    )
+
+    pending_payload = {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "pending_notification_types": ["gate"],
+        "has_active_turn": False,
+        "active_turn_chat_mode": None,
+        "active_turn_chat_mode_source": None,
+    }
+    user_ws_1.send_json.assert_awaited_once_with(pending_payload)
+    user_ws_2.send_json.assert_awaited_once_with(pending_payload)
+    other_ws.send_json.assert_not_called()
+    admin_ws.send_json.assert_not_called()
+
+    await manager._handle_event(
+        Event(
+            type=EventType.NOTIFICATION_RESOLVED,
+            data={
+                "notification_id": "notif-1",
+                "notification_type": "gate",
+                "user_email": "user@example.com",
+                "conversation_id": "conv-1",
+                "decision": "approve",
+            },
+        )
+    )
+
+    resolved_payload = {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "pending_notification_types": [],
+        "has_active_turn": False,
+        "active_turn_chat_mode": None,
+        "active_turn_chat_mode_source": None,
+    }
+    assert user_ws_1.send_json.await_args_list[-1].args == (resolved_payload,)
+    assert user_ws_2.send_json.await_args_list[-1].args == (resolved_payload,)
+    other_ws.send_json.assert_not_called()
+    admin_ws.send_json.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notification_attention_refresh_requires_user_email(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending_types = AsyncMock(return_value={"conv-1": ["gate"]})
+    monkeypatch.setattr(
+        "cognis.api.websocket.list_pending_notification_types_by_conversation",
+        pending_types,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            turn_scheduler=SimpleNamespace(
+                add_observer=lambda _conversation_id, _observer: None,
+                running_turn_state=lambda _conversation_id: None,
+            ),
+            session_factory=lambda: _NullSession(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws = AsyncMock()
+    await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+
+    await manager._handle_event(
+        Event(
+            type=EventType.NOTIFICATION_CREATED,
+            data={
+                "notification_id": "notif-1",
+                "notification_type": "gate",
+                "conversation_id": "conv-1",
+                "payload": {"message": "Approve?"},
+            },
+        )
+    )
+
+    pending_types.assert_not_awaited()
+    user_ws.send_json.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Rate limiting tests
 # ---------------------------------------------------------------------------
 
@@ -386,6 +550,102 @@ async def test_chunk_gap_frame_emitted_after_drops() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_completion_event_emits_activity_correction() -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            turn_scheduler=SimpleNamespace(
+                add_observer=lambda _conversation_id, _observer: None,
+                running_turn_state=lambda _conversation_id: None,
+            ),
+            session_factory=lambda: _NullSession(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws = AsyncMock()
+    connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    manager.subscribe(connection, "conv-1")
+
+    completed_at = "2026-01-02T03:04:00+00:00"
+    await manager._handle_event(
+        Event(
+            type=EventType.TURN_COMPLETED,
+            data={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "message_id": "msg-1",
+                "completed_at": completed_at,
+            },
+        )
+    )
+
+    payloads = [call.args[0] for call in user_ws.send_json.await_args_list]
+    assert payloads[0]["type"] == "turn_settled"
+    assert payloads[1] == {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "has_active_turn": False,
+        "active_turn_chat_mode": None,
+        "active_turn_chat_mode_source": None,
+        "last_message_at": completed_at,
+        "updated_at": completed_at,
+    }
+
+
+@pytest.mark.asyncio
+async def test_notification_attention_refresh_preserves_running_turn_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _fake_pending_types(
+        _session: Any, _user_email: str, _conversation_ids: list[str]
+    ) -> dict[str, list[str]]:
+        return {"conv-1": ["step_question"]}
+
+    monkeypatch.setattr(
+        "cognis.api.websocket.list_pending_notification_types_by_conversation",
+        _fake_pending_types,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            turn_scheduler=SimpleNamespace(
+                running_turn_state=lambda _conversation_id: {
+                    "chat_mode": "build",
+                    "chat_mode_source": "user_explicit",
+                }
+            ),
+            session_factory=lambda: _NullSession(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws = AsyncMock()
+    await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+
+    await manager._handle_event(
+        Event(
+            type=EventType.NOTIFICATION_CREATED,
+            data={
+                "notification_id": "notif-1",
+                "notification_type": "step_question",
+                "user_email": "user@example.com",
+                "conversation_id": "conv-1",
+            },
+        )
+    )
+
+    user_ws.send_json.assert_awaited_once_with(
+        {
+            "type": "conversation_updated",
+            "conversation_id": "conv-1",
+            "pending_notification_types": ["step_question"],
+            "has_active_turn": True,
+            "active_turn_chat_mode": "build",
+            "active_turn_chat_mode_source": "user_explicit",
+        }
+    )
+
+
+@pytest.mark.asyncio
 async def test_turn_observer_strips_attachment_payload_bytes() -> None:
     manager = AsyncMock()
     manager.has_tts_enabled_subscribers = lambda _conversation_id: False
@@ -452,6 +712,8 @@ async def test_turn_observer_emits_conversation_activity_after_completion() -> N
         "type": "conversation_updated",
         "conversation_id": "conv-1",
         "has_active_turn": False,
+        "active_turn_chat_mode": None,
+        "active_turn_chat_mode_source": None,
         "last_message_at": completed_at.isoformat(),
         "updated_at": completed_at.isoformat(),
     }

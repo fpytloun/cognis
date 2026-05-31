@@ -27,6 +27,7 @@ def _validate_skill_relative_path(value: str, *, field_name: str) -> str:
         raise ValueError(f"{field_name} must stay within the staged skill workspace")
     return normalized[2:] if normalized.startswith("./") else normalized
 
+
 # ---------------------------------------------------------------------------
 # Executable skill tool recipe
 # ---------------------------------------------------------------------------
@@ -178,8 +179,9 @@ class ResolvedSkill(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
     decomposition_source_hash: str | None = None
     asset_manifest: list[SkillAssetRef] = Field(default_factory=list)
-    auto_load: bool = False  # Internal flag: attached to all agents
+    auto_load: bool = False  # Internal legacy flag: attached to all agents
     attached: bool = False
+    auto_load_instructions: bool = False
 
 
 class ResolvedSkillSet(BaseModel):
@@ -266,3 +268,4 @@ class AgentSkillRef(BaseModel):
 
     skill_id: str
     enabled: bool = True
+    auto_load_instructions: bool = False

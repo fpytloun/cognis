@@ -140,6 +140,41 @@ message body is available through an explicit details or edit affordance, and
 expanded content stays height-bounded so long queued text cannot dominate the
 viewport.
 
+### Side Questions (`/btw`)
+
+`/btw <question>` asks a quick side question without interrupting the active
+turn or entering the normal queued-message pipeline.
+
+Primary use cases:
+
+- ask why the agent is doing something while the main turn is still running;
+- ask a follow-up in the same side thread after the main turn completes;
+- ask a contextual or unrelated question without changing the main work thread.
+
+The UI renders `/btw` as a side-thread panel associated with the active or
+selected main turn:
+
+```
+[btw] Why are you running the full test suite?        [Dismiss]
+      The current change touches request assembly and provider streaming,
+      so the agent is validating both the narrow test and the integration
+      boundary before finalizing.
+```
+
+Behavior:
+
+- `/btw` is allowed while a turn is active; normal user messages still queue.
+- The side panel can send follow-up `/btw` messages in the same
+  `side_thread_id`.
+- Side-thread messages are persisted for reload/audit, but visually separated
+  from the main transcript and marked as side-lane messages.
+- Main chat does not automatically consume side-thread content. A future
+  explicit "Promote side discussion" action may add a summarized side thread to
+  the main context.
+- Initial `/btw` side turns are no-tools. If the model attempts a tool call, the
+  server rejects it and the UI shows a factual no-tools notice rather than
+  executing anything.
+
 ### Session Compaction Cards
 When a session is compacted (automatic or manual `/compact`), an inline
 card appears in the timeline:
@@ -165,9 +200,13 @@ The chat composer accepts slash commands:
 - `/new`, `/reset`, or `/clear` — Start fresh: new conversation (web) or new session (channel-bound)
 - `/undo` — Rebase the same conversation to hide the last normal user turn and all later assistant output; no new conversation is created
 - `/redo` — Restore the undone session if no normal message has diverged from the undo branch
+- `/btw <question>` — Ask a side question in a separate side-thread lane without interrupting or queueing behind the current turn
 - `/approve` or `/deny` — Resolve pending escalation prompts
 
-Slash commands are rejected with an error if a turn is currently in progress.
+Most slash commands are rejected with an error if a turn is currently in
+progress. `/btw` is an explicit exception: it runs as an ephemeral side-question
+LLM call with no tools and records side-lane messages that are excluded from
+ordinary main-turn context.
 
 ## Agent Creation Wizard
 

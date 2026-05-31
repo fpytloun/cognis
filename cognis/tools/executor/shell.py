@@ -54,14 +54,14 @@ _BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "Use edit, multiedit, apply_patch, or write instead of embedded Python scripts that rewrite files.",
     ),
-    (
-        re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
-        "Use edit, multiedit, apply_patch, or write instead of shell redirection to rewrite source files.",
-    ),
-    (
-        re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
-        "Use edit, multiedit, apply_patch, or write instead of tee to rewrite source files.",
-    ),
+)
+_SOURCE_REWRITE_ADVISORY = (
+    "Prefer dedicated edit tools for rewriting source files. "
+    "Use shell redirection only when it is necessary and intentional."
+)
+_SOURCE_REWRITE_ADVISORY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
+    re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
 )
 _SHELL_PARSE_ERROR_PATTERN = re.compile(
     r"syntax error near unexpected token|parse error near|unexpected EOF|unexpected end of file",
@@ -85,6 +85,7 @@ class _BackgroundShellSession:
     turn_id: str | None = None
     call_id: str | None = None
     agent_id: str | None = None
+    advisory: str | None = None
     completion_callback: BackgroundShellCompletionCallback | None = None
     created_at: float = field(default_factory=time)
     last_activity_at: float = field(default_factory=time)
@@ -144,6 +145,7 @@ class _BackgroundShellSession:
             "turn_id": self.turn_id,
             "call_id": self.call_id,
             "agent_id": self.agent_id,
+            "advisory": self.advisory,
             "created_at": self.created_at,
             "last_activity_at": self.last_activity_at,
             "runtime_seconds": max(0.0, current - self.created_at),
@@ -178,6 +180,7 @@ class _BackgroundShellManager:
         turn_id: str | None = None,
         call_id: str | None = None,
         agent_id: str | None = None,
+        advisory: str | None = None,
         completion_callback: BackgroundShellCompletionCallback | None = None,
     ) -> _BackgroundShellSession:
         session = _BackgroundShellSession(
@@ -193,6 +196,7 @@ class _BackgroundShellManager:
             turn_id=turn_id,
             call_id=call_id,
             agent_id=agent_id,
+            advisory=advisory,
             completion_callback=completion_callback,
         )
         session.readers = [
@@ -342,6 +346,13 @@ def _blocked_shell_edit_message(command: str) -> str | None:
     for pattern, message in _BLOCKED_EDIT_PATTERNS:
         if pattern.search(normalized):
             return message
+    return None
+
+
+def _shell_source_rewrite_advisory(command: str) -> str | None:
+    normalized = command.strip()
+    if any(pattern.search(normalized) for pattern in _SOURCE_REWRITE_ADVISORY_PATTERNS):
+        return _SOURCE_REWRITE_ADVISORY
     return None
 
 
@@ -508,6 +519,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     blocked_message = _blocked_shell_edit_message(command)
     if blocked_message is not None:
         return ToolResult(output=blocked_message, is_error=True)
+    advisory = _shell_source_rewrite_advisory(command)
 
     timeout_seconds, timeout_error = _parse_timeout(timeout_ms, run_in_background=run_in_background)
     if timeout_error is not None:
@@ -546,8 +558,9 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         runtime_access = context.runtime_metadata.get("runtime_access")
         runtime_access = runtime_access if isinstance(runtime_access, dict) else {}
         raw_callback = context.runtime_metadata.get(_BACKGROUND_COMPLETION_CALLBACK_KEY)
-        if raw_callback is None:
-            raw_callback = context.shared_runtime_metadata.get(_BACKGROUND_COMPLETION_CALLBACK_KEY)
+        shared_metadata = context.shared_runtime_metadata
+        if raw_callback is None and shared_metadata is not None:
+            raw_callback = shared_metadata.get(_BACKGROUND_COMPLETION_CALLBACK_KEY)
         callback = (
             cast(BackgroundShellCompletionCallback, raw_callback)
             if callable(raw_callback)
@@ -586,6 +599,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
                 if isinstance(runtime_access.get("agent_id"), str)
                 else None
             ),
+            advisory=advisory,
             completion_callback=callback,
         )
         await asyncio.sleep(min(timeout_seconds, _DEFAULT_BACKGROUND_TIMEOUT_MS // 1000))
@@ -593,9 +607,10 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         status = "completed" if done else "running"
         preview = initial_output.strip() or "(no initial output yet)"
         description_line = f"Description: {description}\n" if description else ""
+        advisory_line = f"Advisory: {advisory}\n" if advisory else ""
         return ToolResult(
             output=(
-                f"Started background shell {shell_id}.\n"
+                advisory_line + f"Started background shell {shell_id}.\n"
                 f"Status: {status}\n"
                 f"{description_line}"
                 f"Use bash_output with shell_id='{shell_id}' to read output and bash_kill to stop it.\n\n"
@@ -610,6 +625,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
                 "pid": process.pid,
                 "executor_id": context.executor_handle.executor_id,
                 "executor_type": context.executor_handle.executor_type,
+                "advisory": advisory,
                 "commands": [
                     _command_metadata(
                         command, resolved_cwd, ok=not done or exit_code == 0, exit_code=exit_code
@@ -677,6 +693,8 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     shell_hint = _shell_parse_error_hint(stderr_text)
 
     parts: list[str] = []
+    if advisory:
+        parts.append(f"Advisory: {advisory}")
     if terminal_text:
         parts.append(terminal_text)
     if shell_hint:
@@ -691,7 +709,8 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         metadata={
             "commands": [
                 _command_metadata(command, resolved_cwd, ok=exit_code == 0, exit_code=exit_code)
-            ]
+            ],
+            "advisory": advisory,
         },
     )
 

@@ -265,18 +265,46 @@
     });
   }
 
+  const LEGAL_LINK_TOKENS = [
+    "privacy policy", "privacy & cookies", "privacy and cookies", "cookie policy",
+    "third party cookie", "social media cookies", "terms", "legal", "support",
+    "documentation", "learn more", "more info", "read more",
+  ];
+
+  function isLegalOrNavigationCandidate(el, label) {
+    const href = normalizeText((el.getAttribute && el.getAttribute("href")) || "");
+    const combined = (label + " " + href).trim();
+    if (LEGAL_LINK_TOKENS.some((token) => combined.includes(token))) return true;
+    const chromeAncestor = el.closest && el.closest("footer, header, nav");
+    if (!chromeAncestor) return false;
+    return !(el.closest("[role='dialog'], [aria-modal='true'], dialog"));
+  }
+
+  function isActionControl(el, banner) {
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "button") return true;
+    if (tag === "input") return true;
+    if ((el.getAttribute && el.getAttribute("role")) === "button") return true;
+    if (tag !== "a") return false;
+    if (banner && banner.matches("[role='dialog'], [aria-modal='true'], dialog")) return true;
+    const className = String(el.className || "").toLowerCase();
+    return /\b(btn|button|consent|accept|reject|agree)\b/.test(className);
+  }
+
   // Heuristic fallback: scan visible <button>/<a> for multilingual consent text.
   // Only used after every named rule failed and a banner-shaped container
   // is likely present.
   function heuristicFallback() {
     const banners = [];
-    for (const el of document.querySelectorAll("div, section, aside, footer, dialog, [role='dialog'], [aria-modal='true']")) {
+    for (const el of document.querySelectorAll("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
       if (!isVisible(el)) continue;
       const style = window.getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       const isOverlay = style.position === "fixed" || style.position === "sticky" || style.position === "absolute";
+      const isDialog = el.matches("dialog, [role='dialog'], [aria-modal='true']");
       const isLargeDialog = rect.width >= Math.min(window.innerWidth * 0.45, 480) && rect.height >= 120;
-      if (!isOverlay && !isLargeDialog) continue;
+      if (!isDialog && !isOverlay) continue;
+      if (!isDialog && !isLargeDialog) continue;
       const text = normalizeText(el.innerText || el.textContent || "");
       if (text.length < 8 || text.length > 8000) continue;
       if (BANNER_TOKENS.some((token) => text.includes(token))) {
@@ -291,7 +319,9 @@
       const buttons = banner.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']");
       for (const btn of buttons) {
         if (!isVisible(btn)) continue;
+        if (!isActionControl(btn, banner)) continue;
         const label = elementText(btn);
+        if (isLegalOrNavigationCandidate(btn, label)) continue;
         if (!labelMatches(label, labels)) continue;
         try {
           btn.click();
@@ -301,25 +331,6 @@
         } catch {
           /* try next */
         }
-      }
-    }
-
-    if (action !== "accept") return false;
-
-    // Some CMPs render controls outside the textual banner. For accept-only,
-    // allow a final page-wide pass, but require an active banner first to avoid
-    // clicking unrelated CTA buttons.
-    for (const btn of document.querySelectorAll("button, a, [role='button'], input[type='button'], input[type='submit']")) {
-      if (!isVisible(btn)) continue;
-      const label = elementText(btn);
-      if (!labelMatches(label, ACCEPT_LABELS)) continue;
-      try {
-        btn.click();
-        markClicked();
-        try { console.debug("[cognis-autoconsent] heuristic global accept: " + label); } catch {}
-        return true;
-      } catch {
-        /* try next */
       }
     }
     return false;

@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.tools.executor.browser.manager import BrowserManager, BrowserSession
+from cognis.tools.executor.browser.manager import (
+    BrowserManager,
+    BrowserSession,
+    BrowserSessionSettings,
+)
 
 
 def test_browser_manager_derives_persistent_profile_from_origin() -> None:
@@ -89,6 +93,57 @@ def test_browser_manager_response_activity_bump_is_throttled() -> None:
     manager._bump_session_activity(session)  # noqa: SLF001
 
     assert session.last_used_at == first
+
+
+def test_browser_manager_session_settings_override_without_mutating_defaults() -> None:
+    manager = BrowserManager(
+        auto_consent="accept",
+        stealth_enabled=True,
+        fingerprint_hardening=True,
+        humanize_input=True,
+    )
+
+    settings = manager._resolve_session_settings(  # noqa: SLF001
+        {
+            "auto_consent": "off",
+            "stealth_enabled": False,
+            "fingerprint_hardening": False,
+            "humanize_input": False,
+        }
+    )
+
+    assert settings.as_dict() == {
+        "auto_consent": "off",
+        "stealth_enabled": False,
+        "fingerprint_hardening": False,
+        "humanize_input": False,
+    }
+    assert manager.auto_consent == "accept"
+    assert manager.stealth_enabled is True
+    assert manager.fingerprint_hardening is True
+    assert manager.humanize_input is True
+
+
+def test_browser_manager_rejects_conflicting_existing_session_settings() -> None:
+    manager = BrowserManager(auto_consent="accept")
+    session = BrowserSession(
+        session_id="s",
+        context=SimpleNamespace(),
+        page=SimpleNamespace(),
+        browser_settings=BrowserSessionSettings(
+            auto_consent="accept",
+            stealth_enabled=True,
+            fingerprint_hardening=True,
+            humanize_input=True,
+        ),
+    )
+    requested = {"auto_consent": "off"}
+    resolved = manager._resolve_session_settings(requested)  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="cannot be changed"):
+        manager._ensure_session_settings_compatible(  # noqa: SLF001
+            session, requested=requested, resolved=resolved
+        )
 
 
 def test_browser_manager_needs_xvfb_for_headed_linux_without_display(

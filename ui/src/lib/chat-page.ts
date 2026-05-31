@@ -4,6 +4,29 @@ export interface ConversationRetryScope {
 }
 
 export type ConversationStatusFilter = 'active' | 'starred' | 'archived';
+export type ConversationAttentionTone = 'default' | 'amber' | 'rose';
+export type ChatModeTone = 'default' | 'plan' | 'build';
+
+const ATTENTION_PENDING_NOTIFICATION_TYPES = new Set<string>([
+  'auth_challenge',
+  'credential_request',
+  'escalation',
+  'gate',
+  'step_question',
+]);
+
+const ROSE_PENDING_NOTIFICATION_TYPES = new Set<string>([
+  'credential_request',
+  'escalation',
+]);
+
+const ROSE_SESSION_STATUSES = new Set<string>(['failed', 'terminated']);
+const AMBER_SESSION_STATUSES = new Set<string>(['cancelled', 'suspended']);
+const NORMAL_COMPLETION_REASONS = new Set<string>([
+  'compacted',
+  'step_approved',
+  'user_reset',
+]);
 
 const ROOT_SESSION_TIMELINE_EVENT_TYPES = new Set<string>([
   'assistant_stream_snapshot',
@@ -12,6 +35,7 @@ const ROOT_SESSION_TIMELINE_EVENT_TYPES = new Set<string>([
   'chunk',
   'message_complete',
   'tool_call',
+  'tool_progress',
   'tool_output_chunk',
   'tool_result',
   'tool_result_chunk',
@@ -121,6 +145,64 @@ export function conversationStatusFilterForConversation(
   return 'active';
 }
 
+export function conversationAttentionTone(conversation: {
+  active_session_status?: string | null;
+  active_session_completion_reason?: string | null;
+  pending_notification_types?: string[] | null;
+}): ConversationAttentionTone {
+  const status = conversation.active_session_status ?? null;
+  if (status && ROSE_SESSION_STATUSES.has(status)) return 'rose';
+  if (status && AMBER_SESSION_STATUSES.has(status)) return 'amber';
+
+  const pendingNotificationTypes = conversation.pending_notification_types ?? [];
+  if (pendingNotificationTypes.some((type) => ROSE_PENDING_NOTIFICATION_TYPES.has(type))) {
+    return 'rose';
+  }
+  if (pendingNotificationTypes.some((type) => ATTENTION_PENDING_NOTIFICATION_TYPES.has(type))) {
+    return 'amber';
+  }
+
+  const completionReason = conversation.active_session_completion_reason ?? null;
+  if (status === 'completed' && completionReason && !NORMAL_COMPLETION_REASONS.has(completionReason)) {
+    return 'amber';
+  }
+
+  return 'default';
+}
+
+export function conversationAttentionDotClass(tone: ConversationAttentionTone): string {
+  if (tone === 'rose') return 'bg-rose-400';
+  if (tone === 'amber') return 'bg-amber-400';
+  return 'bg-sky-400';
+}
+
+export function conversationAttentionOrbitClass(tone: ConversationAttentionTone): string {
+  if (tone === 'rose') return 'conversation-turn-orbit--rose';
+  if (tone === 'amber') return 'conversation-turn-orbit--amber';
+  return '';
+}
+
+export function conversationAttentionLabel(tone: ConversationAttentionTone): string {
+  if (tone === 'rose') return 'requires attention: session failed or ended unexpectedly';
+  if (tone === 'amber') return 'requires attention: blocked or waiting for input';
+  return 'unread';
+}
+
+export function pendingNotificationTypesFromNotifications(
+  notifications: Array<{ notification_type?: string | null; status?: string | null }>
+): string[] {
+  const types = new Set<string>();
+  for (const notification of notifications) {
+    if (notification.status !== 'pending' || !notification.notification_type) continue;
+    types.add(notification.notification_type);
+  }
+  return [...types];
+}
+
+export function normalizeChatModeTone(value: unknown): ChatModeTone {
+  return value === 'plan' || value === 'build' ? value : 'default';
+}
+
 export function buildConversationUrl(
   conversationId: string,
   status: ConversationStatusFilter,
@@ -176,9 +258,11 @@ export function getNextHistoryAfterSeq(response: {
 
 export function isRestorableChatConversation(conversation: {
   status?: string | null;
-  context?: { type?: string | null } | null;
+  context?: { type?: string | null; platform_data?: Record<string, unknown> | null } | null;
 } | null | undefined): boolean {
-  return conversation?.status === 'active' && (conversation.context?.type ?? '').toLowerCase() === 'web';
+  return conversation?.status === 'active'
+    && (conversation.context?.type ?? '').toLowerCase() === 'web'
+    && conversation.context?.platform_data?.kind !== 'agent_direct';
 }
 
 export function isPreSessionChatConversation(conversation: {

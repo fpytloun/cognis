@@ -63,6 +63,40 @@ def test_mcp_server_config_validates_transport_fields() -> None:
         )
 
 
+def test_mcp_oauth_config_is_http_only_and_rejects_authorization_header() -> None:
+    config = MCPServerConfig(
+        name="oauth",
+        transport="sse",
+        url="http://localhost/sse",
+        headers={"X-Tenant": "demo"},
+        auth_config={
+            "type": "oauth2",
+            "issuer": "https://auth.example.com",
+            "resource": "https://mcp.example.com",
+            "scopes": ["tools.read"],
+        },
+    )
+    assert config.auth_config.type == "oauth2"
+    assert config.headers["X-Tenant"] == "demo"
+
+    with pytest.raises(ValueError, match="OAuth is only supported"):
+        MCPServerConfig(
+            name="broken",
+            transport="stdio",
+            command="/bin/echo",
+            auth_config={"type": "oauth2", "issuer": "https://auth.example.com"},
+        )
+
+    with pytest.raises(ValueError, match="Authorization headers are not allowed"):
+        MCPServerConfig(
+            name="broken",
+            transport="streamable_http",
+            url="http://localhost/mcp",
+            headers={"Authorization": "Bearer static"},
+            auth_config={"type": "oauth2", "issuer": "https://auth.example.com"},
+        )
+
+
 def test_select_static_tools_honors_disabled_categories_and_tools() -> None:
     agent = SimpleNamespace(
         tools={

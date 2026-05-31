@@ -101,6 +101,22 @@ def test_direct_codex_bad_request_preserves_error_body_for_fallbacks() -> None:
     assert reasoning_summary_rejected(classify_llm_exception(exc_info.value)) is True
 
 
+def test_direct_codex_bad_request_includes_top_level_detail() -> None:
+    response = httpx.Response(
+        400,
+        json={"detail": "Instructions are required"},
+        request=httpx.Request("POST", "https://example.invalid"),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        _raise_for_status(response)
+
+    assert type(exc_info.value).__name__ == "BadRequestError"
+    assert str(exc_info.value) == (
+        "Direct Codex request failed: HTTP 400; Instructions are required"
+    )
+
+
 @pytest.mark.asyncio
 async def test_direct_codex_5xx_errors_remain_retryable() -> None:
     attempts = 0

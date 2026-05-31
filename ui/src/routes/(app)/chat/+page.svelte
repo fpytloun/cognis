@@ -5,7 +5,7 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { api } from '$lib/api/client';
-import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
+  import { CHAT_STORAGE_KEYS, isRestorableChatConversation } from '$lib/chat-page';
   import type { Agent } from '$lib/types/api';
 
   let loading = true;
@@ -23,16 +23,30 @@ import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
     return primary.find((a) => a.status === 'active')?.agent_id ?? primary[0]?.agent_id ?? '';
   }
 
+  async function restoreLastOpenedConversation(): Promise<boolean> {
+    if (typeof window === 'undefined') return false;
+    const conversationId = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+    if (!conversationId) return false;
+
+    try {
+      const conversation = await api.conversations.detail(conversationId);
+      if (isRestorableChatConversation(conversation)) {
+        await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
+        return true;
+      }
+    } catch {
+      // Ignore stale or inaccessible local state and fall back to resolving
+      // the latest active web conversation for the selected agent.
+    }
+
+    window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+    return false;
+  }
+
   onMount(() => {
     void (async () => {
       try {
-        const recentConversations = await api.conversations.list(null, {
-          contextType: 'web',
-          status: 'active',
-        });
-        const latestConversation = recentConversations.items[0] ?? null;
-        if (latestConversation) {
-          await goto(`/chat/${latestConversation.conversation_id}`, { replaceState: true });
+        if (await restoreLastOpenedConversation()) {
           return;
         }
 
@@ -44,7 +58,7 @@ import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
           return;
         }
 
-        const conversation = await api.conversations.resolve({ agent_id: agentId, context_type: 'web' });
+        const conversation = await api.conversations.resolve({ agent_id: agentId, context_type: 'web', scope: 'latest' });
         await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
       } catch (caughtError) {
         error = caughtError instanceof Error ? caughtError.message : 'Unable to load conversations.';

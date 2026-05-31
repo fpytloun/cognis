@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  executorDegradedDetails,
   executorRuntimeBadgeStatus,
   executorRuntimeLabel,
   executorRuntimeSummary,
@@ -52,6 +53,30 @@ describe('executor helpers', () => {
     );
 
     expect(summary).toContain('todoist');
+  });
+
+  it('summarizes generic degraded runtime issues before MCP details', () => {
+    const degraded = executor({
+      runtime_state: 'degraded',
+      runtime_metadata: {
+        degraded_issues: [
+          {
+            source: 'browser',
+            title: 'Browser unavailable',
+            message: 'Playwright failed to initialize'
+          }
+        ],
+        mcp_servers: [
+          { name: 'todoist', status: 'failed', phase: 'initialize', message: 'startup failed' }
+        ]
+      }
+    });
+
+    expect(executorRuntimeSummary(degraded)).toBe('1 degraded issue(s): Browser unavailable');
+    expect(executorDegradedDetails(degraded)).toEqual([
+      'browser: Browser unavailable · Playwright failed to initialize',
+      'todoist: initialize · startup failed'
+    ]);
   });
 
   it('rejects shell-style stdio commands with spaces', () => {

@@ -22,6 +22,12 @@ from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
 SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
+LONG_LIVED_CHAT_COMPACTION_ADDENDUM = (
+    "This is a long-lived ambient chat. There may be no single task goal. "
+    "Preserve standing preferences, ongoing topics, open threads, decisions, "
+    "background work references, user-specific context, and recent conversational "
+    'continuity. Use "(none)" for task-specific sections that do not apply.'
+)
 
 COMPACTION_TOTAL = Counter(
     "cognis_session_compactions_total",
@@ -260,6 +266,7 @@ class CompactionStrategy:
         *,
         trigger: str = "manual",
         model_context: CompactionModelContext | None = None,
+        long_lived_chat: bool = False,
     ) -> CompactionResult:
         """Attempt LLM-driven compaction of buffered session history.
 
@@ -289,6 +296,8 @@ class CompactionStrategy:
             if compaction_agent and compaction_agent.system_prompt
             else "Summarize the conversation history concisely."
         )
+        if long_lived_chat:
+            compaction_prompt = f"{compaction_prompt}\n\n{LONG_LIVED_CHAT_COMPACTION_ADDENDUM}"
 
         # Resolve token budget and build the three-band input.
         max_input_tokens = await self._resolve_max_input_tokens(

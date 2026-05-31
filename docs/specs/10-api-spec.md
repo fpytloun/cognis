@@ -121,12 +121,14 @@ GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
       "seq": 101,
       "type": "user_message",
       "content": "Can you research OAuth2?",
+      "lane": "main",
       "timestamp": "2026-03-27T10:30:00Z"
     },
     {
       "seq": 102,
       "type": "assistant_message",
       "content": "I'll research that for you...",
+      "lane": "main",
       "token_usage": {...},
       "timestamp": "2026-03-27T10:30:05Z"
     }
@@ -142,6 +144,23 @@ The controller reads from Intaris event store and formats for the client.
 `active_streams` and `active_tool_outputs` are optional refresh/reconnect
 snapshots for in-flight assistant text and tool output respectively; persisted
 history remains canonical once the turn is recorded.
+
+Message records may include lane metadata:
+
+```json
+{
+  "lane": "side",
+  "side_thread_id": "btw:turn_01HV...",
+  "anchor_turn_id": "turn_01HV...",
+  "prompt_visibility": "side_only",
+  "tool_policy": "none"
+}
+```
+
+Clients must treat `lane="main"` as the default when metadata is absent.
+Side-lane messages are part of the same Intaris session history for audit and UI
+replay, but are visually separated and excluded from normal main-turn model
+context by the controller.
 
 ### Channels
 
@@ -217,6 +236,38 @@ POST /api/v1/conversations/conv_abc/messages
 → 200 OK
 { "status": "command_executed", "result": {"type": "system_message", "text": "Session: ses_123\n..."} }
 ```
+
+`/btw <question>` is a special side-question slash command. It is accepted even
+while the conversation has an active main turn. The command records side-lane
+user/assistant messages in the active session, but it does not enqueue a normal
+turn and does not mutate main-lane context.
+
+```http
+POST /api/v1/conversations/conv_abc/messages
+{ "content": "/btw why is the agent running tests?" }
+
+→ 200 OK
+{
+  "status": "command_executed",
+  "result": {
+    "type": "side_question_answer",
+    "conversation_id": "conv_abc",
+    "session_id": "ses_123",
+    "side_thread_id": "btw:turn_01HV...",
+    "anchor_turn_id": "turn_01HV...",
+    "question": "why is the agent running tests?",
+    "answer": "The active turn is validating...",
+    "lane": "side",
+    "tool_policy": "none",
+    "usage": {...}
+  }
+}
+```
+
+If the side-question LLM response attempts any tool call while
+`tool_policy="none"`, the controller rejects it, executes no tool, records the
+side answer as a no-tools failure/notice, and returns a structured
+`side_question_answer` result with `tool_call_rejected=true`.
 
 Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
 `session_suspended` (409), `rate_limited` / `queue_full` (429).
@@ -391,6 +442,10 @@ GET    /api/v1/mcp-servers/:id                  → Get current user's MCP serve
 POST   /api/v1/mcp-servers                      → Create MCP server config (user-scoped)
 PUT    /api/v1/mcp-servers/:id                  → Update MCP server config (user-scoped)
 DELETE /api/v1/mcp-servers/:id                  → Delete MCP server config (user-scoped, 409 if referenced)
+POST   /api/v1/mcp-servers/:server_id/oauth/start       → Start OAuth authorization for an HTTP MCP server
+GET    /api/v1/mcp/oauth/callback                       → Public OAuth redirect callback
+GET    /api/v1/mcp-servers/:server_id/oauth/status      → Current user's MCP OAuth connection status
+POST   /api/v1/mcp-servers/:server_id/oauth/disconnect  → Revoke local stored MCP OAuth tokens
 GET    /api/v1/agents/:id/effective-tools       → Effective tool set for saved agent
 POST   /api/v1/agents/effective-tools/preview   → Effective tool preview for unsaved agent draft
 ```

@@ -144,20 +144,29 @@ def build_fetch_tool_result(
 
     for index, image in enumerate(_document_images(document_data), start=1):
         lines = _image_lines(image)
+        anchor = f"media:{index}"
+        lines.append(f"Lazy artifact: tool_artifact:<tool_call_id>:{anchor}")
+        lines.append(
+            "To inspect this image, call artifact_read with "
+            f'artifact_id="tool_artifact:<tool_call_id>:{anchor}".'
+        )
         label = str(
             image.get("caption") or image.get("alt") or image.get("url") or f"Media {index}"
         )
+        artifact_candidate = _image_artifact_candidate(image, source_url=display_url)
         compact_builder.add_section(
-            f"media:{index}",
+            anchor,
             kind="media",
             label=label,
             lines=lines,
+            artifact_candidate=artifact_candidate,
         )
         stored_builder.add_section(
-            f"media:{index}",
+            anchor,
             kind="media",
             label=label,
             lines=lines,
+            artifact_candidate=artifact_candidate,
         )
 
     output, _compact_anchors = compact_builder.build()
@@ -290,6 +299,52 @@ def _image_lines(image: dict[str, object]) -> list[str]:
         if value is not None and str(value).strip():
             lines.append(f"{label}: {_compact_field(str(value), max_chars=600)}")
     return lines
+
+
+def _image_artifact_candidate(
+    image: dict[str, object], *, source_url: str
+) -> dict[str, object] | None:
+    url = image.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    metadata: dict[str, object] = {
+        "source_tool": "web_fetch",
+        "source_page_url": source_url,
+    }
+    for key in ("role", "source", "alt", "caption", "width", "height"):
+        value = image.get(key)
+        if value is not None and str(value).strip():
+            metadata[key] = value
+    return {
+        "source_type": "remote_url",
+        "url": url.strip(),
+        "mime_hint": _mime_hint_from_url(url.strip()),
+        "filename_hint": _filename_hint_from_url(url.strip()),
+        "metadata": metadata,
+    }
+
+
+def _mime_hint_from_url(url: str) -> str | None:
+    path = urlparse(url).path.lower()
+    if path.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if path.endswith(".png"):
+        return "image/png"
+    if path.endswith(".webp"):
+        return "image/webp"
+    if path.endswith(".gif"):
+        return "image/gif"
+    if path.endswith(".avif"):
+        return "image/avif"
+    if path.endswith(".svg"):
+        return "image/svg+xml"
+    return None
+
+
+def _filename_hint_from_url(url: str) -> str | None:
+    path = urlparse(url).path.rstrip("/")
+    name = path.rsplit("/", 1)[-1]
+    return name or None
 
 
 def _compact_field(value: str, *, max_chars: int) -> str:

@@ -1,5 +1,6 @@
 import { createMarkdownStreamer, renderMarkdown, stripMarkdown, type MarkdownStreamer } from '$lib/markdown';
 import { normalizeFileDiffs, type FileDiff } from '$lib/diff';
+import { parseTodoSnapshot, type TodoSnapshotItem } from '$lib/todos';
 import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, ActiveToolOutputSnapshot, AttachmentRef, ChatMode, ChatModeSource, CognisWebSocketEvent, MessageEvent, ToolOutputPresentationMetadata } from '$lib/types/api';
 
 /**
@@ -18,7 +19,40 @@ interface PendingStreamChunk {
   contentOffset: number;
 }
 
+type ToolResultEvent = Extract<CognisWebSocketEvent, { type: 'tool_result' }>;
+type ToolOutputChunkEvent = Extract<CognisWebSocketEvent, { type: 'tool_result_chunk' | 'tool_output_chunk' }> & {
+  call_id?: string;
+  tool_name?: string;
+  delta?: string;
+  content?: string;
+  text?: string;
+  stream?: string | null;
+  is_error?: boolean;
+  chunk_index?: number;
+  content_offset?: number;
+  session_id?: string;
+};
+
+interface PendingToolOutputChunk {
+  delta: string;
+  isError: boolean;
+  chunkIndex?: number;
+  contentOffset?: number;
+  sessionId?: string;
+}
+
 const pendingStreamChunks = new Map<string, PendingStreamChunk[]>();
+const pendingToolOutputChunks = new Map<string, PendingToolOutputChunk[]>();
+const pendingToolResults = new Map<string, ToolResultEvent>();
+const MAX_PENDING_TOOL_OUTPUT_KEYS = 200;
+
+function pruneOldestPendingToolEntry<T>(map: Map<string, T>): void {
+  while (map.size > MAX_PENDING_TOOL_OUTPUT_KEYS) {
+    const first = map.keys().next().value;
+    if (typeof first !== 'string') return;
+    map.delete(first);
+  }
+}
 
 function getStreamer(messageId: string): MarkdownStreamer {
   let streamer = streamers.get(messageId);
@@ -73,6 +107,119 @@ function clearPendingChunks(messageId: string | undefined, turnId: string | null
   pendingStreamChunks.delete(streamKey(messageId, turnId));
 }
 
+function toolEventKey(params: {
+  conversationId?: string | null;
+  sessionId?: string | null;
+  turnId?: string | null;
+  callId?: string | null;
+}): string {
+  return [
+    params.conversationId ?? 'unknown-conversation',
+    params.sessionId ?? 'unknown-session',
+    params.turnId ?? 'unknown-turn',
+    params.callId ?? 'unknown-call',
+  ].join(':');
+}
+
+function bufferPendingToolOutputChunk(key: string, chunk: PendingToolOutputChunk): void {
+  if (!key) return;
+  const chunks = pendingToolOutputChunks.get(key) ?? [];
+  if (
+    chunks.some(
+      (existing) =>
+        existing.chunkIndex === chunk.chunkIndex
+        && existing.contentOffset === chunk.contentOffset
+        && existing.delta === chunk.delta,
+    )
+  ) {
+    return;
+  }
+  chunks.push(chunk);
+  chunks.sort((left, right) => {
+    const leftOffset = left.contentOffset ?? Number.MAX_SAFE_INTEGER;
+    const rightOffset = right.contentOffset ?? Number.MAX_SAFE_INTEGER;
+    if (leftOffset !== rightOffset) return leftOffset - rightOffset;
+    return (left.chunkIndex ?? Number.MAX_SAFE_INTEGER) - (right.chunkIndex ?? Number.MAX_SAFE_INTEGER);
+  });
+  pendingToolOutputChunks.set(key, chunks);
+  pruneOldestPendingToolEntry(pendingToolOutputChunks);
+}
+
+function appendToolOutputChunk(
+  existing: ToolCallTimelineItem,
+  chunk: PendingToolOutputChunk,
+): ToolCallTimelineItem {
+  if (
+    typeof chunk.chunkIndex === 'number'
+    && typeof existing.streamChunkCount === 'number'
+    && chunk.chunkIndex < existing.streamChunkCount
+  ) {
+    return existing;
+  }
+  if (
+    typeof chunk.contentOffset === 'number'
+    && typeof existing.streamContentOffset === 'number'
+    && chunk.contentOffset < existing.streamContentOffset
+  ) {
+    return existing;
+  }
+  const streamedOutput = `${existing.streamedOutput ?? ''}${chunk.delta}`;
+  return {
+    ...existing,
+    streamedOutput,
+    result: streamedOutput,
+    isError: chunk.isError || existing.isError,
+    streamChunkCount: typeof chunk.chunkIndex === 'number' ? chunk.chunkIndex + 1 : existing.streamChunkCount,
+    streamContentOffset: typeof chunk.contentOffset === 'number' ? chunk.contentOffset + utf16CodeUnits(chunk.delta) : existing.streamContentOffset,
+    sessionId: chunk.sessionId ?? existing.sessionId,
+    liveOutputAvailable: true,
+  };
+}
+
+function applyBufferedToolOutputChunks(key: string, item: ToolCallTimelineItem): ToolCallTimelineItem {
+  const chunks = pendingToolOutputChunks.get(key);
+  if (!chunks || chunks.length === 0) return item;
+  pendingToolOutputChunks.delete(key);
+  return chunks.reduce((current, chunk) => appendToolOutputChunk(current, chunk), item);
+}
+
+function bufferPendingToolResult(key: string, event: ToolResultEvent): void {
+  if (!key) return;
+  pendingToolResults.set(key, event);
+  pruneOldestPendingToolEntry(pendingToolResults);
+}
+
+function applyToolResultEvent(
+  existing: ToolCallTimelineItem,
+  event: ToolResultEvent,
+): ToolCallTimelineItem {
+  const evaluation = event.evaluation ?? undefined;
+  const attachments = normalizeEventAttachments(event.attachments);
+  const fileDiffs = normalizeFileDiffs(event.file_diffs);
+  const turnId = normalizeEventTurnId(event.turn_id);
+  const keepStreamed = Boolean(event.transport_truncated) && (existing.streamedOutput?.length ?? 0) > event.result.length;
+  return mergeToolPresentation({
+    ...existing,
+    status: event.is_error ? 'failed' : 'completed',
+    timestamp: event.timestamp ?? existing.timestamp,
+    result: keepStreamed ? existing.streamedOutput : event.result,
+    isError: event.is_error,
+    durationMs: event.duration_ms ?? undefined,
+    evaluation,
+    attachments: attachments.length > 0 ? attachments : existing.attachments,
+    fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
+    turnId: existing.turnId ?? turnId,
+    sessionId: event.session_id ?? existing.sessionId,
+  }, event);
+}
+
+function applyPendingToolResult(key: string, item: ToolCallTimelineItem): ToolCallTimelineItem {
+  const pending = pendingToolResults.get(key);
+  if (!pending) return item;
+  pendingToolResults.delete(key);
+  return applyToolResultEvent(item, pending);
+}
+
 export function releaseStreamer(messageId: string): void {
   streamers.delete(messageId);
 }
@@ -124,6 +271,7 @@ export interface ThinkingTimelineItem {
 export interface MessageTimelineItem {
   id: string;
   kind: 'message';
+  sessionId?: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
   html: string;
@@ -193,33 +341,16 @@ export interface ToolCallTimelineItem {
    * conversation reload.
    */
   notificationId?: string;
+  progressPhase?: string;
+  progressInputChars?: number;
+  progressInputLines?: number;
+  progressComplete?: boolean;
 }
 
-export interface TodoSnapshotItem {
-  content: string;
-  status: string;
-  priority: string;
-}
+export { parseTodoSnapshot, type TodoSnapshotItem };
 
 function normalizeToolName(name: string): string {
   return name.toLowerCase().replace(/_/g, '');
-}
-
-export function parseTodoSnapshot(value: unknown): TodoSnapshotItem[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      if (!item || typeof item !== 'object') return null;
-      const record = item as Record<string, unknown>;
-      const content = typeof record.content === 'string' ? record.content.trim() : '';
-      if (!content) return null;
-      return {
-        content,
-        status: typeof record.status === 'string' ? record.status : 'pending',
-        priority: typeof record.priority === 'string' ? record.priority : 'medium'
-      } satisfies TodoSnapshotItem;
-    })
-    .filter((item): item is TodoSnapshotItem => item !== null);
 }
 
 function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
@@ -428,6 +559,7 @@ function createSystemMessageItem(
 
 function createMessageItem(
   id: string,
+  sessionId: string | null,
   role: 'user' | 'assistant' | 'system',
   content: string,
   timestamp: string | null,
@@ -444,6 +576,7 @@ function createMessageItem(
   return {
     id,
     kind: 'message',
+    sessionId,
     role,
     content,
     html: role !== 'system' ? renderMarkdown(content) : '',
@@ -459,6 +592,12 @@ function createMessageItem(
     streamChunkCount,
     streamContentOffset: content.length,
   };
+}
+
+function eventSessionId(event: MessageEvent): string | null {
+  const directSessionId = normalizeIdentifier(event.session_id);
+  if (directSessionId) return directSessionId;
+  return normalizeIdentifier(event.data.session_id);
 }
 
 function attachmentIds(attachments: AttachmentRef[] = []): string[] {
@@ -901,6 +1040,7 @@ function upsertAssistantTurnMessage(
   items: TimelineItem[],
   {
     id,
+    sessionId,
     content,
     timestamp,
     seq,
@@ -912,6 +1052,7 @@ function upsertAssistantTurnMessage(
     streaming = false,
   }: {
     id: string;
+    sessionId?: string | null;
     content: string;
     timestamp: string | null;
     seq: number | null;
@@ -937,6 +1078,7 @@ function upsertAssistantTurnMessage(
       attachments: nextAttachments,
       streaming,
       messageId: messageId ?? existing.messageId,
+      sessionId: sessionId ?? existing.sessionId,
       turnId,
       chatMode: chatMode ?? existing.chatMode,
       chatModeSource: chatModeSource ?? existing.chatModeSource,
@@ -944,7 +1086,7 @@ function upsertAssistantTurnMessage(
     return;
   }
 
-  const item = createMessageItem(id, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId);
+  const item = createMessageItem(id, sessionId ?? null, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId);
   item.chatMode = chatMode;
   item.chatModeSource = chatModeSource;
   items.push(item);
@@ -1060,6 +1202,7 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
       html: streamer.render(content),
       streaming: true,
       messageId: snapshot.message_id,
+      sessionId: snapshot.session_id ?? existing.sessionId,
       turnId,
       streamChunkCount: snapshot.chunk_count,
       streamContentOffset: snapshot.content_offset,
@@ -1072,6 +1215,7 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
 
   const item = createMessageItem(
     `message:${snapshot.message_id}:${items.length}`,
+    snapshot.session_id ?? null,
     'assistant',
     content,
     snapshot.updated_at ?? new Date().toISOString(),
@@ -1234,10 +1378,10 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     const attachments = normalizeEventAttachments(event.data.attachments);
     const turnId = normalizeEventTurnId(event.data.turn_id);
     // Use session_id from event data to build lineage-safe IDs (seq is session-local).
-    const sid = typeof event.data.session_id === 'string' ? event.data.session_id : '';
+    const sid = eventSessionId(event) ?? '';
     const eid = sid ? `${sid}:${event.seq}` : `${event.seq}`;
     if (event.type === 'user_message') {
-      const item = createMessageItem(`event:${eid}:user`, 'user', content, event.timestamp, event.seq, undefined, false, attachments, false, turnId);
+      const item = createMessageItem(`event:${eid}:user`, sid || null, 'user', content, event.timestamp, event.seq, undefined, false, attachments, false, turnId);
       item.chatMode = normalizeChatMode(event.data.chat_mode);
       item.chatModeSource = normalizeChatModeSource(event.data.chat_mode_source);
       items.push(item);
@@ -1248,6 +1392,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
       if (content.trim() || attachments.length > 0) {
         upsertAssistantTurnMessage(items, {
           id: `event:${eid}:assistant`,
+          sessionId: sid || null,
           content,
           timestamp: event.timestamp,
           seq: event.seq,
@@ -1625,6 +1770,7 @@ export function appendOptimisticUserMessage(
     ...items,
     createMessageItem(
       localId,
+      null,
       'user',
       content,
       new Date().toISOString(),
@@ -1786,6 +1932,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     }
     const item = createMessageItem(
       stableItemId,
+      event.session_id ?? null,
       'user',
       event.content,
       event.timestamp ?? new Date().toISOString(),
@@ -1851,18 +1998,19 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
     const itemId = `message:${event.message_id}:${next.length}`;
     const item = createMessageItem(
-        itemId,
-        'assistant',
-        event.content,
-        new Date().toISOString(),
-        null,
-        event.message_id,
-        true,
-        [],
-        false,
-        turnId,
-        chunkIndex !== null ? chunkIndex + 1 : 1,
-      );
+      itemId,
+      event.session_id ?? null,
+      'assistant',
+      event.content,
+      new Date().toISOString(),
+      null,
+      event.message_id,
+      true,
+      [],
+      false,
+      turnId,
+      chunkIndex !== null ? chunkIndex + 1 : 1,
+    );
     item.chatMode = eventChatMode;
     item.chatModeSource = eventChatModeSource;
     next.push(applyBufferedChunksToMessage(item, turnId));
@@ -1910,6 +2058,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       clearPendingChunks(event.message_id, turnId);
       upsertAssistantTurnMessage(next, {
         id: itemId,
+        sessionId: event.session_id ?? null,
         content: finalContent ?? '',
         timestamp: new Date().toISOString(),
         seq: event.seq,
@@ -2137,6 +2286,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
 
   if (event.type === 'tool_call') {
     const turnId = normalizeEventTurnId(event.turn_id);
+    const key = toolEventKey({
+      conversationId: event.conversation_id,
+      sessionId: event.session_id,
+      turnId,
+      callId: event.call_id,
+    });
     next = finalizeOpenPhaseAssistant(next, turnId);
     // Orchestration tools are displayed as delegation cards, not tool blocks
     if (['delegate', 'fork'].includes(event.tool_name)) return next;
@@ -2154,7 +2309,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     };
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
-      next[index] = {
+      next[index] = applyPendingToolResult(key, applyBufferedToolOutputChunks(key, {
         ...existing,
         ...toolItem,
         // Preserve fields from the original event when not provided by the update
@@ -2165,99 +2320,43 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         evaluation: existing.evaluation,
         attachments: existing.attachments,
         turnId: toolItem.turnId ?? existing.turnId,
-      };
+      }));
       return next;
     }
-    next.push(toolItem);
+    next.push(applyPendingToolResult(key, applyBufferedToolOutputChunks(key, toolItem)));
     return next;
   }
 
-  if (event.type === 'tool_result') {
-    const turnId = normalizeEventTurnId(event.turn_id);
-    const itemId = `tool:${event.call_id}`;
-    const evaluation = event.evaluation ?? undefined;
-    const attachments = normalizeEventAttachments(event.attachments);
-    const fileDiffs = normalizeFileDiffs(event.file_diffs);
-    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
-    if (index >= 0) {
-      const existing = next[index] as ToolCallTimelineItem;
-      const keepStreamed = Boolean(event.transport_truncated) && (existing.streamedOutput?.length ?? 0) > event.result.length;
-      next[index] = mergeToolPresentation({
-        ...existing,
-        status: event.is_error ? 'failed' : 'completed',
-        timestamp: event.timestamp ?? existing.timestamp,
-        result: keepStreamed ? existing.streamedOutput : event.result,
-        isError: event.is_error,
-        durationMs: event.duration_ms ?? undefined,
-        evaluation,
-        attachments: attachments.length > 0 ? attachments : existing.attachments,
-        fileDiffs: fileDiffs.length > 0 ? fileDiffs : existing.fileDiffs,
-        turnId: existing.turnId ?? turnId,
-      }, event);
-      return next;
-    }
-    // tool_result arrived before tool_call — create a placeholder
-    next.push(mergeToolPresentation({
-      id: itemId,
-      kind: 'tool_call',
-      callId: event.call_id,
-      toolName: event.tool_name,
-      turnId,
-      status: event.is_error ? 'failed' : 'completed',
-      timestamp: event.timestamp ?? new Date().toISOString(),
-      result: event.result,
-      isError: event.is_error,
-      durationMs: event.duration_ms ?? undefined,
-      evaluation,
-      attachments: attachments.length > 0 ? attachments : undefined,
-      fileDiffs: fileDiffs.length > 0 ? fileDiffs : undefined,
-    }, event));
-    return next;
-  }
-
-  if (event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk') {
+  if (event.type === 'tool_progress') {
     const rawEvent = event as typeof event & {
-      call_id?: string;
-      tool_name?: string;
-      delta?: string;
-      content?: string;
-      text?: string;
-      stream?: string | null;
-      is_error?: boolean;
-      chunk_index?: number;
-      content_offset?: number;
+      progress?: {
+        phase?: string;
+        input_chars?: number;
+        input_lines?: number;
+        complete?: boolean;
+      };
+      timestamp?: string | null;
     };
+    const turnId = normalizeEventTurnId(event.turn_id);
+    next = finalizeOpenPhaseAssistant(next, turnId);
     const callId = rawEvent.call_id ?? '';
+    if (!callId) return next;
     const itemId = `tool:${callId}`;
     const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
-    const delta = rawEvent.delta ?? rawEvent.content ?? rawEvent.text ?? '';
-    const isErrorChunk = rawEvent.is_error ?? rawEvent.stream === 'stderr';
+    const progress = rawEvent.progress ?? {};
+    const patch = {
+      progressPhase: typeof progress.phase === 'string' ? progress.phase : 'preparing_input',
+      progressInputChars: typeof progress.input_chars === 'number' ? progress.input_chars : undefined,
+      progressInputLines: typeof progress.input_lines === 'number' ? progress.input_lines : undefined,
+      progressComplete: typeof progress.complete === 'boolean' ? progress.complete : undefined,
+    };
     if (index >= 0) {
       const existing = next[index] as ToolCallTimelineItem;
-      if (
-        typeof rawEvent.chunk_index === 'number'
-        && typeof existing.streamChunkCount === 'number'
-        && rawEvent.chunk_index < existing.streamChunkCount
-      ) {
-        return next;
-      }
-      if (
-        typeof rawEvent.content_offset === 'number'
-        && typeof existing.streamContentOffset === 'number'
-        && rawEvent.content_offset < existing.streamContentOffset
-      ) {
-        return next;
-      }
-      const streamedOutput = `${existing.streamedOutput ?? ''}${delta}`;
       next[index] = {
         ...existing,
-        streamedOutput,
-        result: streamedOutput,
-        isError: isErrorChunk || existing.isError,
-        streamChunkCount: typeof rawEvent.chunk_index === 'number' ? rawEvent.chunk_index + 1 : existing.streamChunkCount,
-        streamContentOffset: typeof rawEvent.content_offset === 'number' ? rawEvent.content_offset + utf16CodeUnits(delta) : existing.streamContentOffset,
-        sessionId: rawEvent.session_id ?? existing.sessionId,
-        liveOutputAvailable: true,
+        ...patch,
+        status: existing.status === 'completed' || existing.status === 'failed' ? existing.status : 'started',
+        turnId: existing.turnId ?? turnId,
       };
       return next;
     }
@@ -2266,16 +2365,64 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       kind: 'tool_call',
       callId,
       toolName: rawEvent.tool_name ?? 'unknown',
-      turnId: normalizeEventTurnId(event.turn_id),
+      turnId,
       status: 'started',
-      timestamp: event.timestamp ?? new Date().toISOString(),
-      streamedOutput: delta,
-      result: delta,
-      isError: isErrorChunk,
-      streamChunkCount: typeof rawEvent.chunk_index === 'number' ? rawEvent.chunk_index + 1 : undefined,
-      streamContentOffset: typeof rawEvent.content_offset === 'number' ? rawEvent.content_offset + utf16CodeUnits(delta) : undefined,
+      timestamp: rawEvent.timestamp ?? new Date().toISOString(),
+      ...patch,
+    });
+    return next;
+  }
+
+  if (event.type === 'tool_result') {
+    const turnId = normalizeEventTurnId(event.turn_id);
+    const key = toolEventKey({
+      conversationId: event.conversation_id,
+      sessionId: event.session_id,
+      turnId,
+      callId: event.call_id,
+    });
+    const itemId = `tool:${event.call_id}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      next[index] = applyToolResultEvent(existing, event);
+      return next;
+    }
+    bufferPendingToolResult(key, event);
+    return next;
+  }
+
+  if (event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk') {
+    const rawEvent = event as ToolOutputChunkEvent;
+    const callId = rawEvent.call_id ?? '';
+    const turnId = normalizeEventTurnId(event.turn_id);
+    const key = toolEventKey({
+      conversationId: 'conversation_id' in rawEvent ? rawEvent.conversation_id : null,
       sessionId: rawEvent.session_id,
-      liveOutputAvailable: true,
+      turnId,
+      callId,
+    });
+    const itemId = `tool:${callId}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    const delta = rawEvent.delta ?? rawEvent.content ?? rawEvent.text ?? '';
+    const isErrorChunk = rawEvent.is_error ?? rawEvent.stream === 'stderr';
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      next[index] = appendToolOutputChunk(existing, {
+        delta,
+        isError: isErrorChunk,
+        chunkIndex: rawEvent.chunk_index,
+        contentOffset: rawEvent.content_offset,
+        sessionId: rawEvent.session_id,
+      });
+      return next;
+    }
+    bufferPendingToolOutputChunk(key, {
+      delta,
+      isError: isErrorChunk,
+      chunkIndex: rawEvent.chunk_index,
+      contentOffset: rawEvent.content_offset,
+      sessionId: rawEvent.session_id,
     });
     return next;
   }

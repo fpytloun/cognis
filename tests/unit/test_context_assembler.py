@@ -10,6 +10,7 @@ import pytest
 from cognis.core.context import (
     ContextAssembler,
     _build_channel_context_info,
+    _build_direct_chat_context_info,
     _build_environment_info,
     _load_project_instructions,
 )
@@ -374,6 +375,35 @@ def _agent_with_skills() -> AgentDefinition:
     )
 
 
+def _agent_with_auto_loaded_skill() -> AgentDefinition:
+    return AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        system_prompt="You are helpful.",
+        skills={
+            "_available_skills_metadata": (
+                "<available_skills>\n"
+                "  <skill>\n"
+                "    <name>Coding</name>\n"
+                "    <loaded>true</loaded>\n"
+                "  </skill>\n"
+                "</available_skills>"
+            ),
+            "_auto_loaded_skill_contexts": [
+                (
+                    "<loaded_skill>\n"
+                    "<skill_id>coding</skill_id>\n"
+                    "<name>Coding</name>\n"
+                    "<instructions>\nUse careful implementation discipline.\n</instructions>\n"
+                    "</loaded_skill>"
+                )
+            ],
+        },
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+    )
+
+
 def _conversation() -> ConversationModel:
     return ConversationModel(
         conversation_id="conv-1",
@@ -397,6 +427,19 @@ def _signal_conversation() -> ConversationModel:
                 "chat_name": "Ops",
                 "thread_id": "thread-1",
             },
+        ),
+    )
+
+
+def _agent_direct_conversation() -> ConversationModel:
+    return ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="web",
+            ref="web:agent_direct:user@example.com:agent-1",
+            platform_data={"kind": "agent_direct"},
         ),
     )
 
@@ -440,6 +483,26 @@ def test_build_channel_context_info_is_channel_only() -> None:
     assert "create_task" in content
 
 
+def test_build_direct_chat_context_info_is_agent_direct_only() -> None:
+    assert _build_direct_chat_context_info(ConversationContext(type="web")) is None
+    assert _build_direct_chat_context_info(ConversationContext(type="signal")) is None
+
+    content = _build_direct_chat_context_info(
+        ConversationContext(
+            type="web",
+            ref="web:agent_direct:user@example.com:agent-1",
+            platform_data={"kind": "agent_direct"},
+        )
+    )
+
+    assert content is not None
+    assert "Direct chat context:" in content
+    assert "- Channel: web" in content
+    assert "- Direct agent chat: yes" in content
+    assert "delegate(wait=false)" in content
+    assert "create_task" in content
+
+
 @pytest.mark.asyncio
 async def test_context_assembler_injects_channel_context_only_for_channel_conversations() -> None:
     assembler = ContextAssembler(
@@ -464,6 +527,19 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     assert any("Conversation channel context:" in message for message in signal_messages)
     assert any("delegate(wait=false)" in message for message in signal_messages)
 
+    direct_result = await assembler.assemble(
+        session=_session(),
+        conversation=_agent_direct_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[],
+    )
+    direct_messages = [str(message.get("content", "")) for message in direct_result.messages]
+
+    assert any("Direct chat context:" in message for message in direct_messages)
+    assert any("delegate(wait=false)" in message for message in direct_messages)
+    assert not any("Conversation channel context:" in message for message in direct_messages)
+
     web_result = await assembler.assemble(
         session=_session(),
         conversation=_conversation(),
@@ -474,7 +550,12 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     web_messages = [str(message.get("content", "")) for message in web_result.messages]
 
     assert not any("Conversation channel context:" in message for message in web_messages)
+    assert not any("Direct chat context:" in message for message in web_messages)
     assert not any("Keep the channel unblocked" in message for message in web_messages)
+    assert not any("Keep this direct chat responsive" in message for message in web_messages)
+    assert not any(
+        "keep the conversation asynchronously responsive" in message for message in web_messages
+    )
 
 
 @pytest.mark.asyncio
@@ -1519,6 +1600,36 @@ async def test_context_assembler_mentions_skill_write_only_when_visible() -> Non
     content = str(result.messages[0]["content"])
     assert "<skills_guidance>" in content
     assert "skill_write" in content
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_includes_auto_loaded_skill_context() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent_with_auto_loaded_skill(),
+        user_message="hello",
+        tool_definitions=[],
+        skip_memory=True,
+        prompt_context=PromptContext.CHAT,
+    )
+
+    content = str(result.messages[0]["content"])
+    assert "<loaded_skills>" in content
+    assert "<loaded_skill>" in content
+    assert "Use careful implementation discipline." in content
+    assert "is not already marked as loaded" in content
+    assert "unless the skill is already marked as loaded" in content
 
 
 @pytest.mark.asyncio

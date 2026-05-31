@@ -57,6 +57,7 @@ export interface AgentFormState {
   stepAgentOverridesJson: string;
   mcpServers: MCPServerFormState[];
   intarisMcpServers: string[];
+  originalSkills: Record<string, unknown> | null;
   originalTools: Record<string, unknown>;
   executorId: string;
   executorSelector: string;
@@ -71,6 +72,7 @@ export interface AgentFormState {
   disabledTools: string[];
   optInBuiltinTools: string[];
   selectedSkillIds: string[];
+  autoLoadSkillIds: string[];
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are {name}, a capable general-purpose AI assistant.
@@ -145,6 +147,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     stepAgentOverridesJson: '{}',
     mcpServers: [],
     intarisMcpServers: [],
+    originalSkills: null,
     originalTools: {},
     executorId: '',
     executorSelector: '',
@@ -152,7 +155,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     disabledCategories: [],
     disabledTools: [],
     optInBuiltinTools: [],
-    selectedSkillIds: []
+    selectedSkillIds: [],
+    autoLoadSkillIds: []
   };
 }
 
@@ -273,6 +277,8 @@ export function agentToFormState(agent: Agent): AgentFormState {
       ? tools.opt_in_builtin_tools.filter((value): value is string => typeof value === 'string')
       : [],
     selectedSkillIds: extractSkillIds(agent.skills),
+    autoLoadSkillIds: extractAutoLoadSkillIds(agent.skills),
+    originalSkills: agent.skills,
     originalTools: tools
   };
 }
@@ -289,6 +295,68 @@ function extractSkillIds(skills: Record<string, unknown> | null): string[] {
     .map((item) => String(item.skill_id));
 }
 
+function extractAutoLoadSkillIds(skills: Record<string, unknown> | null): string[] {
+  if (!skills || typeof skills !== 'object') return [];
+  const items = (skills as Record<string, unknown>).items;
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item): item is Record<string, unknown> =>
+      typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).skill_id === 'string' && !('tool_names' in (item as Record<string, unknown>))
+    )
+    .filter((item) => item.enabled !== false && item.auto_load_instructions === true)
+    .map((item) => String(item.skill_id));
+}
+
+function skillItems(form: AgentFormState): Array<Record<string, unknown> & { skill_id: string; enabled: boolean }> {
+  const existingItems =
+    form.originalSkills && typeof form.originalSkills === 'object' && Array.isArray(form.originalSkills.items)
+      ? form.originalSkills.items.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !('tool_names' in item)))
+      : [];
+  const autoLoadIds = new Set(form.autoLoadSkillIds);
+  const selectedIds = new Set(form.selectedSkillIds);
+  const seen = new Set<string>();
+  const items: Array<Record<string, unknown> & { skill_id: string; enabled: boolean }> = [];
+
+  for (const item of existingItems) {
+    const skillId = typeof item.skill_id === 'string' ? item.skill_id : '';
+    if (!skillId || seen.has(skillId)) continue;
+    seen.add(skillId);
+    if (selectedIds.has(skillId)) {
+      const nextItem: Record<string, unknown> & { skill_id: string; enabled: boolean } = {
+        ...item,
+        skill_id: skillId,
+        enabled: true
+      };
+      if (autoLoadIds.has(skillId)) {
+        nextItem.auto_load_instructions = true;
+      } else {
+        delete nextItem.auto_load_instructions;
+      }
+      items.push(nextItem);
+      continue;
+    }
+    if (item.enabled === false) {
+      items.push({
+        ...item,
+        skill_id: skillId,
+        enabled: false
+      } as { skill_id: string; enabled: boolean; auto_load_instructions?: boolean });
+    }
+  }
+
+  for (const skillId of form.selectedSkillIds) {
+    if (seen.has(skillId)) continue;
+    seen.add(skillId);
+    items.push({
+      skill_id: skillId,
+      enabled: true,
+      ...(autoLoadIds.has(skillId) ? { auto_load_instructions: true } : {})
+    });
+  }
+
+  return items;
+}
+
 function nonEmptyLines(value: string): string[] {
   return value
     .split(/\n+/)
@@ -297,6 +365,7 @@ function nonEmptyLines(value: string): string[] {
 }
 
 export function formStateToPayload(form: AgentFormState): Record<string, unknown> {
+  const serializedSkillItems = skillItems(form);
   const toolPermissions = Object.fromEntries(
     Object.entries(form.toolPermissions).filter(([, value]) => value.length > 0)
   );
@@ -372,9 +441,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         ? { intaris_mcp_servers: form.intarisMcpServers }
         : {})
     },
-    skills: form.selectedSkillIds.length > 0
+    skills: serializedSkillItems.length > 0
       ? {
-          items: form.selectedSkillIds.map((id) => ({ skill_id: id, enabled: true }))
+          items: serializedSkillItems
         }
       : null,
     llm_config: {
@@ -436,7 +505,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
 export function formStateToSystemOverridePayload(form: AgentFormState): Record<string, unknown> {
   return {
     skills: {
-      items: form.selectedSkillIds.map((id) => ({ skill_id: id, enabled: true }))
+      items: skillItems(form)
     },
     llm_config: {
       provider_id: form.providerId || undefined,

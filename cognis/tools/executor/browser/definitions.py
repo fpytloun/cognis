@@ -14,7 +14,8 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             description=(
                 "Open or reuse a browser session and navigate to a URL. "
                 "Use profile_mode='default' unless you specifically need a fresh one-off session. "
-                "When persistent_local mode is used, you may omit profile_id and Cognis will derive a stable site profile automatically."
+                "When persistent_local mode is used, you may omit profile_id and Cognis will derive a stable site profile automatically. "
+                "Use browser_settings to override per-session behavior such as auto_consent='off' for fragile SSO/login flows."
             ),
             parameters={
                 "type": "object",
@@ -34,6 +35,30 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                     "auth_state_ref": {
                         "type": "string",
                         "description": "Optional saved browser auth state ref. Must reference a browser_storage_state credential such as $credential:rohlik-browser. Use browser_fill value_ref for raw username/password fields instead.",
+                    },
+                    "browser_settings": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "description": "Optional behavior overrides for newly created sessions. Overrides cannot change an already-open browser context; use a new session_id or close/reopen to change them.",
+                        "properties": {
+                            "auto_consent": {
+                                "type": "string",
+                                "enum": ["accept", "reject", "off"],
+                                "description": "Cookie-consent automation action. Use 'off' for fragile SSO/login shells.",
+                            },
+                            "stealth_enabled": {
+                                "type": "boolean",
+                                "description": "Override stealth/fingerprint-realism init behavior for this session.",
+                            },
+                            "fingerprint_hardening": {
+                                "type": "boolean",
+                                "description": "Override fingerprint hardening init scripts for this session.",
+                            },
+                            "humanize_input": {
+                                "type": "boolean",
+                                "description": "Override realistic mouse/keyboard input behavior for this session.",
+                            },
+                        },
                     },
                 },
                 "required": ["url", "session_id"],

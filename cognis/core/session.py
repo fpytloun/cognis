@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
 from cognis.core.immutable_prefix import (
@@ -34,9 +35,11 @@ from cognis.models.session import (
     SessionStatus,
     with_session_events_turn_id,
 )
+from cognis.models.workflow import merge_session_policies
 from cognis.runtime_context import (
     current_effective_working_directory,
     current_executor_environment,
+    current_runtime_access_context,
     current_workspace_root,
     scoped_runtime_context,
 )
@@ -257,6 +260,8 @@ def _intaris_session_policy(
     project_paths: list[str] | None = None,
     executor_home: str | None = None,
     executor_tmpdir: str | None = None,
+    interaction_mode: str | None = None,
+    session_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``policy`` payload for ``guardrails.create_session``.
 
@@ -290,13 +295,25 @@ def _intaris_session_policy(
     for raw_path in project_paths or []:
         _add(raw_path)
 
-    return {"allow_paths": paths} if paths else {}
+    policy: dict[str, Any] = {"allow_paths": paths} if paths else {}
+    if interaction_mode:
+        policy["interaction_mode"] = interaction_mode
+        if interaction_mode == "none":
+            policy["judge"] = {
+                "allowed_decisions": ["approve", "deny"],
+                "on_uncertain": "deny",
+                "allow_human_escalation": False,
+            }
+    policy.update(merge_session_policies(session_policy))
+    return policy
 
 
 def _intaris_session_context(
     working_directory: str | None,
     *,
     project_paths: list[str],
+    interaction_mode: str | None = None,
+    session_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
     executor_home = _resolve_executor_home()
     policy = _intaris_session_policy(
@@ -304,6 +321,8 @@ def _intaris_session_context(
         project_paths=project_paths,
         executor_home=executor_home,
         executor_tmpdir=getattr(current_executor_environment.get(), "tmpdir", None),
+        interaction_mode=interaction_mode,
+        session_policy=session_policy,
     )
     source_label = _derive_intaris_source_label(
         working_directory,
@@ -346,8 +365,22 @@ class SessionManager:
                 db_session, session.conversation_id
             )
             project_paths = await _project_source_paths(db_session, project_id)
-        new_policy = _intaris_session_policy(workdir, project_paths=project_paths)
-        if not new_policy.get("allow_paths"):
+        runtime_access = current_runtime_access_context.get()
+        session_policy = None
+        if runtime_access and runtime_access.session_policy:
+            session_policy = runtime_access.session_policy
+        new_policy = _intaris_session_policy(
+            workdir,
+            project_paths=project_paths,
+            interaction_mode=runtime_access.interaction_mode if runtime_access else None,
+            session_policy=session_policy,
+        )
+        if (
+            not new_policy.get("allow_paths")
+            and not new_policy.get("interaction_mode")
+            and not new_policy.get("allow_policies")
+            and not new_policy.get("deny_policies")
+        ):
             return
         intaris_session_id = session.intaris_session_id or session.session_id
         if hasattr(self.providers.guardrails, "update_session_policy"):
@@ -400,6 +433,70 @@ class SessionManager:
                 raise
         return _to_conversation_model(conversation)
 
+    async def get_or_create_agent_direct_conversation(
+        self,
+        *,
+        user_email: str,
+        agent_id: str,
+    ) -> ConversationModel:
+        """Return the sticky web direct chat for a user/agent pair."""
+
+        context_ref = agent_direct_context_ref(user_email, agent_id)
+        for attempt in range(2):
+            async with self.session_factory() as db_session:
+                existing = await queries.get_agent_direct_conversation(
+                    db_session,
+                    user_email,
+                    agent_id,
+                )
+                if existing is not None:
+                    if existing.context_ref != context_ref:
+                        if not await queries.mark_conversation_agent_direct(
+                            db_session,
+                            existing.conversation_id,
+                            user_email=user_email,
+                            agent_id=agent_id,
+                        ):
+                            raise RuntimeError("Failed to mark agent direct conversation")
+                        await db_session.commit()
+                        existing = await queries.get_agent_direct_conversation(
+                            db_session,
+                            user_email,
+                            agent_id,
+                        )
+                        if existing is None:
+                            raise RuntimeError("Failed to canonicalize agent direct conversation")
+                    return _to_conversation_model(existing)
+                try:
+                    await self._require_agent(db_session, agent_id)
+                    conversation = await queries.create_conversation(
+                        db_session,
+                        user_email=user_email,
+                        agent_id=agent_id,
+                        context_type="web",
+                        title=None,
+                        title_source="agent_direct",
+                        context_ref=context_ref,
+                        context_data={"kind": AGENT_DIRECT_KIND},
+                        memory_labels={},
+                    )
+                    await db_session.commit()
+                    return _to_conversation_model(conversation)
+                except Exception:
+                    await db_session.rollback()
+                    if attempt == 0:
+                        continue
+                    raise
+        async with self.session_factory() as db_session:
+            existing = await queries.get_agent_direct_conversation(
+                db_session,
+                user_email,
+                agent_id,
+            )
+            if existing is not None:
+                return _to_conversation_model(existing)
+        raise RuntimeError("Failed to create or load agent direct conversation")
+
     async def create_root_session(
         self,
         *,
@@ -436,6 +533,7 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
+                runtime_access = current_runtime_access_context.get()
                 with scoped_runtime_context(
                     user_email=user_email,
                     agent_id=agent_id,
@@ -447,7 +545,13 @@ class SessionManager:
                         agent_id=agent_id,
                         user_id=user_email,
                         details=_intaris_session_details(workdir),
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                        policy=_intaris_session_policy(
+                            workdir,
+                            project_paths=project_paths,
+                            session_policy=(
+                                runtime_access.session_policy if runtime_access else None
+                            ),
+                        ),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -496,6 +600,8 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
+                runtime_access = current_runtime_access_context.get()
+                session_policy = runtime_access.session_policy if runtime_access else None
                 source_label = _derive_intaris_source_label(
                     workdir,
                     project_paths=project_paths,
@@ -511,7 +617,11 @@ class SessionManager:
                         agent_id=agent_id,
                         user_id=user_email,
                         details=_intaris_session_details(workdir, source=source_label),
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                        policy=_intaris_session_policy(
+                            workdir,
+                            project_paths=project_paths,
+                            session_policy=session_policy,
+                        ),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -599,6 +709,8 @@ class SessionManager:
                 conversation_project_id = getattr(conversation, "project_id", None)
                 project_paths = await _project_source_paths(db_session, conversation_project_id)
                 workdir = _resolve_runtime_workdir()
+                runtime_access = current_runtime_access_context.get()
+                session_policy = runtime_access.session_policy if runtime_access else None
                 source_label = _derive_intaris_source_label(
                     workdir,
                     project_paths=project_paths,
@@ -614,7 +726,11 @@ class SessionManager:
                         agent_id=agent_id,
                         user_id=user_email,
                         details=_intaris_session_details(workdir, source=source_label),
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
+                        policy=_intaris_session_policy(
+                            workdir,
+                            project_paths=project_paths,
+                            session_policy=session_policy,
+                        ),
                     )
                 await queries.set_session_intaris_session_id(
                     db_session, session_row.session_id, session_row.session_id
@@ -644,6 +760,8 @@ class SessionManager:
         extra_prefix_entries: list[ImmutablePrefixEntry] | None = None,
         extra_history_events: list[SessionEvent] | None = None,
         snapshot_extras: dict[str, Any] | None = None,
+        max_source_seq: int | None = None,
+        event_filter: Any | None = None,
     ) -> tuple[ConversationModel, SessionModel, bool]:
         """Fork a source session into a new web conversation."""
 
@@ -684,8 +802,52 @@ class SessionManager:
             },
             extra_prefix_entries=extra_prefix_entries,
             extra_history_events=extra_history_events,
+            max_source_seq=max_source_seq,
+            event_filter=event_filter,
         )
         return conversation, session, copied
+
+    async def fork_active_turn_checkpoint_into_new_conversation(
+        self,
+        *,
+        source_session: SessionModel,
+        source_conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+        active_turn_id: str | None,
+        title: str | None = None,
+        intention: str | None = None,
+        snapshot_extras: dict[str, Any] | None = None,
+    ) -> tuple[ConversationModel, SessionModel, bool]:
+        """Fork a session while a turn is active, excluding that in-flight turn."""
+
+        if not active_turn_id:
+            raise ValueError("active_turn_id is required for active-turn checkpoint fork")
+
+        events = await self._read_history_events(source_session)
+        active_turn_event_seqs = [
+            event.seq for event in events if event.data.get("turn_id") == active_turn_id
+        ]
+        max_source_seq = min(active_turn_event_seqs) - 1 if active_turn_event_seqs else None
+
+        def is_completed_checkpoint_event(event: CachedEvent) -> bool:
+            return event.data.get("turn_id") != active_turn_id
+
+        return await self.fork_into_new_conversation(
+            source_session=source_session,
+            source_conversation=source_conversation,
+            agent=agent,
+            user_email=user_email,
+            title=title,
+            intention=intention,
+            snapshot_extras={
+                "checkpoint": "last_completed_turn",
+                "excluded_active_turn_id": active_turn_id,
+                **(snapshot_extras or {}),
+            },
+            max_source_seq=max_source_seq,
+            event_filter=is_completed_checkpoint_event,
+        )
 
     async def undo_last_turn(
         self,

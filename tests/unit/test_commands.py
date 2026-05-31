@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.commands import CommandDispatcher, is_system_slash_command_message
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
@@ -55,10 +56,22 @@ class _TurnScheduler:
     def __init__(self, *, cancelled: bool) -> None:
         self.cancelled = cancelled
         self.calls: list[str] = []
+        self.submitted: list[tuple[str, str, str]] = []
+        self.submit_error: object | None = None
+        self.checkpoints: dict[str, dict[str, str | None]] = {}
 
     async def cancel_turn(self, conversation_id: str) -> bool:
         self.calls.append(conversation_id)
         return self.cancelled
+
+    async def submit_turn(
+        self, conversation_id: str, content: str, *, user_email: str
+    ) -> object | None:
+        self.submitted.append((conversation_id, content, user_email))
+        return self.submit_error
+
+    def active_turn_checkpoint(self, conversation_id: str) -> dict[str, str | None] | None:
+        return self.checkpoints.get(conversation_id)
 
 
 class _TaskQueue:
@@ -212,6 +225,42 @@ class _SessionManager:
             )
         )
         self.mark_completed = AsyncMock(return_value=True)
+        self.fork_into_new_conversation = AsyncMock(
+            return_value=(
+                ConversationModel(
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context=ConversationContext(type="web"),
+                    active_session_id="sess-2",
+                ),
+                SessionModel(
+                    session_id="sess-2",
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                ),
+                True,
+            )
+        )
+        self.fork_active_turn_checkpoint_into_new_conversation = AsyncMock(
+            return_value=(
+                ConversationModel(
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context=ConversationContext(type="web"),
+                    active_session_id="sess-2",
+                ),
+                SessionModel(
+                    session_id="sess-2",
+                    conversation_id="conv-2",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                ),
+                True,
+            )
+        )
         self.undo_last_turn = AsyncMock(return_value=None)
         self.redo_last_undo = AsyncMock(return_value=None)
 
@@ -350,6 +399,352 @@ async def test_new_web_conversation_does_not_clone_execution_paths() -> None:
     assert context.platform_data == {"draft_id": "draft-1"}
     assert context.memory_labels == {"origin": "chat"}
     manager.mark_completed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_web_command_cancels_busy_turn_and_creates_conversation() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/new",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert scheduler.calls == ["conv-1"]
+    manager.create_conversation_with_root_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_new_agent_direct_command_rotates_session_in_same_conversation() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+    conversation = ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="web",
+            ref=agent_direct_context_ref("user@example.com", "agent-1"),
+            platform_data={"kind": AGENT_DIRECT_KIND},
+        ),
+    )
+
+    result = await dispatcher.dispatch(
+        "/new",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "session_reset"
+    assert result.data["conversation_id"] == "conv-1"
+    assert result.data["session_id"] == "sess-2"
+    assert scheduler.calls == ["conv-1"]
+    manager.rotate_session.assert_awaited_once()
+    manager.create_conversation_with_root_session.assert_not_awaited()
+    manager.mark_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_new_channel_command_cancels_busy_turn_and_rotates_session() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+    conversation = ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="signal", ref="signal:acct:chat"),
+    )
+
+    result = await dispatcher.dispatch(
+        "/new",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "session_reset"
+    assert scheduler.calls == ["conv-1"]
+    manager.rotate_session.assert_awaited_once()
+    manager.create_conversation_with_root_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_command_creates_new_conversation_without_initial_message() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert result.data["conversation_id"] == "conv-2"
+    assert result.data["session_id"] == "sess-2"
+    assert "initial_message_submitted" not in result.data
+    assert scheduler.submitted == []
+    manager.fork_into_new_conversation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fork_command_with_message_submits_initial_turn_to_fork() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork continue exploring this topic",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert result.data["conversation_id"] == "conv-2"
+    assert result.data["session_id"] == "sess-2"
+    assert result.data["initial_message_submitted"] is True
+    assert scheduler.submitted == [("conv-2", "continue exploring this topic", "user@example.com")]
+    manager.fork_into_new_conversation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fork_command_with_message_reports_turn_start_error() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    scheduler.submit_error = SimpleNamespace(
+        code="conflict",
+        message="Conversation is not active",
+        recoverable=False,
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork continue exploring this topic",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert result.data["initial_message_submitted"] is False
+    assert result.data["initial_message_error"] == {
+        "code": "conflict",
+        "message": "Conversation is not active",
+        "recoverable": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fork_command_with_message_uses_checkpoint_during_busy_turn() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    scheduler.checkpoints["conv-1"] = {"session_id": "sess-1", "turn_id": "turn-active"}
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork continue exploring this topic",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert result.data["checkpoint"] == "last_completed_turn"
+    assert result.data["excluded_active_turn_id"] == "turn-active"
+    assert result.data["initial_message_submitted"] is True
+    assert scheduler.submitted == [("conv-2", "continue exploring this topic", "user@example.com")]
+    manager.fork_into_new_conversation.assert_not_awaited()
+    manager.fork_active_turn_checkpoint_into_new_conversation.assert_awaited_once()
+    kwargs = manager.fork_active_turn_checkpoint_into_new_conversation.await_args.kwargs
+    assert kwargs["active_turn_id"] == "turn-active"
+
+
+@pytest.mark.asyncio
+async def test_fork_command_without_message_uses_checkpoint_during_busy_turn() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    scheduler.checkpoints["conv-1"] = {"session_id": "sess-1", "turn_id": "turn-active"}
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "conversation_created"
+    assert result.text == "Conversation forked from the last completed turn."
+    assert result.data["checkpoint"] == "last_completed_turn"
+    assert result.data["excluded_active_turn_id"] == "turn-active"
+    assert "initial_message_submitted" not in result.data
+    assert scheduler.submitted == []
+    manager.fork_into_new_conversation.assert_not_awaited()
+    manager.fork_active_turn_checkpoint_into_new_conversation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fork_command_reports_missing_checkpoint_during_busy_turn() -> None:
+    manager = _SessionManager()
+    scheduler = _TurnScheduler(cancelled=True)
+    scheduler.checkpoints["conv-1"] = {"session_id": "sess-1", "turn_id": None}
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork continue exploring this topic",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+        has_busy_turn=True,
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "active_turn_checkpoint_unavailable"}
+    assert scheduler.submitted == []
+    manager.fork_into_new_conversation.assert_not_awaited()
+    manager.fork_active_turn_checkpoint_into_new_conversation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fork_command_with_message_requires_turn_scheduler() -> None:
+    manager = _SessionManager()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=manager,
+        session_cache=None,
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/fork continue exploring this topic",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data == {"code": "turn_scheduler_unavailable"}
+    manager.fork_into_new_conversation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -630,6 +1025,7 @@ async def test_redo_returns_history_rebased_same_conversation() -> None:
 
 def test_slash_command_classification_ignores_one_shot_chat_modes() -> None:
     assert is_system_slash_command_message("/undo")
+    assert is_system_slash_command_message("/fork continue exploring this topic")
     assert is_system_slash_command_message("/model gpt-5")
     assert is_system_slash_command_message("/task do work")
     assert is_system_slash_command_message("/research compare options")

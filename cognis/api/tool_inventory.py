@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from cognis.models.tool import ToolDefinition, ToolSource, sanitize_mcp_tool_name, stable_tool_id
+from cognis.models.tool import (
+    ToolDefinition,
+    ToolSource,
+    sanitize_mcp_tool_name,
+    stable_tool_id,
+)
 
 
 def extract_intaris_aggregated_server_name(row: dict[str, Any]) -> str | None:

@@ -36,7 +36,7 @@ class _FakeCompactionStrategy:
         fail: bool = False,
         slow: float = 0.0,
     ) -> None:
-        self.calls: list[tuple[str, str]] = []  # (session_id, trigger)
+        self.calls: list[tuple[str, str, bool]] = []  # (session_id, trigger, long_lived_chat)
         self.preserve_turns = 2
         self._result = result or CompactionResult(
             compacted=True,
@@ -55,9 +55,10 @@ class _FakeCompactionStrategy:
         *,
         trigger: str = "manual",
         model_context: object | None = None,
+        long_lived_chat: bool = False,
     ) -> CompactionResult:
         del model_context
-        self.calls.append((session.session_id, trigger))
+        self.calls.append((session.session_id, trigger, long_lived_chat))
         if self._slow:
             await asyncio.sleep(self._slow)
         if self._fail:
@@ -145,6 +146,17 @@ class _FakeSessionCache:
         self, session: SessionModel, *, summary: str, compaction_seq: int
     ) -> None:
         self.compactions.append((session.session_id, summary, compaction_seq))
+
+    def get_events_since_compaction(
+        self, session_id: str, types: list[str] | None = None
+    ) -> list[CachedEvent]:
+        if self._entry is None or self._entry.session_id != session_id:
+            return []
+        events = self._entry.events
+        if types is None:
+            return list(events)
+        allowed = set(types)
+        return [event for event in events if event.type in allowed]
 
     async def append_recorded_events(
         self, session: SessionModel, events: list, result: Any
@@ -277,7 +289,7 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
 
     # Compaction was called with trigger="automatic"
     assert len(compaction.calls) == 1
-    assert compaction.calls[0] == ("session-1", "automatic")
+    assert compaction.calls[0] == ("session-1", "automatic", False)
 
     # Session was rotated
     assert len(session_mgr.rotations) == 1
@@ -445,3 +457,66 @@ async def test_auto_compact_no_cache_entry_runs_normally() -> None:
     # Should still run compaction (no early-exit)
     assert len(compaction.calls) == 1
     assert len(session_mgr.rotations) == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_checkpoint_compacts_with_ambient_prompt_and_trigger() -> None:
+    compaction = _FakeCompactionStrategy()
+    session_mgr = _FakeSessionManager()
+    cache = _FakeSessionCache(entry=_cache_entry_with_events(11))
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(event: Event) -> None:
+        published.append(event)
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(
+        compaction=compaction,
+        session_manager=session_mgr,
+        session_cache=cache,
+        event_bus=bus,
+    )
+
+    new_session = await loop.run_idle_checkpoint_compaction(
+        conversation=_conversation(),
+        session=_session(),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            name="Test Agent",
+            owner_email="user@example.com",
+        ),
+        min_events=20,
+    )
+
+    assert new_session is not None
+    assert compaction.calls == [("session-1", "idle_checkpoint", True)]
+    assert len(session_mgr.rotations) == 1
+    assert published[0].data["trigger"] == "idle_checkpoint"
+
+
+@pytest.mark.asyncio
+async def test_idle_checkpoint_skips_below_min_events() -> None:
+    compaction = _FakeCompactionStrategy()
+    session_mgr = _FakeSessionManager()
+    cache = _FakeSessionCache(entry=_cache_entry_with_events(9))
+    loop = _minimal_agent_loop(
+        compaction=compaction,
+        session_manager=session_mgr,
+        session_cache=cache,
+    )
+
+    new_session = await loop.run_idle_checkpoint_compaction(
+        conversation=_conversation(),
+        session=_session(),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            name="Test Agent",
+            owner_email="user@example.com",
+        ),
+        min_events=20,
+    )
+
+    assert new_session is None
+    assert compaction.calls == []
+    assert session_mgr.rotations == []

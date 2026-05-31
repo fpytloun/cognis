@@ -339,6 +339,10 @@ async def test_list_pending_reconciles_externally_resolved_submitted_escalations
     assert row.resolution["state"] == "resolved_remote"
     assert row.resolution["decision"] == "approve"
     assert event_bus.events[-1].data["notification_id"] == "call-1"
+    assert event_bus.events[-1].data["user_email"] == "user@example.com"
+    assert event_bus.events[-1].data["conversation_id"] == "conv-1"
+    assert event_bus.events[-1].data["task_id"] == "task_live"
+    assert event_bus.events[-1].data["session_id"] == "sess-1"
 
 
 @pytest.mark.asyncio
@@ -371,6 +375,9 @@ async def test_reconcile_remote_escalation_uses_intaris_user_decision() -> None:
     assert row.resolution["decision"] == "deny"
     assert row.resolution["note"] == "denied in Intaris"
     assert row.resolution["state"] == "resolved_remote"
+    assert event_bus.events[-1].data["user_email"] == "user@example.com"
+    assert event_bus.events[-1].data["conversation_id"] == "conv-1"
+    assert event_bus.events[-1].data["session_id"] == "sess-1"
 
 
 @pytest.mark.asyncio

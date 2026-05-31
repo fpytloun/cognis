@@ -54,6 +54,10 @@ import X from 'lucide-svelte/icons/x';
     buildConversationUrl,
     CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
     CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
+    conversationAttentionDotClass,
+    conversationAttentionLabel,
+    conversationAttentionOrbitClass,
+    conversationAttentionTone,
     conversationStatusFilterForConversation,
     distanceFromScrollBottom,
     getConversationRetryScope,
@@ -63,14 +67,17 @@ import X from 'lucide-svelte/icons/x';
     isCurrentConversationLoad,
     isForeignSessionTimelineEvent,
     nextChatScrollState,
+    normalizeChatModeTone,
     parseConversationStatusFilter,
     isPreSessionChatConversation,
+    pendingNotificationTypesFromNotifications,
     setConversationStatusSearchParam,
     shouldReconcileAfterReconnect,
     shouldAdoptConversationSessionId,
     shouldSuppressPreSessionSocketError,
     nextConversationLoadId,
     nextPollDelayMs,
+    type ChatModeTone,
     type ConversationStatusFilter,
     CHAT_STORAGE_KEYS,
     SESSION_LOG_BOOTSTRAP_MAX_PAGES,
@@ -90,12 +97,14 @@ import X from 'lucide-svelte/icons/x';
   import { pastedFileFingerprint, pastedFilesFromClipboardData, readPastedFilesFromNavigator } from '$lib/clipboard';
   import {
     enableWebPush,
+    hasDismissedWebPushPrompt,
     hasEnabledWebPush,
     isWebPushSupported,
     needsIosHomeScreenInstall,
     notifyIfHidden,
     permissionState,
-    reconcileWebPushSubscription
+    reconcileWebPushSubscription,
+    setWebPushPromptDismissed
   } from '$lib/notifications';
   import { buildLinkedServiceUrl, openUrlInNewTab } from '$lib/config';
   import { workspaceHealth } from '$lib/system';
@@ -122,7 +131,8 @@ import X from 'lucide-svelte/icons/x';
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
-  import type { ActiveThinkingSnapshot, Agent, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
+  import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
+  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -136,6 +146,9 @@ import X from 'lucide-svelte/icons/x';
   let availableChannelTypes = $state<string[]>([]);
   let conversationCursor: string | null = null;
   let conversationsHasMore = $state(false);
+  let conversationListLoading = $state(false);
+  let conversationListRefreshing = $state(false);
+  let conversationListLoadCount = 0;
   let conversationSearch = $state('');
   let conversationSearchResults = $state<ConversationSearchMatch[]>([]);
   let conversationSearchLoading = $state(false);
@@ -156,10 +169,12 @@ import X from 'lucide-svelte/icons/x';
   let lastSeededSearchKey = '';
   let lastChatSearchConversationId = '';
   let agents = $state<Agent[]>([]);
+  let agentDirectChats = $state<AgentDirectChat[]>([]);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
   let conversationTodoSnapshots = $state<Record<string, TodoSnapshotItem[]>>({});
   let conversationSubloadsLoading = $state(false);
+  let cachedConversationRefreshing = $state(false);
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
@@ -231,6 +246,8 @@ import X from 'lucide-svelte/icons/x';
   let visibleStartIndex = $state(0);
   let activeConversationId = '';
   let activeSessionLastSeq = 0;
+  let olderMessagesCursor = $state<string | null>(null);
+  let hasOlderMessages = $state(false);
   const CONVERSATION_VIEW_CACHE_LIMIT = 8;
   const escalationTimeoutSeconds = 300;
   let escalations = $state<Escalation[]>([]);
@@ -239,13 +256,14 @@ import X from 'lucide-svelte/icons/x';
   let escalationError = $state('');
   let escalationCountdownTimer: number | null = null;
   let notificationRefreshTimer: number | null = null;
-  let pushPromptDismissed = $state(false);
+  let pushPromptDismissed = $state(hasDismissedWebPushPrompt());
   let pushSubscriptionKnownEnabled = $state(hasEnabledWebPush());
   let pushPromptBusy = $state(false);
   let pushPromptError = $state('');
   let pushDeliveryError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
+  let activeTurnChatMode = $state<ChatModeTone>('default');
   let lastSubmittedMessage = '';
   let lastRecoverableMessage = $state('');
   let showNewChatModal = $state(false);
@@ -308,6 +326,9 @@ import X from 'lucide-svelte/icons/x';
     turnInProgress: boolean;
     awaitingAssistantStart: boolean;
     activeSessionLastSeq: number;
+    olderMessagesCursor: string | null;
+    hasOlderMessages: boolean;
+    activeTurnChatMode: ChatModeTone;
     fetchedAt: number;
   }
 
@@ -750,6 +771,7 @@ import X from 'lucide-svelte/icons/x';
       if (result.ok) {
         pushSubscriptionKnownEnabled = true;
         pushPromptDismissed = true;
+        setWebPushPromptDismissed(true);
         addToast(result.message, 'success');
       } else {
         pushPromptError = result.message;
@@ -773,7 +795,6 @@ import X from 'lucide-svelte/icons/x';
     return false;
   }
 
-  const TERMINAL_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled']);
   const BLOCKED_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled', 'suspended']);
 
   function activeSessionStatus(): string | null {
@@ -782,9 +803,38 @@ import X from 'lucide-svelte/icons/x';
     return root?.status ?? null;
   }
 
+  function backingSessionCount(): number {
+    if (!currentConversation?.active_session_id) return 0;
+
+    const byId = new Map(sessions.map((session) => [session.session_id, session]));
+    const visited = new Set<string>();
+    let count = 0;
+    let currentSessionId: string | null = currentConversation.active_session_id;
+
+    while (currentSessionId && !visited.has(currentSessionId)) {
+      visited.add(currentSessionId);
+      const session = byId.get(currentSessionId);
+      if (!session || session.parent_session_id) break;
+      count += 1;
+      currentSessionId = session.previous_session_id;
+    }
+
+    return count;
+  }
+
   function isSessionBlocked(): boolean {
     const status = activeSessionStatus();
     return status !== null && BLOCKED_SESSION_STATES.has(status);
+  }
+
+  function startNewConversationFromBlockedSession(): void {
+    if (!currentConversation || isReadOnly(currentConversation)) return;
+    error = '';
+    awaitingAssistantStart = false;
+    turnInProgress = false;
+    activeTurnChatMode = 'default';
+    clearConversationTurnState(currentConversation.conversation_id);
+    wsClient.sendMessage(currentConversation.conversation_id, '/new', [], null);
   }
 
   function directQuestionOptions(options: unknown): string[] {
@@ -888,7 +938,7 @@ import X from 'lucide-svelte/icons/x';
 
   function persistLastOpenedConversation(conversation: Conversation): void {
     if (typeof window === 'undefined') return;
-    if (conversation.status === 'active' && isWebConversation(conversation)) {
+    if (conversation.status === 'active' && isWebConversation(conversation) && !isAgentDirectConversation(conversation)) {
       window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
     }
   }
@@ -906,10 +956,11 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function nextVisibleConversationId(excludingConversationId: string): string | null {
-    return conversations.find((conversation) => conversation.conversation_id !== excludingConversationId)?.conversation_id ?? null;
+    return conversations.find((conversation) => (
+      conversation.conversation_id !== excludingConversationId
+      && !isAgentDirectConversation(conversation)
+    ))?.conversation_id ?? null;
   }
-
-  const terminalTodoStatuses = new Set(['completed', 'cancelled']);
 
   let chatTodos = $derived.by(() => {
     const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
@@ -921,8 +972,8 @@ import X from 'lucide-svelte/icons/x';
     }
     return [];
   });
-  let activeChatTodos = $derived.by(() => chatTodos.filter((todo) => !terminalTodoStatuses.has(todo.status)));
-  let visibleChatProgressTodos = $derived(chatTodos.filter((todo) => todo.status !== 'cancelled'));
+  let activeChatTodos = $derived.by(() => incompleteTodos(chatTodos));
+  let visibleChatProgressTodos = $derived(activeVisibleTodos(chatTodos));
   let shouldShowChatTodoProgress = $derived(turnInProgress && visibleChatProgressTodos.length > 0);
   // Keep the latest todo snapshot visible even after everything is
   // completed so the user can still inspect what just finished.
@@ -933,7 +984,7 @@ import X from 'lucide-svelte/icons/x';
   }));
 
   function visibleTodoSnapshot(todos: TodoSnapshotItem[] | undefined): TodoSnapshotItem[] {
-    return (todos ?? []).filter((todo) => todo.status !== 'cancelled');
+    return activeVisibleTodos(todos);
   }
 
   function hasIncompleteTodo(todos: TodoSnapshotItem[]): boolean {
@@ -1035,6 +1086,9 @@ import X from 'lucide-svelte/icons/x';
     if (event.code === 'session_creation_failed') {
       return 'Could not create or recover the conversation session. Try again or check the diagnostics page.';
     }
+    if (event.code === 'session_ended') {
+      return 'This session has ended. Use /new or Start new conversation to continue.';
+    }
     if (event.code === 'turn_cancelled') {
       return 'The current turn was cancelled.';
     }
@@ -1060,6 +1114,15 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
+  function isAgentDirectConversation(conversation: Conversation | null | undefined): boolean {
+    return conversation?.context?.type === 'web'
+      && conversation.context.platform_data?.kind === 'agent_direct';
+  }
+
+  function canStarConversation(conversation: Conversation): boolean {
+    return !isAgentDirectConversation(conversation);
+  }
+
   function sortConversationsByActivity(items: Conversation[]): Conversation[] {
     return [...items].sort((left, right) => {
       const activityDelta = conversationActivityValue(right) - conversationActivityValue(left);
@@ -1070,10 +1133,29 @@ import X from 'lucide-svelte/icons/x';
     });
   }
 
+  function sortAgentDirectChats(items: AgentDirectChat[]): AgentDirectChat[] {
+    return [...items].sort((left, right) => {
+      const activityDelta = conversationActivityValue(right.conversation) - conversationActivityValue(left.conversation);
+      if (activityDelta !== 0) return activityDelta;
+      return left.agent.agent_id.localeCompare(right.agent.agent_id);
+    });
+  }
+
   function mergeConversationList(items: Conversation[], { reset = false }: { reset?: boolean } = {}): void {
-    const next = reset ? [] : [...conversations];
+    const next = reset ? [] : conversations.filter((conversation) => !isAgentDirectConversation(conversation));
     const indexById = new Map(next.map((conversation, index) => [conversation.conversation_id, index]));
     for (const conversation of items) {
+      if (currentConversation?.conversation_id === conversation.conversation_id) {
+        currentConversation = conversation;
+        turnInProgress = conversation.has_active_turn;
+        activeTurnChatMode = conversation.has_active_turn
+          ? normalizeChatModeTone(conversation.active_turn_chat_mode)
+          : 'default';
+      }
+      if (isAgentDirectConversation(conversation)) {
+        patchAgentDirectChat(conversation);
+        continue;
+      }
       const index = indexById.get(conversation.conversation_id);
       if (index === undefined) {
         indexById.set(conversation.conversation_id, next.length);
@@ -1085,14 +1167,44 @@ import X from 'lucide-svelte/icons/x';
     conversations = sortConversationsByActivity(next);
   }
 
+  function patchAgentDirectChat(conversation: Conversation): void {
+    if (!isAgentDirectConversation(conversation)) return;
+    const agent = agents.find((candidate) => candidate.agent_id === conversation.agent_id);
+    if (!agent) return;
+    mergeAgentDirectChats([{ agent, conversation }]);
+  }
+
+  function mergeAgentDirectChats(items: AgentDirectChat[]): void {
+    const merged = new Map(agentDirectChats.map((item) => [item.agent.agent_id, item]));
+    for (const item of items) {
+      merged.set(item.agent.agent_id, item);
+    }
+    agentDirectChats = sortAgentDirectChats([...merged.values()]);
+  }
+
   function patchConversationInList(
     conversationId: string,
     patch: Partial<Conversation>,
     options: { touchUpdatedAt?: boolean; touchLastMessageAt?: boolean } = {}
   ): void {
     const index = conversations.findIndex((conversation) => conversation.conversation_id === conversationId);
-    if (index < 0) return;
     const now = new Date().toISOString();
+    if (index < 0) {
+      const direct = agentDirectChats.find((item) => item.conversation.conversation_id === conversationId);
+      if (direct) {
+        const updatedDirectConversation: Conversation = {
+          ...direct.conversation,
+          ...patch,
+          updated_at: options.touchUpdatedAt ? patch.updated_at ?? now : patch.updated_at ?? direct.conversation.updated_at,
+          last_message_at: options.touchLastMessageAt ? patch.last_message_at ?? now : patch.last_message_at ?? direct.conversation.last_message_at,
+        };
+        patchAgentDirectChat(updatedDirectConversation);
+        if (currentConversation?.conversation_id === conversationId) {
+          currentConversation = { ...currentConversation, ...updatedDirectConversation };
+        }
+      }
+      return;
+    }
     const existing = conversations[index];
     const updated: Conversation = {
       ...existing,
@@ -1103,6 +1215,7 @@ import X from 'lucide-svelte/icons/x';
     const next = [...conversations];
     next[index] = updated;
     conversations = sortConversationsByActivity(next);
+    patchAgentDirectChat(updated);
     if (currentConversation?.conversation_id === conversationId) {
       currentConversation = { ...currentConversation, ...updated };
     }
@@ -1113,8 +1226,21 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     const previousSessionId = currentConversation.active_session_id;
-    currentConversation = { ...currentConversation, active_session_id: activeSessionId };
-    patchConversationInList(currentConversation.conversation_id, { active_session_id: activeSessionId }, { touchUpdatedAt: true });
+    currentConversation = {
+      ...currentConversation,
+      active_session_id: activeSessionId,
+      active_session_status: null,
+      active_session_completion_reason: null,
+    };
+    patchConversationInList(
+      currentConversation.conversation_id,
+      {
+        active_session_id: activeSessionId,
+        active_session_status: null,
+        active_session_completion_reason: null,
+      },
+      { touchUpdatedAt: true }
+    );
     if (previousSessionId !== activeSessionId) {
       invalidateSessionInfo();
       if (headerInfoOpen) {
@@ -1171,6 +1297,9 @@ import X from 'lucide-svelte/icons/x';
       turnInProgress,
       awaitingAssistantStart,
       activeSessionLastSeq,
+      olderMessagesCursor,
+      hasOlderMessages,
+      activeTurnChatMode,
       fetchedAt: Date.now(),
     });
   }
@@ -1190,6 +1319,9 @@ import X from 'lucide-svelte/icons/x';
     turnInProgress = entry.turnInProgress;
     awaitingAssistantStart = entry.awaitingAssistantStart;
     activeSessionLastSeq = entry.activeSessionLastSeq;
+    olderMessagesCursor = entry.olderMessagesCursor ?? null;
+    hasOlderMessages = entry.hasOlderMessages ?? false;
+    activeTurnChatMode = entry.activeTurnChatMode ?? 'default';
     visibleStartIndex = Math.min(entry.visibleStartIndex, Math.max(0, timeline.length - 1));
     userScrolledUp = entry.userScrolledUp;
     initialLoadTimedOut = false;
@@ -1207,10 +1339,10 @@ import X from 'lucide-svelte/icons/x';
 
   function timelineItemKey(item: TimelineItem): string {
     if (item.kind === 'message') {
-      if (item.messageId) return `message:${item.role}:${item.messageId}`;
+      if (item.messageId) return `message:${item.role}:${item.sessionId ?? 'unknown-session'}:${item.messageId}`;
       if (item.clientMessageId) return `client-message:${item.clientMessageId}`;
       if (item.queueId) return `queue-message:${item.queueId}`;
-      if (item.seq !== null) return `message-seq:${item.role}:${item.seq}`;
+      if (item.seq !== null) return `message-seq:${item.role}:${item.sessionId ?? 'unknown-session'}:${item.seq}`;
     }
     return `${item.kind}:${item.id}`;
   }
@@ -1234,12 +1366,16 @@ import X from 'lucide-svelte/icons/x';
   function mergeTimelineRefresh(refreshed: TimelineItem[], existing: TimelineItem[]): TimelineItem[] {
     if (existing.length === 0) return refreshed;
     const refreshedKeys = new Set(refreshed.map(timelineItemKey));
+    const firstRefreshedExistingIndex = existing.findIndex((item) => refreshedKeys.has(timelineItemKey(item)));
+    const preservedOlderItems = firstRefreshedExistingIndex > 0
+      ? existing.slice(0, firstRefreshedExistingIndex).filter((item) => !refreshedKeys.has(timelineItemKey(item)))
+      : [];
     const preservedLiveItems = existing.filter((item) => {
       if (!isLiveOnlyTimelineItem(item)) return false;
       return !refreshedKeys.has(timelineItemKey(item));
     });
-    if (preservedLiveItems.length === 0) return refreshed;
-    const result = [...refreshed];
+    if (preservedOlderItems.length === 0 && preservedLiveItems.length === 0) return refreshed;
+    const result = [...preservedOlderItems, ...refreshed];
     for (const item of preservedLiveItems) {
       const previousIndex = existing.findIndex((candidate) => candidate.id === item.id);
       const insertAfterKey = previousIndex > 0 ? timelineItemKey(existing[previousIndex - 1]) : null;
@@ -1255,6 +1391,20 @@ import X from 'lucide-svelte/icons/x';
     return result;
   }
 
+  function prependOlderTimelinePage(existing: TimelineItem[], older: TimelineItem[]): TimelineItem[] {
+    if (older.length === 0) return existing;
+    const existingKeys = new Set(existing.map(timelineItemKey));
+    const uniqueOlder = older.filter((item) => !existingKeys.has(timelineItemKey(item)));
+    return uniqueOlder.length > 0 ? [...uniqueOlder, ...existing] : existing;
+  }
+
+  function messageHistoryOlderCursor(
+    response: import('$lib/types/api').MessageHistoryResponse,
+  ): string | null {
+    const cursor = (response as unknown as { older_cursor?: unknown }).older_cursor;
+    return typeof cursor === 'string' && cursor.length > 0 ? cursor : null;
+  }
+
   function clearConversationTurnState(conversationId: string | null | undefined, lastMessageAt?: string | null): void {
     if (!conversationId) return;
     const patch: Partial<Conversation> = { has_active_turn: false };
@@ -1264,20 +1414,40 @@ import X from 'lucide-svelte/icons/x';
     patchConversationInList(conversationId, patch, { touchLastMessageAt: lastMessageAt !== undefined });
     if (currentConversation?.conversation_id === conversationId) {
       turnInProgress = false;
+      activeTurnChatMode = 'default';
     }
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
+    conversationListLoadCount += 1;
+    conversationListLoading = true;
     const channelFilter = selectedChannel !== 'all' ? selectedChannel : null;
     const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
-    const response = await api.conversations.list(reset ? null : conversationCursor, {
-      contextType: channelFilter,
+    try {
+      const response = await api.conversations.list(reset ? null : conversationCursor, {
+        contextType: channelFilter,
+        agentId: agentFilter,
+        status: selectedConversationStatus,
+      });
+      mergeConversationList(response.items, { reset });
+      conversationCursor = response.cursor;
+      conversationsHasMore = response.has_more;
+    } finally {
+      conversationListLoadCount = Math.max(0, conversationListLoadCount - 1);
+      conversationListLoading = conversationListLoadCount > 0;
+    }
+  }
+
+  async function loadAgentDirectChats(): Promise<void> {
+    if (selectedChannel !== 'all' && selectedChannel !== 'web') {
+      agentDirectChats = [];
+      return;
+    }
+    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
+    agentDirectChats = await api.conversations.agentDirect({
       agentId: agentFilter,
-      status: selectedConversationStatus,
+      status: 'active'
     });
-    mergeConversationList(response.items, { reset });
-    conversationCursor = response.cursor;
-    conversationsHasMore = response.has_more;
   }
 
   function persistEnterToSendPreference(): void {
@@ -1369,6 +1539,9 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function conversationTitle(conversation: Conversation): string {
+    if (isAgentDirectConversation(conversation)) {
+      return agentLabel(conversationAgent(conversation));
+    }
     return conversation.title?.trim() || 'Untitled conversation';
   }
 
@@ -1383,6 +1556,10 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationAgent(conversation: Conversation): Agent | undefined {
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
+  }
+
+  function agentLabel(agent: Agent | undefined): string {
+    return agent?.display_name ?? agent?.name ?? agent?.agent_id ?? 'Agent';
   }
 
   function subSessionAgent(): Agent | undefined {
@@ -1724,6 +1901,107 @@ import X from 'lucide-svelte/icons/x';
     return '';
   }
 
+  function conversationOrbitClass(conversation: Conversation, mode: 'default' | 'plan' | 'build'): string {
+    const attentionClass = conversationAttentionOrbitClass(conversationAttentionTone(conversation));
+    return attentionClass || turnOrbitClass(mode);
+  }
+
+  function conversationDotClass(conversation: Conversation): string {
+    return conversationAttentionDotClass(conversationAttentionTone(conversation));
+  }
+
+  function conversationAttentionDescription(conversation: Conversation): string {
+    return conversationAttentionLabel(conversationAttentionTone(conversation));
+  }
+
+  function conversationHasAttention(conversation: Conversation): boolean {
+    return conversationAttentionTone(conversation) !== 'default';
+  }
+
+  function syncActiveSessionAttention(conversationId: string | null | undefined, sessionList: Session[]): void {
+    if (!conversationId) return;
+    const conversation = conversations.find((candidate) => candidate.conversation_id === conversationId)
+      ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
+      ?? (currentConversation?.conversation_id === conversationId ? currentConversation : null);
+    if (!conversation?.active_session_id) return;
+    const activeSession = sessionList.find((session) => session.session_id === conversation.active_session_id);
+    if (!activeSession) return;
+    patchConversationInList(conversationId, {
+      active_session_status: activeSession.status,
+      active_session_completion_reason: activeSession.completion_reason,
+    });
+  }
+
+  function patchConversationPendingNotificationType(
+    conversationId: string | null | undefined,
+    notificationType: string,
+    present: boolean
+  ): void {
+    if (!conversationId) return;
+    const conversation = conversations.find((candidate) => candidate.conversation_id === conversationId)
+      ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
+      ?? (currentConversation?.conversation_id === conversationId ? currentConversation : null);
+    if (!conversation) return;
+    const currentTypes = conversation.pending_notification_types ?? [];
+    const nextTypes = present
+      ? Array.from(new Set([...currentTypes, notificationType]))
+      : currentTypes.filter((type) => type !== notificationType);
+    patchConversationInList(conversationId, { pending_notification_types: nextTypes });
+  }
+
+  function refreshConversationPendingNotificationTypes(conversationId: string | null | undefined): void {
+    if (!conversationId) return;
+    void api.notifications
+      .list(conversationId)
+      .then((notifications) => {
+        patchConversationInList(conversationId, {
+          pending_notification_types: pendingNotificationTypesFromNotifications(notifications),
+        });
+      })
+      .catch(() => {});
+  }
+
+  function notificationTypeForEvent(eventType: string): string | null {
+    if (eventType === 'workflow_gate' || eventType === 'workflow_gate_resolved') return 'gate';
+    if (eventType === 'workflow_step_question' || eventType === 'workflow_step_question_resolved') return 'step_question';
+    if (eventType === 'auth_challenge' || eventType === 'auth_challenge_resolved') return 'auth_challenge';
+    if (eventType === 'credential_request' || eventType === 'credential_request_resolved') return 'credential_request';
+    if (eventType === 'escalation' || eventType === 'escalation_resolved') return 'escalation';
+    return null;
+  }
+
+  function websocketConversationPatch(event: {
+    title?: string;
+    has_unread?: boolean;
+    has_active_turn?: boolean;
+    active_turn_chat_mode?: import('$lib/types/api').ChatMode | null;
+    active_turn_chat_mode_source?: import('$lib/types/api').ChatModeSource | null;
+    active_session_status?: string | null;
+    active_session_completion_reason?: string | null;
+    pending_notification_types?: string[];
+    last_message_at?: string | null;
+    updated_at?: string | null;
+  }): Partial<Conversation> {
+    const patch: Partial<Conversation> = {};
+    if (typeof event.title === 'string') patch.title = event.title;
+    if (typeof event.has_unread === 'boolean') patch.has_unread = event.has_unread;
+    if (typeof event.has_active_turn === 'boolean') {
+      patch.has_active_turn = event.has_active_turn;
+      if (!event.has_active_turn) {
+        patch.active_turn_chat_mode = event.active_turn_chat_mode ?? null;
+        patch.active_turn_chat_mode_source = event.active_turn_chat_mode_source ?? null;
+      }
+    }
+    if (typeof event.active_turn_chat_mode === 'string') patch.active_turn_chat_mode = event.active_turn_chat_mode;
+    if (typeof event.active_turn_chat_mode_source === 'string') patch.active_turn_chat_mode_source = event.active_turn_chat_mode_source;
+    if (typeof event.active_session_status === 'string' || event.active_session_status === null) patch.active_session_status = event.active_session_status;
+    if (typeof event.active_session_completion_reason === 'string' || event.active_session_completion_reason === null) patch.active_session_completion_reason = event.active_session_completion_reason;
+    if (Array.isArray(event.pending_notification_types)) patch.pending_notification_types = event.pending_notification_types;
+    if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;
+    if (typeof event.updated_at === 'string') patch.updated_at = event.updated_at;
+    return patch;
+  }
+
   // Enable the composer's send button only when there is something to send
   // and the conversation is usable. Computed once so the template doesn't
   // duplicate the disabled checks that previously sat on the Send button.
@@ -1735,58 +2013,10 @@ import X from 'lucide-svelte/icons/x';
       !directQuestionSubmitting,
   );
 
-  async function loadHistory(conversationId: string): Promise<import('$lib/types/api').MessageHistoryResponse> {
-    const events: MessageEvent[] = [];
-    let afterSeq = 0;
-    let activeSessionId: string | null | undefined = null;
-    let historyActiveSessionLastSeq = 0;
-    let activeStreams: import('$lib/types/api').ActiveStreamSnapshot[] = [];
-    let activeToolOutputs: import('$lib/types/api').ActiveToolOutputSnapshot[] = [];
-    let hasActiveTurn = false;
-    let historyTruncated = false;
-    let truncationReason: string | null | undefined = null;
-
-    while (true) {
-      const response = await api.conversations.messages(conversationId, afterSeq, 200);
-      events.push(...response.items);
-      activeSessionId = response.active_session_id;
-      historyActiveSessionLastSeq = response.active_session_last_seq ?? historyActiveSessionLastSeq;
-      activeStreams = response.active_streams ?? activeStreams;
-      activeToolOutputs = response.active_tool_outputs ?? activeToolOutputs;
-      hasActiveTurn = response.has_active_turn ?? hasActiveTurn;
-      historyTruncated = response.history_truncated ?? historyTruncated;
-      truncationReason = response.truncation_reason ?? truncationReason;
-      if (!response.has_more || response.items.length === 0) {
-        return {
-          items: events,
-          last_seq: response.last_seq,
-          has_more: response.has_more,
-          has_active_turn: hasActiveTurn,
-          active_streams: activeStreams,
-          active_tool_outputs: activeToolOutputs,
-          active_session_id: activeSessionId,
-          active_session_last_seq: historyActiveSessionLastSeq,
-          history_truncated: historyTruncated,
-          truncation_reason: truncationReason
-        };
-      }
-
-      afterSeq = getNextHistoryAfterSeq(response);
-      if (afterSeq === 0) {
-        return {
-          items: events,
-          last_seq: response.last_seq,
-          has_more: response.has_more,
-          has_active_turn: hasActiveTurn,
-          active_streams: activeStreams,
-          active_tool_outputs: activeToolOutputs,
-          active_session_id: activeSessionId,
-          active_session_last_seq: historyActiveSessionLastSeq,
-          history_truncated: historyTruncated,
-          truncation_reason: truncationReason
-        };
-      }
-    }
+  async function loadHistory(
+    conversationId: string,
+  ): Promise<import('$lib/types/api').MessageHistoryResponse> {
+    return loadConversationHistoryPage(conversationId);
   }
 
   async function loadSessionHistory(
@@ -1825,18 +2055,22 @@ import X from 'lucide-svelte/icons/x';
     [agents] = await Promise.all([api.agents.listAll()]);
     restoreSelectedAgent();
     await refreshAvailableChannelTypes();
-    await loadConversationPage(true);
+    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
   async function forceRefreshConversationHistory(): Promise<void> {
+    if (conversationListRefreshing) return;
+    conversationListRefreshing = true;
     resetConversationSearchResults();
-    await refreshSidebarData();
+    try {
+      await refreshSidebarData();
+    } finally {
+      conversationListRefreshing = false;
+    }
   }
 
   async function refreshAvailableChannelTypes(): Promise<void> {
-    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
     const allConversations = await api.conversations.listAll({
-      agentId: agentFilter,
       contextType: null,
       status: selectedConversationStatus
     });
@@ -2052,7 +2286,7 @@ import X from 'lucide-svelte/icons/x';
 
     lastTimelineScrollTop = currentScrollTop;
 
-    if (currentScrollTop <= 24 && visibleStartIndex > 0) {
+    if (currentScrollTop <= 24 && (visibleStartIndex > 0 || hasOlderMessages)) {
       void loadOlder();
     }
   }
@@ -2105,7 +2339,7 @@ import X from 'lucide-svelte/icons/x';
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, selectedChannel);
     resetConversationSearchResults();
-    await loadConversationPage(true);
+    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
   function restoreSelectedChannel(): void {
@@ -2369,6 +2603,8 @@ import X from 'lucide-svelte/icons/x';
     if (reloadHistory && historyResult.status === 'fulfilled') {
       nextActiveSessionId = historyResult.value.active_session_id ?? nextActiveSessionId;
       activeSessionLastSeq = historyResult.value.active_session_last_seq ?? activeSessionLastSeq;
+      olderMessagesCursor = messageHistoryOlderCursor(historyResult.value);
+      hasOlderMessages = Boolean(historyResult.value.has_more && olderMessagesCursor);
       timeline = applyActiveToolOutputSnapshots(
         applyActiveStreamSnapshots(
           shouldMergeTimeline
@@ -2405,6 +2641,9 @@ import X from 'lucide-svelte/icons/x';
       if (!(isPreSessionChatConversation(previousConversation, nextSessions.length) && isMissingSessionError(nextError))) {
         historyError = nextError;
       }
+    }
+    if (reloadHistory) {
+      cachedConversationRefreshing = false;
     }
 
     if (shouldResubscribe) {
@@ -2572,6 +2811,7 @@ import X from 'lucide-svelte/icons/x';
     sessionsError = '';
     escalationError = '';
     escalationResolutionPending = null;
+    cachedConversationRefreshing = false;
     headerInfoOpen = false;
     invalidateSessionInfo();
     mobileListOpen = false;
@@ -2590,6 +2830,7 @@ import X from 'lucide-svelte/icons/x';
       historyError = '';
       sessionsError = '';
       mobileListOpen = false;
+      cachedConversationRefreshing = true;
       wsClient.subscribeConversation(
         conversationId,
         cachedView.activeSessionLastSeq,
@@ -2605,6 +2846,7 @@ import X from 'lucide-svelte/icons/x';
         }
         currentConversation = { ...conversation, has_unread: false };
         mergeConversationList([currentConversation]);
+        patchAgentDirectChat(currentConversation);
         persistLastOpenedConversation(currentConversation);
         void refreshQueuedMessages(conversationId);
         await reloadConversationSubloads(conversationId, requestId, {
@@ -2629,6 +2871,7 @@ import X from 'lucide-svelte/icons/x';
       } finally {
         if (!isStaleConversationLoad(requestId)) {
           conversationSubloadsLoading = false;
+          cachedConversationRefreshing = false;
           switchingConversation = false;
         }
       }
@@ -2655,9 +2898,12 @@ import X from 'lucide-svelte/icons/x';
       activeConversationId = conversationId;
       currentConversation = conversation;
       activeSessionLastSeq = 0;
+      olderMessagesCursor = null;
+      hasOlderMessages = false;
       initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
       mergeConversationList([conversation]);
+      patchAgentDirectChat(conversation);
       queuedCount = 0;
       queuedMessages = [];
       void refreshQueuedMessages(conversationId);
@@ -2670,6 +2916,12 @@ import X from 'lucide-svelte/icons/x';
       editingTitle = false;
       contextUsage = null;
       subSessionPanelOpen = false;
+      wsClient.subscribeConversation(
+        conversationId,
+        0,
+        conversation.active_session_id ?? null,
+        { replaceCursor: true },
+      );
 
       conversationSubloadsLoading = true;
       try {
@@ -2705,6 +2957,8 @@ import X from 'lucide-svelte/icons/x';
       currentConversation = null;
       sessions = [];
       timeline = [];
+      olderMessagesCursor = null;
+      hasOlderMessages = false;
       escalations = [];
       escalationResolutionPending = null;
       pendingDirectQuestion = null;
@@ -2777,6 +3031,14 @@ import X from 'lucide-svelte/icons/x';
     // showing the modal or the modal is obscured by the list drawer.
     mobileListOpen = false;
     showNewChatModal = true;
+  }
+
+  async function openNewConversationForSelectedAgent(): Promise<void> {
+    newChatError = '';
+    newChatAgentId = preferredNewConversationAgentId();
+    mobileListOpen = false;
+    await tick();
+    await createNewConversation();
   }
 
   function closeNewConversationModal(): void {
@@ -2902,7 +3164,7 @@ import X from 'lucide-svelte/icons/x';
     await replaceConversationStatusUrl(status);
     resetConversationSearchResults();
     await refreshAvailableChannelTypes();
-    await loadConversationPage(true);
+    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
   async function saveTitle(): Promise<void> {
@@ -3028,7 +3290,7 @@ import X from 'lucide-svelte/icons/x';
     { command: '/default', description: 'Return to agent default mode; add text for one-shot default' },
     { command: '/compact', description: 'Compact conversation' },
     { command: '/summarize', description: 'Alias for /compact' },
-    { command: '/fork', description: 'Fork conversation into a new chat' },
+    { command: '/fork', description: 'Fork conversation; add text to start the fork' },
     { command: '/undo', description: 'Undo the last user turn in this chat' },
     { command: '/redo', description: 'Redo the last undone turn in this chat' },
     { command: '/new', description: 'Start new conversation' },
@@ -3389,24 +3651,65 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadOlder(): Promise<void> {
-    if (!timelineEl || loadingOlderMessages || visibleStartIndex === 0) return;
+    if (!timelineEl || loadingOlderMessages) return;
+
+    if (visibleStartIndex === 0 && (!hasOlderMessages || !olderMessagesCursor || !currentConversation)) {
+      return;
+    }
 
     const previousScrollHeight = timelineEl.scrollHeight;
     const previousScrollTop = timelineEl.scrollTop;
     loadingOlderMessages = true;
     programmaticScroll = true;
 
-    visibleStartIndex = Math.max(0, visibleStartIndex - 50);
-    await tick();
-
-    requestAnimationFrame(() => {
-      if (timelineEl) {
-        timelineEl.scrollTop = previousScrollTop + (timelineEl.scrollHeight - previousScrollHeight);
-        lastTimelineScrollTop = timelineEl.scrollTop;
+    try {
+      if (visibleStartIndex > 0) {
+        visibleStartIndex = Math.max(0, visibleStartIndex - 50);
+        await tick();
+      } else if (olderMessagesCursor && currentConversation) {
+        const response = await loadConversationHistoryPage(
+          currentConversation.conversation_id,
+          olderMessagesCursor,
+        );
+        timeline = prependOlderTimelinePage(timeline, normalizeHistory(response.items));
+        olderMessagesCursor = messageHistoryOlderCursor(response);
+        hasOlderMessages = Boolean(response.has_more && olderMessagesCursor);
+        visibleStartIndex = 0;
+        saveCurrentConversationView();
+        await tick();
       }
+      requestAnimationFrame(() => {
+        if (timelineEl) {
+          timelineEl.scrollTop = previousScrollTop + (timelineEl.scrollHeight - previousScrollHeight);
+          lastTimelineScrollTop = timelineEl.scrollTop;
+        }
+        loadingOlderMessages = false;
+        programmaticScroll = false;
+      });
+    } catch (caughtError) {
+      const message = asApiError(caughtError).message;
+      addToast(`Unable to load older messages: ${message}`, 'error');
       loadingOlderMessages = false;
       programmaticScroll = false;
-    });
+      if (timelineEl) {
+        timelineEl.scrollTop = previousScrollTop;
+        lastTimelineScrollTop = timelineEl.scrollTop;
+      }
+    }
+  }
+
+  async function loadConversationHistoryPage(
+    conversationId: string,
+    before: string | null = null,
+  ): Promise<import('$lib/types/api').MessageHistoryResponse> {
+    const conversationsApi = api.conversations as typeof api.conversations & {
+      historyPage(
+        conversationId: string,
+        limit?: number,
+        before?: string | null,
+      ): Promise<import('$lib/types/api').MessageHistoryResponse>;
+    };
+    return conversationsApi.historyPage(conversationId, 200, before);
   }
 
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
@@ -3418,10 +3721,7 @@ import X from 'lucide-svelte/icons/x';
       const otherConvId = event.conversation_id;
       recordTodoSnapshotFromSocketEvent(event);
       if (event.type === 'conversation_updated' && event.conversation_id) {
-        const patch: Partial<Conversation> = {};
-        if (typeof event.title === 'string') patch.title = event.title;
-        if (typeof event.has_active_turn === 'boolean') patch.has_active_turn = event.has_active_turn;
-        if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;
+        const patch = websocketConversationPatch(event);
         if (Object.keys(patch).length > 0) {
           patchConversationInList(event.conversation_id, patch, {
             touchUpdatedAt: typeof event.title === 'string' || typeof event.updated_at === 'string',
@@ -3430,16 +3730,35 @@ import X from 'lucide-svelte/icons/x';
         }
       } else if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'delegation_started') {
         setConversationTurnIndicator(otherConvId, true);
+        if (event.type === 'turn_started') {
+          patchConversationInList(otherConvId, {
+            active_turn_chat_mode: normalizeChatModeTone(event.chat_mode),
+            active_turn_chat_mode_source: event.chat_mode_source ?? null,
+          });
+        }
       } else if (event.type === 'turn_settled') {
         clearConversationTurnState(otherConvId, event.completed_at);
+      } else if (event.type === 'task_paused') {
+        clearConversationTurnState(otherConvId);
       } else if (event.type === 'message_complete') {
         clearConversationTurnState(otherConvId, event.completed_at);
       } else if (event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
         clearConversationTurnState(otherConvId);
       }
+      const pendingNotificationType = notificationTypeForEvent(event.type);
+      if (pendingNotificationType) {
+        if (event.type.endsWith('_resolved')) {
+          refreshConversationPendingNotificationTypes(otherConvId);
+        } else {
+          patchConversationPendingNotificationType(otherConvId, pendingNotificationType, true);
+        }
+      }
       if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed') {
         const idx = conversations.findIndex((c) => c.conversation_id === otherConvId);
-        const conversation = idx >= 0 ? conversations[idx] : null;
+        const agentDirectConversation = agentDirectChats.find(
+          (item) => item.conversation.conversation_id === otherConvId
+        )?.conversation;
+        const conversation = idx >= 0 ? conversations[idx] : agentDirectConversation ?? null;
         if (idx >= 0) {
           if (event.type === 'message_complete') {
             patchConversationInList(
@@ -3521,6 +3840,15 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'turn_started' || event.type === 'queued') {
       turnInProgress = true;
+      if (event.type === 'turn_started') {
+        activeTurnChatMode = normalizeChatModeTone(event.chat_mode);
+        if (currentConversation) {
+          patchConversationInList(currentConversation.conversation_id, {
+            active_turn_chat_mode: activeTurnChatMode,
+            active_turn_chat_mode_source: event.chat_mode_source ?? null,
+          });
+        }
+      }
       setConversationTurnIndicator(currentConversation?.conversation_id, true);
     }
 
@@ -3557,6 +3885,17 @@ import X from 'lucide-svelte/icons/x';
         }
         return;
       }
+      if (event.code === 'session_ended') {
+        if (currentConversation) {
+          void api.conversations
+            .sessions(currentConversation.conversation_id)
+            .then((s) => {
+              sessions = s;
+              syncActiveSessionAttention(currentConversation?.conversation_id, s);
+            })
+            .catch(() => {});
+        }
+      }
       error = nextError;
       if (event.code === 'pending_input_request') {
         void refreshPendingDirectQuestion();
@@ -3576,13 +3915,26 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'delegation_started') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
       setConversationTurnIndicator(currentConversation?.conversation_id, true);
     }
 
     recordTodoSnapshotFromSocketEvent(event);
+
+    const pendingNotificationType = notificationTypeForEvent(event.type);
+    if (pendingNotificationType) {
+      if (event.type.endsWith('_resolved')) {
+        refreshConversationPendingNotificationTypes(currentConversation?.conversation_id);
+      } else {
+        patchConversationPendingNotificationType(
+          currentConversation?.conversation_id,
+          pendingNotificationType,
+          true,
+        );
+      }
+    }
 
     if (
       'session_id' in event
@@ -3591,11 +3943,14 @@ import X from 'lucide-svelte/icons/x';
       syncConversationActiveSession(event.session_id);
     }
 
-    if (event.type === 'turn_settled') {
+    if (event.type === 'turn_settled' || event.type === 'task_paused') {
       awaitingAssistantStart = false;
       turnInProgress = false;
       if (currentConversation) {
-        clearConversationTurnState(currentConversation.conversation_id, event.completed_at);
+        clearConversationTurnState(
+          currentConversation.conversation_id,
+          event.type === 'turn_settled' ? event.completed_at : undefined,
+        );
       }
       directQuestionSubmitting = false;
     }
@@ -3637,6 +3992,7 @@ import X from 'lucide-svelte/icons/x';
         .sessions(currentConversation.conversation_id)
         .then((s) => {
           sessions = s;
+          syncActiveSessionAttention(currentConversation?.conversation_id, s);
         })
         .catch(() => {});
     }
@@ -3673,14 +4029,10 @@ import X from 'lucide-svelte/icons/x';
     // Handle conversation_updated for title and activity changes.
     if (event.type === 'conversation_updated') {
       if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
-        const patch: Partial<Conversation> = {};
-        if (typeof event.title === 'string') patch.title = event.title;
+        const patch = websocketConversationPatch(event);
         if (typeof event.has_active_turn === 'boolean') {
-          patch.has_active_turn = event.has_active_turn;
           turnInProgress = event.has_active_turn;
         }
-        if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;
-        if (typeof event.updated_at === 'string') patch.updated_at = event.updated_at;
         if (Object.keys(patch).length > 0) {
           patchConversationInList(currentConversation.conversation_id, patch, {
             touchUpdatedAt: typeof event.title === 'string' || typeof event.updated_at === 'string',
@@ -3693,21 +4045,30 @@ import X from 'lucide-svelte/icons/x';
 
     // Handle session_compacted: add to timeline and refresh sessions
     if (event.type === 'session_compacted') {
+      syncConversationActiveSession(event.session_id);
       timeline = applyWebSocketEvent(timeline, event);
       syncVisibleWindow();
       scrollToBottom();
       // Refresh session list to show the new session
       if (currentConversation) {
-        api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});
+        api.conversations.sessions(currentConversation.conversation_id)
+          .then((s) => {
+            sessions = s;
+            syncActiveSessionAttention(currentConversation?.conversation_id, s);
+          })
+          .catch(() => {});
       }
       return;
     }
 
     // Handle session_reset: clear timeline for new session
     if (event.type === 'session_reset') {
+      syncConversationActiveSession(event.session_id);
       awaitingAssistantStart = false;
       turnInProgress = false;
       activeSessionLastSeq = 0;
+      olderMessagesCursor = null;
+      hasOlderMessages = false;
       setConversationTurnIndicator(currentConversation?.conversation_id, false);
       timeline = applyWebSocketEvent([], {
         type: 'system_message',
@@ -3718,7 +4079,12 @@ import X from 'lucide-svelte/icons/x';
       scrollToBottom(true);
       // Refresh session list
       if (currentConversation) {
-        api.conversations.sessions(currentConversation.conversation_id).then((s) => { sessions = s; }).catch(() => {});
+        api.conversations.sessions(currentConversation.conversation_id)
+          .then((s) => {
+            sessions = s;
+            syncActiveSessionAttention(currentConversation?.conversation_id, s);
+          })
+          .catch(() => {});
       }
       return;
     }
@@ -3728,6 +4094,8 @@ import X from 'lucide-svelte/icons/x';
       awaitingAssistantStart = false;
       turnInProgress = false;
       activeSessionLastSeq = 0;
+      olderMessagesCursor = null;
+      hasOlderMessages = false;
       queuedCount = 0;
       queuedMessages = [];
       directQuestionSubmitting = false;
@@ -3869,11 +4237,22 @@ import X from 'lucide-svelte/icons/x';
     if (typeof eventSeq === 'number') {
       activeSessionLastSeq = Math.max(activeSessionLastSeq, eventSeq);
     }
+    if (
+      hasOlderMessages
+      && currentConversation
+      && event.type === 'message_complete'
+      && event.session_id
+      && event.session_id !== currentConversation.active_session_id
+    ) {
+      olderMessagesCursor = null;
+      hasOlderMessages = false;
+    }
     saveCurrentConversationView();
     // Skip syncVisibleWindow for high-frequency streaming events to avoid
     // triggering a full virtual-scroll recalculation on every delta.
     if (
       event.type !== 'tool_call' &&
+      event.type !== 'tool_progress' &&
       event.type !== 'tool_result' &&
       event.type !== 'tool_result_chunk' &&
       event.type !== 'tool_output_chunk' &&
@@ -3883,7 +4262,7 @@ import X from 'lucide-svelte/icons/x';
     }
 
     // Auto-scroll on new content
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
+    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
       scrollToBottom();
     }
 
@@ -3897,7 +4276,7 @@ import X from 'lucide-svelte/icons/x';
     persistSelectedAgent();
     resetConversationSearchResults();
     await refreshAvailableChannelTypes();
-    await loadConversationPage(true);
+    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
   let subSessionPollTimer: number | null = null;
@@ -4121,7 +4500,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   let visibleConversationList = $derived.by(() => {
-    let list = conversations;
+    let list = conversations.filter((conversation) => !isAgentDirectConversation(conversation));
     const query = conversationSearch.trim().toLowerCase();
     if (query && (!searchEnabled || !conversationSearchSubmitted)) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
@@ -4129,6 +4508,9 @@ import X from 'lucide-svelte/icons/x';
     return sortConversationsByActivity(list);
   });
 
+  let visibleAgentDirectChats = $derived.by(() => {
+    return sortAgentDirectChats(agentDirectChats);
+  });
   let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
   let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
   let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
@@ -4361,13 +4743,72 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
+        {#if visibleAgentDirectChats.length > 0}
+          <div class="border-t border-slate-800/60 pt-3">
+            <div class="mb-2 flex items-center justify-between px-1">
+              <p class="text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500">Direct chats</p>
+            </div>
+            <div class="flex gap-2 overflow-x-auto pb-1">
+              {#each visibleAgentDirectChats as item}
+                {@const conversation = item.conversation}
+                {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
+                {@const unread = conversation.has_unread && !isActive}
+                {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+                {@const showAttentionDot = (unread || conversationHasAttention(conversation)) && !inProgress}
+                {@const attentionDescription = conversationAttentionDescription(conversation)}
+                {@const turnMode = conversationChatMode(conversation)}
+                <a
+                  class={`group flex min-w-[4.5rem] flex-col items-center gap-1 rounded-2xl px-2 py-2 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-300 hover:bg-slate-900/70'}`}
+                  href={conversationUrl(conversation.conversation_id)}
+                  onclick={closeMobileList}
+                  aria-current={isActive ? 'page' : undefined}
+                  aria-label={`Open direct chat with ${agentLabel(item.agent)}${isActive ? ', current conversation' : ''}${showAttentionDot ? `, ${attentionDescription}` : ''}`}
+                  title={`Open direct chat with ${agentLabel(item.agent)}`}
+                >
+                  <span class="relative grid h-12 w-12 shrink-0 place-items-center">
+                    {#if inProgress}
+                      <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
+                    {/if}
+                    <AgentAvatar name={agentLabel(item.agent)} avatarUrl={item.agent.avatar_url ?? null} class="h-10 w-10" />
+                    {#if showAttentionDot}
+                      <span class={`absolute right-0 top-0 h-3 w-3 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
+                    {/if}
+                  </span>
+                  <span class="max-w-[4rem] truncate text-center text-[11px] font-medium">{agentLabel(item.agent)}</span>
+                </a>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
         <div class="flex items-center justify-between gap-3 border-t border-slate-800/60 pt-3">
-          <h2 class="text-sm font-semibold text-white">History</h2>
-          <button
-            class="text-xs font-medium text-sky-400 transition hover:text-sky-300"
-            onclick={openNewConversationModal}
-            type="button"
-          >+ New</button>
+          <div class="flex min-w-0 items-center gap-2">
+            <h2 class="text-sm font-semibold text-white">History</h2>
+            {#if conversationListLoading || conversationListRefreshing || conversationSearchLoading}
+              <span class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500" aria-live="polite">
+                <RefreshCw class="h-3 w-3 animate-spin" />
+                {conversationSearchLoading ? 'Searching' : conversationListRefreshing ? 'Refreshing' : 'Loading'}
+              </span>
+            {/if}
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              class="rounded-lg p-1 text-slate-500 transition hover:bg-slate-800 hover:text-sky-300 disabled:cursor-not-allowed disabled:text-slate-700"
+              disabled={conversationListRefreshing || conversationListLoading}
+              onclick={() => void forceRefreshConversationHistory()}
+              type="button"
+              aria-label="Refresh conversation history"
+              title="Refresh conversation history"
+            >
+              <RefreshCw class={`h-4 w-4 ${conversationListRefreshing ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              class="text-xs font-medium text-sky-400 transition hover:text-sky-300 disabled:cursor-not-allowed disabled:text-slate-600"
+              disabled={newChatCreating}
+              onclick={openNewConversationModal}
+              type="button"
+            >+ New</button>
+          </div>
         </div>
 
         <form class="relative" onsubmit={(event) => { event.preventDefault(); void submitConversationSearch(); }}>
@@ -4425,7 +4866,13 @@ import X from 'lucide-svelte/icons/x';
         disabled={!isMobileViewport()}
         onRefresh={forceRefreshConversationHistory}
       >
-        <div class="space-y-1">
+        <div class="space-y-1 pb-3">
+          {#if (conversationListLoading || conversationListRefreshing) && visibleConversationList.length === 0 && !(conversationSearchSubmitted && searchEnabled)}
+            <div class="rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-6 text-center text-sm text-slate-400">
+              <RefreshCw class="mx-auto mb-2 h-4 w-4 animate-spin text-slate-500" />
+              Loading conversation history...
+            </div>
+          {/if}
           {#if conversationSearchSubmitted && conversationSearchLoading && searchEnabled}
             <p class="mb-3 rounded-2xl border border-slate-800 px-4 py-4 text-center text-sm text-slate-400">
               Searching conversation history...
@@ -4508,16 +4955,19 @@ import X from 'lucide-svelte/icons/x';
 
           {#if conversationSearchSubmitted && searchEnabled}
             <!-- Content search replaces the normal list; empty state is handled above. -->
-          {:else if visibleConversationList.length === 0}
+          {:else}
+            {#if visibleConversationList.length === 0 && !(conversationListLoading || conversationListRefreshing)}
             <p class="rounded-2xl border border-dashed border-slate-700 px-4 py-6 text-center text-sm text-slate-400">
               No conversations found.
             </p>
-          {:else}
+            {:else}
             {#each visibleConversationList as conversation}
               {@const agent = conversationAgent(conversation)}
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
               {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+              {@const showAttentionDot = (unread || conversationHasAttention(conversation)) && !inProgress}
+              {@const attentionDescription = conversationAttentionDescription(conversation)}
               {@const turnMode = conversationChatMode(conversation)}
               {@const rowTodoProgressTodos = conversationTodoProgressTodos(conversation)}
               <a
@@ -4528,11 +4978,11 @@ import X from 'lucide-svelte/icons/x';
               >
                 <div class="relative grid h-9 w-9 shrink-0 place-items-center">
                   {#if inProgress}
-                    <span class={`conversation-turn-orbit ${turnOrbitClass(turnMode)}`} aria-hidden="true"><span></span></span>
+                    <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
                   {/if}
                   <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                  {#if unread && !inProgress}
-                    <span class="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 bg-sky-400"></span>
+                  {#if showAttentionDot}
+                    <span class={`absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
                   {/if}
                 </div>
                 <div class="min-w-0 flex-1">
@@ -4547,16 +4997,18 @@ import X from 'lucide-svelte/icons/x';
                   </div>
                 </div>
                 <div class="relative z-10 mt-1 flex shrink-0 flex-col items-center gap-1">
-                  <button
-                    aria-label={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                    class={`rounded-lg p-1 transition hover:bg-slate-800 ${conversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-600 hover:text-slate-200'}`}
-                    disabled={starringConversationId === conversation.conversation_id}
-                    onclick={(event) => { event.preventDefault(); event.stopPropagation(); void toggleConversationStar(conversation); }}
-                    title={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                    type="button"
-                  >
-                    <Star class={`h-4 w-4 ${conversation.starred_at ? 'fill-current' : ''}`} />
-                  </button>
+                  {#if canStarConversation(conversation)}
+                    <button
+                      aria-label={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                      class={`rounded-lg p-1 transition hover:bg-slate-800 ${conversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-600 hover:text-slate-200'}`}
+                      disabled={starringConversationId === conversation.conversation_id}
+                      onclick={(event) => { event.preventDefault(); event.stopPropagation(); void toggleConversationStar(conversation); }}
+                      title={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                      type="button"
+                    >
+                      <Star class={`h-4 w-4 ${conversation.starred_at ? 'fill-current' : ''}`} />
+                    </button>
+                  {/if}
                   {#if shouldShowConversationTodoProgress(conversation)}
                     <TodoProgressPopover
                       todos={rowTodoProgressTodos}
@@ -4569,11 +5021,14 @@ import X from 'lucide-svelte/icons/x';
                 </div>
               </a>
             {/each}
+            {/if}
           {/if}
 
           {#if conversationsHasMore}
             <div class="pt-2">
-              <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => loadConversationPage(false)}>Load more conversations</Button>
+              <Button class="w-full justify-center" size="sm" variant="secondary" disabled={conversationListLoading} onclick={() => loadConversationPage(false)}>
+                {conversationListLoading ? 'Loading...' : 'Load more conversations'}
+              </Button>
             </div>
           {/if}
         </div>
@@ -4734,9 +5189,10 @@ import X from 'lucide-svelte/icons/x';
                   </span>
                 {/if}
 
-                {#if sessions.length > 1}
-                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Sub-sessions">
-                    {sessions.length} sessions
+                {@const backingSessions = backingSessionCount()}
+                {#if backingSessions > 1}
+                  <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Backing sessions">
+                    {backingSessions} backing sessions
                   </span>
                 {/if}
 
@@ -4783,18 +5239,20 @@ import X from 'lucide-svelte/icons/x';
             every viewport for a predictable affordance.
           -->
           <div class="flex items-start gap-2">
-            <div class="flex flex-col items-center gap-1">
-              <button
-                class={`inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 transition hover:bg-slate-800 sm:h-8 sm:w-8 ${currentConversation?.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-400 hover:text-slate-100'}`}
-                onclick={() => { if (currentConversation) void toggleConversationStar(currentConversation); }}
-                type="button"
-                title={currentConversation?.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                aria-label={currentConversation?.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                disabled={!currentConversation || starringConversationId === currentConversation.conversation_id}
-              >
-                <Star class={`h-4 w-4 ${currentConversation?.starred_at ? 'fill-current' : ''}`} />
-              </button>
-            </div>
+            {#if currentConversation && canStarConversation(currentConversation)}
+              <div class="flex flex-col items-center gap-1">
+                <button
+                  class={`inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 transition hover:bg-slate-800 sm:h-8 sm:w-8 ${currentConversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-400 hover:text-slate-100'}`}
+                  onclick={() => { if (currentConversation) void toggleConversationStar(currentConversation); }}
+                  type="button"
+                  title={currentConversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                  aria-label={currentConversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                  disabled={starringConversationId === currentConversation.conversation_id}
+                >
+                  <Star class={`h-4 w-4 ${currentConversation.starred_at ? 'fill-current' : ''}`} />
+                </button>
+              </div>
+            {/if}
             {#if !isWindowMode && canOpenAuxiliaryWindow}
               <button
                 class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
@@ -4827,20 +5285,22 @@ import X from 'lucide-svelte/icons/x';
             >
               <Info class="h-4 w-4" />
             </button>
-            <div class="hidden flex-wrap gap-2 sm:flex">
-              {#if currentConversation?.status === 'archived'}
-                <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
-                  {archivingConversation ? 'Restoring...' : 'Restore'}
+            {#if !isAgentDirectConversation(currentConversation)}
+              <div class="hidden flex-wrap gap-2 sm:flex">
+                {#if currentConversation?.status === 'archived'}
+                  <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
+                    {archivingConversation ? 'Restoring...' : 'Restore'}
+                  </Button>
+                {:else}
+                  <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
+                    {archivingConversation ? 'Archiving...' : 'Archive'}
+                  </Button>
+                {/if}
+                <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
+                  {deletingConversation ? 'Deleting...' : 'Delete'}
                 </Button>
-              {:else}
-                <Button size="sm" variant="secondary" disabled={!currentConversation || archivingConversation} onclick={archiveConversation}>
-                  {archivingConversation ? 'Archiving...' : 'Archive'}
-                </Button>
-              {/if}
-              <Button size="sm" variant="danger" disabled={!currentConversation || deletingConversation} onclick={deleteConversation}>
-                {deletingConversation ? 'Deleting...' : 'Delete'}
-              </Button>
-            </div>
+              </div>
+            {/if}
           </div>
         </div>
       </div>
@@ -5076,7 +5536,10 @@ import X from 'lucide-svelte/icons/x';
                 <button
                   aria-label="Dismiss notification prompt"
                   class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-sky-100 transition hover:bg-sky-500/20"
-                  onclick={() => { pushPromptDismissed = true; }}
+                  onclick={() => {
+                    pushPromptDismissed = true;
+                    setWebPushPromptDismissed(true);
+                  }}
                   type="button"
                 >
                   <X class="h-4 w-4" />
@@ -5196,6 +5659,15 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
+        {#if cachedConversationRefreshing && currentConversation && !historyError && !sessionsError}
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-100">
+            <div class="flex items-center gap-2">
+              <RefreshCw class="h-3.5 w-3.5 animate-spin" />
+              <span>Showing cached conversation, refreshing latest messages…</span>
+            </div>
+          </div>
+        {/if}
+
         <!-- Timeline -->
         <div
           class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-1.5 sm:p-4"
@@ -5210,6 +5682,16 @@ import X from 'lucide-svelte/icons/x';
           tabindex="-1"
         >
           <div bind:this={timelineContentEl} class="space-y-3">
+            {#if hasOlderMessages && visibleStartIndex === 0 && !loadingOlderMessages}
+              <button
+                class="mx-auto block rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/50 hover:text-sky-100"
+                onclick={() => void loadOlder()}
+                type="button"
+              >
+                Load older messages
+              </button>
+            {/if}
+
             {#if loadingOlderMessages}
               <p class="px-4 py-2 text-center text-xs text-slate-500">Loading older messages…</p>
             {/if}
@@ -5298,7 +5780,7 @@ import X from 'lucide-svelte/icons/x';
 
             {#if showTurnProgress}
               <div class="flex items-center gap-3 px-2 py-2">
-                <LiveDots />
+                <LiveDots tone={activeTurnChatMode === 'plan' ? 'emerald' : activeTurnChatMode === 'build' ? 'amber' : 'sky'} />
               </div>
             {/if}
           </div>
@@ -5368,14 +5850,19 @@ import X from 'lucide-svelte/icons/x';
               This conversation has been deleted.
             </div>
           {:else if isSessionBlocked()}
-            <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-center text-sm text-sky-100">
-              {#if activeSessionStatus() === 'suspended'}
-                This session is suspended.
-              {:else if activeSessionStatus() === 'terminated'}
-                This session has been terminated.
-              {:else}
-                This session has ended ({activeSessionStatus()}).
-              {/if}
+            <div class="space-y-3 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-center text-sm text-sky-100">
+              <p>
+                {#if activeSessionStatus() === 'suspended'}
+                  This session is suspended.
+                {:else if activeSessionStatus() === 'terminated'}
+                  This session has been terminated.
+                {:else}
+                  This session has ended ({activeSessionStatus()}).
+                {/if}
+              </p>
+              <Button size="sm" onclick={startNewConversationFromBlockedSession}>
+                Start new conversation
+              </Button>
             </div>
           {:else}
           <!--
@@ -5782,6 +6269,18 @@ import X from 'lucide-svelte/icons/x';
     --turn-orbit-rgb: 251 146 60;
     --turn-orbit-tip-rgb: 252 211 77;
     --turn-orbit-shadow-rgb: 245 158 11;
+  }
+
+  .conversation-turn-orbit--amber {
+    --turn-orbit-rgb: 251 191 36;
+    --turn-orbit-tip-rgb: 252 211 77;
+    --turn-orbit-shadow-rgb: 245 158 11;
+  }
+
+  .conversation-turn-orbit--rose {
+    --turn-orbit-rgb: 251 113 133;
+    --turn-orbit-tip-rgb: 253 164 175;
+    --turn-orbit-shadow-rgb: 244 63 94;
   }
 
   .conversation-turn-orbit span {

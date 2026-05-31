@@ -23,11 +23,28 @@ from cognis.models.workflow import (
     Workflow,
     WorkflowState,
 )
+from cognis.runtime_context import (
+    current_agent_id,
+    current_agent_owner_email,
+    current_runtime_access_context,
+)
 
 
 class _SessionFactory:
+    def __init__(self) -> None:
+        self.rows: list[object] = []
+
     def __call__(self) -> _SessionFactory:
         return self
+
+    def begin(self) -> _SessionFactory:
+        return self
+
+    def add(self, row: object) -> None:
+        self.rows.append(row)
+
+    async def flush(self) -> None:
+        return None
 
     async def __aenter__(self) -> _SessionFactory:
         return self
@@ -40,6 +57,9 @@ class _SessionFactory:
 
     async def rollback(self) -> None:
         return None
+
+    async def execute(self, *_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
 
 
 class _EventBus:
@@ -755,7 +775,11 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
 
     async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
-        return SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+        return SimpleNamespace(
+            step_run_id="run-1",
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+        )
 
     async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
@@ -815,7 +839,7 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
             task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
         ),
         StepDefinition(name="plan", type="run", prompt="Plan"),
-        SimpleNamespace(agent_id="agent-1"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
     )
 
     assert conversation.conversation_id == "conv-1"
@@ -833,7 +857,11 @@ async def test_reuse_or_create_step_session_reports_unseeded_resume_when_fork_fa
 
     async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
-        return SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1")
+        return SimpleNamespace(
+            step_run_id="run-1",
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+        )
 
     async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
@@ -887,7 +915,7 @@ async def test_reuse_or_create_step_session_reports_unseeded_resume_when_fork_fa
             task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
         ),
         StepDefinition(name="plan", type="run", prompt="Plan"),
-        SimpleNamespace(agent_id="agent-1"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
     )
 
     assert seeded is False
@@ -1403,6 +1431,128 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
 
     assert output is not None
     assert refreshed == [("/home/user/src/cognis", "/home/user/src/cognis")]
+
+
+@pytest.mark.asyncio
+async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-b",
+        workflow_state=WorkflowState(),
+    )
+    step_def = StepDefinition(
+        name="implement",
+        type="run",
+        prompt="Do work",
+        agent_override="system:implement",
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
+    conversation = SimpleNamespace(conversation_id="conv-1")
+    session = SimpleNamespace(
+        session_id="sess-1",
+        intaris_session_id="sess-1",
+        user_email="user@example.com",
+        parent_session_id=None,
+        delegation_mode="primary",
+    )
+    primary_agent = AgentDefinition(
+        agent_id="agent-b",
+        owner_email="user@example.com",
+        name="Agent B",
+        agent_type="primary",
+    )
+    step_agent = AgentDefinition(
+        agent_id="system:implement",
+        owner_email="system@example.com",
+        name="Implement",
+        agent_type="secondary",
+        is_system=True,
+    )
+    observed: dict[str, object] = {}
+
+    async def _resolve_step_agents(
+        *args: object, **kwargs: object
+    ) -> tuple[AgentDefinition, AgentDefinition]:
+        del args, kwargs
+        return primary_agent, step_agent
+
+    async def _create_step_session(*args: object, **kwargs: object):
+        del args, kwargs
+        return conversation, session
+
+    async def _resolve_runtime(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            tool_registry=None,
+            executor_connection=None,
+            executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
+            runtime_info=None,
+            cleanup=lambda: asyncio.sleep(0),
+        )
+
+    async def _latest_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return None
+
+    async def _create_step_run(*args: object, **kwargs: object):
+        del args, kwargs
+        return SimpleNamespace()
+
+    async def _update_step_run(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+    async def _refresh(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def _run_step(ctx: object, **kwargs: object) -> StepOutput:
+        del kwargs
+        observed["ctx_agent_id"] = getattr(getattr(ctx, "agent", None), "agent_id", None)
+        observed["ctx_executor_agent_id"] = getattr(
+            getattr(ctx, "executor_agent", None), "agent_id", None
+        )
+        observed["runtime_agent_id"] = current_agent_id.get()
+        observed["runtime_agent_owner_email"] = current_agent_owner_email.get()
+        runtime_access = current_runtime_access_context.get()
+        observed["runtime_access_agent_id"] = (
+            runtime_access.agent_id if runtime_access is not None else None
+        )
+        observed["runtime_access_agent_type"] = (
+            runtime_access.agent_type if runtime_access is not None else None
+        )
+        return StepOutput(summary="done", content="done")
+
+    monkeypatch.setattr(engine, "_resolve_step_agents", _resolve_step_agents)
+    monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
+    monkeypatch.setattr(engine, "_resolve_step_runtime", _resolve_runtime)
+    monkeypatch.setattr(engine._agent_loop, "run_step", _run_step, raising=False)
+    monkeypatch.setattr(engine._session_manager, "refresh_intaris_session_policy", _refresh)
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _latest_step_run,
+    )
+    monkeypatch.setattr("cognis.core.workflow_engine.create_step_run", _create_step_run)
+    monkeypatch.setattr("cognis.core.workflow_engine.update_step_run", _update_step_run)
+
+    output, _step_run_id = await engine._execute_run_step(
+        task, step_def, task.workflow_state or WorkflowState(), workflow
+    )
+
+    assert output is not None
+    assert observed == {
+        "ctx_agent_id": "system:implement",
+        "ctx_executor_agent_id": "agent-b",
+        "runtime_agent_id": "agent-b",
+        "runtime_agent_owner_email": "user@example.com",
+        "runtime_access_agent_id": "agent-b",
+        "runtime_access_agent_type": "primary",
+    }
 
 
 @pytest.mark.asyncio

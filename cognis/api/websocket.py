@@ -51,6 +51,7 @@ from cognis.store.queries import (
     get_browser_session_by_token,
     get_task,
     get_user,
+    list_pending_notification_types_by_conversation,
     mark_artifacts_attached,
 )
 
@@ -206,12 +207,22 @@ class WebSocketTurnObserver:
         *,
         has_active_turn: bool,
         last_message_at: datetime | None = None,
+        active_turn_chat_mode: str | None = None,
+        active_turn_chat_mode_source: str | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "conversation_updated",
             "conversation_id": conversation_id,
             "has_active_turn": has_active_turn,
         }
+        if has_active_turn:
+            if active_turn_chat_mode is not None:
+                payload["active_turn_chat_mode"] = active_turn_chat_mode
+            if active_turn_chat_mode_source is not None:
+                payload["active_turn_chat_mode_source"] = active_turn_chat_mode_source
+        else:
+            payload["active_turn_chat_mode"] = None
+            payload["active_turn_chat_mode_source"] = None
         if last_message_at is not None:
             payload["last_message_at"] = last_message_at.isoformat()
             payload["updated_at"] = last_message_at.isoformat()
@@ -280,6 +291,29 @@ class WebSocketTurnObserver:
         if arguments is not None:
             payload["arguments"] = arguments
         await self._manager.send_to_conversation(conversation_id, payload)
+
+    async def on_tool_progress(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        progress: dict[str, Any],
+        turn_id: str | None = None,
+    ) -> None:
+        await self._manager.send_to_conversation(
+            conversation_id,
+            {
+                "type": "tool_progress",
+                "conversation_id": conversation_id,
+                "session_id": session_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "progress": progress,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "turn_id": turn_id,
+            },
+        )
 
     async def on_tool_result(
         self,
@@ -401,6 +435,8 @@ class WebSocketTurnObserver:
             result.conversation_id,
             has_active_turn=False,
             last_message_at=completed_at,
+            active_turn_chat_mode=result.chat_mode,
+            active_turn_chat_mode_source=result.chat_mode_source,
         )
 
         # Notify clients if the conversation title changed
@@ -548,6 +584,7 @@ class WebSocketConnectionManager:
         self.app = app
         self._connections: dict[str, AuthenticatedWebSocket] = {}
         self._by_conversation: dict[str, set[str]] = defaultdict(set)
+        self._by_user: dict[str, set[str]] = defaultdict(set)
 
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
@@ -574,6 +611,7 @@ class WebSocketConnectionManager:
             role=claims.get("role", "user"),
         )
         self._connections[connection.connection_id] = connection
+        self._by_user[connection.user_email].add(connection.connection_id)
         WS_CONNECTIONS_ACTIVE.inc()
         WS_CONNECTIONS_TOTAL.inc()
         return connection
@@ -581,6 +619,11 @@ class WebSocketConnectionManager:
     def disconnect(self, connection: AuthenticatedWebSocket) -> None:
         """Unregister a WebSocket connection."""
         self._connections.pop(connection.connection_id, None)
+        user_connections = self._by_user.get(connection.user_email)
+        if user_connections is not None:
+            user_connections.discard(connection.connection_id)
+            if not user_connections:
+                del self._by_user[connection.user_email]
         for cid in list(connection.subscriptions):
             self._unsubscribe(connection, cid)
         WS_CONNECTIONS_ACTIVE.dec()
@@ -641,6 +684,19 @@ class WebSocketConnectionManager:
         if coroutines:
             await asyncio.gather(*coroutines, return_exceptions=True)
 
+    async def send_to_user(self, user_email: str, payload: dict[str, Any]) -> None:
+        """Fan out a payload to all connections authenticated as one user."""
+        connection_ids = self._by_user.get(user_email, set())
+        if not connection_ids:
+            return
+        coroutines = []
+        for cid in list(connection_ids):
+            conn = self._connections.get(cid)
+            if conn is not None:
+                coroutines.append(conn.send_json(payload))
+        if coroutines:
+            await asyncio.gather(*coroutines, return_exceptions=True)
+
     def has_tts_enabled_subscribers(self, conversation_id: str) -> bool:
         """Return True when at least one TTS-enabled connection is subscribed."""
         connection_ids = self._by_conversation.get(conversation_id, set())
@@ -685,13 +741,6 @@ class WebSocketConnectionManager:
         # FOLLOW_UP_TURN_REQUESTED is handled by TurnScheduler
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
             return
-        # TURN_COMPLETED / TURN_ERROR are handled by the TurnObserver bridge.
-        # TURN_STARTED is event-bus-only, so let it flow through _event_to_payload.
-        if event.type in (
-            EventType.TURN_COMPLETED,
-            EventType.TURN_ERROR,
-        ):
-            return
 
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
@@ -700,6 +749,87 @@ class WebSocketConnectionManager:
         if payload is None:
             return
         await self.send_to_conversation(conversation_id, payload)
+        activity_payload = self._conversation_activity_payload(event, conversation_id)
+        if activity_payload is not None:
+            await self.send_to_conversation(conversation_id, activity_payload)
+        attention_payload = await self._notification_attention_payload(event, conversation_id)
+        if attention_payload is not None:
+            await self.send_to_user(attention_payload["user_email"], attention_payload["payload"])
+
+    def _conversation_activity_payload(
+        self,
+        event: Event,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        """Build an authoritative sidebar activity correction payload."""
+
+        if event.type == EventType.TURN_COMPLETED:
+            completed_at = event.data.get("completed_at") or (
+                event.timestamp.isoformat() if event.timestamp else None
+            )
+            payload: dict[str, Any] = {
+                "type": "conversation_updated",
+                "conversation_id": conversation_id,
+                "has_active_turn": False,
+                "active_turn_chat_mode": None,
+                "active_turn_chat_mode_source": None,
+            }
+            if completed_at is not None:
+                payload["last_message_at"] = completed_at
+                payload["updated_at"] = completed_at
+            return payload
+
+        if event.type in (EventType.TURN_ERROR, EventType.TASK_PAUSED):
+            return {
+                "type": "conversation_updated",
+                "conversation_id": conversation_id,
+                "has_active_turn": False,
+                "active_turn_chat_mode": None,
+                "active_turn_chat_mode_source": None,
+            }
+
+        return None
+
+    async def _notification_attention_payload(
+        self,
+        event: Event,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        """Build a user-wide sidebar refresh payload for notification events."""
+        if event.type not in (EventType.NOTIFICATION_CREATED, EventType.NOTIFICATION_RESOLVED):
+            return None
+        user_email = event.data.get("user_email")
+        if not isinstance(user_email, str) or not user_email:
+            return None
+
+        async with self.app.state.session_factory() as session:
+            pending_by_conversation = await list_pending_notification_types_by_conversation(
+                session,
+                user_email,
+                [conversation_id],
+            )
+        scheduler = getattr(self.app.state, "turn_scheduler", None)
+        running_turn_state = (
+            scheduler.running_turn_state(conversation_id)
+            if scheduler is not None and hasattr(scheduler, "running_turn_state")
+            else None
+        )
+        has_active_turn = running_turn_state is not None
+        return {
+            "user_email": user_email,
+            "payload": {
+                "type": "conversation_updated",
+                "conversation_id": conversation_id,
+                "pending_notification_types": pending_by_conversation.get(conversation_id, []),
+                "has_active_turn": has_active_turn,
+                "active_turn_chat_mode": (
+                    running_turn_state.get("chat_mode") if running_turn_state else None
+                ),
+                "active_turn_chat_mode_source": (
+                    running_turn_state.get("chat_mode_source") if running_turn_state else None
+                ),
+            },
+        }
 
     async def _resolve_conversation_id(self, event: Event) -> str | None:
         """Resolve the conversation_id from an event."""
@@ -2113,6 +2243,18 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             payload["title"] = event.data.get("title")
         if isinstance(event.data.get("has_active_turn"), bool):
             payload["has_active_turn"] = event.data.get("has_active_turn")
+        if "active_turn_chat_mode" in event.data:
+            payload["active_turn_chat_mode"] = event.data.get("active_turn_chat_mode")
+        if "active_turn_chat_mode_source" in event.data:
+            payload["active_turn_chat_mode_source"] = event.data.get("active_turn_chat_mode_source")
+        if "active_session_status" in event.data:
+            payload["active_session_status"] = event.data.get("active_session_status")
+        if "active_session_completion_reason" in event.data:
+            payload["active_session_completion_reason"] = event.data.get(
+                "active_session_completion_reason"
+            )
+        if isinstance(event.data.get("pending_notification_types"), list):
+            payload["pending_notification_types"] = event.data.get("pending_notification_types")
         if event.data.get("last_message_at") is not None:
             payload["last_message_at"] = event.data.get("last_message_at")
         if event.data.get("updated_at") is not None:
@@ -2155,6 +2297,9 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "message_id": event.data.get("message_id"),
+            "turn_id": event.data.get("turn_id"),
+            "chat_mode": event.data.get("chat_mode"),
+            "chat_mode_source": event.data.get("chat_mode_source"),
         }
     if event.type == EventType.TURN_COMPLETED:
         return {

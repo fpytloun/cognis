@@ -14,7 +14,12 @@ from cognis.api.executor_runtime import reconcile_executor
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
 from cognis.logging import get_logger
-from cognis.models.tool import MCP_SERVER_IDS_KEY, ExecutorCapabilities, MCPServerConfig
+from cognis.models.tool import (
+    MCP_SERVER_IDS_KEY,
+    ExecutorCapabilities,
+    MCPServerConfig,
+    effective_mcp_auth_config,
+)
 from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
 from cognis.store.queries import get_executor_row, get_mcp_server, update_executor_runtime_state
@@ -224,6 +229,7 @@ async def _resolve_executor_mcp_payload(
                 url=mcp_row.url,
                 env=mcp_row.env,
                 headers=mcp_row.headers,
+                auth_config=mcp_row.auth_config,
             )
             if invalid_reason is not None:
                 _logger.warning(
@@ -231,6 +237,32 @@ async def _resolve_executor_mcp_payload(
                     extra={"extra_data": {"server_id": server_id, "reason": invalid_reason}},
                 )
                 continue
+            headers = mcp_row.headers or {}
+            auth_config = effective_mcp_auth_config(mcp_row.auth_config, headers)
+            oauth_service = getattr(providers, "mcp_oauth_service", None) or getattr(
+                providers, "_mcp_oauth_service", None
+            )
+            if auth_config.type == "oauth2" and oauth_service is not None and row.owner_email:
+                result = await oauth_service.inject_authorization_header(
+                    user_email=row.owner_email,
+                    server=mcp_row,
+                    headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+                )
+                if result.authorization_required:
+                    _logger.warning(
+                        "OAuth MCP server requires authorization",
+                        extra={
+                            "extra_data": {
+                                "server_id": server_id,
+                                "reason": result.reason,
+                                "transaction_id": result.transaction_id,
+                            }
+                        },
+                    )
+                    headers = result.headers
+                headers = result.headers
+                if not result.authorization_required:
+                    auth_config = {"type": "static_headers"}
             servers.append(
                 MCPServerConfig(
                     name=mcp_row.name,
@@ -239,7 +271,8 @@ async def _resolve_executor_mcp_payload(
                     url=mcp_row.url,
                     args=mcp_row.args or [],
                     env=mcp_row.env or {},
-                    headers=mcp_row.headers or {},
+                    headers=headers,
+                    auth_config=auth_config,
                     timeout_seconds=mcp_row.timeout_seconds,
                     server_id=mcp_row.server_id,
                 )

@@ -95,6 +95,15 @@ The tools section inside settings manages shared MCP server definitions. These a
 
 This split matters because agents inherit tools from their executor rather than talking to MCP servers directly.
 
+HTTP MCP servers can use controller-managed OAuth when their authentication mode
+is set to `oauth2`. Cognis starts an authorization challenge, stores the
+resulting tokens encrypted per user/server/provider/resource, refreshes them on
+the controller, and sends only a bearer access token to the executor. OAuth is
+available only for HTTP MCP transports; stdio servers still use command,
+arguments, environment, and secrets. Do not configure a static `Authorization`
+header on an OAuth MCP server. Non-auth headers such as feature flags or tenant
+IDs may still be configured.
+
 This is separate from the top-level `Tools` workspace:
 
 - `Settings -> Tools` manages MCP server definitions and attachment points

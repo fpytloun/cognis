@@ -10,12 +10,14 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis.core.workflow_registry import SYSTEM_WORKFLOWS
 from cognis.logging import get_logger
 from cognis.models.schedule import (
     ScheduleModel,
     describe_schedule,
 )
 from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
     create_schedule,
@@ -23,8 +25,11 @@ from cognis.store.queries import (
     get_conversation,
     get_schedule,
     list_schedules,
+    list_visible_agents,
+    list_workflows,
     update_schedule,
 )
+from cognis.tools.argument_normalization import strip_empty_optional_values
 
 logger = get_logger(__name__)
 
@@ -45,8 +50,17 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "get", "create", "update", "delete", "trigger", "status"],
-                "description": "The action to perform.",
+                "enum": [
+                    "options",
+                    "list",
+                    "get",
+                    "create",
+                    "update",
+                    "delete",
+                    "trigger",
+                    "status",
+                ],
+                "description": "The action to perform. Use options to discover valid values.",
             },
             "schedule_id": {
                 "type": "string",
@@ -119,7 +133,8 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                 "description": (
                     "How task results are delivered. "
                     "'preferred_channel' uses the configured preferred channel (default); "
-                    "'latest_active_for_agent' delivers to the most recent active conversation."
+                    "'latest_active_for_agent' delivers to the most recent active conversation; "
+                    "'specific_conversation' requires delivery_target."
                 ),
             },
             "delivery_target": {
@@ -162,6 +177,13 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
                 "enum": ["none", "explicit_gates", "step_requests"],
                 "description": "Interaction policy for tasks created by this schedule.",
             },
+            "session_policy": {
+                "type": "object",
+                "description": (
+                    "Optional Intaris session policy for created tasks. Supports "
+                    "allow_policies and deny_policies; prefer plain English strings."
+                ),
+            },
             "include_definition": {
                 "type": "boolean",
                 "description": (
@@ -179,6 +201,11 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
 )
 
 _TOOL_NAMES = {"manage_schedules"}
+_ACTIONS = ("options", "list", "get", "create", "update", "delete", "trigger", "status")
+_SCHEDULE_TYPES = ("cron", "interval", "one_shot")
+_DELIVERY_MODES = ("preferred_channel", "latest_active_for_agent", "specific_conversation")
+_COMPLETION_MODE_FAMILIES = ("default", "direct")
+_INTERACTION_MODE_OVERRIDES = ("none", "explicit_gates", "step_requests")
 
 
 def schedule_tools() -> list[ToolDefinition]:
@@ -201,9 +228,12 @@ async def handle_schedule_tool(
     agent_id: str | None = None,
 ) -> ToolResult:
     """Handle a schedule management tool call."""
+    arguments = strip_empty_optional_values(dict(arguments), MANAGE_SCHEDULES_TOOL.parameters)
     action = arguments.get("action", "")
 
     try:
+        if action == "options":
+            return await _handle_options(session_factory, user_email)
         if action == "list":
             return await _handle_list(session_factory, user_email, arguments)
         if action == "get":
@@ -219,7 +249,7 @@ async def handle_schedule_tool(
         if action == "status":
             return await _handle_status(session_factory, user_email, arguments)
         return ToolResult(
-            output=f"Unknown action: {action}. Use list, get, create, update, delete, trigger, or status.",
+            output=f"Unknown action: {action}. Use one of: {', '.join(_ACTIONS)}.",
             is_error=True,
         )
     except Exception as exc:
@@ -230,6 +260,70 @@ async def handle_schedule_tool(
 # ---------------------------------------------------------------------------
 # Action handlers
 # ---------------------------------------------------------------------------
+
+
+async def _handle_options(
+    session_factory: Any,
+    user_email: str,
+) -> ToolResult:
+    """Return LLM-facing schedule tool options and conditional field rules."""
+    async with session_factory() as db:
+        agents = await list_visible_agents(db, user_email)
+        workflows = await list_workflows(db, owner_email=user_email, include_system=False)
+
+    agent_options = [
+        {
+            "agent_id": row.agent_id,
+            "name": row.name,
+            "display_name": getattr(row, "display_name", None),
+            "status": row.status,
+            "shared": grant is not None,
+        }
+        for row, grant in agents
+        if getattr(row, "status", "active") == "active"
+    ]
+    workflow_options = [
+        {
+            "workflow_id": workflow.workflow_id,
+            "name": workflow.name,
+            "is_system": True,
+        }
+        for workflow in SYSTEM_WORKFLOWS.values()
+    ]
+    workflow_options.extend(
+        {
+            "workflow_id": row.workflow_id,
+            "name": row.name,
+            "is_system": bool(getattr(row, "is_system", False)),
+        }
+        for row in workflows
+    )
+
+    payload = {
+        "valid_values": {
+            "action": list(_ACTIONS),
+            "schedule_type": list(_SCHEDULE_TYPES),
+            "delivery_mode": list(_DELIVERY_MODES),
+            "completion_mode_family": list(_COMPLETION_MODE_FAMILIES),
+            "interaction_mode_override": list(_INTERACTION_MODE_OVERRIDES),
+        },
+        "conditional_fields": {
+            "schedule_type=cron": ["cron_expr"],
+            "schedule_type=interval": ["interval_seconds"],
+            "schedule_type=one_shot": ["one_shot_at"],
+            "delivery_mode=specific_conversation": ["delivery_target"],
+            "delivery_mode=preferred_channel": ["omit delivery_target"],
+            "delivery_mode=latest_active_for_agent": ["omit delivery_target"],
+        },
+        "notes": [
+            "Use get or status before update; update is patch-style and omitted fields are preserved.",
+            "Optional empty strings are ignored. Do not send delivery_target except for specific_conversation.",
+            "For silent scheduled tasks, set allow_silent_completion=true and interaction_mode_override=none.",
+        ],
+        "available_agents": agent_options,
+        "available_workflows": workflow_options,
+    }
+    return ToolResult(output=json.dumps(payload, indent=2))
 
 
 async def _handle_list(
@@ -300,36 +394,21 @@ async def _handle_create(
     if not name:
         return ToolResult(output="'name' is required for create.", is_error=True)
 
-    stype = arguments.get("schedule_type", "cron")
-    cron_expr = arguments.get("cron_expr")
-    interval_seconds = arguments.get("interval_seconds")
-    one_shot_at_str = arguments.get("one_shot_at")
+    timing_fields, timing_error = _resolve_timing_fields(arguments)
+    if timing_error is not None:
+        return timing_error
+    stype = timing_fields["schedule_type"]
+    cron_expr = timing_fields.get("cron_expr")
+    interval_seconds = timing_fields.get("interval_seconds")
+    one_shot_at = timing_fields.get("one_shot_at")
 
-    if stype == "cron" and not cron_expr:
-        return ToolResult(output="'cron_expr' is required for cron schedules.", is_error=True)
-    if stype == "interval" and not interval_seconds:
-        return ToolResult(
-            output="'interval_seconds' is required for interval schedules.", is_error=True
-        )
-    if stype == "one_shot" and not one_shot_at_str:
-        return ToolResult(output="'one_shot_at' is required for one_shot schedules.", is_error=True)
-
-    # Validate cron expression
-    if cron_expr:
-        try:
-            from croniter import croniter
-
-            croniter(cron_expr)
-        except (ValueError, KeyError) as exc:
-            return ToolResult(output=f"Invalid cron expression: {exc}", is_error=True)
-
-    # Parse one_shot_at
-    one_shot_at = None
-    if one_shot_at_str:
-        try:
-            one_shot_at = datetime.fromisoformat(one_shot_at_str)
-        except ValueError:
-            return ToolResult(output=f"Invalid one_shot_at: {one_shot_at_str}", is_error=True)
+    for key, allowed in (
+        ("completion_mode_family", _COMPLETION_MODE_FAMILIES),
+        ("interaction_mode_override", _INTERACTION_MODE_OVERRIDES),
+    ):
+        enum_error = _validate_optional_enum_arg(arguments, key, allowed)
+        if enum_error is not None:
+            return enum_error
 
     # Build task template
     task_template: dict[str, Any] = {}
@@ -341,25 +420,30 @@ async def _handle_create(
         task_template["priority"] = arguments["task_priority"]
     if arguments.get("expected_output"):
         task_template["expected_output"] = arguments["expected_output"]
-    delivery_mode = arguments.get("delivery_mode", "preferred_channel")
-    delivery_target = arguments.get("delivery_target")
-    if delivery_mode == "specific_conversation" and not delivery_target:
-        return ToolResult(
-            output="'delivery_target' is required when delivery_mode is specific_conversation.",
-            is_error=True,
-        )
+    if isinstance(arguments.get("session_policy"), dict):
+        task_template["session_policy"] = arguments["session_policy"]
+
+    delivery, delivery_error = _resolve_delivery(arguments)
+    if delivery_error is not None:
+        return delivery_error
 
     async with session_factory() as db:
-        if delivery_target is not None:
-            delivery_error = await _validate_delivery_target(db, user_email, str(delivery_target))
+        validation_error = await _validate_agent_and_workflow(
+            db,
+            user_email,
+            target_agent=arguments.get("agent_id") or agent_id,
+            workflow_id=arguments.get("workflow_id"),
+        )
+        if validation_error is not None:
+            return validation_error
+        if delivery["mode"] == "specific_conversation":
+            delivery_error = await _validate_delivery_target(
+                db, user_email, str(delivery["target"])
+            )
             if delivery_error is not None:
                 return delivery_error
 
-    delivery_mode = arguments.get("delivery_mode", "preferred_channel")
-    task_template["delivery"] = {
-        "mode": delivery_mode,
-        "target": delivery_target,
-    }
+    task_template["delivery"] = delivery
 
     target_agent = arguments.get("agent_id") or agent_id
     if not target_agent:
@@ -439,13 +523,17 @@ async def _handle_update(
             return ToolResult(output=f"Schedule {schedule_id} not found.", is_error=True)
 
         fields: dict[str, Any] = {}
+        for key, allowed in (
+            ("schedule_type", _SCHEDULE_TYPES),
+            ("completion_mode_family", _COMPLETION_MODE_FAMILIES),
+            ("interaction_mode_override", _INTERACTION_MODE_OVERRIDES),
+        ):
+            enum_error = _validate_optional_enum_arg(arguments, key, allowed)
+            if enum_error is not None:
+                return enum_error
         for key in (
             "name",
             "description",
-            "schedule_type",
-            "cron_expr",
-            "interval_seconds",
-            "one_shot_at",
             "timezone",
             "agent_id",
             "workflow_id",
@@ -457,15 +545,23 @@ async def _handle_update(
             "interaction_mode_override",
         ):
             if key in arguments and arguments[key] is not None:
-                if key == "one_shot_at":
-                    parsed = _parse_datetime_arg(arguments[key])
-                    if parsed is None:
-                        return ToolResult(
-                            output=f"Invalid one_shot_at: {arguments[key]}", is_error=True
-                        )
-                    fields[key] = parsed
-                else:
-                    fields[key] = arguments[key]
+                fields[key] = arguments[key]
+
+        timing_keys = {"schedule_type", "cron_expr", "interval_seconds", "one_shot_at"}
+        if timing_keys & arguments.keys():
+            timing_fields, timing_error = _resolve_timing_fields(arguments, existing=existing)
+            if timing_error is not None:
+                return timing_error
+            fields.update(timing_fields)
+
+        validation_error = await _validate_agent_and_workflow(
+            db,
+            user_email,
+            target_agent=fields.get("agent_id"),
+            workflow_id=fields.get("workflow_id"),
+        )
+        if validation_error is not None:
+            return validation_error
 
         template_keys = {
             "task_title",
@@ -474,6 +570,7 @@ async def _handle_update(
             "delivery_mode",
             "delivery_target",
             "expected_output",
+            "session_policy",
         }
         if template_keys & arguments.keys():
             template = dict(existing.task_template)
@@ -485,29 +582,26 @@ async def _handle_update(
                 template["priority"] = arguments["task_priority"]
             if arguments.get("expected_output") is not None:
                 template["expected_output"] = arguments["expected_output"]
+            if "session_policy" in arguments:
+                if arguments["session_policy"] is None:
+                    template.pop("session_policy", None)
+                elif isinstance(arguments["session_policy"], dict):
+                    template["session_policy"] = arguments["session_policy"]
             if arguments.get("delivery_mode") or arguments.get("delivery_target") is not None:
-                delivery = template.get("delivery", {})
-                if not isinstance(delivery, dict):
-                    delivery = {}
-                if arguments.get("delivery_mode"):
-                    delivery["mode"] = arguments["delivery_mode"]
-                if arguments.get("delivery_target") is not None:
+                existing_delivery = template.get("delivery")
+                if not isinstance(existing_delivery, dict):
+                    existing_delivery = {}
+                delivery, delivery_error = _resolve_delivery(arguments, existing=existing_delivery)
+                if delivery_error is not None:
+                    return delivery_error
+                if delivery["mode"] == "specific_conversation":
                     delivery_error = await _validate_delivery_target(
                         db,
                         user_email,
-                        str(arguments["delivery_target"]),
+                        str(delivery["target"]),
                     )
                     if delivery_error is not None:
                         return delivery_error
-                    delivery["target"] = arguments["delivery_target"]
-                if delivery.get("mode") == "specific_conversation" and not delivery.get("target"):
-                    return ToolResult(
-                        output=(
-                            "'delivery_target' is required when delivery_mode is "
-                            "specific_conversation."
-                        ),
-                        is_error=True,
-                    )
                 template["delivery"] = delivery
             fields["task_template"] = template
 
@@ -619,10 +713,13 @@ def _row_to_model(row: Any) -> ScheduleModel:
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
-        completion_delivery={
-            "completion_mode_family": getattr(row, "completion_mode_family", "default"),
-            "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
-        },
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family=getattr(row, "completion_mode_family", "default"),
+            allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+        ),
+        session_policy=SessionPolicy.model_validate(
+            (row.task_template or {}).get("session_policy") or {}
+        ),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
         last_run_status=row.last_run_status,
@@ -674,6 +771,7 @@ def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -
         "max_concurrent_runs": row.max_concurrent_runs,
         "delete_after_run": row.delete_after_run,
         "interaction_mode_override": getattr(row, "interaction_mode_override", "none"),
+        "session_policy": template.get("session_policy") or {},
         "last_fired_at": _iso(row.last_fired_at),
         "next_fire_at": _iso(row.next_fire_at),
         "last_run_status": row.last_run_status,
@@ -704,6 +802,84 @@ def _parse_datetime_arg(value: Any) -> datetime | None:
         return None
 
 
+def _resolve_timing_fields(
+    arguments: dict[str, Any],
+    *,
+    existing: Any | None = None,
+) -> tuple[dict[str, Any], ToolResult | None]:
+    current_type = getattr(existing, "schedule_type", None) if existing is not None else None
+    stype = arguments.get("schedule_type") or current_type or "cron"
+    enum_error = _validate_enum_value("schedule_type", stype, _SCHEDULE_TYPES)
+    if enum_error is not None:
+        return {}, enum_error
+
+    cron_expr = arguments.get("cron_expr")
+    if cron_expr is None and existing is not None and stype == current_type:
+        cron_expr = getattr(existing, "cron_expr", None)
+
+    interval_seconds = arguments.get("interval_seconds")
+    if interval_seconds is None and existing is not None and stype == current_type:
+        interval_seconds = getattr(existing, "interval_seconds", None)
+
+    one_shot_at_value = arguments.get("one_shot_at")
+    if one_shot_at_value is None and existing is not None and stype == current_type:
+        one_shot_at_value = getattr(existing, "one_shot_at", None)
+
+    fields: dict[str, Any] = {"schedule_type": stype}
+    if stype == "cron":
+        if not cron_expr:
+            return {}, ToolResult(
+                output="'cron_expr' is required for cron schedules.", is_error=True
+            )
+        try:
+            from croniter import croniter
+
+            croniter(cron_expr)
+        except (ValueError, KeyError) as exc:
+            return {}, ToolResult(output=f"Invalid cron expression: {exc}", is_error=True)
+        fields.update(
+            {
+                "cron_expr": cron_expr,
+                "interval_seconds": None,
+                "one_shot_at": None,
+            }
+        )
+        return fields, None
+
+    if stype == "interval":
+        if not interval_seconds:
+            return {}, ToolResult(
+                output="'interval_seconds' is required for interval schedules.", is_error=True
+            )
+        fields.update(
+            {
+                "cron_expr": None,
+                "interval_seconds": interval_seconds,
+                "one_shot_at": None,
+            }
+        )
+        return fields, None
+
+    if stype == "one_shot":
+        if not one_shot_at_value:
+            return {}, ToolResult(
+                output="'one_shot_at' is required for one_shot schedules.", is_error=True
+            )
+        one_shot_at = _parse_datetime_arg(one_shot_at_value)
+        if one_shot_at is None:
+            return {}, ToolResult(output=f"Invalid one_shot_at: {one_shot_at_value}", is_error=True)
+        fields.update(
+            {
+                "cron_expr": None,
+                "interval_seconds": None,
+                "one_shot_at": one_shot_at,
+            }
+        )
+        return fields, None
+
+    return {}, ToolResult(output=f"Invalid schedule_type: {stype!r}.", is_error=True)
+
+
 async def _validate_delivery_target(
     db: Any, user_email: str, conversation_id: str
 ) -> ToolResult | None:
@@ -711,6 +887,87 @@ async def _validate_delivery_target(
     if conversation is None or conversation.user_email != user_email:
         return ToolResult(output=f"Conversation {conversation_id} not found.", is_error=True)
     return None
+
+
+async def _validate_agent_and_workflow(
+    db: Any,
+    user_email: str,
+    *,
+    target_agent: str | None,
+    workflow_id: str | None,
+) -> ToolResult | None:
+    if target_agent is not None:
+        visible_agents = await list_visible_agents(db, user_email)
+        if target_agent not in {
+            row.agent_id
+            for row, _grant in visible_agents
+            if getattr(row, "status", "active") == "active"
+        }:
+            return ToolResult(
+                output=f"Agent {target_agent} not found or not available to this user.",
+                is_error=True,
+            )
+
+    if workflow_id is None:
+        return None
+    if workflow_id in SYSTEM_WORKFLOWS:
+        return None
+
+    workflows = await list_workflows(db, owner_email=user_email, include_system=False)
+    if workflow_id not in {row.workflow_id for row in workflows}:
+        return ToolResult(
+            output=f"Workflow {workflow_id} not found or not available to this user.",
+            is_error=True,
+        )
+    return None
+
+
+def _resolve_delivery(
+    arguments: dict[str, Any],
+    *,
+    existing: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], ToolResult | None]:
+    current = existing if isinstance(existing, dict) else {}
+    mode = arguments.get("delivery_mode") or current.get("mode") or "preferred_channel"
+    enum_error = _validate_enum_value("delivery_mode", mode, _DELIVERY_MODES)
+    if enum_error is not None:
+        return {}, enum_error
+
+    if mode == "specific_conversation":
+        target = arguments.get("delivery_target")
+        if target is None:
+            target = current.get("target")
+        if not target:
+            return {}, ToolResult(
+                output="'delivery_target' is required when delivery_mode is specific_conversation.",
+                is_error=True,
+            )
+        return {"mode": mode, "target": target}, None
+
+    return {"mode": mode, "target": None}, None
+
+
+def _validate_optional_enum_arg(
+    arguments: dict[str, Any],
+    field_name: str,
+    allowed: tuple[str, ...],
+) -> ToolResult | None:
+    if field_name not in arguments or arguments[field_name] is None:
+        return None
+    return _validate_enum_value(field_name, arguments[field_name], allowed)
+
+
+def _validate_enum_value(
+    field_name: str,
+    value: Any,
+    allowed: tuple[str, ...],
+) -> ToolResult | None:
+    if value in allowed:
+        return None
+    return ToolResult(
+        output=f"Invalid {field_name}: {value!r}. Use one of: {', '.join(allowed)}.",
+        is_error=True,
+    )
 
 
 def _requires_next_fire_recompute(fields: dict[str, Any]) -> bool:
@@ -731,16 +988,23 @@ def _compute_next_fire_for_update(existing: Any, fields: dict[str, Any]) -> date
 
     from cognis.core.scheduler import Scheduler
 
+    schedule_type = fields.get("schedule_type", existing.schedule_type)
+    last_fired_at = existing.last_fired_at
+    if schedule_type == "one_shot" and (
+        fields.get("schedule_type") == "one_shot" or "one_shot_at" in fields
+    ):
+        last_fired_at = None
+
     temp = type(
         "_S",
         (),
         {
-            "schedule_type": fields.get("schedule_type", existing.schedule_type),
+            "schedule_type": schedule_type,
             "cron_expr": fields.get("cron_expr", existing.cron_expr),
             "interval_seconds": fields.get("interval_seconds", existing.interval_seconds),
             "one_shot_at": fields.get("one_shot_at", existing.one_shot_at),
             "timezone": fields.get("timezone", existing.timezone),
-            "last_fired_at": existing.last_fired_at,
+            "last_fired_at": last_fired_at,
         },
     )()
     sched_inst = Scheduler.__new__(Scheduler)

@@ -11,6 +11,7 @@ import litellm
 
 from cognis.executor.inference_types import CognisInferenceRequest, json_safe_inference_payload
 from cognis.logging import get_logger
+from cognis.providers.llm.errors import build_mid_stream_error_chunk
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     response_model_dump,
@@ -82,6 +83,7 @@ class LiteLLMExecutorBackend:
                         yield {
                             "done": True,
                             "error": str(payload.get("error") or "Responses stream failed"),
+                            "response_error": payload.get("response_error"),
                             "finish_reason": "error",
                         }
                         return
@@ -160,9 +162,11 @@ class LiteLLMExecutorBackend:
                     }
                     index += 1
         except Exception as exc:
+            error_chunk = build_mid_stream_error_chunk(exc)
             yield {
                 "done": True,
-                "error": f"Inference error: {str(exc)[:500]}",
+                "error": f"Inference error: {str(error_chunk.get('error') or exc)[:500]}",
+                "response_error": error_chunk.get("response_error"),
                 "finish_reason": "error",
             }
             return

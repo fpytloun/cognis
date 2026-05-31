@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,9 +19,14 @@ class RuntimeAccessContext:
     agent_type: str = "primary"
     session_id: str | None = None
     conversation_id: str | None = None
+    task_id: str | None = None
+    step_name: str | None = None
+    step_run_id: str | None = None
     parent_session_id: str | None = None
     delegation_mode: str | None = None
     workflow_step: bool = False
+    interaction_mode: str | None = None
+    session_policy: dict[str, Any] | None = None
 
     @property
     def is_root_owner_primary_chat(self) -> bool:

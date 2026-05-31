@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from cognis.logging import get_logger
 
@@ -29,8 +30,7 @@ def create_engine(database_url: str) -> AsyncEngine:
 
     if database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
-        pool_kwargs["pool_size"] = 1
-        pool_kwargs["max_overflow"] = 0
+        pool_kwargs["poolclass"] = NullPool
     else:
         pool_kwargs["pool_size"] = 5
         pool_kwargs["max_overflow"] = 10

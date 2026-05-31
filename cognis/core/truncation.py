@@ -169,7 +169,7 @@ def _build_marker(
         anchor_names = [name for name in (anchors or []) if isinstance(name, str) and name.strip()]
         has_anchors = bool(anchor_names) or bool(anchors_available)
         recovery_calls = []
-        if has_anchors:
+        if has_anchors or anchors_available is None:
             recovery_calls.append(f"list_tool_output_anchors(call_id='{call_id}')")
         if anchor_names:
             recovery_calls.append(

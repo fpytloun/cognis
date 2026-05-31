@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -373,8 +374,13 @@ def _tool_call_item_name(item: dict[str, Any]) -> str:
 def _tool_call_item_arguments(item: dict[str, Any]) -> str:
     if str(item.get("type")) == "apply_patch_call":
         operation = _normalize_native_apply_patch_operation(item.get("operation"))
-        return json.dumps({"operation": operation}) if operation is not None else ""
+        if operation is None:
+            return ""
+        patch_text = _native_apply_patch_operation_to_patch_text(operation)
+        return json.dumps({"patchText": patch_text}) if patch_text is not None else ""
     if str(item.get("type")) == "custom_tool_call":
+        if not item.get("input"):
+            return ""
         if _tool_call_item_name(item) == "apply_patch":
             patch_text = item.get("input")
             return json.dumps({"patchText": patch_text if isinstance(patch_text, str) else ""})
@@ -385,6 +391,37 @@ def _tool_call_item_arguments(item: dict[str, Any]) -> str:
             return json.dumps({"input": raw_input})
         return "{}"
     return str(item.get("arguments") or "")
+
+
+def _custom_tool_input_to_arguments(tool_name: str, input_value: str) -> str:
+    if tool_name == "apply_patch":
+        return json.dumps({"patchText": input_value})
+    return json.dumps({"input": input_value})
+
+
+def _custom_tool_input_delta_to_arguments_delta(tool_name: str, input_delta: str) -> str:
+    if tool_name != "apply_patch":
+        return ""
+    return json.dumps({"patchText": input_delta})[:-2]
+
+
+def _native_apply_patch_operation_to_patch_text(operation: dict[str, Any]) -> str | None:
+    operation_type = str(operation.get("type") or "").strip()
+    path = str(operation.get("path") or "").strip()
+    if operation_type not in _NATIVE_APPLY_PATCH_OPERATION_TYPES or not path:
+        return None
+    if operation_type == "delete_file":
+        return f"*** Begin Patch\n*** Delete File: {path}\n*** End Patch\n"
+    if operation_type == "create_file":
+        content = str(operation.get("content") or "")
+        lines = content.splitlines() or [""]
+        added = "\n".join(f"+{line}" for line in lines)
+        return f"*** Begin Patch\n*** Add File: {path}\n{added}\n*** End Patch\n"
+    if operation_type == "update_file":
+        # Native Responses update operations do not carry a canonical unified
+        # patch body. Do not replay them as controller apply_patch calls.
+        return None
+    return None
 
 
 def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -578,6 +615,30 @@ async def responses_stream_to_chat_chunks(
                 else:
                     yield provider_liveness_chunk
                 continue
+            if event_type == "response.custom_tool_call_input.delta":
+                chunk = state.custom_tool_input_delta(event)
+                progress_chunk = state.custom_tool_progress_delta(event)
+                if chunk is not None:
+                    chunk.update(provider_liveness_chunk)
+                    yield chunk
+                if progress_chunk is not None:
+                    progress_chunk.update(provider_liveness_chunk)
+                    yield progress_chunk
+                if chunk is None and progress_chunk is None:
+                    yield provider_liveness_chunk
+                continue
+            if event_type == "response.custom_tool_call_input.done":
+                chunk = state.custom_tool_input_done(event)
+                progress_chunk = state.custom_tool_progress_delta(event, complete=True)
+                if progress_chunk is not None:
+                    progress_chunk.update(provider_liveness_chunk)
+                    yield progress_chunk
+                if chunk is not None:
+                    chunk.update(provider_liveness_chunk)
+                    yield chunk
+                if chunk is None and progress_chunk is None:
+                    yield provider_liveness_chunk
+                continue
             if event_type == "response.output_item.done":
                 item = _get_output_item(event)
                 if item is None:
@@ -634,15 +695,7 @@ async def responses_stream_to_chat_chunks(
     finally:
         logger.debug(
             "Responses bridge stream summary",
-            extra={
-                "extra_data": {
-                    "event_counts": dict(sorted(state.event_counts.items())),
-                    "text_emissions": state.text_emissions,
-                    "tool_call_emissions": state.tool_call_emissions,
-                    "completed_fallback_used": state.completed_fallback_used,
-                    "completed_seen": state.completed_seen,
-                }
-            },
+            extra={"extra_data": state.diagnostics()},
         )
 
 
@@ -685,6 +738,7 @@ class _ResponsesStreamState:
         self._emitted_reasoning_summary = ""
         self._emitted_refusal = ""
         self.event_counts: dict[str, int] = {}
+        self.recent_event_types: deque[str] = deque(maxlen=20)
         self.text_emissions = 0
         self.tool_call_emissions = 0
         self.completed_fallback_used = False
@@ -693,7 +747,19 @@ class _ResponsesStreamState:
         self.reasoning_part_count = 0
 
     def note_event(self, event_type: str) -> None:
-        self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
+        normalized = event_type or "unknown"
+        self.event_counts[normalized] = self.event_counts.get(normalized, 0) + 1
+        self.recent_event_types.append(normalized)
+
+    def diagnostics(self) -> dict[str, Any]:
+        return {
+            "event_counts": dict(sorted(self.event_counts.items())),
+            "recent_event_types": list(self.recent_event_types),
+            "text_emissions": self.text_emissions,
+            "tool_call_emissions": self.tool_call_emissions,
+            "completed_fallback_used": self.completed_fallback_used,
+            "completed_seen": self.completed_seen,
+        }
 
     def note_text_emitted(self, field: str, text: str) -> None:
         if field == "reasoning_content":
@@ -889,6 +955,133 @@ class _ResponsesStreamState:
                                 "function": {"arguments": merge_result.emitted},
                             }
                         ]
+                    }
+                }
+            ]
+        }
+
+    def custom_tool_input_delta(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        item_id = str(event.get("item_id") or "")
+        state = self._resolve_item_state(item_id)
+        delta = event.get("delta")
+        if state is None or not isinstance(delta, str) or not delta:
+            return None
+        if str(state.get("item_type") or "") != "custom_tool_call":
+            return None
+        self._note_custom_tool_input_progress(state, delta)
+        return self._append_custom_tool_input(state, delta)
+
+    def custom_tool_input_done(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        item_id = str(event.get("item_id") or "")
+        state = self._resolve_item_state(item_id)
+        input_value = event.get("input")
+        if state is None or not isinstance(input_value, str):
+            return None
+        if str(state.get("item_type") or "") != "custom_tool_call":
+            return None
+        self._note_custom_tool_input_progress(state, input_value, replace=True, complete=True)
+        existing_arguments = str(state.get("arguments") or "")
+        target_arguments = _custom_tool_input_to_arguments(
+            str(state.get("name") or "unknown_tool"),
+            input_value,
+        )
+        if existing_arguments == target_arguments:
+            return None
+        if existing_arguments and target_arguments.startswith(existing_arguments):
+            return self._append_custom_tool_input(
+                state,
+                target_arguments[len(existing_arguments) :],
+            )
+        state["arguments"] = target_arguments
+        state["emitted"] = len(target_arguments)
+        self.tool_call_emissions += 1
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": state["index"],
+                                "id": state["call_id"],
+                                "function": {"arguments": target_arguments},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    def _append_custom_tool_input(
+        self,
+        state: dict[str, Any],
+        input_delta: str,
+    ) -> dict[str, Any] | None:
+        tool_name = str(state.get("name") or "unknown_tool")
+        argument_delta = _custom_tool_input_delta_to_arguments_delta(tool_name, str(input_delta))
+        if not argument_delta:
+            return None
+        state["arguments"] = str(state.get("arguments") or "") + argument_delta
+        state["emitted"] = len(str(state.get("arguments") or ""))
+        self.tool_call_emissions += 1
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": state["index"],
+                                "id": state["call_id"],
+                                "function": {"arguments": argument_delta},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    def _note_custom_tool_input_progress(
+        self,
+        state: dict[str, Any],
+        input_value: str,
+        *,
+        replace: bool = False,
+        complete: bool = False,
+    ) -> None:
+        existing_input = str(state.get("custom_input") or "")
+        custom_input = input_value if replace else existing_input + input_value
+        state["custom_input"] = custom_input
+        state["custom_input_chars"] = len(custom_input)
+        state["custom_input_lines"] = custom_input.count("\n") + (1 if custom_input else 0)
+        state["custom_input_complete"] = complete
+
+    def custom_tool_progress_delta(
+        self,
+        event: dict[str, Any],
+        *,
+        complete: bool = False,
+    ) -> dict[str, Any] | None:
+        item_id = str(event.get("item_id") or "")
+        state = self._resolve_item_state(item_id)
+        if state is None or str(state.get("item_type") or "") != "custom_tool_call":
+            return None
+        name = str(state.get("name") or "unknown_tool")
+        input_chars = int(state.get("custom_input_chars") or 0)
+        if input_chars <= 0:
+            return None
+        input_lines = int(state.get("custom_input_lines") or 0)
+        return {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_progress": {
+                            "index": state["index"],
+                            "id": state["call_id"],
+                            "name": name,
+                            "phase": "preparing_input",
+                            "input_chars": input_chars,
+                            "input_lines": input_lines,
+                            "complete": complete or bool(state.get("custom_input_complete")),
+                        }
                     }
                 }
             ]

@@ -38,8 +38,27 @@ def test_chat_prompt_describes_delegate_wait_behavior() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
     assert "Use `wait=true` only when conversation continuation requires" in instructions
-    assert "With `wait=false`, the conversation remains responsive" in instructions
     assert "Do not use `wait=true` by default" in instructions
+    assert "Use `wait=false` by default from live/main chat" not in instructions
+    assert "explicit context or the user asks for background/asynchronous work" in instructions
+
+
+def test_chat_prompt_avoids_async_bias_for_generic_chat() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "In a live/main user conversation, keep the chat responsive" not in instructions
+    assert "Split independent read-only questions into multiple delegate calls" in instructions
+    assert "non-conflicting slices" in instructions
+    assert "Do not try to fan out from secondary or delegated sub-sessions" in instructions
+
+
+def test_task_step_prompt_disallows_async_delegation() -> None:
+    instructions = build_system_instructions(PromptContext.TASK_STEP)
+    assert instructions is not None
+    assert "Workflow steps are execution contexts, not live/main chat" in instructions
+    assert "Do not use `delegate(wait=false)` from a workflow step" in instructions
+    assert "orchestrating/primary step" in instructions
+    assert "must be joined before completing the step" in instructions
 
 
 def test_chat_prompt_routes_to_system_specialists_and_same_agent() -> None:
@@ -96,9 +115,13 @@ def test_chat_prompt_prefers_dedicated_edit_tools_for_coding() -> None:
 def test_chat_prompt_prefers_structured_tools_for_file_inspection() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
-    assert "Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`" in instructions
+    assert (
+        "Do not use `bash` with `rg`, `grep`, `find`, `ls`, `cat`, `head`, `tail`" in instructions
+    )
     assert "when structured" in instructions
-    assert "Do not chain file inspection commands with `&&`, `;`, or separator output" in instructions
+    assert (
+        "Do not chain file inspection commands with `&&`, `;`, or separator output" in instructions
+    )
 
 
 def test_prompt_does_not_assume_patch_is_visible() -> None:
@@ -165,8 +188,9 @@ def test_task_step_prompt_requires_todos_for_non_trivial_work() -> None:
 def test_delegation_prompt_mentions_todos_and_questions() -> None:
     instructions = build_system_instructions(PromptContext.DELEGATION)
     assert instructions is not None
-    assert "create step todos" in instructions
-    assert "use `step_request_input`" in instructions
+    assert "secondary (specialist) agent" in instructions
+    assert "write a comprehensive final assistant message" in instructions
+    assert "Do not delegate further" in instructions
 
 
 def test_follow_up_integrate_prompt_marks_history_as_inactive() -> None:
@@ -207,6 +231,9 @@ def test_coding_skill_allows_explicit_plan_steps() -> None:
     skill = get_system_skill_default("cognis-coding")
     assert skill is not None
     content = str(skill["instructions"])
-    assert "Workflow step objectives and controller completion contracts override this skill" in content
+    assert (
+        "Workflow step objectives and controller completion contracts override this skill"
+        in content
+    )
     assert "unless the user request or current workflow step explicitly asks for a plan" in content
     assert "complete only the current workflow step artifact" in content

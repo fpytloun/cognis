@@ -263,7 +263,10 @@ privacy-first, or `"off"` to disable. Per-host opt-out via
 `auto_consent_disabled_domains`. The script bundle is vendored at
 `cognis/tools/executor/browser/assets/autoconsent.bundle.js`; bump
 `cognis/tools/executor/browser/assets/VERSION.txt` and edit the JS file in
-place when adding new selector rules.
+place when adding new selector rules. The heuristic fallback is deliberately
+scoped to banner/dialog-like containers and avoids footer/legal/support
+navigation links such as privacy, terms, cookie-policy, documentation, and
+"learn more" links.
 
 **Input humanizer** (`humanize_input`, `humanize_intensity`). `browser_click`,
 `browser_fill`, and `browser_type` move the mouse along Bezier paths and
@@ -350,6 +353,25 @@ Recommended agent behavior:
 `profile_id` is optional when `persistent_local` is used. If omitted, Cognis
 derives a stable site-scoped local profile automatically from the target URL.
 
+`browser_open` also accepts an optional `browser_settings` object for behavior
+overrides on newly created browser contexts:
+
+```json
+{
+  "browser_settings": {
+    "auto_consent": "off",
+    "stealth_enabled": true,
+    "fingerprint_hardening": true,
+    "humanize_input": false
+  }
+}
+```
+
+Use `auto_consent = "off"` for fragile SSO/login shells where automatic cookie
+clicks can corrupt the page. These settings are context-creation-only: reusing
+an existing `session_id` with different settings fails clearly; use a new
+session or close/reopen to change them.
+
 ### Session and profile lifecycle
 
 Live browser sessions and persistent local profiles are different things:
@@ -403,6 +425,12 @@ Use:
 Do not paste the full shell command into `Command`. Values like `npx -y @doist/todoist-ai` are treated as a single executable path and will fail.
 
 If an assigned MCP server fails or times out during `spawn`, `initialize`, or `tools/list`, Cognis keeps the executor connected and marks it as `degraded`. The failing MCP server is omitted from the active observed tool set until the configuration is fixed and reapplied.
+
+For OAuth-protected HTTP MCP servers, the controller refreshes and injects the
+access token before sending executor configuration. The executor never receives
+refresh tokens or OAuth transaction state. If connection, list, or tool calls
+return 401/403, Cognis reports a structured MCP authentication error and keeps
+the executor process isolated from that provider failure.
 
 ## Running as a systemd service
 

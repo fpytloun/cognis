@@ -817,9 +817,14 @@
           <textarea bind:value={form.instructions} rows="10" class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" placeholder="# Skill instructions"></textarea>
         </label>
 
-        <label class="flex items-center gap-2 text-sm text-slate-300">
-          <input bind:checked={form.attachToAllAgents} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
-          Attach to all agents
+        <label class="space-y-1 text-sm text-slate-300">
+          <span class="flex items-center gap-2">
+            <input bind:checked={form.attachToAllAgents} class="rounded border-slate-600 bg-slate-950" type="checkbox" />
+            Globally attach to every agent
+          </span>
+          <span class="block pl-6 text-xs text-slate-500">
+            Use rarely for universal platform skills only. This does not preload the skill's full instructions.
+          </span>
         </label>
       </section>
 

@@ -58,6 +58,7 @@ from cognis.models.tool import (
     MCPServerConfig,
     ToolCapability,
     ToolDefinition,
+    effective_mcp_auth_config,
     stable_tool_id,
     tool_display_name,
 )
@@ -482,6 +483,7 @@ async def _resolve_effective_tools_response(
                             url=row.url,
                             env=row.env,
                             headers=row.headers,
+                            auth_config=row.auth_config,
                         )
                         is not None
                     ):
@@ -496,6 +498,7 @@ async def _resolve_effective_tools_response(
                             args=row.args or [],
                             env=row.env or {},
                             headers=row.headers or {},
+                            auth_config=row.auth_config or {},
                             timeout_seconds=row.timeout_seconds,
                         )
                     )
@@ -964,7 +967,21 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
         url=row.url,
         env=row.env,
         headers=row.headers,
+        auth_config=row.auth_config,
     )
+    auth_config = effective_mcp_auth_config(row.auth_config, row.headers).model_dump()
+    if auth_config.get("client_secret_ref") and not str(
+        auth_config["client_secret_ref"]
+    ).startswith("$secret:"):
+        auth_config["client_secret_ref"] = "***"
+    if isinstance(auth_config.get("authorization_params"), dict):
+        auth_config["authorization_params"] = _redact_secret_mapping(
+            {
+                str(key): str(value)
+                for key, value in auth_config["authorization_params"].items()
+                if value is not None
+            }
+        )
 
     return MCPResp(
         server_id=row.server_id,
@@ -975,6 +992,7 @@ def _mcp_row_to_response(row: Any) -> dict[str, Any]:
         args=row.args or [],
         env=_redact_secret_mapping(row.env),
         headers=_redact_secret_mapping(row.headers),
+        auth_config=auth_config,
         timeout_seconds=row.timeout_seconds,
         description=row.description,
         shared=_mcp_is_shared(row),
@@ -1027,6 +1045,7 @@ async def create_mcp_server_route(request: Request, body: MCPServerCreateRequest
             args=normalized_args,
             env=body.env,
             headers=headers,
+            auth_config=body.auth_config,
             timeout_seconds=body.timeout_seconds,
             description=body.description,
             owner_email=user.email,
@@ -1081,6 +1100,7 @@ async def update_mcp_server_route(
             "args": updates.get("args", existing.args or []),
             "env": updates.get("env", existing.env or {}),
             "headers": updates.get("headers", existing.headers or {}),
+            "auth_config": updates.get("auth_config", existing.auth_config),
             "timeout_seconds": updates.get("timeout_seconds", existing.timeout_seconds),
         }
         try:

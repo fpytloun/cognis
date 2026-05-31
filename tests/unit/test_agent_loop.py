@@ -35,6 +35,7 @@ from cognis.core.agent_loop import (
     _PreparedRegularToolCall,
     _result_sections_from_content,
     _should_auto_continue_after_mid_stream_failure,
+    _should_continue_after_exhausted_mid_stream_failure,
     _should_run_pre_turn_auto_compaction,
     _validate_step_completion_notification,
 )
@@ -125,6 +126,35 @@ async def test_llm_stream_idle_timeout_tracks_provider_liveness_without_activity
     assert stats.timeout_phase == "activity"
 
 
+@pytest.mark.asyncio
+async def test_llm_stream_idle_timeout_stops_on_cancel_event() -> None:
+    cancel_event = asyncio.Event()
+    closed = False
+
+    async def _stream():
+        nonlocal closed
+        try:
+            yield {"choices": [{"delta": {"content": "started"}}]}
+            cancel_event.set()
+            yield {"choices": [{"delta": {"content": "should-not-yield"}}]}
+        finally:
+            closed = True
+
+    iterator = _iterate_llm_stream_with_idle_timeout(
+        _stream(),
+        idle_timeout_seconds=30,
+        cancel_event=cancel_event,
+    )
+
+    chunks: list[dict[str, Any]] = []
+    with pytest.raises(asyncio.CancelledError):
+        async for chunk in iterator:
+            chunks.append(chunk)
+
+    assert chunks == [{"choices": [{"delta": {"content": "started"}}]}]
+    assert closed is True
+
+
 def test_idle_timeout_failure_can_start_auto_continuation() -> None:
     assert _should_auto_continue_after_mid_stream_failure(
         "LLM stream produced no meaningful activity for 90s"
@@ -133,6 +163,17 @@ def test_idle_timeout_failure_can_start_auto_continuation() -> None:
         "LLM stream produced provider reasoning events but no meaningful output for 270s"
     )
     assert _should_auto_continue_after_mid_stream_failure("Provider disconnected while streaming")
+
+
+def test_exhausted_idle_timeout_can_auto_continue() -> None:
+    assert _should_continue_after_exhausted_mid_stream_failure(
+        "LLM stream produced no meaningful activity for 90s",
+        {"category": "idle_timeout_activity"},
+    )
+    assert _should_continue_after_exhausted_mid_stream_failure(
+        "Provider disconnected while streaming",
+        {"category": "connection"},
+    )
 
 
 @pytest.mark.asyncio
@@ -208,6 +249,39 @@ def test_stream_accumulator_collects_tool_calls() -> None:
     assert tool_calls[0].call_id == "call_123"
 
 
+def test_stream_accumulator_collects_tool_progress_events() -> None:
+    acc = StreamAccumulator()
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_progress": {
+                            "id": "call_patch",
+                            "name": "apply_patch",
+                            "phase": "preparing_input",
+                            "input_chars": 1200,
+                            "input_lines": 40,
+                            "complete": False,
+                        }
+                    }
+                }
+            ]
+        }
+    )
+
+    events = acc.pop_tool_progress_events()
+
+    assert len(events) == 1
+    assert events[0].call_id == "call_patch"
+    assert events[0].tool_name == "apply_patch"
+    assert events[0].phase == "preparing_input"
+    assert events[0].input_chars == 1200
+    assert events[0].input_lines == 40
+    assert events[0].complete is False
+    assert acc.pop_tool_progress_events() == []
+
+
 def test_stream_accumulator_rejects_unparseable_tool_arguments() -> None:
     acc = StreamAccumulator()
     acc.feed(
@@ -234,6 +308,36 @@ def test_stream_accumulator_rejects_unparseable_tool_arguments() -> None:
     assert isinstance(tool_calls[0], ToolArgumentParseFailure)
     assert tool_calls[0].name == "write_file"
     assert tool_calls[0].call_id == "call_bad"
+
+
+def test_stream_accumulator_rejects_empty_apply_patch_arguments() -> None:
+    acc = StreamAccumulator()
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_patch",
+                                "function": {"name": "apply_patch", "arguments": ""},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    tool_calls = acc.get_tool_calls()
+
+    assert len(tool_calls) == 1
+    assert isinstance(tool_calls[0], ToolArgumentParseFailure)
+    assert tool_calls[0].name == "apply_patch"
+    assert tool_calls[0].call_id == "call_patch"
+    assert tool_calls[0].raw == ""
+    assert tool_calls[0].recovery_attempts == ("non_empty_arguments_required",)
 
 
 def test_stream_accumulator_handles_multiple_tool_calls() -> None:
@@ -2317,6 +2421,38 @@ class _RepeatedIdleThenContinuationRecoveredDirectLLM:
         yield {"choices": [{"delta": {"content": "Recovered after repeated idle."}}]}
 
 
+class _ProjectedRetryProbeLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    def count_messages_tokens(
+        self, messages: list[dict[str, object]], model: str | None = None
+    ) -> int:
+        del model
+        if any("new result" in str(message.get("content")) for message in messages):
+            return 98_000
+        return 0
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        info = _test_model_info()
+        info.max_input_tokens = 100_000
+        info.max_output_tokens = 0
+        return info
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            while True:
+                await asyncio.sleep(60)
+                yield {"choices": []}
+        yield {"choices": [{"delta": {"content": "Recovered with original projection."}}]}
+
+
 class _FakeContextAssembler:
     def __init__(self, *, max_context_tokens: int = 0) -> None:
         self.calls: list[dict[str, object]] = []
@@ -3131,7 +3267,9 @@ class _SuccessfulCompactionStrategy:
         *,
         trigger: str = "manual",
         model_context: object | None = None,
+        long_lived_chat: bool = False,
     ) -> SimpleNamespace:
+        del long_lived_chat
         del model_context
         del session
         self.calls.append(trigger)
@@ -3332,6 +3470,77 @@ def test_projection_skip_reprojects_when_tool_prefix_mutates() -> None:
     assert projected.messages[1]["tool_call_id"] == "call-mutated"
     assert ctx.projection_state.reproject_count == 1
     assert ctx.projection_state.skip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_timeout_retry_reuses_original_projection() -> None:
+    fake_llm = _ProjectedRetryProbeLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=1,
+    )
+    policy = ProjectionPolicy.from_budget(
+        max_context_tokens=100_000,
+        available_prompt_tokens=100_000,
+        phase="within_turn",
+        pressure_mode="normal",
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-idle-projection-retry",
+            intaris_session_id="sess-idle-projection-retry",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-idle-projection-retry"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-idle-projection-retry",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+    ctx.projection_state = ProjectionTurnState(
+        turn_id="turn-projection-retry",
+        policy=policy,
+        last_result=ProjectionResult(
+            messages=[{"role": "system", "content": "projected prefix"}],
+            mutable_start_index=0,
+        ),
+        last_message_count=1,
+        last_prefix_fingerprint="stale",
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered with original projection."
+    assert len(fake_llm.calls) == 2
+    assert fake_llm.calls[0] == fake_llm.calls[1]
+    assert ctx.projection_state.forced_critical_count == 0
 
 
 class _ProjectContextProbeExecutor:
@@ -4786,7 +4995,7 @@ async def test_direct_repeated_empty_responses_fail_gracefully() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_idle_timeout_auto_continues_without_llm_call_retry() -> None:
+async def test_direct_idle_timeout_retries_before_auto_continuation() -> None:
     fake_llm = _SilentThenRecoveredDirectLLM()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -4837,14 +5046,14 @@ async def test_direct_idle_timeout_auto_continues_without_llm_call_retry() -> No
     assert output.summary == "Recovered after silence."
     assert output.content == "Recovered after silence."
     assert len(fake_llm.calls) == 2
-    assert any(
+    assert not any(
         "previous model stream failed" in str(message["content"]) for message in fake_llm.calls[1]
     )
 
 
 @pytest.mark.asyncio
-async def test_direct_idle_timeout_allows_repeated_auto_continuations() -> None:
-    fake_llm = _RepeatedIdleThenContinuationRecoveredDirectLLM(idle_failures=3)
+async def test_direct_idle_timeout_continues_after_retry_budget() -> None:
+    fake_llm = _RepeatedIdleThenContinuationRecoveredDirectLLM(idle_failures=6)
     event_bus = _NoopEventBus()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
@@ -4894,10 +5103,10 @@ async def test_direct_idle_timeout_allows_repeated_auto_continuations() -> None:
     assert output.error is None
     assert output.summary == "Recovered after repeated idle."
     assert output.content == "Recovered after repeated idle."
-    assert len(fake_llm.calls) == 4
+    assert len(fake_llm.calls) == 7
     assert any(
         message["role"] == "system" and "previous model stream failed" in str(message["content"])
-        for message in fake_llm.calls[3]
+        for message in fake_llm.calls[6]
     )
     notices = [
         getattr(event, "data", {})
@@ -4982,7 +5191,7 @@ async def test_direct_model_error_auto_continues_after_retry_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mid_stream_retry_emits_recovery_system_notice() -> None:
+async def test_mid_stream_retry_keeps_notice_until_saved_state_continuation() -> None:
     fake_llm = _ModelErrorThenRecoveredDirectLLM()
     event_bus = _NoopEventBus()
     guardrails = _NoopGuardrails()
@@ -5044,7 +5253,7 @@ async def test_mid_stream_retry_emits_recovery_system_notice() -> None:
         for event in event_bus.events
         if getattr(event, "type", None) == EventType.SYSTEM_NOTICE
     ]
-    assert any(notice.get("kind") == "model_retry" for notice in notices)
+    assert not any(notice.get("kind") == "model_retry" for notice in notices)
     assert any(notice.get("kind") == "model_recovery" for notice in notices)
     persisted_notice_events = [
         event
@@ -7836,6 +8045,16 @@ async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None
                     yield {}
                 return
             if self.calls == 3:
+                assert not any(
+                    message["role"] == "system"
+                    and "previous model stream failed" in str(message["content"])
+                    for message in messages
+                )
+                await asyncio.sleep(30)
+                if False:  # pragma: no cover - keep this an async generator
+                    yield {}
+                return
+            if self.calls == 4:
                 assert any(
                     message["role"] == "system"
                     and "previous model stream failed" in str(message["content"])
@@ -7873,7 +8092,7 @@ async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None
                     ]
                 }
                 return
-            if self.calls == 4:
+            if self.calls == 5:
                 yield {"choices": [{"delta": {"content": "Recovered after idle timeout."}}]}
                 return
             while True:
@@ -7941,7 +8160,7 @@ async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None
     assert output is not None
     assert output.error is None
     assert output.summary == "Recovered after idle timeout."
-    assert fake_llm.calls == 4
+    assert fake_llm.calls == 5
     streamed_text = "".join(tokens)
     assert "Recovered after idle timeout." in streamed_text
     assert "model did not produce output" not in streamed_text
@@ -8382,6 +8601,46 @@ def test_filter_model_inventory_tools_hides_unattached_skill_tools_until_discove
         "skill_attached-skill__run_attached",
         "skill_unattached-skill__run_unattached",
     ]
+
+
+def test_initial_skill_tool_ids_include_auto_loaded_skill_tools() -> None:
+    session_cache = _NoopSessionCache()
+    session_cache.activated_skill_tool_ids.add("builtin:existing")
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=session_cache,
+        context_assembler=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=SimpleNamespace(),
+        event_bus=SimpleNamespace(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            skills={
+                "_attached_skill_tool_ids": ["builtin:attached"],
+                "_auto_loaded_skill_tool_ids": ["builtin:auto"],
+            },
+        ),
+    )
+
+    assert agent_loop._get_initial_promoted_tool_ids(ctx) == {
+        "builtin:attached",
+        "builtin:auto",
+    }
+    assert agent_loop._get_initial_activated_tool_ids(ctx) == {
+        "builtin:auto",
+        "builtin:existing",
+    }
 
 
 def test_filter_model_inventory_tools_respects_legacy_skill_permission_names() -> None:
@@ -9006,6 +9265,57 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
 
     assert result.is_error is False
     assert json.loads(result.output)["task_id"] == "task-1"
+
+
+def test_tool_runtime_metadata_uses_executor_agent_for_runtime_access() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="implement", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            parent_session_id=None,
+            delegation_mode=None,
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            context=SimpleNamespace(type="task", ref="task-1", platform_data={}),
+        ),
+        agent=AgentDefinition(
+            agent_id="system:implement",
+            owner_email="system@example.com",
+            name="Implement",
+            agent_type="secondary",
+            is_system=True,
+        ),
+        executor_agent=AgentDefinition(
+            agent_id="agent-b",
+            owner_email="user@example.com",
+            name="Agent B",
+            agent_type="primary",
+        ),
+        task_id="task-1",
+        policy=CHAT_POLICY,
+    )
+
+    metadata = agent_loop._tool_runtime_metadata(ctx)  # noqa: SLF001
+
+    assert metadata["runtime_access"]["agent_id"] == "agent-b"
+    assert metadata["runtime_access"]["agent_owner_email"] == "user@example.com"
+    assert metadata["runtime_access"]["agent_type"] == "primary"
+    assert metadata["runtime_access"]["tool_agent_id"] == "system:implement"
 
 
 @pytest.mark.asyncio

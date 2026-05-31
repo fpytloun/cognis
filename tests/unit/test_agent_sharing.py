@@ -69,7 +69,7 @@ def test_grantee_can_list_and_view_shared_agent(monkeypatch: object, tmp_path: P
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         list_response = client.get(
             "/api/v1/agents",
@@ -135,7 +135,7 @@ def test_grantee_can_load_shared_agent_avatar(monkeypatch: object, tmp_path: Pat
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         list_response = client.get(
             "/api/v1/agents",
@@ -197,7 +197,7 @@ def test_grantee_can_update_own_executor_override(monkeypatch: object, tmp_path:
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.patch(
             "/api/v1/agents/shared-agent/my-share",
@@ -247,7 +247,7 @@ def test_owner_executor_share_rejects_grantee_executor_override(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.patch(
             "/api/v1/agents/shared-agent/my-share",
@@ -284,7 +284,7 @@ def test_admin_has_no_bypass_for_shared_agent_access(monkeypatch: object, tmp_pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/agents/private-agent",
@@ -323,7 +323,7 @@ def test_grantee_cannot_mutate_shared_agent_bindings(monkeypatch: object, tmp_pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.put(
             "/api/v1/agents/shared-agent/bindings",
@@ -366,7 +366,7 @@ def test_grantee_tool_listing_hides_owner_agent_management_opt_in(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/agents/shared-agent/tools",
@@ -414,7 +414,7 @@ def test_revoked_share_blocks_future_messages(monkeypatch: object, tmp_path: Pat
                 await session.commit()
                 client.app.state._test_grant_id = grant.grant_id
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         revoke_response = client.delete(
             f"/api/v1/agents/shared-agent/shares/{client.app.state._test_grant_id}",
@@ -460,7 +460,7 @@ def test_revoked_share_can_be_granted_again(monkeypatch: object, tmp_path: Path)
                 await session.commit()
                 client.app.state._test_regrant_id = grant.grant_id
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         revoke_response = client.delete(
             f"/api/v1/agents/shared-agent/shares/{client.app.state._test_regrant_id}",
@@ -548,7 +548,7 @@ def test_agent_management_service_can_create_and_revoke_share(
             assert created["status"] == "shared"
             assert revoked == {"status": "revoked", "ok": True, "grant_id": grant_id}
 
-        asyncio.run(_run())
+        client.portal.call(_run)
 
 
 def test_agent_management_settings_get_schema_and_update(

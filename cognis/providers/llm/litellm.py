@@ -11,6 +11,8 @@ import os
 import re
 import tempfile
 import uuid
+from collections import Counter as CollectionsCounter
+from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
@@ -643,13 +645,29 @@ async def _observe_llm_stream_request(
     first_token_after: float | None = None
     first_raw_chunk_after: float | None = None
     chunk_count = 0
+    provider_event_counts: CollectionsCounter[str] = CollectionsCounter()
+    recent_provider_event_types: deque[str] = deque(maxlen=20)
+    response_completed_seen = False
+    response_failed_seen = False
+    meaningful_chunk_count = 0
+    reasoning_chunk_count = 0
     usage: dict[str, Any] = {}
     status = "success"
     error_type: str | None = None
 
     def observe_chunk(chunk: dict[str, Any]) -> None:
         nonlocal chunk_count, first_raw_chunk_after, first_token_after, usage, status, error_type
+        nonlocal response_completed_seen, response_failed_seen, meaningful_chunk_count
+        nonlocal reasoning_chunk_count
         chunk_count += 1
+        provider_event_type = chunk.get("provider_event_type")
+        if isinstance(provider_event_type, str) and provider_event_type:
+            provider_event_counts[provider_event_type] += 1
+            recent_provider_event_types.append(provider_event_type)
+            if provider_event_type in {"response.completed", "response.completed.synthetic"}:
+                response_completed_seen = True
+            elif provider_event_type == "response.failed":
+                response_failed_seen = True
         if first_raw_chunk_after is None:
             first_raw_chunk_after = monotonic() - started_at
             LLM_TIME_TO_FIRST_RAW_CHUNK.labels(
@@ -666,6 +684,23 @@ async def _observe_llm_stream_request(
                 llm_api=llm_api,
                 location=location,
             ).observe(first_token_after)
+        choices = chunk.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                if delta.get("reasoning") or delta.get("reasoning_content"):
+                    reasoning_chunk_count += 1
+                if (
+                    delta.get("content")
+                    or delta.get("tool_calls")
+                    or delta.get("function_call")
+                    or delta.get("refusal")
+                ):
+                    meaningful_chunk_count += 1
         chunk_usage = chunk.get("usage")
         if isinstance(chunk_usage, dict):
             usage = chunk_usage
@@ -719,6 +754,13 @@ async def _observe_llm_stream_request(
                 location=location,
             ).observe(cache_hit_ratio)
         diagnostics = dict(request_diagnostics or {})
+        if provider_event_counts:
+            diagnostics["provider_event_counts"] = dict(sorted(provider_event_counts.items()))
+            diagnostics["recent_provider_event_types"] = list(recent_provider_event_types)
+            diagnostics["response_completed_seen"] = response_completed_seen
+            diagnostics["response_failed_seen"] = response_failed_seen
+            diagnostics["meaningful_chunk_count"] = meaningful_chunk_count
+            diagnostics["reasoning_chunk_count"] = reasoning_chunk_count
         explicit_cache_key_present = diagnostics.get("prompt_cache_key_present") is True
         diagnostics["cache_observation_status"] = _response_cache_observation_status(
             cached_tokens=cached_tokens,
@@ -1525,8 +1567,18 @@ def _apply_responses_request_defaults(
     )
     is_chatgpt = _looks_like_chatgpt_oauth_provider(provider)
 
-    # store: omit for ChatGPT (backend forces False); set for all others.
-    if not is_chatgpt and "store" not in result:
+    # Direct Codex requires store=false. LiteLLM's ChatGPT transform forces
+    # store=false, but the direct transport bypasses that transform.
+    if _uses_direct_codex_transport(provider):
+        result["store"] = False
+        if not isinstance(result.get("instructions"), str) or not result["instructions"].strip():
+            if isinstance(instructions, str) and instructions.strip():
+                result["instructions"] = instructions
+            else:
+                result["instructions"] = (
+                    "You are a helpful assistant. Follow the user's instructions precisely."
+                )
+    elif not is_chatgpt and "store" not in result:
         configured_store = config.get("responses_store")
         result["store"] = configured_store if isinstance(configured_store, bool) else False
 
@@ -5654,9 +5706,9 @@ class LiteLLMProvider:
                     break
             if _looks_like_chatgpt_oauth_provider(provider):
                 if not idle_timeout_configured:
-                    idle_timeout = min(idle_timeout, 45)
+                    idle_timeout = min(idle_timeout, 90)
                 if not max_retries_configured:
-                    max_retries = min(max_retries, 1)
+                    max_retries = min(max_retries, 3)
         return {
             "idle_timeout_seconds": max(1, idle_timeout),
             "max_retries": max(0, max_retries),

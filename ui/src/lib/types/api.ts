@@ -122,6 +122,11 @@ export interface Conversation {
     active_executor_assigned_at: string | null;
     active_executor_expires_at: string | null;
     active_executor_source: string | null;
+    active_session_status: string | null;
+    active_session_completion_reason: string | null;
+    active_turn_chat_mode: ChatMode | null;
+    active_turn_chat_mode_source: ChatModeSource | null;
+    pending_notification_types: string[];
     starred_at: string | null;
     status: string;
     last_message_at: string | null;
@@ -130,6 +135,11 @@ export interface Conversation {
     has_active_turn: boolean;
     created_at: string | null;
     updated_at: string | null;
+}
+
+export interface AgentDirectChat {
+  agent: Agent;
+  conversation: Conversation;
 }
 
 export interface ConversationTitleSuggestion {
@@ -191,6 +201,7 @@ export interface Project {
 
 export interface MessageEvent {
   seq: number | null;
+  session_id?: string | null;
   type: string;
   data: Record<string, unknown>;
   timestamp: string | null;
@@ -318,6 +329,7 @@ export interface MessageHistoryResponse {
   items: MessageEvent[];
   last_seq: number;
   has_more: boolean;
+  older_cursor?: string | null;
   has_active_turn: boolean;
   active_streams?: ActiveStreamSnapshot[];
   active_tool_outputs?: ActiveToolOutputSnapshot[];
@@ -657,6 +669,20 @@ export interface MCPServerTestResponse {
   items: MCPServerTestItem[];
 }
 
+export interface MCPAuthConfig {
+  type: 'none' | 'static_headers' | 'oauth2';
+  issuer?: string | null;
+  authorization_server?: string | null;
+  resource?: string | null;
+  scopes?: string[];
+  client_id?: string | null;
+  client_secret_ref?: string | null;
+  redirect_uri?: string | null;
+  dynamic_client_registration?: boolean;
+  client_metadata_document_url?: string | null;
+  authorization_params?: Record<string, string>;
+}
+
 export interface MCPServerConfigResponse {
   server_id: string;
   name: string;
@@ -666,6 +692,7 @@ export interface MCPServerConfigResponse {
   args: string[];
   env: Record<string, string>;
   headers: Record<string, string>;
+  auth_config: MCPAuthConfig;
   timeout_seconds: number;
   description: string | null;
   shared: boolean;
@@ -685,6 +712,7 @@ export interface MCPServerCreateRequest {
   args?: string[];
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  auth_config?: MCPAuthConfig | null;
   timeout_seconds?: number;
   description?: string | null;
   shared?: boolean;
@@ -698,6 +726,7 @@ export interface MCPServerUpdateRequest {
   args?: string[];
   env?: Record<string, string>;
   headers?: Record<string, string>;
+  auth_config?: MCPAuthConfig | null;
   timeout_seconds?: number;
   description?: string | null;
   status?: string;
@@ -930,12 +959,23 @@ export interface ExecutorMCPServerRuntimeStatus {
   tool_count?: number;
 }
 
+export interface ExecutorRuntimeIssue {
+  source?: string;
+  kind?: string;
+  title?: string;
+  severity?: string;
+  message?: unknown;
+  details?: unknown;
+  [key: string]: unknown;
+}
+
 export interface ExecutorRuntimeMetadata {
   schema_version?: number;
   configure_capabilities?: string[];
   legacy_metadata?: boolean;
   single_controller_process?: boolean;
   warnings?: string[];
+  degraded_issues?: ExecutorRuntimeIssue[];
   mcp_servers?: ExecutorMCPServerRuntimeStatus[];
   environment?: Record<string, string>;
   platform?: Record<string, unknown>;
@@ -1003,7 +1043,7 @@ export interface Skill {
   steps: Record<string, unknown>[] | null;
   tags: string[] | null;
   attach_to_all_agents: boolean;
-  auto_load?: boolean;
+  auto_load?: boolean; // Deprecated alias for attach_to_all_agents
   is_system: boolean;
   source: string;
   current_version_id: string | null;
@@ -1024,7 +1064,7 @@ export interface SkillCreate {
   decomposition_source_hash?: string;
   tags?: string[];
   attach_to_all_agents?: boolean;
-  auto_load?: boolean;
+  auto_load?: boolean; // Deprecated alias for attach_to_all_agents
   secret_placeholders?: string[];
   assets?: SkillAssetInput[];
 }
@@ -1040,7 +1080,7 @@ export interface SkillUpdate {
   decomposition_source_hash?: string;
   tags?: string[];
   attach_to_all_agents?: boolean;
-  auto_load?: boolean;
+  auto_load?: boolean; // Deprecated alias for attach_to_all_agents
   secret_placeholders?: string[];
   assets?: SkillAssetInput[];
 }
@@ -1077,6 +1117,11 @@ export interface SkillDecompositionPreview {
 export interface TaskDelivery {
   mode: string;
   target: string | null;
+}
+
+export interface SessionPolicy {
+  allow_policies: Array<string | Record<string, unknown>>;
+  deny_policies: Array<string | Record<string, unknown>>;
 }
 
 export interface CompletionDeliveryPolicy {
@@ -1188,6 +1233,7 @@ export interface Task {
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
+  session_policy: SessionPolicy | null;
   workflow_id: string | null;
   project_id: string | null;
   attempt_number: number;
@@ -1770,6 +1816,9 @@ export interface WebSocketTurnStartedEvent {
   conversation_id?: string;
   session_id?: string;
   message_id?: string;
+  turn_id?: string | null;
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export interface WebSocketTurnSettledEvent {
@@ -1779,6 +1828,8 @@ export interface WebSocketTurnSettledEvent {
   message_id?: string;
   queued_count?: number;
   completed_at?: string | null;
+  chat_mode?: ChatMode;
+  chat_mode_source?: ChatModeSource;
 }
 
 export interface WebSocketToolCallEvent {
@@ -1791,6 +1842,22 @@ export interface WebSocketToolCallEvent {
   tool_name: string;
   status: string;
   arguments?: Record<string, unknown>;
+  timestamp?: string | null;
+}
+
+export interface WebSocketToolProgressEvent {
+  type: 'tool_progress';
+  conversation_id?: string;
+  session_id?: string;
+  turn_id?: string | null;
+  call_id: string;
+  tool_name: string;
+  progress?: {
+    phase?: string;
+    input_chars?: number;
+    input_lines?: number;
+    complete?: boolean;
+  };
   timestamp?: string | null;
 }
 
@@ -2016,8 +2083,17 @@ export interface WebSocketSessionRecoveredEvent {
 export interface WebSocketConversationUpdatedEvent {
   type: 'conversation_updated';
   conversation_id?: string;
+  agent_id?: string;
+  context_type?: string;
+  context_data?: Record<string, unknown> | null;
   title?: string;
+  has_unread?: boolean;
   has_active_turn?: boolean;
+  active_turn_chat_mode?: ChatMode | null;
+  active_turn_chat_mode_source?: ChatModeSource | null;
+  active_session_status?: string | null;
+  active_session_completion_reason?: string | null;
+  pending_notification_types?: string[];
   last_message_at?: string | null;
   updated_at?: string | null;
 }
@@ -2239,6 +2315,7 @@ export type CognisWebSocketEvent =
   | WebSocketTurnSettledEvent
   | WebSocketMessageCompleteEvent
   | WebSocketToolCallEvent
+  | WebSocketToolProgressEvent
   | WebSocketToolResultEvent
   | WebSocketToolResultChunkEvent
   | WebSocketAssistantThinkingChunkEvent

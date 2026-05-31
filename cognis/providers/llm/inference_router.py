@@ -34,7 +34,10 @@ class InferenceRouter:
         conn = await self._find_executor(executor_id, executor_labels)
         self.last_backend_metadata = None
         if conn is None:
-            yield {"error": "No executor matches the provider selector", "mid_stream_failure": True}
+            yield {
+                "error": "No executor matches the provider selector",
+                "mid_stream_failure": True,
+            }
             return
 
         try:
@@ -48,7 +51,14 @@ class InferenceRouter:
                 owner_email=owner_email,
             ):
                 if chunk.get("error"):
-                    yield {"error": chunk["error"], "mid_stream_failure": True}
+                    error_chunk = {
+                        "error": chunk["error"],
+                        "mid_stream_failure": True,
+                    }
+                    response_error = chunk.get("response_error")
+                    if isinstance(response_error, dict):
+                        error_chunk["response_error"] = response_error
+                    yield error_chunk
                     return
                 if chunk.get("done"):
                     metadata = chunk.get("backend_metadata")
@@ -109,7 +119,21 @@ class InferenceRouter:
             owner_email=owner_email,
         ):
             if chunk.get("mid_stream_failure"):
-                raise RuntimeError(chunk.get("error", "Inference failed"))
+                from cognis.providers.llm.errors import (
+                    LLMStreamProviderError,
+                    MidStreamErrorCategory,
+                )
+
+                details = chunk.get("response_error")
+                if not isinstance(details, dict):
+                    details = {
+                        "category": MidStreamErrorCategory.OTHER.value,
+                        "message": str(chunk.get("error") or "Inference failed"),
+                    }
+                raise LLMStreamProviderError(
+                    str(chunk.get("error") or details.get("message") or "Inference failed"),
+                    payload=details,
+                )
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta", {})
                 if delta.get("content") is not None:

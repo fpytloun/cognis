@@ -7,7 +7,7 @@
     class: className = ''
   } = $props<{
     label?: string;
-    tone?: 'sky' | 'slate' | 'cyan';
+    tone?: 'sky' | 'slate' | 'cyan' | 'emerald' | 'amber';
     size?: 'sm' | 'md';
     inline?: boolean;
     class?: string;
@@ -17,9 +17,11 @@
     const palette = {
       sky: 'bg-sky-400',
       slate: 'bg-slate-400',
-      cyan: 'bg-cyan-300'
+      cyan: 'bg-cyan-300',
+      emerald: 'bg-emerald-300',
+      amber: 'bg-amber-300'
     } as const;
-    const safeTone: keyof typeof palette = tone === 'slate' || tone === 'cyan' || tone === 'sky' ? tone : 'sky';
+    const safeTone: keyof typeof palette = tone in palette ? tone as keyof typeof palette : 'sky';
     const dimensions = size === 'sm' ? 'h-1.5 w-1.5' : 'h-2 w-2';
     return `${dimensions} rounded-full ${palette[safeTone]}`;
   }

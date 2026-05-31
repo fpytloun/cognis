@@ -9,7 +9,10 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.config import load_config
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.web_push import (
+    WebPushRuntimeConfig,
+    WebPushService,
     _generate_vapid_private_key,
     _public_key_from_pem,
     _to_sec1_pem,
@@ -111,6 +114,7 @@ def test_send_one_clears_last_error_after_success(
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
 
     with TestClient(create_app()) as client:
+
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
                 await create_user(
@@ -123,7 +127,9 @@ def test_send_one_clears_last_error_after_success(
                 await session.commit()
 
         asyncio.run(_seed())
-        headers = {"Authorization": f"Bearer {client.app.state.auth_provider.sign_access_token('user@example.com', 'User', 'user')}"}
+        headers = {
+            "Authorization": f"Bearer {client.app.state.auth_provider.sign_access_token('user@example.com', 'User', 'user')}"
+        }
         response = client.post(
             "/api/v1/push/subscriptions",
             headers=headers,
@@ -190,3 +196,45 @@ def test_send_sync_passes_loaded_vapid_key_to_pywebpush(
     assert error is None
     assert isinstance(captured["vapid_private_key"], Vapid01)
     assert not isinstance(captured["vapid_private_key"], str)
+
+
+def test_schedule_error_event_payload_does_not_require_conversation_id() -> None:
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    def _session_factory() -> _Session:
+        return _Session()
+
+    service = WebPushService(
+        session_factory=_session_factory,  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject="mailto:test@example.com",
+            reason="disabled",
+        ),
+    )
+
+    payload = asyncio.run(
+        service._event_payload(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.SCHEDULE_ERROR,
+                data={
+                    "schedule_id": "sched_1",
+                    "schedule_name": "Daily check",
+                    "created_by": "user@example.com",
+                },
+            )
+        )
+    )
+
+    assert payload is not None
+    assert payload["user_email"] == "user@example.com"
+    assert payload["kind"] == "schedule"
+    assert payload["tag"] == "schedule:sched_1"

@@ -260,8 +260,20 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   function toggleSkill(skillId: string): void {
     if (form.selectedSkillIds.includes(skillId)) {
       form.selectedSkillIds = form.selectedSkillIds.filter((v: string) => v !== skillId);
+      form.autoLoadSkillIds = form.autoLoadSkillIds.filter((v: string) => v !== skillId);
     } else {
       form.selectedSkillIds = [...form.selectedSkillIds, skillId];
+    }
+  }
+
+  function toggleSkillAutoLoad(skillId: string): void {
+    if (!form.selectedSkillIds.includes(skillId)) {
+      return;
+    }
+    if (form.autoLoadSkillIds.includes(skillId)) {
+      form.autoLoadSkillIds = form.autoLoadSkillIds.filter((v: string) => v !== skillId);
+    } else {
+      form.autoLoadSkillIds = [...form.autoLoadSkillIds, skillId];
     }
   }
 
@@ -782,37 +794,55 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         {#if skills.length > 0}
           <div class="mt-4 space-y-3">
             <p class="text-sm font-medium text-slate-200">Skills</p>
-            <p class="text-xs text-slate-400">Select skills to attach to this agent. Skills attached to all agents are always available.</p>
+            <p class="text-xs text-slate-400">Select skills to attach to this agent. Auto-load instructions only for core skills that should be injected at startup.</p>
             {#if selectableSkills.length > 0}
               <div class="grid gap-2 md:grid-cols-2">
                 {#each selectableSkills as skill}
-                  <div class="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-sm text-slate-200">
-                    <label class="flex min-w-0 items-center gap-2">
-                      <input
-                        checked={form.selectedSkillIds.includes(skill.skill_id)}
-                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                        type="checkbox"
-                        onchange={() => toggleSkill(skill.skill_id)}
-                        disabled={!canEditField('skills')}
-                      />
-                      <span class="truncate">{skill.name}</span>
-                      {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
-                        <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
-                      {/if}
-                      {#if skill.current_version?.asset_manifest && skill.current_version.asset_manifest.length > 0}
-                        <span class="text-xs text-slate-500">({skill.current_version.asset_manifest.length} assets)</span>
-                      {/if}
-                    </label>
-                    <button type="button" class="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200" onclick={() => { skillDetailId = skill.skill_id; }}>
-                      <Eye class="h-3.5 w-3.5" /> View
-                    </button>
+                  {@const selected = form.selectedSkillIds.includes(skill.skill_id)}
+                  <div class="space-y-2 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2 text-sm text-slate-200">
+                    <div class="flex items-center justify-between gap-3">
+                      <label class="flex min-w-0 items-center gap-2">
+                        <input
+                          checked={selected}
+                          class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                          type="checkbox"
+                          onchange={() => toggleSkill(skill.skill_id)}
+                          disabled={!canEditField('skills')}
+                        />
+                        <span class="truncate">{skill.name}</span>
+                        {#if skill.current_version?.tools && skill.current_version.tools.length > 0}
+                          <span class="text-xs text-slate-500">({skill.current_version.tools.length} tools)</span>
+                        {/if}
+                        {#if skill.current_version?.asset_manifest && skill.current_version.asset_manifest.length > 0}
+                          <span class="text-xs text-slate-500">({skill.current_version.asset_manifest.length} assets)</span>
+                        {/if}
+                      </label>
+                      <button type="button" class="inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200" onclick={() => { skillDetailId = skill.skill_id; }}>
+                        <Eye class="h-3.5 w-3.5" /> View
+                      </button>
+                    </div>
+                    {#if selected}
+                      <label class="ml-6 flex items-start gap-2 text-xs text-slate-400">
+                        <input
+                          checked={form.autoLoadSkillIds.includes(skill.skill_id)}
+                          class="mt-0.5 h-3.5 w-3.5 rounded border-slate-600 bg-slate-950"
+                          type="checkbox"
+                          onchange={() => toggleSkillAutoLoad(skill.skill_id)}
+                          disabled={!canEditField('skills')}
+                        />
+                        <span>
+                          Auto-load instructions
+                          <span class="block text-slate-500">Inject full skill instructions at startup; use sparingly because it increases prompt size.</span>
+                        </span>
+                      </label>
+                    {/if}
                   </div>
                 {/each}
               </div>
             {/if}
             {#if globallyAttachedSkills.length > 0}
               <div class="mt-2">
-                <p class="mb-1 text-xs text-slate-500">Attached to all agents:</p>
+                <p class="mb-1 text-xs text-slate-500">Globally attached to every agent:</p>
                 <div class="flex flex-wrap gap-1">
                   {#each globallyAttachedSkills as skill}
                     <span class="rounded bg-slate-700 px-2 py-0.5 text-xs text-slate-300">{skill.name}</span>
