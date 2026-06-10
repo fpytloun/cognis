@@ -7,6 +7,7 @@ here exist solely for visibility on the Tools page and tool registry.
 
 from __future__ import annotations
 
+from cognis.models.credential import SUPPORTED_CREDENTIAL_KINDS
 from cognis.models.tool import ToolDefinition, ToolSource
 
 _SOURCE = ToolSource(type="builtin")
@@ -140,30 +141,57 @@ WRITE_DELIVERABLE_TOOL = ToolDefinition(
     read_only=False,
 )
 
-STEP_REQUEST_INPUT_TOOL = ToolDefinition(
-    name="step_request_input",
+STEP_REQUEST_QUESTIONS_TOOL = ToolDefinition(
+    name="step_request_questions",
     description=(
-        "Request input from the caller while staying in the same step. "
-        "Use when you need clarification or a decision before proceeding."
+        "Request a structured set of questions from the caller while staying in the same step. "
+        "Use when clarification, design choices, or planning decisions are needed before proceeding."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": "The question to ask the caller.",
-            },
-            "options": {
+            "questions": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional list of suggested answers.",
+                "minItems": 1,
+                "description": "Structured question set to ask the caller.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Stable question identifier."},
+                        "header": {
+                            "type": "string",
+                            "description": "Optional short section label.",
+                        },
+                        "question": {"type": "string", "description": "Question text."},
+                        "options": {
+                            "type": "array",
+                            "description": "Optional selectable answers.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "label": {"type": "string"},
+                                    "description": {"type": "string"},
+                                },
+                                "required": ["id", "label"],
+                            },
+                        },
+                        "multiple": {"type": "boolean", "description": "Allow multiple options."},
+                        "allow_custom": {
+                            "type": "boolean",
+                            "description": "Allow a free-form custom answer.",
+                        },
+                        "required": {"type": "boolean", "description": "Require an answer."},
+                    },
+                    "required": ["id", "question"],
+                },
             },
             "context": {
-                "type": "string",
-                "description": "Background context for the question.",
+                "type": "object",
+                "description": "Optional background context for the question set.",
             },
         },
-        "required": ["question"],
+        "required": ["questions"],
     },
     source=_SOURCE,
     category="workflow",
@@ -179,7 +207,11 @@ REQUEST_CREDENTIAL_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "credential_id": {"type": "string", "description": "Credential ID to create/update"},
-            "kind": {"type": "string", "description": "Credential kind"},
+            "kind": {
+                "type": "string",
+                "enum": list(SUPPORTED_CREDENTIAL_KINDS),
+                "description": ("Credential kind. Use 'username_password' for login credentials."),
+            },
             "label": {"type": "string", "description": "Human-readable credential label"},
             "description": {"type": "string", "description": "Why this credential is needed"},
             "metadata": {
@@ -359,7 +391,7 @@ def workflow_tools() -> list[ToolDefinition]:
     return [
         WRITE_DELIVERABLE_TOOL,
         STEP_COMPLETE_TOOL,
-        STEP_REQUEST_INPUT_TOOL,
+        STEP_REQUEST_QUESTIONS_TOOL,
         REQUEST_CREDENTIAL_TOOL,
         REQUEST_AUTH_CHALLENGE_TOOL,
         LIST_CREDENTIALS_TOOL,

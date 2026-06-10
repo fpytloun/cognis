@@ -359,9 +359,7 @@ async def prepare_skill_assets(
             version_row = await get_skill_version(session, asset_row.skill_version_id)
             if version_row is None or version_row.skill_id != skill_id:
                 raise ValueError("existing_asset_id must belong to the same skill")
-            if not allow_binary and not is_text_like_skill_asset(
-                filename, asset_row.content_type
-            ):
+            if not allow_binary and not is_text_like_skill_asset(filename, asset_row.content_type):
                 raise ValueError(
                     f"Agent-managed skill assets must be text or script files: {filename}"
                 )
@@ -398,12 +396,14 @@ async def prepare_skill_assets(
                     content = base64.b64decode(str(inline_b64), validate=True)
                 except Exception as exc:
                     raise ValueError("content_b64 must be valid base64") from exc
-            content_type = str(raw.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+            content_type = str(
+                raw.get("content_type")
+                or mimetypes.guess_type(filename)[0]
+                or "application/octet-stream"
+            )
 
         if not allow_binary and not is_text_like_skill_asset(filename, content_type):
-            raise ValueError(
-                f"Agent-managed skill assets must be text or script files: {filename}"
-            )
+            raise ValueError(f"Agent-managed skill assets must be text or script files: {filename}")
 
         prepared.append(
             PreparedSkillAsset(

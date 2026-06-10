@@ -6,6 +6,7 @@ The executor never sees them.
 
 Tool taxonomy:
   Sub-session tools: delegate, list_subsessions, get_subsession, cancel_subsession
+  Agent work tools: agent_conversation_*
   Task tools: create_task, list_tasks, get_task, update_task, cancel_task
 """
 
@@ -56,8 +57,23 @@ WORKFLOW_TOOL_NAMES = {
     "duplicate_workflow",
 }
 COMPOSITION_TOOL_NAMES = {"compose_and_run_workflow"}
+MANAGED_CONVERSATION_TOOL_NAMES = {
+    "agent_conversation_create",
+    "agent_conversation_send",
+    "agent_conversation_wait",
+    "agent_conversation_interrupt",
+    "agent_conversation_retry",
+    "agent_conversation_fork",
+    "agent_conversation_close",
+    "agent_conversation_list",
+    "agent_conversation_get",
+}
 ORCHESTRATION_TOOL_NAMES = (
-    SUBSESSION_TOOL_NAMES | TASK_TOOL_NAMES | WORKFLOW_TOOL_NAMES | COMPOSITION_TOOL_NAMES
+    SUBSESSION_TOOL_NAMES
+    | MANAGED_CONVERSATION_TOOL_NAMES
+    | TASK_TOOL_NAMES
+    | WORKFLOW_TOOL_NAMES
+    | COMPOSITION_TOOL_NAMES
 )
 
 # ---------------------------------------------------------------------------
@@ -88,8 +104,16 @@ DELEGATE_TOOL = ToolDefinition(
         "## Wait behavior\n\n"
         "Use wait=true when you need the result before continuing (e.g. joining "
         "parallel explorations). Multiple wait=true calls in one turn execute in "
-        "parallel. Use wait=false (default) for background work — you will receive "
-        "a follow-up when the sub-session finishes. Completed results may include "
+        "parallel. Some conversation surfaces expose async background delegation; "
+        "follow the current context instructions and visible schema. When "
+        "delegate(wait=false) is available, use it only for bounded, non-interactive "
+        "worker-style lookup or analysis with clear output and one final report; do "
+        "not use it for open-ended CI/build/deploy/debug/browser/external-system/"
+        "polling loops. wait=false means fire-and-follow-up, not fire-and-duplicate: "
+        "do not continue the same scoped work in parallel, and end the parent turn "
+        "after a short acknowledgement if there is no independent work that can "
+        "safely proceed without the child result. The parent conversation is resumed "
+        "or notified when the background delegation finishes. Completed results may include "
         "result_anchors for individual assistant messages; use tool-output anchor "
         "tools with the delegate call ID to inspect sections when available."
     ),
@@ -123,9 +147,12 @@ DELEGATE_TOOL = ToolDefinition(
                 "description": (
                     "When true, blocks until the sub-session completes and returns "
                     "its output directly as the tool result. Multiple wait=true calls "
-                    "in one turn run in parallel. When false (default), the sub-session "
-                    "runs in the background and you receive a follow-up. Use true when "
-                    "you need the result before continuing."
+                    "in one turn run in parallel. When false, the sub-session "
+                    "runs in the background and you receive a follow-up/resume "
+                    "notification. Use false only for bounded, non-interactive "
+                    "worker-style lookup or analysis with one final report when the "
+                    "current conversation context exposes async background delegation; "
+                    "do not duplicate the same scoped work in the parent turn."
                 ),
                 "default": False,
             },
@@ -215,7 +242,9 @@ CREATE_TASK_TOOL = ToolDefinition(
         "Create an autonomous task. Tasks are independent work units that run "
         "in the background through the workflow engine with multiple steps, "
         "evaluation, and review. Use for substantial work: implementing features, "
-        "deep research, multi-step analysis. The task runs independently — you "
+        "deep research, multi-step analysis. Use tasks when the work needs durable "
+        "workflow-shaped lifecycle tracking, deliverables, evaluation/review, gates, "
+        "or longer background persistence. The task runs independently — you "
         "define it and the result is delivered to the conversation when complete. "
         "Tasks can spawn their own sub-sessions internally. The task owner agent is "
         "the durable main agent for visibility, gates, logs, and delivery; workflow "
@@ -356,8 +385,8 @@ GET_TASK_TOOL = ToolDefinition(
 RESPOND_TASK_INPUT_TOOL = ToolDefinition(
     name="respond_task_input",
     description=(
-        "Answer a paused task step question or step input request. Use get_task first to inspect "
-        "the pending question and available context, then provide the response so the task can resume."
+        "Answer a paused task step question set. Use get_task first to inspect "
+        "the pending questions and available context, then provide structured answers so the task can resume."
     ),
     parameters={
         "type": "object",
@@ -366,12 +395,31 @@ RESPOND_TASK_INPUT_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "ID of the paused task.",
             },
-            "response": {
+            "mode": {
                 "type": "string",
-                "description": "Answer to the pending step question.",
+                "enum": ["structured", "plain_text"],
+                "description": "Reply mode. Rich clients should use structured.",
+                "default": "structured",
+            },
+            "answers": {
+                "type": "array",
+                "description": "Answers to the pending question set.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question_id": {"type": "string"},
+                        "selected_option_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "default": [],
+                        },
+                        "custom_answer": {"type": "string"},
+                    },
+                    "required": ["question_id"],
+                },
             },
         },
-        "required": ["task_id", "response"],
+        "required": ["task_id", "answers"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
@@ -623,6 +671,236 @@ _ALL_TASK_TOOLS = [
     CANCEL_TASK_TOOL,
     RETRY_TASK_TOOL,
     RESOLVE_TASK_PAUSE_TOOL,
+]
+
+_CHAT_MODE_PROPERTY = {
+    "type": "string",
+    "enum": ["default", "plan", "build"],
+    "description": (
+        "Optional one-shot chat mode for this turn. Use plan for planning-only "
+        "analysis, build for implementation-oriented execution after plan/review "
+        "or when explicitly safe, or default for normal behavior."
+    ),
+    "default": "default",
+}
+
+AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
+    name="agent_conversation_create",
+    description=(
+        "Create a managed agent conversation: a normal main Cognis/Intaris conversation "
+        "for another agent, controlled by this interactive chat. Use this when work "
+        "needs a visible, inspectable, iterative agent session rather than a terminal "
+        "delegate result or a structured workflow task. Not available in tasks. With "
+        "wait=false, this is fire-and-follow-up: after starting the managed turn, do "
+        "not continue the same scoped work in parallel; finish the parent turn unless "
+        "there is independent work that can safely proceed. The parent conversation "
+        "will be resumed or notified when the managed turn finishes. Use "
+        "agent_conversation_create(wait=false) for visible iterative work loops outside "
+        "the live channel, especially CI/build/deploy/debug/browser/external-system/"
+        "polling workflows where the user may need to inspect or interact. For "
+        "implementation/debugging style managed conversations, prefer creating the "
+        'first turn with chat_mode="plan"; after user or main-agent review, continue '
+        'with chat_mode="build". Clearly small read-only diagnostics may use default '
+        "mode. Build mode is acceptable when explicitly requested or obviously safe."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "agent_id": {"type": "string", "description": "Target agent ID."},
+            "title": {"type": "string", "description": "Conversation title."},
+            "initial_message": {
+                "type": "string",
+                "description": "First instruction to send to the managed agent.",
+            },
+            "wait": {
+                "type": "boolean",
+                "description": (
+                    "When true, wait for the started turn to finish before returning. "
+                    "When false, start the turn asynchronously and rely on the follow-up/"
+                    "resume notification instead of duplicating the same work in the parent."
+                ),
+                "default": False,
+            },
+            "chat_mode": _CHAT_MODE_PROPERTY,
+        },
+        "required": ["agent_id", "title", "initial_message"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
+    name="agent_conversation_send",
+    description=(
+        "Send a new turn into an existing managed agent conversation. With wait=false, "
+        "this is fire-and-follow-up: do not continue the same scoped work in parallel "
+        "after sending; finish the parent turn unless independent work can safely "
+        "proceed. The parent conversation will be resumed or notified when the "
+        "managed turn finishes."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "message": {"type": "string", "description": "Message/instruction to send."},
+            "wait": {
+                "type": "boolean",
+                "description": (
+                    "When true, wait for the submitted turn to finish. When false, "
+                    "send asynchronously and rely on the follow-up/resume notification "
+                    "instead of duplicating the same work in the parent."
+                ),
+                "default": False,
+            },
+            "chat_mode": _CHAT_MODE_PROPERTY,
+        },
+        "required": ["conversation_id", "message"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_WAIT_TOOL = ToolDefinition(
+    name="agent_conversation_wait",
+    description=(
+        "Wait for the currently running turn in a managed agent conversation. Returns "
+        "immediately when no turn is in progress so parent turns can safely re-attach."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Optional wait timeout in seconds.",
+            },
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+AGENT_CONVERSATION_INTERRUPT_TOOL = ToolDefinition(
+    name="agent_conversation_interrupt",
+    description="Interrupt the active turn in a managed agent conversation.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "reason": {"type": "string", "description": "Optional interrupt reason."},
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_RETRY_TOOL = ToolDefinition(
+    name="agent_conversation_retry",
+    description=(
+        "Retry the last failed or interrupted Agent work turn in the same normal conversation. "
+        "Use agent_conversation_send, not retry, when providing new instructions or clarification."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "wait": {
+                "type": "boolean",
+                "description": (
+                    "When true, wait for the retried turn to finish. When false, rely on "
+                    "the follow-up/resume notification and do not duplicate the same work "
+                    "in the parent turn."
+                ),
+                "default": False,
+            },
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_FORK_TOOL = ToolDefinition(
+    name="agent_conversation_fork",
+    description="Fork a managed agent conversation and optionally start the fork with a message.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "message": {"type": "string", "description": "Optional first message in the fork."},
+            "wait": {"type": "boolean", "default": False},
+            "chat_mode": _CHAT_MODE_PROPERTY,
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_CLOSE_TOOL = ToolDefinition(
+    name="agent_conversation_close",
+    description="Close a managed agent conversation control link.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "reason": {"type": "string", "description": "Optional close reason."},
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_LIST_TOOL = ToolDefinition(
+    name="agent_conversation_list",
+    description="List managed agent conversations controlled by this user/chat.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Optional state filter, or all."},
+            "limit": {"type": "integer", "default": 25},
+        },
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+AGENT_CONVERSATION_GET_TOOL = ToolDefinition(
+    name="agent_conversation_get",
+    description="Get current state for one managed agent conversation.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+        },
+        "required": ["conversation_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=True,
+)
+
+_ALL_MANAGED_CONVERSATION_TOOLS = [
+    AGENT_CONVERSATION_CREATE_TOOL,
+    AGENT_CONVERSATION_SEND_TOOL,
+    AGENT_CONVERSATION_WAIT_TOOL,
+    AGENT_CONVERSATION_INTERRUPT_TOOL,
+    AGENT_CONVERSATION_RETRY_TOOL,
+    AGENT_CONVERSATION_FORK_TOOL,
+    AGENT_CONVERSATION_CLOSE_TOOL,
+    AGENT_CONVERSATION_LIST_TOOL,
+    AGENT_CONVERSATION_GET_TOOL,
 ]
 
 LIST_WORKFLOWS_TOOL = ToolDefinition(
@@ -898,7 +1176,12 @@ _DELEGATE_SYNC_TOOL = DELEGATE_TOOL.model_copy(
 )
 
 
-def orchestration_tools(mode: OrchestrationMode = OrchestrationMode.FULL) -> list[ToolDefinition]:
+def orchestration_tools(
+    mode: OrchestrationMode = OrchestrationMode.FULL,
+    *,
+    expose_delegate_wait_option: bool = True,
+    expose_managed_conversation_tools: bool = True,
+) -> list[ToolDefinition]:
     """Return orchestration tool definitions for the given mode.
 
     FULL: All sub-session + task tools (main interactive session).
@@ -909,13 +1192,16 @@ def orchestration_tools(mode: OrchestrationMode = OrchestrationMode.FULL) -> lis
         return []
     if mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
         return [_DELEGATE_SYNC_TOOL]
-    # FULL mode
-    return (
-        _ALL_SUBSESSION_TOOLS
-        + _ALL_TASK_TOOLS
-        + _ALL_WORKFLOW_TOOLS
-        + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
-    )
+    # FULL mode. The delegate schema and managed-conversation tools can be
+    # narrowed by conversation-surface policy while preserving the same
+    # OrchestrationMode for runtime authorization.
+    subsession_tools = list(_ALL_SUBSESSION_TOOLS)
+    if not expose_delegate_wait_option:
+        subsession_tools[0] = _DELEGATE_SYNC_TOOL
+    tools = subsession_tools
+    if expose_managed_conversation_tools:
+        tools += _ALL_MANAGED_CONVERSATION_TOOLS
+    return tools + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
 
 
 def is_orchestration_tool(tool_name: str) -> bool:
@@ -931,6 +1217,12 @@ def is_subsession_tool(tool_name: str) -> bool:
 def is_task_tool(tool_name: str) -> bool:
     """Return True for task management tools."""
     return tool_name in TASK_TOOL_NAMES
+
+
+def is_managed_conversation_tool(tool_name: str) -> bool:
+    """Return True for agent work control tools."""
+
+    return tool_name in MANAGED_CONVERSATION_TOOL_NAMES
 
 
 def is_workflow_tool(tool_name: str) -> bool:

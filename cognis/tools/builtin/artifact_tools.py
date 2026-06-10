@@ -1544,6 +1544,25 @@ async def _materialize_tool_artifact_ref(
             output=f"Tool output anchor is not materializable: {tool_artifact_ref}",
             is_error=True,
         )
+    if candidate.get("source_type") == "artifact_id":
+        artifact_id = _optional_string(candidate.get("artifact_id"))
+        if artifact_id is None:
+            return ToolResult(
+                output=f"Tool artifact saved artifact ID missing: {tool_artifact_ref}",
+                is_error=True,
+            )
+        async with session_factory() as session:
+            row = await get_artifact_record(session, artifact_id)
+        if row is None or row.status == "deleted" or _is_expired_artifact_row(row):
+            return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        if row.owner_email and row.owner_email != owner_email:
+            return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
+        metadata = _artifact_metadata_item(row)
+        metadata.update({"tool_artifact_ref": tool_artifact_ref})
+        return ToolResult(
+            output=f"Resolved {tool_artifact_ref} to artifact {artifact_id}.",
+            metadata=metadata,
+        )
     if candidate.get("source_type") != "remote_url":
         return ToolResult(
             output=(

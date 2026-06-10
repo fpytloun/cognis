@@ -21,6 +21,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md build.py ./
 COPY cognis/ ./cognis/
 COPY docs/ ./docs/
+COPY scripts/ ./scripts/
 COPY ui/ ./ui/
 COPY --from=ui-build /app/ui/build ./ui/build
 

@@ -33,7 +33,18 @@ logger = get_logger(__name__)
 
 _CLASSIFICATION_CACHE: dict[str, dict[str, Any]] = {}
 _CACHE_LOCK = asyncio.Lock()
+_CLASSIFIER_ERROR_DETAIL_LIMIT = 500
 _DYNAMIC_SOURCE_TYPES = {"local_mcp", "intaris_mcp", "skill"}
+_CLASSIFIER_ERROR_REDACTIONS = (
+    re.compile(r"sk-[A-Za-z0-9_-]+"),
+    re.compile(r"key-[A-Za-z0-9_-]+"),
+    re.compile(r"https?://[^\s:@]+:[^\s@]+@"),
+    re.compile(r"(?i)(api[_ -]?key\s*[=:]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)(['\"]?api[_ -]?key['\"]?\s*:\s*['\"])([^'\"]+)"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,;]+)"),
+    re.compile(r"(?i)(access[_ -]?token\s*[=:]\s*)([^\s,;]+)"),
+)
+_WHITESPACE_RE = re.compile(r"\s+")
 
 _READ_PREFIXES = (
     "get_",
@@ -74,6 +85,105 @@ _DESTRUCTIVE_PREFIXES = (
     "cancel_all_",
     "reset_",
     "wipe_",
+)
+_READ_ACTIONS = (
+    "get",
+    "list",
+    "search",
+    "fetch",
+    "read",
+    "find",
+    "view",
+    "describe",
+    "query",
+    "lookup",
+    "show",
+    "retrieve",
+)
+_READ_RESOURCE_SEGMENTS = (
+    "alerts",
+    "silences",
+    "labels",
+    "label_values",
+    "labelvalues",
+    "series",
+    "metadata",
+)
+_WRITE_ACTIONS = (
+    "send",
+    "post",
+    "publish",
+    "create",
+    "update",
+    "modify",
+    "set",
+    "add",
+    "grant",
+    "revoke",
+    "assign",
+    "upload",
+    "write",
+    "edit",
+    "patch",
+    "submit",
+    "run",
+    "execute",
+    "trigger",
+    "start",
+    "stop",
+    "enable",
+    "disable",
+)
+_DESTRUCTIVE_ACTIONS = (
+    "delete",
+    "remove",
+    "drop",
+    "purge",
+    "destroy",
+    "cancel",
+    "reset",
+    "wipe",
+    "expire",
+)
+_READ_SCHEMA_FIELDS = (
+    "filter",
+    "filters",
+    "query",
+    "state",
+    "status",
+    "label",
+    "labels",
+    "matcher",
+    "matchers",
+    "selector",
+    "start",
+    "end",
+    "from",
+    "to",
+    "limit",
+    "cursor",
+    "page",
+    "page_size",
+    "pagesize",
+)
+_WRITE_SCHEMA_FIELDS = (
+    "comment",
+    "reason",
+    "duration",
+    "starts_at",
+    "startsat",
+    "ends_at",
+    "endsat",
+    "payload",
+    "body",
+    "data",
+    "content",
+    "message",
+    "text",
+    "assignee",
+    "quantity",
+    "enabled",
+    "value",
 )
 
 _BROWSER_HINTS = (
@@ -183,6 +293,7 @@ def classify_tool_definition(tool: ToolDefinition) -> ToolDefinition:
             "category": tool.category,
             "profile_group": profile_group,
             "capabilities": capabilities,
+            "read_only": _classified_read_only(tool, capabilities),
             "classification_status": tool.classification_status or "ready",
             "classification_source": source,
             "classification_confidence": confidence,
@@ -214,6 +325,7 @@ async def classify_tool_definitions(
     tools: list[ToolDefinition],
     *,
     llm: Any | None = None,
+    acting_user_email: str | None = None,
 ) -> list[ToolDefinition]:
     """Classify tools, using the LLM for unresolved dynamic tools when needed."""
 
@@ -231,7 +343,11 @@ async def classify_tool_definitions(
     if not unresolved or llm is None:
         return classified
 
-    updates, _rejected = await _classify_with_llm(unresolved, llm=llm)
+    updates, _rejected = await _classify_with_llm(
+        unresolved,
+        llm=llm,
+        acting_user_email=acting_user_email,
+    )
     by_id = {stable_id(tool): tool for tool in classified}
     for tool_id, payload in updates.items():
         current = by_id.get(tool_id)
@@ -387,11 +503,22 @@ async def resolve_tool_classifications(
 
 
 async def llm_classification_outcomes(
-    tools: list[ToolDefinition], *, llm: Any
+    tools: list[ToolDefinition],
+    *,
+    llm: Any,
+    acting_user_email: str | None = None,
+    allow_soft_profile_group_mismatch_for: set[str] | None = None,
+    retry_context: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Return accepted tool classifications and per-tool rejection reasons."""
 
-    return await _classify_with_llm(tools, llm=llm)
+    return await _classify_with_llm(
+        tools,
+        llm=llm,
+        acting_user_email=acting_user_email,
+        allow_soft_profile_group_mismatch_for=allow_soft_profile_group_mismatch_for,
+        retry_context=retry_context,
+    )
 
 
 def _heuristic_profile_group(tool: ToolDefinition) -> str:
@@ -421,33 +548,134 @@ def _heuristic_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
     if tool.capabilities:
         return {ToolCapability(capability) for capability in tool.capabilities}
     haystack = _tool_haystack(tool)
-    if any(haystack.startswith(prefix) for prefix in _DESTRUCTIVE_PREFIXES) or any(
-        token in haystack for token in ("delete", "destroy", "purge", "drop", "wipe")
-    ):
+    if _has_destructive_signal(tool, haystack):
         return {ToolCapability.DESTRUCTIVE}
     if tool.read_only:
         return {ToolCapability.READ}
+    if _has_write_signal(tool, haystack):
+        return {ToolCapability.WRITE}
     caps: set[ToolCapability] = {ToolCapability.WRITE}
-    if any(haystack.startswith(prefix) for prefix in _READ_PREFIXES):
+    if _has_read_signal(tool, haystack):
         caps = {ToolCapability.READ}
-    elif any(haystack.startswith(prefix) for prefix in _WRITE_PREFIXES):
-        caps = {ToolCapability.WRITE}
     if tool_profile_group(tool) in {"shell", "browser", "development"} or tool.non_bypassable:
         caps.add(ToolCapability.PRIVILEGED)
     return caps
 
 
+def _has_destructive_signal(tool: ToolDefinition, haystack: str) -> bool:
+    segments = _tool_name_segments(tool)
+    return (
+        any(haystack.startswith(prefix) for prefix in _DESTRUCTIVE_PREFIXES)
+        or any(_contains_token(haystack, action) for action in _DESTRUCTIVE_ACTIONS)
+        or any(segment in _DESTRUCTIVE_ACTIONS for segment in segments)
+        or _description_leading_action(tool) in _DESTRUCTIVE_ACTIONS
+    )
+
+
+def _has_write_signal(tool: ToolDefinition, haystack: str) -> bool:
+    segments = _tool_name_segments(tool)
+    if (
+        any(haystack.startswith(prefix) for prefix in _WRITE_PREFIXES)
+        or any(segment in _WRITE_ACTIONS for segment in segments)
+        or _description_leading_action(tool) in _WRITE_ACTIONS
+    ):
+        return True
+    return _schema_contains_any_field(tool.parameters, _WRITE_SCHEMA_FIELDS)
+
+
+def _has_read_signal(tool: ToolDefinition, haystack: str) -> bool:
+    segments = _tool_name_segments(tool)
+    if any(haystack.startswith(prefix) for prefix in _READ_PREFIXES):
+        return True
+    if _description_leading_action(tool) in _READ_ACTIONS:
+        return True
+    if any(segment in _READ_ACTIONS or segment in _READ_RESOURCE_SEGMENTS for segment in segments):
+        return True
+    if _schema_contains_any_field(tool.parameters, _READ_SCHEMA_FIELDS):
+        return bool(
+            _description_leading_action(tool) in _READ_ACTIONS
+            or any(segment in _READ_ACTIONS for segment in segments)
+        )
+    return False
+
+
+def _description_leading_action(tool: ToolDefinition) -> str | None:
+    description = _classification_description(tool.description)
+    match = re.match(r"\s*([a-zA-Z][a-zA-Z_-]*)", description)
+    if match is None:
+        return None
+    return _normalize_action(match.group(1))
+
+
+def _tool_name_segments(tool: ToolDefinition) -> tuple[str, ...]:
+    values: list[str] = []
+    if tool.source.raw_tool_name:
+        values.append(tool.source.raw_tool_name)
+    values.append(tool.name.split("__", 1)[1] if "__" in tool.name else tool.name)
+
+    segments: list[str] = []
+    for value in values:
+        segments.extend(_normalized_segments(value))
+    return tuple(dict.fromkeys(segments))
+
+
+def _normalized_segments(value: str) -> list[str]:
+    return [_normalize_action(part) for part in re.split(r"[^a-zA-Z0-9]+", value) if part]
+
+
+def _normalize_action(value: str) -> str:
+    normalized = _normalize_for_matching(value).replace(" ", "_")
+    return (
+        normalized[:-1]
+        if normalized.endswith("s") and normalized[:-1] in _READ_ACTIONS
+        else normalized
+    )
+
+
+def _schema_contains_any_field(schema: Any, field_names: tuple[str, ...]) -> bool:
+    wanted = {name.lower() for name in field_names}
+    return any(field_name in wanted for field_name in _schema_field_names(schema))
+
+
+def _schema_field_names(schema: Any) -> set[str]:
+    field_names: set[str] = set()
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for name, subschema in properties.items():
+                field_names.add(_normalize_action(str(name)))
+                field_names.update(_schema_field_names(subschema))
+        for key in ("items", "additionalProperties", "anyOf", "oneOf", "allOf"):
+            value = schema.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    field_names.update(_schema_field_names(item))
+            else:
+                field_names.update(_schema_field_names(value))
+    elif isinstance(schema, list):
+        for item in schema:
+            field_names.update(_schema_field_names(item))
+    return field_names
+
+
 async def _classify_with_llm(
-    tools: list[ToolDefinition], *, llm: Any
+    tools: list[ToolDefinition],
+    *,
+    llm: Any,
+    acting_user_email: str | None = None,
+    allow_soft_profile_group_mismatch_for: set[str] | None = None,
+    retry_context: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     uncached: list[tuple[str, ToolDefinition, str]] = []
     cached_results: dict[str, dict[str, Any]] = {}
     rejected: dict[str, str] = {}
+    allow_soft_profile_group_mismatch_for = allow_soft_profile_group_mismatch_for or set()
+    retry_context = retry_context or {}
     async with _CACHE_LOCK:
         for tool in tools:
             tool_id = stable_id(tool)
             fingerprint = _tool_fingerprint(tool)
-            cache_key = f"{tool_id}:{fingerprint}"
+            cache_key = f"{acting_user_email or '__global__'}:{tool_id}:{fingerprint}"
             cached = _CLASSIFICATION_CACHE.get(cache_key)
             if cached is not None:
                 error = _validate_profile_group(
@@ -486,6 +714,18 @@ async def _classify_with_llm(
                             "source_type": tool.source.type,
                             "current_category": tool.category,
                             "read_only": tool.read_only,
+                            **(
+                                {
+                                    "previous_rejection": retry_context[tool_id],
+                                    "retry_instruction": (
+                                        "Reconsider the prior profile_group disagreement. "
+                                        "Deterministic keyword hints are advisory for profile groups; "
+                                        "return your best valid profile_group and capabilities."
+                                    ),
+                                }
+                                if tool_id in retry_context
+                                else {}
+                            ),
                         }
                         for tool_id, tool, _cache_key in uncached
                     ]
@@ -494,6 +734,7 @@ async def _classify_with_llm(
             ),
         },
     ]
+    tool_ids = [tool_id for tool_id, _tool, _cache_key in uncached]
     try:
         response = await llm.generate(
             messages,
@@ -501,13 +742,64 @@ async def _classify_with_llm(
             temperature=0,
             max_retries=1,
             response_format={"type": "json_object"},
+            acting_user_email=acting_user_email,
         )
-        payload = extract_json_object(extract_text_from_response(response), label="tool_classifier")
-    except Exception:
-        logger.warning("Tool LLM classification failed", exc_info=True)
+    except Exception as exc:
+        error = _classifier_error("llm_generate_failed", exc)
+        logger.warning(
+            "Tool LLM classification generation failed",
+            extra={
+                "extra_data": {
+                    "tool_ids": tool_ids,
+                    "error_kind": "generation",
+                    "error": error,
+                    "acting_user_email_present": acting_user_email is not None,
+                }
+            },
+        )
         return cached_results, {
             **rejected,
-            **{tool_id: "llm_generate_failed" for tool_id, _tool, _cache_key in uncached},
+            **{tool_id: error for tool_id, _tool, _cache_key in uncached},
+        }
+    try:
+        content = extract_text_from_response(response)
+        if not content.strip():
+            raise ValueError("empty classifier response content")
+    except Exception as exc:
+        error = _classifier_error("llm_response_extract_failed", exc)
+        logger.warning(
+            "Tool LLM classification response extraction failed",
+            extra={
+                "extra_data": {
+                    "tool_ids": tool_ids,
+                    "error_kind": "response_extraction",
+                    "error": error,
+                    "acting_user_email_present": acting_user_email is not None,
+                }
+            },
+        )
+        return cached_results, {
+            **rejected,
+            **{tool_id: error for tool_id, _tool, _cache_key in uncached},
+        }
+    try:
+        payload = extract_json_object(content, label="tool_classifier")
+    except Exception as exc:
+        error = _classifier_error("llm_json_extract_failed", exc)
+        logger.warning(
+            "Tool LLM classification JSON extraction failed",
+            extra={
+                "extra_data": {
+                    "tool_ids": tool_ids,
+                    "error_kind": "json_extraction",
+                    "error": error,
+                    "acting_user_email_present": acting_user_email is not None,
+                }
+            },
+        )
+        return cached_results, {
+            **rejected,
+            **{tool_id: error for tool_id, _tool, _cache_key in uncached},
         }
 
     results_by_id: dict[str, dict[str, Any]] = dict(cached_results)
@@ -541,6 +833,21 @@ async def _classify_with_llm(
             normalized["capabilities"],
         )
         if error is not None:
+            if (
+                tool_id in allow_soft_profile_group_mismatch_for
+                and _is_soft_profile_group_validation_error(error)
+            ):
+                logger.info(
+                    "Accepting retried LLM tool classification despite heuristic profile-group mismatch",
+                    extra={"extra_data": {"tool_id": tool_id, "prior_reason": error}},
+                )
+                results_by_id[tool_id] = normalized
+                cache_key = next(
+                    (key for candidate_id, _tool, key in uncached if candidate_id == tool_id), None
+                )
+                if cache_key is not None:
+                    to_cache[cache_key] = normalized
+                continue
             logger.warning(
                 "Rejected LLM tool classification",
                 extra={"extra_data": {"tool_id": tool_id, "reason": error}},
@@ -562,6 +869,20 @@ async def _classify_with_llm(
     return results_by_id, rejected
 
 
+def _is_soft_profile_group_validation_error(error: str) -> bool:
+    """Return true when the LLM profile group should win after one corrective retry."""
+
+    return error in {
+        "browser_tool_misclassified",
+        "browser_group_without_browser_signal",
+        "web_group_for_browser_tool",
+        "communication_tool_misclassified",
+        "office_tool_misclassified",
+        "personal_tool_misclassified",
+        "web_group_without_web_signal",
+    }
+
+
 def _normalize_capabilities(value: Any) -> list[ToolCapability]:
     if not isinstance(value, list):
         return []
@@ -574,6 +895,26 @@ def _normalize_capabilities(value: Any) -> list[ToolCapability]:
         if capability not in normalized:
             normalized.append(capability)
     return normalized
+
+
+def _classifier_error(prefix: str, exc: Exception) -> str:
+    detail = _sanitize_classifier_error_detail(str(exc) or exc.__class__.__name__)
+    return f"{prefix}:{exc.__class__.__name__}:{detail}"
+
+
+def _sanitize_classifier_error_detail(detail: str) -> str:
+    sanitized = detail
+    for pattern in _CLASSIFIER_ERROR_REDACTIONS:
+        sanitized = pattern.sub(
+            r"\1[redacted]" if pattern.groups else "[redacted-api-key]",
+            sanitized,
+        )
+    sanitized = _WHITESPACE_RE.sub(" ", sanitized).strip()
+    if not sanitized:
+        sanitized = "no error detail"
+    if len(sanitized) > _CLASSIFIER_ERROR_DETAIL_LIMIT:
+        sanitized = sanitized[: _CLASSIFIER_ERROR_DETAIL_LIMIT - 3].rstrip() + "..."
+    return sanitized
 
 
 def _validate_profile_group(

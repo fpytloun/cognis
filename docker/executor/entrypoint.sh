@@ -105,6 +105,50 @@ EOF
   fi
 }
 
+load_local_compose_token() {
+  local token_file wait_seconds deadline
+  token_file="${COGNIS_EXECUTOR_TOKEN_FILE:-/run/cognis-local/executor.env}"
+  wait_seconds="${COGNIS_EXECUTOR_TOKEN_WAIT_SECONDS:-0}"
+
+  if [[ -n "${COGNIS_EXECUTOR_TOKEN:-}" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$token_file" ]]; then
+    load_executor_env_file "$token_file"
+    return 0
+  fi
+
+  if [[ "$wait_seconds" == "0" ]]; then
+    return 0
+  fi
+
+  deadline=$((SECONDS + wait_seconds))
+  while [[ SECONDS -lt deadline ]]; do
+    if [[ -f "$token_file" ]]; then
+      load_executor_env_file "$token_file"
+      return 0
+    fi
+    sleep 2
+  done
+}
+
+load_executor_env_file() {
+  local env_file line key value
+  env_file="$1"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      COGNIS_CONTROLLER_URL|COGNIS_EXECUTOR_TOKEN|COGNIS_EXECUTOR_WORKDIR|COGNIS_EXECUTOR_ALLOW_INSECURE_WS)
+        export "$key=$value"
+        ;;
+    esac
+  done < "$env_file"
+}
+
 if [[ "$(id -u)" == "0" ]]; then
   mkdir -p "$DEFAULT_HOME"
   if [[ "${COGNIS_SKIP_HOME_CHOWN:-}" != "1" ]]; then
@@ -115,6 +159,7 @@ fi
 
 setup_nss_wrapper
 initialize_home
+load_local_compose_token
 
 if [[ "$#" -eq 0 ]]; then
   set -- cognis-executor

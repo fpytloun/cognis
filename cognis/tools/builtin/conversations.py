@@ -7,14 +7,16 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
 from cognis.api.serializers import conversation_to_response, serialize_event_rows
 from cognis.core.conversation_search import join_session_matches
+from cognis.core.long_lived_chat import is_long_lived_chat_context
+from cognis.core.session_cache import CachedEvent
 from cognis.models.search import SearchRequestFilters, SearchSessionsRequest
+from cognis.models.session import ConversationContext, SessionModel
 from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource
 from cognis.store.queries import (
     get_conversation,
+    get_session_row,
     get_setting_value,
     list_conversation_sessions,
     list_conversations,
@@ -114,9 +116,40 @@ READ_CONVERSATION_MESSAGES_TOOL = _tool(
     },
 )
 
+SUMMARIZE_CONVERSATION_TOOL = _tool(
+    "summarize_conversation",
+    (
+        "Generate a read-only compaction-format summary for a target conversation session. "
+        "Defaults to the active session of the current conversation."
+    ),
+    {
+        "conversation_id": {
+            "type": "string",
+            "description": "Conversation to summarize. Defaults to the current conversation.",
+        },
+        "session_id": {
+            "type": "string",
+            "description": (
+                "Specific Cognis or Intaris session to summarize. Defaults to the "
+                "conversation active session, or the latest session when unavailable."
+            ),
+        },
+        "use_cached": {
+            "type": "boolean",
+            "default": True,
+            "description": "Return an existing compaction summary when available instead of regenerating.",
+        },
+    },
+)
+
 
 def conversation_tools() -> list[ToolDefinition]:
-    return [LIST_CONVERSATIONS_TOOL, SEARCH_CONVERSATIONS_TOOL, READ_CONVERSATION_MESSAGES_TOOL]
+    return [
+        LIST_CONVERSATIONS_TOOL,
+        SEARCH_CONVERSATIONS_TOOL,
+        READ_CONVERSATION_MESSAGES_TOOL,
+        SUMMARIZE_CONVERSATION_TOOL,
+    ]
 
 
 def _user(context: ToolExecutionContext) -> str:
@@ -191,6 +224,58 @@ def _conversation_activity(row: Any) -> datetime | None:
         _as_aware(getattr(row, "created_at", None)),
     ]
     return max((item for item in candidates if item is not None), default=None)
+
+
+def _conversation_context(row: Any) -> ConversationContext:
+    return ConversationContext(
+        type=getattr(row, "context_type", None) or "web",
+        ref=getattr(row, "context_ref", None),
+        platform_data=getattr(row, "context_data", None) or {},
+        memory_labels=getattr(row, "memory_labels", None) or {},
+    )
+
+
+def _session_model(row: Any) -> SessionModel:
+    return SessionModel(
+        session_id=row.session_id,
+        conversation_id=row.conversation_id,
+        parent_session_id=getattr(row, "parent_session_id", None),
+        previous_session_id=getattr(row, "previous_session_id", None),
+        user_email=row.user_email,
+        agent_id=row.agent_id,
+        delegation_mode=getattr(row, "delegation_mode", None),
+        delegation_task=getattr(row, "delegation_task", None),
+        status=getattr(row, "status", "active"),
+        completion_reason=getattr(row, "completion_reason", None),
+        intaris_session_id=getattr(row, "intaris_session_id", None),
+        mnemory_session_id=getattr(row, "mnemory_session_id", None),
+        started_at=getattr(row, "started_at", None),
+        idle_since=getattr(row, "idle_since", None),
+        completed_at=getattr(row, "completed_at", None),
+        result_summary=getattr(row, "result_summary", None),
+        result_content=getattr(row, "result_content", None),
+        updated_at=getattr(row, "updated_at", None),
+    )
+
+
+def _cached_event(raw_event: dict[str, Any]) -> CachedEvent:
+    return CachedEvent(
+        seq=int(raw_event.get("seq") or 0),
+        type=str(raw_event.get("type") or ""),
+        data=dict(raw_event.get("data") or {}),
+        source=raw_event.get("source"),
+        ts=raw_event.get("ts"),
+    )
+
+
+def _latest_compaction_summary(events: list[CachedEvent]) -> tuple[str | None, int]:
+    for event in reversed(events):
+        if event.type != "compaction_summary":
+            continue
+        summary = event.data.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary, event.seq
+    return None, 0
 
 
 def _filter_conversations_by_time(
@@ -293,8 +378,9 @@ def _truncate_content(content: str, *, include_truncation: bool) -> tuple[str, b
 
 
 def build_conversation_tool_handlers(
-    session_factory: async_sessionmaker[AsyncSession],
+    session_factory: Any,
     intaris: Any,
+    compaction_strategy: Any | None = None,
 ) -> dict[str, Any]:
     async def list_conversations_handler(
         arguments: dict[str, Any], context: ToolExecutionContext
@@ -607,8 +693,112 @@ def build_conversation_tool_handlers(
             },
         }
 
+    async def summarize_conversation_handler(
+        arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, Any]:
+        strategy = compaction_strategy
+        if strategy is None and isinstance(context.shared_runtime_metadata, dict):
+            strategy = context.shared_runtime_metadata.get("compaction_strategy")
+        if strategy is None:
+            raise ValueError("Compaction strategy is unavailable")
+
+        user_email = _user(context)
+        conversation_id = arguments.get("conversation_id") or _current_conversation_id(context)
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("conversation_id is required outside an active conversation")
+        requested_session_id = arguments.get("session_id")
+        if requested_session_id is not None and not isinstance(requested_session_id, str):
+            raise ValueError("session_id must be a string")
+
+        async with session_factory() as session:
+            conversation = await get_conversation(session, conversation_id)
+            if (
+                conversation is None
+                or conversation.user_email != user_email
+                or conversation.status == "deleted"
+            ):
+                raise ValueError("Conversation not found")
+            session_rows = await list_conversation_sessions(session, conversation_id)
+            session_row = None
+            if requested_session_id:
+                for row in session_rows:
+                    if (
+                        row.session_id == requested_session_id
+                        or row.intaris_session_id == requested_session_id
+                    ):
+                        session_row = row
+                        break
+                if session_row is None:
+                    raise ValueError("session_id does not belong to this conversation")
+            elif getattr(conversation, "active_session_id", None):
+                session_row = await get_session_row(session, conversation.active_session_id)
+                if session_row is not None and session_row.conversation_id != conversation_id:
+                    session_row = None
+            if session_row is None and session_rows:
+                session_row = session_rows[-1]
+
+        if session_row is None:
+            return {
+                "conversation_id": conversation_id,
+                "session_id": None,
+                "intaris_session_id": None,
+                "summary": None,
+                "format": "compaction_summary_v1",
+                "generated": False,
+                "method": "noop",
+                "message": "Conversation has no sessions to summarize.",
+            }
+
+        session_model = _session_model(session_row)
+        intaris_session_id = session_model.intaris_session_id or session_model.session_id
+        raw_event_read = await intaris.read_events(
+            intaris_session_id,
+            after_seq=0,
+            allow_missing_stream=True,
+        )
+        raw_events = [event for event in list(raw_event_read.events) if isinstance(event, dict)]
+        events = [_cached_event(event) for event in raw_events]
+        last_compaction_summary, last_compaction_seq = _latest_compaction_summary(events)
+        use_cached = bool(arguments.get("use_cached", True))
+        if use_cached and last_compaction_summary:
+            return {
+                "conversation_id": conversation_id,
+                "session_id": session_model.session_id,
+                "intaris_session_id": intaris_session_id,
+                "summary": last_compaction_summary,
+                "format": "compaction_summary_v1",
+                "generated": False,
+                "method": "cached_compaction_summary",
+                "turns_summarized": 0,
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tail_start_seq": None,
+            }
+
+        result = await strategy.preview_summary_from_events(
+            session_model,
+            events=[event for event in events if event.seq > last_compaction_seq],
+            last_compaction_summary=last_compaction_summary,
+            trigger="tool_preview",
+            long_lived_chat=is_long_lived_chat_context(_conversation_context(conversation)),
+        )
+        return {
+            "conversation_id": conversation_id,
+            "session_id": session_model.session_id,
+            "intaris_session_id": session_model.intaris_session_id or session_model.session_id,
+            "summary": result.summary,
+            "format": "compaction_summary_v1",
+            "generated": result.compacted,
+            "method": result.method,
+            "turns_summarized": result.turns_compacted,
+            "tokens_before": result.tokens_before,
+            "tokens_after": result.tokens_after,
+            "tail_start_seq": result.tail_start_seq,
+        }
+
     return {
         "list_conversations": list_conversations_handler,
         "search_conversations": search_conversations_handler,
         "read_conversation_messages": read_conversation_messages_handler,
+        "summarize_conversation": summarize_conversation_handler,
     }

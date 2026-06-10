@@ -1,7 +1,8 @@
-.PHONY: dev serve test lint format typecheck build clean ui ui-dev help
+.PHONY: dev serve test lint format typecheck build clean ui ui-dev help local-compose-build local-compose-up local-compose-seed local-compose-executor-up local-compose-logs local-compose-down local-compose-reset local-compose-wait
 
 PYTHON ?= uv run python
 COGNIS ?= uv run cognis-controller
+LOCAL_COMPOSE ?= docker compose -f compose.local.yml
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -58,6 +59,36 @@ test-contract: ## Run contract tests (requires Mnemory + Intaris)
 
 test-all: ## Run all tests
 	uv run pytest -v
+
+# ---------------------------------------------------------------------------
+# Local Compose deployment
+# ---------------------------------------------------------------------------
+
+local-compose-build: ## Build local Cognis/controller and executor images
+	$(LOCAL_COMPOSE) build cognis cognis-executor seed
+
+local-compose-up: ## Start the Local Compose deployment
+	mkdir -p .local/cognis-compose/executor-token
+	$(LOCAL_COMPOSE) up -d qdrant mnemory intaris cognis
+
+local-compose-seed: ## Seed the Local Compose deployment and write executor token files
+	$(LOCAL_COMPOSE) --profile seed run --rm seed
+
+local-compose-executor-up: ## Start the Docker sidecar WebSocket executor
+	$(LOCAL_COMPOSE) up -d cognis-executor
+
+local-compose-wait: ## Wait for Local Compose services to be reachable on localhost
+	uv run python scripts/local_compose_wait.py
+
+local-compose-logs: ## Follow Local Compose logs
+	$(LOCAL_COMPOSE) logs -f
+
+local-compose-down: ## Stop the Local Compose deployment without deleting volumes
+	$(LOCAL_COMPOSE) down
+
+local-compose-reset: ## Stop Local Compose and destroy all local volumes/state
+	$(LOCAL_COMPOSE) --profile seed down -v
+	rm -rf .local/cognis-compose
 
 # ---------------------------------------------------------------------------
 # Code quality

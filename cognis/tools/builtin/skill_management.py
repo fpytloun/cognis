@@ -82,6 +82,8 @@ SKILL_LOAD_TOOL = ToolDefinition(
         "Use this when you need to follow a skill's guidance. Always returns the "
         "latest published version. This is the primary way to access skill content "
         "— the available_skills metadata in the system prompt only contains summaries. "
+        "Do not read filesystem SKILL.md files as a substitute for loading visible "
+        "Cognis skills. "
         "Loading a skill also makes its deferred skill tools available for subsequent model calls."
     ),
     parameters={
@@ -133,7 +135,14 @@ SKILL_WRITE_TOOL = ToolDefinition(
     name="skill_write",
     description=(
         "Create or update a skill. Provide skill_id to update an existing skill, "
-        "or omit it to create a new one. Creates a new immutable version on each write."
+        "or omit it to create a new one. Creates a new immutable version on each write. "
+        "This is the authoritative path for skill creation and updates; do not "
+        "create or edit filesystem SKILL.md files instead. Use proactively when a "
+        "task reveals durable reusable procedure, tool guidance, safety boundaries, "
+        "or user-specific workflow/style expectations. Prefer updating an existing "
+        "relevant skill over creating a new one; create new skills only for recurring "
+        "class-level workflows, not one-off progress notes, transient failures, or "
+        "narrow bug fixes."
     ),
     parameters={
         "type": "object",
@@ -210,7 +219,8 @@ SKILL_ASSET_WRITE_TOOL = ToolDefinition(
     name="skill_asset_write",
     description=(
         "Add or replace a skill asset by filename. Agents may attach text/script content directly "
-        "or reuse an existing published artifact via source_artifact_id."
+        "or reuse an existing published artifact via source_artifact_id. Use this Cognis tool for "
+        "skill assets instead of writing files into a filesystem skill directory."
     ),
     parameters={
         "type": "object",
@@ -238,7 +248,10 @@ SKILL_ASSET_WRITE_TOOL = ToolDefinition(
 
 SKILL_ASSET_DELETE_TOOL = ToolDefinition(
     name="skill_asset_delete",
-    description="Remove an asset from a skill by filename, creating a new skill version.",
+    description=(
+        "Remove an asset from a skill by filename, creating a new skill version. "
+        "Use this Cognis tool instead of deleting files from a filesystem skill directory."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -256,7 +269,10 @@ SKILL_ASSET_DELETE_TOOL = ToolDefinition(
 
 SKILL_DELETE_TOOL = ToolDefinition(
     name="skill_delete",
-    description="Delete a skill by ID. This removes the skill and all its versions.",
+    description=(
+        "Delete a skill by ID. This removes the skill and all its versions. "
+        "Use this Cognis tool instead of removing filesystem skill manifests."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -276,7 +292,8 @@ SKILL_IMPORT_URL_TOOL = ToolDefinition(
     description=(
         "Import a skill from a URL. Supports SKILL.md files (Claude Code / Agent Skills format), "
         "GitHub blob/raw/folder URLs, and Cognis YAML format. "
-        "The imported skill is created as a new DB-managed skill with provenance tracking."
+        "The imported skill is created as a new DB-managed skill with provenance tracking; "
+        "do not manually create filesystem SKILL.md files for skill management."
     ),
     parameters={
         "type": "object",
@@ -312,7 +329,10 @@ SKILL_IMPORT_URL_TOOL = ToolDefinition(
 
 SKILL_EXPORT_TOOL = ToolDefinition(
     name="skill_export",
-    description="Export a skill as SKILL.md, Cognis YAML, or a full Cognis package.",
+    description=(
+        "Export a Cognis-managed skill as SKILL.md, Cognis YAML, or a full Cognis package. "
+        "Exports are generated through Cognis; do not manage skills by editing exported SKILL.md files."
+    ),
     parameters={
         "type": "object",
         "properties": {

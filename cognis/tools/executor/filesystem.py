@@ -12,7 +12,6 @@ import mimetypes
 import os
 import re
 import shutil
-import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -750,7 +749,8 @@ def _default_skill_asset_path(skill_id: str, asset: dict[str, Any], filename: st
         ).strip("._")
         or "asset"
     )
-    root = Path(tempfile.gettempdir()) / "cognis_skill_assets" / safe_skill / safe_asset
+    data_dir = Path(os.environ.get("COGNIS_DATA_DIR") or "~/.cognis").expanduser()
+    root = data_dir / "skill_assets" / safe_skill / safe_asset
     target = (root / filename).resolve()
     if not target.is_relative_to(root.resolve()):
         raise ValueError(f"Unsafe skill asset filename rejected: {filename}")

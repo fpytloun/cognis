@@ -51,6 +51,18 @@ from cognis.tools.executor.filesystem import (
     handle_write,
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
+from cognis.tools.executor.officecli import OFFICECLI_RUNTIME_METADATA_KEY
+from cognis.tools.executor.officecli.definitions import office_tool_definitions
+from cognis.tools.executor.officecli.handlers import (
+    handle_office_create,
+    handle_office_get,
+    handle_office_patch,
+    handle_office_query,
+    handle_office_read,
+    handle_office_render,
+    handle_office_validate,
+)
+from cognis.tools.executor.officecli.manifest import certified_tool_names
 from cognis.tools.executor.search import handle_glob, handle_grep
 from cognis.tools.executor.shell import handle_bash, handle_bash_kill, handle_bash_output
 from cognis.tools.executor.web import (
@@ -710,6 +722,8 @@ ALL_EXECUTOR_TOOLS: list[ToolDefinition] = [
     *browser_tool_definitions(),
 ]
 
+OFFICE_EXECUTOR_TOOLS: list[ToolDefinition] = office_tool_definitions()
+
 _HANDLER_MAP: dict[
     str,
     Any,
@@ -730,6 +744,13 @@ _HANDLER_MAP: dict[
     "bash_kill": handle_bash_kill,
     "document_generate": handle_document_generate,
     "artifact_publish": handle_artifact_publish,
+    "office_read": handle_office_read,
+    "office_get": handle_office_get,
+    "office_query": handle_office_query,
+    "office_validate": handle_office_validate,
+    "office_render": handle_office_render,
+    "office_create": handle_office_create,
+    "office_patch": handle_office_patch,
     "browser_open": handle_browser_open,
     "browser_snapshot": handle_browser_snapshot,
     "browser_list_sessions": handle_browser_list_sessions,
@@ -767,6 +788,15 @@ _HANDLER_MAP: dict[
 def executor_tool_definitions() -> list[ToolDefinition]:
     """Return all executor-native tool definitions."""
     return list(ALL_EXECUTOR_TOOLS)
+
+
+def office_executor_tool_definitions(runtime_metadata: dict[str, Any]) -> list[ToolDefinition]:
+    """Return Office tools only for a certified, available OfficeCLI runtime."""
+    officecli = runtime_metadata.get(OFFICECLI_RUNTIME_METADATA_KEY) or {}
+    if not isinstance(officecli, dict) or not officecli.get("available"):
+        return []
+    allowed = certified_tool_names(str(officecli.get("version") or ""))
+    return [tool for tool in OFFICE_EXECUTOR_TOOLS if tool.name in allowed]
 
 
 def executor_tool_handlers() -> dict[str, Any]:

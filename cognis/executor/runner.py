@@ -29,7 +29,11 @@ from cognis.models.tool import (
 )
 from cognis.tools.executor.browser.handlers import build_manager_from_config
 from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
-from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
+from cognis.tools.executor.definitions import (
+    executor_tool_definitions,
+    executor_tool_handlers,
+    office_executor_tool_definitions,
+)
 from cognis.tools.executor.file_freshness import _FILE_FRESHNESS_KEY, get_file_freshness_tracker
 from cognis.tools.executor.lsp import (
     LSP_MANAGER_KEY,
@@ -38,6 +42,11 @@ from cognis.tools.executor.lsp import (
     build_lsp_status_report,
     cleanup_lsp_manager,
     resolve_lsp_runtime_config,
+)
+from cognis.tools.executor.officecli import (
+    OFFICECLI_RUNTIME_METADATA_KEY,
+    ensure_officecli,
+    resolve_officecli_runtime_config,
 )
 from cognis.tools.executor.project_context import (
     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
@@ -646,6 +655,26 @@ class ExecutorRunner:
                 lsp_manager = None
             if lsp_manager is not None:
                 self._runtime_metadata[LSP_MANAGER_KEY] = lsp_manager
+            officecli_config = resolve_officecli_runtime_config(
+                config if isinstance(config, dict) else {}
+            )
+            officecli_status = await ensure_officecli(officecli_config)
+            self._runtime_metadata[OFFICECLI_RUNTIME_METADATA_KEY] = officecli_status.metadata()
+            self._runtime_metadata["officecli_available"] = officecli_status.available
+            self._runtime_metadata["officecli_enabled"] = officecli_status.enabled
+            self._runtime_metadata["officecli_auto_install"] = officecli_status.auto_install
+            self._runtime_metadata["officecli_version"] = officecli_status.version
+            self._runtime_metadata["officecli_platform"] = officecli_status.platform_key
+            self._runtime_metadata["officecli_command"] = officecli_status.command
+            self._runtime_metadata["officecli_capabilities"] = officecli_status.capabilities or {}
+            self._runtime_metadata["officecli_error"] = officecli_status.error
+            self._runtime_metadata["officecli_installed_from"] = officecli_status.installed_from
+            office_defs = filter_tools_by_executor(
+                office_executor_tool_definitions(self._runtime_metadata),
+                enabled_tools,
+                enabled_tool_groups,
+            )
+            native_defs = [*native_defs, *office_defs]
 
             self._configured_tool_definitions = [*native_defs, *web_defs, *discovered_tools]
             native_handlers = executor_tool_handlers()
@@ -1404,7 +1433,12 @@ class ExecutorRunner:
                         "www_authenticate": exc.www_authenticate,
                     }
                 )
-                warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
+                if exc.authorization_required:
+                    warnings.append(
+                        f"MCP server {server.name} requires authorization during {exc.phase}."
+                    )
+                else:
+                    warnings.append(f"MCP server {server.name} failed during {exc.phase}.")
                 continue
             except BaseException as exc:
                 if _should_reraise_isolated_exception(exc):

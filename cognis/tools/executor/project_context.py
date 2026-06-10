@@ -80,7 +80,9 @@ async def handle_project_context_probe(
         fallback_cwd=fallback_cwd,
         fallback_home=fallback_home,
     )
-    result = _discover_project_context(anchor=anchor, hint_text=hint_text, fallback_home=fallback_home)
+    result = _discover_project_context(
+        anchor=anchor, hint_text=hint_text, fallback_home=fallback_home
+    )
     if result["status"] == "loaded":
         return ToolResult(
             output=f"Loaded project instructions for {result['project_root']}",
@@ -184,7 +186,9 @@ def _search_by_hint(hint_text: str, *, fallback_home: str | None) -> dict[str, A
     for hint in hints:
         for root_name in _COMMON_PROJECT_ROOTS:
             candidate = home / root_name / hint
-            if candidate.is_dir() and (_is_project_root(candidate) or _select_instruction(candidate)):
+            if candidate.is_dir() and (
+                _is_project_root(candidate) or _select_instruction(candidate)
+            ):
                 matches.append(candidate.resolve(strict=False))
     unique_matches = sorted({path for path in matches})
     if len(unique_matches) != 1:

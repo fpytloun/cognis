@@ -1,0 +1,175 @@
+services:
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.1}
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant-local-data:/qdrant/storage
+    restart: unless-stopped
+
+  mnemory:
+    image: ${MNEMORY_IMAGE:-genunix/mnemory:latest}
+    depends_on:
+      qdrant:
+        condition: service_started
+    environment:
+      DATA_DIR: /data
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8050
+      MGMT_PORT: 9090
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_COLLECTION: ${MNEMORY_QDRANT_COLLECTION:-mnemory}
+      SESSION_BACKEND: sqlite
+      SESSION_PATH: /data/sessions.db
+      ARTIFACT_BACKEND: filesystem
+      ARTIFACT_PATH: /data/artifacts
+      LLM_BASE_URL: ${MNEMORY_LLM_BASE_URL:-${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}}
+      LLM_API_KEY: ${MNEMORY_LLM_API_KEY:-${COGNIS_LOCAL_LLM_API_KEY:-}}
+      LLM_MODEL: ${MNEMORY_LLM_MODEL:-gpt-oss-120b}
+      FIND_LLM_MODEL: ${MNEMORY_FIND_LLM_MODEL:-gpt-oss-120b}
+      FSCK_LLM_MODEL: ${MNEMORY_FSCK_LLM_MODEL:-gpt-oss-120b}
+      CONSOLIDATION_LLM_MODEL: ${MNEMORY_CONSOLIDATION_LLM_MODEL:-gpt-oss-120b}
+      EMBED_BASE_URL: ${MNEMORY_EMBED_BASE_URL:-${MNEMORY_LLM_BASE_URL:-${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}}}
+      EMBED_API_KEY: ${MNEMORY_EMBED_API_KEY:-${MNEMORY_LLM_API_KEY:-${COGNIS_LOCAL_LLM_API_KEY:-}}}
+      EMBED_MODEL: ${MNEMORY_EMBED_MODEL:-text-embedding-3-small}
+      EMBED_DIMS: ${MNEMORY_EMBED_DIMS:-1536}
+      MNEMORY_JWKS_URL: http://cognis:8080/.well-known/jwks.json
+      EXCHANGE_COOKIE_SECURE: "false"
+    ports:
+      - "${MNEMORY_PORT:-8050}:8050"
+      - "${MNEMORY_MGMT_PORT:-9090}:9090"
+    volumes:
+      - mnemory-local-data:/data
+    restart: unless-stopped
+
+  intaris:
+    image: ${INTARIS_IMAGE:-genunix/intaris:latest}
+    depends_on:
+      qdrant:
+        condition: service_started
+    environment:
+      DATA_DIR: /data
+      DB_BACKEND: sqlite
+      DB_PATH: /data/intaris.db
+      INTARIS_HOST: 0.0.0.0
+      INTARIS_PORT: 8060
+      INTARIS_BASE_URL: ${INTARIS_BASE_URL:-http://localhost:8060}
+      COOKIE_SECURE: "false"
+      LLM_BASE_URL: ${INTARIS_LLM_BASE_URL:-${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}}
+      LLM_API_KEY: ${INTARIS_LLM_API_KEY:-${COGNIS_LOCAL_LLM_API_KEY:-}}
+      LLM_MODEL: ${INTARIS_LLM_MODEL:-gpt-oss-20b}
+      ANALYSIS_LLM_BASE_URL: ${INTARIS_ANALYSIS_LLM_BASE_URL:-${INTARIS_LLM_BASE_URL:-${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}}}
+      ANALYSIS_LLM_API_KEY: ${INTARIS_ANALYSIS_LLM_API_KEY:-${INTARIS_LLM_API_KEY:-${COGNIS_LOCAL_LLM_API_KEY:-}}}
+      ANALYSIS_LLM_MODEL: ${INTARIS_ANALYSIS_LLM_MODEL:-gpt-oss-120b}
+      ANALYSIS_L3_LLM_MODEL: ${INTARIS_ANALYSIS_L3_LLM_MODEL:-gpt-oss-120b}
+      JUDGE_LLM_MODEL: ${INTARIS_JUDGE_LLM_MODEL:-gpt-oss-120b}
+      EVENT_STORE_ENABLED: "true"
+      EVENT_STORE_BACKEND: filesystem
+      EVENT_STORE_PATH: /data/events
+      INTARIS_JWKS_URL: http://cognis:8080/.well-known/jwks.json
+      INTARIS_SEARCH_ENABLED: "true"
+      INTARIS_SEARCH_VECTOR_PROVIDER: qdrant
+      INTARIS_SEARCH_QDRANT_URL: http://qdrant:6333
+      INTARIS_SEARCH_QDRANT_COLLECTION: ${INTARIS_SEARCH_QDRANT_COLLECTION:-intaris-search}
+      INTARIS_SEARCH_EMBEDDING_BASE_URL: ${INTARIS_SEARCH_EMBEDDING_BASE_URL:-${INTARIS_LLM_BASE_URL:-${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}}}
+      INTARIS_SEARCH_EMBEDDING_API_KEY: ${INTARIS_SEARCH_EMBEDDING_API_KEY:-${INTARIS_LLM_API_KEY:-${COGNIS_LOCAL_LLM_API_KEY:-}}}
+      INTARIS_SEARCH_EMBEDDING_MODEL: ${INTARIS_SEARCH_EMBEDDING_MODEL:-text-embedding-3-small}
+      INTARIS_SEARCH_EMBEDDING_DIM: ${INTARIS_SEARCH_EMBEDDING_DIM:-1536}
+      INTARIS_SEARCH_SPARSE_MODEL: ${INTARIS_SEARCH_SPARSE_MODEL:-Qdrant/bm25}
+    ports:
+      - "${INTARIS_PORT:-8060}:8060"
+    volumes:
+      - intaris-local-data:/data
+    restart: unless-stopped
+
+  cognis:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      mnemory:
+        condition: service_started
+      intaris:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    environment:
+      COGNIS_DATA_DIR: /data
+      COGNIS_HOST: 0.0.0.0
+      COGNIS_PORT: 8080
+      COGNIS_PUBLIC_BASE_URL: ${COGNIS_PUBLIC_BASE_URL:-http://localhost:8080}
+      COGNIS_LOG_FORMAT: ${COGNIS_LOG_FORMAT:-text}
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND: qdrant
+      COGNIS_KNOWLEDGEBASE_QDRANT_URL: http://qdrant:6333
+      COGNIS_KNOWLEDGEBASE_QDRANT_COLLECTION: ${COGNIS_KNOWLEDGEBASE_QDRANT_COLLECTION:-cognis_knowledgebase_chunks}
+      COGNIS_INITIAL_ADMIN_EMAIL: ${COGNIS_LOCAL_ADMIN_EMAIL:-admin@localhost}
+      COGNIS_INITIAL_ADMIN_PASSWORD: ${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}
+      COGNIS_LOCAL_LLM_BASE_URL: ${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}
+      COGNIS_LOCAL_LLM_API_KEY: ${COGNIS_LOCAL_LLM_API_KEY:-}
+      COGNIS_LOCAL_CHAT_MODEL: ${COGNIS_LOCAL_CHAT_MODEL:-gpt-oss-120b}
+    ports:
+      - "${COGNIS_PORT:-8080}:8080"
+    volumes:
+      - cognis-local-data:/data
+    restart: unless-stopped
+
+  seed:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      cognis:
+        condition: service_started
+      mnemory:
+        condition: service_started
+      intaris:
+        condition: service_started
+    profiles:
+      - seed
+    environment:
+      COGNIS_DATA_DIR: /data
+      COGNIS_LOG_FORMAT: ${COGNIS_LOG_FORMAT:-text}
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_LOCAL_ADMIN_EMAIL: ${COGNIS_LOCAL_ADMIN_EMAIL:-admin@localhost}
+      COGNIS_LOCAL_ADMIN_PASSWORD: ${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}
+      COGNIS_LOCAL_ADMIN_NAME: ${COGNIS_LOCAL_ADMIN_NAME:-Local Admin}
+      COGNIS_LOCAL_LLM_BASE_URL: ${COGNIS_LOCAL_LLM_BASE_URL:-https://api.groq.com/openai/v1}
+      COGNIS_LOCAL_LLM_API_KEY: ${COGNIS_LOCAL_LLM_API_KEY:-}
+      COGNIS_LOCAL_CHAT_MODEL: ${COGNIS_LOCAL_CHAT_MODEL:-gpt-oss-120b}
+      COGNIS_LOCAL_EXECUTOR_TOKEN_DIR: /run/cognis-local
+    volumes:
+      - cognis-local-data:/data
+      - ./.local/cognis-compose/executor-token:/run/cognis-local
+    command: ["python", "/app/scripts/local_compose_seed.py"]
+
+  cognis-executor:
+    image: ${COGNIS_EXECUTOR_IMAGE:-cognis-executor-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    depends_on:
+      cognis:
+        condition: service_started
+    environment:
+      COGNIS_CONTROLLER_URL: ws://cognis:8080/api/executor/ws
+      COGNIS_EXECUTOR_TOKEN_FILE: /run/cognis-local/executor.env
+      COGNIS_EXECUTOR_TOKEN_WAIT_SECONDS: ${COGNIS_EXECUTOR_TOKEN_WAIT_SECONDS:-180}
+      COGNIS_EXECUTOR_WORKDIR: /home/cognis/workspace
+      COGNIS_LOG_LEVEL: ${COGNIS_EXECUTOR_LOG_LEVEL:-info}
+    volumes:
+      - cognis-executor-home:/home/cognis
+      - ./.local/cognis-compose/executor-token:/run/cognis-local:ro
+    restart: unless-stopped
+
+volumes:
+  cognis-local-data:
+  cognis-executor-home:
+  intaris-local-data:
+  mnemory-local-data:
+  qdrant-local-data:

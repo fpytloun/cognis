@@ -158,10 +158,12 @@ def main() -> None:
         sys.stderr.write("ERROR: Provide --token or set COGNIS_EXECUTOR_TOKEN.\n")
         raise SystemExit(1)
 
-    if not url.startswith("wss://") and not _is_localhost(url):
+    if not url.startswith("wss://") and not _is_localhost(url) and not _allow_insecure_ws():
         sys.stderr.write(
             "ERROR: Remote executor connections require wss:// (TLS). "
-            "Use ws:// only for localhost connections.\n"
+            "Use ws:// only for localhost connections, or set "
+            "COGNIS_EXECUTOR_ALLOW_INSECURE_WS=1 for an explicitly trusted "
+            "local network such as Local Compose.\n"
         )
         raise SystemExit(1)
 
@@ -192,6 +194,15 @@ def _is_localhost(url: str) -> bool:
         if url.startswith(prefix):
             return True
     return False
+
+
+def _allow_insecure_ws() -> bool:
+    return os.environ.get("COGNIS_EXECUTOR_ALLOW_INSECURE_WS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _resolve_workdir(cli_workdir: str | None) -> str:

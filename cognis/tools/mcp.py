@@ -10,7 +10,7 @@ import mimetypes
 import os
 import re
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from typing import Any, Protocol
@@ -155,9 +155,17 @@ class _SessionMCPClient:
 
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
-        self._exit_stack: AsyncExitStack | None = None
-        self._session: ClientSession | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._requests: asyncio.Queue[tuple[str, tuple[Any, ...], asyncio.Future[Any]]] | None = (
+            None
+        )
+        self._ready: asyncio.Future[None] | None = None
         self._tool_schemas: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _consume_future_result(future: asyncio.Future[Any]) -> None:
+        with suppress(BaseException):
+            future.result()
 
     async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[Any, Any]:
         raise NotImplementedError
@@ -165,34 +173,34 @@ class _SessionMCPClient:
     async def connect(self) -> None:
         """Open the MCP transport and perform initialize."""
 
-        exit_stack = AsyncExitStack()
+        if self._task is not None:
+            return
+        loop = asyncio.get_running_loop()
+        self._requests = asyncio.Queue()
+        self._ready = loop.create_future()
+        self._task = asyncio.create_task(self._run_session_owner(), name=f"mcp:{self.config.name}")
         try:
-            read_stream, write_stream = await self._enter_transport(exit_stack)
-            session = await exit_stack.enter_async_context(
-                ClientSession(
-                    read_stream,
-                    write_stream,
-                    read_timeout_seconds=timedelta(seconds=self.config.timeout_seconds),
-                )
-            )
-            await session.initialize()
-        except Exception as exc:
-            await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
-            raise _coerce_client_error(self.config.name, "initialize", exc) from exc
-
-        self._exit_stack = exit_stack
-        self._session = session
+            await asyncio.wait_for(self._ready, timeout=self.config.connect_timeout_seconds)
+        except TimeoutError as exc:
+            await self.close(suppress_cancelled=True)
+            raise MCPClientError(
+                self.config.name,
+                "initialize",
+                f"MCP initialize timed out after {self.config.connect_timeout_seconds}s",
+                error_class="timeout",
+                timed_out=True,
+            ) from exc
+        except asyncio.CancelledError:
+            await self.close(suppress_cancelled=True)
+            raise
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
 
-        if self._session is None:
+        if self._task is None:
             raise RuntimeError("MCP client is not started")
         logger.debug("MCP: %s requesting tools/list", self.config.name)
-        try:
-            result = await self._session.list_tools()
-        except Exception as exc:
-            raise _coerce_client_error(self.config.name, "list_tools", exc) from exc
+        result = await self._submit("list_tools")
         tools = [
             {
                 "name": t.name,
@@ -208,8 +216,6 @@ class _SessionMCPClient:
             input_schema = t.get("inputSchema", {})
             if isinstance(name, str) and isinstance(input_schema, dict):
                 self._tool_schemas[name] = input_schema
-        if hasattr(self._session, "_tool_output_schemas"):
-            self._session._tool_output_schemas.clear()
         logger.info("MCP: %s discovered %d tool(s)", self.config.name, len(tools))
         logger.debug("MCP: %s tool names: %s", self.config.name, [t["name"] for t in tools])
         return tools
@@ -217,46 +223,139 @@ class _SessionMCPClient:
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Execute a tool and return the normalized result payload."""
 
-        if self._session is None:
+        if self._task is None:
             raise RuntimeError("MCP client is not started")
         schema = self._tool_schemas.get(tool_name, {})
         sanitized = _strip_empty_optionals(arguments, schema)
-        try:
-            result = await self._session.call_tool(tool_name, sanitized)
-        except Exception as exc:
-            raise _coerce_client_error(self.config.name, "call_tool", exc) from exc
+        result = await self._submit("call_tool", tool_name, sanitized)
         return _normalize_call_result(result)
 
     async def close(self, *, suppress_cancelled: bool = False) -> None:
         """Close the transport and client session."""
 
         logger.debug("MCP: %s closing", self.config.name)
-        if self._exit_stack is not None:
+        task = self._task
+        requests = self._requests
+        self._task = None
+        self._requests = None
+        self._ready = None
+        if task is not None and requests is not None:
+            if task.done():
+                try:
+                    await task
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    logger.debug(
+                        "MCP: %s owner task already finished during close; suppressing",
+                        self.config.name,
+                        exc_info=True,
+                    )
+                logger.debug("MCP: %s closed", self.config.name)
+                return
+            task.cancel()
             try:
-                await self._exit_stack.aclose()
+                await asyncio.shield(task)
             except asyncio.CancelledError:
-                if not suppress_cancelled:
+                if not task.cancelled() and not suppress_cancelled:
                     raise
-                logger.debug("MCP: %s close cancelled during transport teardown", self.config.name)
+                logger.debug("MCP: %s owner task cancelled during close", self.config.name)
             except BaseException as exc:
-                # Catches Exception as well as BaseExceptionGroup (Python 3.11+
-                # and the anyio exceptiongroup backport on 3.10), which is
-                # raised when anyio detects that aclose() is being called from
-                # a different task than the one that entered the cancel scope.
-                # We must not propagate: callers suppress only Exception and
-                # CancelledError, so an unhandled BaseExceptionGroup would
-                # bypass run()'s except Exception and exit the executor.
-                # Re-raise process-level signals so shutdown is never blocked.
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 logger.debug(
-                    "MCP: %s close raised during transport teardown; suppressing",
+                    "MCP: %s owner task raised during close; suppressing",
                     self.config.name,
                     exc_info=True,
                 )
-            self._exit_stack = None
-            self._session = None
         logger.debug("MCP: %s closed", self.config.name)
+
+    async def _submit(self, operation: str, *args: Any) -> Any:
+        if self._requests is None:
+            raise RuntimeError("MCP client is not started")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        await self._requests.put((operation, args, future))
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=self.config.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            await self.close(suppress_cancelled=True)
+            raise MCPClientError(
+                self.config.name,
+                operation,
+                f"MCP {operation} timed out after {self.config.timeout_seconds}s",
+                error_class="timeout",
+                timed_out=True,
+            ) from exc
+        except asyncio.CancelledError:
+            future.add_done_callback(self._consume_future_result)
+            raise
+
+    async def _run_session_owner(self) -> None:
+        exit_stack = AsyncExitStack()
+        assert self._ready is not None
+        assert self._requests is not None
+        requests = self._requests
+        current_future: asyncio.Future[Any] | None = None
+        try:
+            read_stream, write_stream = await self._enter_transport(exit_stack)
+            session = await exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream,
+                    write_stream,
+                    read_timeout_seconds=timedelta(seconds=self.config.timeout_seconds),
+                )
+            )
+            await session.initialize()
+        except Exception as exc:
+            await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
+            if not self._ready.done():
+                self._ready.set_exception(_coerce_client_error(self.config.name, "initialize", exc))
+            return
+        if not self._ready.done():
+            self._ready.set_result(None)
+
+        try:
+            while True:
+                operation, args, future = await requests.get()
+                current_future = future
+                if operation == "close":
+                    if not future.done():
+                        future.set_result(None)
+                    break
+                try:
+                    if operation == "list_tools":
+                        result = await session.list_tools()
+                        if hasattr(session, "_tool_output_schemas"):
+                            session._tool_output_schemas.clear()
+                    elif operation == "call_tool":
+                        result = await session.call_tool(*args)
+                    else:
+                        raise RuntimeError(f"Unsupported MCP operation: {operation}")
+                except Exception as exc:
+                    phase = operation if operation == "list_tools" else "call_tool"
+                    if not future.done():
+                        future.set_exception(_coerce_client_error(self.config.name, phase, exc))
+                else:
+                    if not future.done():
+                        future.set_result(result)
+                finally:
+                    current_future = None
+        finally:
+            closed_exc = RuntimeError("MCP client closed")
+            if current_future is not None and not current_future.done():
+                current_future.set_exception(closed_exc)
+            while True:
+                try:
+                    _operation, _args, future = requests.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if not future.done():
+                    future.set_exception(RuntimeError("MCP client closed"))
+            await exit_stack.aclose()
 
 
 class StdioMCPClient(_SessionMCPClient):
@@ -361,7 +460,7 @@ class SSEMCPClient(_SessionMCPClient):
             sse_client(
                 self.config.url,
                 headers=self.headers,
-                timeout=self.config.timeout_seconds,
+                timeout=self.config.connect_timeout_seconds,
                 sse_read_timeout=max(self.config.timeout_seconds, _HTTP_READ_TIMEOUT_SECONDS),
             )
         )
@@ -390,6 +489,7 @@ class StreamableHTTPMCPClient(_SessionMCPClient):
                 follow_redirects=True,
                 timeout=httpx.Timeout(
                     self.config.timeout_seconds,
+                    connect=self.config.connect_timeout_seconds,
                     read=max(self.config.timeout_seconds, _HTTP_READ_TIMEOUT_SECONDS),
                 ),
             )
@@ -752,18 +852,31 @@ def _error_class(exc: Exception) -> str:
     return "timeout" if _is_timeout(exc) else type(exc).__name__.lower()
 
 
+def _iter_exception_tree(exc: BaseException) -> Iterable[BaseException]:
+    yield exc
+    if isinstance(exc, BaseExceptionGroup):
+        for child in exc.exceptions:
+            yield from _iter_exception_tree(child)
+
+
 def _coerce_client_error(server_name: str, phase: str, exc: Exception) -> MCPClientError:
     if isinstance(exc, MCPClientError):
         return exc
-    status_code = getattr(exc, "status_code", None)
-    response = getattr(exc, "response", None)
-    if status_code is None and response is not None:
-        status_code = getattr(response, "status_code", None)
+    status_code = None
     www_authenticate = None
-    if response is not None:
-        headers = getattr(response, "headers", None)
-        if headers is not None:
-            www_authenticate = headers.get("www-authenticate")
+    for candidate in _iter_exception_tree(exc):
+        candidate_status = getattr(candidate, "status_code", None)
+        response = getattr(candidate, "response", None)
+        if candidate_status is None and response is not None:
+            candidate_status = getattr(response, "status_code", None)
+        if status_code is None and isinstance(candidate_status, int):
+            status_code = candidate_status
+        if www_authenticate is None and response is not None:
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                www_authenticate = headers.get("www-authenticate")
+        if status_code is not None and www_authenticate is not None:
+            break
     auth_error = None
     if status_code == 401:
         auth_error = "authorization_required"

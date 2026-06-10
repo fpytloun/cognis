@@ -15,3 +15,5 @@ ui/coverage/
 cognis/ui_dist/
 .playwright-mcp/
 .worktrees
+.env.local
+.local/
