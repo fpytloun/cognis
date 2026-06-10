@@ -27,6 +27,7 @@ from cognis.api.websocket import (
     _handle_cancel_queued_message,
     _handle_message,
     _handle_update_queued_message,
+    _is_visible_persisted_system_message,
     _workflow_composed_payload,
 )
 from cognis.core.events import Event, EventType
@@ -36,7 +37,12 @@ from cognis.core.turn_scheduler import (
     classify_turn_error,
 )
 from cognis.models.config import ProviderHealth
-from cognis.store.queries import create_agent, create_conversation, create_user
+from cognis.store.queries import (
+    create_agent,
+    create_conversation,
+    create_managed_conversation_link,
+    create_user,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — fake providers for classify_turn_error
@@ -181,6 +187,61 @@ def test_user_message_payload_exposes_stable_live_identity() -> None:
     assert payload["timestamp"] is not None
 
 
+def test_session_compaction_started_payload_exposes_runtime_state() -> None:
+    event = Event(
+        type=EventType.SESSION_COMPACTION_STARTED,
+        data={
+            "conversation_id": "conversation-1",
+            "session_id": "session-1",
+            "trigger": "idle_checkpoint",
+            "reason": "long_lived_chat_idle",
+            "effective_usage_percentage": 91.2,
+            "hard_pressure_exceeded": True,
+            "phase": "turn",
+            "status": "running",
+            "provider_id": "provider-1",
+            "model_id": "model-1",
+        },
+    )
+
+    payload = _event_to_payload(event, "conversation-1")
+
+    assert payload is not None
+    assert payload["type"] == "session_compaction_started"
+    assert payload["conversation_id"] == "conversation-1"
+    assert payload["session_id"] == "session-1"
+    assert payload["trigger"] == "idle_checkpoint"
+    assert payload["reason"] == "long_lived_chat_idle"
+    assert payload["effective_usage_percentage"] == 91.2
+    assert payload["hard_pressure_exceeded"] is True
+    assert payload["status"] == "running"
+    assert payload["provider_id"] == "provider-1"
+    assert payload["model_id"] == "model-1"
+
+
+def test_session_compaction_finished_payload_clears_runtime_state() -> None:
+    event = Event(
+        type=EventType.SESSION_COMPACTION_FINISHED,
+        data={
+            "conversation_id": "conversation-1",
+            "session_id": "session-1",
+            "trigger": "automatic",
+            "reason": "context_pressure",
+            "status": "failed",
+            "fallback_reason": "compaction_failed",
+        },
+    )
+
+    payload = _event_to_payload(event, "conversation-1")
+
+    assert payload is not None
+    assert payload["type"] == "session_compaction_finished"
+    assert payload["conversation_id"] == "conversation-1"
+    assert payload["session_id"] == "session-1"
+    assert payload["status"] == "failed"
+    assert payload["fallback_reason"] == "compaction_failed"
+
+
 # ---------------------------------------------------------------------------
 # classify_turn_error tests
 # ---------------------------------------------------------------------------
@@ -304,6 +365,73 @@ async def test_connection_manager_sends_user_payload_to_all_user_connections() -
     user_ws_1.send_json.assert_awaited_once_with(payload)
     user_ws_2.send_json.assert_awaited_once_with(payload)
     other_ws.send_json.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
+    manager = _RecordingManager()
+    observer = WebSocketTurnObserver(manager)  # type: ignore[arg-type]
+
+    await observer.on_system_message(
+        "conv-1",
+        "Turn initiated by task failure: Nightly import (task-1).",
+        notice_id="turn-init:fup_task_failed",
+        kind="turn_initiated",
+        scope="turn",
+        turn_id="turn-1",
+    )
+
+    assert manager.payloads == [
+        (
+            "conv-1",
+            {
+                "type": "system_message",
+                "conversation_id": "conv-1",
+                "text": "Turn initiated by task failure: Nightly import (task-1).",
+                "notice_id": "turn-init:fup_task_failed",
+                "kind": "turn_initiated",
+                "scope": "turn",
+                "turn_id": "turn-1",
+            },
+        )
+    ]
+
+
+def test_visible_persisted_system_message_filter_allows_explicit_notices() -> None:
+    assert _is_visible_persisted_system_message(
+        {"notice_id": "turn-init:fup_task_failed", "kind": "turn_initiated"}
+    )
+    assert _is_visible_persisted_system_message({"event": "turn_initiated"})
+
+
+def test_visible_persisted_system_message_filter_rejects_internal_context() -> None:
+    assert not _is_visible_persisted_system_message(
+        {"content": ("Environment: - Executor: olorin (websocket) - Platform: unknown (unknown)")}
+    )
+    assert not _is_visible_persisted_system_message(
+        {"content": "Additional tools may be available but hidden by the current step profile."}
+    )
+
+
+def test_conversation_updated_payload_includes_read_state_fields() -> None:
+    payload = _event_to_payload(
+        Event(
+            type=EventType.CONVERSATION_UPDATED,
+            data={
+                "conversation_id": "conv-1",
+                "has_unread": False,
+                "last_read_at": "2026-06-08T12:00:00+00:00",
+            },
+        ),
+        "conv-1",
+    )
+
+    assert payload == {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "has_unread": False,
+        "last_read_at": "2026-06-08T12:00:00+00:00",
+    }
 
 
 @pytest.mark.asyncio
@@ -907,6 +1035,114 @@ async def test_ws_viewer_cannot_cancel_or_update_queued_messages(
         )
 
         assert [error["code"] for error in manager.errors] == ["forbidden", "forbidden"]
+        turn_scheduler.cancel_queued_message.assert_not_awaited()
+        turn_scheduler.update_queued_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ws_managed_conversation_cannot_send_cancel_or_update_queued_messages(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed_managed_conversation() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="controller-agent",
+                    owner_email="owner@example.com",
+                    name="Controller",
+                    status="active",
+                )
+                await create_agent(
+                    session,
+                    agent_id="target-agent",
+                    owner_email="owner@example.com",
+                    name="Target",
+                    status="active",
+                )
+                controller = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="controller-agent",
+                    context_type="web",
+                )
+                target = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="target-agent",
+                    context_type="agent_work",
+                )
+                await create_managed_conversation_link(
+                    session,
+                    user_email="owner@example.com",
+                    controller_agent_id="controller-agent",
+                    controller_conversation_id=controller.conversation_id,
+                    controller_session_id="controller-session",
+                    target_agent_id="target-agent",
+                    target_conversation_id=target.conversation_id,
+                    target_session_id="target-session",
+                    title="Target",
+                )
+                await session.commit()
+                return target.conversation_id
+
+        conversation_id = await _seed_managed_conversation()
+        turn_scheduler = AsyncMock()
+        client.app.state.turn_scheduler = turn_scheduler
+        manager = _RecordingManager()
+        connection = AuthenticatedWebSocket(
+            connection_id="conn-managed-queue",
+            websocket=AsyncMock(),
+            user_email="owner@example.com",
+            role="user",
+        )
+
+        await _handle_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {
+                "type": "message",
+                "conversation_id": conversation_id,
+                "content": "direct target send",
+            },
+        )
+        await _handle_cancel_queued_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {
+                "type": "cancel_queued_message",
+                "conversation_id": conversation_id,
+                "queue_id": "q-1",
+            },
+        )
+        await _handle_update_queued_message(
+            client.app,
+            manager,  # type: ignore[arg-type]
+            connection,
+            {
+                "type": "update_queued_message",
+                "conversation_id": conversation_id,
+                "queue_id": "q-1",
+                "content": "edited",
+            },
+        )
+
+        assert [error["code"] for error in manager.errors] == [
+            "managed_conversation_read_only",
+            "managed_conversation_read_only",
+            "managed_conversation_read_only",
+        ]
+        turn_scheduler.submit_turn.assert_not_awaited()
         turn_scheduler.cancel_queued_message.assert_not_awaited()
         turn_scheduler.update_queued_message.assert_not_awaited()
 

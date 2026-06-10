@@ -191,6 +191,43 @@ async def test_seed_rotated_tail_events_skips_non_appendable_event_types(tmp_pat
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_seed_rotated_tail_events_batches_large_event_sets(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+    new_session = SessionModel(
+        session_id="new-session",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intaris_session_id="intaris-new-session",
+    )
+    tail_events = [
+        SimpleNamespace(seq=index, type="user_message", data={"content": f"message {index}"})
+        for index in range(1001)
+    ]
+
+    await manager._seed_rotated_tail_events(
+        new_session,
+        tail_events=tail_events,
+        previous_session_id="old-session",
+    )
+
+    assert len(providers.guardrails.recorded_events) == 2
+    assert [len(events) for _, events, _ in providers.guardrails.recorded_events] == [1000, 1]
+    assert [key for _, _, key in providers.guardrails.recorded_events] == [
+        "new-session:compaction_tail:old-session:batch:1",
+        "new-session:compaction_tail:old-session:batch:2",
+    ]
+    assert len(cache.appended_events) == 2
+    assert [len(events) for _, events, _ in cache.appended_events] == [1000, 1]
+    assert cache.appended_events[1][1][0].data["source_seq"] == 1000
+
+    await engine.dispose()
+
+
 async def _session_factory(tmp_path) -> object:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'cognis.db'}")
     session_factory = create_session_factory(engine)
@@ -939,6 +976,7 @@ async def test_create_root_session_falls_back_to_executor_cwd_when_context_unset
     assert providers.guardrails.last_details["working_directory"] == "/home/user/src/cognis"
     assert providers.guardrails.last_policy is not None
     assert "/tmp/*" in providers.guardrails.last_policy["allow_paths"]
+    assert "/private/tmp/*" in providers.guardrails.last_policy["allow_paths"]
     assert "/var/tmp/*" in providers.guardrails.last_policy["allow_paths"]
     assert "/home/user/*" in providers.guardrails.last_policy["allow_paths"]
     assert "/home/user/src/cognis/*" in providers.guardrails.last_policy["allow_paths"]
@@ -1010,6 +1048,7 @@ async def test_intaris_session_policy_includes_project_source_paths(tmp_path) ->
 
     allow_paths = providers.guardrails.last_policy["allow_paths"]
     assert "/tmp/*" in allow_paths
+    assert "/private/tmp/*" in allow_paths
     assert "/var/tmp/*" in allow_paths
     assert "/home/user/src/cognis/*" in allow_paths
     assert "/home/user/src/intaris/*" in allow_paths

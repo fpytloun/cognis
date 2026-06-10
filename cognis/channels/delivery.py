@@ -588,32 +588,44 @@ class ChannelDeliveryService:
         await self.send_to_conversation(conversation_id, content)
 
     def _render_step_question_notification(self, payload: dict[str, Any]) -> str:
-        """Render a step question prompt for channel integrations."""
-        question = str(payload.get("question") or "The assistant needs more input to continue.")
+        """Render a question set prompt for plain-text channel integrations."""
         lines: list[str] = []
-        # Context first (provides rationale before the question)
         context = payload.get("context")
         if isinstance(context, str) and context.strip():
             lines.append(context.strip())
-        elif isinstance(context, dict) and isinstance(context.get("context"), str):
-            lines.append(context["context"].strip())
-        lines.append(question)
-        # Numbered option list
-        options = payload.get("options")
-        if isinstance(options, list) and options:
-            option_lines: list[str] = []
-            idx = 1
-            for option in options:
-                label: str | None = None
-                if isinstance(option, str):
-                    label = option
-                elif isinstance(option, dict) and isinstance(option.get("label"), str):
-                    label = option["label"]
-                if label:
-                    option_lines.append(f"{idx}. {label}")
-                    idx += 1
-            if option_lines:
-                lines.append("\n".join(option_lines))
+        elif isinstance(context, dict):
+            note = context.get("note") or context.get("context")
+            if isinstance(note, str) and note.strip():
+                lines.append(note.strip())
+        questions = payload.get("questions")
+        if not isinstance(questions, list) or not questions:
+            lines.append("The assistant needs more input to continue.")
+        else:
+            for q_index, question in enumerate(questions, start=1):
+                if not isinstance(question, dict):
+                    continue
+                q_lines: list[str] = []
+                header = question.get("header")
+                if isinstance(header, str) and header.strip():
+                    q_lines.append(header.strip())
+                text = str(question.get("question") or "").strip()
+                q_lines.append(f"{q_index}. {text}" if text else f"{q_index}. Question")
+                options = question.get("options")
+                if isinstance(options, list) and options:
+                    for opt_index, option in enumerate(options, start=1):
+                        if not isinstance(option, dict):
+                            continue
+                        label = str(option.get("label") or "").strip()
+                        if not label:
+                            continue
+                        desc = str(option.get("description") or "").strip()
+                        q_lines.append(f"   {opt_index}) {label}" + (f" — {desc}" if desc else ""))
+                    if question.get("multiple"):
+                        q_lines.append("   You may choose multiple options.")
+                if question.get("allow_custom", True):
+                    q_lines.append("   A custom answer is OK.")
+                lines.append("\n".join(q_lines))
+        lines.append("Reply in free text. Your full reply will be forwarded to the assistant.")
         return "\n\n".join(lines)
 
     def _render_auth_challenge_notification(self, payload: dict[str, Any]) -> str:

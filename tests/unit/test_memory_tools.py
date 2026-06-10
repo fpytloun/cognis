@@ -97,9 +97,7 @@ class TestMemoryToolDefinitions:
             "forget remove stored memory",
             category="memory",
             already_visible_tool_ids={
-                stable_tool_id(tool)
-                for tool in ALL_MEMORY_TOOLS
-                if tool.name != "memory_delete"
+                stable_tool_id(tool) for tool in ALL_MEMORY_TOOLS if tool.name != "memory_delete"
             },
         )
 
@@ -320,7 +318,7 @@ class TestWorkflowToolDefinitions:
         names = {t.name for t in workflow_tools()}
         assert {
             "step_complete",
-            "step_request_input",
+            "step_request_questions",
             "step_todo_write",
             "step_todo_list",
         }.issubset(names)

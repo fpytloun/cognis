@@ -33,6 +33,7 @@ from cognis.api.models import (
     SkillResponse,
     SkillVersionResponse,
     StepProfileResponse,
+    StepResponseRequest,
     StepRunResponse,
     TaskCreateRequest,
     TaskRerunResponse,
@@ -47,7 +48,6 @@ from cognis.api.models import (
 )
 from cognis.api.routes.push import PushSubscriptionStatusResponse
 from cognis.api.serializers import llm_provider_to_response, step_run_to_response
-from cognis.core.management import _normalize_pause_context, _normalize_pause_options
 from cognis.models.search import (
     ConversationFlatSearchMatch,
     ConversationFlatSearchResponse,
@@ -327,27 +327,42 @@ def test_agent_grant_response_round_trip() -> None:
 
 
 class TestPendingPauseShapeContract:
-    """PendingPauseResponse must accept canonical shapes and
-    normalization helpers must cover legacy shapes."""
+    """PendingPauseResponse must accept first-class question sets only."""
 
-    def test_options_as_list_of_dicts(self) -> None:
+    def test_questions_as_canonical_shape(self) -> None:
         response = PendingPauseResponse(
             pause_id="p-1",
             pause_type="step_input",
-            options=[{"label": "Approve", "action": "approve"}],
+            questions=[
+                {
+                    "id": "q1",
+                    "question": "Choose",
+                    "options": [{"id": "approve", "label": "Approve"}],
+                }
+            ],
         )
-        assert response.options == [{"label": "Approve", "action": "approve"}]
+        assert response.questions is not None
+        assert response.questions[0].id == "q1"
+        assert response.questions[0].options[0].id == "approve"
 
-    def test_options_none_is_allowed(self) -> None:
+    def test_questions_none_is_allowed_for_non_question_pauses(self) -> None:
         response = PendingPauseResponse(pause_id="p-1", pause_type="step_input")
-        assert response.options is None
+        assert response.questions is None
 
-    def test_normalize_options_from_list_of_strings(self) -> None:
-        normalized = _normalize_pause_options(["Yes", "No"])
-        assert normalized == [
-            {"label": "Yes", "action": "Yes"},
-            {"label": "No", "action": "No"},
-        ]
+    def test_singular_question_is_not_canonical(self) -> None:
+        with pytest.raises(ValidationError):
+            PendingPauseResponse(
+                pause_id="p-1",
+                pause_type="step_input",
+                question="Legacy?",
+            )
+
+    def test_step_response_requires_structured_answers(self) -> None:
+        request = StepResponseRequest(
+            answers=[{"question_id": "q1", "selected_option_ids": ["yes"]}],
+            mode="structured",
+        )
+        assert request.answers[0].question_id == "q1"
 
 
 class TestSkillResponseContracts:
@@ -406,25 +421,6 @@ class TestSkillResponseContracts:
         assert response.steps is not None
         assert response.steps[0]["name"] == "plan"
         assert response.decomposition_stale is True
-
-    def test_normalize_options_from_mixed_shape_drops_junk(self) -> None:
-        normalized = _normalize_pause_options([{"label": "A"}, 42, "B"])
-        assert normalized == [{"label": "A"}, {"label": "B", "action": "B"}]
-
-    def test_normalize_options_returns_none_for_empty_or_invalid(self) -> None:
-        assert _normalize_pause_options(None) is None
-        assert _normalize_pause_options("not a list") is None
-        assert _normalize_pause_options([]) is None
-
-    def test_normalize_context_accepts_dict(self) -> None:
-        assert _normalize_pause_context({"key": "value"}) == {"key": "value"}
-
-    def test_normalize_context_wraps_string(self) -> None:
-        assert _normalize_pause_context("background") == {"note": "background"}
-
-    def test_normalize_context_none_and_empty_return_none(self) -> None:
-        assert _normalize_pause_context(None) is None
-        assert _normalize_pause_context("") is None
 
 
 class TestTaskResponseRoundTrip:

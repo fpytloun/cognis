@@ -9,6 +9,7 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | Document | Description |
 |---|---|
 | [Getting Started](guide/getting-started.md) | First-run setup for Mnemory, Intaris, Cognis, a provider, an executor, and your first agent |
+| [Local Compose Deployment](guide/local-compose.md) | Single-instance local deployment with Cognis, Mnemory, Intaris, Qdrant, seeding, and executor options |
 | [Architecture](guide/architecture.md) | Understand the cloud-native controller/executor split and companion services |
 | [Configuring Providers](guide/configuring-providers.md) | Add LLM providers, test them, and set model routing |
 | [Creating Agents](guide/creating-agents.md) | Define identity, tools, skills, executor placement, and workflow behavior |
@@ -41,6 +42,7 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 
 - `/docs`
 - `/docs/getting-started`
+- `/docs/local-compose`
 - `/docs/architecture`
 - `/docs/configuring-providers`
 - `/docs/creating-agents`

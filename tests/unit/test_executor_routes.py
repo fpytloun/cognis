@@ -73,7 +73,9 @@ def test_executor_update_bumps_desired_generation_and_marks_stale(
         assert payload["runtime_state"] == "stale"
 
 
-def test_executor_list_includes_shared_for_regular_users(monkeypatch: object, tmp_path: Path) -> None:
+def test_executor_list_includes_shared_for_regular_users(
+    monkeypatch: object, tmp_path: Path
+) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
 
         async def _seed() -> None:
@@ -226,7 +228,9 @@ def test_executor_token_generation_rotates_token_version(
         assert second_payload["expires_in"] is None
 
         first_claims = client.app.state.auth_provider.verify_executor_token(first_payload["token"])
-        second_claims = client.app.state.auth_provider.verify_executor_token(second_payload["token"])
+        second_claims = client.app.state.auth_provider.verify_executor_token(
+            second_payload["token"]
+        )
         assert first_claims["etv"] == 1
         assert second_claims["etv"] == 2
 

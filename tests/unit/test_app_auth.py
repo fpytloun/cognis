@@ -119,9 +119,7 @@ def test_exchange_token_accepts_known_targets(monkeypatch: object, tmp_path: Pat
             )
 
 
-def test_exchange_token_uses_public_ui_url_override(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_exchange_token_uses_public_ui_url_override(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(
         monkeypatch,
         tmp_path,

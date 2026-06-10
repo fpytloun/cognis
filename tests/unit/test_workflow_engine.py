@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
     CompletionConfig,
@@ -68,6 +69,44 @@ def test_workflow_state_tracks_loop_iterations() -> None:
     assert state.loop_iterations[loop_key] == 1
     state.loop_iterations[loop_key] += 1
     assert state.loop_iterations[loop_key] == 2
+
+
+def test_evaluation_retry_reopens_terminal_todos() -> None:
+    state = WorkflowState(
+        last_retry_reason="evaluation_rejected",
+        last_evaluation_feedback="Run the required Slack triage search.",
+    )
+    terminal_todos = [
+        {"content": "Search Slack", "status": "completed"},
+        {"content": "Write deliverable", "status": "cancelled"},
+    ]
+
+    todos = WorkflowEngine._todos_for_evaluation_retry(state, terminal_todos)
+
+    assert todos == [
+        {
+            "content": (
+                "Revise the step output based on evaluator feedback. Feedback: "
+                "Run the required Slack triage search."
+            ),
+            "status": "pending",
+        }
+    ]
+
+
+def test_evaluation_retry_preserves_non_terminal_todos() -> None:
+    state = WorkflowState(
+        last_retry_reason="evaluation_rejected",
+        last_evaluation_feedback="Finish validation.",
+    )
+    active_todos = [
+        {"content": "Finish validation", "status": "in_progress"},
+        {"content": "Write deliverable", "status": "completed"},
+    ]
+
+    todos = WorkflowEngine._todos_for_evaluation_retry(state, active_todos)
+
+    assert todos == active_todos
 
 
 def test_step_evaluation_approve() -> None:

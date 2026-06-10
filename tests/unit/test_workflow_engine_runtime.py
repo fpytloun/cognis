@@ -10,6 +10,7 @@ import pytest
 
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.workflow_engine import WorkflowEngine, _resolve_task_execution_paths
+from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext
 from cognis.models.task import TaskModel
@@ -472,6 +473,129 @@ async def test_build_result_data_uses_final_deliverable(
     assert result is not None
     assert result["final_deliverable_id"] == "dlv-final"
     assert result["final_content"] == "# Final result"
+
+
+@pytest.mark.asyncio
+async def test_software_development_post_review_gate_pauses_for_should_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Feature",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="running",
+    )
+    state = WorkflowState(
+        step_outputs={
+            "plan": {"summary": "planned", "metadata": {}},
+            "implement": {"summary": "implemented", "metadata": {}},
+            "code_review": {
+                "summary": "reviewed with non-blocking follow-up",
+                "metadata": {
+                    "verdict": "approve",
+                    "required_scope_complete": True,
+                    "missing_scope_count": 0,
+                    "must_fix_count": 0,
+                    "should_fix_count": 1,
+                },
+            },
+        }
+    )
+    gate_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "post_review_gate"
+    )
+
+    persisted_statuses: list[str] = []
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        persisted_statuses.append(state.status)
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    async def _resolve_soon() -> None:
+        while not state.pending_pause_payload:
+            await asyncio.sleep(0.01)
+        pause_id = str(state.pending_pause_payload["pause_id"])
+        while engine._pause_waiter.get(pause_id) is None:
+            await asyncio.sleep(0.01)
+        engine._pause_waiter.resolve(pause_id, PauseResolution(decision="continue"))
+
+    asyncio.create_task(_resolve_soon())
+    result = await engine._handle_gate_step(task, gate_step, state, SOFTWARE_DEVELOPMENT_WORKFLOW)
+
+    assert result == "continue"
+    assert "paused" in persisted_statuses
+    assert notifications.created
+    assert notifications.created[0]["step_name"] == "post_review_gate"
+
+
+@pytest.mark.asyncio
+async def test_post_review_gate_revise_sets_revision_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    notifications = _NotificationService()
+    engine._notification_service = notifications
+
+    task = TaskModel(
+        task_id="task-1",
+        title="Feature",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="running",
+    )
+    state = WorkflowState(
+        step_outputs={
+            "code_review": {
+                "summary": "reviewed with missing UI",
+                "metadata": {
+                    "verdict": "approve",
+                    "required_scope_complete": True,
+                    "missing_scope_count": 0,
+                    "must_fix_count": 0,
+                    "should_fix_count": 1,
+                },
+            },
+        }
+    )
+    gate_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "post_review_gate"
+    )
+
+    async def _persist(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist)
+
+    async def _resolve_soon() -> None:
+        while not state.pending_pause_payload:
+            await asyncio.sleep(0.01)
+        pause_id = str(state.pending_pause_payload["pause_id"])
+        while engine._pause_waiter.get(pause_id) is None:
+            await asyncio.sleep(0.01)
+        engine._pause_waiter.resolve(
+            pause_id,
+            PauseResolution(
+                decision="revise(implement)",
+                data={"note": "Fix the missing UI test before commit."},
+            ),
+        )
+
+    asyncio.create_task(_resolve_soon())
+    result = await engine._handle_gate_step(task, gate_step, state, SOFTWARE_DEVELOPMENT_WORKFLOW)
+
+    assert result == "revise(implement)"
+    assert state.last_revision_context is not None
+    assert "post_review_gate" in state.last_revision_context
+    assert "unresolved scope or review findings" in state.last_revision_context
+    assert "should_fix_count" in state.last_revision_context
+    assert "Fix the missing UI test before commit." in state.last_revision_context
 
 
 @pytest.mark.asyncio

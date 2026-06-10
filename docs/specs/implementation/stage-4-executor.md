@@ -9,7 +9,7 @@
 - MCP client in `tools/mcp.py` for stdio-based MCP server integration.
 - Tool router in `core/tool_router.py` classifies tools into orchestration
   (controller-handled), Intaris MCP, and local execution paths.
-- Built-in tools: `step_complete`, `step_request_input`, `step_todo_write`,
+- Built-in tools: `step_complete`, `step_request_questions`, `step_todo_write`,
   `step_todo_list` for agent loop control flow.
 - Tool permissions enforced per-agent with `allow/evaluate/deny` per tool.
 

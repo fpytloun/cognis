@@ -123,9 +123,7 @@ def test_switch_executor_visible_with_two_usable() -> None:
     schemas = loop._build_controller_tool_schemas(_ctx(pool, active_executor_id="exec-a"))
     schema = _switch_tool(schemas)
     assert schema is not None
-    enum_values = (
-        schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
-    )
+    enum_values = schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
     # Must contain only the USABLE assigned executors, sorted
     assert enum_values == ["exec-a", "exec-add", "exec-b"]
 
@@ -143,9 +141,7 @@ def test_switch_executor_enum_excludes_offline() -> None:
     schemas = loop._build_controller_tool_schemas(_ctx(pool))
     schema = _switch_tool(schemas)
     assert schema is not None
-    enum_values = (
-        schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
-    )
+    enum_values = schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
     assert "exec-down" not in enum_values
 
 
@@ -174,7 +170,9 @@ def _build_registry_with_executor_tool(name: str = "bash") -> ToolRegistry:
     return registry
 
 
-def _exec_ctx(pool: ExecutorPool, registry: ToolRegistry, *, active_executor_id: str | None = None) -> object:
+def _exec_ctx(
+    pool: ExecutorPool, registry: ToolRegistry, *, active_executor_id: str | None = None
+) -> object:
     return SimpleNamespace(
         executor_pool=pool,
         tool_registry=registry,
@@ -200,7 +198,9 @@ def test_target_executor_overlay_two_websocket_executors() -> None:
         ]
     )
     registry = _build_registry_with_executor_tool("bash")
-    schemas = loop._get_executor_tool_schemas(_exec_ctx(pool, registry, active_executor_id="exec-a"))
+    schemas = loop._get_executor_tool_schemas(
+        _exec_ctx(pool, registry, active_executor_id="exec-a")
+    )
     bash = next(s for s in schemas if s["function"]["name"] == "bash")
     properties = bash["function"]["parameters"]["properties"]
     assert "target_executor" in properties
@@ -220,7 +220,9 @@ def test_target_executor_overlay_single_executor_omitted() -> None:
         ]
     )
     registry = _build_registry_with_executor_tool("bash")
-    schemas = loop._get_executor_tool_schemas(_exec_ctx(pool, registry, active_executor_id="exec-a"))
+    schemas = loop._get_executor_tool_schemas(
+        _exec_ctx(pool, registry, active_executor_id="exec-a")
+    )
     bash = next(s for s in schemas if s["function"]["name"] == "bash")
     assert "target_executor" not in bash["function"]["parameters"]["properties"]
 
@@ -315,9 +317,7 @@ def test_get_executor_tool_schemas_does_not_mutate_original_parameters() -> None
         ]
     )
     registry = _build_registry_with_executor_tool("bash")
-    original_props = dict(
-        registry.get("bash").definition.parameters["properties"]
-    )
+    original_props = dict(registry.get("bash").definition.parameters["properties"])
     loop._get_executor_tool_schemas(_exec_ctx(pool, registry, active_executor_id="exec-a"))
     after_props = registry.get("bash").definition.parameters["properties"]
     assert "target_executor" not in original_props

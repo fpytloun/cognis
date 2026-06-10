@@ -381,9 +381,7 @@ def test_credential_request_parses_token_reply(monkeypatch: object, tmp_path: Pa
         assert response.status_code == 200
 
 
-def test_credential_request_accepts_response_payload(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_credential_request_accepts_response_payload(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
 
         async def _seed() -> str:

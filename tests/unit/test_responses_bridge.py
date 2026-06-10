@@ -97,6 +97,20 @@ async def test_responses_stream_failed_event_includes_safe_error_details() -> No
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_suppresses_unbound_text_delta() -> None:
+    async def _stream():
+        yield {"type": "response.output_text.delta", "delta": "hello"}
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    assert chunks[0]["suppressed_output_text_delta"] is True
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_accumulates_custom_apply_patch_input() -> None:
     patch_text = "*** Begin Patch\n*** Add File: /tmp/a.txt\n+hello\n*** End Patch\n"
 
@@ -245,6 +259,77 @@ def test_messages_to_responses_input_keeps_call_id_on_function_call_items() -> N
     assert result == [
         {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_replays_raw_responses_output_items() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "encrypted",
+        "summary": [],
+    }
+    message_item = {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "phase": "commentary",
+        "content": [{"type": "output_text", "text": "I'll inspect that now."}],
+    }
+    call_item = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read",
+        "arguments": "{}",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "I'll inspect that now.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+                "_responses_output_items": [reasoning_item, message_item, call_item],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ],
+    )
+
+    assert result == [
+        reasoning_item,
+        message_item,
+        call_item,
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_replays_custom_tool_output_items() -> None:
+    call_item = {
+        "type": "custom_tool_call",
+        "call_id": "call_custom",
+        "name": "apply_patch",
+        "input": "*** Begin Patch\n*** End Patch\n",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "_responses_output_items": [call_item],
+            },
+            {"role": "tool", "tool_call_id": "call_custom", "content": "ok"},
+        ],
+    )
+
+    assert result == [
+        call_item,
+        {"type": "custom_tool_call_output", "call_id": "call_custom", "output": "ok"},
     ]
 
 
@@ -501,6 +586,17 @@ def test_responses_to_chat_response_does_not_promote_reasoning_blocks_to_content
     assert result["choices"][0]["message"]["content"] is None
 
 
+def test_responses_to_chat_response_does_not_fallback_to_top_level_output_text() -> None:
+    payload = {
+        "status": "completed",
+        "output_text": "Need inspect implementation.",
+    }
+
+    result = responses_to_chat_response(payload)
+
+    assert result["choices"][0]["message"]["content"] is None
+
+
 def test_responses_to_chat_response_marks_incomplete_as_length() -> None:
     payload = {
         "status": "incomplete",
@@ -719,12 +815,14 @@ def test_responses_request_kwargs_maps_reasoning_effort_to_reasoning_summary_aut
 
     assert "reasoning_effort" not in result
     assert result["reasoning"] == {"effort": "low", "summary": "auto"}
+    assert result["include"] == ["reasoning.encrypted_content"]
 
 
 def test_responses_request_kwargs_omits_disabled_reasoning_summary() -> None:
     result = responses_request_kwargs({"reasoning_effort": "low"}, default_reasoning_summary="none")
 
     assert result["reasoning"] == {"effort": "low"}
+    assert result["include"] == ["reasoning.encrypted_content"]
 
 
 def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None:
@@ -733,6 +831,16 @@ def test_responses_request_kwargs_preserves_explicit_reasoning_summary() -> None
     )
 
     assert result["reasoning"] == {"effort": "medium", "summary": "detailed"}
+    assert result["include"] == ["reasoning.encrypted_content"]
+
+
+def test_responses_request_kwargs_can_include_encrypted_reasoning_without_reasoning_override() -> (
+    None
+):
+    result = responses_request_kwargs({}, include_encrypted_reasoning=True)
+
+    assert result["include"] == ["reasoning.encrypted_content"]
+    assert "reasoning" not in result
 
 
 def test_responses_request_kwargs_applies_default_text_verbosity() -> None:
@@ -861,6 +969,495 @@ async def test_responses_stream_to_chat_chunks_falls_back_to_reasoning_on_comple
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_does_not_fallback_to_completed_output_text() -> None:
+    async def _stream():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output_text": "Need inspect implementation.",
+                "usage": {"total_tokens": 5},
+            },
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_unbound_output_text_delta() -> None:
+    async def _stream():
+        yield {"type": "response.output_text.delta", "delta": "Need inspect implementation."}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert chunks[0]["suppressed_output_text_delta"] is True
+    assert chunks[0]["suppressed_output_text_delta_chars"] == len("Need inspect implementation.")
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_unbound_output_text_done() -> None:
+    async def _stream():
+        yield {"type": "response.output_text.delta", "delta": "Need inspect implementation."}
+        yield {"type": "response.output_text.done", "text": "Need inspect implementation."}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert sum(1 for chunk in chunks if chunk.get("suppressed_output_text_delta") is True) == 2
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_preserves_message_bound_output_text_delta() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "I'll inspect that now.",
+        }
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "item_read",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{}",
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == ["I'll inspect that now."]
+    message_chunks = [
+        chunk
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert message_chunks[0]["response_item_id"] == "msg_1"
+    assert message_chunks[0]["response_item_type"] == "message"
+    assert message_chunks[0]["content_source"] == "response.output_text.delta"
+    assert any(
+        (choice.get("delta") or {}).get("tool_calls")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_preserves_message_phase_metadata() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "message",
+                "id": "msg_commentary",
+                "phase": "commentary",
+                "content": [],
+            },
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_commentary",
+            "delta": "I found the cause.",
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    message_chunks = [
+        chunk
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert len(message_chunks) == 1
+    assert message_chunks[0]["response_item_id"] == "msg_commentary"
+    assert message_chunks[0]["response_item_type"] == "message"
+    assert message_chunks[0]["response_message_phase"] == "commentary"
+    assert message_chunks[0]["content_source"] == "response.output_text.delta"
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_duplicate_large_output_text_delta() -> (
+    None
+):
+    repeated_delta = (
+        "This is a long assistant response segment that is large enough to be "
+        "classified as a replayed provider delta rather than intentional prose."
+    )
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": repeated_delta,
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": repeated_delta,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == [repeated_delta]
+    assert sum(1 for chunk in chunks if chunk.get("suppressed_output_text_delta") is True) == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_only_suffix_for_cumulative_delta() -> None:
+    first_delta = (
+        "The first part of the answer is already long enough to distinguish a "
+        "provider snapshot from normal repeated wording in the assistant text."
+    )
+    suffix = " Only this suffix should be emitted."
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": first_delta,
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": first_delta + suffix,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == [first_delta, suffix]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_only_suffix_for_overlapping_delta() -> None:
+    first_delta = (
+        "The assistant has already produced a substantial paragraph with enough "
+        "content to make an overlapping replay detectable before more text arrives."
+    )
+    overlap = first_delta[-96:]
+    suffix = " This new sentence should survive overlap trimming."
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": first_delta,
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": overlap + suffix,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == [first_delta, suffix]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_preserves_short_repeated_output_text_delta() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "ha",
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "ha",
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == ["ha", "ha"]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_preserves_message_bound_output_text_done_suffix() -> (
+    None
+):
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "I'll inspect",
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "I'll inspect that now.",
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == ["I'll inspect", " that now."]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_unbound_content_part_text() -> None:
+    async def _stream():
+        yield {
+            "type": "response.content_part.added",
+            "part": {"type": "output_text", "text": "Need inspect implementation."},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert any(chunk.get("suppressed_content_part_text") is True for chunk in chunks)
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_preserves_message_bound_content_part_text() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.content_part.added",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": "I'll inspect that now."},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    content_deltas = [
+        (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if (choice.get("delta") or {}).get("content")
+    ]
+    assert content_deltas == ["I'll inspect that now."]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_tool_bound_content_part_text() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "item_read",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{}",
+            },
+        }
+        yield {
+            "type": "response.content_part.done",
+            "item_id": "item_read",
+            "part": {"type": "output_text", "text": "Need inspect implementation."},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert any(chunk.get("suppressed_content_part_text") is True for chunk in chunks)
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_tool_bound_output_text_delta() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "item_read",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{}",
+            },
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "item_read",
+            "delta": "Need inspect implementation.",
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert any(chunk.get("suppressed_output_text_delta") is True for chunk in chunks)
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_suppresses_tool_bound_output_text_done() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "item_read",
+                "call_id": "call_read",
+                "name": "read",
+                "arguments": "{}",
+            },
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "item_read",
+            "delta": "Need inspect implementation.",
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "item_read",
+            "text": "Need inspect implementation.",
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert sum(1 for chunk in chunks if chunk.get("suppressed_output_text_delta") is True) == 2
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_to_chat_chunks_falls_back_to_reasoning_summary_on_completion() -> (
     None
 ):
@@ -921,6 +1518,38 @@ async def test_responses_stream_to_chat_chunks_emits_refusal() -> None:
     chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
 
     assert chunks[0]["choices"][0]["delta"]["refusal"] == "Cannot comply"
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_emits_raw_output_items_for_continuation() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "encrypted",
+        "summary": [],
+    }
+    call_item = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "read",
+        "arguments": "{}",
+    }
+
+    async def _stream():
+        yield {"type": "response.output_item.done", "item": reasoning_item}
+        yield {"type": "response.output_item.done", "item": call_item}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 9}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    raw_items = [
+        chunk["responses_output_item"] for chunk in chunks if "responses_output_item" in chunk
+    ]
+
+    assert raw_items == [reasoning_item, call_item]
 
 
 @pytest.mark.asyncio

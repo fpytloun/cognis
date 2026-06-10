@@ -841,8 +841,24 @@ async def test_recover_paused_tasks_step_input_with_persisted_response(
                 "pending_pause_payload": {
                     "pause_id": "input_1",
                     "step_name": "step-a",
-                    "question": "Ready?",
-                    "response": "yes",
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "question": "Ready?",
+                            "options": [],
+                            "multiple": False,
+                            "allow_custom": True,
+                            "required": True,
+                        }
+                    ],
+                    "answers": [
+                        {
+                            "question_id": "q1",
+                            "selected_option_ids": [],
+                            "custom_answer": "yes",
+                        }
+                    ],
+                    "mode": "structured",
                 },
             }
             await update_task_workflow_state(session, "task_step_input", state)
@@ -879,7 +895,16 @@ async def test_recover_paused_tasks_step_input_awaiting_user(tmp_path: object) -
                 "pending_pause_payload": {
                     "pause_id": "input_2",
                     "step_name": "step-a",
-                    "question": "Ready?",
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "question": "Ready?",
+                            "options": [],
+                            "multiple": False,
+                            "allow_custom": True,
+                            "required": True,
+                        }
+                    ],
                 },
             }
             await update_task_workflow_state(session, "task_awaiting", state)

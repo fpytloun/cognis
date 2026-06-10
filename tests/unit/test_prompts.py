@@ -7,6 +7,12 @@ from cognis.core.prompts import (
     build_visible_edit_tool_guidance,
 )
 from cognis.core.system_skills import get_system_skill_default
+from cognis.tools.builtin.orchestration import (
+    AGENT_CONVERSATION_CREATE_TOOL,
+    AGENT_CONVERSATION_SEND_TOOL,
+    CREATE_TASK_TOOL,
+    DELEGATE_TOOL,
+)
 
 
 def test_chat_prompt_describes_turn_local_todos() -> None:
@@ -37,10 +43,55 @@ def test_chat_prompt_sets_pragmatic_coding_expectations() -> None:
 def test_chat_prompt_describes_delegate_wait_behavior() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
-    assert "Use `wait=true` only when conversation continuation requires" in instructions
-    assert "Do not use `wait=true` by default" in instructions
+    assert "Use `delegate(wait=true)` for joined child work" in instructions
+    assert "visible tool schema" in instructions
+    assert "fire-and-follow-up, not fire-and-duplicate" in instructions
+    assert (
+        "do not keep investigating or implementing the same scoped work in parallel" in instructions
+    )
+    assert "follow-up/resume notification" in instructions
     assert "Use `wait=false` by default from live/main chat" not in instructions
-    assert "explicit context or the user asks for background/asynchronous work" in instructions
+    assert "prefer joined delegation, managed conversations, or tasks" in instructions
+    assert "Do not optimize for finishing the whole job inside the parent turn" in instructions
+    assert "parent chat as the command bridge" in instructions
+    assert "`delegate(wait=false)`: bounded, non-interactive worker-style lookup" in instructions
+    assert "`agent_conversation_create(wait=false)`: visible iterative work loop" in instructions
+    assert "`create_task`: durable workflow-shaped work with lifecycle" in instructions
+    assert '`chat_mode="plan"`' in instructions
+    assert '`chat_mode="build"`' in instructions
+
+
+def test_async_work_tool_descriptions_discourage_duplicate_parent_work() -> None:
+    delegate_description = DELEGATE_TOOL.description
+    task_description = CREATE_TASK_TOOL.description
+    create_description = AGENT_CONVERSATION_CREATE_TOOL.description
+    send_description = AGENT_CONVERSATION_SEND_TOOL.description
+
+    assert "fire-and-follow-up, not fire-and-duplicate" in delegate_description
+    assert "bounded, non-interactive worker-style lookup or analysis" in delegate_description
+    assert "one final report" in delegate_description
+    assert (
+        "open-ended CI/build/deploy/debug/browser/external-system/polling loops"
+        in delegate_description
+    )
+    assert "do not continue the same scoped work in parallel" in delegate_description
+    assert "end the parent turn after a short acknowledgement" in delegate_description
+    assert "resumed or notified" in delegate_description
+
+    assert "durable workflow-shaped lifecycle tracking" in task_description
+    assert "deliverables, evaluation/review, gates" in task_description
+
+    assert "fire-and-follow-up" in create_description
+    assert "finish the parent turn unless there is independent work" in create_description
+    assert "resumed or notified" in create_description
+    assert "visible iterative work loops outside the live channel" in create_description
+    assert "CI/build/deploy/debug/browser/external-system/polling workflows" in create_description
+    assert 'chat_mode="plan"' in create_description
+    assert 'chat_mode="build"' in create_description
+
+    assert "fire-and-follow-up" in send_description
+    assert "finish the parent turn unless independent work" in send_description
+    assert "resumed or notified" in send_description
 
 
 def test_chat_prompt_avoids_async_bias_for_generic_chat() -> None:
@@ -56,7 +107,8 @@ def test_task_step_prompt_disallows_async_delegation() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None
     assert "Workflow steps are execution contexts, not live/main chat" in instructions
-    assert "Do not use `delegate(wait=false)` from a workflow step" in instructions
+    assert "joined child work that returns before the step continues" in instructions
+    assert "delegate(wait=false)" not in instructions
     assert "orchestrating/primary step" in instructions
     assert "must be joined before completing the step" in instructions
 

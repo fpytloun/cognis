@@ -18,6 +18,7 @@ from cognis.models.workflow import (
     OnRejectConfig,
     OutcomeRoute,
     StepDefinition,
+    StepInputConfig,
     Workflow,
 )
 from cognis.store.database import create_engine, create_session_factory
@@ -74,8 +75,10 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert implement_step.agent_override == "system:implement"
     assert implement_step.reasoning_effort == "medium"
     assert implement_step.input is not None
-    assert implement_step.input.type == "summary"
+    assert implement_step.input.type == "last"
     assert "smallest correct change" in implement_step.prompt
+    assert "Do not reduce, reinterpret, or silently defer" in implement_step.prompt
+    assert "Use focused refactoring when it is needed" in implement_step.prompt
     assert (
         "continue from that existing work instead of restarting from scratch"
         in implement_step.prompt
@@ -85,19 +88,29 @@ def test_software_development_workflow_uses_implement_specialist() -> None:
     assert "fix the issue and rerun" in implement_step.prompt
     assert "unrelated pre-existing reason" in implement_step.prompt
     assert implement_step.completion is not None
-    assert implement_step.completion.evaluate is False
+    assert implement_step.completion.evaluate is True
+    assert implement_step.completion.max_attempts == 5
+    assert implement_step.completion.evaluator_prompt is not None
+    assert implement_step.metadata_contract is not None
+    implement_metadata = {field.name for field in implement_step.metadata_contract.fields}
+    assert "scope_status" in implement_metadata
+    assert "incomplete_required_scope_count" in implement_metadata
+    assert "validation_summary" in implement_metadata
     assert update_docs_step.agent_override == "system:implement"
     assert update_docs_step.input is not None
-    assert update_docs_step.input.type == "summary"
+    assert update_docs_step.input.type == "last"
     assert "no documentation updates are needed" in update_docs_step.prompt
 
 
-def test_software_development_review_steps_use_outcome_routes() -> None:
+def test_software_development_review_steps_use_outcome_routes_and_quality_gate() -> None:
     architect_step = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "architect_review"
     )
     code_review_step = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "code_review"
+    )
+    post_review_gate = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "post_review_gate"
     )
     commit_step = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "commit"
@@ -132,9 +145,11 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
         OutcomeRoute(status="failed", action="gate"),
     ]
     assert code_review_step.input is not None
-    assert code_review_step.input.type == "summary"
-    assert (
-        "changes are acceptable, complete the step normally with success" in code_review_step.prompt
+    assert code_review_step.input.type == "last"
+    assert "starting with scope completeness" in code_review_step.prompt
+    assert "approval-with-blockers" in code_review_step.prompt
+    assert "Should-fix findings without missing required scope may structurally approve" in (
+        code_review_step.prompt
     )
     assert "use the prior review history" in code_review_step.prompt
     assert "focus on the new or changed diff since the last review" in code_review_step.prompt
@@ -143,7 +158,22 @@ def test_software_development_review_steps_use_outcome_routes() -> None:
     )
     assert "Put the outcome only in step_complete" in code_review_step.prompt
     assert code_review_step.completion is not None
-    assert code_review_step.completion.evaluate is False
+    assert code_review_step.completion.evaluate is True
+    assert code_review_step.completion.evaluator_prompt is not None
+    assert code_review_step.metadata_contract is not None
+    review_metadata = {field.name for field in code_review_step.metadata_contract.fields}
+    assert review_metadata == {
+        "verdict",
+        "required_scope_complete",
+        "missing_scope_count",
+        "must_fix_count",
+        "should_fix_count",
+    }
+    assert post_review_gate.gate is not None
+    assert post_review_gate.gate.options[0].action == "revise(implement)"
+    assert "metadata.code_review.should_fix_count > 0" in (
+        post_review_gate.gate.conditions[0].expression
+    )
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]
     assert commit_step.completion is not None
     assert commit_step.completion.evaluate is False
@@ -199,9 +229,12 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
         if step.name != "plan":
             assert step.allow_questions is False
     assert plan_step.completion is not None
-    assert plan_step.completion.evaluator_prompt is None
-    assert plan_step.completion.evaluate is False
+    assert plan_step.completion.evaluator_prompt is not None
+    assert plan_step.completion.evaluate is True
     assert "Files to create/modify (with rationale)" in plan_step.prompt
+    assert "what behavior/code is changing and why" in plan_step.prompt
+    assert "narrow bug fixes may use a lightweight" in plan_step.prompt
+    assert "scope_contract" in plan_step.prompt
     assert "Environment and workspace setup" in plan_step.prompt
     assert "Worktree, branch, and repository strategy" in plan_step.prompt
     assert "Commit, push, and pull request strategy" in plan_step.prompt
@@ -211,23 +244,33 @@ def test_software_development_plan_step_uses_generic_evaluator_prompt() -> None:
     assert plan_step.metadata_contract is not None
     metadata_fields = {field.name for field in plan_step.metadata_contract.fields}
     assert "lifecycle_strategy" in metadata_fields
+    assert "implementation_intent" in metadata_fields
+    assert "scope_contract" in metadata_fields
+    assert "acceptance_criteria" in metadata_fields
+    assert "validation_plan" in metadata_fields
     assert "delegate" in plan_step.prompt
     assert "system:explore" in plan_step.prompt
 
 
-def test_software_development_workflow_uses_review_steps_instead_of_evaluator() -> None:
-    evaluated_by_review = {
+def test_software_development_workflow_uses_targeted_evaluators() -> None:
+    evaluated_steps = {
         "plan",
-        "architect_review",
         "implement",
         "code_review",
         "final_summary",
     }
 
-    for step_name in evaluated_by_review:
+    for step_name in evaluated_steps:
         step = next(step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == step_name)
         assert step.completion is not None
-        assert step.completion.evaluate is False
+        assert step.completion.evaluate is True
+        assert step.completion.evaluator_prompt is not None
+
+    architect_step = next(
+        step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "architect_review"
+    )
+    assert architect_step.completion is not None
+    assert architect_step.completion.evaluate is False
 
 
 def test_creative_workflow_can_ask_brief_clarifications() -> None:
@@ -244,7 +287,12 @@ def test_validate_workflow_accepts_valid_definition() -> None:
         name="Valid",
         steps=[
             StepDefinition(name="plan", type="run", prompt="Plan"),
-            StepDefinition(name="implement", type="run", prompt="Implement", input=["plan"]),
+            StepDefinition(
+                name="implement",
+                type="run",
+                prompt="Implement",
+                input=StepInputConfig(type="last", source=["plan"]),
+            ),
         ],
     )
     # Should not raise
@@ -262,7 +310,7 @@ def test_validate_workflow_accepts_all_input_source() -> None:
                 name="synthesize",
                 type="run",
                 prompt="Synthesize",
-                input={"type": "last", "source": "all"},
+                input=StepInputConfig(type="last", source="all"),
             ),
         ],
     )
@@ -288,7 +336,11 @@ def test_validate_workflow_rejects_unknown_input_reference() -> None:
         workflow_id="test:bad-input",
         name="Bad Input",
         steps=[
-            StepDefinition(name="implement", type="run", input=["nonexistent"]),
+            StepDefinition(
+                name="implement",
+                type="run",
+                input=StepInputConfig(type="last", source=["nonexistent"]),
+            ),
         ],
     )
     with pytest.raises(ValueError, match="unknown/later input"):

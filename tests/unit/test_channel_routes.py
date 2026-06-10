@@ -54,9 +54,17 @@ def test_list_channel_types(monkeypatch: object, tmp_path: Path) -> None:
         body = response.json()
         assert len(body) >= 8
         assert any(item["channel_type"] == "signal" for item in body)
+        signal = next(item for item in body if item["channel_type"] == "signal")
+        delivery_field = next(
+            field
+            for field in signal["setting_fields"]
+            if field["name"] == "assistant_delivery_mode"
+        )
+        assert delivery_field["default"] == "final_only"
+        assert delivery_field["options"] == ["final_only", "concatenated", "immediate"]
 
 
-def test_create_channel_account_defaults_to_pairing(monkeypatch: object, tmp_path: Path) -> None:
+def test_create_channel_account_applies_defaults(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
@@ -92,15 +100,16 @@ def test_create_channel_account_defaults_to_pairing(monkeypatch: object, tmp_pat
         assert created.status_code == 200
         account_id = created.json()["account_id"]
 
-        async def _fetch() -> tuple[str, str]:
+        async def _fetch() -> tuple[str, str, dict[str, object]]:
             async with app.state.session_factory() as session:
                 row = await get_channel_account(session, account_id)
                 assert row is not None
-                return row.dm_policy, row.group_policy
+                return row.dm_policy, row.group_policy, row.config or {}
 
-        dm_policy, group_policy = asyncio.run(_fetch())
+        dm_policy, group_policy, config = asyncio.run(_fetch())
         assert dm_policy == "pairing"
         assert group_policy == "pairing"
+        assert config["assistant_delivery_mode"] == "final_only"
 
 
 def test_create_webhook_channel_generates_secret(monkeypatch: object, tmp_path: Path) -> None:

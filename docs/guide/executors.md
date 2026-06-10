@@ -73,6 +73,25 @@ WebSocket executors can report several runtime states:
 - Use remote WebSocket executors when tools, channels, or model endpoints must stay on another machine.
 - Disable local executor modes in shared production environments if the controller should not execute tools locally.
 
+## Local Compose executors
+
+The Local Compose deployment supports two WebSocket executor modes:
+
+- **Compose sidecar executor**: `make local-compose-executor-up` starts the
+  `cognis-executor` service. It reads the token file written by
+  `make local-compose-seed`, connects to `ws://cognis:8080/api/executor/ws`,
+  and keeps browser profiles/workspace state in the `cognis-executor-home`
+  Docker volume.
+- **Host executor**: after seeding, source
+  `.local/cognis-compose/executor-token/host-executor.env` and run either
+  `uv run cognis-executor` from a checkout or `uvx cognis-executor`. This is
+  useful when tools need host filesystem access, host browser profiles, local
+  credentials, or easier debugging.
+
+The token files under `.local/cognis-compose/executor-token/` contain executor
+credentials and must not be committed or shared. See
+[Local Compose Deployment](local-compose.md) for commands.
+
 ## Common troubleshooting checks
 
 - verify the executor is connected
@@ -216,6 +235,43 @@ waits for `domcontentloaded`, then does a short best-effort `networkidle` wait s
 slow ad/analytics requests do not block extraction indefinitely. Explicit
 `browser_open` sessions use the executor browser idle timeout, which defaults to
 30 minutes.
+
+## Office document tools
+
+Office document tools are executor-native and backed by a certified OfficeCLI
+binary. The executor only exposes `office_read`, `office_get`, `office_query`,
+`office_validate`, `office_render`, `office_create`, and `office_patch` when
+OfficeCLI is enabled and the resolved binary matches Cognis' pinned certified
+version.
+
+In `Settings -> Executors`, the Office Documents section stores executor config
+like:
+
+```json
+{
+  "officecli": {
+    "enabled": true,
+    "auto_install": true,
+    "version": "v1.0.102",
+    "binary_path": null,
+    "cache_dir": null
+  }
+}
+```
+
+Environment overrides are also supported:
+
+- `COGNIS_OFFICECLI_ENABLED`
+- `COGNIS_OFFICECLI_AUTO_INSTALL`
+- `COGNIS_OFFICECLI_VERSION`
+- `COGNIS_OFFICECLI_BINARY_PATH`
+- `COGNIS_OFFICECLI_CACHE_DIR`
+
+`version` is intentionally a certified-version selector, not a floating
+upstream selector. If it differs from Cognis' compatibility manifest, office
+tools stay unavailable until Cognis is upgraded and the new OfficeCLI version has
+passed compatibility tests. When `auto_install` is enabled, the executor fetches
+only the pinned certified binary and verifies its SHA256 before exposing tools.
 
 When direct HTTP fetch is blocked and browser fallback is enabled, Cognis now
 tries a headed browser first whenever `web.browser_fetch.headed_fallback_enabled`

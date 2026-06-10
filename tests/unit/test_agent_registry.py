@@ -28,7 +28,7 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
         "apply_patch",
         "grep",
         "glob",
-        "list",
+        "list_directory",
         "bash",
     ]
     assert skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
@@ -58,6 +58,13 @@ def test_system_research_agent_has_expanded_web_tools() -> None:
     assert "Relevant media, diagrams, or artifacts" in agent.system_prompt
 
 
+def test_system_explore_agent_uses_real_listing_tool() -> None:
+    agent = SYSTEM_AGENTS["system:explore"]
+    tools = agent.tools or {}
+
+    assert tools.get("builtin_tools") == ["read", "grep", "glob", "list_directory", "bash"]
+
+
 def test_system_review_agents_use_pragmatic_prompts() -> None:
     architect = SYSTEM_AGENTS["system:architect"]
     review = SYSTEM_AGENTS["system:code-review"]
@@ -77,8 +84,14 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
 def test_system_committer_allows_explicit_publish_only() -> None:
     agent = SYSTEM_AGENTS["system:committer"]
 
-    assert "Push only when task or project instructions explicitly require publishing" in agent.system_prompt
-    assert "Open a pull request only when task or project instructions explicitly require" in agent.system_prompt
+    assert (
+        "Push only when task or project instructions explicitly require publishing"
+        in agent.system_prompt
+    )
+    assert (
+        "Open a pull request only when task or project instructions explicitly require"
+        in agent.system_prompt
+    )
     assert "NEVER push" not in agent.system_prompt
 
 

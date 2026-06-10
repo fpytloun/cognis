@@ -21,9 +21,12 @@ from cognis.core.followups import (
     FollowUpRequiredAction,
     FollowUpStatus,
     TaskResultFollowUp,
+    render_follow_up_turn_notice,
 )
 from cognis.core.turn_scheduler import (
     ActiveToolOutputSnapshot,
+    TurnError,
+    TurnResult,
     TurnScheduler,
     _effective_user_content,
     _QueuedMessage,
@@ -34,6 +37,8 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
+    EventAppendResult,
+    SessionEvent,
     SessionModel,
     SessionStatus,
 )
@@ -41,10 +46,13 @@ from cognis.store.models import Base
 from cognis.store.queries import (
     create_agent,
     create_conversation,
+    create_managed_conversation_link,
     create_session,
     create_user,
     get_conversation,
+    get_managed_conversation_link,
     update_conversation_active_session,
+    update_managed_conversation_link,
 )
 
 
@@ -60,6 +68,7 @@ class _RecordingObserver:
     def __init__(self) -> None:
         self.tokens: list[str] = []
         self.system_messages: list[str] = []
+        self.system_message_events: list[dict[str, object]] = []
         self.completed: list[str] = []
         self.queued: list[int] = []
         self.queued_messages: list[list[dict[str, object]]] = []
@@ -118,6 +127,17 @@ class _RecordingObserver:
     ) -> None:
         return None
 
+    async def on_tool_progress(
+        self,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        progress: dict[str, object],
+        turn_id: str | None = None,
+    ) -> None:
+        return None
+
     async def on_thinking(
         self,
         conversation_id: str,
@@ -143,8 +163,26 @@ class _RecordingObserver:
     async def on_turn_error(self, conversation_id: str, error: object) -> None:
         return None
 
-    async def on_system_message(self, conversation_id: str, text: str) -> None:
+    async def on_system_message(
+        self,
+        conversation_id: str,
+        text: str,
+        notice_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
         self.system_messages.append(text)
+        self.system_message_events.append(
+            {
+                "conversation_id": conversation_id,
+                "text": text,
+                "notice_id": notice_id,
+                "kind": kind,
+                "scope": scope,
+                "turn_id": turn_id,
+            }
+        )
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         self.queued.append(queued_count)
@@ -216,6 +254,23 @@ class _IdleAgentLoop:
             }
         )
         return self.new_session
+
+
+class _RecordingGuardrails:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def record_events(self, **kwargs: object) -> EventAppendResult:
+        self.calls.append(kwargs)
+        events = kwargs.get("events")
+        count = len(events) if isinstance(events, list) else 0
+        return EventAppendResult(ok=True, count=count, first_seq=42, last_seq=41 + count)
+
+
+class _DedupeGuardrails(_RecordingGuardrails):
+    async def record_events(self, **kwargs: object) -> EventAppendResult:
+        self.calls.append(kwargs)
+        return EventAppendResult(ok=True, count=0, first_seq=0, last_seq=0)
 
 
 def _scheduler_for_redo_invalidation(session_factory: object) -> TurnScheduler:
@@ -782,6 +837,383 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
 
 
 @pytest.mark.asyncio
+async def test_cancelled_turn_persists_partial_active_stream_and_completes_bubble() -> None:
+    guardrails = _RecordingGuardrails()
+    event_bus = EventBus()
+    observed_completed: list[Event] = []
+
+    async def _record_completed(event: Event) -> None:
+        observed_completed.append(event)
+
+    event_bus.subscribe(EventType.TURN_COMPLETED, _record_completed)
+    session_cache = SimpleNamespace(append_recorded_events=AsyncMock())
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(side_effect=asyncio.CancelledError)
+        ),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=session_cache,
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(guardrails=guardrails),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=event_bus,
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._clear_follow_up_pending = AsyncMock()  # type: ignore[method-assign]
+    await scheduler._append_active_stream_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        message_id="turn-1",
+        turn_id="turn-1",
+        delta="partial answer",
+    )
+
+    await scheduler._run_turn(
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            status="active",
+        ),
+        session=SessionModel(
+            session_id="sess-1",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={},
+        ),
+        content="hello",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=asyncio.Event(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_id="turn-1",
+    )
+
+    assert await scheduler.active_stream_snapshots("conv-1") == []
+    assert len(guardrails.calls) == 1
+    recorded_events = guardrails.calls[0]["events"]
+    assert isinstance(recorded_events, list)
+    recorded_event = recorded_events[0]
+    assert isinstance(recorded_event, SessionEvent)
+    assert recorded_event.type == "assistant_message"
+    assert recorded_event.data == {
+        "content": "partial answer",
+        "turn_id": "turn-1",
+        "partial": True,
+        "cancelled": True,
+        "finish_reason": "user_cancelled",
+    }
+    session_cache.append_recorded_events.assert_awaited_once()
+    assert observer.completed == ["turn-1"]
+    assert len(observed_completed) == 1
+    completion = observed_completed[0].data
+    assert completion["final_content"] == "partial answer"
+    assert completion["last_seq"] == 42
+    assert completion["partial"] is True
+    assert completion["finish_reason"] == "user_cancelled"
+
+
+def test_render_follow_up_turn_notice_includes_task_failure_metadata() -> None:
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_task_failed",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint=FollowUpRelevanceHint.UNKNOWN,
+        required_action=FollowUpRequiredAction.INFORM_FAILURE,
+        topic_ref="task-1",
+        status=FollowUpStatus.FAILED,
+        task_id="task-1",
+        task_title="Nightly import",
+        source_type="api",
+        delivery_mode="same_conversation",
+        result_summary="Importer exited with code 1",
+        description=None,
+    )
+
+    notice = render_follow_up_turn_notice(follow_up)
+
+    assert notice.startswith("Turn initiated by task failure: Nightly import (task-1).")
+    assert "Status: failed." in notice
+    assert "Summary: Importer exited with code 1." in notice
+
+
+@pytest.mark.asyncio
+async def test_follow_up_turn_persists_visible_system_notice() -> None:
+    guardrails = _RecordingGuardrails()
+    session_cache = SimpleNamespace(
+        append_recorded_events=AsyncMock(),
+        refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=1)),
+        get_context_usage=lambda _session_id: None,
+        get_entry=lambda _session_id: None,
+    )
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(return_value=SimpleNamespace(content="", attachments=[]))
+        ),
+        decision_engine=SimpleNamespace(decide=AsyncMock(return_value=None)),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=session_cache,
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(guardrails=guardrails),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._mark_follow_up_handled = AsyncMock()  # type: ignore[method-assign]
+    scheduler._adopt_late_intaris_title = AsyncMock()  # type: ignore[method-assign]
+    scheduler._load_visible_conversation_title = AsyncMock(return_value="Conversation")  # type: ignore[method-assign]
+    observer = _RecordingObserver()
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_task_failed",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint=FollowUpRelevanceHint.UNKNOWN,
+        required_action=FollowUpRequiredAction.INFORM_FAILURE,
+        topic_ref="task-1",
+        status=FollowUpStatus.FAILED,
+        task_id="task-1",
+        task_title="Nightly import",
+        source_type="api",
+        delivery_mode="same_conversation",
+        result_summary="Importer exited with code 1",
+        description=None,
+    )
+
+    await scheduler._run_turn(
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            title="Conversation",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            status="active",
+        ),
+        session=SessionModel(
+            session_id="sess-1",
+            intaris_session_id="isess-1",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={},
+        ),
+        content="",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=True,
+        follow_up=follow_up,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=asyncio.Event(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_id="turn-1",
+    )
+
+    assert len(guardrails.calls) == 1
+    call = guardrails.calls[0]
+    assert call["session_id"] == "isess-1"
+    assert call["idempotency_key"] == "isess-1:turn_initiated:fup_task_failed"
+    events = call["events"]
+    assert isinstance(events, list)
+    event = events[0]
+    assert isinstance(event, SessionEvent)
+    assert event.type == "system_message"
+    assert event.data["notice_id"] == "turn-init:fup_task_failed"
+    assert event.data["kind"] == "turn_initiated"
+    assert event.data["scope"] == "turn"
+    assert event.data["turn_id"] == "turn-1"
+    assert event.data["follow_up_id"] == "fup_task_failed"
+    assert event.data["origin_kind"] == "task_result"
+    assert event.data["source_id"] == "task-1"
+    assert event.data["source_title"] == "Nightly import"
+    assert str(event.data["content"]).startswith(
+        "Turn initiated by task failure: Nightly import (task-1)."
+    )
+    session_cache.append_recorded_events.assert_awaited_once()
+    assert observer.system_message_events == [
+        {
+            "conversation_id": "conv-1",
+            "text": event.data["content"],
+            "notice_id": "turn-init:fup_task_failed",
+            "kind": "turn_initiated",
+            "scope": "turn",
+            "turn_id": "turn-1",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_normal_user_turn_does_not_persist_visible_turn_notice() -> None:
+    guardrails = _RecordingGuardrails()
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(return_value=SimpleNamespace(content="", attachments=[]))
+        ),
+        decision_engine=SimpleNamespace(decide=AsyncMock(return_value=None)),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=1)),
+            get_context_usage=lambda _session_id: None,
+            get_entry=lambda _session_id: None,
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(guardrails=guardrails),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._adopt_late_intaris_title = AsyncMock()  # type: ignore[method-assign]
+    scheduler._load_visible_conversation_title = AsyncMock(return_value="Conversation")  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            title="Conversation",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+            status="active",
+        ),
+        session=SessionModel(
+            session_id="sess-1",
+            intaris_session_id="isess-1",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={},
+        ),
+        content="hello",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=asyncio.Event(),
+        turn_control=_TurnControl(),
+        turn_id="turn-1",
+    )
+
+    assert guardrails.calls == []
+
+
+@pytest.mark.asyncio
+async def test_follow_up_turn_notice_dedupe_response_does_not_rebroadcast() -> None:
+    guardrails = _DedupeGuardrails()
+    session_cache = SimpleNamespace(append_recorded_events=AsyncMock())
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=session_cache,
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(guardrails=guardrails),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_task_done",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint=FollowUpRelevanceHint.UNKNOWN,
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Nightly import",
+        source_type="api",
+        delivery_mode="same_conversation",
+        result_summary="Done",
+        description=None,
+    )
+
+    await scheduler._persist_follow_up_turn_notice(
+        conversation_id="conv-1",
+        session=SessionModel(
+            session_id="sess-1",
+            intaris_session_id="isess-1",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="owner@example.com", name="Agent"),
+        user_email="user@example.com",
+        follow_up=follow_up,
+        turn_id="turn-1",
+        turn_observers=[observer],
+    )
+
+    assert len(guardrails.calls) == 1
+    session_cache.append_recorded_events.assert_not_awaited()
+    assert observer.system_messages == []
+
+
+@pytest.mark.asyncio
 async def test_thinking_callback_trims_metadata_for_legacy_observers() -> None:
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
@@ -879,10 +1311,8 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
             is_error=False,
             metadata={"transport_truncated": True, "output_size": 5},
         )
-        snapshots = await scheduler.active_tool_output_snapshots("conv-1")
-        assert snapshots[0]["status"] == "completed"
-        assert snapshots[0]["result"] == "hello"
-        assert "_raw_output" not in snapshots[0]
+        assert await scheduler.active_tool_output_snapshots("conv-1") == []
+        assert ("conv-1", "sess-1", "call-1") not in scheduler._active_tool_outputs
     finally:
         scheduler._active_turns["conv-1"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1021,6 +1451,59 @@ async def test_active_tool_output_snapshots_ignore_stale_previous_turn_items() -
         snapshots = await scheduler.active_tool_output_snapshots("conv-1")
         assert [snapshot["call_id"] for snapshot in snapshots] == ["current-call"]
         assert ("conv-1", "sess-1", "old-call") not in scheduler._active_tool_outputs
+    finally:
+        scheduler._active_turns["conv-1"].cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler._active_turns["conv-1"]
+
+
+@pytest.mark.asyncio
+async def test_completed_active_tool_output_is_removed_during_running_turn() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(60))
+    control = _TurnControl()
+    control.turn_id = "turn-1"
+    scheduler._turn_controls["conv-1"] = control
+
+    try:
+        await scheduler._append_active_tool_output_chunk(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            call_id="call-1",
+            tool_name="bash",
+            turn_id="turn-1",
+            delta="running output",
+            stream="stdout",
+        )
+        assert await scheduler.active_tool_output_snapshots("conv-1")
+
+        await scheduler._finalize_active_tool_output(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            call_id="call-1",
+            tool_name="bash",
+            turn_id="turn-1",
+            result="final output",
+            is_error=False,
+        )
+
+        assert await scheduler.active_tool_output_snapshots("conv-1") == []
+        assert ("conv-1", "sess-1", "call-1") not in scheduler._active_tool_outputs
     finally:
         scheduler._active_turns["conv-1"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -2861,6 +3344,472 @@ async def test_run_turn_merges_absorbed_delivery_metadata() -> None:
     assert result.attachments == [{"artifact_id": "art-2", "filename": "image.png"}]
 
 
+async def _create_managed_link_fixture(session_factory):
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+            status="active",
+        )
+        await create_agent(
+            db_session,
+            agent_id="target-agent",
+            owner_email="user@example.com",
+            name="Target",
+            status="active",
+        )
+        controller = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            context_type="web",
+        )
+        target = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+        )
+        link = await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=target.conversation_id,
+            target_session_id="target-session",
+            title="Target",
+        )
+        await db_session.commit()
+        return controller, target, link
+
+
+def _managed_test_scheduler(session_factory, event_bus: EventBus | None = None) -> TurnScheduler:
+    return TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=event_bus or EventBus(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_managed_conversation_completion_clears_stale_last_error(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-clear-error.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+            status="active",
+        )
+        await create_agent(
+            db_session,
+            agent_id="target-agent",
+            owner_email="user@example.com",
+            name="Target",
+            status="active",
+        )
+        controller = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            context_type="web",
+        )
+        target = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+        )
+        link = await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=target.conversation_id,
+            target_session_id="target-session",
+            title="Target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="interrupted",
+            active_turn_id="turn-1",
+            last_error="The current turn was cancelled.",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    scheduler = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    await scheduler._publish_turn_completed(
+        TurnResult(
+            conversation_id=target.conversation_id,
+            session_id="target-session",
+            message_id="turn-1",
+            turn_id="turn-1",
+            final_content="completed",
+        )
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "completed"
+        assert refreshed.turn_state == "completed"
+        assert refreshed.active_turn_id is None
+        assert refreshed.last_result_summary == "completed"
+        assert refreshed.last_error is None
+        assert refreshed.notify_on_completion is False
+        assert refreshed.completed_at is not None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_managed_conversation_completion_with_pending_continuation_stays_running(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-continuation.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+            status="active",
+        )
+        await create_agent(
+            db_session,
+            agent_id="target-agent",
+            owner_email="user@example.com",
+            name="Target",
+            status="active",
+        )
+        controller = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            context_type="web",
+        )
+        target = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+        )
+        link = await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=target.conversation_id,
+            target_session_id="target-session",
+            title="Target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-1",
+            last_error="The current turn was cancelled.",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    scheduler = TurnScheduler(
+        session_factory=session_factory,
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    await scheduler._publish_turn_completed(
+        TurnResult(
+            conversation_id=target.conversation_id,
+            session_id="target-session",
+            message_id="turn-1",
+            turn_id="turn-1",
+            final_content="partial",
+            managed_continuation_pending=True,
+        )
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "running"
+        assert refreshed.active_turn_id == "turn-1"
+        assert refreshed.last_error is None
+        assert refreshed.last_result_summary == "partial"
+        assert refreshed.notify_on_completion is True
+        assert refreshed.completed_at is None
+
+    await scheduler._mark_managed_conversation_turn_running(
+        target_conversation_id=target.conversation_id,
+        target_session_id="target-session",
+        turn_id="turn-2",
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "running"
+        assert refreshed.active_turn_id == "turn-2"
+        assert refreshed.last_error is None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_managed_partial_cancelled_completion_stays_interrupted_and_notifies(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-partial-cancel.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    _controller, target, link = await _create_managed_link_fixture(session_factory)
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-1",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    follow_ups: list[dict[str, object]] = []
+    event_bus = EventBus()
+
+    async def _record_follow_up(event: Event) -> None:
+        follow_ups.append(event.data["follow_up"])
+
+    event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, _record_follow_up)
+    scheduler = _managed_test_scheduler(session_factory, event_bus)
+
+    await scheduler._publish_turn_completed(
+        TurnResult(
+            conversation_id=target.conversation_id,
+            session_id="target-session",
+            message_id="msg-1",
+            turn_id="turn-1",
+            final_content="partial output",
+            partial=True,
+            finish_reason="user_cancelled",
+        )
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "interrupted"
+        assert refreshed.active_turn_id is None
+        assert refreshed.last_result_summary == "partial output"
+        assert refreshed.last_error == "The current turn was cancelled."
+        assert refreshed.notify_on_completion is False
+        assert refreshed.completed_at is None
+
+    assert len(follow_ups) == 1
+    follow_up = follow_ups[0]
+    assert follow_up["status"] == "cancelled"
+    assert follow_up["required_action"] == "inform_failure"
+    assert follow_up["title"] == "Agent work needs attention: Target"
+    assert "agent_conversation_retry" in str(follow_up["description"])
+    assert follow_up["metadata"]["turn_state"] == "interrupted"
+    assert follow_up["metadata"]["recoverable"] is True
+    assert "The current turn was cancelled." in str(follow_up["summary"])
+    assert "partial output" in str(follow_up["summary"])
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_managed_turn_cancelled_error_marks_interrupted_and_recoverable(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-turn-cancel.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    _controller, target, link = await _create_managed_link_fixture(session_factory)
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-1",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    follow_ups: list[dict[str, object]] = []
+    event_bus = EventBus()
+
+    async def _record_follow_up(event: Event) -> None:
+        follow_ups.append(event.data["follow_up"])
+
+    event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, _record_follow_up)
+    scheduler = _managed_test_scheduler(session_factory, event_bus)
+
+    await scheduler._publish_turn_error(
+        target.conversation_id,
+        "target-session",
+        TurnError(
+            code="turn_cancelled",
+            message="The current turn was cancelled.",
+            recoverable=True,
+        ),
+        turn_id="turn-1",
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "interrupted"
+        assert refreshed.active_turn_id is None
+        assert refreshed.last_error == "The current turn was cancelled."
+        assert refreshed.notify_on_completion is False
+        assert refreshed.completed_at is None
+
+    assert len(follow_ups) == 1
+    follow_up = follow_ups[0]
+    assert follow_up["status"] == "cancelled"
+    assert follow_up["required_action"] == "inform_failure"
+    assert follow_up["metadata"]["turn_state"] == "interrupted"
+    assert follow_up["metadata"]["recoverable"] is True
+    assert "agent_conversation_retry" in str(follow_up["description"])
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_managed_step_timeout_failure_notification_is_actionable(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-timeout-failure.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    _controller, target, link = await _create_managed_link_fixture(session_factory)
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-1",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    follow_ups: list[dict[str, object]] = []
+    event_bus = EventBus()
+
+    async def _record_follow_up(event: Event) -> None:
+        follow_ups.append(event.data["follow_up"])
+
+    event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, _record_follow_up)
+    scheduler = _managed_test_scheduler(session_factory, event_bus)
+
+    await scheduler._publish_turn_error(
+        target.conversation_id,
+        "target-session",
+        TurnError(
+            code="step_failed",
+            message="Step timed out after 3600s safety timeout; automatic continuation exhausted.",
+            recoverable=True,
+        ),
+        turn_id="turn-1",
+    )
+
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "failed"
+        assert refreshed.active_turn_id is None
+        assert refreshed.last_error.startswith("Step timed out after 3600s")
+        assert refreshed.notify_on_completion is False
+        assert refreshed.completed_at is None
+
+    assert len(follow_ups) == 1
+    follow_up = follow_ups[0]
+    assert follow_up["status"] == "failed"
+    assert follow_up["required_action"] == "inform_failure"
+    assert follow_up["metadata"]["turn_state"] == "failed"
+    assert follow_up["metadata"]["recoverable"] is True
+    assert "needs attention" in str(follow_up["title"])
+    assert "agent_conversation_retry" in str(follow_up["description"])
+    assert "Step timed out after 3600s" in str(follow_up["summary"])
+
+    await engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_run_turn_queues_automatic_continuation_after_tool_call_ceiling() -> None:
     scheduler = TurnScheduler(
@@ -2938,6 +3887,8 @@ async def test_run_turn_queues_automatic_continuation_after_tool_call_ceiling() 
         "Tool-call limit reached (200/200 tool calls). Continuing automatically."
     ]
     scheduler.submit_turn.assert_awaited_once()
+    completed_result = scheduler._publish_turn_completed.await_args.args[0]
+    assert completed_result.managed_continuation_pending is True
     assert scheduler.submit_turn.await_args.args[:2] == ("conv-1", "")
     follow_up = scheduler.submit_turn.await_args.kwargs["follow_up"]
     assert scheduler.submit_turn.await_args.kwargs["system_initiated"] is True

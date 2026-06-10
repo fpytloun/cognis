@@ -9,7 +9,9 @@ from cognis.tools.executor.project_context import handle_project_context_probe
 from cognis.tools.registry import ToolExecutionContext
 
 
-def _context(*, workspace_root: str | None = None, working_directory: str | None = None) -> ToolExecutionContext:
+def _context(
+    *, workspace_root: str | None = None, working_directory: str | None = None
+) -> ToolExecutionContext:
     runtime_metadata: dict[str, object] = {}
     if workspace_root is not None:
         runtime_metadata["workspace_root"] = workspace_root

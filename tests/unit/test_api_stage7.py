@@ -37,6 +37,7 @@ from cognis.store.queries import (
     create_artifact_record,
     create_conversation,
     create_deliverable,
+    create_managed_conversation_link,
     create_session,
     create_skill,
     create_skill_asset,
@@ -72,6 +73,99 @@ def test_viewer_cannot_create_task(monkeypatch: object, tmp_path: Path) -> None:
             json={"agent_id": "agent-1", "title": "Do work"},
         )
         assert response.status_code == 403
+
+
+def test_managed_conversation_queue_mutations_are_read_only(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed_managed_conversation() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="controller-agent",
+                    owner_email="owner@example.com",
+                    name="Controller",
+                    status="active",
+                )
+                await create_agent(
+                    session,
+                    agent_id="target-agent",
+                    owner_email="owner@example.com",
+                    name="Target",
+                    status="active",
+                )
+                controller = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="controller-agent",
+                    context_type="web",
+                )
+                target = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="target-agent",
+                    context_type="agent_work",
+                )
+                await create_managed_conversation_link(
+                    session,
+                    user_email="owner@example.com",
+                    controller_agent_id="controller-agent",
+                    controller_conversation_id=controller.conversation_id,
+                    controller_session_id="controller-session",
+                    target_agent_id="target-agent",
+                    target_conversation_id=target.conversation_id,
+                    target_session_id="target-session",
+                    title="Target",
+                )
+                await session.commit()
+                return target.conversation_id
+
+        conversation_id = asyncio.run(_seed_managed_conversation())
+        turn_scheduler = SimpleNamespace(
+            queued_messages=lambda _conversation_id: [],
+            submit_turn=AsyncMock(),
+            update_queued_message=AsyncMock(),
+            cancel_queued_message=AsyncMock(),
+        )
+        client.app.state.turn_scheduler = turn_scheduler
+        headers = _auth_headers(client.app, email="owner@example.com")
+
+        get_response = client.get(f"/api/v1/conversations/{conversation_id}/queue", headers=headers)
+        patch_response = client.patch(
+            f"/api/v1/conversations/{conversation_id}/queue/q-1",
+            headers=headers,
+            json={"content": "edited"},
+        )
+        delete_response = client.delete(
+            f"/api/v1/conversations/{conversation_id}/queue/q-1",
+            headers=headers,
+        )
+        send_response = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers=headers,
+            json={"content": "direct target send"},
+        )
+
+        assert get_response.status_code == 200
+        assert patch_response.status_code == 409
+        assert patch_response.json()["error"]["code"] == "managed_conversation_read_only"
+        assert delete_response.status_code == 409
+        assert delete_response.json()["error"]["code"] == "managed_conversation_read_only"
+        assert send_response.status_code == 409
+        assert send_response.json()["error"]["code"] == "managed_conversation_read_only"
+        turn_scheduler.submit_turn.assert_not_awaited()
+        turn_scheduler.update_queued_message.assert_not_awaited()
+        turn_scheduler.cancel_queued_message.assert_not_awaited()
 
 
 def test_session_intaris_detail_prefers_intaris_summary(
@@ -815,9 +909,20 @@ def test_step_response_resumes_recovered_step_input(monkeypatch: object, tmp_pat
                         "pending_pause_type": "step_input",
                         "pending_pause_payload": {
                             "pause_id": "input_recovered",
-                            "question": "Need input",
                             "step_name": "plan",
-                            "options": ["A", "B"],
+                            "questions": [
+                                {
+                                    "id": "q1",
+                                    "question": "Need input",
+                                    "options": [
+                                        {"id": "A", "label": "A"},
+                                        {"id": "B", "label": "B"},
+                                    ],
+                                    "multiple": False,
+                                    "allow_custom": True,
+                                    "required": True,
+                                }
+                            ],
                         },
                     },
                 )
@@ -851,7 +956,17 @@ def test_step_response_resumes_recovered_step_input(monkeypatch: object, tmp_pat
         response = client.post(
             f"/api/v1/tasks/{task_id}/step-response",
             headers=_auth_headers(app, email="user@example.com"),
-            json={"step_name": "plan", "response": "A"},
+            json={
+                "step_name": "plan",
+                "mode": "structured",
+                "answers": [
+                    {
+                        "question_id": "q1",
+                        "selected_option_ids": ["A"],
+                        "custom_answer": None,
+                    }
+                ],
+            },
         )
         assert response.status_code == 200
         assert called["resume"] is True
@@ -891,9 +1006,20 @@ def test_websocket_step_response_surfaces_resume_conflict(
                         "pending_pause_type": "step_input",
                         "pending_pause_payload": {
                             "pause_id": "input_ws_conflict",
-                            "question": "Need input",
                             "step_name": "plan",
-                            "options": ["A", "B"],
+                            "questions": [
+                                {
+                                    "id": "q1",
+                                    "question": "Need input",
+                                    "options": [
+                                        {"id": "A", "label": "A"},
+                                        {"id": "B", "label": "B"},
+                                    ],
+                                    "multiple": False,
+                                    "allow_custom": True,
+                                    "required": True,
+                                }
+                            ],
                         },
                     },
                 )
@@ -923,7 +1049,14 @@ def test_websocket_step_response_surfaces_resume_conflict(
                     "type": "step_response",
                     "task_id": task_id,
                     "step_name": "plan",
-                    "response": "A",
+                    "mode": "structured",
+                    "answers": [
+                        {
+                            "question_id": "q1",
+                            "selected_option_ids": ["A"],
+                            "custom_answer": None,
+                        }
+                    ],
                 }
             )
             payload = ws.receive_json()
@@ -977,7 +1110,21 @@ def test_websocket_direct_chat_step_response_resolves_notification(
                 conversation_id=conversation_id,
                 session_id=session_id,
                 notification_id="notif_direct_ok",
-                payload={"question": "Need input"},
+                payload={
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "question": "Need input",
+                            "options": [
+                                {"id": "A", "label": "A"},
+                                {"id": "B", "label": "B"},
+                            ],
+                            "multiple": False,
+                            "allow_custom": True,
+                            "required": True,
+                        }
+                    ]
+                },
             )
         )
 
@@ -1004,7 +1151,14 @@ def test_websocket_direct_chat_step_response_resolves_notification(
                 {
                     "type": "step_response",
                     "notification_id": notification.notification_id,
-                    "response": "A",
+                    "mode": "structured",
+                    "answers": [
+                        {
+                            "question_id": "q1",
+                            "selected_option_ids": ["A"],
+                            "custom_answer": None,
+                        }
+                    ],
                 },
             )
         )
@@ -1016,7 +1170,14 @@ def test_websocket_direct_chat_step_response_resolves_notification(
                 {
                     "type": "step_response",
                     "notification_id": notification.notification_id,
-                    "response": "B",
+                    "mode": "structured",
+                    "answers": [
+                        {
+                            "question_id": "q1",
+                            "selected_option_ids": ["B"],
+                            "custom_answer": None,
+                        }
+                    ],
                 },
             )
         )
@@ -1025,7 +1186,18 @@ def test_websocket_direct_chat_step_response_resolves_notification(
         resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
         assert resolved is not None
         assert resolved.status == "resolved"
-        assert resolved.resolution == {"decision": "continue", "response": "A", "state": "resolved"}
+        assert resolved.resolution == {
+            "decision": "continue",
+            "answers": [
+                {
+                    "question_id": "q1",
+                    "selected_option_ids": ["A"],
+                    "custom_answer": None,
+                }
+            ],
+            "mode": "structured",
+            "state": "resolved",
+        }
 
 
 def test_websocket_direct_chat_step_response_resolves_auth_challenge(
@@ -1164,7 +1336,18 @@ def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
                 conversation_id=conversation_id,
                 session_id=session_id,
                 notification_id="notif_direct_orphan",
-                payload={"question": "Need input"},
+                payload={
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "question": "Need input",
+                            "options": [{"id": "A", "label": "A"}],
+                            "multiple": False,
+                            "allow_custom": True,
+                            "required": True,
+                        }
+                    ]
+                },
             )
         )
         app.state.pause_waiter.clear(notification.notification_id)
@@ -1192,7 +1375,14 @@ def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
                 {
                     "type": "step_response",
                     "notification_id": notification.notification_id,
-                    "response": "A",
+                    "mode": "structured",
+                    "answers": [
+                        {
+                            "question_id": "q1",
+                            "selected_option_ids": ["A"],
+                            "custom_answer": None,
+                        }
+                    ],
                 },
             )
         )
@@ -2075,7 +2265,17 @@ def test_websocket_replay_skips_missing_active_session_error(
 
         asyncio.run(manager.replay(connection, conversation_id=conversation_id, last_seq=0))
 
-        assert [payload["type"] for payload in socket.sent] == ["queued_messages_updated"]
+        assert [payload["type"] for payload in socket.sent] == [
+            "queued_messages_updated",
+            "conversation_state_snapshot",
+        ]
+        state_payload = socket.sent[-1]
+        assert state_payload["conversation_id"] == conversation_id
+        state = state_payload["state"]
+        assert isinstance(state, dict)
+        assert state["conversation_id"] == conversation_id
+        assert state["conversation_kind"] == "normal"
+        assert state["task"] is None
         assert conversation_id in connection.subscriptions
 
 
@@ -2270,7 +2470,9 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             headers=_auth_headers(app, email="user@example.com"),
         )
         assert response.status_code == 200
-        assert response.json() == {
+        payload = response.json()
+        state_snapshot = payload.pop("state_snapshot")
+        assert payload == {
             "items": [],
             "last_seq": 0,
             "has_more": False,
@@ -2283,6 +2485,10 @@ def test_conversation_messages_returns_empty_when_stream_missing(
             "history_truncated": False,
             "truncation_reason": None,
         }
+        assert state_snapshot["conversation_id"] == conversation_id
+        assert state_snapshot["conversation_kind"] == "normal"
+        assert state_snapshot["task"] is None
+        assert state_snapshot["active_session"]["session_id"] == _session_id
 
 
 def test_conversation_messages_latest_page_reads_only_tail_sessions(
@@ -2413,6 +2619,164 @@ def test_conversation_messages_latest_page_reads_only_tail_sessions(
                 "last_n": 1,
                 "allow_missing_stream": True,
             }
+        ]
+
+
+def test_conversation_messages_latest_page_includes_compaction_marker(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Compacted chat",
+                )
+                previous = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    session_id="sess-marker-prev",
+                )
+                active = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    previous_session_id=previous.session_id,
+                    session_id="sess-marker-active",
+                )
+                await set_session_intaris_session_id(
+                    session, previous.session_id, previous.session_id
+                )
+                await set_session_intaris_session_id(session, active.session_id, active.session_id)
+                await update_conversation_active_session(
+                    session,
+                    conversation.conversation_id,
+                    active.session_id,
+                )
+                await session.commit()
+                return conversation.conversation_id, previous.session_id, active.session_id
+
+        conversation_id, _previous_session_id, active_session_id = client.portal.call(_seed)
+        calls: list[dict[str, object]] = []
+
+        async def _fake_read_events(
+            session_id: str,
+            after_seq: int = 0,
+            limit: int = 0,
+            last_n: int | None = None,
+            allow_missing_stream: bool = False,
+            **_: object,
+        ) -> EventReadResult:
+            calls.append(
+                {
+                    "session_id": session_id,
+                    "after_seq": after_seq,
+                    "limit": limit,
+                    "last_n": last_n,
+                    "allow_missing_stream": allow_missing_stream,
+                }
+            )
+            if session_id != active_session_id:
+                raise AssertionError(f"unexpected session read: {session_id}")
+            if last_n == 1:
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 2,
+                            "type": "system_message",
+                            "data": {
+                                "content": "Automatic compaction is starting before this turn continues.",
+                                "notice_id": "notice-compaction-start",
+                                "kind": "compaction_start",
+                            },
+                            "ts": "2026-03-28T00:00:01Z",
+                        }
+                    ],
+                    last_seq=2,
+                    has_more=True,
+                    missing_stream_fallback_used=False,
+                )
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "compaction_summary",
+                        "data": {
+                            "summary": "Durable compaction summary",
+                            "method": "rotation",
+                            "source_session_id": "sess-marker-prev",
+                        },
+                        "ts": "2026-03-28T00:00:00Z",
+                    },
+                    {
+                        "seq": 2,
+                        "type": "system_message",
+                        "data": {
+                            "content": "Automatic compaction is starting before this turn continues.",
+                            "notice_id": "notice-compaction-start",
+                            "kind": "compaction_start",
+                        },
+                        "ts": "2026-03-28T00:00:01Z",
+                    },
+                ],
+                last_seq=2,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+        app.state.providers.guardrails.read_events = _fake_read_events
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages?anchor=latest&limit=1",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["type"] for item in body["items"]] == [
+            "compaction_summary",
+            "system_message",
+        ]
+        assert body["items"][0]["data"]["session_id"] == active_session_id
+        assert body["items"][0]["data"]["source_session_id"] == "sess-marker-prev"
+        assert body["items"][0]["data"]["summary"] == "Durable compaction summary"
+        assert calls == [
+            {
+                "session_id": active_session_id,
+                "after_seq": 0,
+                "limit": 0,
+                "last_n": 1,
+                "allow_missing_stream": True,
+            },
+            {
+                "session_id": active_session_id,
+                "after_seq": 0,
+                "limit": 25,
+                "last_n": None,
+                "allow_missing_stream": True,
+            },
         ]
 
 

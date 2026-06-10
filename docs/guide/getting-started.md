@@ -163,6 +163,31 @@ docker run -d \
 
 The executor image runs as the non-root `cognis` user by default. Its home directory is designed to be mounted as a persistent volume so browser profiles, LSP caches, shell history, and workspace files survive restarts.
 
+## Local Compose deployment
+
+For a complete single-instance local deployment, use
+[`compose.local.yml`](../../compose.local.yml) instead of starting each service
+manually. It runs Cognis, Mnemory, Intaris, Qdrant, and a WebSocket executor,
+then seeds a local admin user, provider, model routing, executor record, agent,
+and sample conversation.
+
+```bash
+cp .env.local.example .env.local
+# Fill COGNIS_LOCAL_LLM_BASE_URL and COGNIS_LOCAL_LLM_API_KEY.
+set -a
+source .env.local
+set +a
+make local-compose-build
+make local-compose-up
+make local-compose-wait
+make local-compose-seed
+make local-compose-executor-up
+```
+
+Open `http://localhost:8080` and log in with the configured local admin
+credentials. See [Local Compose Deployment](local-compose.md) for the full env
+contract, reset workflow, and the host-executor alternative.
+
 ## Common setup problems
 
 - **Mnemory or Intaris unreachable**

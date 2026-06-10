@@ -365,8 +365,9 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
         _count_active_tasks_for_schedule,
     )
 
-    await scheduler._fire_schedule("sched_1")  # type: ignore[attr-defined]
+    task_id = await scheduler._fire_schedule("sched_1")  # type: ignore[attr-defined]
 
+    assert task_id == "task_1"
     delivery = captured_submit["delivery"]
     assert isinstance(delivery, TaskDelivery)
     assert delivery.mode == "preferred_channel"

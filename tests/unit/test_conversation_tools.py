@@ -65,6 +65,38 @@ class _FakeIntaris:
         )
 
 
+class _FakeSessionCache:
+    def __init__(self, entry: Any | None = None) -> None:
+        self.entry = entry
+        self.refreshed: list[str] = []
+
+    def get_entry(self, session_id: str) -> Any | None:
+        del session_id
+        return self.entry
+
+    async def refresh(self, session: Any) -> Any | None:
+        self.refreshed.append(session.session_id)
+        return self.entry
+
+
+class _FakeCompactionStrategy:
+    def __init__(self, entry: Any | None = None) -> None:
+        self.session_cache = _FakeSessionCache(entry)
+        self.preview_calls: list[dict[str, Any]] = []
+
+    async def preview_summary_from_events(self, session: Any, **kwargs: Any) -> SimpleNamespace:
+        self.preview_calls.append({"session": session, **kwargs})
+        return SimpleNamespace(
+            compacted=True,
+            method="llm",
+            summary="## Goal\n- generated",
+            turns_compacted=3,
+            tokens_before=120,
+            tokens_after=24,
+            tail_start_seq=42,
+        )
+
+
 def _context() -> ToolExecutionContext:
     return ToolExecutionContext(
         executor_handle=ExecutorHandle(executor_id="exec-1", executor_type="in_process"),
@@ -94,7 +126,7 @@ def _conversation(status: str = "active") -> SimpleNamespace:
         context_ref="web:conv-1",
         context_data={},
         memory_labels={},
-        active_session_id=None,
+        active_session_id="sess-1",
         active_executor_id=None,
         last_read_at=None,
         last_message_at=datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
@@ -108,7 +140,21 @@ def _session(session_id: str, intaris_session_id: str) -> SimpleNamespace:
         session_id=session_id,
         intaris_session_id=intaris_session_id,
         conversation_id="conv-1",
+        user_email="alice@example.com",
+        agent_id="agent-1",
+        parent_session_id=None,
+        previous_session_id=None,
+        delegation_mode=None,
+        delegation_task=None,
+        status="active",
+        completion_reason=None,
+        mnemory_session_id=None,
         started_at=datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
+        idle_since=None,
+        completed_at=None,
+        result_summary=None,
+        result_content=None,
+        updated_at=datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
     )
 
 
@@ -241,6 +287,77 @@ async def test_list_conversations_filters_time_and_paginates(
     )
     assert [row["conversation_id"] for row in next_page["conversations"]] == ["first"]
     assert next_page["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_summarize_conversation_generates_read_only_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_row = _session("sess-1", "int-1")
+    strategy = _FakeCompactionStrategy()
+    monkeypatch.setattr(ct, "get_conversation", lambda *_args: _async_value(_conversation()))
+    monkeypatch.setattr(ct, "get_session_row", lambda *_args: _async_value(session_row))
+    monkeypatch.setattr(
+        ct,
+        "list_conversation_sessions",
+        lambda *_args: _async_value([session_row]),
+    )
+    handlers = ct.build_conversation_tool_handlers(
+        lambda: _SessionContext(),
+        _FakeIntaris(),
+        strategy,
+    )
+
+    result = await handlers["summarize_conversation"]({}, _context())
+
+    assert result["summary"] == "## Goal\n- generated"
+    assert result["format"] == "compaction_summary_v1"
+    assert result["generated"] is True
+    assert result["method"] == "llm"
+    assert result["session_id"] == "sess-1"
+    assert result["intaris_session_id"] == "int-1"
+    assert len(strategy.preview_calls) == 1
+    assert strategy.preview_calls[0]["session"].session_id == "sess-1"
+    assert strategy.preview_calls[0]["trigger"] == "tool_preview"
+
+
+@pytest.mark.asyncio
+async def test_summarize_conversation_returns_cached_summary_without_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_row = _session("sess-1", "int-1")
+    strategy = _FakeCompactionStrategy()
+    monkeypatch.setattr(ct, "get_conversation", lambda *_args: _async_value(_conversation()))
+    monkeypatch.setattr(ct, "get_session_row", lambda *_args: _async_value(session_row))
+    monkeypatch.setattr(
+        ct,
+        "list_conversation_sessions",
+        lambda *_args: _async_value([session_row]),
+    )
+    handlers = ct.build_conversation_tool_handlers(
+        lambda: _SessionContext(),
+        _FakeIntaris(
+            {
+                "int-1": [
+                    {
+                        "seq": 4,
+                        "type": "compaction_summary",
+                        "data": {"summary": "## Goal\n- cached"},
+                        "ts": "2026-05-07T12:00:04Z",
+                    }
+                ]
+            }
+        ),
+        strategy,
+    )
+
+    result = await handlers["summarize_conversation"]({}, _context())
+
+    assert result["summary"] == "## Goal\n- cached"
+    assert result["generated"] is False
+    assert result["method"] == "cached_compaction_summary"
+    assert strategy.preview_calls == []
+    assert strategy.session_cache.refreshed == []
 
 
 def _async_value(value: Any) -> Any:

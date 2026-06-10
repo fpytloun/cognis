@@ -405,6 +405,48 @@ class TestWriteTool:
         assert result.metadata["skill_asset"]["local_path"] == str(target)
 
     @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_defaults_to_cognis_data_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "youtube-transcript",
+                        "asset_manifest": [
+                            {
+                                "filename": "assets/youtube_transcript.py",
+                                "asset_id": "sa-script",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_type": "text/x-python",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {"skill_id": "youtube-transcript", "asset_id": "sa-script"},
+            context,
+        )
+
+        expected = (
+            tmp_path
+            / "data"
+            / "skill_assets"
+            / "youtube-transcript"
+            / "sa-script"
+            / "assets"
+            / "youtube_transcript.py"
+        )
+        assert not result.is_error
+        assert expected.read_text() == "print('hi')\n"
+        assert result.metadata is not None
+        assert result.metadata["skill_asset"]["local_path"] == str(expected)
+
+    @pytest.mark.asyncio()
     async def test_skill_asset_materialize_rejects_directory_traversal_filename(
         self, tmp_path: Path
     ) -> None:

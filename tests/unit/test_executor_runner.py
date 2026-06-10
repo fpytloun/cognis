@@ -491,6 +491,56 @@ async def test_prepare_mcp_runtime_suppresses_failed_client_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_prepare_mcp_runtime_reports_authorization_required_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    class _UnauthorizedClient:
+        async def connect(self) -> None:
+            raise MCPClientError(
+                "mfg-portal",
+                "initialize",
+                "HTTP 401 Unauthorized",
+                error_class="httpstatuserror",
+                status_code=401,
+                auth_error="authorization_required",
+                www_authenticate='Bearer resource_metadata="https://mfg.example/.well-known/oauth-protected-resource/mcp"',
+            )
+
+        async def list_tools(self) -> list[dict[str, object]]:
+            return []
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, object]) -> object:
+            del tool_name, arguments
+            return {}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+            return None
+
+    monkeypatch.setattr("cognis.executor.runner.build_mcp_client", lambda *_: _UnauthorizedClient())
+
+    clients, discovered, statuses, warnings = await runner._prepare_mcp_runtime(
+        [
+            MCPServerConfig(
+                name="mfg-portal",
+                transport="streamable_http",
+                url="https://mfg.example/mcp",
+            )
+        ],
+        {},
+    )
+
+    assert clients == {}
+    assert discovered == []
+    assert warnings == ["MCP server mfg-portal requires authorization during initialize."]
+    assert statuses[0]["authorization_required"] is True
+    assert statuses[0]["status_code"] == 401
+    assert statuses[0]["auth_error"] == "authorization_required"
+
+
+@pytest.mark.asyncio
 async def test_prepare_mcp_runtime_isolates_transport_base_exception_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -487,7 +487,7 @@ POST   /api/v1/tasks/:id/pause                    → Pause running task
 POST   /api/v1/tasks/:id/resume                   → Resume paused task
 POST   /api/v1/tasks/:id/cancel                   → Cancel task (any state)
 POST   /api/v1/tasks/:id/gate-response            → Respond to a gate step
-POST   /api/v1/tasks/:id/step-response            → Respond to `step_request_input` for the current step
+POST   /api/v1/tasks/:id/step-response            → Respond to the current `step_request_questions` question set
 GET    /api/v1/notifications                      → List pending notifications (escalations, gates, step questions, credential requests, auth challenges)
 POST   /api/v1/notifications/:id/resolve         → Resolve a notification directly
 POST   /api/v1/tasks/batch-submit                 → Submit multiple draft tasks at once
@@ -505,6 +505,27 @@ Task create/update payloads also support:
 
 These control where task results/questions are routed back (same conversation,
 specific conversation, latest active for agent, preferred channel, or silent).
+
+Pending step-question pauses expose a canonical `questions` array. Rich clients
+respond to `/step-response` with structured answers:
+
+```json
+{
+  "step_name": "plan",
+  "mode": "structured",
+  "answers": [
+    {
+      "question_id": "strategy",
+      "selected_option_ids": ["jwt"],
+      "custom_answer": null
+    }
+  ]
+}
+```
+
+Signal and other plain-text-like channels do not send per-question selections;
+their full inbound message is recorded as `mode: "plain_text"` with one custom
+answer for the first question so the agent can interpret it in context.
 
 Task creation preserves draft behavior by default. `draft=true` or
 `start_immediately=false` stores a task without enqueueing it. Use
@@ -643,7 +664,7 @@ Connections that do not send a valid auth message within the timeout are closed.
 {type: "update_queued_message", conversation_id, queue_id, content}  // Edit pending queued text
 {type: "resolve_escalation", call_id, decision, note?}
 {type: "gate_response", task_id, step_name, action, feedback?}  // Respond to workflow gate
-{type: "step_response", task_id?, notification_id?, step_name?, response}  // Respond to step_request_input
+{type: "step_response", task_id?, notification_id?, step_name?, mode, answers}  // Respond to step_request_questions question set
 {type: "reconnect", conversation_id, last_seq}     // Reconnect and replay missed events
 {type: "ping"}
 ```
@@ -677,6 +698,9 @@ read-only viewers receive `forbidden` and cannot change pending messages.
 
 // Conversation metadata
 {type: "conversation_updated", conversation_id, title?}
+{type: "conversation_state_snapshot", conversation_id, state}
+{type: "conversation_state_delta", conversation_id, delta_id, state_version,
+ snapshot_required, changed_paths, replace, source}
 {type: "queued", conversation_id, queued_count}
 {type: "queued_messages_updated", conversation_id, queued_count, messages}
 
@@ -745,6 +769,25 @@ read-only viewers receive `forbidden` and cannot change pending messages.
 Notes:
 - `seq` in `message_complete` is the Intaris event sequence number. The
   client tracks this for reconnection.
+- Conversation detail responses include `conversation_state`, and message
+  history responses include `state_snapshot`. These are authoritative
+  backend-projected chat-facing state envelopes. For normal chats the envelope
+  contains only active conversation/session state. For task-linked chats, the
+  backend resolves authorized task or step links from persisted conversation
+  records and projects task status, relevant/current step state, step todos,
+  pending input/credential/auth/escalation summaries, capabilities, and offsets.
+- `conversation_state_snapshot` is emitted after a successful reconnect/open
+  subscription so stale client cache is not the source of truth.
+- `conversation_state_delta` carries an idempotent replacement delta with
+  delta fields flattened at the top level. In the first protocol version,
+  clients should apply `replace.state` as the
+  replacement authoritative state subtree for the given `conversation_id`.
+  Deltas are live hints; if the client detects a gap or receives
+  `snapshot_required`, it should reload history or reconnect for a fresh
+  snapshot.
+- Conversation state uses `state_version: 1`. Linked task and step references
+  are informational projections; task and step backend models remain the
+  authoritative owners of task state.
 - `tool_call` events now include `arguments` (optional) when status is `"started"`.
   A separate `tool_result` event delivers the result after execution completes.
   For direct chat, the controller also emits a second `tool_call` with

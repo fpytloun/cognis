@@ -132,7 +132,11 @@ async def test_stream_complete_normalizes_responses_events(monkeypatch: pytest.M
     handler = InferenceHandler()
 
     async def fake_stream():
-        yield {"type": "response.output_text.delta", "delta": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "Hello"}
         yield {
             "type": "response.output_item.added",
             "item": {
@@ -170,6 +174,38 @@ async def test_stream_complete_normalizes_responses_events(monkeypatch: pytest.M
     assert chunks[1]["tool_calls"][0]["function"]["name"] == "search_tools"
     assert chunks[2]["tool_calls"][0]["function"]["arguments"] == '{"query":"docs"}'
     assert chunks[-1]["usage"]["total_tokens"] == 8
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_suppresses_unbound_responses_output_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+
+    async def fake_stream():
+        yield {"type": "response.output_text.delta", "delta": "Need commit."}
+        yield {"type": "response.output_text.done", "text": "Need commit."}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    async def fake_aresponses(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    assert all(not chunk.get("content") for chunk in chunks)
+    assert chunks[-1]["usage"]["total_tokens"] == 5
 
 
 @pytest.mark.asyncio
@@ -279,7 +315,15 @@ async def test_stream_complete_emits_output_text_done_without_delta(
     handler = InferenceHandler()
 
     async def fake_stream():
-        yield {"type": "response.output_text.done", "text": "Hello from done"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_done", "content": []},
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "msg_done",
+            "text": "Hello from done",
+        }
         yield {
             "type": "response.completed",
             "response": {"status": "completed", "usage": {"total_tokens": 5}},
@@ -310,8 +354,20 @@ async def test_stream_complete_normalizes_enum_style_event_types(
     handler = InferenceHandler()
 
     async def fake_stream():
-        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA", "delta": "Hello"}
-        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE", "text": "Hello"}
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED",
+            "item": {"type": "message", "id": "msg_enum", "content": []},
+        }
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA",
+            "item_id": "msg_enum",
+            "delta": "Hello",
+        }
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE",
+            "item_id": "msg_enum",
+            "text": "Hello",
+        }
         yield {
             "type": "ResponsesAPIStreamEvents.RESPONSE_COMPLETED",
             "response": {"status": "completed", "usage": {"total_tokens": 5}},
@@ -344,8 +400,12 @@ async def test_stream_complete_does_not_duplicate_output_text_done(
     handler = InferenceHandler()
 
     async def fake_stream():
-        yield {"type": "response.output_text.delta", "delta": "Hello"}
-        yield {"type": "response.output_text.done", "text": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_dedupe", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_dedupe", "delta": "Hello"}
+        yield {"type": "response.output_text.done", "item_id": "msg_dedupe", "text": "Hello"}
         yield {
             "type": "response.completed",
             "response": {"status": "completed", "usage": {"total_tokens": 5}},
@@ -378,7 +438,12 @@ async def test_stream_complete_emits_content_part_done_text(
 
     async def fake_stream():
         yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_part", "content": []},
+        }
+        yield {
             "type": "response.content_part.done",
+            "item_id": "msg_part",
             "part": {"type": "output_text", "text": "Hello from content part"},
         }
         yield {

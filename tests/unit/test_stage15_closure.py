@@ -525,6 +525,87 @@ def test_agent_direct_lookup_canonicalizes_legacy_direct_context(tmp_path: Path)
     assert latest_id != conversation_id
 
 
+def test_session_manager_creates_agent_direct_with_stable_agent_title(tmp_path: Path) -> None:
+    async def _run() -> tuple[str | None, str]:
+        engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_factory = create_session_factory(engine)
+        async with session_factory() as session:
+            await create_user(
+                session, email="user@example.com", name="User", password_hash="hash", role="user"
+            )
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent 1",
+                display_name="Miroslav",
+                status="active",
+            )
+            await session.commit()
+
+        manager = SessionManager(session_factory, providers=object(), session_cache=object())
+        conversation = await manager.get_or_create_agent_direct_conversation(
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await engine.dispose()
+        return conversation.title, conversation.title_source
+
+    assert asyncio.run(_run()) == ("Miroslav", "agent_direct")
+
+
+def test_session_manager_repairs_intaris_titled_agent_direct_chat(tmp_path: Path) -> None:
+    async def _run() -> tuple[str | None, str, dict[str, object] | None]:
+        engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_factory = create_session_factory(engine)
+        async with session_factory() as session:
+            await create_user(
+                session, email="user@example.com", name="User", password_hash="hash", role="user"
+            )
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent 1",
+                display_name="Miroslav",
+                status="active",
+            )
+            await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                context_ref=agent_direct_context_ref("user@example.com", "agent-1"),
+                context_data={
+                    "kind": AGENT_DIRECT_KIND,
+                    "intaris_latest_title": "Lawn stain cause investigation",
+                },
+                title="Lawn stain cause investigation",
+                title_source="intaris",
+            )
+            await session.commit()
+
+        manager = SessionManager(session_factory, providers=object(), session_cache=object())
+        conversation = await manager.get_or_create_agent_direct_conversation(
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await engine.dispose()
+        return conversation.title, conversation.title_source, conversation.context.platform_data
+
+    title, title_source, platform_data = asyncio.run(_run())
+    assert title == "Miroslav"
+    assert title_source == "agent_direct"
+    assert platform_data == {
+        "kind": AGENT_DIRECT_KIND,
+        "intaris_latest_title": "Lawn stain cause investigation",
+    }
+
+
 def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) -> None:
     async def _run() -> list[EventType]:
         engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")

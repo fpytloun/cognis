@@ -114,7 +114,9 @@ def test_task_create_accepts_decomposed_skill_source(monkeypatch: object, tmp_pa
         assert workflow_body["lineage"]["source_skill_ids"] == ["skill_release"]
 
 
-def test_schedule_create_accepts_decomposed_skill_source(monkeypatch: object, tmp_path: Path) -> None:
+def test_schedule_create_accepts_decomposed_skill_source(
+    monkeypatch: object, tmp_path: Path
+) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_skill_workflow_source(client.app))
         headers = _auth_headers(client.app, email="user@example.com")

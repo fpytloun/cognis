@@ -530,12 +530,19 @@ should show this as a question card distinct from a workflow gate:
 ┌────────────────────────────────────────────┐
 │ ❓ Planning needs clarification             │
 │                                            │
+│ Implementation choice                      │
 │ Which auth strategy should be used?        │
 │                                            │
 │ [JWT Refresh Tokens] [Session Only]        │
 │ [Provide custom answer...]                 │
 └────────────────────────────────────────────┘
 ```
+
+Question cards may contain multiple questions. Each question can have selectable
+options, optional multi-select, and an optional custom-answer field. Rich clients
+submit structured answers keyed by question id. Signal and plain-text-like
+channels render the same question set as numbered text, but their full user
+reply is passed back as one free-form answer for the agent to interpret.
 
 Difference from gates:
 - step question resumes the SAME step session

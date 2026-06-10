@@ -365,7 +365,11 @@ async def test_chatgpt_stream_uses_litellm_responses_with_hydrated_oauth(
     captured: dict[str, Any] = {}
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": "hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "hello"}
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     async def _fake_aresponses(**kwargs: object) -> object:
@@ -495,8 +499,12 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
         return codex_support.CodexAuth(access_token="token", account_id="account")
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": "hel"}
-        yield {"type": "response.output_text.delta", "delta": "lo"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "hel"}
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "lo"}
         yield {
             "type": "response.completed",
             "response": {
@@ -558,8 +566,12 @@ async def test_chatgpt_json_generate_uses_streaming_direct_codex_transport(
         return codex_support.CodexAuth(access_token="token", account_id="account")
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": '{"ok":'}
-        yield {"type": "response.output_text.delta", "delta": " true}"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": '{"ok":'}
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": " true}"}
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     async def _fake_responses(self: Any, **kwargs: object) -> object:
@@ -583,7 +595,10 @@ async def test_chatgpt_json_generate_uses_streaming_direct_codex_transport(
 
     assert captured["stream"] is True
     assert captured["instructions"] == "Return JSON only."
-    assert captured["input"] == [{"role": "user", "content": "classify"}]
+    assert captured["input"] == [
+        {"role": "system", "content": "Return JSON."},
+        {"role": "user", "content": "classify"},
+    ]
     assert result["choices"][0]["message"]["content"] == '{"ok": true}'
     await engine.dispose()
 
@@ -625,7 +640,15 @@ async def test_chatgpt_json_generate_retries_stream_without_reasoning_summary(
         }
 
     async def _successful_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": '{"ok": true}'}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": '{"ok": true}',
+        }
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     async def _fake_responses(self: Any, **kwargs: object) -> object:
@@ -683,7 +706,11 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
         return codex_support.CodexAuth(access_token="token", account_id="account")
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": "hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "hello"}
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
     async def _fake_responses(self: Any, **kwargs: object) -> object:
@@ -714,6 +741,69 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
     assert captured["stream"] is True
     assert captured["store"] is False
     assert chunks[0]["choices"][0]["delta"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_json_stream_uses_direct_codex_transport_json_marker(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="chatgpt",
+                display_name="ChatGPT Subscription",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "chatgpt",
+                    "default_model": "gpt-5.3-codex",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_auth(self: LiteLLMProvider, row: LLMProvider) -> codex_support.CodexAuth:
+        return codex_support.CodexAuth(access_token="token", account_id="account")
+
+    async def _fake_stream() -> object:
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": '{"ok":true}'}
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    async def _fake_responses(self: Any, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _fake_stream()
+
+    monkeypatch.setattr(LLMService, "_chatgpt_codex_auth", _fake_auth)
+    monkeypatch.setattr(litellm_provider_module.DirectCodexTransport, "responses", _fake_responses)
+
+    chunks = [
+        chunk
+        async for chunk in LLMService(session_factory).stream_generate(
+            messages=[{"role": "user", "content": "classify"}],
+            model="gpt-5.3-codex",
+            provider_id="chatgpt",
+            response_format={"type": "json_object"},
+        )
+    ]
+
+    assert (
+        captured["instructions"]
+        == "You are a helpful assistant. Follow the user's instructions precisely."
+    )
+    assert captured["input"] == [
+        {"role": "system", "content": "Return JSON."},
+        {"role": "user", "content": "classify"},
+    ]
+    assert chunks[0]["choices"][0]["delta"]["content"] == '{"ok":true}'
     await engine.dispose()
 
 
@@ -3130,7 +3220,7 @@ async def test_litellm_provider_responses_sets_cache_key_and_store_false(
     assert captured["instructions"] == "immutable prefix"
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert captured["store"] is False
-    assert "include" not in captured
+    assert captured["include"] == ["reasoning.encrypted_content"]
     assert str(captured["prompt_cache_key"]).startswith("cognis-")
     assert captured["prompt_cache_retention"] == "24h"
     await engine.dispose()
@@ -3859,7 +3949,11 @@ async def test_litellm_provider_stream_generate_normalizes_responses_events(
         await session.commit()
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "Hello"}
         yield {
             "type": "response.output_item.added",
             "item": {
@@ -3901,6 +3995,57 @@ async def test_litellm_provider_stream_generate_normalizes_responses_events(
         == '{"query":"docs"}'
     )
     assert chunks[-1]["usage"]["total_tokens"] == 7
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_stream_generate_suppresses_unbound_responses_output_text(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="proxy",
+                display_name="LiteLLM Proxy",
+                location="controller",
+                backend="litellm",
+                config={"preset": "litellm_proxy", "default_model": "gpt-5.4"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_stream() -> object:
+        yield {"type": "response.output_text.delta", "delta": "Need commit."}
+        yield {"type": "response.output_text.done", "text": "Need commit."}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 4}},
+        }
+
+    async def _fake_aresponses(**_: object) -> object:
+        return _fake_stream()
+
+    monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.aresponses", _fake_aresponses)
+
+    provider = LiteLLMProvider(session_factory)
+    chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+        )
+    ]
+
+    assert all(
+        not (choice.get("delta") or {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert chunks[-1]["usage"]["total_tokens"] == 4
     await engine.dispose()
 
 
@@ -3960,9 +4105,10 @@ async def test_litellm_provider_stream_generate_emits_message_item_text_without_
         )
     ]
 
-    assert chunks[0]["choices"][0]["delta"]["content"] == "Hello from item"
+    choices_chunks = [chunk for chunk in chunks if chunk.get("choices")]
+    assert choices_chunks[0]["choices"][0]["delta"]["content"] == "Hello from item"
     assert chunks[-1]["usage"]["total_tokens"] == 5
-    assert len([chunk for chunk in chunks if chunk.get("choices")]) == 2
+    assert len(choices_chunks) == 2
     await engine.dispose()
 
 
@@ -3986,7 +4132,15 @@ async def test_litellm_provider_stream_generate_emits_output_text_done_without_d
         await session.commit()
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.done", "text": "Hello from done"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_done", "content": []},
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "msg_done",
+            "text": "Hello from done",
+        }
         yield {
             "type": "response.completed",
             "response": {"status": "completed", "usage": {"total_tokens": 4}},
@@ -4032,8 +4186,20 @@ async def test_litellm_provider_stream_generate_normalizes_enum_style_event_type
         await session.commit()
 
     async def _fake_stream() -> object:
-        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA", "delta": "Hello"}
-        yield {"type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE", "text": "Hello"}
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED",
+            "item": {"type": "message", "id": "msg_enum", "content": []},
+        }
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA",
+            "item_id": "msg_enum",
+            "delta": "Hello",
+        }
+        yield {
+            "type": "ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE",
+            "item_id": "msg_enum",
+            "text": "Hello",
+        }
         yield {
             "type": "ResponsesAPIStreamEvents.RESPONSE_COMPLETED",
             "response": {"status": "completed", "usage": {"total_tokens": 4}},
@@ -4085,8 +4251,12 @@ async def test_litellm_provider_stream_generate_does_not_duplicate_output_text_d
         await session.commit()
 
     async def _fake_stream() -> object:
-        yield {"type": "response.output_text.delta", "delta": "Hello"}
-        yield {"type": "response.output_text.done", "text": "Hello"}
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_dedupe", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_dedupe", "delta": "Hello"}
+        yield {"type": "response.output_text.done", "item_id": "msg_dedupe", "text": "Hello"}
         yield {
             "type": "response.completed",
             "response": {"status": "completed", "usage": {"total_tokens": 4}},
@@ -4138,7 +4308,12 @@ async def test_litellm_provider_stream_generate_emits_content_part_done_text(
 
     async def _fake_stream() -> object:
         yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_part", "content": []},
+        }
+        yield {
             "type": "response.content_part.done",
+            "item_id": "msg_part",
             "part": {"type": "output_text", "text": "Hello from content part"},
         }
         yield {

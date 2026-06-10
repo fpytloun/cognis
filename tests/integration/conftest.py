@@ -14,7 +14,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.bootstrap import ensure_data_dir, ensure_jwt_keypair, ensure_secrets_key
-from cognis.config import CognisConfig
+from cognis.config import CognisConfig, load_config
 
 
 def _free_port() -> int:
@@ -56,6 +56,43 @@ def _wait_healthy(url: str, *, timeout: float = 120.0, interval: float = 1.0) ->
     raise RuntimeError(
         f"Service at {url} did not become healthy within {timeout}s"
         + (f": {last_error}" if last_error else "")
+    )
+
+
+def _bootstrap_config(
+    *,
+    cognis_dir: Path,
+    host: str,
+    port: int,
+    mnemory_url: str,
+    intaris_url: str,
+    admin_email: str,
+    admin_password: str,
+) -> CognisConfig:
+    """Build a complete test CognisConfig for bootstrap-only helpers."""
+
+    return replace(
+        load_config(),
+        data_dir=cognis_dir,
+        host=host,
+        port=port,
+        mnemory_url=mnemory_url,
+        intaris_url=intaris_url,
+        public_mnemory_ui_url=mnemory_url,
+        public_intaris_ui_url=intaris_url,
+        public_base_url=f"http://{host}:{port}" if port else "",
+        database_url=f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}",
+        jwt_private_key_path=cognis_dir / "keys" / "private.pem",
+        jwt_public_key_path=cognis_dir / "keys" / "public.pem",
+        secrets_key_path=cognis_dir / "secrets.key",
+        log_level="warning",
+        log_format="text",
+        serve_ui=False,
+        cors_origins=["*"],
+        artifact_path=cognis_dir / "artifacts",
+        vapid_private_key_path=cognis_dir / "keys" / "vapid_private.pem",
+        initial_admin_email=admin_email,
+        initial_admin_password=admin_password,
     )
 
 
@@ -216,21 +253,14 @@ def integration_stack(
     llm_model = clean_env.get("COGNIS_TEST_LLM_MODEL", "gpt-4.1-nano")
 
     # Step 1: Bootstrap keys BEFORE starting anything
-    bootstrap_config = CognisConfig(
-        data_dir=cognis_dir,
+    bootstrap_config = _bootstrap_config(
+        cognis_dir=cognis_dir,
         host="127.0.0.1",
         port=0,
         mnemory_url=mnemory_url,
         intaris_url=intaris_url,
-        database_url=f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}",
-        jwt_private_key_path=cognis_dir / "keys" / "private.pem",
-        jwt_public_key_path=cognis_dir / "keys" / "public.pem",
-        secrets_key_path=cognis_dir / "secrets.key",
-        log_level="warning",
-        log_format="text",
-        cors_origins=["*"],
-        initial_admin_email=admin_email,
-        initial_admin_password=admin_password,
+        admin_email=admin_email,
+        admin_password=admin_password,
     )
     ensure_data_dir(bootstrap_config)
     ensure_jwt_keypair(bootstrap_config)
@@ -252,6 +282,8 @@ def integration_stack(
             "MCP_HOST": "127.0.0.1",
             "MCP_PORT": str(mnemory_port),
             "MNEMORY_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="mnemory",
@@ -265,6 +297,8 @@ def integration_stack(
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="intaris",
@@ -320,7 +354,17 @@ def integration_stack(
             "display_name": "OpenAI (test)",
             "location": "controller",
             "backend": "litellm",
-            "config": {"default_model": llm_model},
+            "config": {
+                "default_model": llm_model,
+                "models": [
+                    {
+                        "model_id": llm_model,
+                        "display_name": "Integration test model",
+                        "supports_tools": True,
+                        "supports_streaming": True,
+                    }
+                ],
+            },
         },
     )
     assert provider_response.status_code == 200, (
@@ -408,21 +452,14 @@ def live_stack(
     llm_model = clean_env.get("COGNIS_TEST_LLM_MODEL", "gpt-4.1-nano")
 
     # Bootstrap keys first
-    bootstrap_config = CognisConfig(
-        data_dir=cognis_dir,
+    bootstrap_config = _bootstrap_config(
+        cognis_dir=cognis_dir,
         host="127.0.0.1",
         port=cognis_port,
         mnemory_url=mnemory_url,
         intaris_url=intaris_url,
-        database_url=f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}",
-        jwt_private_key_path=cognis_dir / "keys" / "private.pem",
-        jwt_public_key_path=cognis_dir / "keys" / "public.pem",
-        secrets_key_path=cognis_dir / "secrets.key",
-        log_level="warning",
-        log_format="text",
-        cors_origins=["*"],
-        initial_admin_email=admin_email,
-        initial_admin_password=admin_password,
+        admin_email=admin_email,
+        admin_password=admin_password,
     )
     ensure_data_dir(bootstrap_config)
     ensure_jwt_keypair(bootstrap_config)

@@ -628,7 +628,7 @@ cycles. When extending the controller, API, or workflow engine, follow
 these rules:
 
 - **One source of truth for controller tool schemas.** Controller-injected
-  tools (``step_todo_write``, ``step_complete``, ``step_request_input``,
+  tools (``step_todo_write``, ``step_complete``, ``step_request_questions``,
   etc.) must pull their JSON schema from
   ``cognis/tools/builtin/workflow.py``. Never hand-roll a second schema
   in the agent loop — the LLM-facing and validator-facing schemas must

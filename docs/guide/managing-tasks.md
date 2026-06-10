@@ -61,6 +61,12 @@ API/UI needs to distinguish it from total step time.
 
 Some workflows pause for human input. When that happens, Cognis records the pause and lets you respond from the task flow instead of losing the context in chat.
 
+Step questions are stored as a question set: a paused step can ask one or more
+questions, each with selectable options, multi-select when allowed, and an
+optional custom answer. Web/API clients answer with structured per-question
+answers. Plain-text channels such as Signal show the whole question set, but the
+entire reply is forwarded as one free-form answer for the agent to interpret.
+
 Gate pauses include evaluated condition details when available: referenced
 values, expected or threshold values, comparison operator, actual result,
 pass/fail outcome, branch or action taken, and any evaluation error. These

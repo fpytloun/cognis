@@ -5,11 +5,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
 from cognis.tools import mcp as mcp_module
 from cognis.tools.mcp import (
+    AsyncExitStack,
     MCPClientError,
     StdioMCPClient,
     StreamableHTTPMCPClient,
@@ -246,45 +248,6 @@ async def test_connect_failure_cleanup_does_not_mask_primary_error() -> None:
     assert "primary failure" in str(exc_info.value)
 
 
-@pytest.mark.asyncio
-async def test_mcp_client_close_suppresses_cancelled_error() -> None:
-    client = StdioMCPClient(
-        MCPServerConfig(name="filesystem", command=sys.executable, args=[], timeout_seconds=10)
-    )
-
-    class _ExitStack:
-        async def aclose(self) -> None:
-            raise asyncio.CancelledError()
-
-    client._exit_stack = _ExitStack()
-    client._session = SimpleNamespace()
-
-    await client.close(suppress_cancelled=True)
-
-    assert client._exit_stack is None
-    assert client._session is None
-
-
-@pytest.mark.asyncio
-async def test_mcp_client_close_propagates_task_cancellation() -> None:
-    client = StdioMCPClient(
-        MCPServerConfig(name="filesystem", command=sys.executable, args=[], timeout_seconds=10)
-    )
-
-    class _ExitStack:
-        async def aclose(self) -> None:
-            raise asyncio.CancelledError()
-
-    client._exit_stack = _ExitStack()
-    client._session = SimpleNamespace()
-
-    with pytest.raises(asyncio.CancelledError):
-        await client.close()
-
-    assert client._exit_stack is not None
-    assert client._session is not None
-
-
 # ---------------------------------------------------------------------------
 # _strip_empty_optionals tests
 # ---------------------------------------------------------------------------
@@ -425,47 +388,168 @@ def test_strip_empty_optionals_nested_object() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_close_suppresses_base_exception_group_suppress_true() -> None:
-    """BaseExceptionGroup from anyio cross-task teardown is silently swallowed."""
+async def test_mcp_client_close_uses_session_owner_task() -> None:
+    """Close cancels the session owner so teardown runs in that owner task."""
     client = StdioMCPClient(MCPServerConfig(name="broken", command="/bin/echo", timeout_seconds=5))
+    owner_task: asyncio.Task[None] | None = None
+    cancelled = False
 
-    class _ExitStack:
-        async def aclose(self) -> None:
-            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+    async def owner() -> None:
+        nonlocal cancelled, owner_task
+        owner_task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
 
-    client._exit_stack = _ExitStack()
-    client._session = SimpleNamespace()
+    requests: asyncio.Queue[tuple[str, tuple[object, ...], asyncio.Future[object]]] = (
+        asyncio.Queue()
+    )
+    client._requests = requests
+    client._task = asyncio.create_task(owner())
+    await asyncio.sleep(0)
 
-    # Must not raise and must clear both references.
     await client.close(suppress_cancelled=True)
 
-    assert client._exit_stack is None
-    assert client._session is None
+    assert cancelled is True
+    assert owner_task is not None
+    assert owner_task.done()
+    assert client._task is None
+    assert client._requests is None
 
 
 @pytest.mark.asyncio
-async def test_mcp_client_close_suppresses_base_exception_group_suppress_false() -> None:
-    """BaseExceptionGroup is always suppressed (it is not a real CancelledError)."""
-    client = StdioMCPClient(MCPServerConfig(name="broken", command="/bin/echo", timeout_seconds=5))
+async def test_mcp_session_owner_closes_context_in_entering_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered_task: asyncio.Task[None] | None = None
+    exited_task: asyncio.Task[None] | None = None
 
-    class _ExitStack:
-        async def aclose(self) -> None:
-            raise BaseExceptionGroup("anyio-cancel", [RuntimeError("cross-task scope")])
+    class _Context:
+        async def __aenter__(self) -> tuple[object, object]:
+            nonlocal entered_task
+            entered_task = asyncio.current_task()
+            return object(), object()
 
-    client._exit_stack = _ExitStack()
-    client._session = SimpleNamespace()
+        async def __aexit__(self, *_args: object) -> None:
+            nonlocal exited_task
+            exited_task = asyncio.current_task()
 
-    # BaseExceptionGroup is not re-raised even when suppress_cancelled=False;
-    # it is an anyio artifact, not a genuine task cancellation.
-    await client.close(suppress_cancelled=False)
+    class _Session:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.tools = [SimpleNamespace(name="inspect", description="", inputSchema={})]
 
-    assert client._exit_stack is None
-    assert client._session is None
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self) -> SimpleNamespace:
+            return SimpleNamespace(tools=self.tools)
+
+    class _Client(_SessionMCPClient):
+        async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[object, object]:
+            return await exit_stack.enter_async_context(_Context())
+
+    monkeypatch.setattr(mcp_module, "ClientSession", _Session)
+    client = _Client(MCPServerConfig(name="fake", command="/bin/echo", timeout_seconds=5))
+
+    await client.connect()
+    assert await client.list_tools()
+    await client.close()
+
+    assert entered_task is not None
+    assert exited_task is entered_task
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_times_out_and_closes_owner_task() -> None:
+    class _Client(_SessionMCPClient):
+        async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[object, object]:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    client = _Client(MCPServerConfig(name="hung", command="/bin/echo", timeout_seconds=1))
+
+    with pytest.raises(MCPClientError, match="timed out") as exc_info:
+        await client.connect()
+
+    assert exc_info.value.timed_out is True
+    assert client._task is None
+    assert client._requests is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_operation_times_out_and_closes_owner_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def list_tools(self) -> SimpleNamespace:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class _Client(_SessionMCPClient):
+        async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[object, object]:
+            return object(), object()
+
+    monkeypatch.setattr(mcp_module, "ClientSession", _Session)
+    client = _Client(MCPServerConfig(name="hung", command="/bin/echo", timeout_seconds=1))
+
+    await client.connect()
+    with pytest.raises(MCPClientError, match="timed out") as exc_info:
+        await client.list_tools()
+
+    assert exc_info.value.timed_out is True
+    assert client._task is None
+    assert client._requests is None
 
 
 def test_runtime_mcp_server_key_falls_back_safely() -> None:
     assert runtime_mcp_server_key(MCPServerConfig(name="demo", command="/bin/echo")) == "demo"
     assert runtime_mcp_server_key(ToolSource(type="local_mcp", server_name="demo")) == "demo"
+
+
+def test_coerce_client_error_extracts_http_status_from_exception_group() -> None:
+    request = httpx.Request("POST", "https://mfg.prd.lumilens.com/mcp")
+    response = httpx.Response(
+        401,
+        headers={"www-authenticate": 'Bearer error="invalid_token"'},
+        request=request,
+    )
+    exc = ExceptionGroup(
+        "streamable-http",
+        [
+            httpx.HTTPStatusError(
+                "Client error '401 Unauthorized'",
+                request=request,
+                response=response,
+            )
+        ],
+    )
+
+    result = mcp_module._coerce_client_error("mfg-portal", "list_tools", exc)
+
+    assert result.status_code == 401
+    assert result.auth_error == "authorization_required"
+    assert result.authorization_required is True
+    assert result.www_authenticate == "Bearer [redacted]"
 
 
 def test_strip_empty_optionals_preserves_zero_and_false() -> None:

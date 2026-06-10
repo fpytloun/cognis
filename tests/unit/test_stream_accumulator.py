@@ -6,7 +6,7 @@ restarts and split tool calls could silently corrupt arguments.
 
 from __future__ import annotations
 
-from cognis.core.agent_loop import StreamAccumulator
+from cognis.core.agent_loop import _MAX_TOOL_CALL_ARGUMENT_CHARS, StreamAccumulator
 from cognis.providers.llm.errors import ToolArgumentParseFailure
 
 
@@ -122,6 +122,27 @@ def test_malformed_arguments_fall_through_to_raw() -> None:
     assert len(calls) == 1
     assert isinstance(calls[0], ToolArgumentParseFailure)
     assert calls[0].raw == '{"todos":['
+
+
+def test_oversized_tool_arguments_become_recoverable_failure() -> None:
+    acc = StreamAccumulator()
+    _feed_tool_delta(
+        acc,
+        '{"patchText":"' + ("x" * (_MAX_TOOL_CALL_ARGUMENT_CHARS + 1)),
+        name="apply_patch",
+    )
+    _feed_tool_delta(acc, "ignored-after-limit", name="apply_patch")
+
+    calls = acc.get_tool_calls()
+
+    assert len(calls) == 1
+    assert isinstance(calls[0], ToolArgumentParseFailure)
+    assert calls[0].name == "apply_patch"
+    assert calls[0].reason == "tool_call_arguments_too_large"
+    assert calls[0].recovery_attempts == ("tool_call_arguments_too_large",)
+    assert calls[0].argument_length is not None
+    assert calls[0].argument_length > _MAX_TOOL_CALL_ARGUMENT_CHARS
+    assert len(calls[0].raw) == 4096
 
 
 def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:

@@ -10,6 +10,7 @@ from cognis.api.runtime_support import (
     _build_remote_runtime_registry,
     _merge_remote_runtime_inventory,
     _resolve_intaris_mcp_tools,
+    mcp_server_assignment_key,
     select_static_tools,
 )
 from cognis.core.executor_policy import ExecutorPolicy
@@ -54,6 +55,28 @@ def _builtin_tool(name: str) -> ToolDefinition:
         category="system",
         read_only=True,
     )
+
+
+def _mcp_tool(*, name: str, server_name: str, server_id: str | None = None) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=name,
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_name=server_name,
+            server_id=server_id,
+            raw_tool_name=name,
+        ),
+        category="mcp",
+        read_only=True,
+    )
+
+
+def test_mcp_server_assignment_key_prefers_stable_server_id() -> None:
+    tool = _mcp_tool(name="search", server_name="github", server_id="srv-github")
+
+    assert mcp_server_assignment_key(tool.source) == "local_mcp:srv-github"
 
 
 def test_manage_agents_is_default_off_without_opt_in() -> None:
@@ -749,6 +772,68 @@ async def test_merge_remote_runtime_inventory_prefers_remote_and_builtin_on_coll
     assert [tool.name for tool in result.tools] == [colliding_name, "list_agents"]
     assert result.collision_count >= 2
     assert any("hidden" in warning.lower() for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_merge_remote_runtime_inventory_honors_disabled_mcp_server_group() -> None:
+    disabled_tool = _mcp_tool(
+        name="mcp_github__search",
+        server_name="github",
+        server_id="srv-github",
+    )
+    enabled_tool = _mcp_tool(
+        name="mcp_linear__search",
+        server_name="linear",
+        server_id="srv-linear",
+    )
+    providers = SimpleNamespace(guardrails=_Guardrails(aggregated=[]))
+
+    result = await _merge_remote_runtime_inventory(
+        remote_tools_data=[
+            disabled_tool.model_dump(mode="json"),
+            enabled_tool.model_dump(mode="json"),
+        ],
+        agent_tools=[],
+        providers=providers,
+        agent=_agent(),
+        disabled_categories=set(),
+        disabled_tools=set(),
+        disabled_mcp_servers={"local_mcp:srv-github"},
+    )
+
+    assert [tool.name for tool in result.tools] == ["mcp_linear__search"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_intaris_mcp_tools_honors_disabled_mcp_server_group() -> None:
+    providers = SimpleNamespace(
+        guardrails=_Guardrails(
+            aggregated=[
+                {
+                    "server": "github",
+                    "tool": "search",
+                    "description": "Search GitHub",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "server": "linear",
+                    "tool": "search",
+                    "description": "Search Linear",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ]
+        )
+    )
+
+    result = await _resolve_intaris_mcp_tools(
+        providers,
+        _agent(tools={"intaris_mcp_servers": ["github", "linear"]}),
+        set(),
+        set(),
+        {"intaris_mcp:github"},
+    )
+
+    assert {tool.source.server_name for tool in result.tools} == {"linear"}
 
 
 @pytest.mark.asyncio

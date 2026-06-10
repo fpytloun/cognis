@@ -94,9 +94,7 @@ def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path
         assert detail_response.json()["last_run_status"] == "running"
 
 
-def test_schedule_create_rejects_other_user_workflow(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_schedule_create_rejects_other_user_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
@@ -420,3 +418,203 @@ def test_schedule_status_ignores_other_users_tasks(monkeypatch: object, tmp_path
         detail_response = client.get(f"/api/v1/schedules/{schedule_id}", headers=headers)
         assert detail_response.status_code == 200
         assert detail_response.json()["last_run_status"] == "running"
+
+
+def test_schedule_list_filters_by_project(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                project_one = await create_project(
+                    session,
+                    project_id="project-one",
+                    owner_email="user@example.com",
+                    name="Project One",
+                )
+                project_two = await create_project(
+                    session,
+                    project_id="project-two",
+                    owner_email="user@example.com",
+                    name="Project Two",
+                )
+                first = await create_schedule(
+                    session,
+                    name="First schedule",
+                    schedule_type="interval",
+                    interval_seconds=600,
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    project_id=project_one.project_id,
+                    task_template={},
+                    next_fire_at=datetime.now(UTC) + timedelta(hours=1),
+                    created_by="user@example.com",
+                )
+                await create_schedule(
+                    session,
+                    name="Second schedule",
+                    schedule_type="interval",
+                    interval_seconds=600,
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    project_id=project_two.project_id,
+                    task_template={},
+                    next_fire_at=datetime.now(UTC) + timedelta(hours=1),
+                    created_by="user@example.com",
+                )
+                await session.commit()
+                return project_one.project_id, first.schedule_id
+
+        project_id, schedule_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/schedules",
+            headers=_auth_headers(app, email="user@example.com"),
+            params={"project_id": project_id},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["schedule_id"] for item in body] == [schedule_id]
+
+
+def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                schedule = await create_schedule(
+                    session,
+                    name="Manual trigger",
+                    schedule_type="interval",
+                    interval_seconds=600,
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    task_template={"title": "Triggered task"},
+                    created_by="user@example.com",
+                )
+                await session.commit()
+                return schedule.schedule_id
+
+        schedule_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/schedules/{schedule_id}/trigger",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["task_id"].startswith("task_")
+        assert body["schedule_id"] == schedule_id
+        assert body["last_run_status"] in {"queued", "ready", "running"}
+
+
+def test_project_response_counts_active_schedules(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                project = await create_project(
+                    session,
+                    project_id="project-counts",
+                    owner_email="user@example.com",
+                    name="Project Counts",
+                )
+                await create_schedule(
+                    session,
+                    name="Active schedule",
+                    schedule_type="interval",
+                    interval_seconds=600,
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    project_id=project.project_id,
+                    task_template={},
+                    next_fire_at=datetime.now(UTC) + timedelta(hours=1),
+                    created_by="user@example.com",
+                )
+                await create_schedule(
+                    session,
+                    name="Expired one-shot",
+                    schedule_type="one_shot",
+                    one_shot_at=datetime.now(UTC) - timedelta(hours=1),
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    project_id=project.project_id,
+                    task_template={},
+                    next_fire_at=None,
+                    created_by="user@example.com",
+                )
+                await create_schedule(
+                    session,
+                    name="Disabled schedule",
+                    schedule_type="interval",
+                    interval_seconds=600,
+                    timezone="UTC",
+                    agent_id="agent-1",
+                    project_id=project.project_id,
+                    task_template={},
+                    enabled=False,
+                    next_fire_at=datetime.now(UTC) + timedelta(hours=1),
+                    created_by="user@example.com",
+                )
+                await session.commit()
+                return project.project_id
+
+        project_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        list_response = client.get("/api/v1/projects", headers=headers)
+        assert list_response.status_code == 200
+        listed_project = next(
+            item for item in list_response.json() if item["project_id"] == project_id
+        )
+        assert listed_project["active_schedule_count"] == 1
+
+        detail_response = client.get(f"/api/v1/projects/{project_id}", headers=headers)
+        assert detail_response.status_code == 200
+        assert detail_response.json()["active_schedule_count"] == 1

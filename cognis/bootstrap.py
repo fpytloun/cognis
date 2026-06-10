@@ -63,6 +63,8 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "security.token_ttl_seconds": ("security", 3600),
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
+    "mcp.tool_timeout_seconds": ("mcp", 300),
+    "mcp.connect_timeout_seconds": ("mcp", 15),
     "web.backend": ("web", "direct"),
     "web.search_backend": ("web", "direct"),
     "web.fetch_backend": ("web", "direct"),

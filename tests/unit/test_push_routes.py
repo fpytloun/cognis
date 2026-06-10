@@ -256,9 +256,7 @@ def test_push_subscription_test_endpoint_sends_to_current_user(
         assert response.json() == {"sent_to": 1, "errors": 0}
 
 
-def test_turn_completed_web_chat_creates_push_payload(
-    monkeypatch: object, tmp_path: Path
-) -> None:
+def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         import asyncio
 

@@ -205,9 +205,7 @@ async def test_pool_additional_explicit() -> None:
             session_factory=_FakeSessionFactory(rows),
             agent_execution={
                 "executor_id": "exec-primary",
-                "additional_executors": [
-                    {"executor_id": "exec-extra", "description": "Mac"}
-                ],
+                "additional_executors": [{"executor_id": "exec-extra", "description": "Mac"}],
             },
             user_email="user@example.com",
             executor_owner_email="user@example.com",

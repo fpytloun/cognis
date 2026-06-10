@@ -48,12 +48,35 @@ from cognis.models.session import ConversationContext
 
 logger = get_logger(__name__)
 
+_ASSISTANT_DELIVERY_MODE_FINAL_ONLY = "final_only"
+_ASSISTANT_DELIVERY_MODE_CONCATENATED = "concatenated"
+_ASSISTANT_DELIVERY_MODE_IMMEDIATE = "immediate"
+_LEGACY_ASSISTANT_DELIVERY_MODE_FINAL = "final"
+_ASSISTANT_DELIVERY_MODES = frozenset(
+    {
+        _ASSISTANT_DELIVERY_MODE_FINAL_ONLY,
+        _ASSISTANT_DELIVERY_MODE_CONCATENATED,
+        _ASSISTANT_DELIVERY_MODE_IMMEDIATE,
+    }
+)
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_assistant_delivery_mode(value: Any) -> str:
+    """Normalize channel assistant delivery mode, preserving legacy semantics."""
+
+    mode = str(value or "").strip().lower()
+    if mode == _LEGACY_ASSISTANT_DELIVERY_MODE_FINAL:
+        return _ASSISTANT_DELIVERY_MODE_CONCATENATED
+    if mode in _ASSISTANT_DELIVERY_MODES:
+        return mode
+    return _ASSISTANT_DELIVERY_MODE_CONCATENATED
 
 
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
@@ -267,7 +290,12 @@ class InboundPipeline:
             turn_scheduler=self._turn_scheduler,
             reply_to_id=message.message_id,
             channel_manager_ref=self._channel_manager_ref,
-            assistant_delivery_mode=str(config.settings.get("assistant_delivery_mode", "final")),
+            assistant_delivery_mode=_normalize_assistant_delivery_mode(
+                config.settings.get(
+                    "assistant_delivery_mode",
+                    _ASSISTANT_DELIVERY_MODE_CONCATENATED,
+                )
+            ),
         )
 
         # 5. Submit turn
@@ -654,10 +682,19 @@ class InboundPipeline:
                 user_email=user_email,
             )
         else:
+            from cognis.core.question_sets import plain_text_reply_for_questions
+
+            try:
+                data = plain_text_reply_for_questions(
+                    content,
+                    target.payload.get("questions") if isinstance(target.payload, dict) else [],
+                )
+            except ValueError:
+                return False
             resolved = await self._notification_service.resolve(
                 target.notification_id,
                 "continue",
-                {"response": content},
+                data,
                 user_email=user_email,
             )
         return resolved
@@ -796,7 +833,7 @@ class ChannelTurnObserver:
         turn_scheduler: Any,
         reply_to_id: str | None = None,
         channel_manager_ref: Any,
-        assistant_delivery_mode: str = "final",
+        assistant_delivery_mode: str = _ASSISTANT_DELIVERY_MODE_CONCATENATED,
     ) -> None:
         self._channel_type = channel_type
         self._account_id = account_id
@@ -809,7 +846,7 @@ class ChannelTurnObserver:
         self._accumulated_text = ""
         self._typing_sent = False
         self._turn_active = False
-        self._assistant_delivery_mode = assistant_delivery_mode
+        self._assistant_delivery_mode = _normalize_assistant_delivery_mode(assistant_delivery_mode)
 
     async def on_token(
         self,
@@ -850,7 +887,10 @@ class ChannelTurnObserver:
 
         # In immediate mode, deliver any accumulated assistant text before
         # the tool starts executing so the user sees the message right away.
-        if self._assistant_delivery_mode == "immediate" and self._accumulated_text:
+        if (
+            self._assistant_delivery_mode == _ASSISTANT_DELIVERY_MODE_IMMEDIATE
+            and self._accumulated_text
+        ):
             adapter = self._get_adapter()
             if adapter is not None:
                 await self._send_text(self._accumulated_text, adapter=adapter)
@@ -916,7 +956,7 @@ class ChannelTurnObserver:
         Called by the delivery service before sending a step_question
         notification so the assistant's preceding message arrives first.
         """
-        if self._assistant_delivery_mode != "immediate":
+        if self._assistant_delivery_mode != _ASSISTANT_DELIVERY_MODE_IMMEDIATE:
             return
         if not self._accumulated_text:
             return
@@ -961,7 +1001,8 @@ class ChannelTurnObserver:
         if adapter is None:
             return
 
-        content = _append_attachment_fallback(self._accumulated_text, attachment_fallback_lines)
+        content = self._completion_content(result)
+        content = _append_attachment_fallback(content, attachment_fallback_lines)
         chat_mode = getattr(result, "chat_mode", None)
         chat_mode_source = getattr(result, "chat_mode_source", None)
         explicit_chat_mode = chat_mode_source in {"one_shot", "conversation_override"}
@@ -1085,6 +1126,13 @@ class ChannelTurnObserver:
             )
             return False
         return isinstance(fallback_id, str) and bool(fallback_id.strip())
+
+    def _completion_content(self, result: Any) -> str:
+        if self._assistant_delivery_mode == _ASSISTANT_DELIVERY_MODE_FINAL_ONLY:
+            final_content = getattr(result, "final_content", None) if result is not None else None
+            if isinstance(final_content, str):
+                return final_content
+        return self._accumulated_text
 
     async def on_turn_error(self, conversation_id: str, error: Any) -> None:
         """Send error message to the channel."""

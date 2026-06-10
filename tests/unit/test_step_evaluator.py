@@ -104,7 +104,9 @@ def _step_def(prompt: str = "Implement the feature") -> StepDefinition:
 def _step_output(summary: str = "Done", claims: list[str] | None = None) -> StepOutput:
     return StepOutput(
         summary=summary,
+        content="Implemented the feature.",
         outputs={"result": "ok"},
+        metadata={"status": "complete"},
         claims=claims or ["Implemented the feature"],
     )
 
@@ -162,7 +164,9 @@ async def test_evaluator_timeout_forces_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_from_session_factory_uses_seeded_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_from_session_factory_uses_seeded_timeout_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def _fake_get_setting_value(session: object, key: str, default: object = None) -> object:
         del session
         assert key == "evaluator.timeout_ms"
@@ -196,9 +200,16 @@ async def test_evaluator_error_forces_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_evaluator_uses_step_inputs() -> None:
-    evaluator = StepEvaluator(llm=_LLM(), evaluator_timeout_seconds=5.0)
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
 
-    plan_output = StepOutput(summary="Plan: build REST API", outputs={}, claims=[])
+    plan_output = StepOutput(
+        summary="Plan: build REST API",
+        content="Plan deliverable requires backend and frontend work.",
+        outputs={"scope": ["backend", "frontend"]},
+        metadata={"scope_contract": [{"id": "frontend", "required": True}]},
+        claims=["Planned frontend scope"],
+    )
     result = await evaluator.evaluate(
         step_definition=_step_def(),
         step_output=_step_output(),
@@ -206,6 +217,13 @@ async def test_evaluator_uses_step_inputs() -> None:
     )
 
     assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert "Metadata:" in prompt
+    assert "scope_contract" in prompt
+    assert "Structured outputs" not in prompt
+    assert "Outputs:" in prompt
+    assert "Plan deliverable requires backend and frontend work" in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -50,7 +50,7 @@ surfaces mismatches in Week 0, not Week 5.
   - Explicit step completion via `step_complete` controller tool
   - Semantic step evaluation (independent LLM check)
   - Gate/pause steps with structured options
-  - In-step questions via `step_request_input` for workflows that allow caller interaction
+  - In-step questions via `step_request_questions` for workflows that allow caller interaction
   - Review loops with bounded iteration
   - Step-local todo/task tools as cognitive aids
   - Workflow selection: automatic (classifier), user explicit, agent default

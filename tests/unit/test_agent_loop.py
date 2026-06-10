@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from cognis.core.agent_loop import (
     _DELEGATION_RESULT_MAX_CHARS,
+    _MAX_TOOL_CALL_ARGUMENT_CHARS,
     CHAT_POLICY,
     DELEGATION_POLICY,
     SECONDARY_AGENT_DELEGATION_POLICY,
@@ -31,11 +35,14 @@ from cognis.core.agent_loop import (
     _build_delegation_message_result,
     _controller_builtin_enabled,
     _filter_model_inventory_tools,
+    _has_compactable_pre_turn_history,
     _iterate_llm_stream_with_idle_timeout,
     _PreparedRegularToolCall,
+    _reattach_responses_output_items,
     _result_sections_from_content,
     _should_auto_continue_after_mid_stream_failure,
     _should_continue_after_exhausted_mid_stream_failure,
+    _should_run_post_turn_auto_compaction,
     _should_run_pre_turn_auto_compaction,
     _validate_step_completion_notification,
 )
@@ -45,9 +52,17 @@ from cognis.core.project_context import ProjectContextEntry
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
+from cognis.core.turn_scheduler import TurnResult
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.deliverable import Deliverable
-from cognis.models.session import EventAppendResult, ReasoningReportResult, SessionEvent
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    EventAppendResult,
+    EventReadResult,
+    ReasoningReportResult,
+    SessionEvent,
+)
 from cognis.models.tool import (
     Permission,
     ToolCall,
@@ -69,6 +84,17 @@ from cognis.providers.llm.errors import ToolArgumentParseFailure
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.llm.retry import LLMContextOverflowError
 from cognis.runtime_context import scoped_runtime_context
+from cognis.store.models import Base
+from cognis.store.queries import (
+    create_agent,
+    create_conversation,
+    create_managed_conversation_link,
+    create_session,
+    create_user,
+    get_managed_conversation_link,
+    get_managed_conversation_link_for_target,
+    update_managed_conversation_link,
+)
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -247,6 +273,45 @@ def test_stream_accumulator_collects_tool_calls() -> None:
     assert tool_calls[0].name == "step_complete"
     assert tool_calls[0].arguments == {"summary": "done"}
     assert tool_calls[0].call_id == "call_123"
+
+
+def test_stream_accumulator_preserves_text_when_tool_calls_follow() -> None:
+    acc = StreamAccumulator()
+    acc.feed({"choices": [{"delta": {"content": "I'll inspect that now."}}]})
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_read",
+                                "function": {"name": "read", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    assert acc.get_content() == "I'll inspect that now."
+    assert acc.get_internal_content() == ""
+    assert acc.has_tool_calls()
+
+
+def test_stream_accumulator_preserves_commentary_as_visible_content() -> None:
+    acc = StreamAccumulator()
+    delta = acc.feed(
+        {
+            "choices": [{"delta": {"content": "I'll inspect that now."}}],
+            "response_message_phase": "commentary",
+        }
+    )
+
+    assert delta == "I'll inspect that now."
+    assert acc.get_content() == "I'll inspect that now."
 
 
 def test_stream_accumulator_collects_tool_progress_events() -> None:
@@ -1311,6 +1376,79 @@ async def test_run_step_uses_step_local_pending_events_on_concurrent_failures(
         "pending-sess-b",
         "Step failed: RuntimeError: boom-sess-b",
     ]
+
+
+@pytest.mark.asyncio
+async def test_record_outgoing_audit_messages_copies_replay_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    captured: list[SessionEvent] = []
+
+    async def _fake_record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object = None,
+    ) -> bool:
+        del ctx, reason, on_token
+        captured.extend(events)
+        events.clear()
+        return True
+
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _fake_record_events_strict)
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="step", type="run"),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        turn_id="turn-1",
+    )
+
+    await agent_loop._record_outgoing_audit_messages(
+        ctx,
+        [
+            {
+                "role": "developer",
+                "source": "memory_search",
+                "content": '<memory_context trust="untrusted">remembered</memory_context>',
+                "content_type": "text",
+                "position": 3,
+                "hash": "hash",
+                "metadata": {
+                    "context_injection": True,
+                    "replayable": True,
+                    "replay_scope": "same_session",
+                    "visibility": "agent_context",
+                    "model_role": "system",
+                    "trust": "untrusted",
+                },
+            }
+        ],
+    )
+
+    assert len(captured) == 1
+    assert captured[0].type == "developer_message"
+    assert captured[0].data["source"] == "memory_search"
+    assert captured[0].data["turn_id"] == "turn-1"
+    assert captured[0].data["context_injection"] is True
+    assert captured[0].data["replayable"] is True
+    assert captured[0].data["visibility"] == "agent_context"
+    assert captured[0].data["model_role"] == "system"
 
 
 @pytest.mark.asyncio
@@ -2511,6 +2649,15 @@ class _SingleTextLLM:
         yield {"choices": [{"delta": {"content": "Done."}}]}
 
 
+class _RecordingSingleTextLLM(_SingleTextLLM):
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        yield {"choices": [{"delta": {"content": "Done."}}]}
+
+
 class _StepCompleteValidationLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -2928,6 +3075,116 @@ class _FinalAssistantContentLLM:
         }
 
 
+class _ResponsesTextThenToolLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "responses_output_item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "encrypted",
+                    "summary": [],
+                },
+                "provider_event": "responses",
+                "provider_event_type": "response.output_item.done",
+            }
+            yield {
+                "responses_output_item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll inspect that now."}],
+                },
+                "provider_event": "responses",
+                "provider_event_type": "response.output_item.done",
+            }
+            yield {
+                "choices": [{"delta": {"content": "I'll inspect that now."}}],
+                "provider_event": "responses",
+                "provider_event_type": "response.output_text.delta",
+                "response_message_phase": "commentary",
+            }
+            yield {
+                "responses_output_item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_todo_done",
+                    "name": "step_todo_write",
+                    "arguments": json.dumps(
+                        {
+                            "todos": [
+                                {
+                                    "content": "Inspect implementation",
+                                    "status": "completed",
+                                }
+                            ]
+                        }
+                    ),
+                },
+                "provider_event": "responses",
+                "provider_event_type": "response.output_item.done",
+            }
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_todo_done",
+                                    "function": {
+                                        "name": "step_todo_write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "todos": [
+                                                    {
+                                                        "content": "Inspect implementation",
+                                                        "status": "completed",
+                                                    }
+                                                ]
+                                            }
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "provider_event": "responses",
+                "provider_event_type": "response.function_call_arguments.done",
+            }
+            yield {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "provider_event": "responses",
+                "provider_event_type": "response.completed",
+            }
+            return
+
+        yield {
+            "choices": [{"delta": {"content": "Final user-visible answer."}}],
+            "provider_event": "responses",
+            "provider_event_type": "response.output_text.delta",
+        }
+        yield {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "provider_event": "responses",
+            "provider_event_type": "response.completed",
+        }
+
+
 class _ToolCallCeilingLLM:
     def __init__(self) -> None:
         self.calls = 0
@@ -3132,7 +3389,7 @@ class _NoopEventBus:
 
 
 class _NoopGuardrails:
-    async def record_events(self, **_: object) -> EventAppendResult:
+    async def record_events(self, *_: object, **__: object) -> EventAppendResult:
         return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
 
     async def read_events(self, **_: object) -> SimpleNamespace:
@@ -3148,6 +3405,23 @@ class _NoopGuardrails:
 
     async def health(self) -> SimpleNamespace:
         return SimpleNamespace(status="healthy")
+
+
+class _RecordedEventsGuardrails(_NoopGuardrails):
+    def __init__(self, events_by_session: dict[str, list[dict[str, object]]]) -> None:
+        self.events_by_session = events_by_session
+        self.read_calls: list[dict[str, object]] = []
+
+    async def read_events(self, **kwargs: object) -> EventReadResult:
+        self.read_calls.append(dict(kwargs))
+        session_id = str(kwargs.get("session_id") or "")
+        events = list(self.events_by_session.get(session_id, []))
+        return EventReadResult(
+            events=events,
+            last_seq=len(events),
+            has_more=False,
+            missing_stream_fallback_used=False,
+        )
 
 
 class _NoopSessionManager:
@@ -3175,6 +3449,877 @@ class _NoopSessionManager:
             agent_id=getattr(current_session, "agent_id", "agent-1"),
             mnemory_session_id=None,
         )
+
+
+class _IdleWaitScheduler:
+    def __init__(self) -> None:
+        self.waits: list[dict[str, object]] = []
+        self.active_turns: dict[str, str | None] = {}
+
+    def active_turn_id(self, conversation_id: str) -> str | None:
+        return self.active_turns.get(conversation_id)
+
+    async def wait_for_turn(
+        self,
+        conversation_id: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        self.waits.append({"conversation_id": conversation_id, "timeout_seconds": timeout_seconds})
+        return None
+
+
+def _background_work_agent_loop(
+    session_factory,
+    scheduler: _IdleWaitScheduler | None = None,
+    *,
+    guardrails: object | None = None,
+) -> AgentLoop:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(),
+            guardrails=guardrails if guardrails is not None else _NoopGuardrails(),
+        ),
+        session_manager=SimpleNamespace(session_factory=session_factory),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    if scheduler is not None:
+        agent_loop.set_turn_scheduler(scheduler)
+    return agent_loop
+
+
+def _background_work_ctx(
+    conversation_id: str,
+    *,
+    context_type: str = "web",
+    parent_session_id: str | None = None,
+) -> StepContext:
+    return StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="controller-session",
+            intaris_session_id="controller-session",
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            parent_session_id=parent_session_id,
+        ),
+        conversation=SimpleNamespace(
+            conversation_id=conversation_id,
+            project_id=None,
+            context=ConversationContext(type=context_type),
+        ),
+        agent=AgentDefinition(
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+        ),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+
+async def _create_background_work_base(session_factory):
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+            status="active",
+        )
+        await create_agent(
+            db_session,
+            agent_id="target-agent",
+            owner_email="user@example.com",
+            name="Target",
+            status="active",
+        )
+        controller = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            context_type="web",
+        )
+        await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "controller-agent",
+            session_id="controller-session",
+        )
+        await db_session.commit()
+        return controller
+
+
+async def _create_managed_link_for_background_work(
+    db_session,
+    controller_conversation_id: str,
+    *,
+    title: str,
+    target_conversation_id: str,
+):
+    target = await create_conversation(
+        db_session,
+        user_email="user@example.com",
+        agent_id="target-agent",
+        context_type="agent_work",
+        conversation_id=target_conversation_id,
+    )
+    return await create_managed_conversation_link(
+        db_session,
+        user_email="user@example.com",
+        controller_agent_id="controller-agent",
+        controller_conversation_id=controller_conversation_id,
+        controller_session_id="controller-session",
+        target_agent_id="target-agent",
+        target_conversation_id=target.conversation_id,
+        target_session_id=f"{target.conversation_id}-session",
+        title=title,
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_work_reminder_prioritizes_warnings_and_caps_items(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'background-work.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    now = datetime.now(UTC)
+    async with session_factory() as db_session:
+        warning_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Impossible running work",
+            target_conversation_id="conv-warning",
+        )
+        warning_link.turn_state = "running"
+        warning_link.active_turn_id = "turn-warning"
+        warning_link.completed_at = now
+        warning_link.updated_at = now - timedelta(minutes=10)
+
+        failed_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Failed work",
+            target_conversation_id="conv-failed",
+        )
+        failed_link.turn_state = "failed"
+        failed_link.last_error = "boom"
+        failed_link.updated_at = now - timedelta(minutes=1)
+
+        running_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Running work",
+            target_conversation_id="conv-running",
+        )
+        running_link.turn_state = "running"
+        running_link.active_turn_id = "turn-running"
+        running_link.updated_at = now
+
+        idle_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Idle open work",
+            target_conversation_id="conv-idle",
+        )
+        idle_link.turn_state = "idle"
+        idle_link.updated_at = now
+
+        completed_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Clean completed work",
+            target_conversation_id="conv-completed",
+        )
+        completed_link.conversation_state = "completed"
+        completed_link.turn_state = "completed"
+        completed_link.completed_at = now
+        completed_link.updated_at = now
+        await db_session.commit()
+
+    scheduler = _IdleWaitScheduler()
+    scheduler.active_turns["conv-running"] = "turn-running"
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx(controller.conversation_id)
+    )
+
+    assert reminder is not None
+    assert reminder["_background_work_status_reminder"] is True
+    content = reminder["content"]
+    assert content.index("Impossible running work") < content.index("Failed work")
+    assert content.index("Failed work") < content.index("Running work")
+    assert "warnings: running+completed_at" in content
+    assert (
+        "recommended_action: keep in mind; continue other work; use "
+        "agent_conversation_get/agent_conversation_wait only if this turn depends on the result"
+        in content
+    )
+    assert "1 additional background work items omitted, ids: conv-idle" in content
+    assert "Clean completed work" not in content
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_background_work_reminder_includes_delegated_sessions_and_suppresses_child_context(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'background-delegates.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    now = datetime.now(UTC)
+    async with session_factory() as db_session:
+        running_child = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            delegation_mode="delegate_async",
+            delegation_task="Trace reminder path",
+            status="active",
+            session_id="sess-running-child",
+        )
+        running_child.updated_at = now
+        stale_child = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            delegation_mode="delegate_async",
+            delegation_task="Stale reminder path",
+            status="active",
+            session_id="sess-stale-child",
+        )
+        stale_child.updated_at = now - timedelta(minutes=10)
+        failed_child = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            delegation_mode="delegate",
+            delegation_task="Review result",
+            status="failed",
+            session_id="sess-failed-child",
+        )
+        failed_child.updated_at = now - timedelta(minutes=1)
+        completed_child = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            delegation_mode="delegate",
+            delegation_task="Completed child",
+            status="completed",
+            session_id="sess-completed-child",
+        )
+        completed_child.completed_at = now
+        completed_child.updated_at = now
+        await db_session.commit()
+
+    agent_loop = _background_work_agent_loop(session_factory)
+    running_task = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        async with agent_loop._children_lock:
+            agent_loop._active_children.setdefault("controller-session", {})[
+                "sess-running-child"
+            ] = running_task
+        reminder = await agent_loop._build_background_work_status_reminder(
+            _background_work_ctx(controller.conversation_id)
+        )
+    finally:
+        running_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await running_task
+
+    assert reminder is not None
+    content = reminder["content"]
+    assert "sess-running-child" in content
+    assert (
+        "recommended_action: keep in mind; continue other work; use get_subsession only "
+        "if this turn depends on the result" in content
+    )
+    assert "sess-stale-child" in content
+    assert "warnings: active-no-running-task, stale-active" in content
+    assert "sess-failed-child" in content
+    assert "failed-no-summary" in content
+    assert "use get_subsession; re-delegate if still needed" in content
+    assert "Completed child" not in content
+
+    child_context_reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx(controller.conversation_id, context_type="agent_work")
+    )
+    assert child_context_reminder is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_background_work_reminder_ignores_non_database_session_factory() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx("conv-no-db")
+    )
+
+    assert reminder is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("turn_state", "active_turn_id"),
+    [
+        ("running", "turn-1"),
+        ("queued", None),
+        ("idle", "turn-1"),
+    ],
+)
+async def test_agent_conversation_wait_reports_running_when_link_still_active(
+    tmp_path: Path,
+    turn_state: str,
+    active_turn_id: str | None,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_factory() as db_session:
+        await create_user(db_session, "user@example.com", "User", "hash")
+        await create_agent(
+            db_session,
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+            status="active",
+        )
+        await create_agent(
+            db_session,
+            agent_id="target-agent",
+            owner_email="user@example.com",
+            name="Target",
+            status="active",
+        )
+        controller = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            context_type="web",
+        )
+        target = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+        )
+        link = await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=target.conversation_id,
+            target_session_id="target-session",
+            title="Target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state=turn_state,
+            active_turn_id=active_turn_id,
+        )
+        await db_session.commit()
+
+    scheduler = _IdleWaitScheduler()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=SimpleNamespace(session_factory=session_factory),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    agent_loop.set_turn_scheduler(scheduler)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="controller-session",
+            intaris_session_id="controller-session",
+            user_email="user@example.com",
+            agent_id="controller-agent",
+            parent_session_id=None,
+        ),
+        conversation=SimpleNamespace(
+            conversation_id=controller.conversation_id,
+            project_id=None,
+        ),
+        agent=AgentDefinition(
+            agent_id="controller-agent",
+            owner_email="user@example.com",
+            name="Controller",
+        ),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_wait",
+            arguments={
+                "conversation_id": target.conversation_id,
+                "timeout_seconds": 1,
+            },
+        ),
+        ctx=ctx,
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == ("queued" if turn_state == "queued" else "running")
+    assert payload["waited"] is False
+    assert payload["conversation"]["turn_state"] == turn_state
+    assert payload["conversation"]["active_turn_id"] == active_turn_id
+    assert scheduler.waits == [{"conversation_id": target.conversation_id, "timeout_seconds": 1}]
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.turn_state == turn_state
+        assert refreshed.active_turn_id == active_turn_id
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_create_sets_completion_notification_before_submit(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-create-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    class _CreateSessionManager:
+        def __init__(self, factory) -> None:
+            self.session_factory = factory
+
+        async def create_conversation_with_root_session(self, **kwargs: object):
+            async with self.session_factory() as db_session:
+                conversation = await create_conversation(
+                    db_session,
+                    user_email=str(kwargs["user_email"]),
+                    agent_id=str(kwargs["agent_id"]),
+                    context_type=kwargs["context"].type,
+                    title=str(kwargs["title"]),
+                    title_source=str(kwargs["title_source"]),
+                    context_ref=kwargs["context"].ref,
+                    context_data=dict(kwargs["context"].platform_data),
+                    memory_labels=dict(kwargs["context"].memory_labels),
+                    conversation_id="conv-created",
+                    project_id=kwargs["project_id"],
+                )
+                session = await create_session(
+                    db_session,
+                    conversation.conversation_id,
+                    str(kwargs["user_email"]),
+                    str(kwargs["agent_id"]),
+                    session_id="sess-created",
+                )
+                await db_session.commit()
+                return (
+                    SimpleNamespace(
+                        conversation_id=conversation.conversation_id,
+                        project_id=conversation.project_id,
+                    ),
+                    SimpleNamespace(
+                        session_id=session.session_id,
+                        intaris_session_id=session.session_id,
+                        user_email=session.user_email,
+                        agent_id=session.agent_id,
+                    ),
+                )
+
+    class _CreateCompletesDuringSubmitScheduler:
+        def __init__(self) -> None:
+            self.notify_on_completion_at_submit: bool | None = None
+            self.turn_state_at_submit: str | None = None
+
+        def active_turn_id(self, conversation_id: str) -> str | None:
+            assert conversation_id == "conv-created"
+            return None
+
+        async def submit_turn(
+            self, conversation_id: str, *_args: object, **_kwargs: object
+        ) -> None:
+            assert conversation_id == "conv-created"
+            async with session_factory() as db_session:
+                link = await get_managed_conversation_link_for_target(
+                    db_session,
+                    conversation_id,
+                )
+                assert link is not None
+                self.notify_on_completion_at_submit = link.notify_on_completion
+                self.turn_state_at_submit = link.turn_state
+                await update_managed_conversation_link(
+                    db_session,
+                    link.link_id,
+                    conversation_state="completed",
+                    turn_state="completed",
+                    clear_active_turn_id=True,
+                    notify_on_completion=False,
+                    last_result_summary="done",
+                    completed=True,
+                )
+                await db_session.commit()
+            return None
+
+    scheduler = _CreateCompletesDuringSubmitScheduler()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_CreateSessionManager(session_factory),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    agent_loop.set_turn_scheduler(scheduler)
+
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_create",
+            arguments={
+                "agent_id": "target-agent",
+                "title": "Target work",
+                "initial_message": "Do the work.",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "accepted"
+    assert scheduler.notify_on_completion_at_submit is True
+    assert scheduler.turn_state_at_submit == "running"
+    async with session_factory() as db_session:
+        link = await get_managed_conversation_link_for_target(db_session, "conv-created")
+        assert link is not None
+        assert link.turn_state == "completed"
+        assert link.conversation_state == "completed"
+        assert link.notify_on_completion is False
+        assert link.last_result_summary == "done"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_send_wait_for_queued_turn_uses_observer_result(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-queued-wait.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await db_session.commit()
+
+    class _QueuedWaitScheduler:
+        def __init__(self) -> None:
+            self.wait_called = False
+            self.submitted_observer_count = 0
+
+        def has_active_turn(self, conversation_id: str) -> bool:
+            assert conversation_id == "conv-target"
+            return True
+
+        def active_turn_id(self, conversation_id: str) -> str | None:
+            assert conversation_id == "conv-target"
+            return "turn-queued"
+
+        async def submit_turn(self, conversation_id: str, *_args: object, **kwargs: object) -> None:
+            assert conversation_id == "conv-target"
+            observers = tuple(kwargs["turn_observers"])
+            self.submitted_observer_count = len(observers)
+            result = TurnResult(
+                conversation_id="conv-target",
+                session_id="conv-target-session",
+                message_id="msg-queued",
+                turn_id="turn-queued",
+                final_content="queued done",
+            )
+            await observers[0].on_turn_complete(result)
+            return None
+
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> None:
+            self.wait_called = True
+            raise AssertionError("queued wait=true should use the queued observer result")
+
+    scheduler = _QueuedWaitScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_send",
+            arguments={
+                "conversation_id": "conv-target",
+                "message": "continue",
+                "wait": True,
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "completed"
+    assert payload["waited"] is True
+    assert payload["turn"]["turn_id"] == "turn-queued"
+    assert payload["turn"]["final_content"] == "queued done"
+    assert scheduler.submitted_observer_count == 1
+    assert scheduler.wait_called is False
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.turn_state == "running"
+        assert refreshed.active_turn_id == "turn-queued"
+        assert refreshed.notify_on_completion is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_send_observer_supports_mid_turn_absorb(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-queued-absorb.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await db_session.commit()
+
+    class _QueuedAbsorbScheduler:
+        def __init__(self) -> None:
+            self.submitted_observers: tuple[object, ...] = ()
+
+        def has_active_turn(self, conversation_id: str) -> bool:
+            assert conversation_id == "conv-target"
+            return True
+
+        def active_turn_id(self, conversation_id: str) -> str | None:
+            assert conversation_id == "conv-target"
+            return "turn-active"
+
+        async def submit_turn(self, conversation_id: str, *_args: object, **kwargs: object) -> None:
+            assert conversation_id == "conv-target"
+            self.submitted_observers = tuple(kwargs["turn_observers"])
+            return None
+
+    scheduler = _QueuedAbsorbScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_send",
+            arguments={
+                "conversation_id": "conv-target",
+                "message": "continue",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "accepted"
+    assert len(scheduler.submitted_observers) == 1
+    assert getattr(scheduler.submitted_observers[0], "supports_mid_turn_absorb", False) is True
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_state", ["interrupted", "failed"])
+async def test_agent_conversation_retry_replays_recorded_target_user_message(
+    tmp_path: Path,
+    turn_state: str,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'managed-retry-{turn_state}.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state=turn_state,
+            clear_active_turn_id=True,
+            last_error="The current turn was cancelled." if turn_state == "interrupted" else "boom",
+        )
+        await db_session.commit()
+
+    guardrails = _RecordedEventsGuardrails(
+        {
+            "conv-target-session": [
+                {
+                    "seq": 1,
+                    "type": "developer_message",
+                    "data": {"content": "Agent work context"},
+                },
+                {
+                    "seq": 2,
+                    "type": "user_message",
+                    "data": {"content": "initial managed instruction"},
+                },
+                {
+                    "seq": 3,
+                    "type": "assistant_message",
+                    "data": {"content": "partial"},
+                },
+                {
+                    "seq": 4,
+                    "type": "user_message",
+                    "data": {"content": "latest continuation from send"},
+                },
+            ]
+        }
+    )
+
+    class _RetryScheduler:
+        def __init__(self) -> None:
+            self.submissions: list[dict[str, object]] = []
+
+        def has_active_turn(self, conversation_id: str) -> bool:
+            assert conversation_id == "conv-target"
+            return False
+
+        def active_turn_id(self, conversation_id: str) -> str | None:
+            assert conversation_id == "conv-target"
+            return "turn-retry"
+
+        async def submit_turn(
+            self,
+            conversation_id: str,
+            message: str,
+            **kwargs: object,
+        ) -> None:
+            self.submissions.append(
+                {"conversation_id": conversation_id, "message": message, **kwargs}
+            )
+            return None
+
+    scheduler = _RetryScheduler()
+    agent_loop = _background_work_agent_loop(
+        session_factory,
+        scheduler,
+        guardrails=guardrails,
+    )
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_retry",
+            arguments={
+                "conversation_id": "conv-target",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "accepted"
+    assert scheduler.submissions == [
+        {
+            "conversation_id": "conv-target",
+            "message": "latest continuation from send",
+            "user_email": "user@example.com",
+        }
+    ]
+    assert guardrails.read_calls == [
+        {
+            "session_id": "conv-target-session",
+            "after_seq": 0,
+            "limit": 500,
+            "types": ["user_message"],
+            "allow_missing_stream": True,
+        }
+    ]
+    async with session_factory() as db_session:
+        refreshed = await get_managed_conversation_link(db_session, link.link_id)
+        assert refreshed is not None
+        assert refreshed.turn_state == "running"
+        assert refreshed.active_turn_id == "turn-retry"
+        assert refreshed.last_error is None
+
+    await engine.dispose()
 
 
 class _NoopSessionCache:
@@ -3228,6 +4373,234 @@ class _NoopSessionCache:
 
     async def update_intention(self, *_: object, **__: object) -> bool:
         return False
+
+
+@pytest.mark.asyncio
+async def test_handle_delegate_rejects_async_from_managed_agent_conversation() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="managed", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="worker",
+        ),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="worker",
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work"},
+            ),
+        ),
+        agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    result = await agent_loop._handle_delegate(
+        ToolCall(
+            call_id="call-1",
+            name="delegate",
+            arguments={"task": "Investigate.", "agent_id": "system:explore", "wait": False},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert payload["code"] == "delegate_async_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_handle_delegate_defaults_to_sync_from_managed_agent_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_handle_delegate_tool_call(*args: object, **kwargs: object):
+        captured["wait"] = kwargs.get("wait")
+        return ToolResult(output=json.dumps({"status": "started"})), SimpleNamespace(
+            session_id="child-1",
+            intaris_session_id="child-1",
+            agent_id="system:explore",
+        )
+
+    async def _fake_run_child_session(**kwargs: object) -> StepOutput:
+        captured.update(kwargs)
+        return StepOutput(summary="done", content="done", outputs={})
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    monkeypatch.setattr(
+        "cognis.core.agent_loop.handle_delegate_tool_call",
+        _fake_handle_delegate_tool_call,
+    )
+    monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
+
+    async def _noop_record(*args: object, **kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _noop_record)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="managed", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="worker",
+        ),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="worker",
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work"},
+            ),
+        ),
+        agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    result = await agent_loop._handle_delegate(
+        ToolCall(
+            call_id="call-1",
+            name="delegate",
+            arguments={"task": "Investigate.", "agent_id": "system:explore"},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert captured["wait"] is True
+
+
+def test_managed_agent_conversation_hides_async_delegate_and_conversation_tools() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="managed", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="worker",
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work"},
+            ),
+        ),
+        agent=AgentDefinition(agent_id="worker", owner_email="user@example.com", name="Worker"),
+        policy=CHAT_POLICY,
+    )
+
+    schemas = loop._build_controller_tool_schemas(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in schemas}
+
+    delegate_schema = by_name["delegate"]["function"]["parameters"]
+    assert "wait" not in delegate_schema["properties"]
+    assert "agent_conversation_create" not in by_name
+    assert "agent_conversation_send" not in by_name
+    assert "create_task" in by_name
+
+
+def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conversations() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    schemas = loop._build_controller_tool_schemas(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in schemas}
+
+    delegate_schema = by_name["delegate"]["function"]["parameters"]
+    assert "wait" not in delegate_schema["properties"]
+    assert "agent_conversation_create" in by_name
+    assert "create_task" in by_name
+
+
+@pytest.mark.asyncio
+async def test_handle_delegate_rejects_explicit_async_from_direct_topic_conversation() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        orchestration_mode=OrchestrationMode.FULL,
+    )
+
+    result = await agent_loop._handle_delegate(
+        ToolCall(
+            call_id="call-1",
+            name="delegate",
+            arguments={"task": "Investigate.", "agent_id": "system:explore", "wait": False},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert payload["code"] == "delegate_async_not_allowed"
 
 
 class _ContextOverflowThenTextLLM:
@@ -3318,6 +4691,167 @@ def test_retry_auto_compaction_runs_when_rotated_session_still_hard_pressure() -
     )
 
     assert _should_run_pre_turn_auto_compaction(ctx, context_result)
+
+
+def test_post_turn_auto_compaction_skips_when_projection_made_prompt_safe() -> None:
+    ctx = SimpleNamespace(
+        policy=CHAT_POLICY,
+        last_projection_exceeded_selected_budget=False,
+    )
+    context_result = SimpleNamespace(recommend_compaction=True)
+
+    assert not _should_run_post_turn_auto_compaction(ctx, context_result)
+
+
+def test_post_turn_auto_compaction_runs_when_projection_pressure_unresolved() -> None:
+    ctx = SimpleNamespace(
+        policy=CHAT_POLICY,
+        last_projection_exceeded_selected_budget=True,
+    )
+    context_result = SimpleNamespace(recommend_compaction=True)
+
+    assert _should_run_post_turn_auto_compaction(ctx, context_result)
+
+
+def test_post_turn_auto_compaction_preserves_conservative_fallback_without_projection() -> None:
+    ctx = SimpleNamespace(
+        policy=CHAT_POLICY,
+        last_projection_exceeded_selected_budget=None,
+    )
+    context_result = SimpleNamespace(recommend_compaction=True)
+
+    assert _should_run_post_turn_auto_compaction(ctx, context_result)
+
+
+def test_pre_turn_compaction_history_gate_skips_same_turn_pressure() -> None:
+    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    events = [
+        SimpleNamespace(type="user_message"),
+        SimpleNamespace(type="assistant_message"),
+        SimpleNamespace(type="user_message"),
+        SimpleNamespace(type="assistant_message"),
+    ]
+    cache = SimpleNamespace(
+        get_entry=lambda _session_id: SimpleNamespace(),
+        get_events_since_compaction=lambda _session_id, _types=None: list(events),
+    )
+
+    assert not _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+
+
+def test_pre_turn_compaction_history_gate_allows_old_history_compaction() -> None:
+    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    events = [
+        SimpleNamespace(type="user_message"),
+        SimpleNamespace(type="assistant_message"),
+        SimpleNamespace(type="user_message"),
+        SimpleNamespace(type="assistant_message"),
+        SimpleNamespace(type="user_message"),
+    ]
+    cache = SimpleNamespace(
+        get_entry=lambda _session_id: SimpleNamespace(),
+        get_events_since_compaction=lambda _session_id, _types=None: list(events),
+    )
+
+    assert _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+
+
+def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> None:
+    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    cache = SimpleNamespace(
+        get_entry=lambda _session_id: None,
+        get_events_since_compaction=lambda _session_id, _types=None: [],
+    )
+
+    assert _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_hard_pressure_without_compactable_history_reaches_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _HardPressureAssembler:
+        async def assemble(self, **_: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                messages=[{"role": "user", "content": "Continue."}],
+                resolved_model="test-model",
+                cache_breakpoint_index=None,
+                audit_messages=[],
+                system_notices=[],
+                prompt_tokens=260_190,
+                static_tokens=0,
+                dynamic_tokens=260_190,
+                max_context_tokens=300_000,
+                max_input_tokens=272_000,
+                available_prompt_tokens=272_000,
+                compaction_threshold=0.85,
+                compaction_threshold_prompt_tokens=231_200,
+                loop_pressure_threshold_prompt_tokens=258_400,
+                recommend_compaction=True,
+            )
+
+    class _FewTurnSessionCache(_NoopSessionCache):
+        def get_events_since_compaction(
+            self, _session_id: str, _types: list[str] | None = None
+        ) -> list[SimpleNamespace]:
+            del _types
+            return [
+                SimpleNamespace(type="user_message"),
+                SimpleNamespace(type="assistant_message"),
+                SimpleNamespace(type="user_message"),
+            ]
+
+    fake_llm = _RecordingSingleTextLLM()
+    event_bus = _NoopEventBus()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_FewTurnSessionCache(),
+        context_assembler=_HardPressureAssembler(),
+        compaction_strategy=SimpleNamespace(preserve_turns=2),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=event_bus,
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    auto_compact_saw_model_call: list[bool] = []
+
+    async def _record_auto_compact(*_: object, **__: object) -> None:
+        auto_compact_saw_model_call.append(bool(fake_llm.calls))
+        if not fake_llm.calls:
+            raise AssertionError("pre-turn auto-compaction should be skipped")
+        return None
+
+    monkeypatch.setattr(agent_loop, "_auto_compact", _record_auto_compact)
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Continue.",
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.summary == "Done."
+    assert len(fake_llm.calls) == 1
+    assert auto_compact_saw_model_call == [True]
+    assert any(
+        getattr(event, "type", None) == EventType.SYSTEM_NOTICE
+        and "Continuing with prompt projection" in str(event.data.get("message"))
+        for event in event_bus.events
+    )
 
 
 def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() -> None:
@@ -3684,6 +5218,59 @@ class _ProjectContextLLM:
         return
 
 
+class _OversizedToolArgumentsLLM:
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_huge_patch",
+                                    "function": {
+                                        "name": "apply_patch",
+                                        "arguments": '{"patchText":"'
+                                        + ("x" * (_MAX_TOOL_CALL_ARGUMENT_CHARS + 1)),
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+
+        failed_tool_results = [
+            message
+            for message in messages
+            if message.get("role") == "tool" and message.get("tool_call_id") == "call_huge_patch"
+        ]
+        assert len(failed_tool_results) == 1
+        payload = json.loads(str(failed_tool_results[0].get("content") or "{}"))
+        assert payload["status"] == "rejected"
+        assert payload["reason"] == "tool_call_arguments_too_large"
+        assert payload["tool"] == "apply_patch"
+        assert payload["limit_chars"] == _MAX_TOOL_CALL_ARGUMENT_CHARS
+        assert payload["argument_length"] > _MAX_TOOL_CALL_ARGUMENT_CHARS
+        assert "x" * 10_000 not in json.dumps(messages)
+
+        yield {"choices": [{"delta": {"content": "Recovered after tool argument rejection."}}]}
+
+
 class _ReadOnlyProjectContextLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, object]]] = []
@@ -3955,6 +5542,44 @@ async def _run_reminder_capture(ctx: object) -> list[list[dict[str, object]]]:
     assert output is not None
     assert len(fake_llm.calls) >= 2
     return fake_llm.calls
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_arguments_return_tool_error_and_continue() -> None:
+    fake_llm = _OversizedToolArgumentsLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-oversized-tool-arguments",
+            intaris_session_id="sess-oversized-tool-arguments",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-oversized-tool-arguments"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Apply a huge patch",
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.content == "Recovered after tool argument rejection."
+    assert len(fake_llm.calls) == 2
 
 
 @pytest.mark.asyncio
@@ -4639,6 +6264,126 @@ async def test_direct_todo_cleanup_only_can_complete_silently() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_text_with_tool_call_is_streamed_persisted_and_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_llm = _ResponsesTextThenToolLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    recorded_batches: list[list[SessionEvent]] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        **_: object,
+    ) -> bool:
+        del ctx
+        recorded_batches.append(list(events))
+        return True
+
+    monkeypatch.setattr(agent_loop, "_record_events_strict", _record_events_strict)
+    streamed: list[str] = []
+
+    async def _on_token(token: str) -> None:
+        streamed.append(token)
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-responses-tool-text",
+            intaris_session_id="sess-responses-tool-text",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-responses-tool-text"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[{"content": "Inspect implementation", "status": "pending"}],
+        policy=CHAT_POLICY,
+        user_message="Inspect this.",
+        user_attachments=[],
+        system_initiated=False,
+    )
+
+    output = await agent_loop.run_step(ctx, on_token=_on_token)
+
+    assert output is not None
+    assert output.content == "Final user-visible answer."
+    assert streamed == ["I'll inspect that now.", "\n\n", "Final user-visible answer."]
+    recorded_events = [event for batch in recorded_batches for event in batch]
+    assert any(
+        event.type == "assistant_message" and event.data.get("content") == "I'll inspect that now."
+        for event in recorded_events
+    )
+    assert any(
+        event.type == "assistant_message"
+        and event.data.get("content") == "Final user-visible answer."
+        for event in recorded_events
+    )
+    assert not any(
+        event.type == "lifecycle" and event.data.get("event") == "assistant_internal_trace"
+        for event in recorded_events
+    )
+    replayed_assistant = [
+        message for message in fake_llm.calls[1] if message.get("role") == "assistant"
+    ]
+    assert replayed_assistant
+    assert replayed_assistant[-1]["content"] == "I'll inspect that now."
+
+
+def test_reattach_responses_output_items_restores_projected_assistant_metadata() -> None:
+    source_messages = [
+        {
+            "role": "assistant",
+            "content": "I'll inspect that now.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+            "_responses_output_items": [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "encrypted"},
+                {"type": "message", "id": "msg_1", "phase": "commentary"},
+                {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}"},
+            ],
+        }
+    ]
+    projected_messages = [
+        {
+            "role": "assistant",
+            "content": "I'll inspect that now.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        }
+    ]
+
+    restored = _reattach_responses_output_items(projected_messages, source_messages)
+
+    assert [item["type"] for item in restored[0].get("_responses_output_items", [])] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
     fake_llm = _FakeReminderLLM()
     consumed_reasons: list[str] = []
@@ -4688,6 +6433,7 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
         is_retry=False,
         workflow_state=None,
         step_run_id="sr-1",
+        orchestration_mode=OrchestrationMode.NONE,
         executor_environment=None,
         cancel_event=None,
         bootstrap_wait_for_intention=False,
@@ -4704,6 +6450,104 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
     assert len(fake_llm.calls) >= 2
     assert fake_llm.calls[1][-1]["role"] == "user"
     assert fake_llm.calls[1][-1]["content"] == "Also include the deployment notes."
+
+
+@pytest.mark.asyncio
+async def test_workflow_step_absorbs_boundary_batch_before_step_complete_reprompt() -> None:
+    fake_llm = _FakeReminderLLM()
+    consumed_reasons: list[str] = []
+    recorded_batches: list[list[SessionEvent]] = []
+
+    async def _consume_boundary_batch(reason: str) -> list[dict[str, object]]:
+        consumed_reasons.append(reason)
+        if len(consumed_reasons) > 1:
+            return []
+        return [
+            {
+                "content": (
+                    "Additional workflow task context from user@example.com:\n\n"
+                    "Please include the rollout impact."
+                ),
+                "attachments": [],
+                "system_initiated": False,
+                "follow_up": None,
+                "source": "task_context_comment",
+                "comment_id": "tcmt-1",
+                "author_email": "user@example.com",
+            }
+        ]
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+    ) -> bool:
+        del ctx, reason, on_token
+        recorded_batches.append(list(events))
+        events.clear()
+        return True
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=WorkflowState(),
+        step_run_id="sr-1",
+        orchestration_mode=OrchestrationMode.NONE,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+        consume_boundary_batch=_consume_boundary_batch,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert isinstance(output.error, str)
+    assert "after_assistant_message" in consumed_reasons
+    assert len(fake_llm.calls) >= 2
+    assert fake_llm.calls[1][-1]["role"] == "user"
+    assert fake_llm.calls[1][-1]["content"].endswith("Please include the rollout impact.")
+    recorded_events = [event for batch in recorded_batches for event in batch]
+    context_events = [
+        event
+        for event in recorded_events
+        if event.type == "user_message" and event.data.get("source") == "task_context_comment"
+    ]
+    assert len(context_events) == 1
+    assert context_events[0].data["comment_id"] == "tcmt-1"
+    assert context_events[0].data["author_email"] == "user@example.com"
 
 
 class _ResponsesApiToolCycleLLM:
@@ -5452,6 +7296,12 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
                     StepCompletionMetadataField(
                         name="source_strategy", type="array", required=False
                     ),
+                    StepCompletionMetadataField(
+                        name="scope_contract",
+                        type="array",
+                        required=True,
+                        description="Array of objects. Scope items with acceptance evidence.",
+                    ),
                     StepCompletionMetadataField(name="open_questions", type="array", required=True),
                 ]
             ),
@@ -5470,6 +7320,7 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
     ]
 
     assert metadata_properties["source_strategy"]["items"] == {"type": "string"}
+    assert metadata_properties["scope_contract"]["items"] == {"type": "object"}
     assert metadata_properties["open_questions"]["items"] == {"type": "string"}
 
 
@@ -6290,7 +8141,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
     await cb("c3", "bash", "<out>", False, 5, {"decision": "allow"}, None)
 
 
-def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> None:
+def test_step_request_questions_schema_only_exposed_for_question_enabled_steps() -> None:
     loop = object.__new__(AgentLoop)
     base = dict(
         session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
@@ -6310,11 +8161,11 @@ def test_step_request_input_schema_only_exposed_for_question_enabled_steps() -> 
     )
 
     assert any(
-        tool["function"]["name"] == "step_request_input"
+        tool["function"]["name"] == "step_request_questions"
         for tool in loop._build_controller_tool_schemas(question_ctx)
     )
     assert not any(
-        tool["function"]["name"] == "step_request_input"
+        tool["function"]["name"] == "step_request_questions"
         for tool in loop._build_controller_tool_schemas(autonomous_ctx)
     )
 
@@ -8670,6 +10521,7 @@ def test_format_prior_step_outputs_full_includes_full_content() -> None:
         step_outputs={
             "plan": StepOutput(
                 summary="Plan ready",
+                metadata={"scope_contract": [{"id": "backend"}]},
                 claims=["Covered edge cases"],
                 content="Detailed plan body",
                 deliverable_id="dlv-plan",
@@ -8702,6 +10554,8 @@ def test_format_prior_step_outputs_full_includes_full_content() -> None:
     text = agent_loop._format_prior_step_outputs(ctx)
 
     assert "Summary: Plan ready" in text
+    assert "Metadata:" in text
+    assert "scope_contract" in text
     assert "Claims:" in text
     assert "Deliverable:\nDetailed plan body" in text
     assert "Structured outputs:" in text
@@ -8713,6 +10567,7 @@ def test_format_prior_step_outputs_summary_includes_deliverable_content() -> Non
         step_outputs={
             "implement": StepOutput(
                 summary="Implemented change",
+                metadata={"scope_status": [{"id": "backend", "status": "completed"}]},
                 claims=["Ran tests"],
                 content="Long implementation details",
                 deliverable_id="dlv-implement",
@@ -8745,6 +10600,8 @@ def test_format_prior_step_outputs_summary_includes_deliverable_content() -> Non
     text = agent_loop._format_prior_step_outputs(ctx)
 
     assert "Summary: Implemented change" in text
+    assert "Metadata:" in text
+    assert "scope_status" in text
     assert "Deliverable:\nLong implementation details" in text
     assert "Structured outputs:" in text
     assert "Claims:" not in text
@@ -8756,6 +10613,7 @@ def test_format_prior_step_outputs_last_includes_deliverable_content() -> None:
         step_outputs={
             "plan": StepOutput(
                 summary="Plan ready",
+                metadata={"scope_contract": [{"id": "frontend"}]},
                 claims=["Reviewed dependencies"],
                 content="Verbose plan details",
                 deliverable_id="dlv-plan",
@@ -8788,6 +10646,8 @@ def test_format_prior_step_outputs_last_includes_deliverable_content() -> None:
     text = agent_loop._format_prior_step_outputs(ctx)
 
     assert "Summary: Plan ready" in text
+    assert "Metadata:" in text
+    assert "scope_contract" in text
     assert "Claims:" in text
     assert "Deliverable:\nVerbose plan details" in text
     assert "Structured outputs:" in text
@@ -8946,7 +10806,7 @@ async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> N
 
 
 @pytest.mark.asyncio
-async def test_respond_task_input_tool_returns_error_without_response() -> None:
+async def test_respond_task_input_tool_returns_error_without_answers() -> None:
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
@@ -8976,7 +10836,7 @@ async def test_respond_task_input_tool_returns_error_without_response() -> None:
     )
 
     assert result.is_error is True
-    assert json.loads(result.output)["error"] == "response is required."
+    assert json.loads(result.output)["error"] == "answers must be an array."
 
 
 @pytest.mark.asyncio

@@ -9,10 +9,12 @@ import pytest
 
 from cognis.core.context import (
     ContextAssembler,
+    _build_agent_work_context_info,
     _build_channel_context_info,
     _build_direct_chat_context_info,
     _build_environment_info,
     _load_project_instructions,
+    events_to_messages,
 )
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.executor_pool import ExecutorAvailability, ExecutorPool, ResolvedExecutorTarget
@@ -479,8 +481,15 @@ def test_build_channel_context_info_is_channel_only() -> None:
     assert "- Chat type: group" in content
     assert "- Chat name: Ops" in content
     assert "- Thread-bound: yes" in content
-    assert "delegate(wait=false)" in content
-    assert "create_task" in content
+    assert "Do not optimize for finishing the whole job inside the parent turn" in content
+    assert "parent chat as the command bridge" in content
+    assert "delegate(wait=false) for bounded, non-interactive worker-style lookup" in content
+    assert "agent_conversation_create(wait=false) for visible iterative work loops" in content
+    assert 'chat_mode="plan"' in content
+    assert 'chat_mode="build"' in content
+    assert "wait=false means fire-and-follow-up, not fire-and-duplicate" in content
+    assert "follow-up/resume notification" in content
+    assert "create_task for durable workflow-shaped work with lifecycle" in content
 
 
 def test_build_direct_chat_context_info_is_agent_direct_only() -> None:
@@ -499,8 +508,34 @@ def test_build_direct_chat_context_info_is_agent_direct_only() -> None:
     assert "Direct chat context:" in content
     assert "- Channel: web" in content
     assert "- Direct agent chat: yes" in content
-    assert "delegate(wait=false)" in content
+    assert "delegate(wait=false)" not in content
+    assert "delegate(wait=true)" in content
+    assert "managed conversation" in content
+    assert "fire-and-follow-up" in content
+    assert "do not continue the same scoped work in parallel" in content
     assert "create_task" in content
+
+
+def test_build_agent_work_context_info_lists_only_valid_managed_options() -> None:
+    content = _build_agent_work_context_info(
+        ConversationContext(
+            type="agent_work",
+            platform_data={
+                "kind": "agent_work",
+                "controller_agent_id": "riker",
+                "controller_conversation_id": "conv-controller",
+                "controller_session_id": "sess-controller",
+            },
+        )
+    )
+
+    assert content is not None
+    assert "Agent work context:" in content
+    assert "delegate(wait=false)" not in content
+    assert "agent_conversation_create(wait=false)" not in content
+    assert "Use delegate for specialist child work" in content
+    assert "Avoid asynchronous delegation from managed conversations" in content
+    assert "create_task only for durable workflow-shaped work" in content
 
 
 @pytest.mark.asyncio
@@ -525,7 +560,27 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     signal_messages = [str(message.get("content", "")) for message in signal_result.messages]
 
     assert any("Conversation channel context:" in message for message in signal_messages)
-    assert any("delegate(wait=false)" in message for message in signal_messages)
+    assert any(
+        "Do not optimize for finishing the whole job inside the parent turn" in message
+        for message in signal_messages
+    )
+    assert any("parent chat as the command bridge" in message for message in signal_messages)
+    assert any(
+        "delegate(wait=false) for bounded, non-interactive worker-style lookup" in message
+        for message in signal_messages
+    )
+    assert any(
+        "agent_conversation_create(wait=false) for visible iterative work loops" in message
+        for message in signal_messages
+    )
+    assert any(
+        'chat_mode="plan"' in message and 'chat_mode="build"' in message
+        for message in signal_messages
+    )
+    assert any(
+        "create_task for durable workflow-shaped work with lifecycle" in message
+        for message in signal_messages
+    )
 
     direct_result = await assembler.assemble(
         session=_session(),
@@ -535,9 +590,13 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
         tool_definitions=[],
     )
     direct_messages = [str(message.get("content", "")) for message in direct_result.messages]
+    direct_context_messages = [
+        message for message in direct_messages if "Direct chat context:" in message
+    ]
 
     assert any("Direct chat context:" in message for message in direct_messages)
-    assert any("delegate(wait=false)" in message for message in direct_messages)
+    assert not any("delegate(wait=false)" in message for message in direct_context_messages)
+    assert any("delegate(wait=true)" in message for message in direct_context_messages)
     assert not any("Conversation channel context:" in message for message in direct_messages)
 
     web_result = await assembler.assemble(
@@ -1147,6 +1206,106 @@ async def test_context_assembler_degrades_on_mnemory_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_audits_recalled_memories_as_replayable_developer_context() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="remembered context?",
+        tool_definitions=[],
+    )
+
+    audit = next(item for item in result.audit_messages if item["source"] == "memory_search")
+    assert audit["role"] == "developer"
+    assert "Uses pytest" in audit["content"]
+    assert audit["metadata"] == {
+        "context_injection": True,
+        "replayable": True,
+        "replay_scope": "same_session",
+        "visibility": "agent_context",
+        "model_role": "system",
+        "trust": "untrusted",
+    }
+
+
+def test_events_to_messages_replays_only_marked_developer_context_injections() -> None:
+    events = [
+        {
+            "type": "developer_message",
+            "data": {
+                "role": "developer",
+                "source": "memory_search",
+                "content": '<memory_context trust="untrusted">\nRecalled memories:\n- Uses pytest\n</memory_context>',
+                "context_injection": True,
+                "replayable": True,
+                "visibility": "agent_context",
+                "model_role": "system",
+            },
+        },
+        {
+            "type": "developer_message",
+            "data": {
+                "role": "developer",
+                "source": "routing_reminder",
+                "content": "Do not replay ordinary audit messages.",
+            },
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "system"
+    assert (
+        messages[0]["content"]
+        == '<memory_context trust="untrusted">\nRecalled memories:\n- Uses pytest\n</memory_context>'
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_does_not_prune_recalled_memories_first() -> None:
+    class _TinyLLM(_LLM):
+        def count_messages_tokens(self, messages: list[dict[str, object]], model: str) -> int:
+            del model
+            return sum(len(str(message.get("content", ""))) for message in messages)
+
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_TinyLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=900,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="x" * 1200,
+        tool_definitions=[],
+    )
+
+    assert any(
+        isinstance(message.get("content"), str)
+        and "Recalled memories:" in message["content"]
+        and "Uses pytest" in message["content"]
+        for message in result.messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_fails_before_search_when_bootstrap_identity_lacks_core() -> None:
     class _MissingCoreMemory(_Memory):
         async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
@@ -1238,10 +1397,9 @@ async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
         tool_definitions=[large_tool],
     )
 
-    # With the new context structure, core memories are in the immutable prefix
-    # and are never pruned. Only mutable recalled memories (search results)
-    # should be pruned when the token budget is tight.
-    assert not any(
+    # Managed recalled memories are already part of Mnemory's session-level
+    # dedupe state, so they must not be silently pruned after recall.
+    assert any(
         'trust="untrusted"' in str(message["content"])
         and "Recalled memories:" in str(message["content"])
         for message in result.messages
@@ -1559,6 +1717,8 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "skill_write" not in content
     assert "<critical_rules>" in content
     assert "IMPORTANT: If the task names a skill" in content
+    assert "Skills are managed exclusively through Cognis-provided skill tools" in content
+    assert "Do not create or edit filesystem SKILL.md files" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "Mutable recalled memory" not in content
@@ -1600,6 +1760,10 @@ async def test_context_assembler_mentions_skill_write_only_when_visible() -> Non
     content = str(result.messages[0]["content"])
     assert "<skills_guidance>" in content
     assert "skill_write" in content
+    assert "Use skill_write to create or update skills for future use" in content
+    assert "task reveals reusable workflow, tool, safety, or style guidance" in content
+    assert "use skill_asset_write for reusable references, templates, or scripts" in content
+    assert "do not create SKILL.md files instead" in content
 
 
 @pytest.mark.asyncio
@@ -1667,6 +1831,10 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "<skills_guidance>" in content
     assert "<critical_rules>" in content
     assert "IMPORTANT: If the task names a skill" in content
+    assert "Skills are managed exclusively through Cognis-provided skill tools" in content
+    assert "task teaches a durable reusable procedure" in content
+    assert "Prefer updating an existing relevant skill over creating a new one" in content
+    assert "recurring class-level workflows" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "<memory_instructions>" not in content

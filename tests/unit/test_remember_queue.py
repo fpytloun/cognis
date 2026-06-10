@@ -26,9 +26,10 @@ class _Worker:
 class _EventReader:
     def __init__(self) -> None:
         self.recorded_events: list[dict[str, object]] = []
+        self.read_kwargs: list[dict[str, object]] = []
 
     async def read_events(self, **kwargs: object) -> object:
-        del kwargs
+        self.read_kwargs.append(dict(kwargs))
         return type(
             "EventRead",
             (),
@@ -72,6 +73,31 @@ class _FailingWorker:
         del kwargs
         self.calls += 1
         raise RuntimeError(self.message)
+
+
+class _LegacyEventReader(_EventReader):
+    async def read_events(self, **kwargs: object) -> object:
+        self.read_kwargs.append(dict(kwargs))
+        if "seqs" in kwargs:
+            raise TypeError("read_events() got an unexpected keyword argument 'seqs'")
+        return type(
+            "EventRead",
+            (),
+            {
+                "events": [
+                    {
+                        "seq": 1,
+                        "type": "user_message",
+                        "data": {"content": "hi", "attachments": []},
+                    },
+                    {
+                        "seq": 2,
+                        "type": "assistant_message",
+                        "data": {"content": "done", "attachments": []},
+                    },
+                ]
+            },
+        )()
 
 
 @pytest.mark.asyncio
@@ -133,6 +159,7 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
 
     assert worker.calls >= 1
     assert worker.last_kwargs is not None
+    assert replay_queue._event_reader.read_kwargs[0]["seqs"] == [1, 2]
     assert worker.last_kwargs["messages"] == [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "done"},
@@ -141,6 +168,54 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
     async with session_factory() as session:
         count = await session.scalar(sa.select(sa.func.count()).select_from(RememberQueueRow))
         assert count == 0
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_remember_queue_replay_falls_back_for_legacy_event_reader(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-legacy.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", password_hash="x", role="user"))
+        await session.commit()
+
+    worker = _Worker()
+    event_reader = _LegacyEventReader()
+    queue = RememberRetryQueue(
+        worker,
+        session_factory=session_factory,
+        event_reader=event_reader,
+        max_depth=10,
+        max_concurrent=1,
+    )
+    await queue.enqueue(
+        {
+            "session_id": "s1",
+            "intaris_session_id": "intaris-s1",
+            "user_email": "user@example.com",
+            "agent_id": "agent-1",
+            "user_event_seq": 1,
+            "assistant_event_seq": 2,
+        }
+    )
+
+    await queue.start()
+    await asyncio.sleep(0.4)
+    await queue.stop()
+
+    assert worker.calls >= 1
+    assert [call.get("seqs") for call in event_reader.read_kwargs] == [[1, 2], None]
+    assert event_reader.read_kwargs[1]["after_seq"] == 0
+    assert worker.last_kwargs is not None
+    assert worker.last_kwargs["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "done"},
+    ]
 
     await engine.dispose()
 

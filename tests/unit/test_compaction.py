@@ -88,6 +88,19 @@ class _LLM:
         return len(text)
 
 
+class _FailingLLM(_LLM):
+    async def generate(
+        self,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        task_type: str = "default",
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.messages.append(messages)
+        self.kwargs.append({"model": model, "task_type": task_type, **dict(kwargs)})
+        raise ValueError("LLM failed")
+
+
 def _session() -> SessionModel:
     return SessionModel(
         session_id="session-1",
@@ -120,6 +133,53 @@ async def test_compaction_records_summary_and_updates_cache() -> None:
     assert llm.kwargs[0]["task_type"] == "compaction"
     assert result.tail_start_seq == 3
     assert [event.seq for event in result.preserved_tail_events] == [3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_compaction_preview_summary_does_not_record_or_update_cache() -> None:
+    cache = _Cache()
+    guardrails = _Guardrails()
+    llm = _LLM()
+    strategy = CompactionStrategy(
+        guardrails=guardrails,
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.preview_summary(_session())
+
+    assert result.compacted is True
+    assert result.method == "llm"
+    assert result.summary == "summary text"
+    assert result.compaction_seq is None
+    assert result.turns_compacted == 1
+    assert result.tail_start_seq == 3
+    assert guardrails.calls == 0
+    assert cache.applied == []
+
+
+@pytest.mark.asyncio
+async def test_compaction_preview_mechanical_fallback_does_not_record_or_update_cache() -> None:
+    cache = _Cache()
+    guardrails = _Guardrails()
+    strategy = CompactionStrategy(
+        guardrails=guardrails,
+        llm=_FailingLLM(),
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.preview_summary(_session())
+
+    assert result.compacted is True
+    assert result.method == "mechanical_sliding_window"
+    assert result.summary
+    assert result.compaction_seq is None
+    assert guardrails.calls == 0
+    assert cache.applied == []
 
 
 @pytest.mark.asyncio

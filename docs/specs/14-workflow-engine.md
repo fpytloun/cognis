@@ -404,7 +404,7 @@ class InteractionMode:
 - `explicit_gates` — only workflow-defined gate steps may pause execution.
   Dynamic caller requests from within steps are not available.
 - `step_requests` — run steps with `allow_questions=true` may dynamically
-  request caller input via `step_request_input`.
+  request caller input via `step_request_questions`.
 
 Tasks may override the workflow's interaction mode for a single run. UI-created
 and agent-created tasks default to the workflow policy. Scheduled tasks default
@@ -552,7 +552,7 @@ Agent runs step (full agentic loop)
         → if still no signal: treat as failed attempt
 ```
 
-### The `step_request_input` tool (optional)
+### The `step_request_questions` tool (optional)
 
 Available when BOTH conditions are met:
 1. the current execution context uses interaction mode `step_requests`
@@ -560,24 +560,57 @@ Available when BOTH conditions are met:
 
 ```json
 {
-  "name": "step_request_input",
-    "description": "Request input from the caller while staying within the same workflow step or direct-chat turn.",
+  "name": "step_request_questions",
+  "description": "Request input from the caller while staying within the same workflow step or direct-chat turn.",
   "parameters": {
-    "question": "What you need to know",
-    "options": "Optional list of structured options",
-    "context": "Why you need this input",
-    "timeout_action": "Optional: fail | cancel | continue_with_default"
+    "questions": [
+      {
+        "id": "strategy",
+        "header": "Implementation choice",
+        "question": "Which auth strategy should be used?",
+        "options": [
+          {"id": "jwt", "label": "JWT refresh tokens"},
+          {"id": "session", "label": "Server-side sessions"}
+        ],
+        "multiple": false,
+        "allow_custom": true,
+        "required": true
+      }
+    ],
+    "context": {"reason": "The next implementation step depends on this choice."}
   }
 }
 ```
 
 When called:
 1. If task-backed, the current StepRun transitions to `paused`
-2. Caller (main chat, user, API) receives the question
+2. Caller (main chat, user, API) receives the question set
 3. Execution does NOT advance — this is not a gate step
 4. Caller responds
-5. Response is injected into the SAME step session or direct-chat turn
+5. The structured reply is injected into the SAME step session or direct-chat turn
 6. Agent loop continues
+
+Rich clients and APIs answer with a question-set reply:
+
+```json
+{
+  "mode": "structured",
+  "answers": [
+    {
+      "question_id": "strategy",
+      "selected_option_ids": ["jwt"],
+      "custom_answer": null
+    }
+  ]
+}
+```
+
+`selected_option_ids` supports multi-select only when the corresponding question
+sets `multiple=true`. `custom_answer` is accepted only when the question sets
+`allow_custom=true`; required questions must have at least one selected option or
+a custom answer. Signal and plain-text-like channels render the full question
+set, but their inbound reply is treated as one free-form `plain_text` custom
+answer attached to the first question for the agent to interpret.
 
 For direct chat, the pause is transient: it blocks only new user turns in the
 same conversation while the question is live. If the controller restarts, the
@@ -1152,7 +1185,7 @@ Any state → cancelled
 pending → running → evaluating → approved → (next step)
                                → rejected → running (re-attempt)
                                → failed
-running → paused (gate or step_request_input)
+running → paused (gate or step_request_questions)
        → paused → running (response received)
 ```
 
@@ -1163,7 +1196,7 @@ running → paused (gate or step_request_input)
 - `max_attempts` — max re-runs of a single step (default 3)
 - `max_tool_calls` — max tool calls within a step session (from agent settings)
 - `max_duration` — wall-clock timeout for a step (from agent settings)
-- `question_timeout` — for `step_request_input` waiting period
+- `question_timeout` — for `step_request_questions` waiting period
 
 ### Per-workflow limits
 
@@ -1197,7 +1230,7 @@ Within a step session:
 | `01-architecture.md` | Workflow engine is a new core component |
 | `02-agent-model.md` | Agents have workflow config (available, default, step overrides) |
 | `03-session-model.md` | Workflow runs create step sessions; Intaris mapping |
-| `06-tool-system.md` | step_complete, step_request_input are controller-injected tools |
+| `06-tool-system.md` | step_complete, step_request_questions are controller-injected tools |
 | `09-ui-ux.md` | Workflow progress in task cards, gate UI, workflow editor |
 | `10-api-spec.md` | Workflow CRUD, gate response, step status |
 | `13-nfr-operations.md` | Workflow metrics: step durations, evaluation rates, revision rates |

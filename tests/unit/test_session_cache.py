@@ -275,6 +275,38 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
 
 
 @pytest.mark.asyncio
+async def test_session_cache_keeps_replayable_developer_context_in_history() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-memory")
+
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="developer_message",
+                data={
+                    "role": "developer",
+                    "source": "memory_search",
+                    "content": '<memory_context trust="untrusted">\n'
+                    "Recalled memories:\n- Uses pytest\n</memory_context>",
+                    "context_injection": True,
+                    "replayable": True,
+                    "replay_scope": "same_session",
+                    "visibility": "agent_context",
+                    "model_role": "system",
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+
+    events = cache.get_events_since_compaction(session.session_id)
+    assert [event.type for event in events] == ["developer_message"]
+    assert events[0].data["source"] == "memory_search"
+    assert cache.get_prefix_entries(session.session_id) == []
+
+
+@pytest.mark.asyncio
 async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_events() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session("session-discovery")

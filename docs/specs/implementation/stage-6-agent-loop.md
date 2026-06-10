@@ -48,7 +48,7 @@ full design.
        - Text → stream to client
        - Tool call → Tool Router dispatch → feed result back → loop
        - `step_complete` → signal completion to workflow engine
-       - `step_request_input` → pause and return to caller (if allowed)
+       - `step_request_questions` → pause and return to caller (if allowed)
        - Orchestration tool (delegate / task-workflow control) → controller operation
     5. Continue until `step_complete` is called or limits hit
     6. Finalize step:
@@ -65,9 +65,10 @@ full design.
 ### 2. Controller-Injected Step Tools
 
 - `step_complete(summary, outputs, claims)` — always injected into run steps
-- `step_request_input(question, options, context)` — injected only when
+- `step_request_questions(questions, context)` — injected only when
   workflow interaction mode is `step_requests` AND the current step has
-  `allow_questions=true`; resumes the same step session
+  `allow_questions=true`; asks one or more structured questions and resumes the
+  same step session with structured answers
 - `step_todo_write(todos)` — step-scoped cognitive aid, survives compaction
 - `step_todo_list()` — read current step todos
 
@@ -211,7 +212,7 @@ them before they reach the executor.
 - [x] Multiple tool calls in a single step work correctly
 - [x] `step_complete` tool is intercepted by controller (not sent to executor)
 - [x] LLM stop without `step_complete` triggers re-prompt
-- [x] `step_request_input` pauses and resumes the SAME step session
+- [x] `step_request_questions` pauses and resumes the SAME step session
 - [x] Step-local todo tools work and survive compaction
 - [x] Session lock prevents concurrent turns in same session
 

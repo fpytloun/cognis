@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.core import tool_router as tool_router_module
 from cognis.core.chat_modes import is_plan_hidden_tool
 from cognis.core.tool_router import ToolRoute, ToolRouter, _extract_output_anchor_names
 from cognis.models.agent import AgentDefinition, AgentPermissions
@@ -124,6 +125,20 @@ class _RemoteExecutor(_Executor):
         super().__init__(result=result)
         self.executor_id = "remote-exec"
         self.executor_type = "websocket"
+
+
+class _FakeMCPRow(SimpleNamespace):
+    server_id: str
+    name: str
+    status: str
+    transport: str
+    command: str | None
+    url: str | None
+    args: list[str]
+    env: dict[str, str]
+    headers: dict[str, str]
+    auth_config: dict[str, object]
+    timeout_seconds: int
 
 
 class _ArtifactStore:
@@ -377,6 +392,402 @@ def _session_factory() -> object:
         yield _Session()
 
     return factory
+
+
+@pytest.mark.asyncio
+async def test_controller_executes_oauth_http_mcp_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_1",
+        name="mfg-portal",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://mfg.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_get_mcp_server(
+        _session: object,
+        server_id: str,
+        *,
+        owner_email: str,
+        include_shared: bool,
+    ) -> object:
+        assert server_id == "mcp_1"
+        assert owner_email == "user@example.com"
+        assert include_shared is True
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        if key == "mcp.tool_timeout_seconds":
+            assert default == 300
+            return 300
+        if key == "mcp.connect_timeout_seconds":
+            assert default == 15
+            return 15
+        raise AssertionError(key)
+
+    class _OAuthService:
+        async def inject_authorization_header(
+            self,
+            *,
+            user_email: str,
+            server: object,
+            headers: dict[str, str],
+            conversation_id: str,
+            session_id: str,
+            task_id: object = None,
+            step_name: object = None,
+            step_run_id: object = None,
+            delivery_mode: str | None = None,
+        ) -> object:
+            assert user_email == "user@example.com"
+            assert server is mcp_row
+            assert headers == {}
+            assert conversation_id == "conv-a"
+            assert session_id == "session-a"
+            assert task_id is None
+            assert step_name is None
+            assert step_run_id is None
+            assert delivery_mode == "same_conversation"
+            return SimpleNamespace(
+                authorization_required=False,
+                headers={"Authorization": "Bearer fresh"},
+            )
+
+    class _Client:
+        def __init__(self, config: object, secrets: dict[str, str]) -> None:
+            assert secrets == {}
+            self.config = config
+            self.closed = False
+
+        async def connect(self) -> None:
+            assert self.config.headers == {"Authorization": "Bearer fresh"}
+
+        async def call_tool(self, raw_name: str, arguments: dict[str, object]) -> object:
+            calls.append((raw_name, arguments))
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+            self.closed = True
+
+    def fake_build_mcp_client(config: object, secrets: dict[str, str]) -> object:
+        return _Client(config, secrets)
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+    monkeypatch.setattr(tool_router_module, "build_mcp_client", fake_build_mcp_client)
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=_OAuthService(),
+    )
+    registered_tool = RegisteredTool(
+        definition=ToolDefinition(
+            name="mcp_mfg_portal__whoami",
+            description="whoami",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(
+                type="local_mcp",
+                server_id="mcp_1",
+                server_name="mfg-portal",
+                raw_tool_name="whoami",
+            ),
+        )
+    )
+
+    result = await router._execute_controller_oauth_mcp_if_applicable(
+        ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={"x": 1}),
+        registered_tool=registered_tool,
+        session=_session(),
+    )
+
+    assert result is not None
+    assert result.output == "ok"
+    assert result.metadata is not None
+    assert result.metadata["executed_by"] == "controller_oauth_mcp"
+    assert result.metadata["timeout_seconds"] == 300
+    assert calls == [("whoami", {"x": 1})]
+
+
+@pytest.mark.asyncio
+async def test_controller_oauth_mcp_returns_auth_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_1",
+        name="mfg-portal",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://mfg.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+
+    async def fake_get_mcp_server(
+        _session: object,
+        _server_id: str,
+        *,
+        owner_email: str,
+        include_shared: bool,
+    ) -> object:
+        assert owner_email == "user@example.com"
+        assert include_shared is True
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        if key == "mcp.tool_timeout_seconds":
+            assert default == 300
+            return 300
+        if key == "mcp.connect_timeout_seconds":
+            assert default == 15
+            return 15
+        raise AssertionError(key)
+
+    class _OAuthService:
+        calls: list[dict[str, object]] = []
+
+        async def inject_authorization_header(self, **_kwargs: object) -> object:
+            self.calls.append(dict(_kwargs))
+            return SimpleNamespace(
+                authorization_required=True,
+                headers={},
+                transaction_id="txn_1",
+                authorization_url="https://auth.example",
+                authorization_expires_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+                reason="token_expired",
+            )
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=_OAuthService(),
+    )
+    registered_tool = RegisteredTool(
+        definition=ToolDefinition(
+            name="mcp_mfg_portal__whoami",
+            description="whoami",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="local_mcp", server_id="mcp_1", raw_tool_name="whoami"),
+        )
+    )
+
+    result = await router._execute_controller_oauth_mcp_if_applicable(
+        ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={}),
+        registered_tool=registered_tool,
+        session=_session(),
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert "MCP authorization is required for mfg-portal" in result.output
+    assert "https://auth.example" in result.output
+    assert "2026-01-02T03:04:05+00:00" in result.output
+    assert "retry the tool call" in result.output
+    assert result.metadata is not None
+    assert result.metadata["code"] == "mcp_authorization_required"
+    assert result.metadata["server_id"] == "mcp_1"
+    assert result.metadata["server_name"] == "mfg-portal"
+    assert result.metadata["transaction_id"] == "txn_1"
+    assert result.metadata["authorization_url"] == "https://auth.example"
+    assert result.metadata["authorization_expires_at"] == "2026-01-02T03:04:05+00:00"
+    assert router._mcp_oauth_service.calls[0]["delivery_mode"] == "same_conversation"
+
+
+@pytest.mark.asyncio
+async def test_controller_oauth_mcp_returns_setup_failure_when_auth_url_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_1",
+        name="mfg-portal",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://mfg.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+
+    async def fake_get_mcp_server(
+        _session: object,
+        _server_id: str,
+        *,
+        owner_email: str,
+        include_shared: bool,
+    ) -> object:
+        assert owner_email == "user@example.com"
+        assert include_shared is True
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        if key == "mcp.tool_timeout_seconds":
+            assert default == 300
+            return 300
+        if key == "mcp.connect_timeout_seconds":
+            assert default == 15
+            return 15
+        raise AssertionError(key)
+
+    class _OAuthService:
+        async def inject_authorization_header(self, **_kwargs: object) -> object:
+            assert _kwargs["delivery_mode"] == "same_conversation"
+            return SimpleNamespace(
+                authorization_required=True,
+                headers={},
+                transaction_id=None,
+                authorization_url=None,
+                reason="authorization_required",
+            )
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=_OAuthService(),
+    )
+    registered_tool = RegisteredTool(
+        definition=ToolDefinition(
+            name="mcp_mfg_portal__whoami",
+            description="whoami",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(type="local_mcp", server_id="mcp_1", raw_tool_name="whoami"),
+        )
+    )
+
+    result = await router._execute_controller_oauth_mcp_if_applicable(
+        ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={}),
+        registered_tool=registered_tool,
+        session=_session(),
+    )
+
+    assert result is not None
+    assert result.is_error is True
+    assert "MCP OAuth setup failed for mfg-portal" in result.output
+    assert "could not generate an OAuth authorization URL" in result.output
+    assert "MCP authorization is required before this tool can be used" not in result.output
+    assert result.metadata is not None
+    assert result.metadata["code"] == "mcp_oauth_setup_failed"
+    assert result.metadata["server_id"] == "mcp_1"
+    assert result.metadata["server_name"] == "mfg-portal"
+    assert result.metadata["retryable"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_bypasses_executor_for_oauth_http_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_1",
+        name="mfg-portal",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://mfg.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+
+    async def fake_get_mcp_server(
+        _session: object,
+        _server_id: str,
+        *,
+        owner_email: str,
+        include_shared: bool,
+    ) -> object:
+        assert owner_email == "user@example.com"
+        assert include_shared is True
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        if key == "mcp.tool_timeout_seconds":
+            assert default == 300
+            return 300
+        if key == "mcp.connect_timeout_seconds":
+            assert default == 15
+            return 15
+        raise AssertionError(key)
+
+    class _OAuthService:
+        async def inject_authorization_header(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                authorization_required=False,
+                headers={"Authorization": "Bearer fresh"},
+            )
+
+    class _Client:
+        def __init__(self, config: object, _secrets: dict[str, str]) -> None:
+            self.config = config
+
+        async def connect(self) -> None:
+            return None
+
+        async def call_tool(self, _raw_name: str, _arguments: dict[str, object]) -> object:
+            return {"content": [{"type": "text", "text": "controller result"}]}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+
+    def fake_build_mcp_client(config: object, secrets: dict[str, str]) -> object:
+        return _Client(config, secrets)
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+    monkeypatch.setattr(tool_router_module, "build_mcp_client", fake_build_mcp_client)
+
+    tool_name = "mcp_mfg_portal__whoami"
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name=tool_name,
+                description="whoami",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="local_mcp", server_id="mcp_1", raw_tool_name="whoami"),
+                timeout_seconds=5,
+            )
+        )
+    )
+    executor = _Executor()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=_OAuthService(),
+    )
+
+    result = await router.execute(
+        ToolCall(call_id="call_1", name=tool_name, arguments={}),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert "controller result" in str(result.output)
+    assert executor.calls == 0
+    assert result.metadata is not None
+    assert result.metadata["executed_by"] == "controller_oauth_mcp"
+    assert result.metadata["timeout_seconds"] == 300
 
 
 def test_tool_router_classifies_routes() -> None:
@@ -696,8 +1107,60 @@ async def test_tool_router_passes_executor_runtime_to_guardrails() -> None:
     _session_id, _tool_name, _arguments, context = guardrails.last_evaluate_call
     assert context["working_directory"] == "/home/riker"
     assert context["executor_environment"]["cwd"] == "/home/riker"
+    assert "hostname" not in context["executor_environment"]
     assert context["tool"]["description"] == "memory search"
     assert context["tool"]["read_only"] is True
+    assert context["tool"]["id"] == "builtin:artifact_publish"
+
+
+@pytest.mark.asyncio
+async def test_evaluation_context_summarizes_tool_classification_and_parameters() -> None:
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    context = await router._evaluation_context(
+        ToolCall(call_id="r1", name="mcp_alertmanager__silences", arguments={}),
+        ToolDefinition(
+            name="mcp_alertmanager__silences",
+            description="List Alertmanager silences",
+            parameters={
+                "type": "object",
+                "required": ["filter"],
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Matcher used to filter active silences.",
+                    },
+                    "large": {"type": "object", "x-internal": "not included"},
+                },
+            },
+            source=ToolSource(
+                type="local_mcp",
+                server_id="alertmanager-prod",
+                server_name="alertmanager",
+                raw_tool_name="silences",
+            ),
+            category="observability",
+            profile_group="development",
+            read_only=True,
+            classification_status="ready",
+            classification_source="llm",
+            classification_confidence=0.92,
+            risk_level="low",
+        ),
+    )
+
+    assert context["tool"]["id"] == "mcp:alertmanager-prod:silences"
+    assert context["tool"]["read_only"] is True
+    assert context["tool"]["classification"] == {
+        "status": "ready",
+        "source": "llm",
+        "confidence": 0.92,
+    }
+    assert context["tool"]["parameters_summary"]["required"] == ["filter"]
+    assert context["tool"]["parameters_summary"]["properties"]["filter"] == {
+        "type": "string",
+        "description": "Matcher used to filter active silences.",
+    }
+    assert context["tool"]["parameters_summary"]["properties"]["large"] == {"type": "object"}
 
 
 @pytest.mark.asyncio
@@ -1428,11 +1891,25 @@ async def test_tool_router_enriches_inline_attachment_output_with_artifact_guida
     assert result.attachments[0]["artifact_id"] == "att_1"
     assert result.metadata is not None
     raw_output = result.metadata["_raw_output"]
+    assert 'Binary content: attached as artifact (artifact_id="att_1")' in raw_output
+    assert 'artifact_read with artifact_id="att_1" to analyze this image' in raw_output
     assert "[[attachments]]" in raw_output
     assert "Artifact ID: att_1" in raw_output
     assert "Filename: a.png" in raw_output
     assert 'artifact_read with artifact_id="att_1"' in raw_output
     assert 'artifact_get_url with artifact_id="att_1"' in raw_output
+    anchors = result.metadata["output_anchors"]
+    assert any(
+        anchor["anchor"] == "binary"
+        and anchor["artifact_candidate"]
+        == {
+            "source_type": "artifact_id",
+            "artifact_id": "att_1",
+            "mime_hint": "image/png",
+            "filename_hint": "a.png",
+        }
+        for anchor in anchors
+    )
 
 
 @pytest.mark.asyncio
@@ -1822,6 +2299,107 @@ async def test_artifact_read_materializes_tool_artifact_ref(
     assert "Materialized tool_artifact:call-web:media:1 as artifact att_1" in result.output
     assert result.metadata is not None
     assert result.metadata["materialized_artifact_id"] == "att_1"
+
+
+@pytest.mark.asyncio
+async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    class _Anchor:
+        anchor = "binary"
+        artifact_candidate = {
+            "source_type": "artifact_id",
+            "artifact_id": "att_1",
+            "mime_hint": "image/png",
+            "filename_hint": "a.png",
+        }
+
+    class _ToolOutputStore:
+        async def list_anchors(self, call_id: str) -> list[_Anchor]:
+            assert call_id == "call-web"
+            return [_Anchor()]
+
+    class _Store(_ArtifactStore):
+        async def async_load(
+            self, namespace: str, object_id: str, filename: str
+        ) -> tuple[bytes, str]:
+            del namespace, object_id, filename
+            return b"png-bytes", "image/png"
+
+    class _Llm:
+        async def get_model_info(
+            self,
+            model_id: str,
+            provider_id: str | None = None,
+            acting_user_email: str | None = None,
+        ) -> object:
+            del model_id, provider_id, acting_user_email
+            return SimpleNamespace(
+                supports_vision=True,
+                supports_pdf_input=False,
+                supports_audio_input=False,
+                supports_file_input=False,
+            )
+
+    class _Session:
+        async def commit(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    row = SimpleNamespace(
+        artifact_id="att_1",
+        namespace="attachments",
+        object_id="att_1",
+        filename="a.png",
+        owner_email="user@example.com",
+        conversation_id="conv-a",
+        session_id="session-a",
+        message_role="assistant",
+        purpose="web_fetch",
+        kind="image",
+        mime_type="image/png",
+        size_bytes=9,
+        status="attached",
+        created_at=None,
+        expires_at=None,
+        deleted_at=None,
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(return_value=row),
+    )
+
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "tool_artifact:call-web:binary"},
+        llm=_Llm(),
+        artifact_store=_Store(),
+        session_factory=session_factory,
+        user_email="user@example.com",
+        current_model="gpt-4o-mini",
+        current_provider_id=None,
+        runtime_metadata={"tool_output_store": _ToolOutputStore()},
+    )
+
+    assert result.is_error is False
+    assert "Materialized tool_artifact:call-web:binary as artifact att_1" in result.output
+    assert result.metadata is not None
+    assert result.metadata["materialized_artifact_id"] == "att_1"
+    assert result.attachments == [
+        {
+            "artifact_id": "att_1",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "a.png",
+            "size_bytes": 9,
+            "url": "https://cognis.example.com/attachments/att_1/a.png",
+        }
+    ]
 
 
 @pytest.mark.asyncio

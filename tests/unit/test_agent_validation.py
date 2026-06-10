@@ -31,9 +31,7 @@ def test_additional_executors_explicit_id_ok() -> None:
     _validate_agent_execution(
         {
             "executor_id": "exec-primary",
-            "additional_executors": [
-                {"executor_id": "exec-extra", "description": "Mac"}
-            ],
+            "additional_executors": [{"executor_id": "exec-extra", "description": "Mac"}],
         }
     )
 
@@ -42,9 +40,7 @@ def test_additional_executors_selector_ok() -> None:
     _validate_agent_execution(
         {
             "executor_id": "exec-primary",
-            "additional_executors": [
-                {"executor_selector": {"role": "browser"}}
-            ],
+            "additional_executors": [{"executor_selector": {"role": "browser"}}],
         }
     )
 
@@ -64,20 +60,14 @@ def test_additional_entry_must_be_dict() -> None:
 def test_additional_must_have_exactly_one_of_id_or_selector() -> None:
     with pytest.raises(Exception) as exc:
         _validate_agent_execution(
-            {
-                "additional_executors": [
-                    {"executor_id": "x", "executor_selector": {"a": "b"}}
-                ]
-            }
+            {"additional_executors": [{"executor_id": "x", "executor_selector": {"a": "b"}}]}
         )
     assert "exactly one of" in str(exc.value)
 
 
 def test_additional_must_have_at_least_one_of_id_or_selector() -> None:
     with pytest.raises(Exception) as exc:
-        _validate_agent_execution(
-            {"additional_executors": [{"description": "no id no selector"}]}
-        )
+        _validate_agent_execution({"additional_executors": [{"description": "no id no selector"}]})
     assert "exactly one of" in str(exc.value)
 
 
@@ -107,23 +97,13 @@ def test_additional_id_must_not_collide_with_earlier_additional() -> None:
 
 def test_additional_selector_keys_must_be_non_empty() -> None:
     with pytest.raises(Exception) as exc:
-        _validate_agent_execution(
-            {
-                "additional_executors": [
-                    {"executor_selector": {"": "value"}}
-                ]
-            }
-        )
+        _validate_agent_execution({"additional_executors": [{"executor_selector": {"": "value"}}]})
     assert "non-empty" in str(exc.value)
 
 
 def test_additional_description_must_be_string() -> None:
     with pytest.raises(Exception) as exc:
         _validate_agent_execution(
-            {
-                "additional_executors": [
-                    {"executor_id": "a", "description": 123}
-                ]
-            }
+            {"additional_executors": [{"executor_id": "a", "description": 123}]}
         )
     assert "description" in str(exc.value)

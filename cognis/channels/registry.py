@@ -19,12 +19,13 @@ _ASSISTANT_DELIVERY_MODE_FIELD = SettingField(
     name="assistant_delivery_mode",
     label="Assistant delivery mode",
     description=(
-        "Choose whether channel replies are delivered once at the end of the turn "
-        "or in buffered chunks while the assistant is still generating."
+        "Choose whether channel replies deliver only the final assistant message, "
+        "all turn messages concatenated at the end, or buffered chunks while the "
+        "assistant is still generating."
     ),
     field_type="select",
-    default="final",
-    options=["final", "immediate"],
+    default="final_only",
+    options=["final_only", "concatenated", "immediate"],
 )
 
 # ---------------------------------------------------------------------------

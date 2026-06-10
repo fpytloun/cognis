@@ -17,14 +17,19 @@ from cognis.models.session import (
 )
 
 
-def _conversation(*, title: str | None = None, title_source: str = "unset") -> ConversationModel:
+def _conversation(
+    *,
+    title: str | None = None,
+    title_source: str = "unset",
+    platform_data: dict[str, object] | None = None,
+) -> ConversationModel:
     return ConversationModel(
         conversation_id="conv-1",
         user_email="user@example.com",
         agent_id="agent-1",
         title=title,
         title_source=title_source,
-        context=ConversationContext(type="web"),
+        context=ConversationContext(type="web", platform_data=platform_data or {}),
     )
 
 
@@ -35,10 +40,21 @@ def test_manual_and_channel_titles_are_protected() -> None:
     )
 
 
-def test_blank_agent_direct_title_can_adopt_intaris_title() -> None:
-    assert can_adopt_intaris_title(_conversation(title_source="agent_direct")) is True
+def test_agent_direct_titles_do_not_adopt_intaris_title() -> None:
     assert (
-        can_adopt_intaris_title(_conversation(title="Existing title", title_source="agent_direct"))
+        can_adopt_intaris_title(
+            _conversation(title_source="agent_direct", platform_data={"kind": "agent_direct"})
+        )
+        is False
+    )
+    assert (
+        can_adopt_intaris_title(
+            _conversation(
+                title="Existing title",
+                title_source="agent_direct",
+                platform_data={"kind": "agent_direct"},
+            )
+        )
         is False
     )
 
@@ -125,6 +141,24 @@ async def test_sync_intaris_title_updates_only_unprotected_conversations(
     assert context_updates[-1] == {
         "conversation_id": "conv-1",
         "context_data": {"intaris_latest_title": "Ignored title"},
+    }
+    assert calls == []
+
+    calls.clear()
+    context_updates.clear()
+    direct = _conversation(
+        title="Agent 1",
+        title_source="agent_direct",
+        platform_data={"kind": "agent_direct"},
+    )
+    updated = await sync_intaris_title(session, direct, "Topic title")
+
+    assert updated is True
+    assert direct.title == "Agent 1"
+    assert direct.context.platform_data["intaris_latest_title"] == "Topic title"
+    assert context_updates[-1] == {
+        "conversation_id": "conv-1",
+        "context_data": {"kind": "agent_direct", "intaris_latest_title": "Topic title"},
     }
     assert calls == []
 

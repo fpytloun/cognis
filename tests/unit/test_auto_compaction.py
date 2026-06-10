@@ -301,11 +301,16 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     assert cache.refreshed == ["new-session-1"]
     assert cache.compactions == []
 
-    # Event was published by rotation.
-    assert len(published) == 1
-    assert published[0].type.value == "session_compacted"
-    assert published[0].data["previous_session_id"] == "session-1"
-    assert published[0].data["session_id"] == "new-session-1"
+    # Runtime start is visible before the terminal rotation event.
+    assert [event.type.value for event in published] == [
+        "session_compaction_started",
+        "session_compacted",
+    ]
+    assert published[0].data["session_id"] == "session-1"
+    assert published[0].data["status"] == "running"
+    assert published[1].data["previous_session_id"] == "session-1"
+    assert published[1].data["session_id"] == "new-session-1"
+    assert published[1].data["status"] == "compacted"
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-06-10
+
+### Added
+
+- Added managed agent conversations with chat UI support, retry handling, parent notifications, and durable managed-conversation state.
+- Added first-class workflow question sets, richer workflow tool rendering, evaluator retry todo reopening, and a conversation summary tool.
+- Added MCP server group tool assignment, OfficeCLI document tools, local compose stack support, and proactive skill update guidance.
+- Added session policy UI/API propagation, compaction progress cards, background work reminders, and richer chat timeline status indicators.
+
+### Changed
+
+- Improved Responses and LLM streaming ownership, reasoning-state preservation, replay behavior, and content-part gating.
+- Hardened context projection, compaction recovery, same-turn pressure handling, memory recall preservation, and task context injection.
+- Improved MCP OAuth initialization, token refresh, timeout handling, executor reconfiguration, and nested auth failure classification.
+- Refined chat routing, sidebar state, active chat recovery, route-change handling, conversation switching, and selected-agent direct chat behavior.
+
+### Fixed
+
+- Fixed oversized tool argument handling, classifier retry loop bounds, streamed assistant commentary preservation, and final transcript isolation.
+- Fixed managed queued message handling, async work handoff behavior, agent-work continuations, and parent notification for async managed conversation creation.
+- Fixed local compose release validation, migration sanity checks, OfficeCLI validation, executor websocket reconfigure recovery, and release-blocking regressions.
+- Fixed UI loops, compaction timeline persistence, read-state synchronization, active tool snapshots, and workflow/task rendering regressions.
+
 ## [0.7.0] - 2026-06-01
 
 ### Added

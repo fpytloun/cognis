@@ -21,9 +21,9 @@ import httpx
 import pytest
 
 from cognis.bootstrap import ensure_data_dir, ensure_jwt_keypair, ensure_secrets_key
-from cognis.config import CognisConfig
 from tests.integration.conftest import (
     LiveStack,
+    _bootstrap_config,
     _free_port,
     _start_service,
     _stop_service,
@@ -95,21 +95,14 @@ def test_stale_session_recovery_on_restart(
     llm_model = clean_env.get("COGNIS_TEST_LLM_MODEL", "gpt-4.1-nano")
 
     # Bootstrap keys
-    bootstrap_config = CognisConfig(
-        data_dir=cognis_dir,
+    bootstrap_config = _bootstrap_config(
+        cognis_dir=cognis_dir,
         host="127.0.0.1",
         port=cognis_port,
         mnemory_url=mnemory_url,
         intaris_url=intaris_url,
-        database_url=f"sqlite+aiosqlite:///{cognis_dir / 'cognis.db'}",
-        jwt_private_key_path=cognis_dir / "keys" / "private.pem",
-        jwt_public_key_path=cognis_dir / "keys" / "public.pem",
-        secrets_key_path=cognis_dir / "secrets.key",
-        log_level="warning",
-        log_format="text",
-        cors_origins=["*"],
-        initial_admin_email=admin_email,
-        initial_admin_password=admin_password,
+        admin_email=admin_email,
+        admin_password=admin_password,
     )
     ensure_data_dir(bootstrap_config)
     ensure_jwt_keypair(bootstrap_config)
@@ -129,6 +122,8 @@ def test_stale_session_recovery_on_restart(
             "MCP_HOST": "127.0.0.1",
             "MCP_PORT": str(mnemory_port),
             "MNEMORY_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="mnemory",
@@ -141,6 +136,8 @@ def test_stale_session_recovery_on_restart(
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="intaris",

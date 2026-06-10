@@ -11,6 +11,7 @@ from cognis.channels.inbound import (
     InboundPipeline,
     _fallback_attachment_content,
     _filter_turn_attachments_for_voice_input,
+    _normalize_assistant_delivery_mode,
     _prepare_audio_for_stt,
     _signal_image_preview_payload,
     _stt_passthrough_target,
@@ -41,6 +42,14 @@ class _FakeManager:
 
     def get_adapter(self, account_id: str) -> _FakeAdapter:
         return self._adapter
+
+
+def test_normalize_assistant_delivery_mode_preserves_legacy_final_semantics() -> None:
+    assert _normalize_assistant_delivery_mode("final") == "concatenated"
+    assert _normalize_assistant_delivery_mode("final_only") == "final_only"
+    assert _normalize_assistant_delivery_mode("concatenated") == "concatenated"
+    assert _normalize_assistant_delivery_mode("immediate") == "immediate"
+    assert _normalize_assistant_delivery_mode("unknown") == "concatenated"
 
 
 @pytest.mark.asyncio
@@ -550,7 +559,7 @@ async def test_channel_turn_observer_immediate_mode_flushes_on_tool_call() -> No
 
 
 @pytest.mark.asyncio
-async def test_channel_turn_observer_final_mode_does_not_flush_on_tool_call() -> None:
+async def test_channel_turn_observer_concatenated_mode_does_not_flush_on_tool_call() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
@@ -563,20 +572,20 @@ async def test_channel_turn_observer_final_mode_does_not_flush_on_tool_call() ->
         turn_scheduler=turn_scheduler,
         reply_to_id="msg-1",
         channel_manager_ref=lambda: manager,
-        assistant_delivery_mode="final",
+        assistant_delivery_mode="concatenated",
     )
 
     await observer.on_token("conv-1", "sess-1", "msg-2", "Let me check that.")
     await observer.on_tool_call("conv-1", "sess-1", "call-1", "bash", {"command": "ls"})
 
-    # In final mode, text should NOT be flushed on tool_call — only typing indicator
+    # In concatenated mode, text should NOT be flushed on tool_call — only typing indicator
     adapter.send_message.assert_not_awaited()
     adapter.send_typing.assert_awaited()
     assert observer._accumulated_text == "Let me check that."
 
 
 @pytest.mark.asyncio
-async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None:
+async def test_channel_turn_observer_concatenated_mode_never_flushes_mid_turn() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
@@ -589,7 +598,7 @@ async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None
         turn_scheduler=turn_scheduler,
         reply_to_id="msg-1",
         channel_manager_ref=lambda: manager,
-        assistant_delivery_mode="final",
+        assistant_delivery_mode="concatenated",
     )
 
     await observer.on_token("conv-1", "sess-1", "msg-2", "Some buffered content")
@@ -599,6 +608,101 @@ async def test_channel_turn_observer_final_mode_never_flushes_mid_turn() -> None
 
     await observer.on_turn_complete(None)
     assert turn_scheduler.remove_observer.called
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_legacy_final_mode_is_concatenated() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Progress update.")
+    await observer.on_tool_call("conv-1", "sess-1", "call-1", "bash", {"command": "ls"})
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Final answer.")
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-2",
+            final_content="Final answer.",
+        )
+    )
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "Progress update.Final answer."
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_final_only_mode_sends_final_content() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final_only",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Let me check that.")
+    await observer.on_tool_call("conv-1", "sess-1", "call-1", "bash", {"command": "ls"})
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Done.")
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="msg-2",
+            final_content="Done.",
+        )
+    )
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "Done."
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_final_only_mode_falls_back_to_buffer_without_final_content() -> (
+    None
+):
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="msg-1",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final_only",
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", "Only buffered text.")
+    await observer.on_turn_complete(None)
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "Only buffered text."
 
 
 def test_channel_turn_observer_absorbs_latest_reply_anchor() -> None:

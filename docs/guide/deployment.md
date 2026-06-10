@@ -57,6 +57,37 @@ docker run -d \
 
 On Linux, `--add-host=host.docker.internal:host-gateway` lets the container reach services running on the Docker host.
 
+## Local Compose deployment
+
+For local personal use, demos, development, and implementation-test feedback
+loops, Cognis also ships a single-instance Local Compose deployment:
+
+```bash
+cp .env.local.example .env.local
+# Fill COGNIS_LOCAL_LLM_BASE_URL and COGNIS_LOCAL_LLM_API_KEY.
+set -a
+source .env.local
+set +a
+make local-compose-build
+make local-compose-up
+make local-compose-wait
+make local-compose-seed
+make local-compose-executor-up
+```
+
+This starts local Qdrant, published Mnemory/Intaris images, a Cognis controller
+built from the checkout, and a WebSocket executor built from the checkout. The
+seed step configures a single-user Cognis instance with an env-authenticated
+OpenAI-compatible provider and a dummy local agent.
+
+Local Compose uses local SQLite/data volumes and is intentionally not a
+production high-availability topology. Use `make local-compose-reset` only when
+you intend to destroy all local users, secrets, conversations, memory, Intaris
+events, Qdrant vectors, and executor browser profiles.
+
+See [Local Compose Deployment](local-compose.md) for the full environment
+contract and executor options.
+
 ## WebSocket executors
 
 Create a WebSocket executor in `Settings -> Executors`, generate a token, and run the executor image:

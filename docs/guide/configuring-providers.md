@@ -63,6 +63,18 @@ Use this for local models exposed through Ollama. Make sure the selected model i
 
 Use this when a LiteLLM proxy is already aggregating your models. Cognis treats the proxy as the provider and lets the proxy perform the final upstream routing.
 
+The Local Compose deployment seeds a shared LiteLLM/OpenAI-compatible provider
+using environment-based auth:
+
+- `COGNIS_LOCAL_LLM_BASE_URL`
+- `COGNIS_LOCAL_LLM_API_KEY`
+- `COGNIS_LOCAL_CHAT_MODEL`
+
+This repository does not resolve Cognis credential IDs in scripts. If your
+running Cognis instance stores a LiteLLM credential, inject those env vars from
+that credential externally before starting or seeding Local Compose. The seeded
+provider stores only the env-var reference, not the API key value.
+
 ### ChatGPT Subscription (Codex)
 
 Use this when Cognis should call LiteLLM's native ChatGPT subscription provider. This preset uses OAuth device-code authentication instead of an API key. Create the provider first, then start OAuth from the provider editor. The UI shows the verification URL and user code; after you approve in the browser, Cognis stores the resulting token cache in the encrypted secrets table.

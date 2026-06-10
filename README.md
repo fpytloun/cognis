@@ -62,7 +62,7 @@ iOS PWA:
 - **Tasks and workflows**: Durable task board, dependencies, priorities, step runs, gates, deliverables, comments, reruns, revisions, schedules, and reusable workflow templates.
 - **Remote executors**: In-process, subprocess, and WebSocket executors. Use stateless cloud executors for ephemeral work or persistent executor homes for browser profiles, workspaces, caches, and local identity.
 - **Browser and web tools**: Web search/fetch/crawl/map/research plus executor-native browser sessions, snapshots, queries, clicks, typing, forms, console/network inspection, screenshots, and saved auth state.
-- **MCP and native tools**: Built-in filesystem, shell, search, LSP, artifact, image, date/time, memory, browser, web, workflow, and system tools, plus MCP tools from controller-managed or executor-attached servers.
+- **MCP and native tools**: Built-in filesystem, shell, search, LSP, artifact, image, date/time, memory, browser, web, Office document, workflow, and system tools, plus MCP tools from controller-managed or executor-attached servers.
 - **Skills**: Versioned instruction, asset, and tool bundles. Agents discover compact skill metadata, load full instructions on demand, and can expose linked or bundled tools through the executor boundary.
 - **Memory**: Mnemory-backed recall and remember for user facts, agent personality, episodic memory, and artifacts.
 - **Knowledgebases**: Optional artifact-backed retrieval over Qdrant native dense+sparse hybrid search, with built-in agent tools for create/attach/index/search/source-context workflows.
@@ -273,6 +273,7 @@ Still ahead:
 - [Security and Privacy](docs/guide/security-and-privacy.md)
 - [Troubleshooting](docs/guide/troubleshooting.md)
 - [Internal Design Specs](docs/specs/README.md)
+- [OfficeCLI Executor-Native Office Tools](docs/specs/officecli-tools.md)
 
 ## License
 
