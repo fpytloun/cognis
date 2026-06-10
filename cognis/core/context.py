@@ -49,9 +49,13 @@ from cognis.core.immutable_prefix import (
 from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES
 from cognis.core.message_markers import (
     ALL_INTERNAL_MARKERS,
+    AUDIT_METADATA,
+    AUDIT_ROLE,
+    AUDIT_SOURCE,
     IMMUTABLE_PREFIX,
     TURN_BOUNDARY,
 )
+from cognis.core.orchestration_policy import is_managed_agent_conversation_context
 from cognis.core.prompts import PromptContext, build_critical_rules, build_system_instructions
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
@@ -82,6 +86,7 @@ HISTORY_ATTACHMENT_REPLAY_TOTAL = Counter(
 )
 
 EVENT_TYPES_FOR_CONTEXT = [
+    "developer_message",
     "user_message",
     "assistant_message",
     "tool_call",
@@ -362,10 +367,31 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
             "",
             "Channel behavior:",
             "- This guidance applies only because the current conversation is channel-bound.",
-            "- Keep the channel unblocked. For non-trivial exploration, research, "
-            "implementation, or other long-running work, prefer delegate(wait=false) "
-            "or create_task so work continues asynchronously and a follow-up turn can "
-            "deliver the result when complete.",
+            "- Keep the channel unblocked. Do not optimize for finishing the whole job "
+            "inside the parent turn. Optimize for correct work routing. In a live "
+            "channel, blocking the channel is worse than returning later with a "
+            "completed result.",
+            "- Move the work loop out of the live channel and keep the parent chat as "
+            "the command bridge.",
+            "- Use delegate(wait=true) only when the current answer depends on the child result.",
+            "- Use delegate(wait=false) for bounded, non-interactive worker-style lookup "
+            "or analysis with clear output and one final report.",
+            "- Use agent_conversation_create(wait=false) for visible iterative work loops "
+            "outside the live channel, especially CI/build/deploy/debug/browser/"
+            "external-system/polling workflows where the user may need to inspect or "
+            "interact.",
+            "- For implementation/debugging managed conversations, prefer starting with "
+            'chat_mode="plan"; after user or main-agent review, continue with '
+            'chat_mode="build". For clearly small read-only diagnostics, default mode '
+            "is acceptable. Build mode is acceptable when explicitly requested or "
+            "obviously safe.",
+            "- Use create_task for durable workflow-shaped work with lifecycle, "
+            "deliverables, review/evaluation, or longer background persistence.",
+            "- wait=false means fire-and-follow-up, not fire-and-duplicate. After "
+            "starting async child work, stop the parent turn unless independent "
+            "parent-side work can safely continue without the child result.",
+            "- The conversation will receive a follow-up/resume notification when "
+            "async child work finishes.",
             "- Use inline work only for quick answers or very small actions that can "
             "finish without noticeably blocking the channel.",
             "- Keep channel replies concise and suitable for the channel medium.",
@@ -388,14 +414,50 @@ def _build_direct_chat_context_info(context: ConversationContext | None) -> str 
             "",
             "Direct chat behavior:",
             "- This guidance applies only because the current web conversation is a persistent direct chat.",
-            "- Keep this direct chat responsive. For non-trivial exploration, research, "
-            "implementation, or other long-running work, prefer delegate(wait=false) "
-            "or create_task so work continues asynchronously and a follow-up turn can "
-            "deliver the result when complete.",
-            "- Use inline work only for quick answers or very small actions that can "
-            "finish without noticeably blocking the direct chat.",
+            "- Use inline work for quick answers or small actions.",
+            "- Use delegate(wait=true) for specialist exploration, review, or research "
+            "that must finish before you can continue.",
+            "- Use a managed conversation for visible interactive work and create_task "
+            "for heavier workflow-shaped work.",
+            "- If using managed conversation wait=false, treat it as fire-and-follow-up: "
+            "do not continue the same scoped work in parallel; end the parent turn "
+            "when there is no independent work to do.",
+            "- Use wait=true when the current turn must synthesize the result before replying.",
         ]
     )
+
+
+def _build_agent_work_context_info(context: ConversationContext | None) -> str | None:
+    """Build context for conversations managed by another Cognis agent."""
+
+    if context is None:
+        return None
+    platform_data = context.platform_data or {}
+    if platform_data.get("provenance_in_prefix") is True:
+        return None
+    if not is_managed_agent_conversation_context(context):
+        return None
+
+    controller_agent_id = _string_value(platform_data.get("controller_agent_id")) or "unknown"
+    controller_conversation_id = _string_value(platform_data.get("controller_conversation_id"))
+    controller_session_id = _string_value(platform_data.get("controller_session_id"))
+
+    lines = [
+        "Agent work context:",
+        f"- This session is managed by Cognis agent `{controller_agent_id}` on behalf of the user.",
+        "- Treat user messages in this session as instructions from that authenticated internal agent.",
+        "- Do not mention this management context unless it is operationally relevant.",
+        "- Use inline work for small actions.",
+        "- Use delegate for specialist child work that must finish before this managed turn can continue.",
+        "- Avoid asynchronous delegation from managed conversations; prefer wait=true for joined child work.",
+        "- Use create_task only for durable workflow-shaped work where asynchronous completion is appropriate.",
+        "- If the controller must decide or start visible asynchronous work, return a concise blocking issue or recommendation.",
+    ]
+    if controller_conversation_id:
+        lines.append(f"- Controller conversation: {controller_conversation_id}")
+    if controller_session_id:
+        lines.append(f"- Controller session: {controller_session_id}")
+    return "\n".join(lines)
 
 
 def _string_value(value: Any) -> str | None:
@@ -991,6 +1053,15 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
+        if agent_work_context_info := _build_agent_work_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": agent_work_context_info,
+                    "_audit_source": "agent_work_context",
+                    "_audit_role": "developer",
+                }
+            )
 
         # History messages (append-only)
         history_messages = await self._events_to_messages(
@@ -1068,8 +1139,16 @@ class ContextAssembler:
                         '<memory_context trust="untrusted">\n'
                         "Recalled memories:\n" + mutable_search_results + "\n</memory_context>"
                     ),
-                    "_audit_source": "memory_search",
-                    "_audit_role": "developer",
+                    AUDIT_SOURCE: "memory_search",
+                    AUDIT_ROLE: "developer",
+                    AUDIT_METADATA: {
+                        "context_injection": True,
+                        "replayable": True,
+                        "replay_scope": "same_session",
+                        "visibility": "agent_context",
+                        "model_role": "system",
+                        "trust": "untrusted",
+                    },
                 }
             )
 
@@ -1955,6 +2034,7 @@ class ContextAssembler:
                     "source": audit_source,
                     "content_type": "text",
                     "hash": _audit_hash(role, content, audit_source),
+                    "metadata": dict(message.get(AUDIT_METADATA) or {}),
                 }
             )
         return audit_messages
@@ -2066,12 +2146,24 @@ class ContextAssembler:
                 "needed for the current task or workflow step and is not already "
                 "marked as loaded. Skills marked as attached are preferred defaults "
                 "for this agent, but loaded skill instructions are subordinate to "
-                "workflow step contracts and controller completion requirements."
+                "workflow step contracts and controller completion requirements. "
+                "Skills are managed exclusively through Cognis-provided skill "
+                "tools, not filesystem SKILL.md files or other filesystem skill "
+                "manifests. When a task teaches a durable reusable procedure, "
+                "consider updating or creating a Cognis skill. Prefer updating "
+                "an existing relevant skill over creating a new one. Create new "
+                "skills only for recurring class-level workflows, not one-off "
+                "task progress, transient failures, or narrow bug fixes. "
+                "Skills are procedural memory; facts and preferences belong in "
+                "memory."
             )
             if visible_tool_names is not None and "skill_write" in visible_tool_names:
                 skill_guidance += (
-                    " You can also create new skills with skill_write to remember "
-                    "procedures for future use."
+                    " Use skill_write to create or update skills for future use "
+                    "when the task reveals reusable workflow, tool, safety, or "
+                    "style guidance; use skill_asset_write for reusable "
+                    "references, templates, or scripts; do not create SKILL.md "
+                    "files instead."
                 )
             tagged_skills_guidance = _tagged_section(
                 "skills_guidance",
@@ -2291,23 +2383,7 @@ class ContextAssembler:
             self.llm.count_messages_tokens(pruned_messages, resolved_model) + tool_schema_tokens
             > max_prompt_tokens
         ):
-            # Priority 1: Drop mutable recalled memories (search results)
-            recalled_index = next(
-                (
-                    index
-                    for index, message in enumerate(pruned_messages)
-                    if message.get("role") == "system"
-                    and isinstance(message.get("content"), str)
-                    and "Recalled memories:" in str(message.get("content"))
-                    and '<memory_context trust="untrusted">' in str(message.get("content"))
-                ),
-                None,
-            )
-            if recalled_index is not None:
-                pruned_messages.pop(recalled_index)
-                continue
-
-            # Priority 2: Compact old tool outputs to recoverable placeholders.
+            # Priority 1: Compact old tool outputs to recoverable placeholders.
             # This keeps call_id handles visible before we resort to dropping
             # complete tool-call groups under hard context pressure.
             compacted_messages = _compact_oldest_droppable_tool_group(pruned_messages)
@@ -2315,7 +2391,7 @@ class ContextAssembler:
                 pruned_messages = compacted_messages
                 continue
 
-            # Priority 3: Drop oldest non-protected messages (history).
+            # Priority 2: Drop oldest non-protected messages (history).
             # Tool call groups (assistant message with tool_calls + matching
             # tool role responses) must be dropped atomically to avoid
             # orphaned tool_calls that LLM providers reject.
@@ -2526,6 +2602,36 @@ def events_to_messages(
                     )
                 else:
                     messages.append({"role": "assistant", "content": content})
+        elif event_type == "developer_message":
+            _append_orphan_placeholders()
+            content = event_data.get("content")
+            if (
+                isinstance(content, str)
+                and event_data.get("context_injection") is True
+                and event_data.get("replayable") is True
+                and event_data.get("visibility") == "agent_context"
+            ):
+                role = event_data.get("model_role")
+                if role not in {"system", "developer"}:
+                    role = "system"
+                messages.append(
+                    {
+                        "role": role,
+                        "content": content,
+                        AUDIT_METADATA: {
+                            key: event_data[key]
+                            for key in (
+                                "context_injection",
+                                "replayable",
+                                "replay_scope",
+                                "visibility",
+                                "model_role",
+                                "trust",
+                            )
+                            if key in event_data
+                        },
+                    }
+                )
         elif event_type == "tool_result":
             # The agent loop stores tool output under key "result";
             # fall back to "output" for forward-compatibility.
@@ -3014,6 +3120,14 @@ def _is_protected_context_message(message: dict[str, Any]) -> bool:
     if message.get("_prior_context"):
         return True
     if message.get("_project_context"):
+        return True
+    audit_metadata = message.get(AUDIT_METADATA)
+    if (
+        isinstance(audit_metadata, dict)
+        and audit_metadata.get("context_injection") is True
+        and audit_metadata.get("replayable") is True
+        and audit_metadata.get("visibility") == "agent_context"
+    ):
         return True
     return _is_immutable_prefix_message(message)
 

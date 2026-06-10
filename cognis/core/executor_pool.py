@@ -164,7 +164,9 @@ def parse_additional_executors(execution: dict[str, Any] | None) -> list[dict[st
         has_selector = bool(
             isinstance(selector, dict)
             and selector
-            and all(isinstance(k, str) and isinstance(v, (str, int, bool)) for k, v in selector.items())
+            and all(
+                isinstance(k, str) and isinstance(v, (str, int, bool)) for k, v in selector.items()
+            )
         )
         if has_id == has_selector:
             # Need exactly one

@@ -155,6 +155,14 @@ async def _pairing_response(
     )
 
 
+def _settings_with_defaults(meta: Any, settings: dict[str, Any] | None) -> dict[str, Any]:
+    resolved = {
+        field.name: field.default for field in meta.setting_fields if field.default is not None
+    }
+    resolved.update(settings or {})
+    return resolved
+
+
 async def _validate_default_conversation(
     request: Request,
     *,
@@ -244,9 +252,7 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
             "credential_refs": row.credential_refs or {},
             "default_conversation_id": row.default_conversation_id,
             "allow_new_conversations": row.allow_new_conversations,
-            "preferred_for_task_delivery": getattr(
-                row, "preferred_for_task_delivery", False
-            ),
+            "preferred_for_task_delivery": getattr(row, "preferred_for_task_delivery", False),
             "adapter_location": getattr(row, "adapter_location", "controller"),
             "executor_id": getattr(row, "executor_id", None),
             "allowed_senders": row.allowed_senders or [],
@@ -350,7 +356,7 @@ async def create_account(request: Request) -> Any:
             display_name=display_name,
             agent_id=agent_id,
             user_email=user_email,
-            config=body.get("settings", {}),
+            config=_settings_with_defaults(meta, body.get("settings")),
             credential_refs=body.get("credential_refs", {}),
             default_conversation_id=default_conversation_id,
             allow_new_conversations=body.get("allow_new_conversations", True),

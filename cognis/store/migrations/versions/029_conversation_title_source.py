@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "029_conversation_title_source"
-down_revision = "028_credentials_table"
+down_revision = "028"
 branch_labels = None
 depends_on = None
 
@@ -27,7 +27,12 @@ def upgrade() -> None:
         "WHEN title IS NULL OR TRIM(title) = '' THEN 'unset' "
         "ELSE 'manual' END"
     )
-    op.alter_column("conversations", "title_source", server_default=None)
+    with op.batch_alter_table("conversations") as batch_op:
+        batch_op.alter_column(
+            "title_source",
+            existing_type=sa.String(),
+            server_default=None,
+        )
 
 
 def downgrade() -> None:

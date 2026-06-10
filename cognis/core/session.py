@@ -47,6 +47,13 @@ from cognis.store import queries
 
 logger = get_logger(__name__)
 
+
+def _agent_direct_title(agent: AgentDefinition) -> str:
+    """Return the stable visible title for an agent direct chat."""
+
+    return (agent.display_name or agent.name or agent.agent_id).strip() or agent.agent_id
+
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _MAX_INTENTION_LENGTH = 500
 _MAX_STATUS_REASON_LENGTH = 500
@@ -286,6 +293,7 @@ def _intaris_session_policy(
             seen.add(pattern)
 
     _add("/tmp")
+    _add("/private/tmp")
     _add("/var/tmp")
     _add(executor_tmpdir)
     if executor_home:
@@ -444,6 +452,8 @@ class SessionManager:
         context_ref = agent_direct_context_ref(user_email, agent_id)
         for attempt in range(2):
             async with self.session_factory() as db_session:
+                agent = await self._require_agent(db_session, agent_id)
+                direct_title = _agent_direct_title(agent)
                 existing = await queries.get_agent_direct_conversation(
                     db_session,
                     user_email,
@@ -466,15 +476,34 @@ class SessionManager:
                         )
                         if existing is None:
                             raise RuntimeError("Failed to canonicalize agent direct conversation")
+                    existing_title = (existing.title or "").strip()
+                    if existing_title != direct_title and existing.title_source in {
+                        "unset",
+                        "agent_direct",
+                        "intaris",
+                    }:
+                        await queries.update_conversation(
+                            db_session,
+                            existing.conversation_id,
+                            title=direct_title,
+                            title_source="agent_direct",
+                        )
+                        await db_session.commit()
+                        existing = await queries.get_agent_direct_conversation(
+                            db_session,
+                            user_email,
+                            agent_id,
+                        )
+                        if existing is None:
+                            raise RuntimeError("Failed to reload agent direct conversation")
                     return _to_conversation_model(existing)
                 try:
-                    await self._require_agent(db_session, agent_id)
                     conversation = await queries.create_conversation(
                         db_session,
                         user_email=user_email,
                         agent_id=agent_id,
                         context_type="web",
-                        title=None,
+                        title=direct_title,
                         title_source="agent_direct",
                         context_ref=context_ref,
                         context_data={"kind": AGENT_DIRECT_KIND},
@@ -817,6 +846,7 @@ class SessionManager:
         active_turn_id: str | None,
         title: str | None = None,
         intention: str | None = None,
+        context: ConversationContext | None = None,
         snapshot_extras: dict[str, Any] | None = None,
     ) -> tuple[ConversationModel, SessionModel, bool]:
         """Fork a session while a turn is active, excluding that in-flight turn."""
@@ -840,6 +870,7 @@ class SessionManager:
             user_email=user_email,
             title=title,
             intention=intention,
+            context=context,
             snapshot_extras={
                 "checkpoint": "last_completed_turn",
                 "excluded_active_turn_id": active_turn_id,
@@ -1521,6 +1552,8 @@ class SessionManager:
                         data={
                             "summary": compaction_summary,
                             "method": "rotation",
+                            "marker_role": "context_seed",
+                            "timeline_visible": False,
                             "trigger": completion_reason,
                             "source_session_id": current_session.session_id,
                         },
@@ -1697,23 +1730,36 @@ class SessionManager:
             )
         if not cloned_events:
             return
+        batch_size = 1000
+        batches = [
+            cloned_events[index : index + batch_size]
+            for index in range(0, len(cloned_events), batch_size)
+        ]
         try:
             with scoped_runtime_context(
                 user_email=new_session.user_email,
                 agent_id=new_session.agent_id,
             ):
-                append_result = await self.providers.guardrails.record_events(
-                    session_id=session_id,
-                    events=cloned_events,
-                    source="cognis",
-                    idempotency_key=f"{new_session.session_id}:compaction_tail:{previous_session_id}",
-                    retry_missing_session=True,
-                    user_email=new_session.user_email,
-                    agent_id=new_session.agent_id,
-                )
-            append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
-            if append_result.ok and callable(append_recorded_events):
-                await append_recorded_events(new_session, cloned_events, append_result)
+                for batch_index, batch_events in enumerate(batches):
+                    idempotency_key = (
+                        f"{new_session.session_id}:compaction_tail:{previous_session_id}"
+                    )
+                    if len(batches) > 1:
+                        idempotency_key = f"{idempotency_key}:batch:{batch_index + 1}"
+                    append_result = await self.providers.guardrails.record_events(
+                        session_id=session_id,
+                        events=batch_events,
+                        source="cognis",
+                        idempotency_key=idempotency_key,
+                        retry_missing_session=True,
+                        user_email=new_session.user_email,
+                        agent_id=new_session.agent_id,
+                    )
+                    append_recorded_events = getattr(
+                        self.session_cache, "append_recorded_events", None
+                    )
+                    if append_result.ok and callable(append_recorded_events):
+                        await append_recorded_events(new_session, batch_events, append_result)
         except Exception as exc:
             extra_data: dict[str, Any] = {"session_id": new_session.session_id}
             if isinstance(exc, httpx.HTTPStatusError):

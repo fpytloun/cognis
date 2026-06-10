@@ -8,7 +8,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
+from cognis.core.question_sets import normalize_questions, normalize_reply
 from cognis.models.artifact import AttachmentRef
+from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import SessionPolicy, WorkflowState
 
@@ -241,8 +243,24 @@ class ConversationResponse(BaseModel):
     last_read_at: datetime | None = None
     has_unread: bool = False
     has_active_turn: bool = False
+    managed_agent: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    conversation_state: ConversationStateEnvelope | None = None
+
+
+class ManagedConversationActionRequest(BaseModel):
+    message: str | None = None
+    reason: str | None = None
+    instruction: str | None = None
+    wait: bool = False
+
+
+class ManagedConversationActionResponse(BaseModel):
+    status: str
+    conversation_id: str
+    managed_agent: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
 
 
 class ConversationTitleSuggestionResponse(BaseModel):
@@ -373,6 +391,10 @@ class MessageHistoryResponse(BaseModel):
         default=None,
         description="Machine-readable reason explaining why the history response was truncated.",
     )
+    state_snapshot: ConversationStateEnvelope | None = Field(
+        default=None,
+        description="Authoritative backend-projected conversation state at history load time.",
+    )
 
 
 class ProjectSourceCreateRequest(BaseModel):
@@ -464,6 +486,7 @@ class ProjectResponse(BaseModel):
     status: str = "active"
     sources: list[ProjectSourceResponse] = Field(default_factory=list)
     workflow_ids: list[str] = Field(default_factory=list)
+    active_schedule_count: int = 0
     grants: list[ProjectGrantResponse] = Field(default_factory=list)
     is_shared_with_me: bool = False
     shared_by_email: str | None = None
@@ -801,7 +824,41 @@ class EnrichModelsPreviewRequest(BaseModel):
     env_var: str | None = None
 
 
+class QuestionSetOption(BaseModel):
+    id: str
+    label: str
+    description: str | None = None
+
+
+class QuestionSetQuestion(BaseModel):
+    id: str
+    question: str
+    header: str | None = None
+    options: list[QuestionSetOption] = Field(default_factory=list)
+    multiple: bool = False
+    allow_custom: bool = True
+    required: bool = True
+
+
+class QuestionSetAnswer(BaseModel):
+    question_id: str
+    selected_option_ids: list[str] = Field(default_factory=list)
+    custom_answer: str | None = None
+
+
+class QuestionSetReply(BaseModel):
+    answers: list[QuestionSetAnswer] = Field(default_factory=list)
+    mode: Literal["structured", "plain_text"] = "structured"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_reply(cls, value: Any) -> Any:
+        return normalize_reply(value)
+
+
 class PendingPauseResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
     pause_id: str
     pause_type: str
     task_id: str | None = None
@@ -809,8 +866,24 @@ class PendingPauseResponse(BaseModel):
     step_run_id: str | None = None
     session_id: str | None = None
     question: str | None = None
+    questions: list[QuestionSetQuestion] | None = None
     options: list[dict[str, Any]] | None = None
     context: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_questions(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("questions") is not None:
+            normalized = dict(value)
+            normalized["questions"] = normalize_questions(normalized.get("questions"))
+            return normalized
+        return value
+
+    @model_validator(mode="after")
+    def _reject_step_question_legacy_fields(self) -> PendingPauseResponse:
+        if self.pause_type in {"step_input", "step_question"} and self.question is not None:
+            raise ValueError("step question pauses must use questions")
+        return self
 
 
 class TaskCreateRequest(BaseModel):
@@ -1181,6 +1254,10 @@ class ScheduleResponse(BaseModel):
     human_schedule: str | None = None
 
 
+class ScheduleTriggerResponse(ScheduleResponse):
+    task_id: str | None = None
+
+
 class GateResponseRequest(BaseModel):
     step_name: str | None = None
     action: str
@@ -1189,7 +1266,21 @@ class GateResponseRequest(BaseModel):
 
 class StepResponseRequest(BaseModel):
     step_name: str | None = None
-    response: str = ""
+    answers: list[QuestionSetAnswer]
+    mode: Literal["structured", "plain_text"] = "structured"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_reply(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        try:
+            normalized = normalize_reply(value)
+        except ValueError as exc:
+            raise PydanticCustomError("invalid_question_reply", str(exc)) from exc
+        if value.get("step_name") is not None:
+            normalized["step_name"] = value.get("step_name")
+        return normalized
 
 
 class WorkflowRequest(BaseModel):

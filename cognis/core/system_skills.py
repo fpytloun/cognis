@@ -417,6 +417,58 @@ over this skill for paid users who want a turnkey multi-source report.
 - Do not silently ignore disagreements between sources.
 """,
     },
+    "office-documents": {
+        "skill_id": "office-documents",
+        "content": """---
+name: Office Documents
+description: Create, inspect, validate, render, and safely modify DOCX/XLSX/PPTX files with Cognis Office tools backed by certified OfficeCLI.
+tags:
+  - office
+  - documents
+  - docx
+  - xlsx
+  - pptx
+linked_tool_ids:
+  - builtin:office_read
+  - builtin:office_get
+  - builtin:office_query
+  - builtin:office_validate
+  - builtin:office_render
+  - builtin:office_create
+  - builtin:office_patch
+---
+
+# Purpose
+
+Use this skill when working with Office documents (`.docx`, `.xlsx`, `.pptx`) in Cognis.
+
+# Workflow
+
+- Prefer Cognis tools over raw shell commands: `office_read`, `office_get`, `office_query`, `office_validate`, `office_render`, `office_create`, and `office_patch`.
+- Start with `office_read` for a high-level view, then use `office_get` or `office_query` for stable paths/selectors.
+- Use `office_patch` with structured `set`/`add`/`remove` operations. Pass `expected_base_sha256` when editing a known source to reject stale edits.
+- Use `office_create` for new documents and pass initial operations when useful.
+- Validate generated or modified documents with `office_validate`.
+- When visual or structural correctness matters, use `office_render` and/or a readback with `office_read`, `office_get`, or `office_query`.
+
+# Operation Shape
+
+Patch/create operations map to OfficeCLI verbs without exposing raw shell:
+
+- `verb`: `set`, `add`, or `remove`
+- `path`, `parent`, or `selector`: target scope
+- `type`: element type for `add`
+- `props`: key/value properties converted to OfficeCLI properties
+- `before`, `after`, `index`, `from_path`: positioning or clone controls where supported
+
+# Safety
+
+- Treat Office files as untrusted parser inputs.
+- Do not overwrite source artifacts; mutating tools create a temp copy and return a new artifact by default.
+- Do not use OfficeCLI watch/editor/browser flows from Cognis tools; browser document editors are out of scope.
+- Do not install or run floating `latest` OfficeCLI manually when Cognis Office tools are available.
+""",
+    },
 }
 
 

@@ -51,8 +51,10 @@ def is_executor_row_usable(
     if row is None:
         return False
     row_owner_email = getattr(row, "owner_email", None)
-    if owner_email is not None and row_owner_email != owner_email and not is_shared_owner_email(
-        row_owner_email
+    if (
+        owner_email is not None
+        and row_owner_email != owner_email
+        and not is_shared_owner_email(row_owner_email)
     ):
         return False
     if getattr(row, "status", None) != "active":
@@ -86,6 +88,8 @@ async def validate_executor_mcp_scope(
         if row is None:
             msg = f"MCP server '{server_id}' is not available for this user"
             raise ValueError(msg)
-        if is_shared_owner_email(owner_email) and not is_shared_owner_email(getattr(row, "owner_email", None)):
+        if is_shared_owner_email(owner_email) and not is_shared_owner_email(
+            getattr(row, "owner_email", None)
+        ):
             msg = f"MCP server '{server_id}' is private and cannot be assigned to a shared executor"
             raise ValueError(msg)

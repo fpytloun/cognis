@@ -18,7 +18,9 @@ COMPACTION_HANDLES_CAPPED = Counter(
 _MAX_RECOVERABLE_HANDLES = 50
 
 
-def recoverable_tool_output_lines(events: list[Any], *, max_entries: int = _MAX_RECOVERABLE_HANDLES) -> list[str]:
+def recoverable_tool_output_lines(
+    events: list[Any], *, max_entries: int = _MAX_RECOVERABLE_HANDLES
+) -> list[str]:
     """Return deterministic recoverable tool-output handle lines, capped and ranked."""
     candidates: list[tuple[int, str, str]] = []  # (output_size, name, hint_line)
     for event in events:

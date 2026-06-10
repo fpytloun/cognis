@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.question_sets import normalize_questions
 from cognis.logging import get_logger
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import NotificationRow
@@ -282,8 +283,13 @@ class NotificationService:
                 step_run_id=step_run_id,
                 session_id=session_id,
                 conversation_id=resolved_conversation_id,
-                question=str((payload or {}).get("question", "")),
-                options=(payload or {}).get("options"),
+                question=(payload or {}).get("message") or (payload or {}).get("question"),
+                options=(payload or {}).get("options")
+                if isinstance((payload or {}).get("options"), list)
+                else None,
+                questions=normalize_questions((payload or {}).get("questions"))
+                if (payload or {}).get("questions") is not None
+                else None,
                 context=pause_context if isinstance(pause_context, dict) else None,
             )
         )
@@ -812,8 +818,14 @@ class NotificationService:
                     step_run_id=row.step_run_id,
                     session_id=row.session_id,
                     conversation_id=row.conversation_id,
-                    question=str((row.payload or {}).get("question", "")),
-                    options=(row.payload or {}).get("options"),
+                    question=(row.payload or {}).get("message")
+                    or (row.payload or {}).get("question"),
+                    options=(row.payload or {}).get("options")
+                    if isinstance((row.payload or {}).get("options"), list)
+                    else None,
+                    questions=normalize_questions((row.payload or {}).get("questions"))
+                    if (row.payload or {}).get("questions") is not None
+                    else None,
                     context=(row.payload or {}).get("context")
                     if isinstance((row.payload or {}).get("context"), dict)
                     else None,

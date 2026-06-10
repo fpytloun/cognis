@@ -40,6 +40,19 @@ class RuntimeAccessContext:
             and not self.workflow_step
         )
 
+    @property
+    def is_interactive_root_chat(self) -> bool:
+        """Return true when controller-only tools may manage peer conversations."""
+
+        return (
+            bool(self.user_email)
+            and bool(self.agent_id)
+            and self.parent_session_id is None
+            and not self.delegation_mode
+            and not self.workflow_step
+            and not self.task_id
+        )
+
 
 current_user_email: ContextVar[str | None] = ContextVar("current_user_email", default=None)
 current_agent_id: ContextVar[str | None] = ContextVar("current_agent_id", default=None)

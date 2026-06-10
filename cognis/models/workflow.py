@@ -210,8 +210,8 @@ class StepInputConfig(BaseModel):
 
     * ``"null"``    — nothing from previous steps.
     * ``"full"``    — complete event history from **one** source step session.
-    * ``"summary"`` — LLM-generated summary of source step session(s).
-    * ``"last"``    — ``step_complete`` output(s) from source step(s).
+    * ``"summary"`` — durable step summary plus deliverable/structured outputs.
+    * ``"last"``    — richer ``step_complete`` output(s), including claims.
 
     ``source`` names the step(s) whose output is referenced.  For ``"full"``
     only a single source is allowed.  ``None`` means the engine will default

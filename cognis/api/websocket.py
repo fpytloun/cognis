@@ -34,8 +34,14 @@ from cognis.api.models import (
     WebSocketPong,
 )
 from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
+from cognis.core.conversation_state import (
+    build_state_delta,
+    linked_conversation_ids_for_task,
+    snapshot_for_conversation,
+)
 from cognis.core.events import Event, EventType
 from cognis.core.notification_resolution import build_auth_challenge_resolution_data
+from cognis.core.question_sets import validate_reply_for_questions
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError as SessionCreationFailedError,  # noqa: F401 — re-export
 )
@@ -49,6 +55,7 @@ from cognis.runtime_context import current_user_email
 from cognis.store.models import Task
 from cognis.store.queries import (
     get_browser_session_by_token,
+    get_conversation,
     get_task,
     get_user,
     list_pending_notification_types_by_conversation,
@@ -57,7 +64,22 @@ from cognis.store.queries import (
 
 logger = get_logger(__name__)
 
+
+def _is_visible_persisted_system_message(data: dict[str, Any]) -> bool:
+    """Return true for persisted system messages intended for chat timeline UI."""
+
+    notice_id = data.get("notice_id")
+    if isinstance(notice_id, str) and notice_id:
+        return True
+
+    if data.get("kind") == "turn_initiated":
+        return True
+
+    return data.get("event") == "turn_initiated"
+
+
 _NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
+_MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics (transport-specific)
@@ -424,6 +446,8 @@ class WebSocketTurnObserver:
             "attachments": strip_attachment_payload_bytes(result.attachments or []),
             "chat_mode": result.chat_mode,
             "chat_mode_source": result.chat_mode_source,
+            "partial": result.partial,
+            "finish_reason": result.finish_reason,
         }
         if result.delegated:
             payload["delegated"] = True
@@ -533,13 +557,25 @@ class WebSocketTurnObserver:
                 },
             )
 
-    async def on_system_message(self, conversation_id: str, text: str) -> None:
+    async def on_system_message(
+        self,
+        conversation_id: str,
+        text: str,
+        notice_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
         await self._manager.send_to_conversation(
             conversation_id,
             {
                 "type": "system_message",
                 "conversation_id": conversation_id,
                 "text": text,
+                "notice_id": notice_id,
+                "kind": kind,
+                "scope": scope,
+                "turn_id": turn_id,
             },
         )
 
@@ -741,6 +777,9 @@ class WebSocketConnectionManager:
         # FOLLOW_UP_TURN_REQUESTED is handled by TurnScheduler
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
             return
+        if event.type == EventType.CONVERSATION_STATE_CHANGED:
+            await self._fanout_conversation_state_delta(event)
+            return
 
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
@@ -755,6 +794,116 @@ class WebSocketConnectionManager:
         attention_payload = await self._notification_attention_payload(event, conversation_id)
         if attention_payload is not None:
             await self.send_to_user(attention_payload["user_email"], attention_payload["payload"])
+        if event.type in {
+            EventType.STEP_STARTED,
+            EventType.STEP_COMPLETED,
+            EventType.STEP_FAILED,
+            EventType.STEP_PAUSED,
+            EventType.TASK_STARTED,
+            EventType.TASK_COMPLETED,
+            EventType.TASK_FAILED,
+            EventType.TASK_CANCELLED,
+            EventType.TASK_PAUSED,
+            EventType.NOTIFICATION_CREATED,
+            EventType.NOTIFICATION_RESOLVED,
+        }:
+            source_kind = {
+                EventType.NOTIFICATION_CREATED: "task.notification.created",
+                EventType.NOTIFICATION_RESOLVED: "task.notification.resolved",
+            }.get(event.type, f"task.{event.type.value}")
+            await self._fanout_conversation_state_delta(
+                Event(
+                    type=EventType.CONVERSATION_STATE_CHANGED,
+                    data={**event.data, "source_kind": source_kind},
+                )
+            )
+
+    async def _send_conversation_state_snapshot(
+        self,
+        connection: AuthenticatedWebSocket,
+        conversation_id: str,
+        *,
+        active_session_last_seq: int | None = None,
+    ) -> None:
+        async with self.app.state.session_factory() as session:
+            snapshot = await snapshot_for_conversation(
+                session,
+                user_email=connection.user_email,
+                conversation_id=conversation_id,
+                turn_scheduler=getattr(self.app.state, "turn_scheduler", None),
+                active_session_last_seq=active_session_last_seq,
+            )
+        if snapshot is None:
+            return
+        await connection.send_json(
+            {
+                "type": "conversation_state_snapshot",
+                "conversation_id": conversation_id,
+                "state": snapshot.model_dump(mode="json"),
+            }
+        )
+
+    async def _fanout_conversation_state_delta(self, event: Event) -> None:
+        task_id = event.data.get("task_id")
+        user_email = event.data.get("user_email")
+        if not isinstance(task_id, str):
+            return
+        if not isinstance(user_email, str) or not user_email:
+            async with self.app.state.session_factory() as session:
+                task = await get_task(session, task_id)
+            if task is None:
+                return
+            user_email = task.created_by
+        step_run_id = event.data.get("step_run_id")
+        if not isinstance(step_run_id, str):
+            step_run_id = None
+        source_kind = event.data.get("source_kind")
+        if not isinstance(source_kind, str) or not source_kind:
+            source_kind = "task.state.changed"
+        async with self.app.state.session_factory() as session:
+            conversation_ids = await linked_conversation_ids_for_task(
+                session,
+                user_email=user_email,
+                task_id=task_id,
+                step_run_id=step_run_id if source_kind == "task_step.todos.changed" else None,
+            )
+            snapshots = {
+                conversation_id: snapshot
+                for conversation_id in conversation_ids
+                if (
+                    snapshot := await snapshot_for_conversation(
+                        session,
+                        user_email=user_email,
+                        conversation_id=conversation_id,
+                        turn_scheduler=getattr(self.app.state, "turn_scheduler", None),
+                    )
+                )
+                is not None
+            }
+        for conversation_id, snapshot in snapshots.items():
+            changed_paths = ["state"]
+            if source_kind == "task_step.todos.changed":
+                changed_paths.append("task.relevant_step.todos")
+            elif source_kind.startswith("task.notification."):
+                changed_paths.append("pending")
+            else:
+                changed_paths.append("task")
+            delta = build_state_delta(
+                conversation_id=conversation_id,
+                source_kind=source_kind,
+                task_id=task_id,
+                step_run_id=step_run_id,
+                changed_paths=changed_paths,
+                replace={"state": snapshot.model_dump(mode="json")},
+            )
+            await self.send_to_conversation(
+                conversation_id,
+                {
+                    "type": "conversation_state_delta",
+                    "conversation_id": conversation_id,
+                    **delta.model_dump(mode="json"),
+                },
+            )
 
     def _conversation_activity_payload(
         self,
@@ -903,6 +1052,7 @@ class WebSocketConnectionManager:
         await self.send_queue_snapshot(connection, conversation_id)
 
         if session_row is None:
+            await self._send_conversation_state_snapshot(connection, conversation_id)
             return
 
         session = _to_session_model(session_row)
@@ -989,6 +1139,10 @@ class WebSocketConnectionManager:
                             "token_usage": None,
                             "queued_count": 0,
                             "attachments": attachments,
+                            "partial": bool(data.get("partial")),
+                            "finish_reason": data.get("finish_reason")
+                            if isinstance(data.get("finish_reason"), str)
+                            else None,
                         }
                     )
                     replayed += 1
@@ -1157,6 +1311,24 @@ class WebSocketConnectionManager:
                             }
                         )
                     replayed += 1
+                elif event_type == "system_message":
+                    if not _is_visible_persisted_system_message(data):
+                        continue
+                    await connection.send_json(
+                        {
+                            "type": "system_message",
+                            "conversation_id": conversation_id,
+                            "seq": item.get("seq"),
+                            "text": str(
+                                data.get("content") or data.get("text") or data.get("message") or ""
+                            ),
+                            "turn_id": data.get("turn_id"),
+                            "notice_id": data.get("notice_id"),
+                            "kind": data.get("kind"),
+                            "scope": data.get("scope"),
+                        }
+                    )
+                    replayed += 1
                 elif event_type == "lifecycle" and data.get("event") == "system_notice":
                     await connection.send_json(
                         {
@@ -1224,6 +1396,11 @@ class WebSocketConnectionManager:
                         **snapshot,
                     }
                 )
+        await self._send_conversation_state_snapshot(
+            connection,
+            conversation_id,
+            active_session_last_seq=result.last_seq,
+        )
 
         await connection.send_json(
             {
@@ -1475,7 +1652,13 @@ async def _handle_message(
         )
         return
 
-    if not await _authorize_conversation_frame(app, manager, connection, conversation_id):
+    if not await _authorize_conversation_frame(
+        app,
+        manager,
+        connection,
+        conversation_id,
+        require_mutation=True,
+    ):
         return
 
     # Subscribe only after authorization, because queue snapshots include user content.
@@ -1916,6 +2099,8 @@ async def _handle_step_response(
     task_id = message.get("task_id")
     notification_id = message.get("notification_id")
     response = message.get("response", "")
+    raw_reply = {"answers": message.get("answers"), "mode": message.get("mode", "structured")}
+    reply: dict[str, Any] | None = None
     if notification_id is not None and not isinstance(notification_id, str):
         await manager.send_error(
             connection,
@@ -2026,10 +2211,20 @@ async def _handle_step_response(
                     recoverable=True,
                 )
             return
+        try:
+            reply = validate_reply_for_questions(raw_reply, pause.questions or [])
+        except ValueError as exc:
+            await manager.send_error(
+                connection,
+                code="validation_error",
+                message=str(exc),
+                recoverable=True,
+            )
+            return
         resolved = await svc.resolve(
             notification.notification_id,
             "continue",
-            {"response": str(response)},
+            reply,
             user_email=notification.user_email,
         )
         if not resolved:
@@ -2046,10 +2241,29 @@ async def _handle_step_response(
     if notif is None and isinstance(task_id, str):
         notif = await svc.find_by_task(task_id, notification_type="step_question", status="pending")
     if notif is not None:
+        try:
+            questions = (
+                (
+                    app.state.pause_waiter.get(notif.notification_id).questions
+                    if app.state.pause_waiter.get(notif.notification_id) is not None
+                    else None
+                )
+                or (notif.payload or {}).get("questions")
+                or []
+            )
+            reply = validate_reply_for_questions(raw_reply, questions)
+        except ValueError as exc:
+            await manager.send_error(
+                connection,
+                code="validation_error",
+                message=str(exc),
+                recoverable=True,
+            )
+            return
         resolved = await svc.resolve(
             notif.notification_id,
             "continue",
-            {"response": str(response)},
+            reply,
         )
         if not resolved:
             await manager.send_error(
@@ -2069,9 +2283,19 @@ async def _handle_step_response(
             pause_type="step_input",
         )
         if pause is not None:
+            try:
+                reply = validate_reply_for_questions(raw_reply, pause.questions or [])
+            except ValueError as exc:
+                await manager.send_error(
+                    connection,
+                    code="validation_error",
+                    message=str(exc),
+                    recoverable=True,
+                )
+                return
             app.state.pause_waiter.resolve(
                 pause.pause_id,
-                PauseResolution(decision="continue", data={"response": str(response)}),
+                PauseResolution(decision="continue", data=reply),
             )
             resolved = True
 
@@ -2085,8 +2309,18 @@ async def _handle_step_response(
         return
 
     # Handle task resume for recovered tasks (task not actively running)
+    if not isinstance(task_id, str):
+        return
     if not app.state.task_queue.has_active_run(task_id):
-        await _store_recovered_step_input_response(app, task_id, str(response))
+        if reply is None:
+            await manager.send_error(
+                connection,
+                code="validation_error",
+                message="Structured question-set reply is required",
+                recoverable=True,
+            )
+            return
+        await _store_recovered_step_input_response(app, task_id, reply)
         pause = app.state.pause_waiter.find_pending(task_id=task_id, pause_type="step_input")
         if pause is not None:
             app.state.pause_waiter.clear(pause.pause_id)
@@ -2201,8 +2435,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "step_name": event.data.get("step_name"),
-            "question": event.data.get("question"),
-            "options": event.data.get("options"),
+            "questions": event.data.get("questions"),
             "context": event.data.get("context"),
         }
     if event.type == EventType.STEP_STARTED:
@@ -2255,10 +2488,16 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             )
         if isinstance(event.data.get("pending_notification_types"), list):
             payload["pending_notification_types"] = event.data.get("pending_notification_types")
+        if isinstance(event.data.get("has_unread"), bool):
+            payload["has_unread"] = event.data.get("has_unread")
+        if event.data.get("last_read_at") is not None:
+            payload["last_read_at"] = event.data.get("last_read_at")
         if event.data.get("last_message_at") is not None:
             payload["last_message_at"] = event.data.get("last_message_at")
         if event.data.get("updated_at") is not None:
             payload["updated_at"] = event.data.get("updated_at")
+        if isinstance(event.data.get("created_conversation_id"), str):
+            payload["created_conversation_id"] = event.data.get("created_conversation_id")
         return payload
     if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
         "tool_call_started",
@@ -2440,6 +2679,44 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "decision": event.data.get("decision"),
             "reason": event.data.get("reason"),
         }
+    if event.type == EventType.SESSION_COMPACTION_STARTED:
+        return {
+            "type": "session_compaction_started",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "trigger": event.data.get("trigger"),
+            "reason": event.data.get("reason"),
+            "prompt_tokens": event.data.get("prompt_tokens"),
+            "max_context_tokens": event.data.get("max_context_tokens"),
+            "max_input_tokens": event.data.get("max_input_tokens"),
+            "available_prompt_tokens": event.data.get("available_prompt_tokens"),
+            "compaction_threshold_prompt_tokens": event.data.get(
+                "compaction_threshold_prompt_tokens"
+            ),
+            "loop_pressure_threshold_prompt_tokens": event.data.get(
+                "loop_pressure_threshold_prompt_tokens"
+            ),
+            "compaction_threshold": event.data.get("compaction_threshold"),
+            "previous_usage_percentage": event.data.get("previous_usage_percentage"),
+            "effective_usage_percentage": event.data.get("effective_usage_percentage"),
+            "hard_pressure_exceeded": event.data.get("hard_pressure_exceeded"),
+            "used_timeout_fallback": event.data.get("used_timeout_fallback"),
+            "phase": event.data.get("phase"),
+            "status": event.data.get("status"),
+            "provider_id": event.data.get("provider_id"),
+            "model_id": event.data.get("model_id"),
+            "fallback_reason": event.data.get("fallback_reason"),
+        }
+    if event.type == EventType.SESSION_COMPACTION_FINISHED:
+        return {
+            "type": "session_compaction_finished",
+            "conversation_id": conversation_id,
+            "session_id": event.data.get("session_id"),
+            "trigger": event.data.get("trigger"),
+            "reason": event.data.get("reason"),
+            "status": event.data.get("status"),
+            "fallback_reason": event.data.get("fallback_reason"),
+        }
     if event.type == EventType.SESSION_COMPACTED:
         return {
             "type": "session_compacted",
@@ -2468,6 +2745,11 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "effective_usage_percentage": event.data.get("effective_usage_percentage"),
             "hard_pressure_exceeded": event.data.get("hard_pressure_exceeded"),
             "used_timeout_fallback": event.data.get("used_timeout_fallback"),
+            "phase": event.data.get("phase"),
+            "status": event.data.get("status"),
+            "provider_id": event.data.get("provider_id"),
+            "model_id": event.data.get("model_id"),
+            "fallback_reason": event.data.get("fallback_reason"),
         }
     # Unified notification events
     if event.type == EventType.NOTIFICATION_CREATED:
@@ -2503,8 +2785,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "notification_id": event.data.get("notification_id"),
                 "task_id": event.data.get("task_id"),
                 "step_name": event.data.get("step_name"),
-                "question": payload.get("question"),
-                "options": payload.get("options"),
+                "questions": payload.get("questions"),
                 "context": payload.get("context"),
             }
         if ntype == "auth_challenge":
@@ -2607,9 +2888,8 @@ async def _authorize_conversation_frame(
     conversation_id: str,
     *,
     require_mutation: bool = False,
+    allow_managed_conversation_mutation: bool = False,
 ) -> bool:
-    from cognis.store.queries import get_conversation
-
     async with app.state.session_factory() as db_session:
         conversation_row = await get_conversation(db_session, conversation_id)
     if conversation_row is None:
@@ -2634,6 +2914,21 @@ async def _authorize_conversation_frame(
             code="forbidden",
             message="Viewer accounts are read-only",
             recoverable=False,
+        )
+        return False
+    if (
+        require_mutation
+        and not allow_managed_conversation_mutation
+        and conversation_row.context_type in _MANAGED_CONVERSATION_CONTEXT_TYPES
+    ):
+        await manager.send_error(
+            connection,
+            code="managed_conversation_read_only",
+            message=(
+                "Managed conversations are read-only from the target chat; "
+                "use managed actions from the controller conversation."
+            ),
+            recoverable=True,
         )
         return False
     return True
@@ -2666,7 +2961,9 @@ async def _persist_task_feedback(app: Any, task_id: str, feedback: str) -> None:
         await session.commit()
 
 
-async def _store_recovered_step_input_response(app: Any, task_id: str, response: str) -> None:
+async def _store_recovered_step_input_response(
+    app: Any, task_id: str, reply: dict[str, Any]
+) -> None:
     async with app.state.session_factory() as session:
         row = await get_task(session, task_id)
         if row is None or not row.workflow_state:
@@ -2675,7 +2972,8 @@ async def _store_recovered_step_input_response(app: Any, task_id: str, response:
         if state.get("pending_pause_type") != "step_input":
             return
         payload = dict(state.get("pending_pause_payload") or {})
-        payload["response"] = response
+        payload["answers"] = reply.get("answers", [])
+        payload["mode"] = reply.get("mode", "structured")
         state["pending_pause_payload"] = payload
         row.workflow_state = state
         await session.commit()
@@ -2718,8 +3016,7 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                             "notification_id": notif.notification_id,
                             "task_id": notif.task_id,
                             "step_name": notif.step_name,
-                            "question": payload.get("question", ""),
-                            "options": payload.get("options"),
+                            "questions": payload.get("questions"),
                             "context": payload.get("context"),
                         }
                     )
@@ -2806,8 +3103,7 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                     "type": "workflow_step_question",
                     "task_id": row.task_id,
                     "step_name": pause.step_name,
-                    "question": pause.question,
-                    "options": pause.options,
+                    "questions": pause.questions,
                     "context": pause.context,
                 }
             )

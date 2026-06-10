@@ -30,6 +30,7 @@ from cognis.store.models import MCPServerRow
 from cognis.store.queries import (
     create_mcp_oauth_transaction,
     get_mcp_oauth_token,
+    get_mcp_oauth_token_for_server,
     get_mcp_oauth_transaction,
     get_mcp_server,
     mark_mcp_oauth_token_status,
@@ -58,6 +59,19 @@ _RESERVED_AUTHORIZATION_PARAMS = {
 class MCPOAuthError(RuntimeError):
     """Safe OAuth error for user-visible/API paths."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str | None = None,
+        authorization_required: bool = False,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.authorization_required = authorization_required
+        self.retryable = retryable
+
 
 @dataclass(frozen=True)
 class AuthorizationStart:
@@ -82,6 +96,30 @@ class TokenInjectionResult:
     reason: str | None = None
     authorization_url: str | None = None
     transaction_id: str | None = None
+    authorization_expires_at: datetime | None = None
+
+
+def oauth_required_mcp_status(
+    *,
+    server_id: object,
+    server_name: str,
+    reason: str | None,
+    transaction_id: str | None = None,
+    authorization_url: str | None = None,
+) -> dict[str, Any]:
+    """Return safe runtime metadata for an MCP server awaiting OAuth authorization."""
+
+    return {
+        "server_id": str(server_id),
+        "name": server_name,
+        "phase": "authorization",
+        "status": "authorization_required",
+        "authorization_required": True,
+        "reason": reason or "authorization_required",
+        "transaction_id": transaction_id,
+        "authorization_url": authorization_url,
+        "authorization_url_available": bool(authorization_url),
+    }
 
 
 @dataclass(frozen=True)
@@ -203,9 +241,15 @@ class MCPOAuthService:
                 raise MCPOAuthError("MCP OAuth server URL is required for discovery")
             issuer = await self._discover_issuer_from_resource(server.url)
         issuer = _safe_url(issuer.rstrip("/"))
-        metadata = await self._fetch_json(f"{issuer}/.well-known/oauth-authorization-server")
+        metadata = await self._fetch_json(
+            f"{issuer}/.well-known/oauth-authorization-server",
+            missing_ok=True,
+        )
         if not metadata:
-            metadata = await self._fetch_json(f"{issuer}/.well-known/openid-configuration")
+            metadata = await self._fetch_json(
+                f"{issuer}/.well-known/openid-configuration",
+                missing_ok=True,
+            )
         if not metadata:
             raise MCPOAuthError("OAuth authorization server metadata not found")
         metadata_issuer = str(metadata.get("issuer") or issuer).rstrip("/")
@@ -218,7 +262,8 @@ class MCPOAuthService:
         parsed = urlsplit(_safe_url(resource_url))
         base = f"{parsed.scheme}://{parsed.netloc}"
         resource_metadata = await self._fetch_json(
-            urljoin(base, "/.well-known/oauth-protected-resource")
+            urljoin(base, "/.well-known/oauth-protected-resource"),
+            missing_ok=True,
         )
         if resource_metadata:
             auth_servers = resource_metadata.get("authorization_servers")
@@ -229,12 +274,22 @@ class MCPOAuthService:
         ) as client:
             response = await client.get(resource_url)
         challenge = parse_www_authenticate(response.headers.get("www-authenticate"))
+        resource_metadata_url = challenge.get("resource_metadata")
+        if resource_metadata_url:
+            resource_metadata = await self._fetch_json(
+                resource_metadata_url,
+                missing_ok=True,
+            )
+            if resource_metadata:
+                auth_servers = resource_metadata.get("authorization_servers")
+                if isinstance(auth_servers, list) and auth_servers:
+                    return str(auth_servers[0])
         issuer = challenge.get("authorization_uri") or challenge.get("issuer")
         if not issuer:
             raise MCPOAuthError("OAuth authorization server could not be discovered")
         return issuer
 
-    async def _fetch_json(self, url: str) -> dict[str, Any] | None:
+    async def _fetch_json(self, url: str, *, missing_ok: bool = False) -> dict[str, Any] | None:
         current_url = _safe_url(url)
         async with httpx.AsyncClient(timeout=_METADATA_TIMEOUT, follow_redirects=False) as client:
             for _ in range(3):
@@ -252,7 +307,12 @@ class MCPOAuthService:
         response.raise_for_status()
         if len(response.content) > _MAX_METADATA_BYTES:
             raise MCPOAuthError("OAuth metadata response too large")
-        data = response.json()
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            if missing_ok:
+                return None
+            raise MCPOAuthError("OAuth metadata response is not valid JSON") from exc
         return data if isinstance(data, dict) else None
 
     async def _resolve_client_registration(
@@ -527,6 +587,7 @@ class MCPOAuthService:
             reason=reason,
             authorization_url=authorization.authorization_url if authorization else None,
             transaction_id=authorization.transaction_id if authorization else None,
+            authorization_expires_at=authorization.expires_at if authorization else None,
         )
 
     async def complete_callback(self, *, state: str, code: str) -> str:
@@ -569,9 +630,11 @@ class MCPOAuthService:
                     code_verifier=str(payload["code_verifier"]),
                     resource=row.resource,
                 )
+                token_response["token_endpoint"] = token_endpoint
                 expires_at = None
                 if isinstance(token_response.get("expires_in"), int):
                     expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
+                token_response = _record_absolute_refresh_token_expiry(token_response, now)
                 await upsert_mcp_oauth_token(
                     session,
                     user_email=row.user_email,
@@ -654,13 +717,48 @@ class MCPOAuthService:
         }
         if resource:
             data["resource"] = resource
-        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
-            response = await client.post(token_endpoint, data=data)
+        try:
+            async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+                response = await client.post(token_endpoint, data=data)
+        except httpx.HTTPError as exc:
+            raise MCPOAuthError(
+                "OAuth token refresh backend is unavailable",
+                reason="refresh_backend_unavailable",
+                retryable=True,
+            ) from exc
         if response.status_code >= 400:
-            raise MCPOAuthError("OAuth token refresh failed")
-        payload = response.json()
+            error_value = None
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = None
+            if isinstance(error_payload, dict):
+                raw_error = error_payload.get("error")
+                if isinstance(raw_error, str):
+                    error_value = raw_error
+            if error_value == "invalid_grant":
+                raise MCPOAuthError(
+                    "OAuth refresh token is invalid or expired",
+                    reason="invalid_grant",
+                    authorization_required=True,
+                )
+            raise MCPOAuthError(
+                "OAuth token refresh failed",
+                reason="refresh_backend_failed",
+                retryable=response.status_code >= 500,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MCPOAuthError(
+                "OAuth refresh response was not valid JSON",
+                reason="refresh_backend_failed",
+            ) from exc
         if not isinstance(payload, dict) or not payload.get("access_token"):
-            raise MCPOAuthError("OAuth refresh response missing access token")
+            raise MCPOAuthError(
+                "OAuth refresh response missing access token",
+                reason="refresh_backend_failed",
+            )
         return payload
 
     async def inject_authorization_header(
@@ -690,18 +788,36 @@ class MCPOAuthService:
             delivery_mode=delivery_mode,
         )
         issuer = (auth_config.issuer or auth_config.authorization_server or "").rstrip("/")
-        if not issuer:
-            metadata = await self.discover_metadata(server)
-            issuer = str(metadata["issuer"]).rstrip("/")
         resource = auth_config.resource or server.url
         async with self._session_factory() as session:
-            row = await get_mcp_oauth_token(
-                session,
-                user_email=user_email,
-                mcp_server_id=server.server_id,
-                issuer=issuer,
-                resource=resource,
-            )
+            row = None
+            if issuer:
+                row = await get_mcp_oauth_token(
+                    session,
+                    user_email=user_email,
+                    mcp_server_id=server.server_id,
+                    issuer=issuer,
+                    resource=resource,
+                )
+            else:
+                row = await get_mcp_oauth_token_for_server(
+                    session,
+                    user_email=user_email,
+                    mcp_server_id=server.server_id,
+                )
+                if row is not None:
+                    issuer = str(row.issuer or "").rstrip("/")
+                    resource = auth_config.resource or row.resource or server.url
+                else:
+                    metadata = await self.discover_metadata(server)
+                    issuer = str(metadata["issuer"]).rstrip("/")
+                    row = await get_mcp_oauth_token(
+                        session,
+                        user_email=user_email,
+                        mcp_server_id=server.server_id,
+                        issuer=issuer,
+                        resource=resource,
+                    )
             if row is None or row.status != "active":
                 authorization = await self.start_authorization_for_server(
                     user_email=user_email,
@@ -719,67 +835,68 @@ class MCPOAuthService:
                     reason="authorization_required",
                     authorization_url=authorization.authorization_url if authorization else None,
                     transaction_id=authorization.transaction_id if authorization else None,
+                    authorization_expires_at=authorization.expires_at if authorization else None,
                 )
             payload = self._decrypt(row.encrypted_payload)
             now = _utcnow()
-            if row.expires_at is not None and row.expires_at <= now + timedelta(
+            should_refresh = row.expires_at is not None and row.expires_at <= now + timedelta(
                 seconds=_REFRESH_SKEW_SECONDS
-            ):
+            )
+            if should_refresh:
                 refresh_token = payload.get("refresh_token")
                 if not isinstance(refresh_token, str) or not refresh_token:
-                    await mark_mcp_oauth_token_status(
-                        session, token_id=row.token_id, status="expired"
-                    )
-                    await session.commit()
-                    authorization = await self.start_authorization_for_server(
-                        user_email=user_email,
-                        server=server,
-                        conversation_id=conversation_id,
-                        task_id=task_id,
-                        step_name=step_name,
-                        step_run_id=step_run_id,
-                        session_id=session_id,
-                        delivery_mode=delivery_mode,
-                    )
-                    return TokenInjectionResult(
+                    return await self._mark_token_invalid_and_start_authorization(
+                        session,
+                        token_id=row.token_id,
                         headers=headers,
-                        authorization_required=True,
-                        reason="token_expired",
-                        authorization_url=authorization.authorization_url
-                        if authorization
-                        else None,
-                        transaction_id=authorization.transaction_id if authorization else None,
+                        context=challenge_context,
+                        reason="refresh_token_missing",
                     )
                 try:
-                    metadata = await self.discover_metadata(server)
+                    token_endpoint = payload.get("token_endpoint")
+                    if not isinstance(token_endpoint, str) or not token_endpoint:
+                        metadata = await self.discover_metadata(server)
+                        token_endpoint = str(metadata.get("token_endpoint") or "")
                     refreshed = await self._refresh_token(
-                        token_endpoint=_safe_url(str(metadata.get("token_endpoint") or "")),
+                        token_endpoint=_safe_url(token_endpoint),
                         client_id=row.client_id
                         or auth_config.client_id
                         or f"cognis-mcp-{server.server_id}",
                         refresh_token=refresh_token,
                         resource=resource,
                     )
-                except Exception:
+                except MCPOAuthError as exc:
+                    if not exc.authorization_required:
+                        raise
                     logger.warning(
-                        "mcp oauth: token refresh failed; token marked invalid",
+                        "mcp oauth: refresh token invalid; token marked invalid",
                         extra={
                             "extra_data": {
                                 "server_id": server.server_id,
                                 "token_id": row.token_id,
+                                "reason": exc.reason or "refresh_failed",
                             }
                         },
-                        exc_info=True,
                     )
                     return await self._mark_token_invalid_and_start_authorization(
                         session,
                         token_id=row.token_id,
-                        reason="refresh_failed",
+                        reason=exc.reason or "refresh_failed",
                         headers=headers,
                         context=challenge_context,
                     )
                 if not refreshed.get("refresh_token"):
                     refreshed["refresh_token"] = refresh_token
+                if not _has_refresh_token_expiry_metadata(refreshed):
+                    for key in (
+                        "refresh_token_expires_at",
+                        "refresh_expires_at",
+                        "authorization_expires_at",
+                    ):
+                        if key in payload:
+                            refreshed[key] = payload[key]
+                refreshed["token_endpoint"] = token_endpoint
+                refreshed = _record_absolute_refresh_token_expiry(refreshed, now)
                 expires_at = None
                 if isinstance(refreshed.get("expires_in"), int):
                     expires_at = now + timedelta(seconds=int(refreshed["expires_in"]))
@@ -808,15 +925,91 @@ class MCPOAuthService:
         return TokenInjectionResult(headers=injected)
 
 
-def oauth_status_payload(row: Any | None) -> dict[str, Any]:
+def _safe_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed
+
+
+def _has_refresh_token_expiry_metadata(token_payload: dict[str, Any]) -> bool:
+    return any(
+        key in token_payload
+        for key in (
+            "refresh_token_expires_at",
+            "refresh_expires_at",
+            "authorization_expires_at",
+            "refresh_token_expires_in",
+            "refresh_expires_in",
+        )
+    )
+
+
+def _record_absolute_refresh_token_expiry(
+    token_payload: dict[str, Any], now: datetime
+) -> dict[str, Any]:
+    if any(
+        token_payload.get(key)
+        for key in ("refresh_token_expires_at", "refresh_expires_at", "authorization_expires_at")
+    ):
+        return token_payload
+    for key in ("refresh_token_expires_in", "refresh_expires_in"):
+        value = token_payload.get(key)
+        if isinstance(value, int) and value > 0:
+            token_payload["refresh_token_expires_at"] = (now + timedelta(seconds=value)).isoformat()
+            return token_payload
+    return token_payload
+
+
+def _future_or_unbounded(value: datetime | None) -> bool:
+    if value is None:
+        return True
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value > _utcnow()
+
+
+def _refresh_token_expires_at(row: Any, token_payload: dict[str, Any]) -> datetime | None:
+    for key in ("refresh_token_expires_at", "refresh_expires_at", "authorization_expires_at"):
+        parsed = _safe_datetime(token_payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def oauth_status_payload(
+    row: Any | None, token_payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
     if row is None:
         return {"connected": False}
+    access_token_expires_at = row.expires_at.isoformat() if row.expires_at else None
+    refreshable = None
+    authorization_expires_at = None
+    if token_payload is not None:
+        refreshable = bool(token_payload.get("refresh_token"))
+        refresh_token_expires_at = _refresh_token_expires_at(row, token_payload)
+        authorization_expires_at = (
+            refresh_token_expires_at.isoformat() if refresh_token_expires_at else None
+        )
+    if refreshable is None:
+        connected = row.status == "active"
+    elif refreshable:
+        connected = row.status == "active" and _future_or_unbounded(refresh_token_expires_at)
+    else:
+        connected = row.status == "active" and _future_or_unbounded(row.expires_at)
     return {
-        "connected": row.status == "active",
+        "connected": connected,
         "issuer": row.issuer,
         "resource": row.resource if row.resource_key != mcp_oauth_resource_key(None) else None,
         "scopes": row.scopes or [],
-        "expires_at": row.expires_at.isoformat() if row.expires_at else None,
-        "refreshable": True,
+        "expires_at": access_token_expires_at,
+        "access_token_expires_at": access_token_expires_at,
+        "authorization_expires_at": authorization_expires_at,
+        "refreshable": refreshable if refreshable is not None else True,
         "status": row.status,
     }

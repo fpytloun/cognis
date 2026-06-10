@@ -1617,6 +1617,14 @@ class SessionCache:
                     or existing.seq <= 0
                 ):
                     entry.project_contexts[project_context.project_root] = project_context
+            if (
+                event.type == "developer_message"
+                and event.data.get("context_injection") is True
+                and event.data.get("replayable") is True
+                and event.data.get("visibility") == "agent_context"
+                and event.seq > entry.last_compaction_seq
+            ):
+                entry.events.append(event)
             entry.last_event_seq = max(entry.last_event_seq, event.seq)
             return
         if event.type == "compaction_summary":

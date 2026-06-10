@@ -96,6 +96,9 @@ class ToolArgumentParseFailure:
     name: str
     raw: str
     recovery_attempts: tuple[str, ...]
+    reason: str = "invalid_json"
+    message: str | None = None
+    argument_length: int | None = None
 
 
 def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:

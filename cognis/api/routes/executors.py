@@ -94,11 +94,7 @@ async def _clear_executor_defaults(session: Any, owner_email: str) -> None:
     owner_filter = ExecutorRow.owner_email == owner_email
     if owner_email == SYSTEM_USER_EMAIL:
         owner_filter = or_(owner_filter, ExecutorRow.owner_email.is_(None))
-    await session.execute(
-        update(ExecutorRow)
-        .where(owner_filter)
-        .values(is_default=False)
-    )
+    await session.execute(update(ExecutorRow).where(owner_filter).values(is_default=False))
 
 
 @router.get("/api/v1/executors", response_model=list[ExecutorConfigResponse])
@@ -113,7 +109,9 @@ async def list_executors_route(request: Request) -> list[ExecutorConfigResponse]
 async def get_executor_route(request: Request, executor_id: str) -> ExecutorConfigResponse:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
+        row = await get_executor_row(
+            session, executor_id, owner_email=user.email, include_shared=True
+        )
     if row is None:
         raise api_exception(404, "not_found", "Executor not found")
     return _executor_to_response(row)
@@ -169,7 +167,9 @@ async def generate_executor_token_route(
     user = require_current_user(request)
     async with executor_token_lock(executor_id):
         async with request.app.state.session_factory() as session:
-            row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
+            row = await get_executor_row(
+                session, executor_id, owner_email=user.email, include_shared=True
+            )
             if row is None:
                 raise api_exception(404, "not_found", "Executor not found")
             _require_executor_mutation_access(request, row)
@@ -208,7 +208,9 @@ async def update_executor_route(
         raise api_exception(400, "validation_error", "No fields to update")
     policy = await load_executor_policy(request.app.state.session_factory)
     async with request.app.state.session_factory() as session:
-        existing = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
+        existing = await get_executor_row(
+            session, executor_id, owner_email=user.email, include_shared=True
+        )
         if existing is None:
             raise api_exception(404, "not_found", "Executor not found")
         _require_executor_mutation_access(request, existing)
@@ -259,7 +261,9 @@ async def update_executor_route(
 async def delete_executor_route(request: Request, executor_id: str) -> None:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        row = await get_executor_row(session, executor_id, owner_email=user.email, include_shared=True)
+        row = await get_executor_row(
+            session, executor_id, owner_email=user.email, include_shared=True
+        )
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
         _require_executor_mutation_access(request, row)

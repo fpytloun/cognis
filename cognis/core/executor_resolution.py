@@ -35,7 +35,9 @@ def is_tool_enabled(
         return True
     if tool.name in tools:
         return True
-    return tool.category in groups
+    return tool.category in groups or (
+        tool.profile_group is not None and tool.profile_group in groups
+    )
 
 
 def filter_tools_by_executor(
@@ -133,7 +135,11 @@ def select_executor_for_agent(
             return ex
 
     for ex in executors:
-        if ex.is_default and _usable(ex) and is_shared_owner_email(getattr(ex, "owner_email", None)):
+        if (
+            ex.is_default
+            and _usable(ex)
+            and is_shared_owner_email(getattr(ex, "owner_email", None))
+        ):
             return ex
 
     # 4. Fallback: first private owner executor, then shared executor.

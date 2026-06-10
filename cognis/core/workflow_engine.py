@@ -69,6 +69,7 @@ from cognis.runtime_context import (
     scoped_runtime_context,
 )
 from cognis.store.queries import (
+    claim_pending_context_task_comments,
     create_step_run,
     fail_running_step_runs_for_task,
     get_agent_direct_conversation,
@@ -432,6 +433,21 @@ class WorkflowEngine:
                             )
                             state.status = "failed"
                             break
+                        if not state.last_revision_context:
+                            gate_payload = state.pending_pause_payload or {}
+                            context = str(gate_payload.get("context") or "").strip()
+                            message = str(gate_payload.get("message") or "").strip()
+                            revision_parts = [
+                                (
+                                    f"Gate '{step_def.name}' requested revision of "
+                                    f"step '{revise_target}'."
+                                )
+                            ]
+                            if message:
+                                revision_parts.append(f"Gate message: {message}")
+                            if context:
+                                revision_parts.append(f"Gate context:\n{context}")
+                            state.last_revision_context = "\n\n".join(revision_parts)
                         state.current_step_index = target_idx
                         # Reset attempt counter so the step gets fresh attempts
                         state.loop_iterations.pop(f"attempts:{revise_target}", None)
@@ -893,6 +909,8 @@ class WorkflowEngine:
             raw_todos = latest_step_run.todos if latest_step_run is not None else None
             if isinstance(raw_todos, list):
                 persisted_todos = [item for item in raw_todos if isinstance(item, dict)]
+            if is_retry and state.last_retry_reason == "evaluation_rejected":
+                persisted_todos = self._todos_for_evaluation_retry(state, persisted_todos)
 
             if latest_step_run is None:
                 step_run_id = f"sr_{uuid.uuid4().hex}"
@@ -1057,6 +1075,33 @@ class WorkflowEngine:
 
         project_context = await self._build_project_context(task)
 
+        async def _consume_context_comments(reason: str) -> list[dict[str, Any]]:
+            async with self._session_factory() as db_session:
+                rows = await claim_pending_context_task_comments(
+                    db_session,
+                    task_id=task.task_id,
+                    step_name=step_def.name,
+                    attempt_number=task.attempt_number,
+                    step_run_id=step_run_id,
+                    reason=reason,
+                )
+                await db_session.commit()
+
+            return [
+                {
+                    "content": (
+                        f"Additional workflow task context from {row.author_email}:\n\n{row.body}"
+                    ),
+                    "attachments": [],
+                    "system_initiated": False,
+                    "follow_up": None,
+                    "source": "task_context_comment",
+                    "author_email": row.author_email,
+                    "comment_id": row.comment_id,
+                }
+                for row in rows
+            ]
+
         # Build step context — task steps can delegate (sync only)
         ctx = StepContext(
             step_definition=step_def,
@@ -1094,6 +1139,9 @@ class WorkflowEngine:
             orchestration_mode=step_orchestration,
             turn_id=step_run_id,
             todos=persisted_todos,
+            consume_boundary_batch=(
+                _consume_context_comments if step_policy is WORKFLOW_POLICY else None
+            ),
         )
 
         async def on_thinking(
@@ -1562,6 +1610,18 @@ class WorkflowEngine:
         # Resume — write status + workflow_state atomically
         state.status = "running"
         state.current_step_status = "running"
+        revise_target = _parse_revise_action(action)
+        if revise_target is not None and not state.last_revision_context:
+            revision_parts = [
+                f"Gate '{step_def.name}' requested revision of step '{revise_target}'."
+            ]
+            if gate.message:
+                revision_parts.append(f"Gate message: {gate.message}")
+            if gate_context:
+                revision_parts.append(f"Gate context:\n{gate_context}")
+            if instruction:
+                revision_parts.append(f"Operator note:\n{instruction}")
+            state.last_revision_context = "\n\n".join(revision_parts)
         state.pending_pause_type = None
         state.pending_pause_payload = None
         if instruction and action != "cancel":
@@ -3125,6 +3185,32 @@ class WorkflowEngine:
         # Fallback — create a fresh session
         conversation, session = await self._create_step_session(task, step_def, agent)
         return conversation, session, False
+
+    @staticmethod
+    def _todos_for_evaluation_retry(
+        state: WorkflowState,
+        persisted_todos: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return active todos for an evaluator-rejected retry attempt.
+
+        A rejected attempt may have completed all todos before calling
+        step_complete. Reusing that terminal list would put the retry straight
+        back into finalization-only mode, preventing the revision from doing
+        normal work. Preserve the previous todo history on the rejected step
+        run, but reopen the active retry with one pending revision todo.
+        """
+
+        terminal_statuses = {"completed", "cancelled", "done"}
+        if not persisted_todos or not all(
+            str(todo.get("status") or "pending") in terminal_statuses for todo in persisted_todos
+        ):
+            return persisted_todos
+
+        content = "Revise the step output based on evaluator feedback."
+        feedback = (state.last_evaluation_feedback or "").strip()
+        if feedback:
+            content = f"{content} Feedback: {feedback}"
+        return [{"content": content, "status": "pending"}]
 
     async def _has_prior_step_session(
         self,

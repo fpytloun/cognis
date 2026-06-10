@@ -887,6 +887,7 @@ _GEMINI_MODEL_PATTERNS = re.compile(r"(gemini|vertex_ai|google)", re.IGNORECASE)
 # (Anthropic) or truncate with strict JSON validators (Groq) see a sensible
 # ceiling. Matches the pattern used by Claude Code, Codex, aider, etc.
 JSON_MODE_AUTOFILL_FALLBACK_MAX_TOKENS = 16384
+_RESPONSES_JSON_INPUT_MARKER: dict[str, Any] = {"role": "system", "content": "Return JSON."}
 
 # Substring matches (case-insensitive) that indicate the provider's server-side
 # JSON validator rejected the generation because the model produced invalid or
@@ -946,6 +947,38 @@ def _is_json_validator_bad_request(exc: BaseException) -> bool:
         return False
     message = str(exc).lower()
     return any(sig in message for sig in _JSON_VALIDATOR_BAD_REQUEST_SIGNATURES)
+
+
+def _responses_request_wants_json_object(request_kwargs: dict[str, Any]) -> bool:
+    text = request_kwargs.get("text")
+    if not isinstance(text, dict):
+        return False
+    text_format = text.get("format")
+    return isinstance(text_format, dict) and text_format.get("type") == "json_object"
+
+
+def _contains_json_word(value: Any) -> bool:
+    if isinstance(value, str):
+        return "json" in value.lower()
+    if isinstance(value, list):
+        return any(_contains_json_word(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_json_word(item) for item in value.values())
+    return False
+
+
+def _ensure_responses_json_input_marker(input_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure Responses JSON mode satisfies providers that validate input text only.
+
+    Some Responses backends reject ``text.format={"type":"json_object"}`` unless
+    the word "json" appears in the input messages. Top-level ``instructions``
+    are not always considered by that validator, so direct Codex calls that move
+    leading system prompts into ``instructions`` need a tiny input marker.
+    """
+
+    if _contains_json_word(input_items):
+        return input_items
+    return [dict(_RESPONSES_JSON_INPUT_MARKER), *input_items]
 
 
 def _openai_tool_search_bad_request_reason(
@@ -4195,6 +4228,7 @@ class LiteLLMProvider:
                     resolved_model=resolved_model,
                     model_info=model_info,
                 ),
+                include_encrypted_reasoning=bool(getattr(model_info, "supports_reasoning", False)),
             )
             if responses_instructions is not None:
                 responses_kwargs["instructions"] = responses_instructions
@@ -4210,6 +4244,8 @@ class LiteLLMProvider:
                 ),
             )
             responses_input = messages_to_responses_input(responses_input_messages)
+            if _responses_request_wants_json_object(responses_kwargs):
+                responses_input = _ensure_responses_json_input_marker(responses_input)
             transport = await self._responses_transport(provider)
             transport_model = (
                 resolved_model if _uses_direct_codex_transport(provider) else prefixed_model
@@ -4668,7 +4704,12 @@ class LiteLLMProvider:
                         resolved_model=resolved_model,
                         model_info=model_info,
                     ),
+                    include_encrypted_reasoning=bool(
+                        getattr(model_info, "supports_reasoning", False)
+                    ),
                 )
+                if _responses_request_wants_json_object(responses_kwargs):
+                    responses_input = _ensure_responses_json_input_marker(responses_input)
                 if responses_instructions is not None:
                     responses_kwargs["instructions"] = responses_instructions
                 active_prompt_cache_key_broken_keys = self._active_capability_keys(

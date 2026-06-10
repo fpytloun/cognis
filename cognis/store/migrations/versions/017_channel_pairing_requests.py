@@ -51,33 +51,31 @@ def upgrade() -> None:
         ["channel_type", "sender_id", "status"],
     )
 
-    op.alter_column(
-        "channel_accounts",
-        "dm_policy",
-        existing_type=sa.String(),
-        server_default="pairing",
-    )
-    op.alter_column(
-        "channel_accounts",
-        "group_policy",
-        existing_type=sa.String(),
-        server_default="pairing",
-    )
+    with op.batch_alter_table("channel_accounts") as batch_op:
+        batch_op.alter_column(
+            "dm_policy",
+            existing_type=sa.String(),
+            server_default="pairing",
+        )
+        batch_op.alter_column(
+            "group_policy",
+            existing_type=sa.String(),
+            server_default="pairing",
+        )
 
 
 def downgrade() -> None:
-    op.alter_column(
-        "channel_accounts",
-        "group_policy",
-        existing_type=sa.String(),
-        server_default="mention",
-    )
-    op.alter_column(
-        "channel_accounts",
-        "dm_policy",
-        existing_type=sa.String(),
-        server_default="open",
-    )
+    with op.batch_alter_table("channel_accounts") as batch_op:
+        batch_op.alter_column(
+            "group_policy",
+            existing_type=sa.String(),
+            server_default="mention",
+        )
+        batch_op.alter_column(
+            "dm_policy",
+            existing_type=sa.String(),
+            server_default="open",
+        )
     op.drop_index("ix_channel_pairing_sender_status", table_name="channel_pairing_requests")
     op.drop_index("ix_channel_pairing_owner_status", table_name="channel_pairing_requests")
     op.drop_table("channel_pairing_requests")

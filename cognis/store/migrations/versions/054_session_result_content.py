@@ -12,8 +12,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("sessions", sa.Column("result_content", sa.Text(), nullable=True))
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    columns = {column["name"] for column in inspector.get_columns("sessions")}
+    if "result_content" not in columns:
+        op.add_column("sessions", sa.Column("result_content", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column("sessions", "result_content")
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    columns = {column["name"] for column in inspector.get_columns("sessions")}
+    if "result_content" in columns:
+        op.drop_column("sessions", "result_content")

@@ -306,6 +306,8 @@ def create_app() -> FastAPI:
             llm=providers.llm,
             session_cache=session_cache,
         )
+        providers.compaction_strategy = compaction_strategy  # type: ignore[attr-defined]
+        providers.executor.in_process.compaction_strategy = compaction_strategy
         decision_engine = await DecisionEngine.from_session_factory(
             session_factory=session_factory,
             llm=providers.llm,
@@ -539,6 +541,7 @@ def create_app() -> FastAPI:
             notification_service=notification_service,
         )
         providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
+        tool_router._mcp_oauth_service = mcp_oauth_service  # noqa: SLF001
         tool_router.notification_service = notification_service
         tool_router.pause_waiter = pause_waiter
         agent_loop.notification_service = notification_service
@@ -577,6 +580,7 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             tool_output_spool=tool_output_spool,
         )
+        agent_loop.set_turn_scheduler(turn_scheduler)
 
         # CommandDispatcher — transport-agnostic slash command handling.
         from cognis.core.commands import CommandDispatcher
@@ -801,7 +805,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.7.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.8.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths

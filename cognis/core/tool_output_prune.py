@@ -35,7 +35,7 @@ PRUNE_PROTECTED_TOOL_NAMES: frozenset[str] = frozenset(
         "step_complete",
         "step_todo_write",
         "step_todo_list",
-        "step_request_input",
+        "step_request_questions",
         "write_deliverable",
     }
 )

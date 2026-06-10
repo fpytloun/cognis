@@ -220,7 +220,9 @@ async def refresh(request: Request, payload: RefreshRequest | None = None) -> Au
             user = await get_user(session, browser_session.user_email)
         elif payload and payload.refresh_token:
             try:
-                claims = app_state.auth_provider.verify_jwt(payload.refresh_token, audience=["cognis"])
+                claims = app_state.auth_provider.verify_jwt(
+                    payload.refresh_token, audience=["cognis"]
+                )
             except Exception as exc:
                 raise HTTPException(status_code=401, detail="Invalid refresh token") from exc
             if claims.get("typ") != "refresh":
@@ -244,7 +246,9 @@ async def refresh(request: Request, payload: RefreshRequest | None = None) -> Au
         refreshed_expiry = _browser_session_expiry(request)
         if browser_session is None:
             raise HTTPException(status_code=401, detail="No active browser session")
-        browser_session = await touch_browser_session(session, browser_session, expires_at=refreshed_expiry)
+        browser_session = await touch_browser_session(
+            session, browser_session, expires_at=refreshed_expiry
+        )
         await session.commit()
         body = _auth_session_body(
             request,

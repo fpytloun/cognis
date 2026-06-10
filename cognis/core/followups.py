@@ -143,12 +143,21 @@ class ContinuationFollowUp(FollowUpBase):
     pending_todos: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class OtherFollowUp(FollowUpBase):
+    origin_kind: Literal[FollowUpOriginKind.OTHER]
+    title: str = Field(min_length=1, max_length=240)
+    summary: str | None = Field(default=None, max_length=_MAX_TEXT_FIELD_CHARS)
+    description: str | None = Field(default=None, max_length=_MAX_DESCRIPTION_CHARS)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 FollowUpMetadata = (
     TaskResultFollowUp
     | DelegationResultFollowUp
     | BackgroundToolResultFollowUp
     | GateFollowUp
     | ContinuationFollowUp
+    | OtherFollowUp
 )
 
 
@@ -169,6 +178,8 @@ def parse_follow_up_metadata(payload: dict[str, Any]) -> FollowUpMetadata:
         return GateFollowUp.model_validate(payload)
     if origin is FollowUpOriginKind.CONTINUATION:
         return ContinuationFollowUp.model_validate(payload)
+    if origin is FollowUpOriginKind.OTHER:
+        return OtherFollowUp.model_validate(payload)
     raise ValueError(f"Unsupported follow-up origin: {origin.value}")
 
 
@@ -200,6 +211,91 @@ def build_history_boundary_message() -> str:
         "The messages above are historical conversation context. They are not pending requests by "
         "default. Respond to the active follow-up event below."
     )
+
+
+def render_follow_up_turn_notice(follow_up: FollowUpMetadata) -> str:
+    """Render the user-visible system notice for a follow-up initiated turn."""
+
+    trigger = follow_up.origin_kind.value.replace("_", " ")
+    title: str | None = None
+    source_id: str | None = None
+    summary: str | None = None
+    include_status = follow_up.status is not FollowUpStatus.COMPLETED
+
+    if isinstance(follow_up, TaskResultFollowUp):
+        trigger = (
+            "scheduled task" if follow_up.origin_kind is FollowUpOriginKind.SCHEDULE else "task"
+        )
+        if follow_up.status is FollowUpStatus.FAILED:
+            trigger += " failure"
+        elif follow_up.status is FollowUpStatus.CANCELLED:
+            trigger += " cancellation"
+        elif follow_up.status is FollowUpStatus.PAUSED:
+            trigger += " pause"
+        elif follow_up.status is FollowUpStatus.COMPLETED:
+            trigger += " completion"
+        title = follow_up.task_title
+        source_id = follow_up.task_id
+        summary = follow_up.result_summary
+    elif isinstance(follow_up, DelegationResultFollowUp):
+        trigger = "managed conversation completion"
+        source_id = follow_up.child_session_id
+        summary = follow_up.result_summary
+    elif isinstance(follow_up, BackgroundToolResultFollowUp):
+        trigger = "background tool completion"
+        title = follow_up.description or follow_up.command_summary or follow_up.tool_name
+        source_id = follow_up.shell_id
+        summary = follow_up.output_summary
+        include_status = (
+            follow_up.status is not FollowUpStatus.COMPLETED
+            or follow_up.exit_code
+            not in (
+                None,
+                0,
+            )
+        )
+    elif isinstance(follow_up, GateFollowUp):
+        trigger = "task gate"
+        title = follow_up.task_title
+        source_id = follow_up.task_id
+        summary = follow_up.gate_message
+        include_status = True
+    elif isinstance(follow_up, ContinuationFollowUp):
+        trigger = "automatic continuation"
+        title = follow_up.reason.replace("_", " ")
+        source_id = follow_up.topic_ref or follow_up.follow_up_id
+        if follow_up.tool_call_count is not None:
+            ceiling = (
+                f"{follow_up.tool_call_count}/{follow_up.max_tool_calls}"
+                if follow_up.max_tool_calls is not None
+                else str(follow_up.tool_call_count)
+            )
+            summary = f"Tool calls: {ceiling}; attempt {follow_up.attempt}/{follow_up.max_attempts}"
+        else:
+            summary = f"Attempt {follow_up.attempt}/{follow_up.max_attempts}"
+    elif isinstance(follow_up, OtherFollowUp):
+        title = follow_up.title
+        source_id = follow_up.topic_ref or follow_up.follow_up_id
+        summary = follow_up.summary
+
+    title = truncate_follow_up_text(title, max_chars=100)
+    source_id = truncate_follow_up_text(source_id, max_chars=80)
+    summary = truncate_follow_up_text(summary, max_chars=160)
+
+    subject = ""
+    if title and source_id:
+        subject = f": {title} ({source_id})"
+    elif title:
+        subject = f": {title}"
+    elif source_id:
+        subject = f": {source_id}"
+
+    parts = [f"Turn initiated by {trigger}{subject}."]
+    if include_status:
+        parts.append(f"Status: {follow_up.status.value}.")
+    if summary:
+        parts.append(f"Summary: {summary}.")
+    return " ".join(parts)
 
 
 def render_follow_up_block(follow_up: FollowUpMetadata) -> str:
@@ -255,6 +351,21 @@ def render_follow_up_block(follow_up: FollowUpMetadata) -> str:
         if follow_up.output_summary:
             lines.append(f"output_tail: {_xml_safe(follow_up.output_summary)}")
         lines.append("Use bash_output with this shell_id to inspect full output if needed.")
+    elif isinstance(follow_up, OtherFollowUp):
+        lines.extend(
+            [
+                f"title: {_xml_safe(follow_up.title)}",
+                f"status: {follow_up.status.value}",
+            ]
+        )
+        if follow_up.summary:
+            lines.append(f"summary: {_xml_safe(follow_up.summary)}")
+        if follow_up.description:
+            lines.append(f"description: {_xml_safe(follow_up.description)}")
+        for key, value in sorted(follow_up.metadata.items()):
+            if value is None:
+                continue
+            lines.append(f"{_xml_safe(str(key))}: {_xml_safe(str(value))}")
     elif isinstance(follow_up, GateFollowUp):
         lines.extend(
             [

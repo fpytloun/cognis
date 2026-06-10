@@ -149,7 +149,9 @@ def build_compaction_input(
     if count_tokens_fn is not None and model is not None and max_input_tokens is not None:
         try:
             actual_tokens = count_tokens_fn(text, model)
-            while actual_tokens > max_input_tokens and (len(head_events) > 1 or len(tail_events) > 1):
+            while actual_tokens > max_input_tokens and (
+                len(head_events) > 1 or len(tail_events) > 1
+            ):
                 # Trim one event from whichever band is larger.
                 if len(head_events) >= len(tail_events) and len(head_events) > 1:
                     dropped_events.insert(0, head_events.pop())

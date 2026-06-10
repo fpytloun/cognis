@@ -8,7 +8,7 @@ import secrets
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import sqlalchemy as sa
 from sqlalchemy import case, delete, select, update
@@ -38,6 +38,7 @@ from cognis.store.models import (
     KnowledgebaseRow,
     LLMProvider,
     LLMProviderAuthSession,
+    ManagedConversationLink,
     MCPOAuthTokenRow,
     MCPOAuthTransactionRow,
     MCPServerRow,
@@ -72,7 +73,11 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-_UNSET = object()
+class _UnsetValue:
+    pass
+
+
+_UNSET = _UnsetValue()
 
 
 def _shared_owner_clause(column: Any) -> Any:
@@ -1552,6 +1557,155 @@ async def get_agent_direct_conversation(
     return result.scalar_one_or_none()
 
 
+async def create_managed_conversation_link(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    controller_agent_id: str,
+    controller_conversation_id: str,
+    controller_session_id: str,
+    target_agent_id: str,
+    target_conversation_id: str,
+    target_session_id: str,
+    title: str,
+    turn_state: str = "idle",
+    notify_on_completion: bool = False,
+) -> ManagedConversationLink:
+    """Create a durable controller-to-target managed conversation link."""
+
+    row = ManagedConversationLink(
+        user_email=user_email,
+        controller_agent_id=controller_agent_id,
+        controller_conversation_id=controller_conversation_id,
+        controller_session_id=controller_session_id,
+        target_agent_id=target_agent_id,
+        target_conversation_id=target_conversation_id,
+        target_session_id=target_session_id,
+        title=title,
+        conversation_state="open",
+        turn_state=turn_state,
+        notify_on_completion=notify_on_completion,
+    )
+    session.add(row)
+    await session.flush()
+    await session.refresh(row)
+    return row
+
+
+async def get_managed_conversation_link(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    user_email: str | None = None,
+) -> ManagedConversationLink | None:
+    """Return a managed conversation link by ID."""
+
+    query = select(ManagedConversationLink).where(ManagedConversationLink.link_id == link_id)
+    if user_email is not None:
+        query = query.where(ManagedConversationLink.user_email == user_email)
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def get_managed_conversation_link_for_target(
+    session: AsyncSession,
+    target_conversation_id: str,
+    *,
+    user_email: str | None = None,
+) -> ManagedConversationLink | None:
+    """Return the latest managed conversation link for a target conversation."""
+
+    query = (
+        select(ManagedConversationLink)
+        .where(ManagedConversationLink.target_conversation_id == target_conversation_id)
+        .order_by(ManagedConversationLink.created_at.desc(), ManagedConversationLink.link_id.asc())
+        .limit(1)
+    )
+    if user_email is not None:
+        query = query.where(ManagedConversationLink.user_email == user_email)
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def list_managed_conversation_links(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    controller_conversation_id: str | None = None,
+    status: str | None = None,
+    limit: int = 25,
+) -> list[ManagedConversationLink]:
+    """List managed conversation links for one user."""
+
+    query = select(ManagedConversationLink).where(ManagedConversationLink.user_email == user_email)
+    if controller_conversation_id is not None:
+        query = query.where(
+            ManagedConversationLink.controller_conversation_id == controller_conversation_id
+        )
+    if status is not None and status != "all":
+        query = query.where(
+            sa.or_(
+                ManagedConversationLink.conversation_state == status,
+                ManagedConversationLink.turn_state == status,
+            )
+        )
+    query = query.order_by(
+        ManagedConversationLink.updated_at.desc(),
+        ManagedConversationLink.created_at.desc(),
+    ).limit(max(1, min(limit, 100)))
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def update_managed_conversation_link(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    conversation_state: str | None = None,
+    turn_state: str | None = None,
+    target_session_id: str | None = None,
+    active_turn_id: str | None = None,
+    clear_active_turn_id: bool = False,
+    notify_on_completion: bool | None = None,
+    last_result_summary: str | None | _UnsetValue = _UNSET,
+    last_error: str | None | _UnsetValue = _UNSET,
+    control_metadata: dict[str, Any] | None = None,
+    completed: bool = False,
+    closed: bool = False,
+) -> ManagedConversationLink | None:
+    """Update managed conversation lifecycle state."""
+
+    row = await get_managed_conversation_link(session, link_id)
+    if row is None:
+        return None
+    if conversation_state is not None:
+        row.conversation_state = conversation_state
+    if turn_state is not None:
+        row.turn_state = turn_state
+    if target_session_id is not None:
+        row.target_session_id = target_session_id
+    if clear_active_turn_id:
+        row.active_turn_id = None
+    if active_turn_id is not None:
+        row.active_turn_id = active_turn_id
+    if notify_on_completion is not None:
+        row.notify_on_completion = notify_on_completion
+    if not isinstance(last_result_summary, _UnsetValue):
+        row.last_result_summary = cast(str | None, last_result_summary)
+    if not isinstance(last_error, _UnsetValue):
+        row.last_error = cast(str | None, last_error)
+    if control_metadata is not None:
+        row.control_metadata = control_metadata
+    if completed:
+        row.completed_at = datetime.now(UTC)
+    if closed:
+        row.closed_at = datetime.now(UTC)
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    await session.refresh(row)
+    return row
+
+
 async def update_conversation(
     session: AsyncSession,
     conversation_id: str,
@@ -2430,6 +2584,68 @@ async def list_task_comments(session: AsyncSession, task_id: str) -> list[TaskCo
         .order_by(TaskCommentRow.created_at.asc(), TaskCommentRow.comment_id.asc())
     )
     return list(result.scalars().all())
+
+
+async def claim_pending_context_task_comments(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    step_name: str,
+    attempt_number: int,
+    step_run_id: str | None,
+    reason: str,
+) -> list[TaskCommentRow]:
+    """Claim pending context-only task comments for live workflow-step injection."""
+
+    result = await session.execute(
+        select(TaskCommentRow)
+        .where(
+            TaskCommentRow.task_id == task_id,
+            TaskCommentRow.intent == "context_only",
+            TaskCommentRow.applied.is_(False),
+            TaskCommentRow.attempt_number == attempt_number,
+            sa.or_(
+                TaskCommentRow.target_step.is_(None),
+                TaskCommentRow.target_step == "",
+                TaskCommentRow.target_step == step_name,
+            ),
+        )
+        .order_by(TaskCommentRow.created_at.asc(), TaskCommentRow.comment_id.asc())
+    )
+    rows = list(result.scalars().all())
+    claimed_at = _utcnow()
+    claimed: list[TaskCommentRow] = []
+    for row in rows:
+        metadata = dict(row.metadata_json or {})
+        metadata.update(
+            {
+                "applied_at": claimed_at.isoformat(),
+                "applied_reason": reason,
+                "applied_step": step_name,
+            }
+        )
+        if step_run_id:
+            metadata["applied_step_run_id"] = step_run_id
+        claim_result = await session.execute(
+            update(TaskCommentRow)
+            .where(
+                TaskCommentRow.comment_id == row.comment_id,
+                TaskCommentRow.applied.is_(False),
+            )
+            .values(
+                applied=True,
+                metadata_json=metadata,
+                updated_at=claimed_at,
+            )
+        )
+        if int(getattr(claim_result, "rowcount", 0) or 0) <= 0:
+            continue
+        row.applied = True
+        row.metadata_json = metadata
+        row.updated_at = claimed_at
+        claimed.append(row)
+    await session.flush()
+    return claimed
 
 
 async def get_task_comment(session: AsyncSession, comment_id: str) -> TaskCommentRow | None:
@@ -3748,6 +3964,28 @@ async def count_active_tasks_for_schedule(session: AsyncSession, schedule_id: st
     return int(result.scalar_one())
 
 
+async def count_active_schedules_for_project(
+    session: AsyncSession,
+    project_id: str,
+    *,
+    created_by: str | None = None,
+) -> int:
+    """Count currently active schedules bound to a project."""
+    stmt = (
+        select(sa.func.count())
+        .select_from(Schedule)
+        .where(
+            Schedule.project_id == project_id,
+            Schedule.enabled.is_(True),
+            Schedule.next_fire_at.isnot(None),
+        )
+    )
+    if created_by is not None:
+        stmt = stmt.where(Schedule.created_by == created_by)
+    result = await session.execute(stmt)
+    return int(result.scalar_one())
+
+
 async def get_latest_schedule_task_runs(
     session: AsyncSession,
     schedule_ids: list[str],
@@ -4144,6 +4382,24 @@ async def list_executors(
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def list_websocket_executors_for_mcp_server(
+    session: AsyncSession,
+    server_id: str,
+) -> list[ExecutorRow]:
+    """List websocket executors whose config references an MCP server."""
+
+    rows = await list_executors(session)
+    result = []
+    for row in rows:
+        if row.executor_type != "websocket":
+            continue
+        config = row.config if isinstance(row.config, dict) else {}
+        server_ids = config.get("mcp_server_ids")
+        if isinstance(server_ids, list) and server_id in server_ids:
+            result.append(row)
+    return result
 
 
 async def get_executor_row(

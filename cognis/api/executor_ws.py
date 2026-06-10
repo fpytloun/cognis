@@ -13,6 +13,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from cognis.api.executor_runtime import reconcile_executor
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
+from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.logging import get_logger
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
@@ -22,12 +23,25 @@ from cognis.models.tool import (
 )
 from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
-from cognis.store.queries import get_executor_row, get_mcp_server, update_executor_runtime_state
+from cognis.store.queries import (
+    get_executor_row,
+    get_mcp_server,
+    get_setting_value,
+    update_executor_runtime_state,
+)
 from cognis.tools.mcp import invalid_mcp_config_reason
 
 _logger = get_logger(__name__)
 
 _AUTH_TIMEOUT_SECONDS = 30
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
 
 
 async def handle_executor_websocket(
@@ -146,6 +160,11 @@ async def handle_executor_websocket(
             exc_info=True,
         )
         configure_ok = False
+        async with session_factory() as session:
+            current = await get_executor_row(session, executor_id)
+            if current is not None and current.runtime_state == "reconfiguring":
+                await update_executor_runtime_state(session, executor_id, runtime_state="blocked")
+                await session.commit()
 
     async with session_factory() as session:
         row = await get_executor_row(session, executor_id)
@@ -211,14 +230,20 @@ async def handle_executor_websocket(
 
 async def _resolve_executor_mcp_payload(
     row: Any, providers: Any
-) -> tuple[list[MCPServerConfig], dict[str, str]]:
+) -> tuple[list[MCPServerConfig], dict[str, str], dict[str, Any]]:
     server_ids = (row.config or {}).get(MCP_SERVER_IDS_KEY, [])
     if not isinstance(server_ids, list) or not server_ids:
-        return [], {}
+        return [], {}, {}
 
     servers: list[MCPServerConfig] = []
+    skipped_statuses: list[dict[str, Any]] = []
+    warnings: list[str] = []
     secret_names: set[str] = set()
     async with providers._session_factory() as session:
+        tool_timeout_raw = await get_setting_value(session, "mcp.tool_timeout_seconds", 300)
+        connect_timeout_raw = await get_setting_value(session, "mcp.connect_timeout_seconds", 15)
+        tool_timeout = _coerce_positive_int(tool_timeout_raw, 300)
+        connect_timeout = _coerce_positive_int(connect_timeout_raw, 15)
         for server_id in server_ids:
             mcp_row = await get_mcp_server(session, str(server_id), owner_email=row.owner_email)
             if mcp_row is None or mcp_row.status != "active":
@@ -242,13 +267,77 @@ async def _resolve_executor_mcp_payload(
             oauth_service = getattr(providers, "mcp_oauth_service", None) or getattr(
                 providers, "_mcp_oauth_service", None
             )
-            if auth_config.type == "oauth2" and oauth_service is not None and row.owner_email:
-                result = await oauth_service.inject_authorization_header(
-                    user_email=row.owner_email,
-                    server=mcp_row,
-                    headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+            if auth_config.type == "oauth2" and (oauth_service is None or not row.owner_email):
+                warning = (
+                    f"MCP server {mcp_row.name} requires OAuth authorization, "
+                    "but no OAuth context is available."
                 )
+                warnings.append(warning)
+                skipped_statuses.append(
+                    oauth_required_mcp_status(
+                        server_id=server_id,
+                        server_name=mcp_row.name,
+                        reason="oauth_context_unavailable",
+                    )
+                )
+                _logger.warning(
+                    "Skipping OAuth MCP server without OAuth context",
+                    extra={
+                        "extra_data": {
+                            "server_id": server_id,
+                            "server_name": mcp_row.name,
+                            "has_oauth_service": oauth_service is not None,
+                            "has_owner_email": bool(row.owner_email),
+                        }
+                    },
+                )
+                continue
+            if auth_config.type == "oauth2" and oauth_service is not None and row.owner_email:
+                try:
+                    result = await oauth_service.inject_authorization_header(
+                        user_email=row.owner_email,
+                        server=mcp_row,
+                        headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+                    )
+                except MCPOAuthError as exc:
+                    warning = (
+                        f"MCP server {mcp_row.name} requires OAuth authorization, "
+                        "but authorization metadata could not be resolved."
+                    )
+                    warnings.append(warning)
+                    skipped_statuses.append(
+                        oauth_required_mcp_status(
+                            server_id=server_id,
+                            server_name=mcp_row.name,
+                            reason=str(exc)[:240],
+                        )
+                    )
+                    _logger.warning(
+                        "Skipping OAuth MCP server with unresolved authorization metadata",
+                        extra={
+                            "extra_data": {
+                                "server_id": server_id,
+                                "server_name": mcp_row.name,
+                                "reason": str(exc)[:240],
+                            }
+                        },
+                    )
+                    continue
                 if result.authorization_required:
+                    warning = (
+                        f"MCP server {mcp_row.name} requires OAuth authorization before "
+                        "tools can be discovered."
+                    )
+                    warnings.append(warning)
+                    skipped_statuses.append(
+                        oauth_required_mcp_status(
+                            server_id=server_id,
+                            server_name=mcp_row.name,
+                            reason=result.reason,
+                            transaction_id=result.transaction_id,
+                            authorization_url=result.authorization_url,
+                        )
+                    )
                     _logger.warning(
                         "OAuth MCP server requires authorization",
                         extra={
@@ -259,10 +348,9 @@ async def _resolve_executor_mcp_payload(
                             }
                         },
                     )
-                    headers = result.headers
+                    continue
                 headers = result.headers
-                if not result.authorization_required:
-                    auth_config = {"type": "static_headers"}
+                auth_config = {"type": "static_headers"}
             servers.append(
                 MCPServerConfig(
                     name=mcp_row.name,
@@ -273,7 +361,8 @@ async def _resolve_executor_mcp_payload(
                     env=mcp_row.env or {},
                     headers=headers,
                     auth_config=auth_config,
-                    timeout_seconds=mcp_row.timeout_seconds,
+                    timeout_seconds=max(int(mcp_row.timeout_seconds or 0), tool_timeout),
+                    connect_timeout_seconds=connect_timeout,
                     server_id=mcp_row.server_id,
                 )
             )
@@ -287,7 +376,12 @@ async def _resolve_executor_mcp_payload(
             secrets[name] = await providers.secrets.get_secret(name, row.owner_email)
         except Exception:
             continue
-    return servers, secrets
+    metadata: dict[str, Any] = {}
+    if skipped_statuses:
+        metadata["mcp_servers"] = skipped_statuses
+    if warnings:
+        metadata["warnings"] = warnings
+    return servers, secrets, metadata
 
 
 async def _close_ws(ws: WebSocket, code: int, reason: str) -> None:

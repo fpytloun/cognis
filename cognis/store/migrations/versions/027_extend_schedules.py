@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "027"
-down_revision = "026"
+down_revision = "026_executor_runtime_metadata"
 branch_labels = None
 depends_on = None
 

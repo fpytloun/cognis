@@ -48,6 +48,8 @@ class EventType(StrEnum):
     SESSION_COMPLETED = "session_completed"
     SESSION_FAILED = "session_failed"
     SESSION_RECOVERED = "session_recovered"
+    SESSION_COMPACTION_STARTED = "session_compaction_started"
+    SESSION_COMPACTION_FINISHED = "session_compaction_finished"
     SESSION_COMPACTED = "session_compacted"
 
     # Step lifecycle
@@ -88,6 +90,7 @@ class EventType(StrEnum):
     TURN_ERROR = "turn_error"
     USER_MESSAGE = "user_message"
     CONVERSATION_UPDATED = "conversation_updated"
+    CONVERSATION_STATE_CHANGED = "conversation_state_changed"
 
     # Agent lifecycle
     AGENT_PROFILE_UPDATED = "agent_profile_updated"

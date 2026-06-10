@@ -17,6 +17,7 @@ from cognis.api.common import (
 from cognis.api.models import (
     CreateScheduleRequest,
     ScheduleResponse,
+    ScheduleTriggerResponse,
     UpdateScheduleRequest,
 )
 from cognis.core.workflow_management import (
@@ -549,14 +550,15 @@ async def delete_schedule_route(
         scheduler.wake()
 
 
-@router.post("/api/v1/schedules/{schedule_id}/trigger", response_model=ScheduleResponse)
+@router.post("/api/v1/schedules/{schedule_id}/trigger", response_model=ScheduleTriggerResponse)
 async def trigger_schedule_route(
     request: Request,
     schedule_id: str,
-) -> ScheduleResponse:
+) -> ScheduleTriggerResponse:
     """Fire a schedule immediately (create a task now)."""
     user = require_current_user(request)
     forbid_mutation_for_viewer(request)
+    task_id: str | None = None
 
     async with request.app.state.session_factory() as db:
         row = await get_schedule(db, schedule_id)
@@ -570,7 +572,7 @@ async def trigger_schedule_route(
     # Use the scheduler to fire it
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
-        await scheduler._fire_schedule(schedule_id)
+        task_id = await scheduler._fire_schedule(schedule_id)
     else:
         raise api_exception(503, "scheduler_unavailable", "Scheduler is not running")
 
@@ -585,7 +587,10 @@ async def trigger_schedule_route(
             [schedule_id],
             created_by=user.email,
         )
-    return _row_to_response(row, latest_run.get(schedule_id))
+    return ScheduleTriggerResponse(
+        **_row_to_response(row, latest_run.get(schedule_id)).model_dump(),
+        task_id=task_id,
+    )
 
 
 @router.post("/api/v1/schedules/{schedule_id}/enable", response_model=ScheduleResponse)

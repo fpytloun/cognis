@@ -35,6 +35,7 @@ from cognis.api.models import (
     WorkflowRunResponse,
 )
 from cognis.logging import get_logger
+from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskModel
 from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
@@ -108,9 +109,14 @@ def conversation_to_response(
     active_session: Any | None = None,
     active_turn_state: dict[str, Any] | None = None,
     pending_notification_types: list[str] | None = None,
+    conversation_state: ConversationStateEnvelope | None = None,
+    managed_link: Any | None = None,
 ) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
+    platform_data = (
+        (row.context_data or {}) if hasattr(row, "context_data") else row.context.platform_data
+    )
     has_unread = last_message_at is not None and (
         last_read_at is None or last_message_at > last_read_at
     )
@@ -124,9 +130,7 @@ def conversation_to_response(
         context=ConversationContextModel(
             type=row.context_type if hasattr(row, "context_type") else row.context.type,
             ref=row.context_ref if hasattr(row, "context_ref") else row.context.ref,
-            platform_data=(row.context_data or {})
-            if hasattr(row, "context_data")
-            else row.context.platform_data,
+            platform_data=platform_data,
             memory_labels=(row.memory_labels or {})
             if hasattr(row, "memory_labels")
             else row.context.memory_labels,
@@ -147,8 +151,25 @@ def conversation_to_response(
         last_read_at=last_read_at,
         has_unread=has_unread,
         has_active_turn=has_active_turn,
+        managed_agent=(
+            {
+                "channel": "agent_work",
+                "link_id": getattr(managed_link, "link_id", None) or platform_data.get("link_id"),
+                "controller_agent_id": platform_data.get("controller_agent_id"),
+                "controller_conversation_id": platform_data.get("controller_conversation_id"),
+                "controller_session_id": platform_data.get("controller_session_id"),
+                "target_agent_id": platform_data.get("target_agent_id"),
+                "conversation_state": getattr(managed_link, "conversation_state", None),
+                "turn_state": getattr(managed_link, "turn_state", None),
+                "last_result_summary": getattr(managed_link, "last_result_summary", None),
+                "last_error": getattr(managed_link, "last_error", None),
+            }
+            if platform_data.get("kind") in {"agent_work", "managed_agent_conversation"}
+            else None
+        ),
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
+        conversation_state=conversation_state,
     )
 
 
@@ -276,6 +297,7 @@ def project_to_response(
     *,
     sources: list[Any] | None = None,
     workflow_ids: list[str] | None = None,
+    active_schedule_count: int = 0,
     grants: list[Any] | None = None,
 ) -> ProjectResponse:
     return ProjectResponse(
@@ -295,6 +317,7 @@ def project_to_response(
         status=row.status,
         sources=[project_source_to_response(source) for source in sources or []],
         workflow_ids=workflow_ids or [],
+        active_schedule_count=active_schedule_count,
         grants=[project_grant_to_response(grant) for grant in grants or []],
         is_shared_with_me=bool(getattr(row, "is_shared_with_me", False)),
         shared_by_email=getattr(row, "shared_by_email", None),
@@ -639,8 +662,9 @@ def pending_pause_to_response(pause: Any | None) -> PendingPauseResponse | None:
         step_name=pause.step_name,
         step_run_id=pause.step_run_id,
         session_id=pause.session_id,
-        question=pause.question,
-        options=pause.options,
+        question=getattr(pause, "question", None),
+        questions=getattr(pause, "questions", None),
+        options=getattr(pause, "options", None),
         context=pause.context,
     )
 

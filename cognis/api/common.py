@@ -112,7 +112,11 @@ class AgentAccess:
 
     @property
     def executor_scope(self) -> str | None:
-        return normalize_executor_scope(str(self.grant.executor_scope)) if self.grant is not None else None
+        return (
+            normalize_executor_scope(str(self.grant.executor_scope))
+            if self.grant is not None
+            else None
+        )
 
 
 async def check_agent_access(request: Request, agent: Any, *, required: str) -> AgentAccess:
@@ -131,7 +135,9 @@ async def check_agent_access(request: Request, agent: Any, *, required: str) -> 
         return AgentAccess(user=user, owner_email=owner_email, is_owner=True)
 
     if required not in {"view", "use", "edit", "delete", "share"}:
-        raise api_exception(500, "internal_error", f"Unsupported agent access requirement: {required}")
+        raise api_exception(
+            500, "internal_error", f"Unsupported agent access requirement: {required}"
+        )
     if required not in {"view", "use"}:
         raise api_exception(403, "forbidden", "Resource access denied")
 
@@ -185,7 +191,9 @@ async def check_project_access(request: Request, project: Any, *, required: str)
         return ProjectAccess(user=user, owner_email=owner_email, is_owner=True)
 
     if required not in {"view", "use", "manage"}:
-        raise api_exception(500, "internal_error", f"Unsupported project access requirement: {required}")
+        raise api_exception(
+            500, "internal_error", f"Unsupported project access requirement: {required}"
+        )
     if required not in {"view", "use"}:
         raise api_exception(403, "forbidden", "Resource access denied")
 

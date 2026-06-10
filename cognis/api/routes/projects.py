@@ -31,6 +31,7 @@ from cognis.api.serializers import (
 )
 from cognis.store.queries import (
     attach_project_workflow,
+    count_active_schedules_for_project,
     create_project,
     create_project_grant,
     create_project_source,
@@ -60,12 +61,26 @@ async def _require_project(request: Request, project_id: str, *, required: str =
     return apply_project_access_metadata(project, access)
 
 
-async def _project_response(request: Request, project: Any, *, include_grants: bool = False) -> ProjectResponse:
+async def _project_response(
+    request: Request, project: Any, *, include_grants: bool = False
+) -> ProjectResponse:
+    user = require_current_user(request)
     async with request.app.state.session_factory() as session:
         sources = await list_project_sources(session, project.project_id)
         workflow_ids = await list_project_workflow_ids(session, project.project_id)
+        active_schedule_count = await count_active_schedules_for_project(
+            session,
+            project.project_id,
+            created_by=user.email,
+        )
         grants = await list_project_grants(session, project.project_id) if include_grants else []
-    return project_to_response(project, sources=sources, workflow_ids=workflow_ids, grants=grants)
+    return project_to_response(
+        project,
+        sources=sources,
+        workflow_ids=workflow_ids,
+        active_schedule_count=active_schedule_count,
+        grants=grants,
+    )
 
 
 async def _require_project_workflow(request: Request, *, workflow_id: str, project_id: str) -> None:
@@ -136,7 +151,9 @@ async def create_project_route(request: Request, payload: ProjectCreateRequest) 
 @router.get("/{project_id}", response_model=ProjectResponse)
 async def get_project_route(request: Request, project_id: str) -> ProjectResponse:
     project = await _require_project(request, project_id)
-    return await _project_response(request, project, include_grants=project.owner_email == require_current_user(request).email)
+    return await _project_response(
+        request, project, include_grants=project.owner_email == require_current_user(request).email
+    )
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
@@ -203,7 +220,9 @@ async def update_source_route(
         source = await get_project_source(session, source_id)
         if source is None or source.project_id != project_id:
             raise api_exception(404, "not_found", "Project source not found")
-        row = await update_project_source(session, source_id, **payload.model_dump(exclude_unset=True))
+        row = await update_project_source(
+            session, source_id, **payload.model_dump(exclude_unset=True)
+        )
         await session.commit()
         if row is None:
             raise api_exception(404, "not_found", "Project source not found")
@@ -225,7 +244,9 @@ async def delete_source_route(request: Request, project_id: str, source_id: str)
 
 
 @router.post("/{project_id}/workflows/{workflow_id}", response_model=ProjectResponse)
-async def attach_workflow_route(request: Request, project_id: str, workflow_id: str) -> ProjectResponse:
+async def attach_workflow_route(
+    request: Request, project_id: str, workflow_id: str
+) -> ProjectResponse:
     forbid_mutation_for_viewer(request)
     project = await _require_project(request, project_id, required="manage")
     await _require_project_workflow(
@@ -240,7 +261,9 @@ async def attach_workflow_route(request: Request, project_id: str, workflow_id: 
 
 
 @router.delete("/{project_id}/workflows/{workflow_id}", response_model=ProjectResponse)
-async def detach_workflow_route(request: Request, project_id: str, workflow_id: str) -> ProjectResponse:
+async def detach_workflow_route(
+    request: Request, project_id: str, workflow_id: str
+) -> ProjectResponse:
     forbid_mutation_for_viewer(request)
     project = await _require_project(request, project_id, required="manage")
     async with request.app.state.session_factory() as session:
@@ -294,7 +317,9 @@ async def revoke_grant_route(request: Request, project_id: str, grant_id: str) -
 
 
 @router.post("/{project_id}/avatar/generate", response_model=ProjectAvatarGenerateResponse)
-async def generate_project_avatar(request: Request, project_id: str) -> ProjectAvatarGenerateResponse:
+async def generate_project_avatar(
+    request: Request, project_id: str
+) -> ProjectAvatarGenerateResponse:
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     project = await _require_project(request, project_id, required="manage")
@@ -321,4 +346,6 @@ async def generate_project_avatar(request: Request, project_id: str) -> ProjectA
     async with request.app.state.session_factory() as session:
         await update_project(session, project_id, avatar_image_id=image_id)
         await session.commit()
-    return ProjectAvatarGenerateResponse(avatar_image_id=image_id, avatar_url=f"/api/v1/images/{image_id}")
+    return ProjectAvatarGenerateResponse(
+        avatar_image_id=image_id, avatar_url=f"/api/v1/images/{image_id}"
+    )

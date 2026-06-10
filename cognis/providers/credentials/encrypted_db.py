@@ -244,7 +244,11 @@ class EncryptedDBCredentialsProvider:
             value = _generate_totp(payload)
         else:
             value = payload if field is None else payload.get(field)
-        if field is not None and field not in payload and not (kind == "totp_seed" and field == "otp"):
+        if (
+            field is not None
+            and field not in payload
+            and not (kind == "totp_seed" and field == "otp")
+        ):
             raise CredentialAccessError(
                 "credential_field_not_found",
                 f"Credential field not found: {credential_id}.{field}",

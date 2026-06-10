@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Query, Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -27,6 +28,8 @@ from cognis.api.models import (
     ConversationTitleSuggestionResponse,
     ConversationUpdateRequest,
     CursorPage,
+    ManagedConversationActionRequest,
+    ManagedConversationActionResponse,
     MessageHistoryResponse,
     QueuedMessageResponse,
     QueuedMessagesResponse,
@@ -45,16 +48,20 @@ from cognis.api.serializers import (
     session_to_response,
 )
 from cognis.core.attachment_utils import hydrate_attachment_refs
+from cognis.core.conversation_state import snapshot_for_conversation
+from cognis.core.managed_conversations import last_managed_conversation_user_message_for_retry
 from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
-from cognis.models.session import ConversationContext
+from cognis.models.session import ConversationContext, SessionEvent, SessionModel
 from cognis.store.queries import (
+    create_managed_conversation_link,
     get_agent,
     get_agent_direct_conversation,
     get_conversation,
     get_latest_active_conversation_for_agent,
     get_latest_root_session_for_conversation,
+    get_managed_conversation_link_for_target,
     get_project,
     get_root_session_chain,
     get_root_session_chain_page,
@@ -66,11 +73,14 @@ from cognis.store.queries import (
     list_visible_agents,
     mark_artifacts_attached,
     mark_conversation_read,
+    update_conversation_context_data,
+    update_managed_conversation_link,
 )
 
 logger = get_logger(__name__)
 
 _CONVERSATION_MESSAGES_CURSOR_VERSION = 1
+_MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
 
 
 def _encode_messages_cursor(session_id: str, seq: int) -> str:
@@ -142,6 +152,10 @@ def _filter_orphan_tool_results(events: list[dict[str, Any]]) -> list[dict[str, 
     return filtered
 
 
+def _has_compaction_summary(events: list[dict[str, Any]]) -> bool:
+    return any(event.get("type") == "compaction_summary" for event in events)
+
+
 def _tag_session_events(session_row: Any, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for event in events:
         if not isinstance(event, dict):
@@ -150,6 +164,34 @@ def _tag_session_events(session_row: Any, events: list[dict[str, Any]]) -> list[
         if isinstance(data, dict) and "session_id" not in data:
             data["session_id"] = session_row.session_id
     return events
+
+
+async def _read_compaction_summary_marker(
+    guardrails: Any,
+    session_row: Any,
+) -> dict[str, Any] | None:
+    """Read the durable rotation compaction marker when a tail page omitted it."""
+
+    try:
+        result = await guardrails.read_events(
+            session_id=session_row.intaris_session_id or session_row.session_id,
+            after_seq=0,
+            limit=25,
+            allow_missing_stream=True,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to read session compaction marker during lineage page",
+            extra={"extra_data": {"session_id": session_row.session_id}},
+            exc_info=True,
+        )
+        return None
+    if result.missing_stream_fallback_used:
+        return None
+    for event in _sort_session_events(list(result.events)):
+        if event.get("type") == "compaction_summary":
+            return event
+    return None
 
 
 def _require_visible_conversation(request: Request, row: Any) -> Any:
@@ -184,6 +226,7 @@ async def _conversation_response(
     has_active_turn: bool | None = None,
 ) -> ConversationResponse:
     active_session = None
+    managed_link = None
     pending_notifications: list[str] = []
     active_turn_state = request.app.state.turn_scheduler.running_turn_state(row.conversation_id)
     resolved_has_active_turn = (
@@ -192,6 +235,12 @@ async def _conversation_response(
     async with request.app.state.session_factory() as session:
         if getattr(row, "active_session_id", None):
             active_session = await get_session_row(session, row.active_session_id)
+        if getattr(row, "context_type", None) in {"agent_work", "managed_agent_conversation"}:
+            managed_link = await get_managed_conversation_link_for_target(
+                session,
+                row.conversation_id,
+                user_email=row.user_email,
+            )
         pending_notifications = (
             await list_pending_notification_types_by_conversation(
                 session,
@@ -199,16 +248,29 @@ async def _conversation_response(
                 [row.conversation_id],
             )
         ).get(row.conversation_id, [])
+        conversation_state = await snapshot_for_conversation(
+            session,
+            user_email=row.user_email,
+            conversation_id=row.conversation_id,
+            turn_scheduler=getattr(request.app.state, "turn_scheduler", None),
+        )
     return conversation_to_response(
         row,
         has_active_turn=resolved_has_active_turn,
         active_turn_state=active_turn_state,
         active_session=active_session,
         pending_notification_types=pending_notifications,
+        conversation_state=conversation_state,
+        managed_link=managed_link,
     )
 
 
-async def _require_mutable_conversation(request: Request, conversation_id: str) -> Any:
+async def _require_mutable_conversation(
+    request: Request,
+    conversation_id: str,
+    *,
+    allow_managed_conversation: bool = False,
+) -> Any:
     user = require_current_user(request)
     forbid_mutation_for_viewer(request)
     async with request.app.state.session_factory() as session:
@@ -218,6 +280,12 @@ async def _require_mutable_conversation(request: Request, conversation_id: str) 
     require_resource_owner(request, row.user_email)
     if row.status == "archived":
         raise api_exception(409, "conflict", "Conversation is not active")
+    if row.context_type in _MANAGED_CONVERSATION_CONTEXT_TYPES and not allow_managed_conversation:
+        raise api_exception(
+            409,
+            "managed_conversation_read_only",
+            "Managed conversations are read-only from the target chat; use managed actions from the controller conversation.",
+        )
     async with request.app.state.session_factory() as session:
         agent = await get_agent(session, row.agent_id)
     if agent is None:
@@ -576,11 +644,43 @@ async def update_conversation(
 async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
     """Mark a conversation as read (sets last_read_at to now)."""
     require_current_user(request)
+    payload: dict[str, Any] | None = None
+    user_email: str | None = None
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
         row = _require_visible_conversation(request, row)
+        user_email = row.user_email
+        was_unread = row.last_message_at is not None and (
+            row.last_read_at is None or row.last_message_at > row.last_read_at
+        )
         await mark_conversation_read(session, conversation_id)
+        if was_unread:
+            payload = {
+                "type": "conversation_updated",
+                "conversation_id": row.conversation_id,
+                "has_unread": False,
+                "last_read_at": row.last_read_at.isoformat() if row.last_read_at else None,
+            }
         await session.commit()
+    if payload is not None:
+        ws_manager = getattr(request.app.state, "ws_manager", None)
+        send_to_user = getattr(ws_manager, "send_to_user", None)
+        send_to_user_func = (
+            cast(Callable[[str, dict[str, Any]], Awaitable[None]], send_to_user)
+            if callable(send_to_user)
+            else None
+        )
+        if send_to_user_func is not None and user_email is not None:
+            try:
+                await send_to_user_func(user_email, payload)
+            except Exception:
+                logger.warning(
+                    "Failed to fan out conversation read state",
+                    extra={
+                        "extra_data": {"conversation_id": conversation_id, "user_email": user_email}
+                    },
+                    exc_info=True,
+                )
     return {"ok": True}
 
 
@@ -802,6 +902,17 @@ async def conversation_messages(
             row_events = _filter_orphan_tool_results(
                 _sort_session_events(_tag_session_events(sr, row_events))
             )
+            if (
+                sr.previous_session_id
+                and not _has_compaction_summary(row_events)
+                and before_session_id is None
+                and getattr(row, "context_type", None) == "web"
+            ):
+                marker = await _read_compaction_summary_marker(guardrails, sr)
+                if marker is not None:
+                    row_events = _sort_session_events(
+                        _tag_session_events(sr, [marker, *row_events])
+                    )
             if sr.session_id == active_session_id:
                 active_session_last_seq = result_last_seq
             page_events.insert(0, (sr, row_events))
@@ -941,6 +1052,14 @@ async def conversation_messages(
         if turn_scheduler is not None
         else []
     )
+    async with request.app.state.session_factory() as state_session:
+        state_snapshot = await snapshot_for_conversation(
+            state_session,
+            user_email=row.user_email,
+            conversation_id=conversation_id,
+            turn_scheduler=turn_scheduler,
+            active_session_last_seq=active_session_last_seq,
+        )
 
     return MessageHistoryResponse(
         items=serialize_event_rows(
@@ -961,6 +1080,7 @@ async def conversation_messages(
         active_session_last_seq=active_session_last_seq,
         history_truncated=history_truncated,
         truncation_reason=truncation_reason,
+        state_snapshot=state_snapshot,
     )
 
 
@@ -1125,7 +1245,11 @@ async def conversation_tool_output_page(
 
 @router.get("/{conversation_id}/queue", response_model=QueuedMessagesResponse)
 async def get_queued_messages(request: Request, conversation_id: str) -> QueuedMessagesResponse:
-    await _require_mutable_conversation(request, conversation_id)
+    await _require_mutable_conversation(
+        request,
+        conversation_id,
+        allow_managed_conversation=True,
+    )
     return _queued_messages_response(
         request.app.state.turn_scheduler.queued_messages(conversation_id)
     )
@@ -1195,6 +1319,12 @@ async def send_message(
         raise api_exception(404, "not_found", "Conversation not found")
     if row.status == "archived":
         raise api_exception(409, "conflict", "Conversation is not active")
+    if row.context_type in _MANAGED_CONVERSATION_CONTEXT_TYPES:
+        raise api_exception(
+            409,
+            "managed_conversation_read_only",
+            "Managed conversations are read-only from the target chat; use managed actions from the controller conversation.",
+        )
 
     # --- Slash command dispatch ---
     command_result = await _try_command_dispatch(request, conversation_id, payload.content, user)
@@ -1284,6 +1414,348 @@ async def send_message(
             status_code=202,
             content=SendMessageResponse(status="accepted").model_dump(),
         )
+
+
+async def _require_managed_conversation(
+    request: Request,
+    conversation_id: str,
+) -> tuple[Any, Any]:
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        if row.context_type not in {"agent_work", "managed_agent_conversation"}:
+            raise api_exception(409, "not_managed_conversation", "Conversation is not managed")
+        link = await get_managed_conversation_link_for_target(
+            session,
+            conversation_id,
+            user_email=user.email,
+        )
+        if link is None:
+            raise api_exception(404, "not_found", "Agent work link not found")
+    return user, link
+
+
+async def _managed_action_response(
+    request: Request,
+    conversation_id: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+) -> ManagedConversationActionResponse:
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        response = await _conversation_response(request, row)
+    return ManagedConversationActionResponse(
+        status=status,
+        conversation_id=conversation_id,
+        managed_agent=response.managed_agent,
+        result=result,
+    )
+
+
+async def _last_agent_work_user_message(request: Request, link: Any) -> str | None:
+    return await last_managed_conversation_user_message_for_retry(
+        session_cache=request.app.state.session_cache,
+        guardrails=request.app.state.providers.guardrails,
+        session_factory=request.app.state.session_factory,
+        link=link,
+    )
+
+
+async def _record_agent_work_context(
+    request: Request,
+    *,
+    session_model: SessionModel,
+    controller_agent_id: str,
+    controller_conversation_id: str,
+    controller_session_id: str,
+    target_agent_id: str,
+) -> None:
+    content = "\n".join(
+        [
+            "Agent work context:",
+            f"- This session is managed by Cognis agent `{controller_agent_id}` on behalf of the user.",
+            "- Treat user messages in this session as instructions from that authenticated internal agent.",
+            "- Do not mention this management context unless it is operationally relevant.",
+            f"- Controller conversation: {controller_conversation_id}",
+            f"- Controller session: {controller_session_id}",
+        ]
+    )
+    event = SessionEvent(
+        type="developer_message",
+        data={
+            "role": "developer",
+            "content": content,
+            "content_type": "text",
+            "source": "agent_work_context",
+            "target_agent_id": target_agent_id,
+        },
+    )
+    append_result = await request.app.state.providers.guardrails.record_events(
+        session_model.session_id,
+        [event],
+        source="cognis_agent_work",
+        user_email=session_model.user_email,
+        agent_id=session_model.agent_id,
+    )
+    await request.app.state.session_cache.append_recorded_events(
+        session_model,
+        [event],
+        append_result,
+    )
+
+
+@router.post("/{conversation_id}/managed/send", response_model=ManagedConversationActionResponse)
+async def managed_conversation_send(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    user, link = await _require_managed_conversation(request, conversation_id)
+    if link.conversation_state == "closed":
+        raise api_exception(409, "closed", "Agent work is closed")
+    message = (payload.message or "").strip()
+    if not message:
+        raise api_exception(400, "invalid_request", "Message is required")
+    async with request.app.state.session_factory() as session:
+        await update_managed_conversation_link(
+            session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            notify_on_completion=not payload.wait,
+            last_error=None,
+        )
+        await session.commit()
+    error = await request.app.state.turn_scheduler.submit_turn(
+        conversation_id,
+        message,
+        user_email=user.email,
+    )
+    active_turn_id = request.app.state.turn_scheduler.active_turn_id(conversation_id)
+    if error is not None or active_turn_id is not None:
+        async with request.app.state.session_factory() as session:
+            await update_managed_conversation_link(
+                session,
+                link.link_id,
+                conversation_state="open",
+                turn_state="failed" if error is not None else "running",
+                active_turn_id=active_turn_id,
+                last_error=error.message if error is not None else None,
+            )
+            await session.commit()
+    if error is not None:
+        raise _turn_error_to_http(error)
+    result = None
+    if payload.wait:
+        waited = await request.app.state.turn_scheduler.wait_for_turn(conversation_id)
+        result = {
+            "kind": waited.__class__.__name__ if waited is not None else "idle",
+            "message": getattr(waited, "message", None),
+            "result_summary": getattr(waited, "result_summary", None),
+        }
+    return await _managed_action_response(request, conversation_id, "sent", result)
+
+
+@router.post("/{conversation_id}/managed/wait", response_model=ManagedConversationActionResponse)
+async def managed_conversation_wait(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    await _require_managed_conversation(request, conversation_id)
+    waited = await request.app.state.turn_scheduler.wait_for_turn(
+        conversation_id,
+        timeout_seconds=30 if payload.wait else 0,
+    )
+    result = {
+        "kind": waited.__class__.__name__ if waited is not None else "idle",
+        "message": getattr(waited, "message", None),
+        "result_summary": getattr(waited, "result_summary", None),
+    }
+    return await _managed_action_response(request, conversation_id, "waited", result)
+
+
+@router.post(
+    "/{conversation_id}/managed/interrupt", response_model=ManagedConversationActionResponse
+)
+async def managed_conversation_interrupt(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    _, link = await _require_managed_conversation(request, conversation_id)
+    cancelled = await request.app.state.turn_scheduler.cancel_turn(conversation_id)
+    async with request.app.state.session_factory() as session:
+        await update_managed_conversation_link(
+            session,
+            link.link_id,
+            turn_state="interrupted" if cancelled else "idle",
+            clear_active_turn_id=True,
+            last_error=payload.reason or "Interrupted from web UI",
+        )
+        await session.commit()
+    return await _managed_action_response(
+        request,
+        conversation_id,
+        "interrupted" if cancelled else "idle",
+    )
+
+
+@router.post("/{conversation_id}/managed/retry", response_model=ManagedConversationActionResponse)
+async def managed_conversation_retry(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    _, link = await _require_managed_conversation(request, conversation_id)
+    if link.turn_state not in {"failed", "interrupted"}:
+        raise api_exception(
+            409,
+            "not_retryable",
+            "Agent work retry is only available after a failed or interrupted turn.",
+        )
+    message = await _last_agent_work_user_message(request, link)
+    if not message:
+        raise api_exception(409, "not_retryable", "No previous user message is available to retry")
+    return await managed_conversation_send(
+        request,
+        conversation_id,
+        ManagedConversationActionRequest(message=message, wait=payload.wait),
+    )
+
+
+@router.post("/{conversation_id}/managed/close", response_model=ManagedConversationActionResponse)
+async def managed_conversation_close(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    _, link = await _require_managed_conversation(request, conversation_id)
+    await request.app.state.turn_scheduler.cancel_turn(conversation_id)
+    async with request.app.state.session_factory() as session:
+        await update_managed_conversation_link(
+            session,
+            link.link_id,
+            conversation_state="closed",
+            turn_state="interrupted",
+            clear_active_turn_id=True,
+            last_error=payload.reason or "Closed from web UI",
+            closed=True,
+        )
+        await session.commit()
+    return await _managed_action_response(request, conversation_id, "closed")
+
+
+@router.post("/{conversation_id}/managed/fork", response_model=ManagedConversationActionResponse)
+async def managed_conversation_fork(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    user, link = await _require_managed_conversation(request, conversation_id)
+    active_turn_id = request.app.state.turn_scheduler.active_turn_id(conversation_id)
+    from cognis.core.session import _to_conversation_model, _to_session_model
+    from cognis.models.agent import AgentDefinition
+
+    async with request.app.state.session_factory() as session:
+        conversation_row = await get_conversation(session, conversation_id)
+        session_row = (
+            await get_session_row(session, link.target_session_id)
+            if link.target_session_id
+            else None
+        )
+        agent_row = await get_agent(session, link.target_agent_id)
+    if conversation_row is None or session_row is None or agent_row is None:
+        raise api_exception(404, "not_found", "Agent work runtime not found")
+
+    target_agent = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+    managed_context_data = {
+        "kind": "agent_work",
+        "controller_agent_id": link.controller_agent_id,
+        "controller_conversation_id": link.controller_conversation_id,
+        "controller_session_id": link.controller_session_id,
+        "target_agent_id": link.target_agent_id,
+        "forked_from_conversation_id": link.target_conversation_id,
+        "forked_from_session_id": link.target_session_id,
+        "provenance_in_prefix": True,
+    }
+    managed_context = ConversationContext(
+        type="agent_work",
+        platform_data=managed_context_data,
+    )
+    fork_title = f"{link.title or 'Agent work'} (fork)"
+    fork_intention = payload.message or f"Forked agent work with {target_agent.name}"
+    if active_turn_id:
+        (
+            new_conversation,
+            new_session,
+            copied,
+        ) = await request.app.state.session_manager.fork_active_turn_checkpoint_into_new_conversation(
+            source_session=_to_session_model(session_row),
+            source_conversation=_to_conversation_model(conversation_row),
+            agent=target_agent,
+            user_email=user.email,
+            active_turn_id=active_turn_id,
+            title=fork_title,
+            intention=fork_intention,
+            context=managed_context,
+            snapshot_extras={"trigger": "managed_conversation_fork"},
+        )
+    else:
+        (
+            new_conversation,
+            new_session,
+            copied,
+        ) = await request.app.state.session_manager.fork_into_new_conversation(
+            source_session=_to_session_model(session_row),
+            source_conversation=_to_conversation_model(conversation_row),
+            agent=target_agent,
+            user_email=user.email,
+            title=fork_title,
+            intention=fork_intention,
+            context=managed_context,
+            snapshot_extras={"trigger": "managed_conversation_fork"},
+        )
+    if not copied:
+        raise api_exception(500, "fork_failed", "Agent work fork did not copy context")
+    async with request.app.state.session_factory() as session:
+        new_link = await create_managed_conversation_link(
+            session,
+            user_email=user.email,
+            controller_agent_id=link.controller_agent_id,
+            controller_conversation_id=link.controller_conversation_id,
+            controller_session_id=link.controller_session_id,
+            target_agent_id=link.target_agent_id,
+            target_conversation_id=new_conversation.conversation_id,
+            target_session_id=new_session.session_id,
+            title=fork_title,
+        )
+        await update_conversation_context_data(
+            session,
+            new_conversation.conversation_id,
+            context_data={**managed_context_data, "link_id": new_link.link_id},
+        )
+        await session.commit()
+    await _record_agent_work_context(
+        request,
+        session_model=new_session,
+        controller_agent_id=link.controller_agent_id,
+        controller_conversation_id=link.controller_conversation_id,
+        controller_session_id=link.controller_session_id,
+        target_agent_id=link.target_agent_id,
+    )
+    if payload.message:
+        error = await request.app.state.turn_scheduler.submit_turn(
+            new_conversation.conversation_id,
+            payload.message,
+            user_email=user.email,
+        )
+        if error is not None:
+            raise _turn_error_to_http(error)
+    return await _managed_action_response(request, new_conversation.conversation_id, "forked")
 
 
 async def _try_command_dispatch(

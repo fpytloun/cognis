@@ -94,7 +94,9 @@ async def build_credential_request_resolution_data(
                 f"Credential approval is missing required fields: {', '.join(missing)}"
             )
 
-    requested_metadata = requested.get("metadata") if isinstance(requested.get("metadata"), dict) else {}
+    requested_metadata = (
+        requested.get("metadata") if isinstance(requested.get("metadata"), dict) else {}
+    )
     credential_metadata = getattr(credential, "metadata", None) if credential is not None else None
     metadata = {
         **requested_metadata,
@@ -108,7 +110,8 @@ async def build_credential_request_resolution_data(
         user_email=user_email,
         kind=str(requested.get("kind") or (getattr(credential, "kind", "") if credential else "")),
         label=str(
-            requested.get("label") or (getattr(credential, "label", "") if credential is not None else "")
+            requested.get("label")
+            or (getattr(credential, "label", "") if credential is not None else "")
         ),
         payload=credential_payload,
         metadata=metadata,
@@ -140,7 +143,11 @@ async def build_auth_challenge_resolution_data(
         if isinstance(notification.payload, dict)
         else []
     )
-    required_field_names = [str(field) for field in required_fields if isinstance(field, str)] if isinstance(required_fields, list) else []
+    required_field_names = (
+        [str(field) for field in required_fields if isinstance(field, str)]
+        if isinstance(required_fields, list)
+        else []
+    )
     response_value: str | None = None
     if response is not None:
         response_value = response

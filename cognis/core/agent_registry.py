@@ -508,7 +508,7 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Explore",
             "Fast read-only codebase exploration",
             _EXPLORE_PROMPT,
-            tools={"builtin_tools": ["read", "grep", "glob", "list", "bash"]},
+            tools={"builtin_tools": ["read", "grep", "glob", "list_directory", "bash"]},
             reasoning_effort="low",
             allow_user_override=True,
             allow_user_disable=True,
@@ -570,7 +570,7 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
                     "apply_patch",
                     "grep",
                     "glob",
-                    "list",
+                    "list_directory",
                     "bash",
                 ]
             },

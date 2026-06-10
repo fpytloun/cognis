@@ -39,6 +39,7 @@ from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
+from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.attachment_utils import (
     attachment_placeholder_text,
     normalize_attachment_refs,
@@ -64,6 +65,8 @@ from cognis.core.followups import (
     FollowUpStatus,
     build_follow_up_id,
     parse_follow_up_metadata,
+    render_follow_up_turn_notice,
+    truncate_follow_up_text,
 )
 from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
@@ -72,7 +75,13 @@ from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
-from cognis.models.session import BLOCKED_STATES, ConversationModel, SessionModel, SessionStatus
+from cognis.models.session import (
+    BLOCKED_STATES,
+    ConversationModel,
+    SessionEvent,
+    SessionModel,
+    SessionStatus,
+)
 from cognis.models.task import TaskDelivery
 from cognis.runtime_context import (
     current_agent_id,
@@ -86,6 +95,8 @@ from cognis.store.models import FollowUpDedupeRow
 from cognis.store.queries import get_setting_value
 
 logger = get_logger(__name__)
+
+_CANCELLED_TURN_ERROR_CODES = {"cancelled", "turn_cancelled"}
 
 _MAX_ACTIVE_TOOL_OUTPUT_CHARS = 64_000
 _ACTIVE_TOOL_OUTPUT_SNAPSHOT_TTL_SECONDS = 6 * 60 * 60
@@ -171,6 +182,19 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
     return attachment_placeholder_text(attachment.kind for attachment in attachments)
 
 
+def _should_bootstrap_wait_for_intention(conversation: ConversationModel) -> bool:
+    """Return whether the first model turn should wait for Intaris intention bootstrap."""
+
+    if can_adopt_intaris_title(conversation):
+        return True
+    context = conversation.context
+    if context is None:
+        return False
+    if not is_agent_direct_context(context.type, context.platform_data):
+        return False
+    return not (conversation.title or "").strip()
+
+
 def _utf16_code_units(value: str) -> int:
     """Return the string length in JavaScript-compatible UTF-16 code units."""
 
@@ -246,6 +270,9 @@ class TurnResult:
     completed_at: datetime | None = None
     chat_mode: ChatMode = "default"
     chat_mode_source: str = "system_default"
+    partial: bool = False
+    finish_reason: str | None = None
+    managed_continuation_pending: bool = False
 
 
 @dataclass(slots=True)
@@ -637,7 +664,15 @@ class TurnObserver(Protocol):
 
     async def on_turn_error(self, conversation_id: str, error: TurnError) -> None: ...
 
-    async def on_system_message(self, conversation_id: str, text: str) -> None: ...
+    async def on_system_message(
+        self,
+        conversation_id: str,
+        text: str,
+        notice_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        turn_id: str | None = None,
+    ) -> None: ...
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None: ...
 
@@ -710,6 +745,9 @@ class TurnScheduler:
         self._active_tool_outputs: dict[tuple[str, str, str], ActiveToolOutputSnapshot] = {}
         self._active_tool_outputs_lock = asyncio.Lock()
         self._active_tool_output_l2: dict[str, dict[str, Any]] = {}
+        self._turn_waiters: dict[str, list[asyncio.Future[TurnResult | TurnError]]] = defaultdict(
+            list
+        )
 
         # Per-user concurrent turn limit
         self._user_turn_counts: dict[str, int] = defaultdict(int)
@@ -810,7 +848,7 @@ class TurnScheduler:
                     if snapshot.turn_id != active_turn_id:
                         stale_keys.append(key)
                         continue
-                    if snapshot.result and not snapshot.expired():
+                    if snapshot.status == "running" and snapshot.result and not snapshot.expired():
                         snapshots.append(snapshot.snapshot())
                 for key in stale_keys:
                     self._active_tool_outputs.pop(key, None)
@@ -859,7 +897,12 @@ class TurnScheduler:
             payload = [
                 snapshot.snapshot()
                 for (cid, _, _), snapshot in self._active_tool_outputs.items()
-                if cid == conversation_id and snapshot.result and not snapshot.expired()
+                if (
+                    cid == conversation_id
+                    and snapshot.status == "running"
+                    and snapshot.result
+                    and not snapshot.expired()
+                )
             ]
         try:
             key = self._active_tool_output_cache_key(conversation_id)
@@ -978,6 +1021,7 @@ class TurnScheduler:
             snapshot.anchors_available = bool(meta.get("anchors_available"))
             snapshot.anchor_count = int(meta.get("anchor_count") or 0)
             snapshot.updated_at = _utcnow()
+            self._active_tool_outputs.pop(key, None)
         self._tool_output_spool.mark_complete(
             conversation_id=conversation_id,
             session_id=session_id,
@@ -1049,6 +1093,168 @@ class TurnScheduler:
         async with self._active_streams_lock:
             self._active_streams.pop(conversation_id, None)
 
+    async def _pop_active_stream(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        message_id: str,
+        turn_id: str | None,
+    ) -> ActiveStreamState | None:
+        async with self._active_streams_lock:
+            stream = self._active_streams.get(conversation_id)
+            if (
+                stream is None
+                or stream.session_id != session_id
+                or stream.message_id != message_id
+                or stream.turn_id != turn_id
+            ):
+                return None
+            self._active_streams.pop(conversation_id, None)
+            return stream
+
+    async def _persist_cancelled_active_stream(
+        self,
+        *,
+        conversation_id: str,
+        session: SessionModel,
+        message_id: str,
+        turn_id: str | None,
+        user_email: str,
+        agent: AgentDefinition,
+    ) -> tuple[str | None, int]:
+        """Persist already streamed assistant text when a turn is cancelled."""
+
+        stream = await self._pop_active_stream(
+            conversation_id=conversation_id,
+            session_id=session.session_id,
+            message_id=message_id,
+            turn_id=turn_id,
+        )
+        if stream is None or not stream.content:
+            return None, 0
+
+        event = SessionEvent(
+            type="assistant_message",
+            data={
+                "content": stream.content,
+                "turn_id": turn_id,
+                "partial": True,
+                "cancelled": True,
+                "finish_reason": "user_cancelled",
+            },
+        )
+        intaris_session_id = session.intaris_session_id or session.session_id
+        digest = hashlib.sha256(stream.content.encode("utf-8")).hexdigest()[:16]
+        idempotency_key = (
+            f"cancelled-active-stream:{intaris_session_id}:"
+            f"{turn_id or message_id}:{stream.chunk_count}:{digest}"
+        )
+        try:
+            append_result = await self._providers.guardrails.record_events(
+                session_id=intaris_session_id,
+                events=[event],
+                source="cognis",
+                idempotency_key=idempotency_key,
+                user_email=user_email,
+                agent_id=agent.agent_id,
+                agent_owner_email=getattr(agent, "owner_email", user_email),
+            )
+            if not append_result.ok:
+                raise RuntimeError("Intaris did not persist cancelled assistant stream")
+            await self._session_cache.append_recorded_events(session, [event], append_result)
+            return stream.content, append_result.last_seq
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to persist cancelled assistant stream",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "turn_id": turn_id,
+                    }
+                },
+                exc_info=True,
+            )
+            return None, 0
+
+    async def _persist_follow_up_turn_notice(
+        self,
+        *,
+        conversation_id: str,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str,
+        follow_up: FollowUpMetadata,
+        turn_id: str,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
+    ) -> None:
+        """Persist and broadcast the visible notice for a follow-up initiated turn."""
+
+        text = render_follow_up_turn_notice(follow_up)
+        notice_id = f"turn-init:{follow_up.follow_up_id}"
+        data: dict[str, Any] = {
+            "content": text,
+            "text": text,
+            "message": text,
+            "event": "turn_initiated",
+            "notice_id": notice_id,
+            "kind": "turn_initiated",
+            "scope": "turn",
+            "turn_id": turn_id,
+            "follow_up_id": follow_up.follow_up_id,
+            "origin_kind": follow_up.origin_kind.value,
+            "status": follow_up.status.value,
+        }
+        topic_ref = getattr(follow_up, "topic_ref", None)
+        if topic_ref:
+            data["source_id"] = topic_ref
+        source_title = getattr(follow_up, "task_title", None) or getattr(follow_up, "title", None)
+        if source_title:
+            data["source_title"] = source_title
+
+        try:
+            event = SessionEvent(type="system_message", data=data)
+            session_id = session.session_id
+            intaris_session_id = getattr(session, "intaris_session_id", None) or session_id
+            idempotency_key = f"{intaris_session_id}:turn_initiated:{follow_up.follow_up_id}"
+            append_result = await self._providers.guardrails.record_events(
+                session_id=intaris_session_id,
+                events=[event],
+                source="cognis",
+                idempotency_key=idempotency_key,
+                user_email=user_email,
+                agent_id=agent.agent_id,
+                agent_owner_email=getattr(agent, "owner_email", user_email),
+            )
+            if not append_result.ok:
+                raise RuntimeError("Intaris did not persist follow-up turn notice")
+            if append_result.count <= 0:
+                return
+            await self._session_cache.append_recorded_events(session, [event], append_result)
+            await self._notify_observers_system_message(
+                conversation_id,
+                text,
+                notice_id=notice_id,
+                kind="turn_initiated",
+                scope="turn",
+                turn_id=turn_id,
+                turn_observers=turn_observers,
+            )
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to persist follow-up turn notice",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "session_id": getattr(session, "session_id", None),
+                        "turn_id": turn_id,
+                        "follow_up_id": follow_up.follow_up_id,
+                    }
+                },
+                exc_info=True,
+            )
+
     async def _clear_redo_on_accepted_user_turn(
         self,
         conversation_id: str,
@@ -1068,6 +1274,46 @@ class TurnScheduler:
             logger.warning(
                 "turn_scheduler: failed to clear redo metadata for accepted user turn",
                 extra={"extra_data": {"conversation_id": conversation_id}},
+                exc_info=True,
+            )
+
+    async def _mark_managed_conversation_turn_running(
+        self,
+        *,
+        target_conversation_id: str,
+        target_session_id: str,
+        turn_id: str | None,
+    ) -> None:
+        """Mirror scheduler-owned launches into the managed-conversation link."""
+
+        try:
+            async with self._session_factory() as db_session:
+                link = await queries.get_managed_conversation_link_for_target(
+                    db_session,
+                    target_conversation_id,
+                )
+                if link is None:
+                    return
+                await queries.update_managed_conversation_link(
+                    db_session,
+                    link.link_id,
+                    conversation_state="open",
+                    turn_state="running",
+                    target_session_id=target_session_id,
+                    active_turn_id=turn_id,
+                    last_error=None,
+                )
+                await db_session.commit()
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to mark managed conversation turn running",
+                extra={
+                    "extra_data": {
+                        "target_conversation_id": target_conversation_id,
+                        "target_session_id": target_session_id,
+                        "turn_id": turn_id,
+                    }
+                },
                 exc_info=True,
             )
 
@@ -1468,6 +1714,39 @@ class TurnScheduler:
         """Check if a turn is still visibly running for the user."""
 
         return self.running_turn_state(conversation_id) is not None
+
+    async def wait_for_turn(
+        self,
+        conversation_id: str,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> TurnResult | TurnError | None:
+        """Wait for a currently running turn, or return immediately when idle."""
+
+        active = self._active_turns.get(conversation_id)
+        if active is None or active.done():
+            return None
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[TurnResult | TurnError] = loop.create_future()
+        self._turn_waiters[conversation_id].append(future)
+        try:
+            if timeout_seconds is None:
+                return await future
+            return await asyncio.wait_for(future, timeout=max(1, int(timeout_seconds)))
+        except TimeoutError:
+            return None
+        finally:
+            with contextlib.suppress(ValueError):
+                self._turn_waiters[conversation_id].remove(future)
+
+    def active_turn_id(self, conversation_id: str) -> str | None:
+        """Return active turn ID for a conversation, if any."""
+
+        control = self._turn_controls.get(conversation_id)
+        active = self._active_turns.get(conversation_id)
+        if active is None or active.done() or control is None:
+            return None
+        return control.turn_id
 
     def queued_count(self, conversation_id: str) -> int:
         """Return the number of queued messages for a conversation."""
@@ -2132,10 +2411,17 @@ class TurnScheduler:
             return
         try:
             follow_up = parse_follow_up_metadata(raw_follow_up)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "turn_scheduler: invalid follow-up metadata, dropping",
-                extra={"extra_data": {"conversation_id": conversation_id}},
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "follow_up_id": raw_follow_up.get("follow_up_id"),
+                        "origin_kind": raw_follow_up.get("origin_kind"),
+                        "error": str(exc),
+                    }
+                },
                 exc_info=True,
             )
             return
@@ -2504,6 +2790,12 @@ class TurnScheduler:
         turn_control.turn_id = turn_id
         turn_observers = turn_control.turn_observers
 
+        await self._mark_managed_conversation_turn_running(
+            target_conversation_id=conversation_id,
+            target_session_id=session.session_id,
+            turn_id=turn_id,
+        )
+
         resolved_chat_mode = ResolvedChatMode(mode="default", source="system_default")
         try:
             current_user_email.set(user_email)
@@ -2558,6 +2850,17 @@ class TurnScheduler:
                     },
                 )
             )
+
+            if system_initiated and follow_up is not None:
+                await self._persist_follow_up_turn_notice(
+                    conversation_id=conversation_id,
+                    session=session,
+                    agent=agent,
+                    user_email=user_email,
+                    follow_up=follow_up,
+                    turn_id=turn_id,
+                    turn_observers=turn_observers,
+                )
 
             # Publish USER_MESSAGE so WebSocket clients watching this
             # conversation see channel-originated messages in real time
@@ -2730,6 +3033,7 @@ class TurnScheduler:
                     turn_observers=turn_observers,
                 )
 
+            queued_continuation_pending = self.queued_count(conversation_id) > 0
             # Post-turn housekeeping
             completed_at = datetime.now(UTC)
             await self._touch_conversation(conversation_id, when=completed_at)
@@ -2806,6 +3110,7 @@ class TurnScheduler:
                 completed_at=completed_at,
                 chat_mode=resolved_chat_mode.mode,
                 chat_mode_source=resolved_chat_mode.source,
+                managed_continuation_pending=queued_continuation_pending,
             )
             turn_control.settled = True
             await self._publish_turn_completed(result, turn_observers=turn_observers)
@@ -2825,28 +3130,71 @@ class TurnScheduler:
 
         except asyncio.CancelledError:
             turn_control.settled = True
+            completed_at = datetime.now(UTC)
+            partial_content, last_seq = await self._persist_cancelled_active_stream(
+                conversation_id=conversation_id,
+                session=session,
+                message_id=message_id,
+                turn_id=turn_id,
+                user_email=user_email,
+                agent=agent,
+            )
+            if partial_content is not None:
+                await self._touch_conversation(conversation_id, when=completed_at)
+                result = TurnResult(
+                    conversation_id=conversation_id,
+                    session_id=session.session_id,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                    last_seq=last_seq,
+                    final_content=partial_content,
+                    system_initiated=system_initiated,
+                    channel_deliverable=(
+                        channel_deliverable or turn_control.absorbed_channel_deliverable
+                    ),
+                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_fallback_text=(
+                        turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                    ),
+                    attachments=(
+                        normalize_attachment_refs(
+                            [
+                                *(outbound_attachments or []),
+                                *turn_control.absorbed_outbound_attachments,
+                            ]
+                        )
+                        or None
+                    ),
+                    completed_at=completed_at,
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
+                    partial=True,
+                    finish_reason="user_cancelled",
+                )
+                await self._publish_turn_completed(result, turn_observers=turn_observers)
             error = TurnError(
                 code="turn_cancelled",
                 message="The current turn was cancelled.",
                 recoverable=True,
             )
-            await self._publish_turn_error(
-                conversation_id,
-                session.session_id,
-                error,
-                turn_id=turn_id,
-                system_initiated=system_initiated,
-                channel_deliverable=(
-                    channel_deliverable or turn_control.absorbed_channel_deliverable
-                ),
-                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
-                delivery_fallback_text=(
-                    turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
-                ),
-                chat_mode=resolved_chat_mode.mode,
-                chat_mode_source=resolved_chat_mode.source,
-                turn_observers=turn_observers,
-            )
+            if partial_content is None:
+                await self._publish_turn_error(
+                    conversation_id,
+                    session.session_id,
+                    error,
+                    turn_id=turn_id,
+                    system_initiated=system_initiated,
+                    channel_deliverable=(
+                        channel_deliverable or turn_control.absorbed_channel_deliverable
+                    ),
+                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_fallback_text=(
+                        turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                    ),
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
+                    turn_observers=turn_observers,
+                )
             TURNS_TOTAL.labels(outcome="cancelled").inc()
             logger.info(
                 "turn_scheduler: turn cancelled",
@@ -3275,6 +3623,10 @@ class TurnScheduler:
         conversation_id: str,
         text: str,
         *,
+        notice_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        turn_id: str | None = None,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Send a system message to all observers."""
@@ -3283,6 +3635,10 @@ class TurnScheduler:
             "on_system_message",
             conversation_id,
             text,
+            notice_id,
+            kind,
+            scope,
+            turn_id,
             turn_observers=turn_observers,
         )
 
@@ -3294,6 +3650,7 @@ class TurnScheduler:
     ) -> None:
         """Notify observers and publish lifecycle event."""
         await self._reset_active_stream(result.conversation_id)
+        self._settle_turn_waiters(result.conversation_id, result)
         await asyncio.gather(
             *(
                 self._call_observer(
@@ -3337,8 +3694,45 @@ class TurnScheduler:
                     "chat_mode": result.chat_mode,
                     "chat_mode_source": result.chat_mode_source,
                     "attachments": strip_attachment_payload_bytes(result.attachments or []),
+                    "partial": result.partial,
+                    "finish_reason": result.finish_reason,
                 },
             )
+        )
+        await self._notify_managed_turn_result(result)
+
+    async def _notify_managed_turn_result(self, result: TurnResult) -> None:
+        """Update managed-conversation state for a completed scheduler turn."""
+
+        cancelled_partial = result.partial and result.finish_reason == "user_cancelled"
+        if cancelled_partial:
+            await self._notify_managed_conversation_controller(
+                target_conversation_id=result.conversation_id,
+                target_session_id=result.session_id,
+                turn_state="interrupted",
+                conversation_state="open",
+                status=FollowUpStatus.CANCELLED,
+                summary=result.final_content,
+                turn_id=result.turn_id,
+                error_message="The current turn was cancelled.",
+                recoverable=True,
+                clear_active_turn=True,
+                notify_on_completion=True,
+                completed=False,
+            )
+            return
+
+        await self._notify_managed_conversation_controller(
+            target_conversation_id=result.conversation_id,
+            target_session_id=result.session_id,
+            turn_state="running" if result.managed_continuation_pending else "completed",
+            conversation_state="open" if result.managed_continuation_pending else "completed",
+            status=FollowUpStatus.COMPLETED,
+            summary=result.final_content,
+            turn_id=result.turn_id,
+            clear_active_turn=not result.managed_continuation_pending,
+            notify_on_completion=not result.managed_continuation_pending,
+            completed=not result.managed_continuation_pending,
         )
 
     async def _publish_turn_error(
@@ -3358,6 +3752,7 @@ class TurnScheduler:
     ) -> None:
         """Notify observers and publish lifecycle event."""
         await self._reset_active_stream(conversation_id)
+        self._settle_turn_waiters(conversation_id, error)
         await asyncio.gather(
             *(
                 self._call_observer(
@@ -3393,6 +3788,169 @@ class TurnScheduler:
                 },
             )
         )
+        await self._notify_managed_turn_error(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            error=error,
+            turn_id=turn_id,
+        )
+
+    async def _notify_managed_turn_error(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        error: TurnError,
+        turn_id: str | None,
+    ) -> None:
+        """Update managed-conversation state for a failed scheduler turn."""
+
+        interrupted = error.code in _CANCELLED_TURN_ERROR_CODES
+        await self._notify_managed_conversation_controller(
+            target_conversation_id=conversation_id,
+            target_session_id=session_id,
+            turn_state="interrupted" if interrupted else "failed",
+            conversation_state="open",
+            status=FollowUpStatus.CANCELLED if interrupted else FollowUpStatus.FAILED,
+            summary=error.message,
+            turn_id=turn_id,
+            error_message=error.message,
+            recoverable=error.recoverable,
+        )
+
+    def _settle_turn_waiters(
+        self,
+        conversation_id: str,
+        value: TurnResult | TurnError,
+    ) -> None:
+        """Resolve futures waiting for the next visible turn settlement."""
+
+        waiters = self._turn_waiters.pop(conversation_id, [])
+        for future in waiters:
+            if not future.done():
+                future.set_result(value)
+
+    async def _notify_managed_conversation_controller(
+        self,
+        *,
+        target_conversation_id: str,
+        target_session_id: str,
+        turn_state: str,
+        conversation_state: str,
+        status: FollowUpStatus,
+        summary: str | None,
+        turn_id: str | None,
+        error_message: str | None = None,
+        recoverable: bool | None = None,
+        clear_active_turn: bool = True,
+        notify_on_completion: bool = True,
+        completed: bool | None = None,
+    ) -> None:
+        """Update managed-conversation state and notify the controller when requested."""
+
+        try:
+            async with self._session_factory() as db_session:
+                link = await queries.get_managed_conversation_link_for_target(
+                    db_session,
+                    target_conversation_id,
+                )
+                if link is None:
+                    return
+                if link.active_turn_id and turn_id and link.active_turn_id != turn_id:
+                    # A stale completion from an interrupted/cancelled previous turn must not
+                    # clear notification state for a newer controller-submitted turn.
+                    return
+                notify = bool(link.notify_on_completion and notify_on_completion)
+                await queries.update_managed_conversation_link(
+                    db_session,
+                    link.link_id,
+                    conversation_state=conversation_state,
+                    turn_state=turn_state,
+                    target_session_id=target_session_id,
+                    active_turn_id=turn_id if not clear_active_turn else None,
+                    clear_active_turn_id=clear_active_turn,
+                    notify_on_completion=False if notify_on_completion else None,
+                    last_result_summary=summary,
+                    last_error=error_message,
+                    completed=completed
+                    if completed is not None
+                    else conversation_state == "completed",
+                )
+                await queries.mark_conversation_read(db_session, target_conversation_id)
+                await db_session.commit()
+                if not notify:
+                    return
+                needs_attention = status in {FollowUpStatus.FAILED, FollowUpStatus.CANCELLED}
+                if error_message and summary and error_message not in summary:
+                    raw_summary = f"{error_message}\n\nPartial output:\n{summary}"
+                else:
+                    raw_summary = error_message or summary
+                follow_up_summary = truncate_follow_up_text(raw_summary, max_chars=600)
+                if needs_attention:
+                    description = (
+                        "A managed agent work turn needs attention. "
+                        f"Status: {turn_state}. "
+                        "Review the managed conversation, then resume with "
+                        "agent_conversation_retry if the last turn is recoverable, or continue "
+                        "with agent_conversation_send when new instructions are needed."
+                    )
+                    title = f"Agent work needs attention: {link.title or target_conversation_id}"
+                else:
+                    description = (
+                        "An agent work turn finished. Integrate the result, "
+                        "ask the user if clarification is needed, or continue the managed "
+                        "conversation with agent_conversation_send."
+                    )
+                    title = f"Agent work finished: {link.title or target_conversation_id}"
+                follow_up = {
+                    "version": 1,
+                    "follow_up_id": build_follow_up_id(
+                        kind="managed_conversation",
+                        conversation_id=link.controller_conversation_id,
+                        parts={
+                            "link_id": link.link_id,
+                            "target_conversation_id": target_conversation_id,
+                            "turn_id": turn_id,
+                            "status": status.value,
+                        },
+                    ),
+                    "mode": FollowUpMode.INTEGRATE.value,
+                    "origin_kind": FollowUpOriginKind.OTHER.value,
+                    "relevance_hint": FollowUpRelevanceHint.SAME_THREAD.value,
+                    "required_action": (
+                        FollowUpRequiredAction.INFORM_FAILURE.value
+                        if needs_attention
+                        else FollowUpRequiredAction.INTEGRATE_RESULT.value
+                    ),
+                    "topic_ref": target_conversation_id,
+                    "status": status.value,
+                    "title": title,
+                    "summary": follow_up_summary,
+                    "description": description,
+                    "metadata": {
+                        "link_id": link.link_id,
+                        "target_agent_id": link.target_agent_id,
+                        "target_conversation_id": target_conversation_id,
+                        "target_session_id": target_session_id,
+                        "turn_state": turn_state,
+                        "recoverable": recoverable,
+                    },
+                }
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.FOLLOW_UP_TURN_REQUESTED,
+                    data={
+                        "conversation_id": link.controller_conversation_id,
+                        "follow_up": follow_up,
+                    },
+                )
+            )
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to notify managed conversation controller",
+                extra={"extra_data": {"target_conversation_id": target_conversation_id}},
+                exc_info=True,
+            )
 
     async def _call_observer(
         self,
@@ -3495,7 +4053,7 @@ class TurnScheduler:
                                 conversation_model,
                                 _to_session_model(new_row),
                                 agent_model,
-                                can_adopt_intaris_title(conversation_model),
+                                _should_bootstrap_wait_for_intention(conversation_model),
                             )
 
                     intention = user_message or f"Conversation with {agent_row.name}"
@@ -3557,7 +4115,7 @@ class TurnScheduler:
                             conversation_model,
                             _to_session_model(new_row),
                             agent_model,
-                            can_adopt_intaris_title(conversation_model),
+                            _should_bootstrap_wait_for_intention(conversation_model),
                         )
 
                 compaction_summary, tail_start_seq = await self._read_compaction_metadata(
@@ -3611,7 +4169,7 @@ class TurnScheduler:
                     conversation_model,
                     new_session,
                     agent_model,
-                    can_adopt_intaris_title(conversation_model),
+                    _should_bootstrap_wait_for_intention(conversation_model),
                 )
 
         # Periodic cleanup of deferred creation locks (outside the lock block)
@@ -3626,7 +4184,7 @@ class TurnScheduler:
             conversation_model,
             session_model,
             agent_model,
-            can_adopt_intaris_title(conversation_model),
+            _should_bootstrap_wait_for_intention(conversation_model),
         )
 
     async def _read_compaction_metadata(

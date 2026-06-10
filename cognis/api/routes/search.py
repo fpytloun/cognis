@@ -118,9 +118,7 @@ async def search_conversations(
 
     # Supplemental flat search: only run for conversations whose Intaris
     # session reported multiple matches, so the UI can expand to see them.
-    multi_match_session_ids = [
-        row.intaris_session_id for row in matches if row.match_count > 1
-    ]
+    multi_match_session_ids = [row.intaris_session_id for row in matches if row.match_count > 1]
     if multi_match_session_ids:
         flat_filters = _intaris_filters(payload.filters)
         flat_filters.session_id = None

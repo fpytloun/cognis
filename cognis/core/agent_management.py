@@ -98,6 +98,23 @@ TOOL_GROUP_DEFINITIONS: tuple[ToolGroupDefinition, ...] = (
         risk_level="high",
         mutating=True,
     ),
+    ToolGroupDefinition(
+        group_id="office",
+        name="Office documents",
+        description="Create, inspect, validate, render, and modify Office documents using executor-native OfficeCLI tools.",
+        tool_ids=(
+            "builtin:office_read",
+            "builtin:office_get",
+            "builtin:office_query",
+            "builtin:office_validate",
+            "builtin:office_render",
+            "builtin:office_create",
+            "builtin:office_patch",
+        ),
+        risk_level="medium",
+        mutating=True,
+        requires_executor=True,
+    ),
 )
 
 
@@ -870,6 +887,7 @@ def _tools_state(tools: dict[str, Any] | None, *, raw_value: Any) -> dict[str, A
         "opt_in_builtin_tools": _string_list(tools.get("opt_in_builtin_tools")) if tools else [],
         "disabled_categories": _string_list(tools.get("disabled_categories")) if tools else [],
         "disabled_tools": _string_list(tools.get("disabled_tools")) if tools else [],
+        "disabled_mcp_servers": _string_list(tools.get("disabled_mcp_servers")) if tools else [],
         "tool_groups": _string_list(tools.get("tool_groups")) if tools else [],
         "allow_tools": _string_list(tools.get("allow_tools")) if tools else [],
         "deny_tools": _string_list(tools.get("deny_tools")) if tools else [],
@@ -988,6 +1006,11 @@ async def _agent_settings_schema(
             "type": "multi_select",
             "storage": "tools.disabled_tools",
             "options": tool_options,
+        },
+        "disabled_mcp_servers": {
+            "type": "multi_select",
+            "storage": "tools.disabled_mcp_servers",
+            "options": [],
         },
         "tool_groups": {
             "type": "multi_select",
@@ -1126,6 +1149,7 @@ async def _settings_updates(
             "opt_in_builtin_tools",
             "disabled_categories",
             "disabled_tools",
+            "disabled_mcp_servers",
             "tool_groups",
             "allow_tools",
             "deny_tools",
@@ -1166,6 +1190,7 @@ def _settings_field_names() -> set[str]:
         "opt_in_builtin_tools",
         "disabled_categories",
         "disabled_tools",
+        "disabled_mcp_servers",
         "tool_groups",
         "allow_tools",
         "deny_tools",
@@ -1244,7 +1269,12 @@ def _apply_tools_setting(tools: dict[str, Any], field: str, value: Any, row: Any
         tools[field] = [
             "manage_agents" if item == "builtin:manage_agents" else item for item in selected
         ]
-    elif field in {"disabled_categories", "disabled_tools", "intaris_mcp_servers"}:
+    elif field in {
+        "disabled_categories",
+        "disabled_tools",
+        "disabled_mcp_servers",
+        "intaris_mcp_servers",
+    }:
         tools[field] = _validated_string_list(value, field)
     elif field == "tool_groups":
         tools[field] = _validated_string_list(value, field, valid=set(_tool_group_map()))

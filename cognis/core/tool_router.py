@@ -31,6 +31,7 @@ from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
 )
+from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.core.session import executor_home_from_workspace_root
 from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.tool_output_presentation import present_tool_output
@@ -41,10 +42,14 @@ from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
     ExecutorHandle,
+    MCPAuthConfig,
+    MCPServerConfig,
     Permission,
     ToolCall,
     ToolDefinition,
     ToolResult,
+    effective_mcp_auth_config,
+    mcp_headers_have_authorization,
     stable_tool_id,
     tool_capabilities,
 )
@@ -52,6 +57,7 @@ from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_
 from cognis.store.queries import (
     create_artifact_record,
     get_artifact_record,
+    get_mcp_server,
     get_setting_value,
 )
 from cognis.tools.argument_normalization import strip_empty_optional_values
@@ -74,6 +80,12 @@ from cognis.tools.builtin.skill_management import (
     is_skill_management_tool,
 )
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
+from cognis.tools.mcp import (
+    HTTP_MCP_TRANSPORTS,
+    MCPClientError,
+    _normalize_call_result,
+    build_mcp_client,
+)
 from cognis.tools.registry import ToolExecutionContext, ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
@@ -86,6 +98,68 @@ TOOL_ROUTE_OUTCOMES = Counter(
     "Tool route outcomes",
     labelnames=("route", "outcome"),
 )
+
+
+def _mcp_oauth_setup_failed_result(
+    *,
+    server_id: str,
+    server_name: str,
+    message: str,
+    retryable: bool = False,
+) -> ToolResult:
+    return ToolResult(
+        output=f"MCP OAuth setup failed for {server_name}: {message[:500]}",
+        is_error=True,
+        metadata={
+            "code": "mcp_oauth_setup_failed",
+            "server_id": server_id,
+            "server_name": server_name,
+            "retryable": retryable,
+        },
+    )
+
+
+def _mcp_oauth_authorization_required_result(
+    *,
+    server_id: str,
+    server_name: str,
+    reason: str | None,
+    transaction_id: str | None,
+    authorization_url: str | None,
+    authorization_expires_at: datetime | None,
+) -> ToolResult:
+    if not authorization_url:
+        return _mcp_oauth_setup_failed_result(
+            server_id=server_id,
+            server_name=server_name,
+            message=(
+                "authorization is required, but Cognis could not generate an OAuth "
+                "authorization URL. Check the MCP OAuth server configuration and retry."
+            ),
+        )
+    expires_at = authorization_expires_at.isoformat() if authorization_expires_at else None
+    expires_text = f"\nThe authorization link expires at {expires_at}." if expires_at else ""
+    return ToolResult(
+        output=(
+            f"MCP authorization is required for {server_name}.\n"
+            f"Open this controller-generated URL to authorize the MCP server:\n"
+            f"{authorization_url}{expires_text}\n"
+            "After completing authorization, retry the tool call."
+        ),
+        is_error=True,
+        metadata={
+            "code": "mcp_authorization_required",
+            "server_id": server_id,
+            "server_name": server_name,
+            "transaction_id": transaction_id,
+            "authorization_url": authorization_url,
+            "authorization_expires_at": expires_at,
+            "reason": reason,
+            "retryable": False,
+        },
+    )
+
+
 TOOL_DECISION_CACHE_HITS = Counter(
     "cognis_tool_decision_cache_hits_total",
     "Short-lived local Intaris decision-cache hits",
@@ -102,6 +176,21 @@ logger = get_logger(__name__)
 ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 _MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_BROWSER_UPLOAD_FILES = 10
+_GUARDRAILS_RUNTIME_CONTEXT_KEYS = (
+    "workspace_root",
+    "working_directory",
+    "chat_mode",
+    "chat_mode_source",
+    "read_only_required",
+)
+_GUARDRAILS_EXECUTOR_ENVIRONMENT_KEYS = (
+    "available",
+    "executor_id",
+    "executor_type",
+    "cwd",
+    "home",
+)
+_GUARDRAILS_CONTEXT_STRING_LIMIT = 1200
 
 _AUTH_STATE_KIND_HINT = (
     "Use browser_fill value_ref for raw credential fields; use auth_state_ref only "
@@ -138,6 +227,67 @@ class PermissionDecision:
     call_id: str | None = None  # Intaris evaluation call_id (for escalation tracking)
 
 
+def _guardrails_context_value(value: Any) -> Any:
+    """Return a bounded JSON-like value for Intaris guardrails context."""
+
+    if isinstance(value, str):
+        return value[:_GUARDRAILS_CONTEXT_STRING_LIMIT]
+    if isinstance(value, bool | int | float) or value is None:
+        return value
+    if isinstance(value, list | tuple):
+        return [_guardrails_context_value(item) for item in value[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:120]: _guardrails_context_value(item)
+            for key, item in list(value.items())[:30]
+        }
+    return str(value)[:_GUARDRAILS_CONTEXT_STRING_LIMIT]
+
+
+def _compact_executor_environment(value: Any) -> dict[str, Any] | None:
+    """Keep only executor facts that are useful for guardrails decisions."""
+
+    if not isinstance(value, dict):
+        return None
+    compact = {
+        key: _guardrails_context_value(value.get(key))
+        for key in _GUARDRAILS_EXECUTOR_ENVIRONMENT_KEYS
+        if value.get(key) is not None
+    }
+    return compact or None
+
+
+def _tool_parameters_summary(parameters: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a small guardrails-oriented summary of a tool JSON schema."""
+
+    if not isinstance(parameters, dict):
+        return None
+    summary: dict[str, Any] = {}
+    required = parameters.get("required")
+    if isinstance(required, list):
+        summary["required"] = [str(item)[:120] for item in required[:12] if isinstance(item, str)]
+
+    properties = parameters.get("properties")
+    if isinstance(properties, dict):
+        compact_properties: dict[str, dict[str, str]] = {}
+        for name, spec in list(properties.items())[:12]:
+            if not isinstance(name, str) or not isinstance(spec, dict):
+                continue
+            entry: dict[str, str] = {}
+            schema_type = spec.get("type")
+            if isinstance(schema_type, str):
+                entry["type"] = schema_type[:80]
+            description = spec.get("description")
+            if isinstance(description, str) and description.strip():
+                entry["description"] = description.strip()[:240]
+            if entry:
+                compact_properties[name[:120]] = entry
+        if compact_properties:
+            summary["properties"] = compact_properties
+
+    return summary or None
+
+
 class ToolRouter:
     """Classify, evaluate, execute, and sanitize tool calls."""
 
@@ -156,6 +306,7 @@ class ToolRouter:
         pause_waiter: Any | None = None,
         event_bus: Any | None = None,
         task_queue: Any | None = None,
+        mcp_oauth_service: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.llm = llm
@@ -169,6 +320,7 @@ class ToolRouter:
         self.pause_waiter = pause_waiter
         self.event_bus = event_bus
         self._task_queue = task_queue
+        self._mcp_oauth_service = mcp_oauth_service
         self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
         self._decision_cache_ttl_seconds = 15.0
@@ -189,6 +341,7 @@ class ToolRouter:
         pause_waiter: Any | None = None,
         event_bus: Any | None = None,
         task_queue: Any | None = None,
+        mcp_oauth_service: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -208,6 +361,7 @@ class ToolRouter:
             pause_waiter=pause_waiter,
             event_bus=event_bus,
             task_queue=task_queue,
+            mcp_oauth_service=mcp_oauth_service,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -340,20 +494,16 @@ class ToolRouter:
 
         runtime = tool_call.runtime_metadata or {}
         context: dict[str, Any] = {}
-        for key in (
-            "workspace_root",
-            "working_directory",
-            "executor_environment",
-            "chat_mode",
-            "chat_mode_source",
-            "read_only_required",
-        ):
+        for key in _GUARDRAILS_RUNTIME_CONTEXT_KEYS:
             value = runtime.get(key)
             if value is not None:
-                context[key] = value
+                context[key] = _guardrails_context_value(value)
+        executor_env = _compact_executor_environment(runtime.get("executor_environment"))
+        if executor_env is not None:
+            context["executor_environment"] = executor_env
         runtime_access = current_runtime_access_context.get()
         if runtime_access and runtime_access.interaction_mode:
-            context["interaction_mode"] = runtime_access.interaction_mode
+            context["interaction_mode"] = _guardrails_context_value(runtime_access.interaction_mode)
         executor_env = context.get("executor_environment")
         if isinstance(executor_env, dict) and not executor_env.get("home"):
             inferred_home = executor_home_from_workspace_root(context.get("workspace_root"))
@@ -361,7 +511,17 @@ class ToolRouter:
                 context["executor_environment"] = {**executor_env, "home": inferred_home}
         if tool_definition is not None:
             source = getattr(tool_definition, "source", None)
+            classification = {
+                key: value
+                for key, value in {
+                    "status": getattr(tool_definition, "classification_status", None),
+                    "source": getattr(tool_definition, "classification_source", None),
+                    "confidence": getattr(tool_definition, "classification_confidence", None),
+                }.items()
+                if value is not None
+            }
             tool_context = {
+                "id": stable_tool_id(tool_definition),
                 "name": getattr(tool_definition, "name", tool_call.name),
                 "description": getattr(tool_definition, "description", None),
                 "read_only": getattr(tool_definition, "read_only", None),
@@ -371,6 +531,11 @@ class ToolRouter:
                 "category": getattr(tool_definition, "category", None),
                 "profile_group": getattr(tool_definition, "profile_group", None),
                 "risk_level": getattr(tool_definition, "risk_level", None),
+                "non_bypassable": getattr(tool_definition, "non_bypassable", None),
+                "classification": classification or None,
+                "parameters_summary": _tool_parameters_summary(
+                    getattr(tool_definition, "parameters", {})
+                ),
                 "source": {
                     key: value
                     for key, value in {
@@ -383,7 +548,16 @@ class ToolRouter:
                 if source is not None
                 else None,
             }
-            context["tool"] = {k: v for k, v in tool_context.items() if v is not None}
+            context["tool"] = {
+                k: _guardrails_context_value(v) for k, v in tool_context.items() if v is not None
+            }
+        if tool_call.name == "bash":
+            description = tool_call.arguments.get("description")
+            if isinstance(description, str) and description.strip():
+                context["intent"] = {
+                    "description": _guardrails_context_value(description.strip()),
+                    "source": "bash.description",
+                }
         skill_context = await self._skill_evaluation_context(tool_call)
         if skill_context:
             context["skill"] = skill_context
@@ -1066,15 +1240,23 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         try:
-            result = await asyncio.wait_for(
-                executor.tool_execute(
-                    scoped_tool_call,
-                    timeout_seconds=registered_tool.definition.timeout_seconds,
-                    output_chunk_callback=output_chunk_callback,
-                ),
-                timeout=registered_tool.definition.timeout_seconds,
+            controller_result = await self._execute_controller_oauth_mcp_if_applicable(
+                scoped_tool_call,
+                registered_tool=registered_tool,
+                session=session,
             )
-            result = await self._persist_browser_auth_state_if_needed(result, session, agent)
+            if controller_result is not None:
+                result = controller_result
+            else:
+                result = await asyncio.wait_for(
+                    executor.tool_execute(
+                        scoped_tool_call,
+                        timeout_seconds=registered_tool.definition.timeout_seconds,
+                        output_chunk_callback=output_chunk_callback,
+                    ),
+                    timeout=registered_tool.definition.timeout_seconds,
+                )
+                result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
             result = await self._postprocess_tool_result(result, scoped_tool_call, session)
         except CredentialAccessError as exc:
@@ -1111,6 +1293,145 @@ class ToolRouter:
             call_id=cid,
             runtime_metadata=tool_call.runtime_metadata,
         )
+
+    async def _execute_controller_oauth_mcp_if_applicable(
+        self,
+        tool_call: ToolCall,
+        *,
+        registered_tool: Any,
+        session: SessionModel,
+    ) -> ToolResult | None:
+        """Execute OAuth HTTP MCP tools in the controller with per-call token refresh."""
+
+        source = registered_tool.definition.source
+        if source.type != "local_mcp" or not source.server_id:
+            return None
+        if self._session_factory is None or self._mcp_oauth_service is None:
+            return None
+
+        async with self._session_factory() as store_session:
+            mcp_row = await get_mcp_server(
+                store_session,
+                source.server_id,
+                owner_email=session.user_email,
+                include_shared=True,
+            )
+            tool_timeout_raw = await get_setting_value(
+                store_session, "mcp.tool_timeout_seconds", 300
+            )
+            connect_timeout_raw = await get_setting_value(
+                store_session, "mcp.connect_timeout_seconds", 15
+            )
+        if mcp_row is None or mcp_row.status != "active":
+            return None
+        if mcp_row.transport not in HTTP_MCP_TRANSPORTS:
+            return None
+
+        base_headers = mcp_row.headers or {}
+        auth_config = effective_mcp_auth_config(mcp_row.auth_config, base_headers)
+        if auth_config.type != "oauth2":
+            return None
+        if mcp_headers_have_authorization(base_headers):
+            return None
+
+        try:
+            token_result = await self._mcp_oauth_service.inject_authorization_header(
+                user_email=session.user_email,
+                server=mcp_row,
+                headers={k: v for k, v in base_headers.items() if k.lower() != "authorization"},
+                conversation_id=session.conversation_id,
+                session_id=session.session_id,
+                task_id=tool_call.runtime_metadata.get("task_id"),
+                step_name=tool_call.runtime_metadata.get("step_name"),
+                step_run_id=tool_call.runtime_metadata.get("step_run_id"),
+                delivery_mode="same_conversation",
+            )
+        except MCPOAuthError as exc:
+            return _mcp_oauth_setup_failed_result(
+                server_id=source.server_id or mcp_row.server_id,
+                server_name=mcp_row.name,
+                message=str(exc),
+                retryable=bool(getattr(exc, "retryable", False)),
+            )
+
+        if token_result.authorization_required:
+            return _mcp_oauth_authorization_required_result(
+                server_id=source.server_id or mcp_row.server_id,
+                server_name=mcp_row.name,
+                reason=token_result.reason,
+                transaction_id=token_result.transaction_id,
+                authorization_url=token_result.authorization_url,
+                authorization_expires_at=getattr(token_result, "authorization_expires_at", None),
+            )
+
+        if isinstance(tool_timeout_raw, int | float | str):
+            try:
+                tool_timeout = int(tool_timeout_raw)
+            except (TypeError, ValueError):
+                tool_timeout = 300
+        else:
+            tool_timeout = 300
+        if isinstance(connect_timeout_raw, int | float | str):
+            try:
+                connect_timeout = int(connect_timeout_raw)
+            except (TypeError, ValueError):
+                connect_timeout = 15
+        else:
+            connect_timeout = 15
+        timeout_seconds = max(int(mcp_row.timeout_seconds or 0), tool_timeout, 1)
+        connect_timeout_seconds = max(connect_timeout, 1)
+
+        config = MCPServerConfig(
+            name=mcp_row.name,
+            transport=mcp_row.transport,
+            command=mcp_row.command,
+            url=mcp_row.url,
+            args=mcp_row.args or [],
+            env={},
+            headers=token_result.headers,
+            auth_config=MCPAuthConfig(type="static_headers"),
+            timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+            server_id=mcp_row.server_id,
+        )
+        client = build_mcp_client(config, secrets={})
+        try:
+            await client.connect()
+            raw = await client.call_tool(
+                source.raw_tool_name or tool_call.name, tool_call.arguments
+            )
+            result = raw if isinstance(raw, ToolResult) else _normalize_call_result(raw)
+            metadata = dict(result.metadata or {})
+            metadata.update(
+                {
+                    "executed_by": "controller_oauth_mcp",
+                    "server_id": source.server_id,
+                    "server_name": mcp_row.name,
+                    "raw_tool_name": source.raw_tool_name or tool_call.name,
+                    "timeout_seconds": timeout_seconds,
+                    "connect_timeout_seconds": connect_timeout_seconds,
+                }
+            )
+            return result.model_copy(update={"metadata": metadata})
+        except MCPClientError as exc:
+            return ToolResult(
+                output=f"MCP tool call failed: {str(exc)[:500]}",
+                is_error=True,
+                metadata={
+                    "code": "mcp_tool_call_failed",
+                    "server_id": source.server_id,
+                    "server_name": exc.server_name,
+                    "phase": exc.phase,
+                    "error_class": exc.error_class,
+                    "timed_out": exc.timed_out,
+                    "status_code": exc.status_code,
+                    "auth_error": exc.auth_error,
+                    "authorization_required": exc.authorization_required,
+                    "retryable": exc.timed_out,
+                },
+            )
+        finally:
+            await client.close(suppress_cancelled=True)
 
     async def _postprocess_tool_result(
         self,
@@ -1301,6 +1622,17 @@ class ToolRouter:
                 arguments.setdefault("source_artifact_filename", metadata["filename"])
                 arguments.setdefault("source_artifact_mime_type", metadata["mime_type"])
                 arguments.setdefault("source_artifact_size_bytes", metadata["size_bytes"])
+        if tool_call.name.startswith("office_"):
+            arguments.pop("source_artifact_content_b64", None)
+            if artifact_id := arguments.get("source_artifact_id"):
+                metadata = await self._get_accessible_content_ref_metadata(
+                    str(artifact_id),
+                    session.user_email,
+                    scope_task_id=self._content_ref_scope_task_id(tool_call),
+                )
+                arguments.setdefault("source_artifact_filename", metadata["filename"])
+                arguments.setdefault("source_artifact_mime_type", metadata["mime_type"])
+                arguments.setdefault("source_artifact_size_bytes", metadata["size_bytes"])
         if tool_call.name == "browser_upload":
             arguments.pop("source_artifacts", None)
             artifact_ids = arguments.get("source_artifact_ids")
@@ -1371,6 +1703,18 @@ class ToolRouter:
             arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
             arguments.setdefault("source_artifact_filename", filename)
             arguments.setdefault("source_artifact_mime_type", mime_type)
+        if tool_call.name.startswith("office_") and (
+            artifact_id := arguments.get("source_artifact_id")
+        ):
+            content, mime_type, filename = await self._load_binary_content_ref(
+                str(artifact_id),
+                session.user_email,
+                scope_task_id=self._content_ref_scope_task_id(tool_call),
+            )
+            arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
+            arguments.setdefault("source_artifact_filename", filename)
+            arguments.setdefault("source_artifact_mime_type", mime_type)
+            arguments.setdefault("source_artifact_size_bytes", len(content))
         if tool_call.name == "document_generate" and (
             artifact_id := arguments.get("source_artifact_id")
         ):
@@ -1947,9 +2291,31 @@ class ToolRouter:
             changed = True
             materialized.append(await self._persist_inline_attachment(raw, session, tool_name))
         enriched_output = self._enrich_attachment_output(result.output, materialized)
-        if not changed and enriched_output == result.output:
+        attachment_anchors = self._attachment_output_anchors(enriched_output, materialized)
+        next_metadata = dict(result.metadata or {})
+        if attachment_anchors:
+            existing_anchors = next_metadata.get("output_anchors")
+            merged_anchors = list(existing_anchors) if isinstance(existing_anchors, list) else []
+            seen_anchor_names = {
+                item.get("anchor")
+                for item in merged_anchors
+                if isinstance(item, dict) and isinstance(item.get("anchor"), str)
+            }
+            for anchor in attachment_anchors:
+                if anchor["anchor"] not in seen_anchor_names:
+                    merged_anchors.append(anchor)
+                    seen_anchor_names.add(anchor["anchor"])
+            next_metadata["output_anchors"] = merged_anchors
+        metadata_changed = next_metadata != (result.metadata or {})
+        if not changed and enriched_output == result.output and not metadata_changed:
             return result
-        return result.model_copy(update={"attachments": materialized, "output": enriched_output})
+        return result.model_copy(
+            update={
+                "attachments": materialized,
+                "output": enriched_output,
+                "metadata": next_metadata,
+            }
+        )
 
     async def _persist_inline_attachment(
         self,
@@ -2019,6 +2385,7 @@ class ToolRouter:
             "mime_type": primary.get("mime_type"),
             "size_bytes": primary.get("size_bytes"),
         }
+        output = self._replace_generic_attachment_guidance(output, primary)
         try:
             parsed = json.loads(output)
             if isinstance(parsed, dict):
@@ -2041,6 +2408,70 @@ class ToolRouter:
         if guidance:
             sections.append(guidance)
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _replace_generic_attachment_guidance(output: str, attachment: dict[str, Any]) -> str:
+        artifact_id = attachment.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return output
+        updated = output.replace(
+            "Binary content: attached as artifact",
+            f'Binary content: attached as artifact (artifact_id="{artifact_id}")',
+            1,
+        )
+        updated = updated.replace(
+            "Use artifact_read to analyze this image with a vision-capable model.",
+            f'Use artifact_read with artifact_id="{artifact_id}" to analyze this image with a vision-capable model.',
+            1,
+        )
+        return updated
+
+    @staticmethod
+    def _attachment_output_anchors(
+        output: str,
+        attachments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        lines = output.splitlines() or [""]
+        start_line = 1
+        for index, line in enumerate(lines, start=1):
+            if line.strip() in {"[[attachments]]", "[[metadata]]"} or "Binary content:" in line:
+                start_line = index
+                break
+        end_line = max(start_line, len(lines))
+
+        anchors: list[dict[str, Any]] = []
+        for index, item in enumerate(attachments, start=1):
+            artifact_id = item.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                continue
+            candidate = {
+                "source_type": "artifact_id",
+                "artifact_id": artifact_id,
+                "mime_hint": item.get("mime_type"),
+                "filename_hint": item.get("filename"),
+            }
+            if index == 1:
+                anchors.append(
+                    {
+                        "anchor": "binary",
+                        "kind": str(item.get("kind") or "attachment"),
+                        "label": str(item.get("filename") or artifact_id),
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "artifact_candidate": candidate,
+                    }
+                )
+            anchors.append(
+                {
+                    "anchor": f"attachment:{index}",
+                    "kind": str(item.get("kind") or "attachment"),
+                    "label": str(item.get("filename") or artifact_id),
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "artifact_candidate": candidate,
+                }
+            )
+        return anchors
 
     def _attachment_guidance_block(self, attachments: list[dict[str, Any]]) -> str:
         lines: list[str] = ["[[attachments]]"]

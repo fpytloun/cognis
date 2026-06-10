@@ -869,7 +869,7 @@ class TaskQueue:
     ) -> None:
         from cognis.core.agent_loop import PendingPause
 
-        if payload.get("response") is not None:
+        if payload.get("answers") is not None:
             # The HTTP respond path persisted the user's answer before
             # the restart; the relaunched agent loop consumes it via
             # ``_get_recovered_step_response`` without a PauseWaiter.
@@ -886,8 +886,9 @@ class TaskQueue:
                     step_name=payload.get("step_name"),
                     step_run_id=payload.get("step_run_id"),
                     session_id=payload.get("session_id"),
-                    question=payload.get("question") or payload.get("message"),
-                    options=_recover_pause_options(payload.get("options")),
+                    questions=payload.get("questions")
+                    if isinstance(payload.get("questions"), list)
+                    else None,
                     context=_recover_pause_context(payload.get("context")),
                 )
             )

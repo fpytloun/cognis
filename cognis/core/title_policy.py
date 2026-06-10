@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.events import Event, EventBus, EventType
 from cognis.models.session import ConversationModel
 from cognis.store.queries import update_conversation, update_conversation_context_data
@@ -21,10 +22,13 @@ def _context_platform_data(conversation: ConversationModel) -> dict[str, object]
 def can_adopt_intaris_title(conversation: ConversationModel) -> bool:
     """Return True when Cognis may update the conversation title from Intaris."""
 
-    return (
-        conversation.title_source in {"unset", "agent_direct"}
-        and not (conversation.title or "").strip()
-    )
+    if is_agent_direct_context(
+        conversation.context.type if conversation.context else None,
+        conversation.context.platform_data if conversation.context else None,
+    ):
+        return False
+
+    return conversation.title_source == "unset" and not (conversation.title or "").strip()
 
 
 def latest_intaris_title(conversation: ConversationModel) -> str | None:

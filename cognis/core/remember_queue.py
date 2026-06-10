@@ -423,12 +423,10 @@ class RememberRetryQueue:
             agent_id=agent_id,
             agent_owner_email=str(agent_owner_email) if agent_owner_email else None,
         ):
-            event_read = await self._event_reader.read_events(
-                session_id=intaris_session_id,
+            event_read = await self._read_replay_events(
+                intaris_session_id=intaris_session_id,
+                requested_seqs=requested_seqs,
                 after_seq=after_seq,
-                limit=max(20, len(requested_seqs) + 4),
-                types=["user_message", "assistant_message"],
-                allow_missing_stream=True,
             )
 
         messages: list[dict[str, str]] = []
@@ -471,6 +469,33 @@ class RememberRetryQueue:
             "agent_id": agent_id,
             "agent_owner_email": agent_owner_email,
         }
+
+    async def _read_replay_events(
+        self,
+        *,
+        intaris_session_id: str,
+        requested_seqs: list[int],
+        after_seq: int,
+    ) -> Any:
+        if requested_seqs:
+            try:
+                return await self._event_reader.read_events(
+                    session_id=intaris_session_id,
+                    seqs=requested_seqs,
+                    types=["user_message", "assistant_message"],
+                    allow_missing_stream=True,
+                )
+            except TypeError as exc:
+                if "seqs" not in str(exc):
+                    raise
+
+        return await self._event_reader.read_events(
+            session_id=intaris_session_id,
+            after_seq=after_seq,
+            limit=max(20, len(requested_seqs) + 4),
+            types=["user_message", "assistant_message"],
+            allow_missing_stream=True,
+        )
 
     @staticmethod
     def _normalize_replay_event(event: Any) -> tuple[str, int | None, dict[str, Any]]:

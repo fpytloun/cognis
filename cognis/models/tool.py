@@ -280,6 +280,7 @@ class MCPServerConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     auth_config: MCPAuthConfig | None = Field(default_factory=MCPAuthConfig)
     timeout_seconds: int = 30
+    connect_timeout_seconds: int = 15
 
     @model_validator(mode="after")
     def _validate_transport_fields(self) -> MCPServerConfig:

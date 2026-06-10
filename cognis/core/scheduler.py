@@ -195,14 +195,14 @@ class Scheduler:
     # Fire logic
     # ------------------------------------------------------------------
 
-    async def _fire_schedule(self, schedule_id: str) -> None:
-        """Create a task from the schedule template."""
+    async def _fire_schedule(self, schedule_id: str) -> str | None:
+        """Create a task from the schedule template and return its task id."""
         now = datetime.now(UTC)
 
         async with self._db_session() as db:
             sched = await get_schedule(db, schedule_id)
             if sched is None or not sched.enabled:
-                return
+                return None
 
             # Check concurrency limit
             active_count = await count_active_tasks_for_schedule(db, schedule_id)
@@ -223,7 +223,7 @@ class Scheduler:
                     consecutive_errors=sched.consecutive_errors,
                 )
                 await db.commit()
-                return
+                return None
 
         # Create the task (outside the schedule DB session)
         try:
@@ -328,6 +328,7 @@ class Scheduler:
                     },
                 )
             )
+            return task.task_id
 
         except Exception as exc:
             if created_workflow_id is not None and created_task_id is None:
@@ -391,6 +392,7 @@ class Scheduler:
                         },
                     )
                 )
+            return None
 
     # ------------------------------------------------------------------
     # Schedule computation

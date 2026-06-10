@@ -518,10 +518,13 @@ class IntarisProvider:
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult:
         params: dict[str, Any] = {}
-        if last_n is not None:
+        if seqs:
+            params["seqs"] = ",".join(str(seq) for seq in seqs)
+        elif last_n is not None:
             params["last_n"] = last_n
         else:
             params["after_seq"] = after_seq
@@ -535,6 +538,7 @@ class IntarisProvider:
                 "extra_data": {
                     "session_id": session_id,
                     "after_seq": after_seq,
+                    "seqs": seqs,
                     "allow_missing_stream": allow_missing_stream,
                 }
             },

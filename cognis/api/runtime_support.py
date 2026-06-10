@@ -26,6 +26,7 @@ from cognis.core.executor_policy import (
     is_executor_type_allowed,
     load_executor_policy,
 )
+from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.core.runtime import (
     ResolvedStepRuntime,
     build_local_executor_environment,
@@ -38,6 +39,7 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolDefinition,
+    ToolSource,
     effective_mcp_auth_config,
     tool_matches_identifier,
 )
@@ -87,6 +89,54 @@ from cognis.tools.skills import (
 )
 
 logger = get_logger(__name__)
+
+MCP_TOOL_SOURCE_TYPES = frozenset({"local_mcp", "intaris_mcp"})
+
+
+def mcp_server_assignment_key(source: ToolSource) -> str | None:
+    """Return the stable per-agent assignment key for an MCP tool source."""
+
+    if source.type not in MCP_TOOL_SOURCE_TYPES:
+        return None
+    server_key = source.server_id or source.server_name
+    if not server_key:
+        return None
+    return f"{source.type}:{server_key}"
+
+
+def disabled_mcp_server_keys(agent_tools_config: dict[str, Any]) -> set[str]:
+    """Extract normalized disabled MCP server assignment keys from agent tools config."""
+
+    raw_keys = agent_tools_config.get("disabled_mcp_servers") or []
+    if not isinstance(raw_keys, list):
+        return set()
+    return {str(item) for item in raw_keys if isinstance(item, str) and item.strip()}
+
+
+def tool_disabled_by_agent_config(
+    tool: ToolDefinition,
+    *,
+    disabled_categories: set[str],
+    disabled_tools: set[str],
+    disabled_mcp_servers: set[str],
+) -> bool:
+    """Return whether an agent-level tool disable rule hides this tool."""
+
+    if tool.category in disabled_categories:
+        return True
+    if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
+        return True
+    server_key = mcp_server_assignment_key(tool.source)
+    return bool(server_key and server_key in disabled_mcp_servers)
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
 
 DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents"})
 
@@ -533,6 +583,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
     # Include all web tools for discovery (as if all backends were available)
     all_web = web_tool_definitions(["direct", "tavily", "brave"], default_backend="direct")
     from cognis.tools.builtin.schedule import schedule_tools
+    from cognis.tools.executor.definitions import OFFICE_EXECUTOR_TOOLS
 
     return [
         *system_tools(),
@@ -551,6 +602,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
         *skill_management_tools(),
         *schedule_tools(),
         *executor_tool_definitions(),
+        *OFFICE_EXECUTOR_TOOLS,
         *all_web,
     ]
 
@@ -625,6 +677,7 @@ def select_static_tools(
 
     disabled_categories = set(agent_tools_config.get("disabled_categories") or [])
     disabled_tools = set(agent_tools_config.get("disabled_tools") or [])
+    disabled_mcp_servers = disabled_mcp_server_keys(agent_tools_config)
     skill_mutation_tools = {
         "skill_write",
         "skill_delete",
@@ -645,8 +698,11 @@ def select_static_tools(
         # Agent-level disable takes precedence
         if any(tool_matches_identifier(tool, identifier) for identifier in explicit_deny):
             continue
-        if tool.category in disabled_categories or any(
-            tool_matches_identifier(tool, identifier) for identifier in disabled_tools
+        if tool_disabled_by_agent_config(
+            tool,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
         ):
             continue
         if default_off_allowed:
@@ -762,13 +818,20 @@ def _build_handler_map(
     session_factory: Any,
     status_provider: Any,
     guardrails_provider: Any | None = None,
+    compaction_strategy: Any | None = None,
     knowledgebase_service: Any | None = None,
 ) -> dict[str, Any]:
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
     handlers.update(build_system_tool_handlers(session_factory, status_provider))
     if guardrails_provider is not None:
-        handlers.update(build_conversation_tool_handlers(session_factory, guardrails_provider))
+        handlers.update(
+            build_conversation_tool_handlers(
+                session_factory,
+                guardrails_provider,
+                compaction_strategy,
+            )
+        )
     handlers.update(build_project_tool_handlers(session_factory))
     if knowledgebase_service is not None:
         handlers.update(build_knowledgebase_tool_handlers(knowledgebase_service))
@@ -1171,10 +1234,18 @@ def build_step_runtime_factory(
             if isinstance(tool_agent.tools, dict)
             else set()
         )
+        disabled_mcp_servers = (
+            disabled_mcp_server_keys(tool_agent.tools)
+            if isinstance(tool_agent.tools, dict)
+            else set()
+        )
         filtered: list[ToolDefinition] = []
         for tool in agent_tools:
-            if tool.category in disabled_categories or any(
-                tool_matches_identifier(tool, identifier) for identifier in disabled_tools
+            if tool_disabled_by_agent_config(
+                tool,
+                disabled_categories=disabled_categories,
+                disabled_tools=disabled_tools,
+                disabled_mcp_servers=disabled_mcp_servers,
             ):
                 continue
             if tool.source.type in ("builtin",):
@@ -1204,6 +1275,7 @@ def build_step_runtime_factory(
         # here to avoid controller fallback.
         mcp_servers: list[MCPServerConfig] = []
         if resolved_type == "in_process":
+            mcp_diagnostics: dict[str, Any] = {}
             mcp_servers = await _resolve_executor_mcp_servers(
                 executor_config,
                 session_factory,
@@ -1215,13 +1287,24 @@ def build_step_runtime_factory(
                 step_name=getattr(access_context, "step_name", None),
                 step_run_id=getattr(access_context, "step_run_id", None),
                 delivery_mode="default" if task_id else "silent",
+                diagnostics=mcp_diagnostics,
             )
+            if mcp_diagnostics:
+                runtime_metadata["mcp_servers"] = list(mcp_diagnostics.get("mcp_servers") or [])
+                runtime_metadata["warnings"] = list(mcp_diagnostics.get("warnings") or [])
+            if disabled_mcp_servers:
+                mcp_servers = [
+                    server
+                    for server in mcp_servers
+                    if f"local_mcp:{server.server_id or server.name}" not in disabled_mcp_servers
+                ]
             secret_owner_email = executor_config.get("executor_owner_email", user_email)
             secrets = await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
             handler_map = _build_handler_map(
                 session_factory,
                 getattr(providers.executor, "status_provider", None),
                 getattr(providers, "guardrails", None),
+                getattr(providers, "compaction_strategy", None),
                 knowledgebase_service,
             )
             handle = await providers.executor.spawn(
@@ -1298,6 +1381,11 @@ def build_step_runtime_factory(
                         if isinstance(tool_agent.tools, dict)
                         else set()
                     )
+                    disabled_mcp_servers = (
+                        disabled_mcp_server_keys(tool_agent.tools)
+                        if isinstance(tool_agent.tools, dict)
+                        else set()
+                    )
 
                     remote_tools = await conn.list_tools()
                     merge_result = await _merge_remote_runtime_inventory(
@@ -1307,11 +1395,13 @@ def build_step_runtime_factory(
                         agent=tool_agent,
                         disabled_categories=disabled_categories,
                         disabled_tools=disabled_tools,
+                        disabled_mcp_servers=disabled_mcp_servers,
                     )
                     handler_map = _build_handler_map(
                         session_factory,
                         getattr(providers.executor, "status_provider", None),
                         getattr(providers, "guardrails", None),
+                        getattr(providers, "compaction_strategy", None),
                         knowledgebase_service,
                     )
                     remote_registry = _build_remote_runtime_registry(
@@ -1682,9 +1772,10 @@ async def _resolve_executor_mcp_servers(
     step_run_id: str | None = None,
     session_id: str | None = None,
     delivery_mode: str | None = "silent",
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[MCPServerConfig]:
     """Resolve MCP servers assigned to an executor via config.mcp_server_ids."""
-    from cognis.store.queries import get_mcp_server
+    from cognis.store.queries import get_mcp_server, get_setting_value
 
     if not executor_config:
         return []
@@ -1694,7 +1785,13 @@ async def _resolve_executor_mcp_servers(
         return []
 
     servers: list[MCPServerConfig] = []
+    skipped_statuses: list[dict[str, Any]] = []
+    warnings: list[str] = []
     async with session_factory() as session:
+        tool_timeout_raw = await get_setting_value(session, "mcp.tool_timeout_seconds", 300)
+        connect_timeout_raw = await get_setting_value(session, "mcp.connect_timeout_seconds", 15)
+        tool_timeout = _coerce_positive_int(tool_timeout_raw, 300)
+        connect_timeout = _coerce_positive_int(connect_timeout_raw, 15)
         for sid in server_ids:
             row = await get_mcp_server(
                 session,
@@ -1733,19 +1830,83 @@ async def _resolve_executor_mcp_servers(
                 oauth_service = getattr(providers, "mcp_oauth_service", None) or getattr(
                     providers, "_mcp_oauth_service", None
                 )
-            if auth_config.type == "oauth2" and oauth_service is not None and user_email:
-                result = await oauth_service.inject_authorization_header(
-                    user_email=user_email,
-                    server=row,
-                    headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
-                    conversation_id=conversation_id,
-                    task_id=task_id,
-                    step_name=step_name,
-                    step_run_id=step_run_id,
-                    session_id=session_id,
-                    delivery_mode=delivery_mode,
+            if auth_config.type == "oauth2" and (oauth_service is None or not user_email):
+                warning = (
+                    f"MCP server {row.name} requires OAuth authorization, "
+                    "but no OAuth context is available."
                 )
+                warnings.append(warning)
+                skipped_statuses.append(
+                    oauth_required_mcp_status(
+                        server_id=sid,
+                        server_name=row.name,
+                        reason="oauth_context_unavailable",
+                    )
+                )
+                logger.warning(
+                    "Skipping OAuth MCP server without OAuth context",
+                    extra={
+                        "extra_data": {
+                            "server_id": sid,
+                            "server_name": row.name,
+                            "has_oauth_service": oauth_service is not None,
+                            "has_user_email": bool(user_email),
+                        }
+                    },
+                )
+                continue
+            if auth_config.type == "oauth2" and oauth_service is not None and user_email:
+                try:
+                    result = await oauth_service.inject_authorization_header(
+                        user_email=user_email,
+                        server=row,
+                        headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        step_name=step_name,
+                        step_run_id=step_run_id,
+                        session_id=session_id,
+                        delivery_mode=delivery_mode,
+                    )
+                except MCPOAuthError as exc:
+                    warning = (
+                        f"MCP server {row.name} requires OAuth authorization, "
+                        "but authorization metadata could not be resolved."
+                    )
+                    warnings.append(warning)
+                    skipped_statuses.append(
+                        oauth_required_mcp_status(
+                            server_id=sid,
+                            server_name=row.name,
+                            reason=str(exc)[:240],
+                        )
+                    )
+                    logger.warning(
+                        "Skipping OAuth MCP server with unresolved authorization metadata",
+                        extra={
+                            "extra_data": {
+                                "server_id": sid,
+                                "server_name": row.name,
+                                "reason": str(exc)[:240],
+                            }
+                        },
+                    )
+                    continue
                 if result.authorization_required:
+                    warning = (
+                        f"MCP server {row.name} requires OAuth authorization before "
+                        "tools can be discovered."
+                    )
+                    warnings.append(warning)
+                    skipped_statuses.append(
+                        oauth_required_mcp_status(
+                            server_id=sid,
+                            server_name=row.name,
+                            reason=result.reason,
+                            transaction_id=result.transaction_id,
+                            authorization_url=result.authorization_url,
+                        )
+                    )
                     logger.warning(
                         "OAuth MCP server requires authorization",
                         extra={
@@ -1756,9 +1917,9 @@ async def _resolve_executor_mcp_servers(
                             }
                         },
                     )
+                    continue
                 headers = result.headers
-                if not result.authorization_required:
-                    auth_config = {"type": "static_headers"}
+                auth_config = {"type": "static_headers"}
             servers.append(
                 MCPServerConfig(
                     server_id=row.server_id,
@@ -1770,7 +1931,8 @@ async def _resolve_executor_mcp_servers(
                     env=row.env or {},
                     headers=headers,
                     auth_config=auth_config,
-                    timeout_seconds=row.timeout_seconds,
+                    timeout_seconds=max(int(row.timeout_seconds or 0), tool_timeout),
+                    connect_timeout_seconds=connect_timeout,
                 )
             )
     if servers:
@@ -1778,6 +1940,11 @@ async def _resolve_executor_mcp_servers(
             "Resolved executor MCP servers",
             extra={"extra_data": {"count": len(servers)}},
         )
+    if diagnostics is not None:
+        if skipped_statuses:
+            diagnostics.setdefault("mcp_servers", []).extend(skipped_statuses)
+        if warnings:
+            diagnostics.setdefault("warnings", []).extend(warnings)
     return servers
 
 
@@ -1804,6 +1971,7 @@ async def _merge_remote_runtime_inventory(
     agent: AgentDefinition,
     disabled_categories: set[str],
     disabled_tools: set[str],
+    disabled_mcp_servers: set[str] | None = None,
     intaris_result: IntarisMCPResolutionResult | None = None,
 ) -> RemoteInventoryMergeResult:
     """Build merged runtime-visible inventory for remote executors."""
@@ -1811,6 +1979,7 @@ async def _merge_remote_runtime_inventory(
     merged: list[ToolDefinition] = []
     merged_names: set[str] = set()
     collision_count = 0
+    disabled_mcp_servers = disabled_mcp_servers or set()
 
     builtin_defs = sorted(
         [tool for tool in agent_tools if tool.source.type in ("builtin", "skill")],
@@ -1821,8 +1990,11 @@ async def _merge_remote_runtime_inventory(
     remote_defs: list[ToolDefinition] = []
     for tool_data in remote_tools_data:
         tool_def = ToolDefinition.model_validate(tool_data)
-        if tool_def.category in disabled_categories or any(
-            tool_matches_identifier(tool_def, identifier) for identifier in disabled_tools
+        if tool_disabled_by_agent_config(
+            tool_def,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
         ):
             continue
         remote_defs.append(tool_def)
@@ -1869,6 +2041,7 @@ async def _merge_remote_runtime_inventory(
             agent,
             disabled_categories,
             disabled_tools,
+            disabled_mcp_servers,
         )
     for warning in intaris_result.warnings:
         _append_warning(warnings, warning)
@@ -1933,8 +2106,10 @@ async def _resolve_intaris_mcp_tools_from_server_cache(
     server_names: set[str],
     disabled_categories: set[str],
     disabled_tools: set[str],
+    disabled_mcp_servers: set[str] | None = None,
 ) -> IntarisMCPResolutionResult:
     result = IntarisMCPResolutionResult()
+    disabled_mcp_servers = disabled_mcp_servers or set()
     if not server_names:
         return result
     try:
@@ -1966,9 +2141,12 @@ async def _resolve_intaris_mcp_tools_from_server_cache(
                 raw_tool_name=raw_tool_name,
                 payload=raw_tool,
             )
-            if "mcp" in disabled_categories:
-                continue
-            if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
+            if tool_disabled_by_agent_config(
+                tool,
+                disabled_categories=disabled_categories,
+                disabled_tools=disabled_tools,
+                disabled_mcp_servers=disabled_mcp_servers,
+            ):
                 continue
             by_server[name].append(tool)
 
@@ -2018,6 +2196,7 @@ async def _resolve_intaris_mcp_tools(
     agent: AgentDefinition,
     disabled_categories: set[str],
     disabled_tools: set[str],
+    disabled_mcp_servers: set[str] | None = None,
 ) -> IntarisMCPResolutionResult:
     """Resolve Intaris MCP tools assigned to an agent.
 
@@ -2032,7 +2211,23 @@ async def _resolve_intaris_mcp_tools(
     if not isinstance(server_names, list) or not server_names:
         return IntarisMCPResolutionResult()
 
+    disabled_server_keys = (
+        disabled_mcp_servers
+        if disabled_mcp_servers is not None
+        else disabled_mcp_server_keys(agent.tools)
+        if isinstance(agent.tools, dict)
+        else set()
+    )
     allowed_names = set(server_names)
+    disabled_names = {
+        key.removeprefix("intaris_mcp:")
+        for key in disabled_server_keys
+        if key.startswith("intaris_mcp:")
+    }
+    allowed_names -= disabled_names
+    if not allowed_names:
+        return IntarisMCPResolutionResult()
+    disabled_mcp_servers = disabled_server_keys
     guardrails = getattr(providers, "guardrails", None)
     if guardrails is None:
         return IntarisMCPResolutionResult()
@@ -2048,6 +2243,7 @@ async def _resolve_intaris_mcp_tools(
             server_names=allowed_names,
             disabled_categories=disabled_categories,
             disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
         )
         _append_warning(result.warnings, "Unable to load aggregated Intaris MCP tools.")
         INTARIS_MCP_RESOLUTION_LATENCY.observe(perf_counter() - start)
@@ -2063,6 +2259,7 @@ async def _resolve_intaris_mcp_tools(
             server_names=allowed_names,
             disabled_categories=disabled_categories,
             disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
         )
         if fallback.tools:
             _append_warning(
@@ -2101,9 +2298,12 @@ async def _resolve_intaris_mcp_tools(
             raw_tool_name=raw_tool_name,
             payload=row,
         )
-        if "mcp" in disabled_categories:
-            continue
-        if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
+        if tool_disabled_by_agent_config(
+            tool,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
+        ):
             continue
         by_server[server_name].append(tool)
 
@@ -2118,6 +2318,7 @@ async def _resolve_intaris_mcp_tools(
             server_names=unresolved_servers,
             disabled_categories=disabled_categories,
             disabled_tools=disabled_tools,
+            disabled_mcp_servers=disabled_mcp_servers,
         )
         result.fallback_used = fallback.fallback_used
         result.collision_count += fallback.collision_count

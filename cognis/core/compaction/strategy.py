@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -277,9 +278,90 @@ class CompactionStrategy:
         Retries once on transient errors before falling back to mechanical
         compaction (or raising a classified failure when fallback is disabled).
         """
+        return await self._generate_summary(
+            session,
+            trigger=trigger,
+            model_context=model_context,
+            long_lived_chat=long_lived_chat,
+            record=True,
+        )
+
+    async def preview_summary(
+        self,
+        session: SessionModel,
+        *,
+        trigger: str = "preview",
+        model_context: CompactionModelContext | None = None,
+        long_lived_chat: bool = False,
+    ) -> CompactionResult:
+        """Generate a compaction-format summary without mutating session state."""
+        return await self._generate_summary(
+            session,
+            trigger=trigger,
+            model_context=model_context,
+            long_lived_chat=long_lived_chat,
+            record=False,
+        )
+
+    async def preview_summary_from_events(
+        self,
+        session: SessionModel,
+        *,
+        events: list[Any],
+        last_compaction_summary: str | None = None,
+        trigger: str = "preview",
+        model_context: CompactionModelContext | None = None,
+        long_lived_chat: bool = False,
+    ) -> CompactionResult:
+        """Generate a read-only compaction-format summary from caller-provided events."""
+        entry = SimpleNamespace(
+            events=list(events),
+            last_compaction_summary=last_compaction_summary,
+        )
+        return await self._generate_summary_from_entry(
+            session,
+            entry=entry,
+            trigger=trigger,
+            model_context=model_context,
+            long_lived_chat=long_lived_chat,
+            record=False,
+        )
+
+    async def _generate_summary(
+        self,
+        session: SessionModel,
+        *,
+        trigger: str,
+        model_context: CompactionModelContext | None,
+        long_lived_chat: bool,
+        record: bool,
+    ) -> CompactionResult:
+        """Generate a compaction summary and optionally record it."""
         entry = self.session_cache.get_entry(session.session_id)
         if entry is None:
+            if not record:
+                return CompactionResult(compacted=False, method="noop")
             entry = await self.session_cache.refresh(session)
+        return await self._generate_summary_from_entry(
+            session,
+            entry=entry,
+            trigger=trigger,
+            model_context=model_context,
+            long_lived_chat=long_lived_chat,
+            record=record,
+        )
+
+    async def _generate_summary_from_entry(
+        self,
+        session: SessionModel,
+        *,
+        entry: Any,
+        trigger: str,
+        model_context: CompactionModelContext | None,
+        long_lived_chat: bool,
+        record: bool,
+    ) -> CompactionResult:
+        """Generate a compaction summary from an event-bearing cache-like entry."""
 
         older_events, preserved_events = _split_events(
             entry.events,
@@ -388,9 +470,21 @@ class CompactionStrategy:
                 preserved_events=preserved_events,
                 trigger=trigger,
                 model_context=model_context,
+                record=record,
             )
 
         summary = append_recoverable_tool_output_handles(summary, older_events)
+        if not record:
+            return self._build_compaction_result(
+                session=session,
+                summary=summary,
+                formatted_input=compaction_input.text,
+                older_events=older_events,
+                preserved_tail_events=preserved_events,
+                method="llm",
+                resolved_model=resolved_model,
+                compaction_seq=None,
+            )
         COMPACTION_TOTAL.labels(trigger=trigger, method="llm").inc()
         return await self._record_compaction(
             session=session,
@@ -438,6 +532,7 @@ class CompactionStrategy:
             preserved_events=preserved_events,
             trigger=trigger,
             model_context=model_context,
+            record=True,
         )
 
     async def _mechanical_fallback(
@@ -448,10 +543,9 @@ class CompactionStrategy:
         preserved_events: list[Any],
         trigger: str,
         model_context: CompactionModelContext | None = None,
+        record: bool = True,
     ) -> CompactionResult:
         summary = build_sliding_window_summary(older_events)
-        COMPACTION_TOTAL.labels(trigger=trigger, method="mechanical_sliding_window").inc()
-        COMPACTION_FALLBACK_USED.labels(trigger=trigger).inc()
         try:
             resolved_model = await self._resolve_compaction_model(
                 model_context,
@@ -459,10 +553,24 @@ class CompactionStrategy:
             )
         except Exception:
             resolved_model = None
+        formatted_input = format_events_for_compaction(older_events)
+        if not record:
+            return self._build_compaction_result(
+                session=session,
+                summary=summary,
+                formatted_input=formatted_input,
+                older_events=older_events,
+                preserved_tail_events=preserved_events,
+                method="mechanical_sliding_window",
+                resolved_model=resolved_model,
+                compaction_seq=None,
+            )
+        COMPACTION_TOTAL.labels(trigger=trigger, method="mechanical_sliding_window").inc()
+        COMPACTION_FALLBACK_USED.labels(trigger=trigger).inc()
         return await self._record_compaction(
             session=session,
             summary=summary,
-            formatted_input=format_events_for_compaction(older_events),
+            formatted_input=formatted_input,
             older_events=older_events,
             preserved_tail_events=preserved_events,
             method="mechanical_sliding_window",
@@ -480,15 +588,19 @@ class CompactionStrategy:
         method: str,
         resolved_model: str | None,
     ) -> CompactionResult:
-        count_tokens = getattr(self.llm, "count_tokens", None)
-        if callable(count_tokens) and resolved_model:
-            tokens_before = count_tokens(formatted_input, resolved_model)
-            tokens_after = count_tokens(summary, resolved_model)
-        else:
-            tokens_before = 0
-            tokens_after = 0
-
-        turns_compacted = sum(1 for event in older_events if event.type == "user_message")
+        result = self._build_compaction_result(
+            session=session,
+            summary=summary,
+            formatted_input=formatted_input,
+            older_events=older_events,
+            preserved_tail_events=preserved_tail_events,
+            method=method,
+            resolved_model=resolved_model,
+            compaction_seq=None,
+        )
+        tokens_before = result.tokens_before
+        tokens_after = result.tokens_after
+        turns_compacted = result.turns_compacted
         compaction_event = SessionEvent(
             type="compaction_summary",
             data={
@@ -515,11 +627,36 @@ class CompactionStrategy:
             summary=summary,
             compaction_seq=append_result.last_seq,
         )
+        result.compaction_seq = append_result.last_seq
+        return result
+
+    def _build_compaction_result(
+        self,
+        *,
+        session: SessionModel,
+        summary: str,
+        formatted_input: str,
+        older_events: list[Any],
+        preserved_tail_events: list[Any],
+        method: str,
+        resolved_model: str | None,
+        compaction_seq: int | None,
+    ) -> CompactionResult:
+        del session
+        count_tokens = getattr(self.llm, "count_tokens", None)
+        if callable(count_tokens) and resolved_model:
+            tokens_before = count_tokens(formatted_input, resolved_model)
+            tokens_after = count_tokens(summary, resolved_model)
+        else:
+            tokens_before = 0
+            tokens_after = 0
+
+        turns_compacted = sum(1 for event in older_events if event.type == "user_message")
         return CompactionResult(
             compacted=True,
             method=method,
             summary=summary,
-            compaction_seq=append_result.last_seq,
+            compaction_seq=compaction_seq,
             turns_compacted=turns_compacted,
             tokens_before=tokens_before,
             tokens_after=tokens_after,

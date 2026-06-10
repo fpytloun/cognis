@@ -9,16 +9,22 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from cognis.api.common import api_exception, require_current_user
+from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_status_payload
+from cognis.logging import get_logger
 from cognis.models.tool import effective_mcp_auth_config
 from cognis.store.queries import (
     get_mcp_oauth_token,
     get_mcp_oauth_token_for_server,
+    get_mcp_oauth_transaction,
     get_mcp_server,
+    list_websocket_executors_for_mcp_server,
     mcp_oauth_resource_key,
+    update_executor_runtime_state,
 )
 
 router = APIRouter(tags=["mcp-oauth"])
+logger = get_logger(__name__)
 
 
 def _service(request: Request) -> Any:
@@ -59,6 +65,7 @@ async def mcp_oauth_callback(request: Request, state: str, code: str | None = No
             f"<h1>MCP authorization failed</h1><p>{escape(str(exc))}</p>",
             status_code=400,
         )
+    await _schedule_mcp_executor_reconfigure(request, transaction_id=transaction_id)
     return HTMLResponse(
         f"<h1>MCP authorization complete</h1><p>Transaction {transaction_id} completed.</p>"
     )
@@ -91,7 +98,19 @@ async def mcp_oauth_status(request: Request, server_id: str) -> dict[str, Any]:
                 user_email=user.email,
                 mcp_server_id=server.server_id,
             )
-    return oauth_status_payload(row)
+    token_payload = None
+    if row is not None:
+        svc = getattr(request.app.state, "mcp_oauth_service", None)
+        try:
+            if svc is not None:
+                token_payload = svc._decrypt(row.encrypted_payload)
+        except Exception:
+            logger.warning(
+                "mcp oauth: failed to inspect token metadata for status payload",
+                extra={"extra_data": {"server_id": server.server_id}},
+                exc_info=True,
+            )
+    return oauth_status_payload(row, token_payload)
 
 
 @router.post("/api/v1/mcp-servers/{server_id}/oauth/disconnect")
@@ -125,3 +144,38 @@ async def disconnect_mcp_oauth(request: Request, server_id: str) -> dict[str, An
             row.resource_key = row.resource_key or mcp_oauth_resource_key(row.resource)
             await session.commit()
     return {"status": "disconnected"}
+
+
+async def _schedule_mcp_executor_reconfigure(request: Request, *, transaction_id: str) -> None:
+    async with request.app.state.session_factory() as session:
+        transaction = await get_mcp_oauth_transaction(session, transaction_id)
+        if transaction is None:
+            return
+        executors = await list_websocket_executors_for_mcp_server(
+            session, transaction.mcp_server_id
+        )
+        scheduled_ids: list[str] = []
+        ws_provider = request.app.state.providers.executor.websocket
+        for row in executors:
+            connected = ws_provider.get_connection(row.executor_id)
+            desired_version = max(int(getattr(row, "desired_config_version", 0) or 0), 0) + 1
+            await update_executor_runtime_state(
+                session,
+                row.executor_id,
+                desired_config_version=desired_version,
+                runtime_state="reconfiguring" if connected is not None else "stale",
+            )
+            scheduled_ids.append(row.executor_id)
+        await session.commit()
+    for executor_id in scheduled_ids:
+        schedule_executor_reconfigure(request.app, executor_id)
+    if scheduled_ids:
+        logger.info(
+            "mcp oauth: scheduled executor reconfigure after authorization",
+            extra={
+                "extra_data": {
+                    "transaction_id": transaction_id,
+                    "executor_ids": scheduled_ids,
+                }
+            },
+        )

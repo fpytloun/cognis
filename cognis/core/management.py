@@ -13,6 +13,11 @@ from cognis.api.serializers import (
 )
 from cognis.core.agent_loop import PauseResolution, PendingPause
 from cognis.core.notifications import NotificationService
+from cognis.core.question_sets import (
+    normalize_context,
+    normalize_questions,
+    validate_reply_for_questions,
+)
 from cognis.models.task import TaskModel
 from cognis.models.workflow import WorkflowState
 from cognis.store.queries import get_task, get_workflow, update_task_workflow_state
@@ -37,48 +42,14 @@ def task_pending_pause_response(pause_waiter: Any, task: TaskModel) -> PendingPa
         step_name=payload.get("step_name"),
         step_run_id=payload.get("step_run_id"),
         session_id=payload.get("session_id"),
-        question=payload.get("question") or payload.get("message") or payload.get("label"),
-        options=_normalize_pause_options(payload.get("options")),
-        context=_normalize_pause_context(payload.get("context")),
+        question=payload.get("message") or payload.get("question"),
+        options=payload.get("options") if isinstance(payload.get("options"), list) else None,
+        questions=normalize_questions(payload.get("questions"))
+        if payload.get("questions") is not None
+        else None,
+        context=normalize_context(payload.get("context")),
     )
     return pending_pause_to_response(recovered_pause)
-
-
-def _normalize_pause_options(value: Any) -> list[dict[str, Any]] | None:
-    """Coerce persisted pause options into the canonical list[dict] shape.
-
-    Historical writers persisted options as ``list[str]`` for step_input
-    pauses while the live path registers options as ``list[dict]``.
-    Normalize at the read edge so task detail endpoints do not 500 for
-    either shape after a restart.
-    """
-
-    if value is None:
-        return None
-    if not isinstance(value, list):
-        return None
-    normalized: list[dict[str, Any]] = []
-    for option in value:
-        if isinstance(option, dict):
-            normalized.append(option)
-        elif isinstance(option, str):
-            normalized.append({"label": option, "action": option})
-    return normalized or None
-
-
-def _normalize_pause_context(value: Any) -> dict[str, Any] | None:
-    """Coerce persisted pause context into a dict or None.
-
-    Historically string values leaked into this field for
-    step_request_input. Drop anything that is not a dict so the response
-    model validates cleanly.
-    """
-
-    if isinstance(value, dict):
-        return value
-    if value is None or value == "":
-        return None
-    return {"note": str(value)}
 
 
 async def task_workflow_run_response(
@@ -233,7 +204,7 @@ async def resolve_task_pause_action(
 async def respond_task_input(
     *,
     task: TaskModel,
-    response: str,
+    reply: dict[str, Any],
     pause_waiter: Any,
     notification_service: NotificationService | None,
     task_queue: Any,
@@ -245,6 +216,8 @@ async def respond_task_input(
     pending_pause = task_pending_pause_response(pause_waiter, task)
     if pending_pause is None or pending_pause.pause_type not in {"step_input", "step_question"}:
         raise ValueError("No pending step question for task")
+    questions = pending_pause.questions or []
+    normalized_reply = validate_reply_for_questions(reply, questions)
 
     resolved = False
     if notification_service is not None:
@@ -257,7 +230,7 @@ async def respond_task_input(
             resolved = await notification_service.resolve(
                 notif.notification_id,
                 "continue",
-                {"response": response},
+                normalized_reply,
                 user_email=user_email,
             )
             if not resolved:
@@ -269,7 +242,7 @@ async def respond_task_input(
             raise ValueError("No pending step question for task")
         ok = pause_waiter.resolve(
             raw_pause.pause_id,
-            PauseResolution(decision="continue", data={"response": response}),
+            PauseResolution(decision="continue", data=normalized_reply),
         )
         if not ok:
             raise RuntimeError("Pause has already been resolved")
@@ -281,7 +254,8 @@ async def respond_task_input(
                 state = WorkflowState.model_validate(row.workflow_state)
                 if state.pending_pause_type == "step_input":
                     payload = dict(state.pending_pause_payload or {})
-                    payload["response"] = response
+                    payload["answers"] = normalized_reply["answers"]
+                    payload["mode"] = normalized_reply["mode"]
                     state.pending_pause_payload = payload
                     await update_task_workflow_state(
                         session, task.task_id, state.model_dump(mode="json")

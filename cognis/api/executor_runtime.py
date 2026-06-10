@@ -34,6 +34,21 @@ def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
     async def _run() -> None:
         try:
             await reconcile_executor(app, executor_id)
+        except Exception as exc:
+            _logger.warning(
+                "executor_runtime: background reconcile failed for %s: %s",
+                executor_id,
+                _safe_error_message(str(exc)),
+                exc_info=True,
+            )
+            try:
+                await _mark_reconcile_failed(app, executor_id, exc)
+            except Exception:
+                _logger.warning(
+                    "executor_runtime: failed to persist reconcile failure for %s",
+                    executor_id,
+                    exc_info=True,
+                )
         finally:
             current = tasks.get(executor_id)
             if current is asyncio.current_task():
@@ -67,6 +82,8 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     "executor_runtime: executor %s not connected, skipping reconcile",
                     executor_id,
                 )
+                if getattr(row, "runtime_state", "offline") == "reconfiguring":
+                    await _mark_reconcile_unavailable(app, row)
                 return False
 
             if applied_version == target_version and getattr(row, "runtime_state", "offline") in {
@@ -117,13 +134,16 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 )
                 await session.commit()
 
+            configure_metadata: dict[str, Any] = getattr(row, "runtime_metadata", None) or {}
             try:
                 _logger.info(
                     "executor_runtime: building configure payload for %s v%d",
                     executor_id,
                     target_version,
                 )
-                payload, metadata = await _build_configure_payload(app, row, target_version)
+                payload, configure_metadata = await _build_configure_payload(
+                    app, row, target_version
+                )
                 _logger.info(
                     "executor_runtime: sending executor.configure RPC to %s (timeout=%ds, %d MCP server(s))",
                     executor_id,
@@ -149,7 +169,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     connection = None
                     continue
                 runtime_metadata = _merge_runtime_metadata(
-                    metadata,
+                    configure_metadata,
                     {
                         "runtime_state": "blocked",
                         "warnings": [
@@ -187,7 +207,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 len(observed_tools),
             )
             runtime_metadata = _merge_runtime_metadata(
-                metadata,
+                configure_metadata,
                 dict(configure_result.get("runtime_metadata") or {}),
             )
             capabilities = ExecutorCapabilities(
@@ -275,6 +295,52 @@ async def _persist_runtime_state(
         )
 
 
+async def _mark_reconcile_unavailable(app: Any, row: Any) -> None:
+    """Move an unavailable executor out of transient reconfiguring state."""
+    runtime_metadata = _merge_runtime_metadata(
+        getattr(row, "runtime_metadata", None) or {},
+        {
+            "runtime_state": "stale",
+            "warnings": [
+                "Executor reconfigure could not continue because the connection is unavailable."
+            ],
+        },
+    )
+    await _persist_runtime_state(
+        app,
+        row.executor_id,
+        runtime_state="stale",
+        applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
+        observed_tools=list(getattr(row, "observed_tools", None) or []),
+        runtime_metadata=runtime_metadata,
+    )
+
+
+async def _mark_reconcile_failed(app: Any, executor_id: str, exc: Exception) -> None:
+    """Persist a terminal reconcile failure so schedulers do not see a transient state forever."""
+    async with app.state.session_factory() as session:
+        row = await get_executor_row(session, executor_id)
+    if row is None or getattr(row, "runtime_state", "offline") != "reconfiguring":
+        return
+    runtime_metadata = _merge_runtime_metadata(
+        getattr(row, "runtime_metadata", None) or {},
+        {
+            "runtime_state": "blocked",
+            "warnings": [
+                f"Executor background reconfigure failed: {_safe_error_message(str(exc))}"
+            ],
+        },
+    )
+    await _persist_runtime_state(
+        app,
+        executor_id,
+        runtime_state="blocked",
+        applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
+        observed_tools=list(getattr(row, "observed_tools", None) or []),
+        runtime_metadata=runtime_metadata,
+    )
+
+
 async def _build_configure_payload(
     app: Any,
     row: Any,
@@ -284,7 +350,9 @@ async def _build_configure_payload(
     from cognis.api.runtime_support import _resolve_web_config
     from cognis.tools.skills import _qualified_skill_tool_name
 
-    mcp_servers, scoped_secrets = await _resolve_executor_mcp_payload(row, app.state.providers)
+    mcp_servers, scoped_secrets, mcp_metadata = await _resolve_executor_mcp_payload(
+        row, app.state.providers
+    )
     web_config = await _resolve_web_config(app.state.providers, row.owner_email)
     scoped_secrets.update(web_config.get("web_secrets", {}))
     skill_manifests: list[dict[str, Any]] = []
@@ -351,6 +419,9 @@ async def _build_configure_payload(
         "platform": {},
         "environment": {},
     }
+    if mcp_metadata:
+        metadata["mcp_servers"] = list(mcp_metadata.get("mcp_servers") or [])
+        metadata["warnings"] = list(mcp_metadata.get("warnings") or [])
     payload = {
         "config_version": desired_version,
         "enabled_tools": row.enabled_tools or [],
@@ -409,9 +480,18 @@ def _merge_runtime_metadata(base: dict[str, Any], result: dict[str, Any]) -> dic
     merged.setdefault("warnings", [])
     warnings = merged.get("warnings")
     if isinstance(warnings, list):
-        merged["warnings"] = [str(item)[:MAX_SAFE_ERROR_LENGTH] for item in warnings][:10]
+        base_warnings = base.get("warnings") if isinstance(base.get("warnings"), list) else []
+        result_warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        merged["warnings"] = [
+            str(item)[:MAX_SAFE_ERROR_LENGTH] for item in [*base_warnings, *result_warnings]
+        ][:10]
     else:
         merged["warnings"] = []
+    base_mcp_servers = base.get("mcp_servers") if isinstance(base.get("mcp_servers"), list) else []
+    result_mcp_servers = (
+        result.get("mcp_servers") if isinstance(result.get("mcp_servers"), list) else []
+    )
+    merged["mcp_servers"] = [*base_mcp_servers, *result_mcp_servers]
     return merged
 
 

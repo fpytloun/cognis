@@ -1,7 +1,7 @@
 """Add is_default to llm_providers.
 
 Revision ID: 006
-Revises: 005
+Revises: 005_agent_sync_metadata
 Create Date: 2026-03-29
 """
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "006"
-down_revision = "005"
+down_revision = "005_agent_sync_metadata"
 branch_labels = None
 depends_on = None
 

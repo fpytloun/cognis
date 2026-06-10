@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -236,9 +236,7 @@ class StepEvaluator:
             else _DEFAULT_EVALUATOR_PROMPT
         )
 
-        formatted_inputs = (
-            "\n".join(f"  {name}: {inp.summary}" for name, inp in step_inputs.items()) or "(none)"
-        )
+        formatted_inputs = self._format_step_inputs(step_inputs)
 
         formatted_outputs = json.dumps(step_output.outputs, default=str)[:2000]
         formatted_claims = "\n".join(f"  - {c}" for c in step_output.claims) or "(none)"
@@ -269,6 +267,39 @@ class StepEvaluator:
             content=formatted_content,
             execution_evidence=formatted_execution_evidence,
             task_context=task_context or "(none)",
+        )
+
+    def _format_step_inputs(self, step_inputs: dict[str, StepOutput]) -> str:
+        """Format prior step outputs for cross-step evaluation.
+
+        Evaluators need enough prior context to verify requirement continuity
+        across workflow steps. A summary-only view is too weak for structured
+        scope contracts, review metadata, or implementation evidence, but
+        replaying full source sessions would be too expensive. Keep this view
+        bounded while including the durable fields emitted by ``step_complete``.
+        """
+
+        if not step_inputs:
+            return "(none)"
+        return "\n\n".join(
+            self._format_step_input(name, output) for name, output in step_inputs.items()
+        )
+
+    def _format_step_input(self, name: str, output: StepOutput) -> str:
+        metadata = json.dumps(output.metadata, default=str)[:2000] if output.metadata else "{}"
+        outputs = json.dumps(output.outputs, default=str)[:2000] if output.outputs else "{}"
+        claims = "\n".join(f"    - {claim}" for claim in output.claims) or "    (none)"
+        content = (output.content or "").strip()
+        content_excerpt = content[:4000] if content else "(no deliverable content)"
+        if len(content) > 4000:
+            content_excerpt += "\n    [truncated]"
+        return (
+            f"  Step {name}:\n"
+            f"    Summary: {output.summary}\n"
+            f"    Metadata: {metadata}\n"
+            f"    Outputs: {outputs}\n"
+            f"    Claims:\n{claims}\n"
+            f"    Deliverable excerpt:\n{content_excerpt}"
         )
 
     def _parse_response(self, response: dict[str, Any]) -> StepEvaluation:
@@ -324,9 +355,10 @@ class StepEvaluator:
                 reasoning=f"invalid evaluator decision: {decision}",
                 feedback="Evaluator returned an invalid decision.",
             )
+        decision_value = cast(Literal["approved", "revise", "failed"], decision)
 
         evaluation = StepEvaluation(
-            decision=decision,
+            decision=decision_value,
             reasoning=str(payload.get("reasoning", "")),
             feedback=payload.get("feedback"),
             evaluated_at=datetime.now(UTC),

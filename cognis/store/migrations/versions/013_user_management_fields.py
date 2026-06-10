@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "013_user_management_fields"
-down_revision = "012_step_run_conversation_id"
+down_revision = "012"
 branch_labels = None
 depends_on = None
 

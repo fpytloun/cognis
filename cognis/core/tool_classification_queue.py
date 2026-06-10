@@ -24,6 +24,9 @@ from cognis.store.queries import (
     upsert_tool_classification,
 )
 from cognis.tools.classification import (
+    _classifier_error,
+    _normalize_capabilities,
+    _sanitize_classifier_error_detail,
     _validate_profile_group,
     llm_classification_outcomes,
     requires_background_classification,
@@ -41,8 +44,10 @@ def _utcnow() -> datetime:
 class _ClaimedClassification:
     classification_id: str
     scope_key: str
+    owner_email: str | None
     tool_id: str
     attempts: int
+    last_error: str | None
     tool_payload: dict[str, Any]
 
 
@@ -121,7 +126,7 @@ class ToolClassificationQueue:
                     and _validate_profile_group(
                         tool,
                         str(row.category),
-                        [str(capability) for capability in row.capabilities],
+                        _normalize_capabilities(row.capabilities),
                     )
                     is None
                 ):
@@ -255,8 +260,10 @@ class ToolClassificationQueue:
                     _ClaimedClassification(
                         classification_id=row.classification_id,
                         scope_key=row.scope_key,
+                        owner_email=row.owner_email,
                         tool_id=row.tool_id,
                         attempts=row.attempts,
+                        last_error=row.last_error,
                         tool_payload=dict(row.tool_payload or {}),
                     )
                 )
@@ -268,7 +275,7 @@ class ToolClassificationQueue:
     def _group_claimed_items(
         self, claimed: list[_ClaimedClassification]
     ) -> list[list[_ClaimedClassification]]:
-        grouped: dict[tuple[str, str, str], list[_ClaimedClassification]] = {}
+        grouped: dict[tuple[str, str, str, str], list[_ClaimedClassification]] = {}
         for item in claimed:
             payload = item.tool_payload
             source = str(
@@ -279,7 +286,9 @@ class ToolClassificationQueue:
                 or payload.get("source", {}).get("server_id")
                 or ""
             )
-            grouped.setdefault((item.scope_key, source, server), []).append(item)
+            grouped.setdefault((item.scope_key, item.owner_email or "", source, server), []).append(
+                item
+            )
         batches: list[list[_ClaimedClassification]] = []
         for items in grouped.values():
             for index in range(0, len(items), self._max_batch_size):
@@ -293,7 +302,19 @@ class ToolClassificationQueue:
             try:
                 tools = [ToolDefinition.model_validate(item.tool_payload) for item in items]
                 {stable_tool_id(tool): tool for tool in tools}
-                updates, rejected = await llm_classification_outcomes(tools, llm=self._llm_provider)
+                updates, rejected = await llm_classification_outcomes(
+                    tools,
+                    llm=self._llm_provider,
+                    acting_user_email=items[0].owner_email,
+                    allow_soft_profile_group_mismatch_for={
+                        item.tool_id for item in items if item.attempts > 0
+                    },
+                    retry_context={
+                        item.tool_id: item.last_error
+                        for item in items
+                        if item.attempts > 0 and item.last_error
+                    },
+                )
                 async with self._session_factory() as session:
                     for item in items:
                         row = await session.get(ToolClassificationRow, item.classification_id)
@@ -321,18 +342,22 @@ class ToolClassificationQueue:
                         row.updated_at = _utcnow()
                     await session.commit()
                 if rejected:
+                    logged_rejected = {
+                        tool_id: _sanitize_classifier_error_detail(reason)
+                        for tool_id, reason in rejected.items()
+                    }
                     logger.warning(
                         "Tool classification batch completed with retries scheduled",
                         extra={
                             "extra_data": {
                                 "batch_size": len(items),
                                 "tool_ids": [item.tool_id for item in items],
-                                "rejected": rejected,
+                                "rejected": logged_rejected,
                             }
                         },
                     )
             except Exception as exc:
-                error_text = str(exc)[:1000]
+                error_text = _classifier_error("tool_classification_batch_failed", exc)
                 logger.warning(
                     "Tool classification batch failed",
                     extra={
@@ -342,7 +367,6 @@ class ToolClassificationQueue:
                             "error": error_text,
                         }
                     },
-                    exc_info=True,
                 )
                 async with self._session_factory() as session:
                     for item in items:

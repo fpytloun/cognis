@@ -42,6 +42,9 @@ AUDIT_SOURCE = "_audit_source"
 # Role override used during audit collection.
 AUDIT_ROLE = "_audit_role"
 
+# Extra metadata copied onto persisted audit events.
+AUDIT_METADATA = "_audit_metadata"
+
 # ── Tool output / projection markers ─────────────────────────────────────────
 
 # Marks a tool result message as protected (never compacted by projection).
@@ -110,6 +113,7 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         PROJECT_CONTEXT,
         AUDIT_SOURCE,
         AUDIT_ROLE,
+        AUDIT_METADATA,
         PROTECTED_TOOL_OUTPUT,
         HAS_FULL_OUTPUT,
         RECOVERY_CALL_ID,

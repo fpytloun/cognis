@@ -16,6 +16,8 @@ _POSITIVE_INT_KEYS = {
     "session.max_active_turns_per_user",
     "session.max_queued_messages",
     "evaluator.timeout_ms",
+    "mcp.tool_timeout_seconds",
+    "mcp.connect_timeout_seconds",
     "web.concurrency.global_cap",
     "web.concurrency.per_host_cap",
     "web.concurrency.direct_cap",

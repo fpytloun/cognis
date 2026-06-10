@@ -112,9 +112,7 @@ def _validate_agent_execution(execution: object) -> None:
     if execution is None:
         return
     if not isinstance(execution, dict):
-        raise api_exception(
-            400, "validation_error", "execution must be an object"
-        )
+        raise api_exception(400, "validation_error", "execution must be an object")
 
     primary_id = execution.get("executor_id")
     if primary_id is not None and not (isinstance(primary_id, str) and primary_id.strip()):
@@ -183,9 +181,7 @@ def _validate_agent_execution(execution: object) -> None:
                     )
         description = entry.get("description")
         if description is not None and not isinstance(description, str):
-            raise api_exception(
-                400, "validation_error", f"{path}.description must be a string"
-            )
+            raise api_exception(400, "validation_error", f"{path}.description must be a string")
 
 
 def _normalized_grantee_execution(payload: dict[str, object] | None) -> dict[str, object]:
@@ -1038,7 +1034,9 @@ async def create_agent_share(
             raise api_exception(404, "not_found", "Agent not found")
         require_resource_owner(request, agent.owner_email)
         if payload.grantee_email == agent.owner_email:
-            raise api_exception(400, "validation_error", "Agent owner cannot be granted their own agent")
+            raise api_exception(
+                400, "validation_error", "Agent owner cannot be granted their own agent"
+            )
         grantee = await get_user(session, str(payload.grantee_email))
         if grantee is None:
             raise api_exception(404, "not_found", "Grantee user not found")
@@ -1049,7 +1047,9 @@ async def create_agent_share(
                 existing.grant_id,
                 executor_scope=payload.executor_scope,
                 note=payload.note,
-                grantee_overrides=None if payload.executor_scope == "owner_executor" else existing.grantee_overrides,
+                grantee_overrides=None
+                if payload.executor_scope == "owner_executor"
+                else existing.grantee_overrides,
                 granted_at=datetime.now(UTC),
                 granted_by=user.email,
                 revoked_at=None,

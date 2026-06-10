@@ -402,6 +402,72 @@ class Session(Base):
     )
 
 
+class ManagedConversationLink(Base):
+    """Control-plane link for an agent-managed normal conversation.
+
+    The target conversation/session remain normal root Intaris/Cognis sessions.
+    This row records supervisory ownership and durable turn state; it must not
+    be confused with ``Session.parent_session_id`` delegation lineage.
+    """
+
+    __tablename__ = "managed_conversation_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "target_conversation_id",
+            name="uq_managed_conversation_links_target_conversation",
+        ),
+        Index(
+            "ix_managed_conversation_links_controller_conversation",
+            "controller_conversation_id",
+        ),
+        Index("ix_managed_conversation_links_user_state", "user_email", "conversation_state"),
+        Index("ix_managed_conversation_links_target_agent", "target_agent_id"),
+    )
+
+    link_id: Mapped[str] = mapped_column(
+        String,
+        primary_key=True,
+        default=lambda: f"mconv_{uuid.uuid4().hex[:24]}",
+    )
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    controller_agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.agent_id"), nullable=False
+    )
+    controller_conversation_id: Mapped[str] = mapped_column(
+        String, ForeignKey("conversations.conversation_id"), nullable=False
+    )
+    controller_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    target_agent_id: Mapped[str] = mapped_column(
+        String, ForeignKey("agents.agent_id"), nullable=False
+    )
+    target_conversation_id: Mapped[str] = mapped_column(
+        String, ForeignKey("conversations.conversation_id"), nullable=False
+    )
+    target_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    conversation_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="open", server_default="open"
+    )
+    turn_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="idle", server_default="idle"
+    )
+    active_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    notify_on_completion: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    last_result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    control_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
 class Setting(Base):
     """System settings stored in DB (replaces config file for app-level config)."""
 

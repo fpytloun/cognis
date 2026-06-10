@@ -38,8 +38,11 @@ from cognis.api.models import (
 )
 from cognis.api.runtime_support import (
     _merge_remote_runtime_inventory,
+    _resolve_executor_mcp_servers,
     _resolve_intaris_mcp_tools,
+    disabled_mcp_server_keys,
     select_static_tools,
+    tool_disabled_by_agent_config,
 )
 from cognis.api.serializers import agent_to_response, mcp_server_to_response, tool_to_response
 from cognis.api.tool_inventory import (
@@ -96,6 +99,14 @@ router = APIRouter(tags=["tools"])
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _coerce_positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
 
 
 def _sanitize_mcp_error(error: Exception) -> str:
@@ -462,46 +473,43 @@ async def _resolve_effective_tools_response(
     except Exception:
         warnings.append("Failed to resolve DB-backed skills for preview.")
 
+    disabled_categories = set(
+        (agent.tools or {}).get("disabled_categories", []) if isinstance(agent.tools, dict) else []
+    )
+    disabled_tools_set = set(
+        (agent.tools or {}).get("disabled_tools", []) if isinstance(agent.tools, dict) else []
+    )
+    disabled_mcp_servers = (
+        disabled_mcp_server_keys(agent.tools) if isinstance(agent.tools, dict) else set()
+    )
+
     config_ids = (selected.config or {}).get(MCP_SERVER_IDS_KEY, [])
     if isinstance(config_ids, list) and config_ids:
         if selected.executor_type == "in_process":
-            mcp_servers: list[MCPServerConfig] = []
-            async with session_factory() as session:
-                for server_id in config_ids:
-                    row = await get_mcp_server(
-                        session,
-                        str(server_id),
-                        owner_email=executor_owner_email,
-                        include_shared=True,
-                    )
-                    if row is None or row.status != "active":
-                        continue
-                    if (
-                        invalid_mcp_config_reason(
-                            transport=row.transport,
-                            command=row.command,
-                            url=row.url,
-                            env=row.env,
-                            headers=row.headers,
-                            auth_config=row.auth_config,
-                        )
-                        is not None
-                    ):
-                        continue
-                    mcp_servers.append(
-                        MCPServerConfig(
-                            server_id=row.server_id,
-                            name=row.name,
-                            transport=row.transport,
-                            command=row.command,
-                            url=row.url,
-                            args=row.args or [],
-                            env=row.env or {},
-                            headers=row.headers or {},
-                            auth_config=row.auth_config or {},
-                            timeout_seconds=row.timeout_seconds,
-                        )
-                    )
+            mcp_diagnostics: dict[str, Any] = {}
+            mcp_servers = await _resolve_executor_mcp_servers(
+                {
+                    "config": selected.config or {},
+                    "executor_owner_email": executor_owner_email,
+                },
+                session_factory,
+                providers=request.app.state.providers,
+                user_email=acting_user_email,
+                conversation_id=getattr(access_context, "conversation_id", None),
+                task_id=getattr(access_context, "task_id", None),
+                step_name=getattr(access_context, "step_name", None),
+                step_run_id=getattr(access_context, "step_run_id", None),
+                session_id=getattr(access_context, "session_id", None),
+                delivery_mode="default" if getattr(access_context, "task_id", None) else "silent",
+                diagnostics=mcp_diagnostics,
+            )
+            warnings.extend(mcp_diagnostics.get("warnings") or [])
+            if disabled_mcp_servers:
+                mcp_servers = [
+                    server
+                    for server in mcp_servers
+                    if f"local_mcp:{server.server_id or server.name}" not in disabled_mcp_servers
+                ]
             configured_tools.extend(
                 await _discover_temp_mcp_tools(
                     request.app.state.providers,
@@ -519,19 +527,27 @@ async def _resolve_effective_tools_response(
         else:
             warnings.append("Executor has assigned MCP servers but no observed manifest yet.")
 
-    disabled_categories = set(
-        (agent.tools or {}).get("disabled_categories", []) if isinstance(agent.tools, dict) else []
-    )
-    disabled_tools_set = set(
-        (agent.tools or {}).get("disabled_tools", []) if isinstance(agent.tools, dict) else []
-    )
     intaris_result = await _resolve_intaris_mcp_tools(
-        request.app.state.providers, agent, disabled_categories, disabled_tools_set
+        request.app.state.providers,
+        agent,
+        disabled_categories,
+        disabled_tools_set,
+        disabled_mcp_servers,
     )
     configured_tools.extend(intaris_result.tools)
     for warning in intaris_result.warnings:
         if warning not in warnings:
             warnings.append(warning)
+    configured_tools = [
+        tool
+        for tool in configured_tools
+        if not tool_disabled_by_agent_config(
+            tool,
+            disabled_categories=disabled_categories,
+            disabled_tools=disabled_tools_set,
+            disabled_mcp_servers=disabled_mcp_servers,
+        )
+    ]
     configured_tools = await resolve_tool_classifications(
         configured_tools,
         session_factory=request.app.state.session_factory,
@@ -580,6 +596,7 @@ async def _resolve_effective_tools_response(
                 agent=agent,
                 disabled_categories=disabled_categories,
                 disabled_tools=disabled_tools_set,
+                disabled_mcp_servers=disabled_mcp_servers,
                 intaris_result=intaris_result,
             )
             for warning in merged_result.warnings:

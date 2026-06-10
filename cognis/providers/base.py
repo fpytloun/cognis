@@ -175,6 +175,7 @@ class GuardrailsProvider(Protocol):
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult: ...
     async def get_last_seq(self, session_id: str) -> int: ...

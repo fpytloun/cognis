@@ -22,6 +22,8 @@ from cognis.providers.llm.errors import classify_response_failure
 
 RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
 RESPONSES_TOOL_CALL_TYPES = frozenset({"function_call", "apply_patch_call", "custom_tool_call"})
+OUTPUT_TEXT_DELTA_DEDUPE_MIN_OVERLAP = 80
+OUTPUT_TEXT_DELTA_DEDUPE_MAX_SCAN = 4096
 
 logger = get_logger(__name__)
 
@@ -174,10 +176,30 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
 
     items: list[dict[str, Any]] = []
     native_apply_patch_call_ids: set[str] = set()
+    custom_tool_call_ids: set[str] = set()
     function_call_ids: set[str] = set()
     for index, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
+        raw_responses_output_items = message.get("_responses_output_items")
+        if role == "assistant" and isinstance(raw_responses_output_items, list):
+            for raw_item in raw_responses_output_items:
+                if isinstance(raw_item, dict):
+                    raw_type = str(raw_item.get("type") or "")
+                    if raw_type == "function_call":
+                        call_id = raw_item.get("call_id")
+                        if isinstance(call_id, str) and call_id:
+                            function_call_ids.add(call_id)
+                    elif raw_type == "custom_tool_call":
+                        call_id = raw_item.get("call_id")
+                        if isinstance(call_id, str) and call_id:
+                            custom_tool_call_ids.add(call_id)
+                    elif raw_type == "apply_patch_call":
+                        call_id = raw_item.get("call_id")
+                        if isinstance(call_id, str) and call_id:
+                            native_apply_patch_call_ids.add(call_id)
+                    items.append(dict(raw_item))
+            continue
         if role in {"system", "user", "assistant"} and not message.get("tool_calls"):
             items.append(
                 {
@@ -246,6 +268,14 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
+            elif normalized_call_id in custom_tool_call_ids:
+                items.append(
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": normalized_call_id,
+                        "output": output,
+                    }
+                )
             else:
                 logger.warning(
                     "Dropping orphan tool output for Responses API",
@@ -302,6 +332,7 @@ def responses_request_kwargs(
     *,
     default_reasoning_summary: str | None = "auto",
     default_text_verbosity: str | None = None,
+    include_encrypted_reasoning: bool = False,
 ) -> dict[str, Any]:
     """Translate chat-completions-style kwargs into Responses-compatible kwargs."""
 
@@ -332,6 +363,13 @@ def responses_request_kwargs(
             normalized_reasoning["summary"] = summary_default
     if normalized_reasoning:
         filtered["reasoning"] = normalized_reasoning
+    if normalized_reasoning or include_encrypted_reasoning:
+        include = filtered.get("include")
+        if isinstance(include, list):
+            if "reasoning.encrypted_content" not in include:
+                filtered["include"] = [*include, "reasoning.encrypted_content"]
+        elif include is None:
+            filtered["include"] = ["reasoning.encrypted_content"]
     verbosity_default = (default_text_verbosity or "").strip().lower()
     if verbosity_default and "text" not in filtered and "text_format" not in filtered:
         filtered["text"] = {"verbosity": verbosity_default}
@@ -467,19 +505,42 @@ async def responses_stream_to_chat_chunks(
             if event_type == "response.output_text.delta":
                 delta = event.get("delta")
                 if isinstance(delta, str) and delta:
-                    state.note_text_emitted("content", delta)
-                    provider_liveness_chunk["choices"] = [{"delta": {"content": delta}}]
-                    yield provider_liveness_chunk
+                    text_chunk = state.output_text_delta(
+                        event,
+                        delta,
+                    )
+                    if text_chunk is not None:
+                        text_chunk.update(provider_liveness_chunk)
+                        yield text_chunk
+                        continue
+                    else:
+                        provider_liveness_chunk["suppressed_output_text_delta"] = True
+                        provider_liveness_chunk["suppressed_output_text_delta_chars"] = len(delta)
+                        provider_liveness_chunk["active_output_item_type"] = (
+                            state.active_item_type()
+                        )
+                        yield provider_liveness_chunk
+                        continue
                 else:
                     yield provider_liveness_chunk
                 continue
             if event_type == "response.output_text.done":
                 text = event.get("text")
                 if isinstance(text, str) and text:
-                    final_text_chunk = state.final_text_delta(text, field="content")
+                    final_text_chunk = state.output_text_done(
+                        event,
+                        text,
+                    )
                     if final_text_chunk is not None:
                         final_text_chunk.update(provider_liveness_chunk)
                         yield final_text_chunk
+                    else:
+                        provider_liveness_chunk["suppressed_output_text_delta"] = True
+                        provider_liveness_chunk["suppressed_output_text_delta_chars"] = len(text)
+                        provider_liveness_chunk["active_output_item_type"] = (
+                            state.active_item_type()
+                        )
+                        yield provider_liveness_chunk
                 else:
                     yield provider_liveness_chunk
                 continue
@@ -487,10 +548,22 @@ async def responses_stream_to_chat_chunks(
                 part = event.get("part")
                 part_text = _extract_content_part_text(part)
                 if part_text:
-                    part_chunk = state.final_text_delta(part_text, field="content")
+                    part_chunk = state.content_part_text(
+                        event,
+                        part_text,
+                    )
                     if part_chunk is not None:
                         part_chunk.update(provider_liveness_chunk)
                         yield part_chunk
+                    else:
+                        provider_liveness_chunk["suppressed_content_part_text"] = True
+                        provider_liveness_chunk["suppressed_content_part_text_chars"] = len(
+                            part_text
+                        )
+                        provider_liveness_chunk["active_output_item_type"] = (
+                            state.active_item_type()
+                        )
+                        yield provider_liveness_chunk
                 else:
                     yield provider_liveness_chunk
                 continue
@@ -582,7 +655,7 @@ async def responses_stream_to_chat_chunks(
                 item = _get_output_item(event)
                 if item is None:
                     continue
-                _, is_new = state.register_item(item)
+                _, is_new = state.activate_item(item)
                 message_chunk = state.message_delta(item, emit_initial=is_new)
                 if message_chunk is not None:
                     message_chunk.update(provider_liveness_chunk)
@@ -643,7 +716,11 @@ async def responses_stream_to_chat_chunks(
                 item = _get_output_item(event)
                 if item is None:
                     continue
-                state.register_item(item)
+                state.complete_item(item)
+                yield {
+                    **provider_liveness_chunk,
+                    "responses_output_item": item,
+                }
                 message_chunk = state.finalize_message_item(item)
                 if message_chunk is not None:
                     message_chunk.update(provider_liveness_chunk)
@@ -732,6 +809,7 @@ class _ResponsesStreamState:
     def __init__(self) -> None:
         self._items: dict[str, dict[str, Any]] = {}
         self._item_aliases: dict[str, str] = {}
+        self._active_item_key: str | None = None
         self._next_tool_index = 0
         self._emitted_content = ""
         self._emitted_reasoning = ""
@@ -807,6 +885,8 @@ class _ResponsesStreamState:
             "state_key": item_key,
             "call_id": normalize_tool_call_id(item.get("call_id"), item.get("id"), item_key),
             "item_type": str(item.get("type") or ""),
+            "item_id": str(item.get("id") or "").strip() or None,
+            "phase": str(item.get("phase") or "").strip() or None,
             "name": _tool_call_item_name(item),
             "name_emitted": False,
             "arguments": _tool_call_item_arguments(item),
@@ -816,6 +896,37 @@ class _ResponsesStreamState:
         self._items[item_key] = state
         self._bind_item_aliases(item_key, aliases)
         return state, True
+
+    @staticmethod
+    def _message_text_metadata(
+        state: dict[str, Any],
+        *,
+        content_source: str,
+    ) -> dict[str, Any]:
+        return {
+            "response_item_id": state.get("item_id") or state.get("state_key"),
+            "response_item_type": "message",
+            "response_message_phase": state.get("phase"),
+            "content_source": content_source,
+        }
+
+    def activate_item(self, item: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        state, is_new = self.register_item(item)
+        if state is not None:
+            self._active_item_key = str(state.get("state_key") or "") or None
+        return state, is_new
+
+    def complete_item(self, item: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+        state, is_new = self.register_item(item)
+        if state is not None and self._active_item_key == state.get("state_key"):
+            self._active_item_key = None
+        return state, is_new
+
+    def active_item_type(self) -> str | None:
+        state = self._resolve_item_state(self._active_item_key or "")
+        if state is None:
+            return None
+        return str(state.get("item_type") or "") or None
 
     def _item_identity(self, item: dict[str, Any]) -> tuple[str, list[str]]:
         raw_item_id = str(item.get("id") or "").strip()
@@ -843,6 +954,79 @@ class _ResponsesStreamState:
                 return state
         return None
 
+    def output_text_delta(
+        self,
+        event: dict[str, Any],
+        delta: str,
+    ) -> dict[str, Any] | None:
+        state = self._resolve_item_state(str(event.get("item_id") or ""))
+        if state is None:
+            state = self._resolve_item_state(self._active_item_key or "")
+        if state is not None and str(state.get("item_type") or "") != "message":
+            return None
+        if state is None:
+            return None
+        normalized_delta = self.incremental_text_delta(delta, field="content")
+        if normalized_delta is None:
+            return None
+        self.note_text_emitted("content", normalized_delta)
+        return {
+            **self._message_text_metadata(
+                state,
+                content_source="response.output_text.delta",
+            ),
+            "choices": [{"delta": {"content": normalized_delta}}],
+        }
+
+    def output_text_done(
+        self,
+        event: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any] | None:
+        state = self._resolve_item_state(str(event.get("item_id") or ""))
+        if state is None:
+            state = self._resolve_item_state(self._active_item_key or "")
+        if state is not None and str(state.get("item_type") or "") != "message":
+            return None
+        if state is None:
+            return None
+        chunk = self.final_text_delta(text, field="content")
+        if chunk is None:
+            return None
+        chunk.update(
+            self._message_text_metadata(
+                state,
+                content_source="response.output_text.done",
+            )
+        )
+        return chunk
+
+    def content_part_text(
+        self,
+        event: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any] | None:
+        state = self._resolve_item_state(str(event.get("item_id") or ""))
+        part = event.get("part")
+        if state is None and isinstance(part, dict):
+            state = self._resolve_item_state(str(part.get("item_id") or ""))
+        if state is None:
+            state = self._resolve_item_state(self._active_item_key or "")
+        if state is not None and str(state.get("item_type") or "") != "message":
+            return None
+        if state is None:
+            return None
+        chunk = self.final_text_delta(text, field="content")
+        if chunk is None:
+            return None
+        chunk.update(
+            self._message_text_metadata(
+                state,
+                content_source="response.content_part",
+            )
+        )
+        return chunk
+
     def message_delta(self, item: dict[str, Any], *, emit_initial: bool) -> dict[str, Any] | None:
         if str(item.get("type")) != "message":
             return None
@@ -852,7 +1036,16 @@ class _ResponsesStreamState:
         if not text:
             return None
         self.note_text_emitted("content", text)
-        return {"choices": [{"delta": {"content": text}}]}
+        state, _ = self.register_item(item)
+        if state is None:
+            return {"choices": [{"delta": {"content": text}}]}
+        return {
+            **self._message_text_metadata(
+                state,
+                content_source="response.output_item.added",
+            ),
+            "choices": [{"delta": {"content": text}}],
+        }
 
     def finalize_message_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
         if str(item.get("type")) != "message":
@@ -860,13 +1053,32 @@ class _ResponsesStreamState:
         text = _extract_message_item_text(item)
         if not text:
             return None
-        return self.final_text_delta(text, field="content")
+        state, _ = self.register_item(item)
+        if state is None:
+            return self.final_text_delta(text, field="content")
+        chunk = self.final_text_delta(text, field="content")
+        if chunk is None:
+            return None
+        chunk.update(
+            self._message_text_metadata(
+                state,
+                content_source="response.output_item.done",
+            )
+        )
+        return chunk
 
     def final_message_fallback(self, response_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        # The completed response object is a lossy aggregate of the typed
+        # Responses stream. Codex treats response.completed as a terminal
+        # metadata event and does not synthesize visible assistant text from
+        # top-level output_text. Follow that model here: use completed fallback
+        # only to recover structured non-visible fields and explicit refusal
+        # text. Message content must come from typed output_text/content_part or
+        # message item events while streaming, otherwise a provider-side
+        # scratchpad leak in output_text can become a persisted assistant_message.
         envelope = _extract_response_envelope(response_payload)
         chunks: list[dict[str, Any]] = []
         for response_field, fallback_text in (
-            ("content", envelope.content),
             ("reasoning_content", envelope.reasoning_content),
             ("reasoning", envelope.reasoning_summary),
             ("refusal", envelope.refusal),
@@ -893,6 +1105,41 @@ class _ResponsesStreamState:
             return {"choices": [{"delta": {field: delta}}]}
         self.note_text_emitted(field, text)
         return {"choices": [{"delta": {field: text}}]}
+
+    def incremental_text_delta(self, delta: str, *, field: str = "content") -> str | None:
+        """Normalize Responses text deltas that replay already emitted text.
+
+        Responses streams usually send true deltas, but Codex/direct transports
+        can occasionally replay a large previous suffix or send a cumulative
+        snapshot through response.output_text.delta. Guard only on large overlaps
+        so intentionally repeated short text still streams unchanged.
+        """
+
+        if not delta:
+            return None
+        emitted = self._emitted_value(field)
+        if not emitted:
+            return delta
+
+        min_overlap = OUTPUT_TEXT_DELTA_DEDUPE_MIN_OVERLAP
+        if len(emitted) >= min_overlap and delta.startswith(emitted):
+            suffix = delta[len(emitted) :]
+            return suffix or None
+
+        if len(delta) >= min_overlap and emitted.endswith(delta):
+            return None
+
+        overlap_limit = min(
+            len(emitted),
+            len(delta) - 1,
+            OUTPUT_TEXT_DELTA_DEDUPE_MAX_SCAN,
+        )
+        for overlap in range(overlap_limit, min_overlap - 1, -1):
+            if emitted.endswith(delta[:overlap]):
+                suffix = delta[overlap:]
+                return suffix or None
+
+        return delta
 
     def initial_tool_delta(self, item: dict[str, Any], *, emit_name: bool) -> dict[str, Any] | None:
         if not _is_responses_tool_call_item(item):
@@ -1224,12 +1471,6 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
                     },
                 }
             )
-
-    if not content_parts:
-        output_text = _extract_text_value(payload.get("output_text"))
-        if output_text:
-            content_parts.append(output_text)
-            envelope.content_source = envelope.content_source or "output_text"
 
     envelope.content = "".join(content_parts)
     envelope.reasoning_content = "".join(reasoning_parts)

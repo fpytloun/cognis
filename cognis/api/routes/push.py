@@ -123,7 +123,9 @@ async def subscription_status(request: Request) -> PushSubscriptionStatusRespons
     service = _get_service(request)
     async with request.app.state.session_factory() as session:
         count_result = await session.execute(
-            select(func.count()).select_from(PushSubscriptionRow).where(
+            select(func.count())
+            .select_from(PushSubscriptionRow)
+            .where(
                 PushSubscriptionRow.user_email == user.email,
                 PushSubscriptionRow.enabled.is_(True),
             )

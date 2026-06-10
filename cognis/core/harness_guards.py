@@ -80,7 +80,7 @@ _LOOP_GUARD_EXEMPT_TOOLS: frozenset[str] = frozenset(
         # The wait/poll-style controller tools are already exclusive and
         # do not reach this guard, but listing them here is cheap belt-
         # and-suspenders in case they ever do.
-        "step_request_input",
+        "step_request_questions",
         "request_credential",
         "request_auth_challenge",
     }

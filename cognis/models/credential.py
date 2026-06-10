@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
@@ -16,6 +16,8 @@ CredentialKind = Literal[
     "browser_storage_state",
     "claude_code_profile",
 ]
+
+SUPPORTED_CREDENTIAL_KINDS = get_args(CredentialKind)
 
 CredentialStatus = Literal["active", "expired", "revoked", "invalid"]
 
