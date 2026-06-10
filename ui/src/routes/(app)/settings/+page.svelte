@@ -5,6 +5,7 @@ import { onMount, tick } from 'svelte';
   import type { MCPEnvVar } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
+  import { formatMcpOAuthStatus, type MCPOAuthStatus } from '$lib/mcp-oauth-status';
   import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
@@ -76,15 +77,6 @@ import { onMount, tick } from 'svelte';
   type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
   type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
   type MCPAuthType = 'none' | 'static_headers' | 'oauth2';
-  type MCPOAuthStatus = {
-    connected: boolean;
-    issuer?: string | null;
-    resource?: string | null;
-    scopes?: string[];
-    expires_at?: string | null;
-    refreshable?: boolean;
-    status?: string;
-  };
   type MCPServerFormState = {
     name: string;
     transport: string;
@@ -3591,6 +3583,99 @@ import { onMount, tick } from 'svelte';
               </div>
             </details>
 
+            <!-- Office document tools settings -->
+            {@const officeConfig = ((exec.config || {}).officecli || {}) as Record<string, unknown>}
+            {@const officeEnabled = officeConfig.enabled !== false}
+            {@const officeAutoInstall = officeConfig.auto_install !== false}
+            {@const officeVersion = String(officeConfig.version ?? 'v1.0.102')}
+            {@const officeBinaryPath = String(officeConfig.binary_path ?? '')}
+            {@const officeCacheDir = String(officeConfig.cache_dir ?? '')}
+            {@const officeRuntime = (exec.runtime_metadata.officecli || {}) as Record<string, unknown>}
+            {@const officeAvailable = officeRuntime.available === true}
+            {@const officeError = typeof officeRuntime.error === 'string' ? officeRuntime.error : ''}
+            <details class="group">
+              <summary class="cursor-pointer text-xs uppercase tracking-wider text-slate-400 hover:text-slate-300 select-none">
+                Office Documents
+                <span class="ml-1 text-slate-500">{officeEnabled ? (officeAvailable ? '(available)' : '(enabled)') : '(disabled)'}</span>
+              </summary>
+              <div class="mt-3 space-y-3 pl-1">
+                <div class="flex flex-wrap gap-4">
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={officeEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), officecli: { ...officeConfig, enabled: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`Office document tools ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Enabled
+                  </label>
+                  <label class="flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" checked={officeAutoInstall} disabled={!officeEnabled}
+                      class="rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                      onchange={async (e) => {
+                        const checked = e.currentTarget.checked;
+                        const cfg = { ...(exec.config || {}), officecli: { ...officeConfig, auto_install: checked } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                        addToast(`OfficeCLI auto-install ${checked ? 'enabled' : 'disabled'}.`, 'success');
+                      }}
+                    />
+                    Auto-install certified OfficeCLI
+                  </label>
+                </div>
+                <div class="grid gap-3 md:grid-cols-3">
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Certified version</span>
+                    <Input value={officeVersion} disabled={!officeEnabled}
+                      onchange={async (e) => {
+                        const cfg = { ...(exec.config || {}), officecli: { ...officeConfig, version: e.currentTarget.value.trim() || 'v1.0.102' } };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                    <span class="block text-xs text-slate-500">Only certified Cognis versions expose office tools.</span>
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Binary path override</span>
+                    <Input value={officeBinaryPath} disabled={!officeEnabled}
+                      placeholder="/usr/local/bin/officecli"
+                      onchange={async (e) => {
+                        const next: Record<string, unknown> = { ...officeConfig };
+                        const value = e.currentTarget.value.trim();
+                        if (value) next.binary_path = value;
+                        else delete next.binary_path;
+                        const cfg = { ...(exec.config || {}), officecli: next };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                  <label class="space-y-1 text-sm text-slate-300">
+                    <span class="text-xs text-slate-400">Cache directory</span>
+                    <Input value={officeCacheDir} disabled={!officeEnabled}
+                      placeholder="default: $COGNIS_DATA_DIR/cache/officecli"
+                      onchange={async (e) => {
+                        const next: Record<string, unknown> = { ...officeConfig };
+                        const value = e.currentTarget.value.trim();
+                        if (value) next.cache_dir = value;
+                        else delete next.cache_dir;
+                        const cfg = { ...(exec.config || {}), officecli: next };
+                        await api.executor.update(exec.executor_id, { config: cfg });
+                        await refreshPageState();
+                      }}
+                    />
+                  </label>
+                </div>
+                <div class="text-xs text-slate-500">
+                  Runtime: {officeAvailable ? `available ${String(officeRuntime.version ?? '')} via ${String(officeRuntime.installed_from ?? 'unknown')}` : `unavailable${officeError ? `: ${officeError}` : ''}`}
+                </div>
+              </div>
+            </details>
+
             <!-- Browser automation settings -->
             {@const browserConfig = ((exec.config || {}).browser || {}) as Record<string, unknown>}
             {@const browserEnabled = browserConfig.enabled !== false}
@@ -4721,9 +4806,7 @@ import { onMount, tick } from 'svelte';
                   <div>
                     <p class="font-medium">OAuth authorization</p>
                     <p class="text-xs text-sky-100/80">
-                      {oauthStatus
-                        ? (oauthStatus.connected ? `Connected${oauthStatus.expires_at ? ` until ${new Date(oauthStatus.expires_at).toLocaleString()}` : ''}` : `Not connected${oauthStatus.status ? ` (${oauthStatus.status})` : ''}`)
-                        : 'Status not loaded'}
+                      {formatMcpOAuthStatus(oauthStatus)}
                     </p>
                   </div>
                   <div class="flex gap-2">

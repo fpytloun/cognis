@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { matchesTaskFilters, sortTasks, taskBoardProjectUrl, taskFiltersFromSearchParams, taskFiltersToSearchParams } from '$lib/tasks';
+import { matchesTaskFilters, scheduleListProjectUrl, sortTasks, taskBoardProjectUrl, taskFiltersFromSearchParams, taskFiltersToSearchParams } from '$lib/tasks';
 import type { Task } from '$lib/types/api';
 
 function makeTask(overrides: Partial<Task>): Task {
@@ -108,5 +108,6 @@ describe('task filters', () => {
 
     expect(params.toString()).toBe('q=docs&agent_id=agent-1&workflow_id=workflow-1&project_id=project-1&status=running');
     expect(taskBoardProjectUrl('project-1')).toBe('/tasks?project_id=project-1');
+    expect(scheduleListProjectUrl('project-1')).toBe('/schedules?project_id=project-1');
   });
 });

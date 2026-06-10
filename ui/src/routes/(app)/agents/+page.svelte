@@ -1,13 +1,12 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
   import Copy from 'lucide-svelte/icons/copy';
   import Eye from 'lucide-svelte/icons/eye';
   import LoaderCircle from 'lucide-svelte/icons/loader-circle';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Pencil from 'lucide-svelte/icons/pencil';
   import Plus from 'lucide-svelte/icons/plus';
-  import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
@@ -16,10 +15,10 @@
   import Card from '$lib/components/ui/Card.svelte';
   import { clearPersistedScroll } from '$lib/actions/scrollPersist';
   import { api, asApiError } from '$lib/api/client';
+  import { CHAT_STORAGE_KEYS } from '$lib/chat-page';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
-  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
-  import type { Agent, Conversation, Workflow } from '$lib/types/api';
+  import type { Agent, Workflow } from '$lib/types/api';
 
   // Expanded-group state survives tab switches via sessionStorage.
   // Falls back to expanded-by-default on first visit and when storage is
@@ -55,13 +54,7 @@
   let secondaryExpanded = readExpanded(AGENTS_SECONDARY_EXPANDED_KEY, true);
   let lightboxUrl: string | null = null;
   let lightboxAlt = '';
-  let chatAgent: Agent | null = null;
-  let chatConversations: Conversation[] = [];
-  let chatLoading = false;
-  let chatCreating = false;
-  let chatError = '';
-  let chatDialogElement: HTMLDivElement | null = null;
-  let chatLastFocusedElement: HTMLElement | null = null;
+  let directChatOpeningAgentId: string | null = null;
 
   // Persist expanded state whenever it changes so the next mount picks
   // it up. `$:` blocks run on every reactive update.
@@ -120,126 +113,25 @@
     return agent.agent_type === 'primary' && agent.status === 'active' && !agent.disabled;
   }
 
-  function conversationTimestamp(conversation: Conversation): string | null {
-    return conversation.last_message_at ?? conversation.updated_at ?? conversation.created_at;
-  }
-
-  function sortedConversations(conversations: Conversation[]): Conversation[] {
-    return [...conversations].sort((left, right) => {
-      const leftTime = conversationTimestamp(left);
-      const rightTime = conversationTimestamp(right);
-      return (rightTime ? Date.parse(rightTime) : 0) - (leftTime ? Date.parse(leftTime) : 0);
-    });
-  }
-
-  function conversationTitle(conversation: Conversation): string {
-    return conversation.title?.trim() || 'Untitled conversation';
-  }
-
   async function openChatModal(agent: Agent): Promise<void> {
     if (!canChat(agent)) return;
-    chatLastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    chatAgent = agent;
-    chatLoading = true;
-    chatCreating = false;
-    chatError = '';
-    chatConversations = [];
-    await tick();
-    chatDialogElement?.focus();
+    directChatOpeningAgentId = agent.agent_id;
     try {
-      const conversations = await api.conversations.listAll({
-        contextType: 'web',
-        agentId: agent.agent_id,
-        status: 'active'
-      });
-      chatConversations = sortedConversations(conversations);
-    } catch (caughtError) {
-      chatError = asApiError(caughtError).message;
-    } finally {
-      chatLoading = false;
-    }
-  }
-
-  async function closeChatModal(): Promise<void> {
-    if (chatCreating) return;
-    const elementToRestore = chatLastFocusedElement;
-    chatAgent = null;
-    chatConversations = [];
-    chatError = '';
-    chatDialogElement = null;
-    chatLastFocusedElement = null;
-    await tick();
-    elementToRestore?.focus();
-  }
-
-  function focusableChatElements(): HTMLElement[] {
-    if (!chatDialogElement) return [];
-    return Array.from(
-      chatDialogElement.querySelectorAll<HTMLElement>(
-        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      )
-    ).filter((element) => !element.hasAttribute('disabled') && element.getAttribute('aria-hidden') !== 'true');
-  }
-
-  function handleChatModalKeydown(event: KeyboardEvent): void {
-    if (!chatAgent) return;
-
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      void closeChatModal();
-      return;
-    }
-
-    if (event.key !== 'Tab') return;
-
-    const focusableElements = focusableChatElements();
-    if (focusableElements.length === 0) {
-      event.preventDefault();
-      chatDialogElement?.focus();
-      return;
-    }
-
-    const firstElement = focusableElements[0];
-    const lastElement = focusableElements[focusableElements.length - 1];
-    const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-
-    if (event.shiftKey) {
-      if (!activeElement || activeElement === firstElement || !chatDialogElement?.contains(activeElement)) {
-        event.preventDefault();
-        lastElement.focus();
+      if (typeof window !== 'undefined') {
+        window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedAgent);
       }
-      return;
-    }
-
-    if (activeElement === lastElement) {
-      event.preventDefault();
-      firstElement.focus();
-    }
-  }
-
-  async function openConversation(conversation: Conversation): Promise<void> {
-    await goto(`/chat/${conversation.conversation_id}`);
-  }
-
-  async function startNewConversation(): Promise<void> {
-    if (!chatAgent) return;
-    chatCreating = true;
-    chatError = '';
-    try {
-      const conversation = await api.conversations.create({
-        agent_id: chatAgent.agent_id,
-        context: {
-          type: 'web',
-          ref: null,
-          platform_data: {},
-          memory_labels: {}
-        }
+      const conversation = await api.conversations.resolve({
+        agent_id: agent.agent_id,
+        context_type: 'web',
+        scope: 'agent_direct'
       });
       await goto(`/chat/${conversation.conversation_id}`);
     } catch (caughtError) {
-      chatError = asApiError(caughtError).message;
+      const message = asApiError(caughtError).message;
+      error = message;
+      addToast(message, 'error', 4_000, `Unable to open ${displayName(agent)} chat`);
     } finally {
-      chatCreating = false;
+      directChatOpeningAgentId = null;
     }
   }
 
@@ -412,8 +304,12 @@
 
       <div class="flex shrink-0 gap-2 sm:self-end">
         {#if canChat(agent)}
-          <Button size="icon" variant="primary" title={`Chat with ${displayName(agent)}`} aria-label={`Chat with ${displayName(agent)}`} onclick={() => openChatModal(agent)}>
-            <MessageSquareText class="h-4 w-4" />
+          <Button size="icon" variant="primary" title={`Open main chat with ${displayName(agent)}`} aria-label={`Open main chat with ${displayName(agent)}`} onclick={() => openChatModal(agent)} disabled={directChatOpeningAgentId !== null}>
+            {#if directChatOpeningAgentId === agent.agent_id}
+              <LoaderCircle class="h-4 w-4 animate-spin" />
+            {:else}
+              <MessageSquareText class="h-4 w-4" />
+            {/if}
           </Button>
         {/if}
         {#if agent.is_shared_with_me}
@@ -448,85 +344,6 @@
 
   </Card>
 {/snippet}
-
-{#if chatAgent}
-  <div
-    class="app-viewport-overlay z-50 flex items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/80 backdrop-blur-sm sm:items-center"
-    style="padding-left: var(--app-floating-overlay-left); padding-right: var(--app-floating-overlay-right); padding-top: var(--app-overlay-gap); padding-bottom: var(--app-overlay-gap);"
-    role="presentation"
-    onkeydown={handleChatModalKeydown}
-  >
-    <button
-      type="button"
-      class="absolute inset-0 cursor-default"
-      aria-label="Close chat selector"
-      onclick={() => void closeChatModal()}
-    ></button>
-    <div
-      bind:this={chatDialogElement}
-      class="relative flex max-h-full w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-2xl"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="agent-chat-title"
-      aria-describedby="agent-chat-description"
-      tabindex="-1"
-    >
-      <div class="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-        <div class="min-w-0">
-          <p class="text-xs uppercase tracking-[0.22em] text-slate-500">Chat with agent</p>
-          <h2 id="agent-chat-title" class="mt-1 truncate text-xl font-semibold text-white">{displayName(chatAgent)}</h2>
-          <p id="agent-chat-description" class="mt-1 text-sm text-slate-400">Open a recent conversation or start a new one.</p>
-        </div>
-        <Button size="icon" variant="ghost" aria-label="Close chat selector" title="Close" onclick={() => void closeChatModal()} disabled={chatCreating}>
-          <X class="h-4 w-4" />
-        </Button>
-      </div>
-
-      <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
-        {#if chatError}
-          <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{chatError}</p>
-        {/if}
-
-        <Button class="w-full justify-center" disabled={chatCreating || chatLoading} onclick={() => void startNewConversation()}>
-          {#if chatCreating}
-            <LoaderCircle class="mr-2 h-4 w-4 animate-spin" />
-            Creating conversation...
-          {:else}
-            <Plus class="mr-2 h-4 w-4" />
-            Start new conversation
-          {/if}
-        </Button>
-
-        <div>
-          <h3 class="text-sm font-medium text-slate-200">Latest conversations</h3>
-          {#if chatLoading}
-            <div class="mt-3 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-5 text-sm text-slate-400">Loading conversations...</div>
-          {:else if chatConversations.length > 0}
-            <div class="mt-3 max-h-[50vh] space-y-2 overflow-y-auto pr-1">
-              {#each chatConversations as conversation (conversation.conversation_id)}
-                <button type="button" class="w-full rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-left transition hover:border-sky-500/50 hover:bg-slate-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400" onclick={() => void openConversation(conversation)}>
-                  <div class="flex items-start justify-between gap-3">
-                    <div class="min-w-0">
-                      <p class="truncate text-sm font-medium text-white">{conversationTitle(conversation)}</p>
-                      <p class="mt-1 break-all text-xs text-slate-500">{conversation.conversation_id}</p>
-                    </div>
-                    {#if conversationTimestamp(conversation)}
-                      <span class="shrink-0 text-xs text-slate-500" title={formatAbsoluteTime(conversationTimestamp(conversation))}>
-                        {formatRelativeTime(conversationTimestamp(conversation))}
-                      </span>
-                    {/if}
-                  </div>
-                </button>
-              {/each}
-            </div>
-          {:else}
-            <p class="mt-3 rounded-2xl border border-dashed border-slate-800 px-4 py-5 text-sm text-slate-500">No active web conversations for this agent yet.</p>
-          {/if}
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
 
 {#if lightboxUrl}
   <ImageLightbox src={lightboxUrl} alt={lightboxAlt} onClose={() => { lightboxUrl = null; }} />

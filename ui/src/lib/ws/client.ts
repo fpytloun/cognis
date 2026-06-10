@@ -3,7 +3,7 @@ import { writable, get } from 'svelte/store';
 import { getWebSocketUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
-import type { AttachmentRef, CognisWebSocketEvent } from '$lib/types/api';
+import type { AttachmentRef, CognisWebSocketEvent, QuestionSetReply } from '$lib/types/api';
 import { clamp } from '$lib/utils';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'stalled';
@@ -197,11 +197,15 @@ class CognisWebSocketClient {
     this.sendRaw({ type: 'gate_response', task_id: taskId, action, step_name: stepName, feedback });
   }
 
-  respondStep(taskId: string, response: string, stepName?: string): void {
-    this.sendRaw({ type: 'step_response', task_id: taskId, response, step_name: stepName });
+  respondStep(taskId: string, reply: QuestionSetReply, stepName?: string): void {
+    this.sendRaw({ type: 'step_response', task_id: taskId, ...reply, step_name: stepName });
   }
 
-  respondStepQuestion(notificationId: string, response: string, stepName?: string): void {
+  respondStepQuestion(notificationId: string, reply: QuestionSetReply, stepName?: string): void {
+    this.sendRaw({ type: 'step_response', notification_id: notificationId, ...reply, step_name: stepName });
+  }
+
+  respondAuthChallenge(notificationId: string, response: string, stepName?: string): void {
     this.sendRaw({ type: 'step_response', notification_id: notificationId, response, step_name: stepName });
   }
 

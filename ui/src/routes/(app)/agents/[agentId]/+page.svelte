@@ -213,6 +213,7 @@
           ...form,
           disabledTools: [],
           disabledCategories: [],
+          disabledMcpServers: [],
         });
         const fullCatalog = await api.agents.previewEffectiveTools(fullCatalogPayload);
         tools = fullCatalog.configured_state.tools;
@@ -413,6 +414,7 @@
       ...form,
       disabledTools: [],
       disabledCategories: [],
+      disabledMcpServers: [],
     });
     if (previewTimer) clearTimeout(previewTimer);
     previewTimer = setTimeout(async () => {

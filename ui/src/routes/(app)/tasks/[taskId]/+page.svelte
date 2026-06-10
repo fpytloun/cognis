@@ -23,6 +23,7 @@ import Target from 'lucide-svelte/icons/target';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
@@ -43,9 +44,24 @@ import Target from 'lucide-svelte/icons/target';
     shouldClearTaskFromError
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
+  import { policyFromText, policyText } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
-import type { Agent, Conversation, Deliverable, Escalation, Notification, Project, Session, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type {
+  Agent,
+  Conversation,
+  Deliverable,
+  Escalation,
+  Notification,
+  Project,
+  QuestionSetAnswer,
+  QuestionSetQuestion,
+  Session,
+  StepRun,
+  Task,
+  TaskDetail,
+  Workflow
+} from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -60,6 +76,7 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
   let dependencyTaskId = $state('');
   let gateFeedback = $state('');
   let stepResponse = $state('');
+  let stepQuestionAnswers = $state<Record<string, { selected: string[]; custom: string }>>({});
   let expandedStepHistory = $state<Set<string>>(new Set());
   let selectedStepName = $state('');
   let selectedAttemptByStep = $state<Record<string, string>>({});
@@ -100,7 +117,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
-    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests'
+    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
+    allow_policy_text: '',
+    deny_policy_text: ''
   });
   let projects = $state<Project[]>([]);
   let projectWorkflowOptions = $state<Workflow[]>([]);
@@ -1065,11 +1084,59 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     if (pause.step_name && currentStepName && pause.step_name !== currentStepName) {
       return {
         ...pause,
-        question: pause.question ?? 'Task is paused and waiting for input.'
+        question: pause.question ?? pause.questions?.[0]?.question ?? 'Task is paused and waiting for input.'
       };
     }
     return pause;
   });
+
+  let activeStepQuestions = $derived.by(() => {
+    if (!activePause || activePause.pause_type === 'gate') return [] as QuestionSetQuestion[];
+    return activePause.questions ?? [];
+  });
+
+  function stepQuestionState(questionId: string): { selected: string[]; custom: string } {
+    return stepQuestionAnswers[questionId] ?? { selected: [], custom: '' };
+  }
+
+  function setStepQuestionCustom(questionId: string, value: string): void {
+    const current = stepQuestionState(questionId);
+    stepQuestionAnswers = {
+      ...stepQuestionAnswers,
+      [questionId]: { ...current, custom: value }
+    };
+  }
+
+  function toggleStepQuestionOption(question: QuestionSetQuestion, optionId: string): void {
+    const current = stepQuestionState(question.id);
+    const selected = new Set(current.selected);
+    if (question.multiple) {
+      if (selected.has(optionId)) {
+        selected.delete(optionId);
+      } else {
+        selected.add(optionId);
+      }
+    } else {
+      selected.clear();
+      selected.add(optionId);
+    }
+    stepQuestionAnswers = {
+      ...stepQuestionAnswers,
+      [question.id]: { ...current, selected: Array.from(selected) }
+    };
+  }
+
+  function buildStepQuestionReply(questions: QuestionSetQuestion[]): QuestionSetAnswer[] {
+    return questions.map((question) => {
+      const current = stepQuestionState(question.id);
+      const custom = current.custom.trim();
+      return {
+        question_id: question.id,
+        selected_option_ids: current.selected,
+        custom_answer: custom ? custom : null
+      };
+    });
+  }
 
   let dependencyTasks = $derived.by(() => {
     if (!task) return [] as Array<{ taskId: string; title: string; status: string }>;
@@ -1151,7 +1218,9 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
         delivery_target: task.delivery.target ?? '',
         completion_mode_family: task.completion_mode_family,
         allow_silent_completion: task.allow_silent_completion,
-        interaction_mode_override: task.interaction_mode_override ?? ''
+        interaction_mode_override: task.interaction_mode_override ?? '',
+        allow_policy_text: policyText(task.session_policy, 'allow_policies'),
+        deny_policy_text: policyText(task.session_policy, 'deny_policies')
       };
       selectedStepName = defaultStepSelection(task, selectedStepName);
       try {
@@ -1236,7 +1305,8 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
         delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null,
         completion_mode_family: editForm.completion_mode_family,
         allow_silent_completion: editForm.allow_silent_completion,
-        interaction_mode_override: editForm.interaction_mode_override || null
+        interaction_mode_override: editForm.interaction_mode_override || null,
+        session_policy: policyFromText(editForm.allow_policy_text, editForm.deny_policy_text)
       });
       task = await api.tasks.detail(updatedTask.task_id);
       addToast('Task updated.', 'success');
@@ -1296,14 +1366,16 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
     }
   }
 
-  async function respondToStepQuestion(response: string): Promise<void> {
+  async function respondToStepQuestion(): Promise<void> {
     if (!task) return;
+    const questions = task.pending_pause?.questions ?? [];
     try {
       await api.tasks.stepResponse(task.task_id, {
-        step_name: task.pending_pause?.step_name,
-        response
+        mode: 'structured',
+        answers: buildStepQuestionReply(questions)
       });
       stepResponse = '';
+      stepQuestionAnswers = {};
       task = await api.tasks.detail(task.task_id);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1637,7 +1709,11 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                     <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-0.5 text-[10px] tracking-[0.2em] text-slate-300">{activePause.step_name}</span>
                   {/if}
                 </div>
-                <h2 class="mt-3 text-lg font-semibold text-white">{activePause.question}</h2>
+                <h2 class="mt-3 text-lg font-semibold text-white">
+                  {activePause.pause_type === 'gate'
+                    ? activePause.question
+                    : activeStepQuestions[0]?.question ?? 'Step question'}
+                </h2>
                 <p class="mt-2 text-sm text-slate-400">
                   {activePause.pause_type === 'gate'
                     ? 'Review the latest attempt, give guidance if needed, then continue or stop the workflow.'
@@ -1667,20 +1743,55 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
                   </div>
                 </div>
               {:else}
-                <div class="space-y-3">
-                  {#if (activePause.options ?? []).length > 0}
-                    <div class="flex flex-wrap gap-2">
-                      {#each activePause.options ?? [] as option}
-                        <button class="rounded-full border border-slate-700 bg-slate-900/70 px-3 py-1.5 text-xs text-slate-200 transition hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white" onclick={() => { stepResponse = String(option.action ?? option.label ?? ''); }} type="button">{String(option.label ?? option.action ?? 'Use option')}</button>
-                      {/each}
+                <div class="space-y-4">
+                  {#each activeStepQuestions as question, questionIndex (question.id)}
+                    {@const answerState = stepQuestionState(question.id)}
+                    <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="rounded-full border border-slate-700 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-400">Question {questionIndex + 1}</span>
+                        {#if question.multiple}
+                          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-sky-200">Multi-select</span>
+                        {/if}
+                        {#if !question.required}
+                          <span class="rounded-full border border-slate-700 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-400">Optional</span>
+                        {/if}
+                      </div>
+                      {#if question.header}
+                        <p class="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">{question.header}</p>
+                      {/if}
+                      <p class="mt-2 text-sm font-medium text-slate-100">{question.question}</p>
+                      {#if question.options.length > 0}
+                        <div class="mt-3 flex flex-wrap gap-2">
+                          {#each question.options as option (option.id)}
+                            {@const selected = answerState.selected.includes(option.id)}
+                            <button
+                              type="button"
+                              class={`rounded-full border px-3 py-1.5 text-xs transition ${selected ? 'border-sky-400/60 bg-sky-500/20 text-sky-100' : 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white'}`}
+                              onclick={() => toggleStepQuestionOption(question, option.id)}
+                            >
+                              {option.label}
+                              {#if option.description}
+                                <span class="ml-1 text-slate-400">— {option.description}</span>
+                              {/if}
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                      {#if question.allow_custom}
+                        <textarea
+                          value={answerState.custom}
+                          oninput={(event) => setStepQuestionCustom(question.id, event.currentTarget.value)}
+                          class="mt-3 min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
+                          placeholder="Optional custom answer"
+                        ></textarea>
+                      {/if}
                     </div>
+                  {/each}
+                  {#if activeStepQuestions.length === 0}
+                    <p class="rounded-2xl border border-rose-500/20 bg-rose-500/5 p-4 text-sm text-rose-200">This step question has no question-set payload and cannot be answered from the task view.</p>
                   {/if}
-                  <textarea bind:value={stepResponse} class="min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Provide the answer that resumes the current step"></textarea>
                   <div class="flex flex-wrap gap-2">
-                    <Button size="sm" onclick={() => respondToStepQuestion(stepResponse)}>Send response</Button>
-                    {#each activePause.options ?? [] as option}
-                      <Button size="sm" variant="secondary" onclick={() => respondToStepQuestion(String(option.action ?? option.label ?? ''))}>{String(option.label ?? option.action ?? 'Use option')}</Button>
-                    {/each}
+                    <Button size="sm" disabled={activeStepQuestions.length === 0} onclick={() => respondToStepQuestion()}>Send response</Button>
                   </div>
                 </div>
               {/if}
@@ -2519,6 +2630,15 @@ import type { Agent, Conversation, Deliverable, Escalation, Notification, Projec
           </select>
           <span class="block text-xs text-slate-500">Fully autonomous disables dynamic clarification questions for this task.</span>
         </label>
+
+        <div class="mt-4">
+          <SessionPolicyEditor
+            bind:allowText={editForm.allow_policy_text}
+            bind:denyText={editForm.deny_policy_text}
+            disabled={!isEditable}
+            title="Intaris session policies"
+          />
+        </div>
 
         <div class="mt-6 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
           <div class="flex items-center justify-between gap-3">

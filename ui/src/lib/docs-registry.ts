@@ -35,7 +35,21 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Set up Mnemory, Intaris, Cognis, a provider, and your first agent.',
     category: 'getting-started',
     sourcePath: 'docs/guide/getting-started.md',
-    relatedSlugs: ['architecture', 'configuring-providers', 'creating-agents', 'using-chat']
+    relatedSlugs: [
+      'local-compose',
+      'architecture',
+      'configuring-providers',
+      'creating-agents',
+      'using-chat'
+    ]
+  },
+  {
+    slug: 'local-compose',
+    title: 'Local Compose Deployment',
+    description: 'Run a complete local Cognis, Mnemory, Intaris, Qdrant, and executor stack.',
+    category: 'getting-started',
+    sourcePath: 'docs/guide/local-compose.md',
+    relatedSlugs: ['getting-started', 'deployment', 'executors', 'configuring-providers']
   },
   {
     slug: 'architecture',
@@ -161,6 +175,7 @@ export const embeddedDocsMeta: DocMeta[] = [
 
 export const ONBOARDING_DOC_SLUGS = [
   'getting-started',
+  'local-compose',
   'architecture',
   'configuring-providers',
   'creating-agents',

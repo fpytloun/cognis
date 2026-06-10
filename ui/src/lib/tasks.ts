@@ -88,6 +88,11 @@ export function taskBoardProjectUrl(projectId: string): string {
   return `/tasks?${searchParams.toString()}`;
 }
 
+export function scheduleListProjectUrl(projectId: string): string {
+  const searchParams = new URLSearchParams({ project_id: projectId });
+  return `/schedules?${searchParams.toString()}`;
+}
+
 export function matchesTaskFilters(task: Task, filters: TaskFilterState): boolean {
   if (filters.agentId && task.agent_id !== filters.agentId) {
     return false;

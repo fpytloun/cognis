@@ -13,10 +13,14 @@
   import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
-  import { skillLoadDisplayName, stepTodoWriteStatusSummary } from '$lib/tool-call-summary';
+  import { skillLoadDisplayName, stepTodoWriteStatusSummary, workflowToolPresentation } from '$lib/tool-call-summary';
+  import { formatStepQuestionResponse, legacyStepRequestOptions, normalizeStepQuestions, stepQuestionOptionLabel } from '$lib/tool-call-question-set';
   import { displayToolName } from '$lib/tools-display';
+  import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
+
+  type StructuredEntry = { key: string; value: unknown };
 
   let expanded = $state(false);
   let inputExpanded = $state(false);
@@ -38,7 +42,10 @@
   const LINES_PER_PAGE = 50;
   const BASH_AUTO_EXPAND_DELAY_MS = 450;
   const BASH_AUTO_COLLAPSE_DELAY_MS = 4000;
-  const startsExpanded = $derived(['steprequestinput', 'requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, '')));
+  const startsExpanded = $derived(
+    ['steprequestquestions', 'requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, ''))
+      || ['writedeliverable', 'stepcomplete'].includes(item.toolName.toLowerCase().replace(/_/g, '')) && workflowToolPresentation(item) !== null
+  );
 
   $effect(() => {
     if (startsExpanded && !autoExpanded) {
@@ -174,12 +181,36 @@
   }
 
   function isStepRequestInput(): boolean {
-    return normalizedToolName() === 'steprequestinput';
+    return normalizedToolName() === 'steprequestquestions';
+  }
+
+  function isRichWorkflowTool(): boolean {
+    return workflowToolPresentation(item) !== null;
+  }
+
+  function hasDeliverableFooter(presentation: ReturnType<typeof workflowToolPresentation>): boolean {
+    return presentation?.kind === 'write_deliverable'
+      && (Boolean(presentation.deliverableId) || presentation.outputKeys.length > 0);
+  }
+
+  function hasRawPayload(): boolean {
+    return Boolean((item.arguments && Object.keys(item.arguments).length > 0) || item.result != null);
   }
 
   function subtitle(): string {
     // Normalize: strip underscores for matching (web_fetch -> webfetch)
     const name = normalizedToolName();
+
+    const workflowPresentation = workflowToolPresentation(item);
+    if (workflowPresentation?.kind === 'write_deliverable') {
+      return truncate(workflowPresentation.title, 120);
+    }
+    if (workflowPresentation?.kind === 'step_complete') {
+      return truncate(workflowPresentation.summary, 120);
+    }
+    if (workflowPresentation?.kind === 'step_todo_write') {
+      return truncate(workflowPresentation.statusSummary || `${workflowPresentation.count} todos`, 120);
+    }
 
     if (name === 'skillload') {
       const skillName = skillLoadDisplayName(item);
@@ -397,22 +428,8 @@
     return Boolean(item.fileDiffs && item.fileDiffs.length > 0);
   }
 
-  function stepRequestQuestion(): string {
-    return typeof item.arguments?.question === 'string' ? item.arguments.question : '';
-  }
-
   function stepRequestOptions(): string[] {
-    if (!Array.isArray(item.arguments?.options)) return [];
-    return item.arguments.options
-      .map((option: unknown) => {
-        if (typeof option === 'string') return option;
-        if (option && typeof option === 'object') {
-          const label = (option as Record<string, unknown>).label;
-          return typeof label === 'string' ? label : '';
-        }
-        return '';
-      })
-      .filter((option: string) => option.length > 0);
+    return legacyStepRequestOptions(item);
   }
 
   function stepRequestContext(): string {
@@ -436,8 +453,7 @@
   }
 
   function stepRequestResponse(): string {
-    const response = parsedToolResult()?.response;
-    return typeof response === 'string' ? response : '';
+    return formatStepQuestionResponse(item, parsedToolResult());
   }
 
   function stepRequestError(): string {
@@ -451,6 +467,38 @@
 
   function terminalTitle(): string {
     return descriptionText() || commandText();
+  }
+
+  function renderDeliverableContent(content: string, format: string): string {
+    return format === 'html' ? sanitizeHtml(content) : renderMarkdown(content);
+  }
+
+  function formatStructuredValue(value: unknown): string {
+    if (value == null) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+
+  function outcomeClass(status: string): string {
+    if (status === 'failed') return 'border-rose-500/40 bg-rose-500/10 text-rose-100';
+    if (status === 'rejected') return 'border-amber-500/40 bg-amber-500/10 text-amber-100';
+    return 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100';
+  }
+
+  function todoStatusClass(status: string): string {
+    if (status === 'completed') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100';
+    if (status === 'cancelled' || status === 'canceled') return 'border-slate-600/60 bg-slate-800/50 text-slate-300';
+    if (status === 'in_progress' || status === 'active' || status === 'running') return 'border-sky-500/35 bg-sky-500/10 text-sky-100';
+    return 'border-amber-500/35 bg-amber-500/10 text-amber-100';
+  }
+
+  function hasStructuredEntries(entries: StructuredEntry[]): boolean {
+    return entries.length > 0;
   }
 
   function workingDirectory(): string {
@@ -509,18 +557,41 @@
       {/if}
       {#if isStepRequestInput()}
         <div>
-          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Question</p>
-          <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
-            <p class="leading-6">{stepRequestQuestion() || 'The agent requested more input.'}</p>
+          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Questions</p>
+          <div class="space-y-3 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
             {#if stepRequestContext()}
-              <p class="mt-2 text-xs text-sky-100/80">{stepRequestContext()}</p>
+              <p class="text-xs leading-5 text-sky-100/80">{stepRequestContext()}</p>
             {/if}
-            {#if stepRequestOptions().length > 0}
-              <div class="mt-3 flex flex-wrap gap-2">
-                {#each stepRequestOptions() as option}
-                  <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100">{option}</span>
-                {/each}
-              </div>
+            {#if normalizeStepQuestions(item).length > 0}
+              {#each normalizeStepQuestions(item) as question, index}
+                <section class="rounded-xl border border-sky-400/15 bg-slate-950/35 px-3 py-2.5">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="rounded-full border border-sky-400/25 px-2 py-0.5 text-[10px] font-medium uppercase tracking-widest text-sky-100/80">#{index + 1}</span>
+                    {#if question.header}
+                      <span class="text-xs font-semibold uppercase tracking-widest text-sky-200">{question.header}</span>
+                    {/if}
+                    {#if question.multiple}
+                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">multi-select</span>
+                    {/if}
+                    {#if question.required}
+                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">required</span>
+                    {/if}
+                    {#if question.allow_custom}
+                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">custom</span>
+                    {/if}
+                  </div>
+                  <p class="mt-2 leading-6">{question.question}</p>
+                  {#if question.options.length > 0}
+                    <div class="mt-3 flex flex-wrap gap-2">
+                      {#each question.options as option}
+                        <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100" title={option.description ?? ''}>{option.label}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </section>
+              {/each}
+            {:else}
+              <p class="leading-6">The agent requested more input.</p>
             {/if}
           </div>
         </div>
@@ -548,6 +619,189 @@
         </div>
 
       {:else}
+        {#if workflowToolPresentation(item)}
+          {@const workflowPresentation = workflowToolPresentation(item)}
+          {#if workflowPresentation?.kind === 'write_deliverable'}
+            <div class="overflow-hidden rounded-2xl border border-emerald-500/25 bg-emerald-500/5">
+              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-500/15 px-4 py-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">Deliverable written</p>
+                  <h4 class="mt-1 truncate text-sm font-semibold text-emerald-50">{workflowPresentation.title}</h4>
+                </div>
+                <div class="flex flex-wrap gap-2 text-[11px] text-emerald-100/75">
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.format}</span>
+                  {#if workflowPresentation.length !== null}
+                    <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.length.toLocaleString()} chars</span>
+                  {/if}
+                  {#if workflowPresentation.version !== null}
+                    <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">v{workflowPresentation.version}</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="max-h-[50vh] overflow-auto px-4 py-3">
+                {#if workflowPresentation.format === 'plain'}
+                  <pre class="whitespace-pre-wrap text-sm leading-6 text-slate-100">{workflowPresentation.content}</pre>
+                {:else}
+                  <div class="prose prose-sm prose-invert max-w-none text-slate-100">{@html renderDeliverableContent(workflowPresentation.content, workflowPresentation.format)}</div>
+                {/if}
+              </div>
+              {#if hasDeliverableFooter(workflowPresentation)}
+                <div class="flex flex-wrap gap-3 border-t border-emerald-500/15 px-4 py-2 text-[11px] text-emerald-100/70">
+                  {#if workflowPresentation.deliverableId}
+                    <span>Deliverable: <span class="font-mono text-emerald-100">{workflowPresentation.deliverableId}</span></span>
+                  {/if}
+                  {#if workflowPresentation.outputKeys.length > 0}
+                    <span>Outputs: <span class="text-emerald-100">{workflowPresentation.outputKeys.join(', ')}</span></span>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {:else if workflowPresentation?.kind === 'step_complete'}
+            <div class="rounded-2xl border border-emerald-500/25 bg-emerald-500/5 px-4 py-3">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">Step completed</p>
+                  <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-emerald-50">{workflowPresentation.summary}</p>
+                </div>
+                <span class={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider ${outcomeClass(workflowPresentation.outcomeStatus)}`}>
+                  {workflowPresentation.outcomeStatus}
+                </span>
+              </div>
+              {#if workflowPresentation.outcomeReason}
+                <p class="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-100">{workflowPresentation.outcomeReason}</p>
+              {/if}
+              <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-emerald-100/75">
+                {#if workflowPresentation.claims.length > 0}
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.claims.length} claims</span>
+                {/if}
+                {#if workflowPresentation.outputKeys.length > 0}
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">outputs: {workflowPresentation.outputKeys.join(', ')}</span>
+                {/if}
+                {#if workflowPresentation.metadataKeys.length > 0}
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">metadata: {workflowPresentation.metadataKeys.join(', ')}</span>
+                {/if}
+                {#if workflowPresentation.notificationMode}
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">notify: {workflowPresentation.notificationMode}</span>
+                {/if}
+              </div>
+              {#if workflowPresentation.claims.length > 0}
+                <div class="mt-4">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-emerald-300">Claims</p>
+                  <ul class="space-y-2">
+                    {#each workflowPresentation.claims as claim}
+                      <li class="rounded-xl border border-emerald-400/15 bg-slate-950/30 px-3 py-2 text-sm leading-6 text-emerald-50">{claim}</li>
+                    {/each}
+                  </ul>
+                </div>
+              {/if}
+              {#if hasStructuredEntries(workflowPresentation.outputs) || hasStructuredEntries(workflowPresentation.metadata) || workflowPresentation.notificationReason}
+                <div class="mt-4 grid gap-3 md:grid-cols-2">
+                  {#if hasStructuredEntries(workflowPresentation.outputs)}
+                    <section class="rounded-xl border border-emerald-400/15 bg-slate-950/30 px-3 py-2">
+                      <p class="mb-2 text-xs font-medium uppercase tracking-widest text-emerald-300">Outputs</p>
+                      <dl class="space-y-2 text-xs">
+                        {#each workflowPresentation.outputs as entry}
+                          <div>
+                            <dt class="font-mono text-emerald-100">{entry.key}</dt>
+                            <dd class="mt-1 whitespace-pre-wrap text-slate-200">{formatStructuredValue(entry.value)}</dd>
+                          </div>
+                        {/each}
+                      </dl>
+                    </section>
+                  {/if}
+                  {#if hasStructuredEntries(workflowPresentation.metadata)}
+                    <section class="rounded-xl border border-emerald-400/15 bg-slate-950/30 px-3 py-2">
+                      <p class="mb-2 text-xs font-medium uppercase tracking-widest text-emerald-300">Metadata</p>
+                      <dl class="space-y-2 text-xs">
+                        {#each workflowPresentation.metadata as entry}
+                          <div>
+                            <dt class="font-mono text-emerald-100">{entry.key}</dt>
+                            <dd class="mt-1 whitespace-pre-wrap text-slate-200">{formatStructuredValue(entry.value)}</dd>
+                          </div>
+                        {/each}
+                      </dl>
+                    </section>
+                  {/if}
+                  {#if workflowPresentation.notificationReason}
+                    <section class="rounded-xl border border-emerald-400/15 bg-slate-950/30 px-3 py-2">
+                      <p class="mb-2 text-xs font-medium uppercase tracking-widest text-emerald-300">Notification reason</p>
+                      <p class="whitespace-pre-wrap text-xs leading-5 text-slate-200">{workflowPresentation.notificationReason}</p>
+                    </section>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {:else if workflowPresentation?.kind === 'step_todo_write'}
+            <div class="rounded-2xl border border-sky-500/25 bg-sky-500/5 px-4 py-3">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-medium uppercase tracking-widest text-sky-300">Todos updated</p>
+                  <p class="mt-1 text-sm text-sky-50">{workflowPresentation.statusSummary || `${workflowPresentation.count} todos`}</p>
+                </div>
+                <div class="flex flex-wrap gap-2 text-[11px] text-sky-100/75">
+                  <span class="rounded-full border border-sky-400/25 px-2 py-0.5">{workflowPresentation.status}</span>
+                  <span class="rounded-full border border-sky-400/25 px-2 py-0.5">{workflowPresentation.count} total</span>
+                  {#if workflowPresentation.nonTerminalCount !== null}
+                    <span class="rounded-full border border-sky-400/25 px-2 py-0.5">{workflowPresentation.nonTerminalCount} open</span>
+                  {/if}
+                  {#if workflowPresentation.unchanged}
+                    <span class="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-amber-100">unchanged</span>
+                  {/if}
+                </div>
+              </div>
+              <ul class="mt-3 space-y-2">
+                {#each workflowPresentation.todos as todo, index}
+                  <li class="flex gap-2 rounded-xl border border-sky-400/15 bg-slate-950/30 px-3 py-2">
+                    <span class="mt-0.5 text-[11px] text-slate-500">#{index + 1}</span>
+                    <div class="min-w-0 flex-1">
+                      <p class="text-sm leading-5 text-slate-100">{todo.content}</p>
+                    </div>
+                    <span class={`h-fit rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${todoStatusClass(todo.status)}`}>{todo.status}</span>
+                  </li>
+                {/each}
+              </ul>
+              {#if workflowPresentation.guidance}
+                <p class="mt-3 rounded-xl border border-sky-400/20 bg-sky-500/10 px-3 py-2 text-xs leading-5 text-sky-100">{workflowPresentation.guidance}</p>
+              {/if}
+            </div>
+          {/if}
+          {#if hasRawPayload()}
+            {@const rawOutputText = cleanResult(item.result)}
+            {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+            <div>
+              <button
+                class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                onclick={() => { rawExpanded = !rawExpanded; }}
+                type="button"
+              >
+                <span>{rawExpanded ? '▼' : '▶'}</span>
+                <span>Raw payload</span>
+              </button>
+              {#if rawExpanded}
+                <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                  {#if item.arguments && Object.keys(item.arguments).length > 0}
+                    <div>
+                      <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                      <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                    </div>
+                  {/if}
+                  {#if item.result != null}
+                    <div>
+                      <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                      <div class="relative">
+                        <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                        <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                          {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        {/if}
+
         {#if hasDiffs() && item.fileDiffs}
           <div>
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Diff</p>
@@ -597,7 +851,7 @@ Running...{/if}</pre>
           </div>
         {/if}
 
-        {#if (!hasDiffs() || rawExpanded) && !isBashTool()}
+        {#if (!hasDiffs() || rawExpanded) && !isBashTool() && !isRichWorkflowTool()}
           {#if item.arguments && Object.keys(item.arguments).length > 0}
             {@const inputText = formatArguments()}
             {@const inputData = formatMaybeJson(inputText, inputExpanded)}

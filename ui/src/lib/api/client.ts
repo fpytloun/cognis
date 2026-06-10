@@ -47,6 +47,7 @@ import type {
   MCPServer,
   MCPServerUpdateRequest,
   MessageHistoryResponse,
+  ManagedConversationActionResponse,
   QueuedMessage,
   QueuedMessagesResponse,
   Notification,
@@ -60,7 +61,9 @@ import type {
   Project,
   ProjectGrant,
   ProjectSource,
+  QuestionSetReply,
   Schedule,
+  ScheduleTriggerResponse,
   ScheduleRun,
     SecretMetadata,
   Session,
@@ -525,6 +528,17 @@ export const api = {
       return request<{ ok: boolean }>(`/api/v1/conversations/${conversationId}/read`, {
         method: 'POST'
       });
+    },
+
+    managedAction(
+      conversationId: string,
+      action: 'send' | 'wait' | 'interrupt' | 'retry' | 'fork' | 'close',
+      payload: { message?: string | null; reason?: string | null; instruction?: string | null; wait?: boolean } = {}
+    ): Promise<ManagedConversationActionResponse> {
+      return request<ManagedConversationActionResponse>(`/api/v1/conversations/${conversationId}/managed/${action}`, {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
     }
   },
 
@@ -813,6 +827,8 @@ export const api = {
       resource?: string | null;
       scopes?: string[];
       expires_at?: string | null;
+      access_token_expires_at?: string | null;
+      authorization_expires_at?: string | null;
       refreshable?: boolean;
       status?: string;
     }> {
@@ -1069,7 +1085,7 @@ export const api = {
       });
     },
 
-    stepResponse(taskId: string, payload: Record<string, unknown>): Promise<{ ok: boolean; task_id: string; status: string }> {
+    stepResponse(taskId: string, payload: QuestionSetReply): Promise<{ ok: boolean; task_id: string; status: string }> {
       return request<{ ok: boolean; task_id: string; status: string }>(`/api/v1/tasks/${taskId}/step-response`, {
         method: 'POST',
         body: JSON.stringify(payload)
@@ -1260,8 +1276,8 @@ export const api = {
       return request<void>(`/api/v1/schedules/${scheduleId}`, { method: 'DELETE' });
     },
 
-    trigger(scheduleId: string): Promise<Schedule> {
-      return request<Schedule>(`/api/v1/schedules/${scheduleId}/trigger`, { method: 'POST' });
+    trigger(scheduleId: string): Promise<ScheduleTriggerResponse> {
+      return request<ScheduleTriggerResponse>(`/api/v1/schedules/${scheduleId}/trigger`, { method: 'POST' });
     },
 
     enable(scheduleId: string): Promise<Schedule> {

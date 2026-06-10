@@ -11,6 +11,7 @@
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -25,6 +26,7 @@
   ].filter((tz, i, arr) => arr.indexOf(tz) === i);
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { policyFromText, policyText } from '$lib/session-policy';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Project, Schedule, ScheduleRun, Skill, Workflow } from '$lib/types/api';
@@ -74,6 +76,8 @@ import Zap from 'lucide-svelte/icons/zap';
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
     interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
+    allow_policy_text: '',
+    deny_policy_text: '',
     max_concurrent_runs: 1
   });
 
@@ -158,6 +162,8 @@ import Zap from 'lucide-svelte/icons/zap';
       completion_mode_family: s.completion_mode_family,
       allow_silent_completion: s.allow_silent_completion,
       interaction_mode_override: s.interaction_mode_override ?? 'none',
+      allow_policy_text: policyText((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy, 'allow_policies'),
+      deny_policy_text: policyText((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy, 'deny_policies'),
       max_concurrent_runs: s.max_concurrent_runs
     };
   }
@@ -208,6 +214,7 @@ import Zap from 'lucide-svelte/icons/zap';
       } else {
         delete taskTemplate.expected_output;
       }
+      taskTemplate.session_policy = policyFromText(form.allow_policy_text, form.deny_policy_text);
       const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
       const updated = await api.schedules.update(schedule.schedule_id, {
         name: form.name,
@@ -254,8 +261,13 @@ import Zap from 'lucide-svelte/icons/zap';
   async function triggerNow(): Promise<void> {
     if (!schedule) return;
     try {
-      schedule = await api.schedules.trigger(schedule.schedule_id);
+      const result = await api.schedules.trigger(schedule.schedule_id);
       addToast('Schedule triggered', 'success');
+      if (result.task_id) {
+        await goto(`/tasks/${result.task_id}`);
+        return;
+      }
+      schedule = result;
       runs = await api.schedules.runs(schedule.schedule_id);
     } catch (e) {
       addToast(asApiError(e).message, 'error');
@@ -547,6 +559,13 @@ import Zap from 'lucide-svelte/icons/zap';
           </select>
           <p class="text-xs text-slate-500">Scheduled tasks default to fully autonomous so unattended runs do not pause for clarification.</p>
         </div>
+
+        <SessionPolicyEditor
+          bind:allowText={form.allow_policy_text}
+          bind:denyText={form.deny_policy_text}
+          title="Intaris session policies"
+          help="Policies are copied to each task created by this schedule."
+        />
 
         <div class="flex justify-end">
           <Button disabled={saving} onclick={handleSave}>

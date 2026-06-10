@@ -23,6 +23,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
+  type McpServerToolGroup = {
+    key: string;
+    label: string;
+    sourceType: string;
+    tools: AgentToolOption[];
+  };
 
   let {
     mode,
@@ -153,8 +159,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   const permissionOptions = ['', 'allow', 'evaluate', 'deny'];
 
   const toolCategories = $derived<string[]>(
-    [...new Set(tools.map((tool: AgentToolOption) => tool.category))].sort() as string[]
+    [...new Set(tools.filter((tool: AgentToolOption) => !isMcpTool(tool)).map((tool: AgentToolOption) => tool.category))].sort() as string[]
   );
+
+  const mcpTools = $derived<AgentToolOption[]>(
+    tools.filter((tool: AgentToolOption) => isMcpTool(tool))
+  );
+
+  const mcpServerGroups = $derived<McpServerToolGroup[]>(groupMcpToolsByServer(mcpTools));
 
   function toolsForCategory(category: string): AgentToolOption[] {
     return tools.filter((tool: AgentToolOption) => tool.category === category);
@@ -162,6 +174,44 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   function toolKey(tool: AgentToolOption): string {
     return tool.tool_id ?? tool.name;
+  }
+
+  function isMcpTool(tool: AgentToolOption): boolean {
+    return tool.source?.type === 'local_mcp' || tool.source?.type === 'intaris_mcp';
+  }
+
+  function mcpServerKey(tool: AgentToolOption): string {
+    const source = tool.source;
+    const sourceType = source?.type === 'intaris_mcp' ? 'intaris_mcp' : 'local_mcp';
+    return `${sourceType}:${source?.server_id || source?.server_name || 'unknown'}`;
+  }
+
+  function mcpSourceLabel(sourceType: string): string {
+    if (sourceType === 'intaris_mcp') return 'Intaris MCP';
+    if (sourceType === 'local_mcp') return 'Executor MCP';
+    return sourceType;
+  }
+
+  function groupMcpToolsByServer(items: AgentToolOption[]): McpServerToolGroup[] {
+    const grouped = new Map<string, McpServerToolGroup>();
+    for (const tool of items) {
+      const key = mcpServerKey(tool);
+      const sourceType = tool.source?.type || 'unknown';
+      const label = tool.source?.server_name || tool.source?.server_id || 'unknown';
+      const group = grouped.get(key) ?? { key, label, sourceType, tools: [] };
+      group.tools.push(tool);
+      grouped.set(key, group);
+    }
+    return Array.from(grouped.values())
+      .map((group) => ({
+        ...group,
+        tools: group.tools.slice().sort((left, right) => toolKey(left).localeCompare(toolKey(right)))
+      }))
+      .sort((left, right) => {
+        const sourceCompare = mcpSourceLabel(left.sourceType).localeCompare(mcpSourceLabel(right.sourceType));
+        if (sourceCompare !== 0) return sourceCompare;
+        return left.label.localeCompare(right.label);
+      });
   }
 
   function categoryDisabled(category: string): boolean {
@@ -186,6 +236,20 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       return;
     }
     form.disabledTools = [...form.disabledTools, toolName];
+  }
+
+  function mcpServerDisabled(serverKey: string): boolean {
+    return form.disabledMcpServers.includes(serverKey);
+  }
+
+  function toggleMcpServer(group: McpServerToolGroup): void {
+    if (mcpServerDisabled(group.key)) {
+      form.disabledMcpServers = form.disabledMcpServers.filter((value: string) => value !== group.key);
+      return;
+    }
+    const groupToolKeys = new Set(group.tools.map((tool) => toolKey(tool)));
+    form.disabledMcpServers = [...form.disabledMcpServers, group.key];
+    form.disabledTools = form.disabledTools.filter((value: string) => !groupToolKeys.has(value));
   }
 
   function validateJson(value: string, label: string): string | null {
@@ -721,6 +785,71 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 </details>
               {/each}
             </div>
+
+            {#if mcpServerGroups.length > 0}
+              <div class="mt-4 space-y-2 rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
+                <div>
+                  <p class="text-sm font-medium text-sky-100">MCP servers</p>
+                  <p class="mt-1 text-xs text-slate-400">Disable a whole MCP server group, or keep the server enabled and disable individual tools below.</p>
+                </div>
+                <div class="space-y-2">
+                  {#each mcpServerGroups as group}
+                    {@const serverDisabled = mcpServerDisabled(group.key)}
+                    <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                      <summary class="cursor-pointer text-sm font-medium text-slate-200">
+                        <span>{group.label}</span>
+                        <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">{mcpSourceLabel(group.sourceType)}</span>
+                        <span class="ml-2 text-xs text-slate-500">{serverDisabled ? 'disabled' : 'enabled'} · {group.tools.length} tools</span>
+                      </summary>
+                      <div class="mt-3 space-y-3">
+                        <label class="flex items-start gap-3 text-sm text-slate-200">
+                          <input
+                            type="checkbox"
+                            checked={!serverDisabled}
+                            onchange={() => toggleMcpServer(group)}
+                            disabled={readonly || categoryDisabled('mcp')}
+                            class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
+                          />
+                          <span>
+                            <span class="font-medium">Enable server group</span>
+                            <span class="block font-mono text-xs text-slate-500">{group.key}</span>
+                          </span>
+                        </label>
+                        <div class="space-y-2 border-t border-slate-800 pt-3">
+                          {#each group.tools as tool}
+                            <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm {serverDisabled ? 'opacity-50' : ''}">
+                              <label class="flex items-center gap-3 text-slate-200">
+                                <input
+                                  type="checkbox"
+                                  checked={!toolDisabled(toolKey(tool))}
+                                  onchange={() => toggleTool(toolKey(tool))}
+                                  disabled={readonly || serverDisabled || categoryDisabled('mcp')}
+                                  class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                                />
+                                <span class="font-mono">{tool.source?.raw_tool_name || tool.name}</span>
+                              </label>
+                              <span class="text-xs text-slate-500">
+                                {tool.description}
+                                {#if (tool as EffectiveToolItem).available_on && ((tool as EffectiveToolItem).available_on?.length ?? 0) > 1}
+                                  <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 font-mono text-[10px] text-slate-300" title="Stage 36: this tool is available on more than one assigned executor. Use target_executor on the tool call to pick.">
+                                    on: {((tool as EffectiveToolItem).available_on ?? []).join(', ')}
+                                  </span>
+                                {/if}
+                              </span>
+                              <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || serverDisabled || toolDisabled(toolKey(tool)) || categoryDisabled('mcp')}>
+                                {#each permissionOptions as option}
+                                  <option value={option}>{option || 'inherit'}</option>
+                                {/each}
+                              </select>
+                            </div>
+                          {/each}
+                        </div>
+                      </div>
+                    </details>
+                  {/each}
+                </div>
+              </div>
+            {/if}
           </div>
         {/if}
 

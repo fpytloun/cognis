@@ -109,6 +109,94 @@ export interface ConversationContext {
   memory_labels: Record<string, string>;
 }
 
+export interface ConversationTodoItem {
+  content: string;
+  status: string;
+  priority?: string | null;
+}
+
+export interface ConversationStepState {
+  step_run_id: string;
+  step_name?: string | null;
+  status: string;
+  conversation_id?: string | null;
+  session_id?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  todos: ConversationTodoItem[];
+}
+
+export interface ConversationTaskState {
+  task_id: string;
+  title?: string | null;
+  status: string;
+  current_step?: ConversationStepState | null;
+  relevant_step?: ConversationStepState | null;
+}
+
+export interface ConversationPendingSummary {
+  notification_id: string;
+  notification_type: string;
+  task_id?: string | null;
+  step_name?: string | null;
+  step_run_id?: string | null;
+  question?: string | null;
+  label?: string | null;
+  message?: string | null;
+  options?: unknown[];
+  metadata?: Record<string, unknown>;
+  created_at?: string | null;
+}
+
+export interface ConversationPendingState {
+  notification_types: string[];
+  pending_input?: ConversationPendingSummary | null;
+  credential_request?: ConversationPendingSummary | null;
+  auth_challenge?: ConversationPendingSummary | null;
+  escalation?: ConversationPendingSummary | null;
+}
+
+export interface ConversationStateEnvelope {
+  conversation_id: string;
+  conversation_kind: 'normal' | 'task' | 'task_step' | 'external_channel';
+  linked_task_id?: string | null;
+  linked_step_run_id?: string | null;
+  state_version: number;
+  snapshot_generated_at: string;
+  capabilities: string[];
+  offsets: {
+    active_session_id?: string | null;
+    active_session_last_seq?: number | null;
+    task_state_revision?: string | null;
+    step_state_revision?: string | null;
+  };
+  active_turn: {
+    has_active_turn: boolean;
+    chat_mode?: string | null;
+    chat_mode_source?: string | null;
+  };
+  active_session: {
+    session_id?: string | null;
+    status?: string | null;
+    completion_reason?: string | null;
+  };
+  task?: ConversationTaskState | null;
+  pending: ConversationPendingState;
+}
+
+export interface ConversationStateDelta {
+  delta_id: string;
+  state_version: number;
+  snapshot_required: boolean;
+  changed_paths: string[];
+  replace: Record<string, unknown>;
+  source: {
+    kind: string;
+    task_id?: string | null;
+    step_run_id?: string | null;
+  };
+}
+
 export interface Conversation {
     conversation_id: string;
     user_email: string;
@@ -133,8 +221,21 @@ export interface Conversation {
     last_read_at: string | null;
     has_unread: boolean;
     has_active_turn: boolean;
+    managed_agent?: {
+      channel: 'agent_work' | 'managed_agent_conversation';
+      link_id?: string | null;
+      controller_agent_id?: string | null;
+      controller_conversation_id?: string | null;
+      controller_session_id?: string | null;
+      target_agent_id?: string | null;
+      conversation_state?: string | null;
+      turn_state?: string | null;
+      last_result_summary?: string | null;
+      last_error?: string | null;
+    } | null;
     created_at: string | null;
     updated_at: string | null;
+    conversation_state?: ConversationStateEnvelope | null;
 }
 
 export interface AgentDirectChat {
@@ -148,6 +249,13 @@ export interface ConversationTitleSuggestion {
   generated_at: string | null;
   available: boolean;
   reason: string | null;
+}
+
+export interface ManagedConversationActionResponse {
+  status: string;
+  conversation_id: string;
+  managed_agent?: Conversation['managed_agent'];
+  result?: Record<string, unknown> | null;
 }
 
 export interface ProjectSource {
@@ -190,6 +298,7 @@ export interface Project {
   status: string;
   sources: ProjectSource[];
   workflow_ids: string[];
+  active_schedule_count: number;
   grants: ProjectGrant[];
   is_shared_with_me: boolean;
   shared_by_email: string | null;
@@ -337,6 +446,7 @@ export interface MessageHistoryResponse {
   active_session_last_seq?: number;
   history_truncated?: boolean;
   truncation_reason?: string | null;
+  state_snapshot?: ConversationStateEnvelope | null;
 }
 
 export type SearchKind = 'reasoning' | 'intention' | 'summary';
@@ -935,6 +1045,14 @@ export interface ExecutorBrowserConfig {
   fingerprint_hardening?: boolean;
 }
 
+export interface ExecutorOfficeCliConfig {
+  enabled?: boolean;
+  auto_install?: boolean;
+  version?: string;
+  binary_path?: string;
+  cache_dir?: string;
+}
+
 export interface ExecutorRuntimeConfig {
   mcp_server_ids?: string[];
   lsp_enabled?: boolean;
@@ -944,6 +1062,7 @@ export interface ExecutorRuntimeConfig {
   lsp_max_concurrent_servers?: number;
   signal?: ExecutorSignalConfig;
   browser?: ExecutorBrowserConfig;
+  officecli?: ExecutorOfficeCliConfig;
   [key: string]: unknown;
 }
 
@@ -1157,8 +1276,36 @@ export interface PendingPause {
   step_run_id: string | null;
   session_id: string | null;
   question: string | null;
+  questions: QuestionSetQuestion[] | null;
   options: Array<Record<string, unknown>> | null;
   context: Record<string, unknown> | null;
+}
+
+export interface QuestionSetOption {
+  id: string;
+  label: string;
+  description: string | null;
+}
+
+export interface QuestionSetQuestion {
+  id: string;
+  question: string;
+  header: string | null;
+  options: QuestionSetOption[];
+  multiple: boolean;
+  allow_custom: boolean;
+  required: boolean;
+}
+
+export interface QuestionSetAnswer {
+  question_id: string;
+  selected_option_ids: string[];
+  custom_answer: string | null;
+}
+
+export interface QuestionSetReply {
+  answers: QuestionSetAnswer[];
+  mode: 'structured' | 'plain_text';
 }
 
 export interface Deliverable {
@@ -1375,6 +1522,7 @@ export interface Schedule {
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
+  session_policy: SessionPolicy | null;
   last_fired_at: string | null;
   next_fire_at: string | null;
   last_run_status: string | null;
@@ -1384,6 +1532,10 @@ export interface Schedule {
   created_at: string | null;
   updated_at: string | null;
   human_schedule: string | null;
+}
+
+export interface ScheduleTriggerResponse extends Schedule {
+  task_id: string | null;
 }
 
 export interface ScheduleRun {
@@ -1809,6 +1961,8 @@ export interface WebSocketMessageCompleteEvent {
   attachments?: AttachmentRef[];
   chat_mode?: ChatMode;
   chat_mode_source?: ChatModeSource;
+  partial?: boolean;
+  finish_reason?: string | null;
 }
 
 export interface WebSocketTurnStartedEvent {
@@ -1947,8 +2101,7 @@ export interface WebSocketWorkflowQuestionEvent {
   notification_id?: string;
   task_id?: string;
   step_name?: string;
-  question?: string;
-  options?: Array<Record<string, unknown>>;
+  questions?: QuestionSetQuestion[];
   context?: Record<string, unknown>;
 }
 
@@ -2094,8 +2247,21 @@ export interface WebSocketConversationUpdatedEvent {
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
   pending_notification_types?: string[];
+  last_read_at?: string | null;
   last_message_at?: string | null;
   updated_at?: string | null;
+  created_conversation_id?: string;
+}
+
+export interface WebSocketConversationStateSnapshotEvent {
+  type: 'conversation_state_snapshot';
+  conversation_id: string;
+  state: ConversationStateEnvelope;
+}
+
+export interface WebSocketConversationStateDeltaEvent extends ConversationStateDelta {
+  type: 'conversation_state_delta';
+  conversation_id: string;
 }
 
 export interface WebSocketToolResultEvent {
@@ -2263,6 +2429,45 @@ export interface WebSocketSessionCompactedEvent {
   effective_usage_percentage?: number | null;
   hard_pressure_exceeded?: boolean;
   used_timeout_fallback?: boolean;
+  phase?: string | null;
+  status?: string | null;
+  provider_id?: string | null;
+  model_id?: string | null;
+  fallback_reason?: string | null;
+}
+
+export interface WebSocketSessionCompactionStartedEvent {
+  type: 'session_compaction_started';
+  conversation_id: string;
+  session_id: string;
+  trigger?: string | null;
+  reason?: string | null;
+  prompt_tokens?: number;
+  max_context_tokens?: number;
+  max_input_tokens?: number;
+  available_prompt_tokens?: number;
+  compaction_threshold_prompt_tokens?: number;
+  loop_pressure_threshold_prompt_tokens?: number;
+  compaction_threshold?: number;
+  previous_usage_percentage?: number | null;
+  effective_usage_percentage?: number | null;
+  hard_pressure_exceeded?: boolean;
+  used_timeout_fallback?: boolean;
+  phase?: string | null;
+  status?: string | null;
+  provider_id?: string | null;
+  model_id?: string | null;
+  fallback_reason?: string | null;
+}
+
+export interface WebSocketSessionCompactionFinishedEvent {
+  type: 'session_compaction_finished';
+  conversation_id: string;
+  session_id: string;
+  trigger?: string | null;
+  reason?: string | null;
+  status?: string | null;
+  fallback_reason?: string | null;
 }
 
 export interface WebSocketSessionResetEvent {
@@ -2321,6 +2526,8 @@ export type CognisWebSocketEvent =
   | WebSocketAssistantThinkingChunkEvent
   | WebSocketAssistantThinkingBlockEvent
   | WebSocketConversationUpdatedEvent
+  | WebSocketConversationStateSnapshotEvent
+  | WebSocketConversationStateDeltaEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
   | WebSocketDelegationCompletedEvent
@@ -2344,6 +2551,8 @@ export type CognisWebSocketEvent =
   | WebSocketNoticeEvent
   | WebSocketEscalationEvent
   | WebSocketEscalationResolvedEvent
+  | WebSocketSessionCompactionStartedEvent
+  | WebSocketSessionCompactionFinishedEvent
   | WebSocketSessionCompactedEvent
   | WebSocketSessionResetEvent
   | WebSocketHistoryRebasedEvent

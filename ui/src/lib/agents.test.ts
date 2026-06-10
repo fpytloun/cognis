@@ -73,6 +73,7 @@ describe('agent payload mapping', () => {
     form.originalTools = {
       disabled_categories: ['filesystem'],
       disabled_tools: ['bash'],
+      disabled_mcp_servers: ['local_mcp:srv-github'],
       intaris_mcp_servers: ['remote-audit'],
       custom_flag: true
     };
@@ -82,6 +83,24 @@ describe('agent payload mapping', () => {
       custom_flag: true,
       delegation_tools: true,
       mcp_servers: []
+    });
+  });
+
+  it('round-trips disabled MCP server groups', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: {
+        disabled_mcp_servers: ['local_mcp:srv-github', 'intaris_mcp:slack']
+      }
+    } as never);
+
+    expect(form.disabledMcpServers).toEqual(['local_mcp:srv-github', 'intaris_mcp:slack']);
+
+    const payload = formStateToPayload(form);
+    expect(payload.tools).toMatchObject({
+      disabled_mcp_servers: ['local_mcp:srv-github', 'intaris_mcp:slack']
     });
   });
 

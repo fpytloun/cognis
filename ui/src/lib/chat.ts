@@ -288,6 +288,8 @@ export interface MessageTimelineItem {
   streamContentOffset?: number;
   chatMode?: ChatMode;
   chatModeSource?: ChatModeSource;
+  partial?: boolean;
+  finishReason?: string | null;
 }
 
 export interface ToolCallEvaluation {
@@ -329,12 +331,12 @@ export interface ToolCallTimelineItem {
   anchorCount?: number;
   reconstructed?: boolean;
   /**
-   * Notification ID backing a pending `step_request_input` tool call.
+   * Notification ID backing a pending `step_request_questions` tool call.
    *
    * The backend creates a `step_question` notification whose
    * `notification_id` is the `pause_id` the agent loop is waiting on, but
    * the `tool_call` event itself does not carry that ID. The chat page
-   * annotates the matching `step_request_input` tool item when the
+   * annotates the matching `step_request_questions` tool item when the
    * corresponding `workflow_step_question` WebSocket event arrives so we
    * can resolve the pause by typing a reply — even if
    * `pendingDirectQuestion` state has been lost to a race, compaction, or
@@ -525,8 +527,11 @@ export interface SystemMessageTimelineItem {
 export interface CompactionTimelineItem {
   id: string;
   kind: 'compaction';
-  previousSessionId: string;
+  status: 'running' | 'compacted' | 'failed' | 'skipped';
+  sessionId?: string;
+  previousSessionId?: string;
   summaryPreview: string;
+  summary?: string;
   method: string;
   turnsCompacted: number;
   trigger?: string;
@@ -555,6 +560,19 @@ function createSystemMessageItem(
     noticeScope,
     timestamp
   };
+}
+
+function isVisiblePersistedSystemMessage(data: Record<string, unknown>): boolean {
+  const noticeId = data.notice_id;
+  if (typeof noticeId === 'string' && noticeId.length > 0) return true;
+
+  const kind = data.kind;
+  if (kind === 'turn_initiated') return true;
+
+  const event = data.event;
+  if (event === 'turn_initiated') return true;
+
+  return false;
 }
 
 function createMessageItem(
@@ -1036,6 +1054,28 @@ function insertBeforeOpenPhaseAssistant(
   return assistantIndex;
 }
 
+function mergeAssistantContent(existing: string, incoming: string): string {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  if (existing === incoming) return existing;
+  if (incoming.startsWith(existing)) return incoming;
+
+  const existingSegments = existing.split(/\n{2,}/);
+  if (existingSegments.some((segment) => segment === incoming)) return existing;
+
+  return `${existing}\n\n${incoming}`;
+}
+
+function reconcileCompletedAssistantContent(existing: string, completed: string | null): string {
+  if (!completed) return existing;
+  if (!existing) return completed;
+  if (existing === completed) return existing;
+  if (completed.startsWith(existing)) return completed;
+  const existingSegments = existing.split(/\n{2,}/);
+  if (existingSegments.at(-1) === completed) return existing;
+  return completed;
+}
+
 function upsertAssistantTurnMessage(
   items: TimelineItem[],
   {
@@ -1049,6 +1089,8 @@ function upsertAssistantTurnMessage(
     turnId,
     chatMode,
     chatModeSource,
+    partial = false,
+    finishReason = null,
     streaming = false,
   }: {
     id: string;
@@ -1061,13 +1103,15 @@ function upsertAssistantTurnMessage(
     turnId: string | null;
     chatMode?: ChatMode;
     chatModeSource?: ChatModeSource;
+    partial?: boolean;
+    finishReason?: string | null;
     streaming?: boolean;
   },
 ): void {
   const existingIndex = findMergeableAssistantIndex(items, turnId, messageId);
   if (existingIndex >= 0) {
     const existing = items[existingIndex] as MessageTimelineItem;
-    const nextContent = existing.content && content ? `${existing.content}\n\n${content}` : existing.content || content;
+    const nextContent = mergeAssistantContent(existing.content, content);
     const nextAttachments = attachments.length > 0 ? [...(existing.attachments ?? []), ...attachments] : existing.attachments ?? [];
     items[existingIndex] = {
       ...existing,
@@ -1082,6 +1126,8 @@ function upsertAssistantTurnMessage(
       turnId,
       chatMode: chatMode ?? existing.chatMode,
       chatModeSource: chatModeSource ?? existing.chatModeSource,
+      partial: partial || existing.partial,
+      finishReason: finishReason ?? existing.finishReason,
     } satisfies MessageTimelineItem;
     return;
   }
@@ -1089,6 +1135,8 @@ function upsertAssistantTurnMessage(
   const item = createMessageItem(id, sessionId ?? null, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId);
   item.chatMode = chatMode;
   item.chatModeSource = chatModeSource;
+  item.partial = partial;
+  item.finishReason = finishReason;
   items.push(item);
 }
 
@@ -1401,7 +1449,37 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           turnId,
           chatMode: normalizeChatMode(event.data.chat_mode),
           chatModeSource: normalizeChatModeSource(event.data.chat_mode_source),
+          partial: event.data.partial === true,
+          finishReason: typeof event.data.finish_reason === 'string' ? event.data.finish_reason : null,
         });
+      }
+      continue;
+    }
+
+    if (event.type === 'system_message') {
+      if (!isVisiblePersistedSystemMessage(event.data)) {
+        continue;
+      }
+      const message = content || (typeof event.data.text === 'string' ? event.data.text : '');
+      if (message) {
+        const noticeId = typeof event.data.notice_id === 'string' ? event.data.notice_id : null;
+        const itemId = noticeId ? `system:${noticeId}` : `system:${eid}`;
+        const systemMessage = createSystemMessageItem(
+          itemId,
+          message,
+          event.timestamp,
+          noticeId,
+          typeof event.data.kind === 'string' ? event.data.kind : null,
+          typeof event.data.scope === 'string' ? event.data.scope : null
+        );
+        const existingIdx = items.findIndex(
+          (item) => item.id === itemId && item.kind === 'system_message'
+        );
+        if (existingIdx >= 0) {
+          items[existingIdx] = systemMessage;
+        } else {
+          items.push(systemMessage);
+        }
       }
       continue;
     }
@@ -1621,7 +1699,18 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
     if (event.type === 'compaction_summary') {
       const summary = typeof event.data.summary === 'string' ? event.data.summary : '';
       const method = typeof event.data.method === 'string' ? event.data.method : 'unknown';
+      const markerRole = typeof event.data.marker_role === 'string' ? event.data.marker_role : null;
+      if (
+        event.data.timeline_visible === false
+        || markerRole === 'context_seed'
+        || method === 'rotation'
+      ) {
+        continue;
+      }
       const turnsCompacted = typeof event.data.turns_compacted === 'number' ? event.data.turns_compacted : 0;
+      const sessionId = typeof event.data.session_id === 'string' ? event.data.session_id : sid || undefined;
+      const sourceSessionId =
+        typeof event.data.source_session_id === 'string' ? event.data.source_session_id : undefined;
       const previousUsagePercentage =
         typeof event.data.previous_usage_percentage === 'number'
           ? event.data.previous_usage_percentage
@@ -1631,10 +1720,13 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           ? event.data.effective_usage_percentage
           : null;
       items.push({
-        id: `compaction:${eid}`,
+        id: sessionId && sourceSessionId ? `compaction:${sourceSessionId}:${sessionId}` : `compaction:${eid}`,
         kind: 'compaction',
-        previousSessionId: '',  // Not available from Intaris event data
+        status: 'compacted',
+        sessionId,
+        previousSessionId: sourceSessionId,
         summaryPreview: summary.slice(0, 500),
+        summary,
         method,
         turnsCompacted,
         trigger: typeof event.data.trigger === 'string' ? event.data.trigger : undefined,
@@ -1807,7 +1899,7 @@ export function removeQueuedOptimisticUserMessage(
 const PENDING_TOOL_STATUSES = new Set(['started', 'running', 'paused']);
 
 /**
- * Canonical match for the `step_request_input` controller tool. The backend
+ * Canonical match for the `step_request_questions` controller tool. The backend
  * uses snake_case; this normalizer keeps the comparison resilient against
  * casing/underscore noise from older history rows.
  */
@@ -1829,13 +1921,13 @@ function hasDeferredAuthChallenge(value: unknown): boolean {
 
 function isPendingInputToolCall(tool: ToolCallTimelineItem): boolean {
   const name = normalizedToolName(tool.toolName);
-  if (name === 'steprequestinput' || name === 'requestauthchallenge') return true;
+  if (name === 'steprequestquestions' || name === 'requestauthchallenge') return true;
   if ((name === 'browserfill' || name === 'browsereval') && hasDeferredAuthChallenge(tool.arguments)) return true;
   return false;
 }
 
 /**
- * Return the most recent `step_request_input` tool call that has not yet
+ * Return the most recent `step_request_questions` tool call that has not yet
  * resolved (status still pending, no tool_result recorded). Used by the chat
  * page to route the user's next text reply into `respondStepQuestion` so the
  * message becomes the resolution of the pause instead of a stray bubble.
@@ -1854,7 +1946,7 @@ export function findPendingStepRequestInputCall(items: TimelineItem[]): ToolCall
 }
 
 /**
- * Attach a notification ID to the latest unresolved `step_request_input`
+ * Attach a notification ID to the latest unresolved `step_request_questions`
  * tool call in the timeline. Called when a `workflow_step_question`
  * WebSocket event arrives, so the tool call knows the `pause_id` it can be
  * resolved against later even if `pendingDirectQuestion` state is lost.
@@ -1874,7 +1966,7 @@ export function annotateStepRequestInputWithNotification(
 }
 
 /**
- * Optimistically mark a `step_request_input` tool call as resolved with the
+ * Optimistically mark a `step_request_questions` tool call as resolved with the
  * user's response. The tool call block immediately shows the answer in its
  * Resolution area while the backend's real `tool_result` is in flight.
  */
@@ -1891,7 +1983,11 @@ export function optimisticallyResolveStepRequestInput(
       ...tool,
       status: 'completed',
       isError: false,
-      result: JSON.stringify({ response: normalizedToolName(tool.toolName) === 'steprequestinput' ? response : '<redacted>' }),
+      result: JSON.stringify(
+        normalizedToolName(tool.toolName) === 'steprequestquestions'
+          ? { mode: 'plain_text', answers: [{ question_id: 'q1', selected_option_ids: [], custom_answer: response }] }
+          : { response: '<redacted>' },
+      ),
     } satisfies ToolCallTimelineItem;
   });
 }
@@ -2032,7 +2128,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const finalContent = typeof event.content === 'string' ? event.content : null;
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
-      const completeContent = finalContent ?? message.content;
+      const completeContent = reconcileCompletedAssistantContent(message.content, finalContent);
       // Finalize and release the streamer for this message.
       const streamer = getStreamer(message.id);
       const finalHtml = streamer.finalize(completeContent);
@@ -2048,6 +2144,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         attachments: attachments.length > 0 ? attachments : message.attachments,
         chatMode: eventChatMode ?? message.chatMode,
         chatModeSource: eventChatModeSource ?? message.chatModeSource,
+        partial: event.partial === true || message.partial,
+        finishReason: event.finish_reason ?? message.finishReason ?? null,
         streamChunkCount: undefined,
         streamContentOffset: undefined,
       };
@@ -2067,6 +2165,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         turnId,
         chatMode: eventChatMode,
         chatModeSource: eventChatModeSource,
+        partial: event.partial === true,
+        finishReason: event.finish_reason ?? null,
       });
       return next;
     }
@@ -2616,12 +2716,50 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     return next;
   }
 
-  if (event.type === 'session_compacted') {
-    next.push({
-      id: `compaction:${Date.now()}`,
+  if (event.type === 'session_compaction_started') {
+    const itemId = `compaction:running:${event.session_id}`;
+    const item: CompactionTimelineItem = {
+      id: itemId,
       kind: 'compaction',
+      status: 'running',
+      sessionId: event.session_id,
+      previousSessionId: event.session_id,
+      summaryPreview: '',
+      method: 'pending',
+      turnsCompacted: 0,
+      trigger: event.trigger ?? undefined,
+      reason: event.reason ?? undefined,
+      previousUsagePercentage: event.previous_usage_percentage ?? null,
+      effectiveUsagePercentage: event.effective_usage_percentage ?? null,
+      hardPressureExceeded: event.hard_pressure_exceeded === true,
+      usedTimeoutFallback: event.used_timeout_fallback === true,
+      timestamp: new Date().toISOString()
+    };
+    const index = next.findIndex((existing) => existing.id === itemId && existing.kind === 'compaction');
+    if (index >= 0) {
+      next[index] = item;
+      return next;
+    }
+    next.push(item);
+    return next;
+  }
+
+  if (event.type === 'session_compaction_finished') {
+    const runningId = `compaction:running:${event.session_id}`;
+    return next.filter((existing) => existing.id !== runningId);
+  }
+
+  if (event.type === 'session_compacted') {
+    const itemId = `compaction:${event.previous_session_id}:${event.session_id}`;
+    const runningId = `compaction:running:${event.previous_session_id}`;
+    const item: CompactionTimelineItem = {
+      id: itemId,
+      kind: 'compaction',
+      status: 'compacted',
+      sessionId: event.session_id,
       previousSessionId: event.previous_session_id,
       summaryPreview: event.summary_preview?.slice(0, 500) ?? '',
+      summary: event.summary_preview ?? '',
       method: event.method ?? 'unknown',
       turnsCompacted: event.turns_compacted ?? 0,
       trigger: event.trigger,
@@ -2631,7 +2769,18 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       hardPressureExceeded: event.hard_pressure_exceeded === true,
       usedTimeoutFallback: event.used_timeout_fallback === true,
       timestamp: new Date().toISOString()
-    });
+    };
+    const runningIndex = next.findIndex((existing) => existing.id === runningId && existing.kind === 'compaction');
+    if (runningIndex >= 0) {
+      next[runningIndex] = item;
+      return next;
+    }
+    const existingIndex = next.findIndex((existing) => existing.id === itemId && existing.kind === 'compaction');
+    if (existingIndex >= 0) {
+      next[existingIndex] = item;
+      return next;
+    }
+    next.push(item);
     return next;
   }
 
@@ -2704,7 +2853,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         : event.type === 'credential_request'
           ? event.message?.trim() || `Task ${event.task_id} paused for credentials.`
           : isDirectQuestion
-            ? event.question?.trim() || 'Conversation paused until you answer the clarification request.'
+            ? event.questions?.[0]?.question?.trim() || 'Conversation paused until you answer the clarification request.'
             : `Task ${event.task_id} paused at ${event.step_name ?? 'a workflow step'}.`;
     next.push(
       createNotice(

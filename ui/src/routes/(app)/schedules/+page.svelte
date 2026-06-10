@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
@@ -9,12 +10,14 @@
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { policyFromText } from '$lib/session-policy';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Project, Schedule, Skill, Workflow } from '$lib/types/api';
@@ -41,6 +44,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let search = $state('');
   let filterType = $state<string>('');
   let filterEnabled = $state<string>('');
+  let filterProjectId = $state<string>('');
   let showCreateModal = $state(false);
   let creating = $state(false);
   let lastAutoProjectWorkflow = $state('');
@@ -89,7 +93,9 @@ import Zap from 'lucide-svelte/icons/zap';
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
-    interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests'
+    interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
+    allow_policy_text: '',
+    deny_policy_text: ''
   });
 
   const typeIcons: Record<string, typeof Clock> = {
@@ -129,13 +135,58 @@ import Zap from 'lucide-svelte/icons/zap';
   let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
   let workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent));
   let workflowLoadKey = 0;
+  let urlHydrated = false;
+  let urlSyncTimer: number | null = null;
+  let lastLoadedProjectId: string | null = null;
+
+  function hydrateProjectFilterFromUrl(): void {
+    const next = $page.url.searchParams.get('project_id') ?? $page.url.searchParams.get('project') ?? '';
+    if (next !== filterProjectId) {
+      filterProjectId = next;
+    }
+  }
+
+  function scheduleFilterUrlSync(): void {
+    if (typeof window === 'undefined' || !urlHydrated) return;
+    if (urlSyncTimer !== null) window.clearTimeout(urlSyncTimer);
+    urlSyncTimer = window.setTimeout(() => {
+      urlSyncTimer = null;
+      const sp = new URLSearchParams($page.url.searchParams);
+      if (filterProjectId) {
+        sp.set('project_id', filterProjectId);
+      } else {
+        sp.delete('project_id');
+        sp.delete('project');
+      }
+      const query = sp.toString();
+      const next = query ? `/schedules?${query}` : '/schedules';
+      const current = $page.url.pathname + $page.url.search;
+      if (next !== current) {
+        void goto(next, { replaceState: true, noScroll: true, keepFocus: true });
+      }
+    }, 200);
+  }
+
+  $effect(() => {
+    void $page.url.search;
+    hydrateProjectFilterFromUrl();
+    urlHydrated = true;
+  });
+
+  $effect(() => {
+    void filterProjectId;
+    scheduleFilterUrlSync();
+    if (urlHydrated && lastLoadedProjectId !== filterProjectId) {
+      void loadData();
+    }
+  });
 
   async function loadData(): Promise<void> {
     loading = true;
     error = '';
     try {
       [schedules, agents, workflows, projectWorkflows, projects, skills, conversations] = await Promise.all([
-        api.schedules.list(),
+        api.schedules.list({ project_id: filterProjectId || null }),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
         api.workflows.listAll({ project_id: null }),
@@ -143,6 +194,7 @@ import Zap from 'lucide-svelte/icons/zap';
         api.skills.list(),
         api.conversations.listAll()
       ]);
+      lastLoadedProjectId = filterProjectId;
       if (!form.agent_id && agents.length > 0) {
         const active = agents.find((a) => a.status === 'active');
         form.agent_id = active?.agent_id ?? agents[0]?.agent_id ?? '';
@@ -193,6 +245,7 @@ import Zap from 'lucide-svelte/icons/zap';
         }
       };
       if (form.expected_output) taskTemplate.expected_output = form.expected_output;
+      taskTemplate.session_policy = policyFromText(form.allow_policy_text, form.deny_policy_text);
       const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
       await api.schedules.create({
         name: form.name,
@@ -242,7 +295,9 @@ import Zap from 'lucide-svelte/icons/zap';
       delivery_target: '',
       completion_mode_family: 'default',
       allow_silent_completion: false,
-      interaction_mode_override: 'none'
+      interaction_mode_override: 'none',
+      allow_policy_text: '',
+      deny_policy_text: ''
     };
   }
 
@@ -284,8 +339,12 @@ import Zap from 'lucide-svelte/icons/zap';
 
   async function triggerNow(schedule: Schedule): Promise<void> {
     try {
-      await api.schedules.trigger(schedule.schedule_id);
+      const result = await api.schedules.trigger(schedule.schedule_id);
       addToast(`${schedule.name} triggered`, 'success');
+      if (result.task_id) {
+        await goto(`/tasks/${result.task_id}`);
+        return;
+      }
       await loadData();
     } catch (e) {
       addToast(asApiError(e).message, 'error');
@@ -415,6 +474,15 @@ import Zap from 'lucide-svelte/icons/zap';
         <option value="">All states</option>
         <option value="enabled">Enabled</option>
         <option value="disabled">Disabled</option>
+      </select>
+      <select
+        bind:value={filterProjectId}
+        class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+      >
+        <option value="">All projects</option>
+        {#each projects as project}
+          <option value={project.project_id}>{project.name}</option>
+        {/each}
       </select>
     </div>
 
@@ -731,6 +799,13 @@ import Zap from 'lucide-svelte/icons/zap';
           </select>
           <p class="text-xs text-slate-500">Scheduled tasks default to fully autonomous so unattended runs do not pause for clarification.</p>
         </div>
+
+        <SessionPolicyEditor
+          bind:allowText={form.allow_policy_text}
+          bind:denyText={form.deny_policy_text}
+          title="Intaris session policies"
+          help="Policies are copied to each task created by this schedule."
+        />
       </div>
     {/snippet}
 

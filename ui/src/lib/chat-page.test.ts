@@ -7,18 +7,27 @@ import {
   conversationAttentionLabel,
   conversationAttentionOrbitClass,
   conversationAttentionTone,
+  conversationShowsAttentionDot,
   conversationStatusFilterForConversation,
+  conversationTurnModeTone,
+  conversationUpdatedRowPatch,
   distanceFromScrollBottom,
   getNextHistoryAfterSeq,
   getConversationRetryScope,
   isNearScrollBottom,
   isForeignSessionTimelineEvent,
   isMissingSessionError,
+  isLastOpenedConversationStorageKey,
+  lastOpenedConversationStorageKey,
   normalizeChatModeTone,
   nextChatScrollState,
   isPreSessionChatConversation,
   isRestorableChatConversation,
+  optimisticConversationTurnPatch,
+  pendingDirectQuestionFromAuthChallengeEvent,
   pendingNotificationTypesFromNotifications,
+  hasRetryableFailedTurnTail,
+  managedConversationTurnState,
   shouldAdoptConversationSessionId,
   shouldSuppressPreSessionSocketError,
   isCurrentConversationLoad,
@@ -26,6 +35,7 @@ import {
   setConversationStatusSearchParam,
   nextPollDelayMs,
   nextConversationLoadId,
+  shouldRestoreLastOpenedConversation,
   shouldReconcileAfterReconnect
 } from '$lib/chat-page';
 
@@ -94,6 +104,44 @@ describe('chat page helpers', () => {
     expect(conversationAttentionLabel('default')).toBe('unread');
   });
 
+  it('clears direct-chat unread dots from conversation_updated row patches', () => {
+    const directConversation = {
+      has_unread: true,
+      active_session_status: null,
+      active_session_completion_reason: null,
+      pending_notification_types: [],
+    };
+
+    expect(conversationShowsAttentionDot(directConversation, false, false)).toBe(true);
+
+    const patch = conversationUpdatedRowPatch({
+      has_unread: false,
+      last_read_at: '2026-06-08T12:00:00+00:00',
+    });
+    const updatedConversation = { ...directConversation, ...patch };
+
+    expect(patch).toEqual({
+      has_unread: false,
+      last_read_at: '2026-06-08T12:00:00+00:00',
+    });
+    expect(conversationShowsAttentionDot(updatedConversation, false, false)).toBe(false);
+  });
+
+  it('keeps direct-chat attention dots for pending notifications after unread clears', () => {
+    const directConversation = {
+      has_unread: true,
+      active_session_status: null,
+      active_session_completion_reason: null,
+      pending_notification_types: ['gate'],
+    };
+    const updatedConversation = {
+      ...directConversation,
+      ...conversationUpdatedRowPatch({ has_unread: false }),
+    };
+
+    expect(conversationShowsAttentionDot(updatedConversation, false, false)).toBe(true);
+  });
+
   it('keeps pending notification type attention until all same-type notifications resolve', () => {
     expect(
       pendingNotificationTypesFromNotifications([
@@ -117,6 +165,124 @@ describe('chat page helpers', () => {
     expect(normalizeChatModeTone('default')).toBe('default');
     expect(normalizeChatModeTone('unknown')).toBe('default');
     expect(normalizeChatModeTone(null)).toBe('default');
+  });
+
+  it('builds optimistic active-turn patches with the pending chat mode', () => {
+    expect(optimisticConversationTurnPatch('build')).toEqual({
+      has_unread: false,
+      has_active_turn: true,
+      active_turn_chat_mode: 'build',
+      active_turn_chat_mode_source: null,
+    });
+
+    expect(optimisticConversationTurnPatch('unexpected').active_turn_chat_mode).toBe('default');
+  });
+
+  it('prefers active-turn chat mode while a conversation is running', () => {
+    expect(
+      conversationTurnModeTone(
+        { has_active_turn: true, active_turn_chat_mode: 'plan' },
+        'build',
+      )
+    ).toBe('plan');
+
+    expect(
+      conversationTurnModeTone(
+        { has_active_turn: true, active_turn_chat_mode: 'build' },
+        'plan',
+      )
+    ).toBe('build');
+  });
+
+  it('falls back to persistent/default chat mode without a running active-turn mode', () => {
+    expect(
+      conversationTurnModeTone(
+        { has_active_turn: false, active_turn_chat_mode: 'plan' },
+        'build',
+      )
+    ).toBe('build');
+
+    expect(
+      conversationTurnModeTone(
+        { has_active_turn: true, active_turn_chat_mode: null },
+        'plan',
+      )
+    ).toBe('plan');
+
+    expect(
+      conversationTurnModeTone(
+        { has_active_turn: true, active_turn_chat_mode: 'unexpected' },
+        'build',
+      )
+    ).toBe('build');
+  });
+
+  it('prefers scheduler active-turn state for managed conversation turn status', () => {
+    expect(
+      managedConversationTurnState({
+        has_active_turn: true,
+        managed_agent: { turn_state: 'completed' },
+      })
+    ).toBe('running');
+
+    expect(
+      managedConversationTurnState({
+        has_active_turn: false,
+        managed_agent: { turn_state: 'completed' },
+      })
+    ).toBe('completed');
+
+    expect(managedConversationTurnState({ has_active_turn: false })).toBe('idle');
+  });
+
+  it('detects a retryable failed turn when the timeline ends after a user message', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'assistant', content: 'previous reply' },
+        { kind: 'message', role: 'user', content: 'do work' },
+      ])
+    ).toBe(true);
+  });
+
+  it('detects a retryable failed turn when a recoverable model failure notice follows the user message', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work' },
+        {
+          kind: 'system_message',
+          text: 'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
+        },
+      ])
+    ).toBe(true);
+  });
+
+  it('does not offer failed-turn retry after a completed assistant reply', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work' },
+        { kind: 'message', role: 'assistant', content: 'done' },
+      ])
+    ).toBe(false);
+  });
+
+  it('keeps live auth challenge events routed as auth challenges', () => {
+    const pending = pendingDirectQuestionFromAuthChallengeEvent({
+      notification_id: 'auth-1',
+      step_name: 'direct',
+      label: 'MFA required',
+      message: 'Enter the MFA code.',
+      metadata: { context: 'Reddit login' },
+    });
+
+    expect(pending).toMatchObject({
+      notificationId: 'auth-1',
+      stepName: 'direct',
+      question: 'Enter the MFA code.',
+      questionId: undefined,
+      options: [],
+      context: 'Reddit login',
+      kind: 'auth_challenge',
+    });
   });
 
   it('scopes retries to failed subloads only', () => {
@@ -205,6 +371,31 @@ describe('chat page helpers', () => {
     expect(isRestorableChatConversation({ status: 'archived', context: { type: 'web' } })).toBe(false);
     expect(isRestorableChatConversation({ status: 'active', context: { type: 'slack' } })).toBe(false);
     expect(isRestorableChatConversation({ status: 'active', context: { type: 'web', platform_data: { kind: 'agent_direct' } } })).toBe(false);
+  });
+
+  it('restores last opened conversations only for the selected agent', () => {
+    const conversation = {
+      agent_id: 'miroslav',
+      status: 'active',
+      context: { type: 'web' },
+    };
+
+    expect(shouldRestoreLastOpenedConversation(conversation, 'miroslav')).toBe(true);
+    expect(shouldRestoreLastOpenedConversation(conversation, 'laforge')).toBe(false);
+    expect(shouldRestoreLastOpenedConversation(conversation, null)).toBe(true);
+  });
+
+  it('scopes last opened conversation storage keys per agent', () => {
+    const legacyKey = 'cognis-chat-last-opened-conversation';
+    const laforgeKey = `${legacyKey}:laforge`;
+    const encodedKey = `${legacyKey}:agent%2Fwith%20space`;
+
+    expect(lastOpenedConversationStorageKey(null)).toBe(legacyKey);
+    expect(lastOpenedConversationStorageKey('laforge')).toBe(laforgeKey);
+    expect(lastOpenedConversationStorageKey('agent/with space')).toBe(encodedKey);
+    expect(isLastOpenedConversationStorageKey(legacyKey)).toBe(true);
+    expect(isLastOpenedConversationStorageKey(laforgeKey)).toBe(true);
+    expect(isLastOpenedConversationStorageKey('cognis-chat-selected-agent')).toBe(false);
   });
 
   it('recognizes brand-new web conversations without a root session', () => {

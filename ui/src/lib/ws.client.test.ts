@@ -111,10 +111,39 @@ describe('ws client heartbeat', () => {
     socket.onopen?.();
     socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
 
-    wsClient.respondStepQuestion('notif-1', 'Use the main repo', 'direct');
+    wsClient.respondStepQuestion(
+      'notif-1',
+      {
+        mode: 'structured',
+        answers: [
+          {
+            question_id: 'q1',
+            selected_option_ids: [],
+            custom_answer: 'Use the main repo'
+          }
+        ]
+      },
+      'direct'
+    );
 
     expect(socket.sent.some((payload) => payload.includes('"notification_id":"notif-1"'))).toBe(true);
     expect(socket.sent.some((payload) => payload.includes('"type":"step_response"'))).toBe(true);
+    wsClient.disconnect();
+  });
+
+  it('sends direct auth challenge responses with response text', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.respondAuthChallenge('auth-1', '123456', 'direct');
+
+    expect(socket.sent.some((payload) => payload.includes('"notification_id":"auth-1"'))).toBe(true);
+    expect(socket.sent.some((payload) => payload.includes('"response":"123456"'))).toBe(true);
     wsClient.disconnect();
   });
 

@@ -74,6 +74,7 @@ const MARKDOWN_LINK_RE = /!??\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/README.md': '/docs',
   'docs/guide/getting-started.md': '/docs/getting-started',
+  'docs/guide/local-compose.md': '/docs/local-compose',
   'docs/guide/architecture.md': '/docs/architecture',
   'docs/guide/configuring-providers.md': '/docs/configuring-providers',
   'docs/guide/creating-agents.md': '/docs/creating-agents',
@@ -92,7 +93,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
 };
 
 const GITHUB_REPO_URL = 'https://github.com/fpytloun/cognis';
-const DOC_REPO_URLS = new Set(['deploy/systemd', 'deploy/systemd/README.md']);
+const DOC_REPO_URLS = new Set(['compose.local.yml', 'deploy/systemd', 'deploy/systemd/README.md']);
 
 function normalizeDocPath(path: string): string {
   const parts = path.split('/');

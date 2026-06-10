@@ -83,6 +83,8 @@ export interface WorkflowFormState {
   defaultOnExhausted: string;
   defaultCompletionModeFamily: 'default' | 'direct';
   defaultAllowSilentCompletion: boolean;
+  allowPolicyText: string;
+  denyPolicyText: string;
   steps: WorkflowStepFormState[];
 }
 
@@ -153,6 +155,8 @@ export function createEmptyWorkflowForm(): WorkflowFormState {
     defaultOnExhausted: 'gate',
     defaultCompletionModeFamily: 'default',
     defaultAllowSilentCompletion: false,
+    allowPolicyText: '',
+    denyPolicyText: '',
     steps: [createEmptyStep()]
   };
 }
@@ -203,6 +207,40 @@ function formInputToPayload(
 
 function parseList(value: string): string[] {
   return value.split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function policyText(defaults: Record<string, unknown>, key: 'allow_policies' | 'deny_policies'): string {
+  const policy = defaults.session_policy;
+  if (!isRecord(policy)) return '';
+  const values = policy[key];
+  if (!Array.isArray(values)) return '';
+  return values
+    .filter((item) => typeof item === 'string' || isRecord(item))
+    .map((item) => (typeof item === 'string' ? item : JSON.stringify(item)))
+    .join('\n');
+}
+
+function policyFromText(allowText: string, denyText: string): Record<string, unknown> {
+  return {
+    allow_policies: parsePolicyLines(allowText),
+    deny_policies: parsePolicyLines(denyText)
+  };
+}
+
+function parsePolicyLines(text: string): Array<string | Record<string, unknown>> {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      if (!line.startsWith('{')) return line;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        return isRecord(parsed) ? parsed : line;
+      } catch {
+        return line;
+      }
+    });
 }
 
 function parseProfileMatrix(value: Workflow['steps'][number]['step_profile']): WorkflowStepProfileRowFormState[] {
@@ -423,6 +461,8 @@ export function workflowToFormState(
     defaultCompletionModeFamily:
       deliveryDefaults?.completion_mode_family === 'direct' ? 'direct' : 'default',
     defaultAllowSilentCompletion: deliveryDefaults?.allow_silent_completion === true,
+    allowPolicyText: policyText(workflow.defaults, 'allow_policies'),
+    denyPolicyText: policyText(workflow.defaults, 'deny_policies'),
     steps: workflow.steps.map((step) => {
       const successRoute = outcomeRouteForStatus(step, 'success');
       const rejectedRoute = outcomeRouteForStatus(step, 'rejected');
@@ -492,7 +532,8 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
       delivery: {
         completion_mode_family: form.defaultCompletionModeFamily,
         allow_silent_completion: form.defaultAllowSilentCompletion
-      }
+      },
+      session_policy: policyFromText(form.allowPolicyText, form.denyPolicyText)
     },
     steps: form.steps.map((step) => {
       const inputPayload = formInputToPayload(step.inputMode, step.inputText);

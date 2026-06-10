@@ -8,6 +8,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   import { api, asApiError } from '$lib/api/client';
   import LoadingState from '$lib/components/LoadingState.svelte';
+  import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import { loadSkillWorkflowDraft, skillToWorkflowDraft } from '$lib/skills';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -739,6 +740,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
               </label>
             </div>
           </label>
+          <div class="mt-4">
+            <SessionPolicyEditor
+              bind:allowText={form.allowPolicyText}
+              bind:denyText={form.denyPolicyText}
+              disabled={!!selectedWorkflow?.is_system || !!editingSkillId}
+              title="Default Intaris session policies"
+              help="Applied to tasks using this workflow unless overridden by the task or schedule."
+            />
+          </div>
         </Card>
 
         <!-- Step editor -->

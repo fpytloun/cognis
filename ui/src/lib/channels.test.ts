@@ -60,6 +60,35 @@ describe('channels helpers', () => {
     expect(edited.settingValues.use_tls).toBe('false');
   });
 
+  it('shows legacy assistant delivery settings as concatenated when editing', () => {
+    const deliveryMeta = {
+      ...meta,
+      setting_fields: [
+        {
+          name: 'assistant_delivery_mode',
+          label: 'Assistant delivery mode',
+          description: '',
+          field_type: 'select',
+          default: 'final_only',
+          options: ['final_only', 'concatenated', 'immediate'],
+        },
+      ],
+    } satisfies ChannelMeta;
+    const account = {
+      account_id: 'acc', channel_type: 'signal', display_name: 'My Signal', enabled: true, agent_id: 'agent-1',
+      config: {}, credential_refs: {}, allowed_senders: [], dm_policy: 'pairing', group_policy: 'pairing',
+      created_at: null, updated_at: null,
+    } satisfies ChannelAccount;
+
+    expect(createChannelDraft(deliveryMeta, [agent], account).settingValues.assistant_delivery_mode).toBe('concatenated');
+
+    const explicitLegacy = {
+      ...account,
+      config: { assistant_delivery_mode: 'final' },
+    } satisfies ChannelAccount;
+    expect(createChannelDraft(deliveryMeta, [agent], explicitLegacy).settingValues.assistant_delivery_mode).toBe('concatenated');
+  });
+
   it('normalizes booleans and numbers safely', () => {
     expect(normalizeSettingValue(meta, 'use_tls', 'true')).toBe(true);
     expect(normalizeSettingValue(meta, 'missing', 'abc')).toBe('abc');

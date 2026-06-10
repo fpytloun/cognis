@@ -10,6 +10,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import { scheduleListProjectUrl } from '$lib/tasks';
   import type { Project, ProjectGrant, ProjectSource, Workflow } from '$lib/types/api';
 
   const projectId = $derived($page.params.projectId);
@@ -264,6 +265,7 @@
             <span class="rounded-full border border-slate-700 px-2 py-1">{project.status}</span>
             <span class="rounded-full border border-slate-700 px-2 py-1">{project.sources.length} sources</span>
             <span class="rounded-full border border-slate-700 px-2 py-1">{project.workflow_ids.length} workflows</span>
+            <a class="rounded-full border border-slate-700 px-2 py-1 hover:border-sky-500/60 hover:text-sky-200" href={scheduleListProjectUrl(project.project_id)}>{project.active_schedule_count} schedules</a>
             {#if project.is_shared_with_me}<span class="rounded-full border border-amber-500/30 px-2 py-1 text-amber-200">shared by {project.shared_by_email}</span>{/if}
           </div>
         </div>

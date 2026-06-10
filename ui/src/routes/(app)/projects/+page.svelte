@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
+  import Clock from 'lucide-svelte/icons/clock';
   import ListTodo from 'lucide-svelte/icons/list-todo';
   import { api } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -8,7 +9,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
-  import { taskBoardProjectUrl } from '$lib/tasks';
+  import { scheduleListProjectUrl, taskBoardProjectUrl } from '$lib/tasks';
   import type { Project } from '$lib/types/api';
 
   let projects = $state<Project[]>([]);
@@ -85,14 +86,24 @@
             <div class="min-w-0 flex-1">
               <div class="flex min-w-0 items-start justify-between gap-2">
                 <a class="min-w-0 break-words text-lg font-semibold text-white hover:text-sky-200 lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal" href={`/projects/${project.project_id}`} title={project.name}>{project.name}</a>
-                <a
-                  class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-200"
-                  href={taskBoardProjectUrl(project.project_id)}
-                  aria-label={`Open task board filtered for ${project.name}`}
-                  title="Open filtered task board"
-                >
-                  <ListTodo class="h-4 w-4" aria-hidden="true" />
-                </a>
+                <div class="flex shrink-0 gap-1">
+                  <a
+                    class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-200"
+                    href={taskBoardProjectUrl(project.project_id)}
+                    aria-label={`Open task board filtered for ${project.name}`}
+                    title="Open filtered task board"
+                  >
+                    <ListTodo class="h-4 w-4" aria-hidden="true" />
+                  </a>
+                  <a
+                    class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-200"
+                    href={scheduleListProjectUrl(project.project_id)}
+                    aria-label={`Open schedules filtered for ${project.name}`}
+                    title="Open filtered schedules"
+                  >
+                    <Clock class="h-4 w-4" aria-hidden="true" />
+                  </a>
+                </div>
               </div>
               <p class="mt-1 line-clamp-2 text-sm text-slate-400">{project.description || 'No description'}</p>
             </div>
@@ -100,6 +111,7 @@
           <div class="mt-4 flex gap-2 text-xs text-slate-500">
             <span>{project.sources.length} sources</span>
             <span>{project.workflow_ids.length} workflows</span>
+            <span>{project.active_schedule_count} schedules</span>
             {#if project.is_shared_with_me}<span class="text-amber-300">shared</span>{/if}
           </div>
         </div>

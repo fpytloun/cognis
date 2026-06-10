@@ -5,7 +5,11 @@
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { api } from '$lib/api/client';
-  import { CHAT_STORAGE_KEYS, isRestorableChatConversation } from '$lib/chat-page';
+  import {
+    CHAT_STORAGE_KEYS,
+    lastOpenedConversationStorageKey,
+    shouldRestoreLastOpenedConversation
+  } from '$lib/chat-page';
   import type { Agent } from '$lib/types/api';
 
   let loading = true;
@@ -23,38 +27,64 @@
     return primary.find((a) => a.status === 'active')?.agent_id ?? primary[0]?.agent_id ?? '';
   }
 
-  async function restoreLastOpenedConversation(): Promise<boolean> {
+  async function restoreLastOpenedConversation(selectedAgentId: string): Promise<boolean> {
     if (typeof window === 'undefined') return false;
-    const conversationId = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
-    if (!conversationId) return false;
+    const keys = [
+      CHAT_STORAGE_KEYS.lastOpenedConversation,
+      lastOpenedConversationStorageKey(selectedAgentId)
+    ].filter((key, index, items) => items.indexOf(key) === index);
 
-    try {
-      const conversation = await api.conversations.detail(conversationId);
-      if (isRestorableChatConversation(conversation)) {
-        await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
-        return true;
+    const candidates = [
+      ...keys.map((key) => ({ storage: window.sessionStorage, key })),
+      lastOpenedConversationStorageKey(selectedAgentId),
+      CHAT_STORAGE_KEYS.lastOpenedConversation,
+    ]
+      .map((candidate) => (
+        typeof candidate === 'string'
+          ? { storage: window.localStorage, key: candidate }
+          : candidate
+      ))
+      .filter((candidate, index, items) => (
+        items.findIndex((item) => item.storage === candidate.storage && item.key === candidate.key) === index
+      ));
+
+    for (const candidate of candidates) {
+      const conversationId = candidate.storage.getItem(candidate.key);
+      if (!conversationId) continue;
+
+      try {
+        const conversation = await api.conversations.detail(conversationId);
+        if (shouldRestoreLastOpenedConversation(conversation, null)) {
+          window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
+          window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
+          window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
+          window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
+          await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
+          return true;
+        }
+      } catch {
+        // Ignore stale or inaccessible local state and fall back to resolving
+        // the latest active web conversation for the selected agent.
       }
-    } catch {
-      // Ignore stale or inaccessible local state and fall back to resolving
-      // the latest active web conversation for the selected agent.
+
+      candidate.storage.removeItem(candidate.key);
     }
 
-    window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
     return false;
   }
 
   onMount(() => {
     void (async () => {
       try {
-        if (await restoreLastOpenedConversation()) {
-          return;
-        }
-
         const agents = await api.agents.listAll();
         const agentId = getSelectedAgentId(agents);
         if (!agentId) {
           noAgents = true;
           loading = false;
+          return;
+        }
+
+        if (await restoreLastOpenedConversation(agentId)) {
           return;
         }
 

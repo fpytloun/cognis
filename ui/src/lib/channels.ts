@@ -181,6 +181,17 @@ export function normalizeSettingValue(meta: ChannelMeta, fieldName: string, valu
   return value;
 }
 
+function normalizeSettingDisplayValue(fieldName: string, value: unknown, fallback: unknown, editing: boolean): string {
+  if (fieldName === 'assistant_delivery_mode' && editing && value === undefined) {
+    return 'concatenated';
+  }
+  const normalized = String(value ?? '');
+  if (fieldName === 'assistant_delivery_mode' && normalized === 'final') {
+    return 'concatenated';
+  }
+  return normalized || String(fallback ?? '');
+}
+
 export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?: ChannelAccount | null): ChannelEditorDraft {
   const primaryAgents = agents.filter((agent) => agent.agent_type === 'primary');
   const credentialValues = Object.fromEntries(
@@ -201,7 +212,15 @@ export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?:
     preferred_for_task_delivery: account?.preferred_for_task_delivery ?? false,
     credentialValues,
     settingValues: Object.fromEntries(
-      meta.setting_fields.map((field) => [field.name, String(account?.config?.[field.name] ?? field.default ?? '')]),
+      meta.setting_fields.map((field) => [
+        field.name,
+        normalizeSettingDisplayValue(
+          field.name,
+          account?.config?.[field.name],
+          field.default,
+          Boolean(account),
+        ),
+      ]),
     ),
   };
 }

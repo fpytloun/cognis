@@ -70,6 +70,7 @@ export interface AgentFormState {
   additionalExecutors: AdditionalExecutorEntry[];
   disabledCategories: string[];
   disabledTools: string[];
+  disabledMcpServers: string[];
   optInBuiltinTools: string[];
   selectedSkillIds: string[];
   autoLoadSkillIds: string[];
@@ -154,6 +155,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     additionalExecutors: [],
     disabledCategories: [],
     disabledTools: [],
+    disabledMcpServers: [],
     optInBuiltinTools: [],
     selectedSkillIds: [],
     autoLoadSkillIds: []
@@ -273,6 +275,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     disabledTools: Array.isArray(tools.disabled_tools)
       ? tools.disabled_tools.filter((value): value is string => typeof value === 'string')
       : [],
+    disabledMcpServers: Array.isArray(tools.disabled_mcp_servers)
+      ? tools.disabled_mcp_servers.filter((value): value is string => typeof value === 'string')
+      : [],
     optInBuiltinTools: Array.isArray(tools.opt_in_builtin_tools)
       ? tools.opt_in_builtin_tools.filter((value): value is string => typeof value === 'string')
       : [],
@@ -373,6 +378,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     delegation_tools: _legacyDelegationTools,
     disabled_categories: _legacyDisabledCategories,
     disabled_tools: _legacyDisabledTools,
+    disabled_mcp_servers: _legacyDisabledMcpServers,
     opt_in_builtin_tools: _legacyOptInBuiltinTools,
     intaris_mcp_servers: _legacyIntarisMcpServers,
     mcp_servers: _legacyMcpServers,
@@ -417,6 +423,9 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
         : {}),
       ...(form.disabledTools.length > 0
         ? { disabled_tools: [...new Set(form.disabledTools)] }
+        : {}),
+      ...(form.disabledMcpServers.length > 0
+        ? { disabled_mcp_servers: [...new Set(form.disabledMcpServers)] }
         : {}),
       ...(form.agentType === 'primary' && form.optInBuiltinTools.length > 0
         ? { opt_in_builtin_tools: [...new Set(form.optInBuiltinTools)] }

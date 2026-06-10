@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { fade } from 'svelte/transition';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
@@ -58,16 +58,25 @@ import X from 'lucide-svelte/icons/x';
     conversationAttentionLabel,
     conversationAttentionOrbitClass,
     conversationAttentionTone,
+    conversationShowsAttentionDot,
     conversationStatusFilterForConversation,
+    conversationTurnModeTone,
+    conversationUpdatedRowPatch,
     distanceFromScrollBottom,
     getConversationRetryScope,
+    hasRetryableFailedTurnTail,
+    managedConversationTurnState,
     getNextHistoryAfterSeq,
     isNearScrollBottom,
     isMissingSessionError,
     isCurrentConversationLoad,
     isForeignSessionTimelineEvent,
+    isLastOpenedConversationStorageKey,
+    lastOpenedConversationStorageKey,
     nextChatScrollState,
     normalizeChatModeTone,
+    optimisticConversationTurnPatch,
+    pendingDirectQuestionFromAuthChallengeEvent,
     parseConversationStatusFilter,
     isPreSessionChatConversation,
     pendingNotificationTypesFromNotifications,
@@ -79,6 +88,7 @@ import X from 'lucide-svelte/icons/x';
     nextPollDelayMs,
     type ChatModeTone,
     type ConversationStatusFilter,
+    type PendingDirectQuestion,
     CHAT_STORAGE_KEYS,
     SESSION_LOG_BOOTSTRAP_MAX_PAGES,
     SESSION_LOG_PAGE_SIZE,
@@ -132,12 +142,13 @@ import X from 'lucide-svelte/icons/x';
     type TodoSnapshotItem
   } from '$lib/chat';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
-  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, Escalation, MessageEvent, Notification, QueuedMessage, Session } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetQuestion, Session } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
   let initialLoadTimedOut = $state(false);
-  let switchingConversation = $state(false);
+  let switchingConversationId = $state<string | null>(null);
+  let switchingConversation = $derived(switchingConversationId !== null);
   let initialConversationResolved = $state(false);
   let error = $state('');
   let historyError = $state('');
@@ -245,6 +256,7 @@ import X from 'lucide-svelte/icons/x';
 
   let visibleStartIndex = $state(0);
   let activeConversationId = '';
+  let routeConversationId = $derived(page.params.conversationId ?? '');
   let activeSessionLastSeq = 0;
   let olderMessagesCursor = $state<string | null>(null);
   let hasOlderMessages = $state(false);
@@ -628,7 +640,9 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function deleteQueuedMessage(queueId: string): Promise<void> {
-    if (!currentConversation) return;
+    const conversation = mutableQueuedMessagesConversation();
+    if (!conversation) return;
+    const conversationId = conversation.conversation_id;
     const previous = queuedMessages;
     const queued = queuedMessages.find((item) => item.queue_id === queueId);
     const previousTimeline = timeline;
@@ -645,7 +659,7 @@ import X from 'lucide-svelte/icons/x';
       );
     }
     try {
-      await api.conversations.deleteQueuedMessage(currentConversation.conversation_id, queueId);
+      await api.conversations.deleteQueuedMessage(conversationId, queueId);
     } catch (caughtError) {
       queuedMessages = previous;
       queuedCount = previous.length;
@@ -658,12 +672,14 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function saveQueuedMessage(queueId: string): Promise<void> {
-    if (!currentConversation) return;
+    const conversation = mutableQueuedMessagesConversation();
+    if (!conversation) return;
+    const conversationId = conversation.conversation_id;
     const content = queueEditContent.trim();
     if (!content) return;
     queueBusyId = queueId;
     try {
-      const updated = await api.conversations.updateQueuedMessage(currentConversation.conversation_id, queueId, content);
+      const updated = await api.conversations.updateQueuedMessage(conversationId, queueId, content);
       queuedMessages = queuedMessages.map((item) => item.queue_id === queueId ? updated : item);
       queueEditingId = null;
       queueEditContent = '';
@@ -686,6 +702,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function startQueuedMessageEdit(queued: QueuedMessage): void {
+    if (!canMutateQueuedMessages()) return;
     queueEditingId = queued.queue_id;
     queueEditContent = queued.content;
     if (!queueIsExpanded(queued.queue_id)) {
@@ -697,19 +714,19 @@ import X from 'lucide-svelte/icons/x';
     queueEditingId = null;
     queueEditContent = '';
   }
+
+  function canMutateQueuedMessages(): boolean {
+    return mutableQueuedMessagesConversation() !== null;
+  }
+
+  function mutableQueuedMessagesConversation(): Conversation | null {
+    if (!currentConversation || isReadOnly(currentConversation)) return null;
+    return currentConversation;
+  }
   let contextUsage = $state<ContextUsage | null>(null);
   let subSessionInfoOpen = $state(false);
   let subSessionInfo = $state<SessionInfoData | null>(null);
   let subSessionInfoLoading = $state(false);
-  interface PendingDirectQuestion {
-    notificationId: string;
-    stepName?: string;
-    question: string;
-    options: string[];
-    context: string;
-    kind?: 'question' | 'auth_challenge';
-  }
-
   type ChatTodo = TodoSnapshotItem;
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
@@ -717,6 +734,7 @@ import X from 'lucide-svelte/icons/x';
   let directQuestionSubmitting = $state(false);
   let chatTodoDrawerOpen = $state(true);
   let retainedChatTodos = $state<ChatTodo[]>([]);
+  let backendConversationState = $state<ConversationStateEnvelope | null>(null);
 
   const sessionIds = new Set<string>();
 
@@ -746,6 +764,23 @@ import X from 'lucide-svelte/icons/x';
 
   function isWebConversation(conversation: Conversation | null): boolean {
     return conversation?.context?.type?.toLowerCase() === 'web';
+  }
+
+  function isManagedConversation(conversation: Conversation | null): boolean {
+    const contextType = String(conversation?.context?.type ?? '').toLowerCase();
+    const managedChannel = String(conversation?.managed_agent?.channel ?? '');
+    return contextType === 'agent_work'
+      || contextType === 'managed_agent_conversation'
+      || managedChannel === 'agent_work'
+      || managedChannel === 'managed_agent_conversation';
+  }
+
+  function managedConversationState(conversation: Conversation | null): string {
+    return conversation?.managed_agent?.conversation_state ?? 'open';
+  }
+
+  function managedTurnState(conversation: Conversation | null): string {
+    return managedConversationTurnState(conversation);
   }
 
   let showPushPrompt = $derived.by(() => {
@@ -791,6 +826,7 @@ import X from 'lucide-svelte/icons/x';
   function isReadOnly(conversation: Conversation | null): boolean {
     if (!conversation) return true;
     if (conversation.status !== 'active') return true;
+    if (isManagedConversation(conversation)) return true;
     if (!isWebConversation(conversation)) return true;
     return false;
   }
@@ -866,6 +902,7 @@ import X from 'lucide-svelte/icons/x';
     question: unknown,
     options: unknown,
     context: unknown,
+    questionId?: string,
     kind: PendingDirectQuestion['kind'] = 'question',
   ): PendingDirectQuestion {
     return {
@@ -876,10 +913,32 @@ import X from 'lucide-svelte/icons/x';
         : kind === 'auth_challenge'
           ? 'Authentication is required to continue.'
           : 'The assistant needs more input to continue.',
+      questionId,
       options: directQuestionOptions(options),
       context: directQuestionContext(context),
       kind
     };
+  }
+
+  function pendingDirectQuestionFromQuestionSet(
+    notificationId: string,
+    stepName: string | undefined,
+    questions: unknown,
+    context: unknown,
+  ): PendingDirectQuestion {
+    const items = Array.isArray(questions) ? (questions as QuestionSetQuestion[]) : [];
+    const firstQuestion = items[0];
+    const pending = pendingDirectQuestionFromParts(
+      notificationId,
+      stepName,
+      firstQuestion?.question,
+      firstQuestion?.options,
+      context,
+      typeof firstQuestion?.id === 'string' ? firstQuestion.id : undefined,
+      'question',
+    );
+    pending.structured = items.length > 1 || items.some((item) => Array.isArray(item.options) && item.options.length > 0);
+    return pending;
   }
 
   function pendingDirectQuestionFromNotification(notification: Notification): PendingDirectQuestion | null {
@@ -892,17 +951,16 @@ import X from 'lucide-svelte/icons/x';
         notification.step_name ?? undefined,
         notification.payload.message ?? notification.payload.label,
         [],
-        notification.payload.metadata,
-        'auth_challenge',
+      notification.payload.metadata,
+        undefined,
+      'auth_challenge',
       );
     }
-    return pendingDirectQuestionFromParts(
+    return pendingDirectQuestionFromQuestionSet(
       notification.notification_id,
       notification.step_name ?? undefined,
-      notification.payload.question,
-      notification.payload.options,
+      notification.payload.questions,
       notification.payload.context,
-      'question',
     );
   }
 
@@ -939,19 +997,35 @@ import X from 'lucide-svelte/icons/x';
   function persistLastOpenedConversation(conversation: Conversation): void {
     if (typeof window === 'undefined') return;
     if (conversation.status === 'active' && isWebConversation(conversation) && !isAgentDirectConversation(conversation)) {
+      window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
+      window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
       window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
+      window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
     }
   }
 
   function clearLastOpenedConversation(conversationId: string | null | undefined = null): void {
     if (typeof window === 'undefined') return;
+    const stores = [window.sessionStorage, window.localStorage];
     if (!conversationId) {
-      window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+      for (const storage of stores) {
+        for (let index = storage.length - 1; index >= 0; index -= 1) {
+          const key = storage.key(index);
+          if (key && isLastOpenedConversationStorageKey(key)) {
+            storage.removeItem(key);
+          }
+        }
+      }
       return;
     }
-    const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
-    if (stored === conversationId) {
-      window.localStorage.removeItem(CHAT_STORAGE_KEYS.lastOpenedConversation);
+    for (const storage of stores) {
+      for (let index = storage.length - 1; index >= 0; index -= 1) {
+        const key = storage.key(index);
+        if (!key || !isLastOpenedConversationStorageKey(key)) continue;
+        if (storage.getItem(key) === conversationId) {
+          storage.removeItem(key);
+        }
+      }
     }
   }
 
@@ -963,6 +1037,12 @@ import X from 'lucide-svelte/icons/x';
   }
 
   let chatTodos = $derived.by(() => {
+    const backendTodos = backendConversationState?.conversation_id === currentConversation?.conversation_id
+      ? backendTodoSnapshot(backendConversationState)
+      : null;
+    if (backendTodos !== null) {
+      return backendTodos;
+    }
     const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       return latestTodos;
@@ -992,7 +1072,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function setConversationTodoSnapshot(conversationId: string | null | undefined, todos: TodoSnapshotItem[]): void {
-    if (!conversationId || todos.length === 0) return;
+    if (!conversationId) return;
     const current = conversationTodoSnapshots[conversationId];
     if (
       current?.length === todos.length
@@ -1041,6 +1121,62 @@ import X from 'lucide-svelte/icons/x';
     }
     return [];
   }
+
+  function backendTodoSnapshot(state: ConversationStateEnvelope | null): TodoSnapshotItem[] | null {
+    if (!state?.task) return null;
+    const step = state.task.relevant_step ?? state.task.current_step ?? null;
+    if (!step) return null;
+    return step.todos.map((todo) => ({
+      content: todo.content,
+      status: todo.status,
+      priority: todo.priority ?? 'normal',
+    }));
+  }
+
+  function conversationStateConversationPatch(state: ConversationStateEnvelope): Partial<Conversation> {
+    const patch: Partial<Conversation> = {
+      pending_notification_types: state.pending?.notification_types ?? [],
+      has_active_turn: state.active_turn?.has_active_turn ?? false,
+      active_session_status: state.active_session?.status ?? null,
+      active_session_completion_reason: state.active_session?.completion_reason ?? null,
+      active_turn_chat_mode: typeof state.active_turn?.chat_mode === 'string'
+        ? normalizeChatModeTone(state.active_turn.chat_mode)
+        : null,
+      active_turn_chat_mode_source: typeof state.active_turn?.chat_mode_source === 'string'
+        ? state.active_turn.chat_mode_source as import('$lib/types/api').ChatModeSource
+        : null,
+    };
+    return patch;
+  }
+
+  function applyConversationStateSnapshot(state: ConversationStateEnvelope | null | undefined): void {
+    if (!state) return;
+    const conversationId = state.conversation_id;
+    if (conversationId === currentConversation?.conversation_id) {
+      backendConversationState = state;
+    }
+    patchConversationInList(conversationId, conversationStateConversationPatch(state));
+    turnInProgress = state.active_turn?.has_active_turn ?? turnInProgress;
+    const todos = backendTodoSnapshot(state);
+    if (todos !== null) {
+      setConversationTodoSnapshot(conversationId, todos);
+    }
+  }
+
+  function applyConversationStateDelta(event: Extract<import('$lib/types/api').CognisWebSocketEvent, { type: 'conversation_state_delta' }>): void {
+    const replacement = event.replace?.state;
+    if (replacement && typeof replacement === 'object') {
+      applyConversationStateSnapshot(replacement as ConversationStateEnvelope);
+    } else if (event.snapshot_required && currentConversation?.conversation_id === event.conversation_id) {
+      void reloadConversationSubloads(event.conversation_id, beginConversationLoad(), {
+        reloadSessions: false,
+        reloadHistory: true,
+        resubscribe: false,
+        preserveTimelineOnHistoryFailure: true,
+        mergeTimeline: true,
+      });
+    }
+  }
   let showTurnProgress = $derived.by(() =>
     turnInProgress
       && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
@@ -1058,6 +1194,7 @@ import X from 'lucide-svelte/icons/x';
   );
 
   function contextTypeBadge(conversation: Conversation): string {
+    if (isManagedConversation(conversation)) return 'Agent-managed';
     const t = conversation.context?.type ?? 'unknown';
     return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
   }
@@ -1337,6 +1474,33 @@ import X from 'lucide-svelte/icons/x';
     return entry;
   }
 
+  function clearConversationViewState(): void {
+    sessions = [];
+    sessionIds.clear();
+    timeline = [];
+    visibleStartIndex = 0;
+    activeSessionLastSeq = 0;
+    olderMessagesCursor = null;
+    hasOlderMessages = false;
+    queuedCount = 0;
+    queuedMessages = [];
+    contextUsage = null;
+    sessionInfo = null;
+    turnInProgress = false;
+    awaitingAssistantStart = false;
+    pendingDirectQuestion = null;
+    pendingCredentialRequest = null;
+    directQuestionSubmitting = false;
+    escalations = [];
+    escalationError = '';
+    escalationResolutionPending = null;
+    lastRecoverableMessage = '';
+    editingTitle = false;
+    subSessionPanelOpen = false;
+    userScrolledUp = false;
+    lastTimelineScrollTop = 0;
+  }
+
   function timelineItemKey(item: TimelineItem): string {
     if (item.kind === 'message') {
       if (item.messageId) return `message:${item.role}:${item.sessionId ?? 'unknown-session'}:${item.messageId}`;
@@ -1481,8 +1645,24 @@ import X from 'lucide-svelte/icons/x';
     window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, selectedAgentId);
   }
 
+  function clearSelectedAgentFilter(): boolean {
+    const hadFilter = selectedAgentId !== 'all'
+      || (typeof window !== 'undefined' && window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent) !== null);
+    selectedAgentId = 'all';
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedAgent);
+    }
+    return hadFilter;
+  }
+
+  async function clearSelectedAgentFilterForDirectChat(): Promise<void> {
+    if (!clearSelectedAgentFilter()) return;
+    resetConversationSearchResults();
+    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+  }
+
   function conversationIdFromRoute(): string {
-    return page.params.conversationId ?? '';
+    return routeConversationId;
   }
 
   function conversationUrl(conversationId: string, extraParams?: URLSearchParams | Record<string, string>): string {
@@ -1554,8 +1734,38 @@ import X from 'lucide-svelte/icons/x';
     return !isCurrentConversationLoad(requestId, conversationLoadRequestId);
   }
 
+  let conversationSwitchRequestId = 0;
+
+  function beginConversationSwitch(conversationId: string, visible: boolean): number {
+    conversationSwitchRequestId = nextConversationLoadId(conversationSwitchRequestId);
+    switchingConversationId = visible ? conversationId : null;
+    backendConversationState = null;
+    return conversationSwitchRequestId;
+  }
+
+  function resetConversationSwitch(): void {
+    conversationSwitchRequestId = nextConversationLoadId(conversationSwitchRequestId);
+    switchingConversationId = null;
+  }
+
+  function finishConversationSwitch(conversationId: string, switchRequestId: number): void {
+    if (
+      isCurrentConversationLoad(switchRequestId, conversationSwitchRequestId)
+      && switchingConversationId === conversationId
+    ) {
+      switchingConversationId = null;
+    }
+  }
+
   function conversationAgent(conversation: Conversation): Agent | undefined {
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
+  }
+
+  async function refreshCurrentConversationMetadata(): Promise<void> {
+    if (!currentConversation) return;
+    const updated = await api.conversations.detail(currentConversation.conversation_id);
+    currentConversation = updated;
+    patchConversationInList(updated.conversation_id, updated);
   }
 
   function agentLabel(agent: Agent | undefined): string {
@@ -1883,12 +2093,15 @@ import X from 'lucide-svelte/icons/x';
     const explicitMode = conversation.context?.platform_data?.chat_mode
       ?? conversation.context?.platform_data?.chatMode
       ?? conversation.context?.platform_data?.mode;
-    if (explicitMode === 'plan' || explicitMode === 'build') return explicitMode;
-    const execution = conversationAgent(conversation)?.execution;
-    const agentDefaultMode = execution && typeof execution === 'object'
-      ? (execution.default_chat_mode ?? execution.defaultChatMode ?? execution.chat_mode)
-      : null;
-    return agentDefaultMode === 'plan' || agentDefaultMode === 'build' ? agentDefaultMode : 'default';
+    let fallbackMode: unknown = explicitMode;
+    if (fallbackMode !== 'plan' && fallbackMode !== 'build') {
+      const execution = conversationAgent(conversation)?.execution;
+      const agentDefaultMode = execution && typeof execution === 'object'
+        ? (execution.default_chat_mode ?? execution.defaultChatMode ?? execution.chat_mode)
+        : null;
+      fallbackMode = agentDefaultMode;
+    }
+    return conversationTurnModeTone(conversation, fallbackMode);
   }
 
   function turnOrbitClass(mode: 'default' | 'plan' | 'build'): string {
@@ -1912,10 +2125,6 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationAttentionDescription(conversation: Conversation): string {
     return conversationAttentionLabel(conversationAttentionTone(conversation));
-  }
-
-  function conversationHasAttention(conversation: Conversation): boolean {
-    return conversationAttentionTone(conversation) !== 'default';
   }
 
   function syncActiveSessionAttention(conversationId: string | null | undefined, sessionList: Session[]): void {
@@ -1968,38 +2177,6 @@ import X from 'lucide-svelte/icons/x';
     if (eventType === 'credential_request' || eventType === 'credential_request_resolved') return 'credential_request';
     if (eventType === 'escalation' || eventType === 'escalation_resolved') return 'escalation';
     return null;
-  }
-
-  function websocketConversationPatch(event: {
-    title?: string;
-    has_unread?: boolean;
-    has_active_turn?: boolean;
-    active_turn_chat_mode?: import('$lib/types/api').ChatMode | null;
-    active_turn_chat_mode_source?: import('$lib/types/api').ChatModeSource | null;
-    active_session_status?: string | null;
-    active_session_completion_reason?: string | null;
-    pending_notification_types?: string[];
-    last_message_at?: string | null;
-    updated_at?: string | null;
-  }): Partial<Conversation> {
-    const patch: Partial<Conversation> = {};
-    if (typeof event.title === 'string') patch.title = event.title;
-    if (typeof event.has_unread === 'boolean') patch.has_unread = event.has_unread;
-    if (typeof event.has_active_turn === 'boolean') {
-      patch.has_active_turn = event.has_active_turn;
-      if (!event.has_active_turn) {
-        patch.active_turn_chat_mode = event.active_turn_chat_mode ?? null;
-        patch.active_turn_chat_mode_source = event.active_turn_chat_mode_source ?? null;
-      }
-    }
-    if (typeof event.active_turn_chat_mode === 'string') patch.active_turn_chat_mode = event.active_turn_chat_mode;
-    if (typeof event.active_turn_chat_mode_source === 'string') patch.active_turn_chat_mode_source = event.active_turn_chat_mode_source;
-    if (typeof event.active_session_status === 'string' || event.active_session_status === null) patch.active_session_status = event.active_session_status;
-    if (typeof event.active_session_completion_reason === 'string' || event.active_session_completion_reason === null) patch.active_session_completion_reason = event.active_session_completion_reason;
-    if (Array.isArray(event.pending_notification_types)) patch.pending_notification_types = event.pending_notification_types;
-    if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;
-    if (typeof event.updated_at === 'string') patch.updated_at = event.updated_at;
-    return patch;
   }
 
   // Enable the composer's send button only when there is something to send
@@ -2335,6 +2512,11 @@ import X from 'lucide-svelte/icons/x';
     return availableChannelTypes;
   }
 
+  function channelDisplayLabel(channel: string): string {
+    if (channel === 'agent_work' || channel === 'managed_agent_conversation') return 'Agent work';
+    return channel.charAt(0).toUpperCase() + channel.slice(1);
+  }
+
   async function persistSelectedChannel(): Promise<void> {
     if (typeof window === 'undefined') return;
     window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, selectedChannel);
@@ -2571,7 +2753,8 @@ import X from 'lucide-svelte/icons/x';
             active_session_id: null,
             active_session_last_seq: 0,
             history_truncated: false,
-            truncation_reason: null
+            truncation_reason: null,
+            state_snapshot: null
           }),
     ]);
 
@@ -2603,6 +2786,7 @@ import X from 'lucide-svelte/icons/x';
     if (reloadHistory && historyResult.status === 'fulfilled') {
       nextActiveSessionId = historyResult.value.active_session_id ?? nextActiveSessionId;
       activeSessionLastSeq = historyResult.value.active_session_last_seq ?? activeSessionLastSeq;
+      applyConversationStateSnapshot(historyResult.value.state_snapshot);
       olderMessagesCursor = messageHistoryOlderCursor(historyResult.value);
       hasOlderMessages = Boolean(historyResult.value.has_more && olderMessagesCursor);
       timeline = applyActiveToolOutputSnapshots(
@@ -2787,14 +2971,14 @@ import X from 'lucide-svelte/icons/x';
   async function openConversation(conversationId: string): Promise<void> {
     if (!conversationId) {
       initializing = false;
-      switchingConversation = false;
+      resetConversationSwitch();
       initialConversationResolved = true;
       return;
     }
 
     if (conversationId === activeConversationId && currentConversation) {
       initializing = false;
-      switchingConversation = false;
+      resetConversationSwitch();
       initialConversationResolved = true;
       return;
     }
@@ -2802,10 +2986,10 @@ import X from 'lucide-svelte/icons/x';
     const requestId = beginConversationLoad();
     const previousConversationId = activeConversationId;
     const isInitialLoad = !initialConversationResolved && !currentConversation;
+    const switchRequestId = beginConversationSwitch(conversationId, !isInitialLoad);
     saveCurrentConversationView();
 
     showAgentProfile = false;
-    switchingConversation = !isInitialLoad;
     error = '';
     historyError = '';
     sessionsError = '';
@@ -2820,9 +3004,20 @@ import X from 'lucide-svelte/icons/x';
       wsClient.unsubscribeConversation(previousConversationId);
     }
 
+    const cachedEntry = conversationViewCache.get(conversationId);
+    if (cachedEntry && isAgentDirectConversation(cachedEntry.conversation)) {
+      conversationViewCache.delete(conversationId);
+    }
+
     const cachedView = restoreConversationView(conversationId);
     if (cachedView) {
-      switchingConversation = false;
+      if (isAgentDirectConversation(cachedView.conversation)) {
+        await clearSelectedAgentFilterForDirectChat();
+        if (isStaleConversationLoad(requestId)) {
+          return;
+        }
+      }
+      resetConversationSwitch();
       initializing = false;
       initialConversationResolved = true;
       stopInitialLoadTimeout();
@@ -2872,11 +3067,12 @@ import X from 'lucide-svelte/icons/x';
         if (!isStaleConversationLoad(requestId)) {
           conversationSubloadsLoading = false;
           cachedConversationRefreshing = false;
-          switchingConversation = false;
         }
       }
       return;
     }
+
+    clearConversationViewState();
 
     try {
       const conversation = await api.conversations.detail(conversationId);
@@ -2894,28 +3090,20 @@ import X from 'lucide-svelte/icons/x';
           return;
         }
       }
+      if (isAgentDirectConversation(conversation)) {
+        await clearSelectedAgentFilterForDirectChat();
+        if (isStaleConversationLoad(requestId)) {
+          return;
+        }
+      }
 
       activeConversationId = conversationId;
       currentConversation = conversation;
-      activeSessionLastSeq = 0;
-      olderMessagesCursor = null;
-      hasOlderMessages = false;
       initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
       mergeConversationList([conversation]);
       patchAgentDirectChat(conversation);
-      queuedCount = 0;
-      queuedMessages = [];
       void refreshQueuedMessages(conversationId);
-      turnInProgress = false;
-      awaitingAssistantStart = false;
-      pendingDirectQuestion = null;
-      pendingCredentialRequest = null;
-      directQuestionSubmitting = false;
-      lastRecoverableMessage = '';
-      editingTitle = false;
-      contextUsage = null;
-      subSessionPanelOpen = false;
       wsClient.subscribeConversation(
         conversationId,
         0,
@@ -2969,12 +3157,12 @@ import X from 'lucide-svelte/icons/x';
     } finally {
       if (!isStaleConversationLoad(requestId)) {
         initializing = false;
-        switchingConversation = false;
         initialConversationResolved = true;
         if (currentConversation || error) {
           stopInitialLoadTimeout();
         }
       }
+      finishConversationSwitch(conversationId, switchRequestId);
     }
   }
 
@@ -3398,7 +3586,7 @@ import X from 'lucide-svelte/icons/x';
     const isSlashCommand = isSystemSlashCommand(content);
     const outboundContent = isSlashCommand ? normalizedSlashCommand : content;
 
-    // Detect a `step_request_input` tool call sitting in the timeline
+    // Detect a `step_request_questions` tool call sitting in the timeline
     // waiting for a reply. This is the source-of-truth signal that the
     // agent loop is paused for user input. `pendingDirectQuestion` is a
     // mirror of the same state but can drift (stale fetch, missed WS
@@ -3411,8 +3599,12 @@ import X from 'lucide-svelte/icons/x';
       addToast('Attachments are not supported for clarification responses.', 'error');
       return;
     }
+    if (isStepInputReply && pendingDirectQuestion?.structured && pendingDirectQuestion.kind !== 'auth_challenge') {
+      addToast('This question set needs structured answers. Open the task view to answer it.', 'error');
+      return;
+    }
 
-    // Optimistic UI. When the message is a step_request_input reply we do
+    // Optimistic UI. When the message is a step_request_questions reply we do
     // not append a separate user bubble — the tool call block will show the
     // user's answer inline as the resolution. Adding a bubble too would
     // duplicate the content and leave the tool call block stuck as pending.
@@ -3427,9 +3619,11 @@ import X from 'lucide-svelte/icons/x';
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
       awaitingAssistantStart = true;
+      turnInProgress = true;
+      activeTurnChatMode = persistentChatMode;
       patchConversationInList(
         currentConversation.conversation_id,
-        { has_unread: false },
+        optimisticConversationTurnPatch(persistentChatMode),
         { touchLastMessageAt: true }
       );
     }
@@ -3483,11 +3677,28 @@ import X from 'lucide-svelte/icons/x';
             ? (pendingStepTool.arguments.step_name as string)
             : pendingDirectQuestion?.stepName;
         haptic.success();
-        wsClient.respondStepQuestion(notificationId, content, stepName);
+        if (pendingDirectQuestion?.kind === 'auth_challenge') {
+          wsClient.respondAuthChallenge(notificationId, content, stepName);
+        } else {
+          wsClient.respondStepQuestion(
+            notificationId,
+            {
+              mode: 'structured',
+              answers: [
+                {
+                  question_id: pendingDirectQuestion?.questionId ?? 'q1',
+                  selected_option_ids: [],
+                  custom_answer: content
+                }
+              ]
+            },
+            stepName
+          );
+        }
         return;
       }
 
-      // Fall back to a regular message: we saw a pending step_request_input
+      // Fall back to a regular message: we saw a pending step_request_questions
       // but could not resolve a notification_id. Replace the missing
       // optimistic bubble so the user still sees their message.
       timeline = appendOptimisticUserMessage(timeline, content, attachments);
@@ -3586,6 +3797,13 @@ import X from 'lucide-svelte/icons/x';
   async function retryLastTurn(): Promise<void> {
     if (!currentConversation || !lastSubmittedMessage) return;
     composer = lastSubmittedMessage;
+    syncComposerHeight();
+    await handleSend();
+  }
+
+  async function continueFailedTurn(): Promise<void> {
+    if (!currentConversation || !canRetryFailedTurn) return;
+    composer = 'Continue';
     syncComposerHeight();
     await handleSend();
   }
@@ -3712,16 +3930,80 @@ import X from 'lucide-svelte/icons/x';
     return conversationsApi.historyPage(conversationId, 200, before);
   }
 
+  async function openCreatedConversation(conversationId: string): Promise<void> {
+    let createdConversation: Conversation | null = null;
+
+    try {
+      createdConversation = await api.conversations.detail(conversationId);
+      const desiredStatusFilter = conversationStatusFilterForConversation(createdConversation, selectedConversationStatus);
+      if (selectedConversationStatus !== desiredStatusFilter) {
+        selectedConversationStatus = desiredStatusFilter;
+      }
+      mergeConversationList([createdConversation]);
+      patchAgentDirectChat(createdConversation);
+    } catch {
+      // Navigation will let the regular conversation loader surface detail
+      // failures; the sidebar refresh below is only opportunistic.
+    }
+
+    await goto(conversationUrl(conversationId));
+
+    void refreshSidebarData()
+      .then(() => {
+        if (createdConversation) {
+          mergeConversationList([createdConversation]);
+          patchAgentDirectChat(createdConversation);
+        }
+      })
+      .catch(() => {
+        if (createdConversation) {
+          mergeConversationList([createdConversation]);
+          patchAgentDirectChat(createdConversation);
+        }
+      });
+  }
+
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
     const currentId = conversationIdFromRoute();
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
+    if (event.type === 'conversation_created') {
+      void openCreatedConversation(event.conversation_id);
+      return;
+    }
+    if (
+      event.type === 'conversation_updated'
+      && typeof (event as { created_conversation_id?: unknown }).created_conversation_id === 'string'
+    ) {
+      void refreshSidebarData();
+    }
+
     if ('conversation_id' in event && event.conversation_id && event.conversation_id !== currentId) {
       // Event for a different conversation — mark it as unread locally
       // and show a browser notification if appropriate.
       const otherConvId = event.conversation_id;
+      if (event.type === 'conversation_state_snapshot') {
+        const todos = backendTodoSnapshot(event.state);
+        if (todos !== null) {
+          setConversationTodoSnapshot(otherConvId, todos);
+        }
+        patchConversationInList(otherConvId, conversationStateConversationPatch(event.state));
+        return;
+      }
+      if (event.type === 'conversation_state_delta') {
+        const replacement = event.replace?.state;
+        if (replacement && typeof replacement === 'object') {
+          const state = replacement as ConversationStateEnvelope;
+          const todos = backendTodoSnapshot(state);
+          if (todos !== null) {
+            setConversationTodoSnapshot(otherConvId, todos);
+          }
+          patchConversationInList(otherConvId, conversationStateConversationPatch(state));
+        }
+        return;
+      }
       recordTodoSnapshotFromSocketEvent(event);
       if (event.type === 'conversation_updated' && event.conversation_id) {
-        const patch = websocketConversationPatch(event);
+        const patch = conversationUpdatedRowPatch(event);
         if (Object.keys(patch).length > 0) {
           patchConversationInList(event.conversation_id, patch, {
             touchUpdatedAt: typeof event.title === 'string' || typeof event.updated_at === 'string',
@@ -3759,16 +4041,23 @@ import X from 'lucide-svelte/icons/x';
           (item) => item.conversation.conversation_id === otherConvId
         )?.conversation;
         const conversation = idx >= 0 ? conversations[idx] : agentDirectConversation ?? null;
+        const agentWorkConversation = isManagedConversation(conversation);
         if (idx >= 0) {
           if (event.type === 'message_complete') {
             patchConversationInList(
               otherConvId,
-              { has_unread: true, last_message_at: event.completed_at ?? undefined },
+              {
+                has_unread: !agentWorkConversation,
+                last_message_at: event.completed_at ?? undefined,
+              },
               { touchLastMessageAt: true }
             );
           } else {
-            patchConversationInList(otherConvId, { has_unread: true });
+            patchConversationInList(otherConvId, { has_unread: !agentWorkConversation });
           }
+        }
+        if (agentWorkConversation) {
+          return;
         }
         // Browser notification
         const convTitle = conversation?.title ?? 'Conversation';
@@ -3800,6 +4089,19 @@ import X from 'lucide-svelte/icons/x';
         rootSessionId: currentConversation?.active_session_id,
       })
     ) {
+      return;
+    }
+
+    if (event.type === 'session_compaction_started') {
+      timeline = applyWebSocketEvent(timeline, event);
+      syncVisibleWindow();
+      scrollToBottom();
+      return;
+    }
+
+    if (event.type === 'session_compaction_finished') {
+      timeline = applyWebSocketEvent(timeline, event);
+      syncVisibleWindow();
       return;
     }
 
@@ -3912,6 +4214,16 @@ import X from 'lucide-svelte/icons/x';
       if (event.recoverable) {
         lastRecoverableMessage = lastSubmittedMessage;
       }
+      return;
+    }
+
+    if (event.type === 'conversation_state_snapshot') {
+      applyConversationStateSnapshot(event.state);
+      return;
+    }
+
+    if (event.type === 'conversation_state_delta') {
+      applyConversationStateDelta(event);
       return;
     }
 
@@ -4029,7 +4341,7 @@ import X from 'lucide-svelte/icons/x';
     // Handle conversation_updated for title and activity changes.
     if (event.type === 'conversation_updated') {
       if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
-        const patch = websocketConversationPatch(event);
+        const patch = conversationUpdatedRowPatch(event);
         if (typeof event.has_active_turn === 'boolean') {
           turnInProgress = event.has_active_turn;
         }
@@ -4149,27 +4461,17 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    // Handle conversation_created: navigate to new conversation
-    if (event.type === 'conversation_created') {
-      api.conversations.detail(event.conversation_id)
-        .then((conversation) => { mergeConversationList([conversation]); })
-        .catch(() => {});
-      void goto(conversationUrl(event.conversation_id));
-      return;
-    }
-
     if (event.type === 'workflow_step_question' && event.notification_id) {
-      // Annotate the matching step_request_input tool call so the user's
+      // Annotate the matching step_request_questions tool call so the user's
       // next reply can be routed to `respondStepQuestion` even if this
       // banner-level pendingDirectQuestion state gets cleared (reload,
       // compaction, or a message_complete arriving during submission).
       timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
       if (!event.task_id) {
-        pendingDirectQuestion = pendingDirectQuestionFromParts(
+        pendingDirectQuestion = pendingDirectQuestionFromQuestionSet(
           event.notification_id,
           event.step_name,
-          event.question,
-          event.options,
+          event.questions,
           event.context,
         );
         directQuestionSubmitting = false;
@@ -4182,14 +4484,7 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'auth_challenge' && event.notification_id) {
       timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
       if (!event.task_id) {
-        pendingDirectQuestion = pendingDirectQuestionFromParts(
-          event.notification_id,
-          event.step_name,
-          event.message ?? event.label,
-          [],
-          event.metadata,
-          event.type,
-        );
+        pendingDirectQuestion = pendingDirectQuestionFromAuthChallengeEvent(event);
         directQuestionSubmitting = false;
         awaitingAssistantStart = false;
         turnInProgress = false;
@@ -4363,12 +4658,16 @@ import X from 'lucide-svelte/icons/x';
   }
 
   $effect(() => {
-    if (page.params.conversationId && page.params.conversationId !== activeConversationId) {
-      void openConversation(page.params.conversationId);
-    } else if (!page.params.conversationId) {
-      initializing = false;
-      initialConversationResolved = true;
-    }
+    const conversationId = routeConversationId;
+    untrack(() => {
+      if (conversationId) {
+        void openConversation(conversationId);
+      } else {
+        initializing = false;
+        resetConversationSwitch();
+        initialConversationResolved = true;
+      }
+    });
   });
 
   $effect(() => {
@@ -4512,6 +4811,15 @@ import X from 'lucide-svelte/icons/x';
     return sortAgentDirectChats(agentDirectChats);
   });
   let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
+  const canRetryFailedTurn = $derived.by(() =>
+    Boolean(currentConversation)
+      && !turnInProgress
+      && !awaitingAssistantStart
+      && !pendingDirectQuestion
+      && !directQuestionSubmitting
+      && !isReadOnly(currentConversation)
+      && hasRetryableFailedTurnTail(displayedTimeline)
+  );
   let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
   let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
 
@@ -4736,7 +5044,7 @@ import X from 'lucide-svelte/icons/x';
             >
               <option value="all">All channels</option>
               {#each channelTypes() as ch}
-                <option value={ch}>{ch.charAt(0).toUpperCase() + ch.slice(1)}</option>
+                <option value={ch}>{channelDisplayLabel(ch)}</option>
               {/each}
             </select>
           </label>
@@ -4752,9 +5060,8 @@ import X from 'lucide-svelte/icons/x';
               {#each visibleAgentDirectChats as item}
                 {@const conversation = item.conversation}
                 {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
-                {@const unread = conversation.has_unread && !isActive}
                 {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
-                {@const showAttentionDot = (unread || conversationHasAttention(conversation)) && !inProgress}
+                {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
                 {@const attentionDescription = conversationAttentionDescription(conversation)}
                 {@const turnMode = conversationChatMode(conversation)}
                 <a
@@ -4966,7 +5273,7 @@ import X from 'lucide-svelte/icons/x';
               {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
               {@const unread = conversation.has_unread && !isActive}
               {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
-              {@const showAttentionDot = (unread || conversationHasAttention(conversation)) && !inProgress}
+              {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
               {@const attentionDescription = conversationAttentionDescription(conversation)}
               {@const turnMode = conversationChatMode(conversation)}
               {@const rowTodoProgressTodos = conversationTodoProgressTodos(conversation)}
@@ -5555,8 +5862,9 @@ import X from 'lucide-svelte/icons/x';
             {#if queuedMessages.length > 0}
               <div class="mt-3 space-y-1.5">
                 {#each queuedMessages as queued (queued.queue_id)}
+                  {@const canMutateQueue = canMutateQueuedMessages()}
                   {@const isExpanded = queueIsExpanded(queued.queue_id)}
-                  {@const isEditing = queueEditingId === queued.queue_id}
+                  {@const isEditing = canMutateQueue && queueEditingId === queued.queue_id}
                   <div class="rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
                     <div class="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
                       <span class="shrink-0 rounded-full border border-sky-300/20 bg-sky-400/10 px-2 py-0.5 text-[11px] font-medium text-sky-100">#{queued.position}</span>
@@ -5567,8 +5875,10 @@ import X from 'lucide-svelte/icons/x';
                       {/if}
                       <div class="ml-auto flex shrink-0 items-center gap-1.5">
                         <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queued message #${queued.position}`} onclick={() => toggleQueuedMessage(queued.queue_id)}>{isExpanded ? 'Collapse' : 'Details'}</Button>
-                        <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} onclick={() => startQueuedMessageEdit(queued)}>Edit</Button>
-                        <Button size="sm" variant="danger" disabled={queueBusyId === queued.queue_id} onclick={() => void deleteQueuedMessage(queued.queue_id)}>Delete</Button>
+                        {#if canMutateQueue}
+                          <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} onclick={() => startQueuedMessageEdit(queued)}>Edit</Button>
+                          <Button size="sm" variant="danger" disabled={queueBusyId === queued.queue_id} onclick={() => void deleteQueuedMessage(queued.queue_id)}>Delete</Button>
+                        {/if}
                       </div>
                     </div>
                     {#if isExpanded || isEditing}
@@ -5613,6 +5923,17 @@ import X from 'lucide-svelte/icons/x';
                   <X class="h-4 w-4" />
                 </button>
               </div>
+            </div>
+          </div>
+        {/if}
+
+        {#if !error && canRetryFailedTurn}
+          <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-3 py-3 text-sm text-rose-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="min-w-0 flex-1 break-words">
+                The last turn failed after your message. Retry it instead of typing continue.
+              </p>
+              <Button size="sm" variant="secondary" onclick={continueFailedTurn}>Retry failed turn</Button>
             </div>
           </div>
         {/if}
@@ -5837,7 +6158,30 @@ import X from 'lucide-svelte/icons/x';
           {/if}
 
           <!-- Composer or read-only banner -->
-          {#if currentConversation && !isWebConversation(currentConversation)}
+          {#if currentConversation && isManagedConversation(currentConversation)}
+            <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                  <p class="font-medium">Agent work</p>
+                  <p class="mt-1 text-sky-100/80">
+                    Read-only target conversation · state {managedConversationState(currentConversation)} · turn {managedTurnState(currentConversation)}
+                  </p>
+                  {#if currentConversation.managed_agent?.controller_conversation_id}
+                    <a
+                      class="mt-2 inline-flex items-center gap-1 text-xs font-medium text-sky-100 underline-offset-4 hover:underline"
+                      href={conversationUrl(currentConversation.managed_agent.controller_conversation_id)}
+                    >
+                      Open controlling conversation
+                      <ExternalLink class="h-3 w-3" />
+                    </a>
+                  {/if}
+                  {#if currentConversation.managed_agent?.last_error && managedTurnState(currentConversation) !== 'running' && managedTurnState(currentConversation) !== 'queued'}
+                    <p class="mt-2 break-words text-xs text-rose-100">Last error: {currentConversation.managed_agent.last_error}</p>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          {:else if currentConversation && !isWebConversation(currentConversation)}
             <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
               This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
             </div>

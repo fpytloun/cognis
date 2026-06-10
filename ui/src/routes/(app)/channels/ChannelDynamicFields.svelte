@@ -7,6 +7,15 @@
   export let draft: ChannelEditorDraft;
   export let editing = false;
   export let credentialOverrides: Record<string, string> = {};
+
+  function optionLabel(fieldName: string, option: string): string {
+    if (fieldName === 'assistant_delivery_mode') {
+      if (option === 'final_only') return 'Final';
+      if (option === 'concatenated') return 'Concatenated';
+      if (option === 'immediate') return 'Immediate';
+    }
+    return option;
+  }
 </script>
 
 {#each meta.credential_fields as field}
@@ -39,7 +48,7 @@
     {#if field.field_type === 'select' && field.options}
       <select bind:value={draft.settingValues[field.name]} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
         {#each field.options as option}
-          <option value={option}>{option}</option>
+          <option value={option}>{optionLabel(field.name, option)}</option>
         {/each}
       </select>
     {:else if field.field_type === 'boolean'}

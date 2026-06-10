@@ -1,8 +1,10 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import { api } from '$lib/api/client';
+  import { policyFromText } from '$lib/session-policy';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
   import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
 
@@ -37,6 +39,7 @@
       completion_mode_family: 'default' | 'direct';
       allow_silent_completion: boolean;
       interaction_mode_override: 'none' | 'explicit_gates' | 'step_requests' | null;
+      session_policy: ReturnType<typeof policyFromText>;
       status: string;
     }) => void;
   }>();
@@ -65,7 +68,9 @@
     delivery_target: '',
     completion_mode_family: 'default' as 'default' | 'direct',
     allow_silent_completion: false,
-    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests'
+    interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
+    allow_policy_text: '',
+    deny_policy_text: ''
   });
 
   function handleSubmit(): void {
@@ -85,6 +90,7 @@
       completion_mode_family: form.completion_mode_family,
       allow_silent_completion: form.allow_silent_completion,
       interaction_mode_override: form.interaction_mode_override || null,
+      session_policy: policyFromText(form.allow_policy_text, form.deny_policy_text),
       status: 'draft'
     });
   }
@@ -246,6 +252,12 @@
         </select>
         <p class="text-xs text-slate-500">Workflow default allows clarification in selected planning steps. Fully autonomous disables dynamic questions.</p>
       </div>
+
+      <SessionPolicyEditor
+        bind:allowText={form.allow_policy_text}
+        bind:denyText={form.deny_policy_text}
+        title="Intaris session policies"
+      />
     </div>
 
   {/snippet}
