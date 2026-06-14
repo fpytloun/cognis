@@ -8,7 +8,6 @@ from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
-
 REPO_ROOT = Path(__file__).resolve().parent
 UI_DIR = REPO_ROOT / "ui"
 UI_BUILD_DIR = UI_DIR / "build"

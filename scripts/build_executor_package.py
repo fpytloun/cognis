@@ -9,7 +9,6 @@ import textwrap
 import tomllib
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_PACKAGE_DIR = REPO_ROOT / "cognis"
 ROOT_PYPROJECT = REPO_ROOT / "pyproject.toml"

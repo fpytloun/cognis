@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.8.0"
+version = "0.9.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }

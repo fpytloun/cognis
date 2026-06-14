@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2026-06-14
+
+### Added
+
+- Added runtime profiles and per-agent execution profile controls across agents, schedules, workflows, APIs, bootstrap, migrations, and UI forms.
+- Added system tool override management for agents, including MCP/system tool toggles and regression coverage.
+- Added certified Signal CLI runtime management with install validation, direct JSON-RPC receive mode, and receive-mode tests.
+- Added hidden-user projection support for provider controller notices and expanded Anthropic proxy/tool discovery compatibility.
+
+### Changed
+
+- Improved agent loop, workflow engine, tool exposure, context assembly, and delegation routing to respect profile-scoped execution and conversation surfaces.
+- Improved message projection and LLM provider handling for Anthropic-compatible proxies, tool argument schemas, deferred loading, and search tool discovery.
+- Refined task, schedule, and workflow serialization surfaces for runtime profile metadata and execution selectors.
+- Expanded UI and unit coverage for agent profiles, tool exposure, direct Signal receive mode, workflow runtime behavior, and provider projection.
+
+### Fixed
+
+- Fixed cross-agent profile leakage in delegated conversations and isolated conversation profiles by agent.
+- Fixed classified tool execution metadata usage, channel read receipts, history cursors, and chat reset handling.
+- Fixed Signal direct receive notification handling and JSON-RPC startup behavior.
+- Fixed workflow evaluation evidence to include session tool events and deferred tasks while executors reconnect.
+
 ## [0.8.0] - 2026-06-10
 
 ### Added
