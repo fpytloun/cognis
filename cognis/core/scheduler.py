@@ -278,6 +278,7 @@ class Scheduler:
             task = await self._task_queue.submit(
                 created_by=sched.created_by,
                 agent_id=sched.agent_id,
+                agent_profile_id=getattr(sched, "agent_profile_id", None),
                 title=str(title),
                 description=str(description),
                 expected_output=expected_output,

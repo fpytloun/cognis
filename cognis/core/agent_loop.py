@@ -30,6 +30,11 @@ from prometheus_client import Counter, Histogram
 from pydantic import ValidationError
 
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.agent_profiles import (
+    normalize_agent_profile_id,
+    requested_agent_profile_id,
+    resolve_agent_profile,
+)
 from cognis.core.anchored_output import AnchoredTextBuilder, compact_snippet
 from cognis.core.attachment_utils import (
     attachment_note,
@@ -120,6 +125,7 @@ from cognis.core.tool_exposure import (
     ToolDiscoveryMode,
     ToolExposureContract,
     prepare_tool_exposure,
+    reverse_tool_argument_aliases,
 )
 from cognis.core.tool_output_presentation import build_transport_tool_output_preview
 from cognis.core.truncation import middle_truncate
@@ -199,6 +205,7 @@ from cognis.tools.builtin.tool_output import is_tool_output_tool
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 from cognis.tools.classification import classify_tool_definitions_sync, resolve_tool_classifications
 from cognis.tools.executor.project_context import INTERNAL_PROJECT_CONTEXT_PROBE_TOOL
+from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 logger = get_logger(__name__)
 
@@ -1532,6 +1539,7 @@ def _task_row_to_model(task_row: Any) -> Any:
             "priority": getattr(task_row, "priority", 0),
             "created_by": getattr(task_row, "created_by", "unknown@example.com"),
             "agent_id": task_row.agent_id,
+            "agent_profile_id": getattr(task_row, "agent_profile_id", None),
             "created_by_agent_id": getattr(task_row, "created_by_agent_id", None),
             "source_type": getattr(task_row, "source_type", "agent"),
             "source_ref": getattr(task_row, "source_ref", None),
@@ -5258,16 +5266,27 @@ class AgentLoop:
                     }
                 )
 
-            # Resolve model and reasoning effort for this turn.
-            # Chain: session override → workflow step default → agent config → provider default.
-            model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
-                ctx.agent.llm_config.model if ctx.agent.llm_config else None
+            resolved_agent_profile = resolve_agent_profile(
+                ctx.agent,
+                requested_agent_profile_id(ctx.session, ctx.conversation),
+                source="conversation",
             )
-            provider_for_llm = ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
+            ctx.runtime_info.update(resolved_agent_profile.audit_metadata())
+
+            # Resolve model and reasoning effort for this turn.
+            # Chain: session override → agent profile → agent config → provider default.
+            model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
+                resolved_agent_profile.model
+                or (ctx.agent.llm_config.model if ctx.agent.llm_config else None)
+            )
+            provider_for_llm = resolved_agent_profile.provider_id or (
+                ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
+            )
 
             reasoning_effort = (
                 self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
                 or getattr(ctx.step_definition, "reasoning_effort", None)
+                or resolved_agent_profile.reasoning_effort
                 or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
             )
             ctx.runtime_info["current_reasoning_effort"] = reasoning_effort
@@ -5523,7 +5542,9 @@ class AgentLoop:
                         source="tool_discovery_guidance",
                         content=(
                             "Additional tools may be available but hidden by the current step profile. "
-                            "Use search_tools when you need a capability not currently visible."
+                            "You MUST call search_tools when you need a capability not currently visible, "
+                            "including Slack, Alertmanager, Mimir/Loki, skill_load, browser, filesystem, "
+                            "shell, or other MCP/external-service tools."
                         ),
                     )
                 else:
@@ -6450,6 +6471,12 @@ class AgentLoop:
                         },
                     )
                     tc.name = mapped_name
+                argument_alias_tree = exposure.argument_alias_map.get(tc.name)
+                if argument_alias_tree:
+                    tc.arguments = reverse_tool_argument_aliases(
+                        tc.arguments,
+                        argument_alias_tree,
+                    )
 
             if finish_reason == "content_filter":
                 error_notice = (
@@ -6807,7 +6834,7 @@ class AgentLoop:
                     assistant_tool_message["_responses_output_items"] = responses_output_items
                 messages.append(assistant_tool_message)
 
-            delegation_spawned = False
+            async_orchestration_spawned = False
             restart_llm_cycle = False
             prepared_regular_batch: list[_PreparedRegularToolCall] = []
             post_tool_system_messages: list[dict[str, Any]] = []
@@ -8259,6 +8286,7 @@ class AgentLoop:
                         "kind": tc.arguments.get("kind"),
                         "scope": tc.arguments.get("scope", "user"),
                         "agent_id": tc.arguments.get("agent_id"),
+                        "agent_profile_id": tc.arguments.get("agent_profile_id"),
                         "label": tc.arguments.get("label")
                         or tc.arguments.get("credential_id")
                         or "Authentication required",
@@ -8674,9 +8702,15 @@ class AgentLoop:
                             None,
                             None,
                         )
-                    # Check if an async delegation was spawned
+                    # Check if async orchestration was spawned.  Fire-and-follow-up
+                    # orchestration must end the parent turn instead of continuing
+                    # the same scoped work "in the meantime".
                     if orch_result.metadata and orch_result.metadata.get("delegation_spawned"):
-                        delegation_spawned = True
+                        async_orchestration_spawned = True
+                    if orch_result.metadata and orch_result.metadata.get(
+                        "async_orchestration_spawned"
+                    ):
+                        async_orchestration_spawned = True
                     continue
 
                 else:
@@ -8894,12 +8928,12 @@ class AgentLoop:
                 )
                 break
 
-            # Delegation spawned — end the parent turn after processing
-            # the full tool batch.  The child runs in the background and
-            # a follow-up turn will be triggered on completion.
-            if delegation_spawned:
+            # Async orchestration spawned — end the parent turn after
+            # processing the full tool batch.  The child runs in the
+            # background and a follow-up turn will be triggered on completion.
+            if async_orchestration_spawned:
                 step_output = StepOutput(
-                    summary="Delegation spawned — working in background.",
+                    summary="Async orchestration spawned — working in background.",
                     content="\n\n".join(assistant_content_parts),
                     attachments=list(collected_attachments),
                 )
@@ -9145,7 +9179,7 @@ class AgentLoop:
                 ),
                 ctx.session,
                 ctx.agent,
-                self._get_tool_registry(ctx),
+                self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
                 self._get_executor(ctx),
             )
             self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
@@ -9516,6 +9550,7 @@ class AgentLoop:
                 "input_redacted": True,
                 "agent_id": child_session.agent_id,
                 "used_agent_id": child_session.agent_id,
+                "agent_profile_id": getattr(child_session, "agent_profile_id", None),
                 "child_session_id": child_session.session_id,
                 "child_intaris_session_id": child_intaris_id,
                 "wait": wait,
@@ -9547,6 +9582,7 @@ class AgentLoop:
                     "mode": "delegate",
                     "agent_id": child_session.agent_id,
                     "used_agent_id": child_session.agent_id,
+                    "agent_profile_id": getattr(child_session, "agent_profile_id", None),
                     "title": _delegation_title(tc.arguments),
                     "task_title": _delegation_title(tc.arguments),
                     "input_redacted": True,
@@ -9704,12 +9740,13 @@ class AgentLoop:
             child_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
             await self._track_child(ctx.session.session_id, child_session.session_id, child_task)
             DELEGATIONS_TOTAL.labels(status="spawned").inc()
-            # Mark delegation_spawned in metadata so the caller ends the turn
+            # Mark async orchestration in metadata so the caller ends the turn.
             result_with_flag = ToolResult(
                 output=result.output,
                 metadata={
                     **(result.metadata or {}),
                     "delegation_spawned": True,
+                    "async_orchestration_spawned": True,
                 },
             )
             return result_with_flag
@@ -10064,6 +10101,13 @@ class AgentLoop:
 
         if tc.name == "agent_conversation_create":
             agent_id = str(tc.arguments.get("agent_id") or "").strip()
+            try:
+                agent_profile_id = normalize_agent_profile_id(tc.arguments.get("agent_profile_id"))
+            except ValueError as exc:
+                return ToolResult(
+                    output=json.dumps({"status": "error", "message": str(exc)}),
+                    is_error=True,
+                )
             title = str(tc.arguments.get("title") or "").strip()
             initial_message = str(tc.arguments.get("initial_message") or "").strip()
             wait = bool(tc.arguments.get("wait", False))
@@ -10088,6 +10132,14 @@ class AgentLoop:
                     output=json.dumps({"status": "error", "message": str(exc)}),
                     is_error=True,
                 )
+            if agent_profile_id is not None:
+                try:
+                    resolve_agent_profile(target_agent, agent_profile_id, source="managed_explicit")
+                except ValueError as exc:
+                    return ToolResult(
+                        output=json.dumps({"status": "error", "message": str(exc)}),
+                        is_error=True,
+                    )
             managed_context = ConversationContext(
                 type="agent_work",
                 ref=controller_conversation_id,
@@ -10097,6 +10149,7 @@ class AgentLoop:
                     "controller_conversation_id": controller_conversation_id,
                     "controller_session_id": controller_session_id,
                     "target_agent_id": target_agent.agent_id,
+                    "target_agent_profile_id": agent_profile_id,
                     "provenance_in_prefix": True,
                 },
                 memory_labels={},
@@ -10107,6 +10160,7 @@ class AgentLoop:
             ) = await self.session_manager.create_conversation_with_root_session(
                 user_email=user_email,
                 agent_id=target_agent.agent_id,
+                agent_profile_id=agent_profile_id,
                 context=managed_context,
                 title=title,
                 title_source="managed_agent",
@@ -10121,6 +10175,7 @@ class AgentLoop:
                     controller_conversation_id=controller_conversation_id,
                     controller_session_id=controller_session_id,
                     target_agent_id=target_agent.agent_id,
+                    target_agent_profile_id=agent_profile_id,
                     target_conversation_id=conversation.conversation_id,
                     target_session_id=session.session_id,
                     title=title,
@@ -10200,7 +10255,11 @@ class AgentLoop:
                     },
                     default=str,
                 ),
-                metadata={"orchestration": True, "mode": "managed_conversation"},
+                metadata={
+                    "orchestration": True,
+                    "mode": "managed_conversation",
+                    "async_orchestration_spawned": True,
+                },
             )
 
         if tc.name == "agent_conversation_send":
@@ -10314,7 +10373,11 @@ class AgentLoop:
                     {"status": "accepted", "conversation": _row_payload(link)},
                     default=str,
                 ),
-                metadata={"orchestration": True, "mode": "managed_conversation"},
+                metadata={
+                    "orchestration": True,
+                    "mode": "managed_conversation",
+                    "async_orchestration_spawned": True,
+                },
             )
 
         if tc.name == "agent_conversation_retry":
@@ -10420,7 +10483,11 @@ class AgentLoop:
                     {"status": "accepted", "conversation": _row_payload(link)},
                     default=str,
                 ),
-                metadata={"orchestration": True, "mode": "managed_conversation"},
+                metadata={
+                    "orchestration": True,
+                    "mode": "managed_conversation",
+                    "async_orchestration_spawned": True,
+                },
             )
 
         if tc.name == "agent_conversation_wait":
@@ -10629,6 +10696,7 @@ class AgentLoop:
                 )
             )
             message = str(tc.arguments.get("message") or "").strip()
+            started_async_turn = False
             if message:
                 error = await self._turn_scheduler.submit_turn(
                     new_conversation.conversation_id,
@@ -10673,6 +10741,7 @@ class AgentLoop:
                             default=str,
                         )
                     )
+                started_async_turn = True
             return ToolResult(
                 output=json.dumps(
                     {
@@ -10681,7 +10750,14 @@ class AgentLoop:
                         "copied": copied,
                     },
                     default=str,
-                )
+                ),
+                metadata={
+                    "orchestration": True,
+                    "mode": "managed_conversation",
+                    "async_orchestration_spawned": True,
+                }
+                if started_async_turn
+                else None,
             )
 
         return ToolResult(
@@ -10751,6 +10827,29 @@ class AgentLoop:
                         ),
                         is_error=True,
                     )
+                try:
+                    task_agent_profile_id = normalize_agent_profile_id(
+                        tc.arguments.get("agent_profile_id")
+                    )
+                except ValueError as exc:
+                    return ToolResult(
+                        output=json.dumps({"status": "error", "message": str(exc)}),
+                        is_error=True,
+                    )
+                if task_agent_profile_id is not None:
+                    from cognis.core.agent_registry import _row_to_definition
+
+                    try:
+                        resolve_agent_profile(
+                            _row_to_definition(agent_row),
+                            task_agent_profile_id,
+                            source="task_explicit",
+                        )
+                    except ValueError as exc:
+                        return ToolResult(
+                            output=json.dumps({"status": "error", "message": str(exc)}),
+                            is_error=True,
+                        )
 
                 workflow_id = tc.arguments.get("workflow_id")
                 if isinstance(workflow_id, str) and not workflow_id.strip():
@@ -10819,6 +10918,7 @@ class AgentLoop:
                 task = await create_method(
                     created_by=ctx.session.user_email,
                     agent_id=raw_agent_id,
+                    agent_profile_id=task_agent_profile_id,
                     title=tc.arguments.get("title", "Untitled task"),
                     description=tc.arguments.get("description", ""),
                     expected_output=tc.arguments.get("expected_output"),
@@ -10846,6 +10946,7 @@ class AgentLoop:
                             "mode": "task",
                             "call_id": tc.call_id,
                             "task": task.title,
+                            "agent_profile_id": task.agent_profile_id,
                             "child_session_id": task.task_id,
                             "status": "started",
                         },
@@ -10864,6 +10965,7 @@ class AgentLoop:
                             "child_session_id": task.task_id,
                             "mode": "task",
                             "agent_id": task.agent_id,
+                            "agent_profile_id": task.agent_profile_id,
                             "task": task.title,
                         },
                     )
@@ -10875,6 +10977,7 @@ class AgentLoop:
                             "status": requested_status,
                             "task_id": task.task_id,
                             "title": task.title,
+                            "agent_profile_id": task.agent_profile_id,
                             "message": (
                                 "Task created as a draft. Submit it to start execution."
                                 if requested_status == "draft"
@@ -10882,6 +10985,13 @@ class AgentLoop:
                             ),
                         }
                     ),
+                    metadata={
+                        "orchestration": True,
+                        "mode": "task",
+                        "async_orchestration_spawned": True,
+                    }
+                    if requested_status == "queued"
+                    else None,
                 )
             except Exception as exc:
                 return ToolResult(
@@ -12263,6 +12373,24 @@ class AgentLoop:
                 output=json.dumps({"error": "Agent not found or not accessible."}),
                 is_error=True,
             )
+        try:
+            compose_agent_profile_id = normalize_agent_profile_id(args.agent_profile_id)
+        except ValueError as exc:
+            return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
+        if compose_agent_profile_id is not None:
+            from cognis.api.serializers import agent_to_response
+
+            agent_definition = AgentDefinition.model_validate(
+                agent_to_response(agent_row).model_dump()
+            )
+            try:
+                resolve_agent_profile(
+                    agent_definition,
+                    compose_agent_profile_id,
+                    source="compose_and_run_workflow",
+                )
+            except ValueError as exc:
+                return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
 
         def _coerce_skill_tools(value: Any) -> list[dict[str, Any]] | None:
             if value is None:
@@ -12639,6 +12767,7 @@ class AgentLoop:
                     or args.context
                     or args.intent,
                     "agent_id": raw_agent_id,
+                    "agent_profile_id": compose_agent_profile_id,
                     "workflow_id": persisted_workflow_id,
                     "task_template": {
                         "title": title,
@@ -12676,6 +12805,7 @@ class AgentLoop:
                 task = await task_queue.submit(
                     created_by=owner_email,
                     agent_id=raw_agent_id,
+                    agent_profile_id=compose_agent_profile_id,
                     title=title,
                     description=args.context or args.intent,
                     expected_output=expected_output,
@@ -12761,7 +12891,14 @@ class AgentLoop:
                     "workflow_preview": preview,
                     "fallback_used": fallback_used,
                 }
-            )
+            ),
+            metadata={
+                "orchestration": True,
+                "mode": "workflow",
+                "async_orchestration_spawned": True,
+            }
+            if task_id or schedule_id
+            else None,
         )
 
     async def _emergency_flush_events(
@@ -13785,7 +13922,7 @@ class AgentLoop:
                 executor_connection = resolved_conn
 
         try:
-            registry = self._get_tool_registry(ctx)
+            registry = self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx))
             registered = registry.get(tc.name) if registry is not None else None
             if registered is not None:
                 route = str(registered.definition.source.type)
@@ -14007,7 +14144,7 @@ class AgentLoop:
             retry_call,
             ctx.session,
             ctx.agent,
-            self._get_tool_registry(ctx),
+            self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
             conn,
             output_chunk_callback=output_chunk_callback,
         )
@@ -17412,6 +17549,9 @@ class AgentLoop:
             ctx.orchestration_mode,
             expose_delegate_wait_option=surface_policy.expose_delegate_wait_option,
             expose_managed_conversation_tools=surface_policy.expose_managed_conversation_tools,
+            expose_task_tools=surface_policy.expose_task_tools,
+            expose_workflow_tools=surface_policy.expose_workflow_tools,
+            expose_compose_workflow_tool=surface_policy.expose_compose_workflow_tool,
         ):
             tools.append(_to_schema(tool_def))
 
@@ -17730,6 +17870,32 @@ class AgentLoop:
         if ctx.tool_registry is not None:
             return ctx.tool_registry
         return getattr(self.providers, "_tool_registry", None)
+
+    def _get_classified_tool_registry(self, ctx: StepContext, registry: Any | None) -> Any | None:
+        """Return a runtime registry overlaid with step-resolved tool classifications."""
+
+        classified_definitions = getattr(ctx, "classified_tool_definitions", None)
+        if not isinstance(classified_definitions, dict):
+            classified_definitions = None
+        if registry is None or not classified_definitions:
+            return registry
+        if not isinstance(registry, ToolRegistry):
+            return registry
+
+        classified_registry = ToolRegistry()
+        changed = False
+        for registered in registry.items():
+            classified_definition = classified_definitions.get(
+                stable_tool_id(registered.definition)
+            )
+            if classified_definition is None:
+                classified_registry.register(registered)
+                continue
+            changed = True
+            classified_registry.register(
+                RegisteredTool(definition=classified_definition, handler=registered.handler)
+            )
+        return classified_registry if changed else registry
 
     def _get_initial_promoted_tool_ids(self, ctx: StepContext) -> set[str]:
         """Return tool ids that should be promoted visible before any discovery calls.

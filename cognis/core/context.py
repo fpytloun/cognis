@@ -17,7 +17,11 @@ from prometheus_client import Counter
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.agent_direct import is_agent_direct_context
+from cognis.core.agent_profiles import (
+    render_agent_profile_context,
+    requested_agent_profile_id,
+    resolve_agent_profile,
+)
 from cognis.core.attachment_utils import (
     attachment_label as _attachment_label,
 )
@@ -46,7 +50,7 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
     sort_prefix_entries,
 )
-from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES
+from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES, is_web_main_chat_context
 from cognis.core.message_markers import (
     ALL_INTERNAL_MARKERS,
     AUDIT_METADATA,
@@ -400,31 +404,47 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
     return "\n".join(lines)
 
 
-def _build_direct_chat_context_info(context: ConversationContext | None) -> str | None:
-    """Build mutable context for sticky web direct chats with agents."""
+def _build_web_main_chat_context_info(context: ConversationContext | None) -> str | None:
+    """Build mutable context for the DM-like main web chat."""
 
-    if context is None or not is_agent_direct_context(context.type, context.platform_data):
+    if not is_web_main_chat_context(context):
         return None
 
     return "\n".join(
         [
-            "Direct chat context:",
+            "Web main chat context:",
             "- Channel: web",
-            "- Direct agent chat: yes",
+            "- Main web chat: yes",
             "",
-            "Direct chat behavior:",
-            "- This guidance applies only because the current web conversation is a persistent direct chat.",
-            "- Use inline work for quick answers or small actions.",
-            "- Use delegate(wait=true) for specialist exploration, review, or research "
-            "that must finish before you can continue.",
-            "- Use a managed conversation for visible interactive work and create_task "
-            "for heavier workflow-shaped work.",
-            "- If using managed conversation wait=false, treat it as fire-and-follow-up: "
-            "do not continue the same scoped work in parallel; end the parent turn "
-            "when there is no independent work to do.",
+            "Web main chat behavior:",
+            "- This guidance applies only because the current web conversation is the "
+            "DM-like main chat, analogous to a Signal/channel conversation.",
+            "- Keep this chat responsive. Do not optimize for finishing the whole job "
+            "inside the parent turn when a worker can report back later.",
+            "- Use inline work only for quick answers or small actions.",
+            "- Use delegate(wait=true) only for specialist exploration, review, or "
+            "research that must finish before you can continue.",
+            "- Use delegate(wait=false) for bounded, non-interactive worker-style "
+            "lookup or analysis with clear output and one final report.",
+            "- Use agent_conversation_create(wait=false) for visible implementation, "
+            "debugging, CI/build/deploy/browser/external-system, or polling work "
+            "loops where the user may need to inspect or interact.",
+            "- For implementation/debugging managed conversations, prefer starting "
+            'with chat_mode="plan"; after user or main-agent review, continue with '
+            'chat_mode="build". Default mode is acceptable for clearly small '
+            "read-only diagnostics, and build mode is acceptable when explicitly "
+            "requested or obviously safe.",
+            "- Use create_task for durable workflow-shaped work with lifecycle, "
+            "deliverables, review/evaluation, or longer background persistence.",
+            "- wait=false means fire-and-follow-up, not fire-and-duplicate. After "
+            "starting async child work, stop the parent turn unless independent "
+            "parent-side work can safely continue without the child result.",
             "- Use wait=true when the current turn must synthesize the result before replying.",
         ]
     )
+
+
+_build_direct_chat_context_info = _build_web_main_chat_context_info
 
 
 def _build_agent_work_context_info(context: ConversationContext | None) -> str | None:
@@ -448,9 +468,10 @@ def _build_agent_work_context_info(context: ConversationContext | None) -> str |
         "- Treat user messages in this session as instructions from that authenticated internal agent.",
         "- Do not mention this management context unless it is operationally relevant.",
         "- Use inline work for small actions.",
+        "- Implement assigned coding/debugging work directly when it is safe and within scope.",
         "- Use delegate for specialist child work that must finish before this managed turn can continue.",
         "- Avoid asynchronous delegation from managed conversations; prefer wait=true for joined child work.",
-        "- Use create_task only for durable workflow-shaped work where asynchronous completion is appropriate.",
+        "- Do not create tasks or workflows to complete this assigned work. If the work is too broad for this managed conversation, report that limitation to the controller.",
         "- If the controller must decide or start visible asynchronous work, return a concise blocking issue or recommendation.",
     ]
     if controller_conversation_id:
@@ -924,10 +945,22 @@ class ContextAssembler:
         # Format mutable search results
         mutable_search_results = _format_search_results(recall_payload.get("search_results"))
 
-        # Model resolution chain: session override → agent config → system default
+        resolved_agent_profile = resolve_agent_profile(
+            agent,
+            requested_agent_profile_id(session, conversation),
+            source="conversation",
+        )
+
+        # Model resolution chain: session override → agent profile → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
-        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
-        explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        explicit_model = (
+            model_override
+            or resolved_agent_profile.model
+            or (agent.llm_config.model if agent.llm_config else None)
+        )
+        explicit_provider_id = resolved_agent_profile.provider_id or (
+            agent.llm_config.provider_id if agent.llm_config else None
+        )
         provider_id: str | None = None
         if hasattr(self.llm, "resolve_model_target"):
             try:
@@ -1044,13 +1077,23 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
-        if direct_chat_context_info := _build_direct_chat_context_info(conversation.context):
+        if web_main_chat_context_info := _build_web_main_chat_context_info(conversation.context):
             messages.append(
                 {
                     "role": "system",
-                    "content": direct_chat_context_info,
-                    "_audit_source": "direct_chat_context",
+                    "content": web_main_chat_context_info,
+                    "_audit_source": "web_main_chat_context",
                     "_audit_role": "developer",
+                }
+            )
+        if agent_profile_context := render_agent_profile_context(resolved_agent_profile):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": agent_profile_context,
+                    "_audit_source": "agent_runtime_profile",
+                    "_audit_role": "developer",
+                    "_audit_metadata": resolved_agent_profile.audit_metadata(),
                 }
             )
         if agent_work_context_info := _build_agent_work_context_info(conversation.context):
@@ -1354,10 +1397,22 @@ class ContextAssembler:
         else:
             cache_entry = cache_result
 
+        resolved_agent_profile = resolve_agent_profile(
+            agent,
+            requested_agent_profile_id(session, conversation),
+            source="conversation",
+        )
+
         # Model resolution
         model_override = self.session_cache.get_model_override(session.session_id)
-        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
-        explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        explicit_model = (
+            model_override
+            or resolved_agent_profile.model
+            or (agent.llm_config.model if agent.llm_config else None)
+        )
+        explicit_provider_id = resolved_agent_profile.provider_id or (
+            agent.llm_config.provider_id if agent.llm_config else None
+        )
         provider_id: str | None = None
         if hasattr(self.llm, "resolve_model_target"):
             try:
@@ -1480,12 +1535,31 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
-        if direct_chat_context_info := _build_direct_chat_context_info(conversation.context):
+        if web_main_chat_context_info := _build_web_main_chat_context_info(conversation.context):
             messages.append(
                 {
                     "role": "system",
-                    "content": direct_chat_context_info,
-                    "_audit_source": "direct_chat_context",
+                    "content": web_main_chat_context_info,
+                    "_audit_source": "web_main_chat_context",
+                    "_audit_role": "developer",
+                }
+            )
+        if agent_profile_context := render_agent_profile_context(resolved_agent_profile):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": agent_profile_context,
+                    "_audit_source": "agent_runtime_profile",
+                    "_audit_role": "developer",
+                    "_audit_metadata": resolved_agent_profile.audit_metadata(),
+                }
+            )
+        if agent_work_context_info := _build_agent_work_context_info(conversation.context):
+            messages.append(
+                {
+                    "role": "system",
+                    "content": agent_work_context_info,
+                    "_audit_source": "agent_work_context",
                     "_audit_role": "developer",
                 }
             )

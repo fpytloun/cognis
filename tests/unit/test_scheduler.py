@@ -482,6 +482,7 @@ class TestScheduleToolDefinitionOutput:
         assert payload["cron_expr"] == "0 8 * * *"
         assert payload["timezone"] == "UTC"
         assert payload["agent_id"] == "agent_1"
+        assert payload["agent_profile_id"] == "fast"
         assert payload["workflow_id"] == "system:general-task"
         assert payload["project_id"] == "proj_1"
         assert payload["task_title"] == "Daily check task"
@@ -902,13 +903,15 @@ class TestScheduleToolDefinitionOutput:
         payload = json.loads(result.output)
         assert "latest_active_for_agent" in payload["valid_values"]["delivery_mode"]
         assert "delivery_mode=specific_conversation" in payload["conditional_fields"]
-        assert {
-            "agent_id": "lumi",
-            "name": "Lumi",
-            "display_name": "Lumi",
-            "status": "active",
-            "shared": False,
-        } in payload["available_agents"]
+        assert any(
+            item["agent_id"] == "lumi"
+            and item["name"] == "Lumi"
+            and item["display_name"] == "Lumi"
+            and item["status"] == "active"
+            and item["shared"] is False
+            and item["agent_profiles"] == []
+            for item in payload["available_agents"]
+        )
         assert any(
             item["workflow_id"] == "system:general-task" for item in payload["available_workflows"]
         )
@@ -997,6 +1000,7 @@ def _schedule_row(**overrides: Any) -> SimpleNamespace:
         "one_shot_at": None,
         "timezone": "UTC",
         "agent_id": "agent_1",
+        "agent_profile_id": "fast",
         "workflow_id": "system:general-task",
         "project_id": "proj_1",
         "skill_id": None,

@@ -16,6 +16,10 @@ import json
 from enum import StrEnum
 from typing import Any
 
+from cognis.core.agent_profiles import (
+    normalize_agent_profile_id,
+    resolve_agent_profile,
+)
 from cognis.models.session import SessionModel
 from cognis.models.tool import ToolCall, ToolDefinition, ToolResult, ToolSource
 
@@ -132,6 +136,14 @@ DELEGATE_TOOL = ToolDefinition(
                     "code review, system:architect for architecture review, system:implement "
                     "for focused implementation. Omit only when the work requires your own "
                     "personality, memories, or conversational continuity."
+                ),
+            },
+            "agent_profile_id": {
+                "type": ["string", "null"],
+                "description": (
+                    "Optional runtime profile ID for the target agent. Profiles are "
+                    "agent-local variants for provider/model/reasoning and prompt tuning; "
+                    "they do not change identity, memory, permissions, or tools."
                 ),
             },
             "context": {
@@ -271,6 +283,13 @@ CREATE_TASK_TOOL = ToolDefinition(
                     "tasks to use the current/main agent. Do not pass system:* specialist "
                     "agents such as system:implement; those execute delegated work or "
                     "workflow steps, but should not own persistent tasks."
+                ),
+            },
+            "agent_profile_id": {
+                "type": "string",
+                "description": (
+                    "Optional runtime profile ID for the task owner agent. Workflow steps "
+                    "may override this with their own agent_profile_id."
                 ),
             },
             "workflow_id": {
@@ -707,6 +726,14 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "agent_id": {"type": "string", "description": "Target agent ID."},
+            "agent_profile_id": {
+                "type": "string",
+                "description": (
+                    "Optional runtime profile ID for the target agent. If omitted, the "
+                    "managed conversation uses the target agent default profile and does "
+                    "not inherit the controller conversation profile."
+                ),
+            },
             "title": {"type": "string", "description": "Conversation title."},
             "initial_message": {
                 "type": "string",
@@ -1127,6 +1154,14 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                     "delegated work or workflow steps, but should not own persistent tasks."
                 ),
             },
+            "agent_profile_id": {
+                "type": "string",
+                "description": (
+                    "Optional runtime profile for the selected task/schedule agent. "
+                    "Omit or pass null to use that agent's default profile. Workflow "
+                    "steps may override this with their own agent_profile_id."
+                ),
+            },
             "priority": {"type": "integer", "default": 0},
         },
         "required": ["intent"],
@@ -1181,10 +1216,14 @@ def orchestration_tools(
     *,
     expose_delegate_wait_option: bool = True,
     expose_managed_conversation_tools: bool = True,
+    expose_task_tools: bool = True,
+    expose_workflow_tools: bool = True,
+    expose_compose_workflow_tool: bool = True,
 ) -> list[ToolDefinition]:
     """Return orchestration tool definitions for the given mode.
 
-    FULL: All sub-session + task tools (main interactive session).
+    FULL: Sub-session tools plus optional managed-conversation, task, and
+    workflow tools according to the conversation-surface policy.
     DELEGATE_SYNC_ONLY: Only sync delegate (task workflow steps).
     NONE: No orchestration tools (sub-sessions).
     """
@@ -1201,7 +1240,13 @@ def orchestration_tools(
     tools = subsession_tools
     if expose_managed_conversation_tools:
         tools += _ALL_MANAGED_CONVERSATION_TOOLS
-    return tools + _ALL_TASK_TOOLS + _ALL_WORKFLOW_TOOLS + [COMPOSE_AND_RUN_WORKFLOW_TOOL]
+    if expose_task_tools:
+        tools += _ALL_TASK_TOOLS
+    if expose_workflow_tools:
+        tools += _ALL_WORKFLOW_TOOLS
+    if expose_compose_workflow_tool:
+        tools.append(COMPOSE_AND_RUN_WORKFLOW_TOOL)
+    return tools
 
 
 def is_orchestration_tool(tool_name: str) -> bool:
@@ -1262,6 +1307,7 @@ async def handle_delegate_tool_call(
     if session_manager is not None and session is not None and agent is not None:
         # Validate secondary agent binding if delegating to a different agent
         target_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
+        target_agent = agent if target_agent_id == getattr(agent, "agent_id", "") else None
         if target_agent_id and target_agent_id != getattr(agent, "agent_id", "") and agent_registry:
             target_agent = await agent_registry.get(
                 target_agent_id, owner_email=getattr(session, "user_email", None)
@@ -1308,6 +1354,51 @@ async def handle_delegate_tool_call(
                         ),
                         None,
                     )
+        explicit_profile_id = normalize_agent_profile_id(args.get("agent_profile_id"))
+        inherited_profile_id = None
+        parent_agent_profile_id = getattr(session, "agent_profile_id", None)
+        parent_agent_profile_id = (
+            parent_agent_profile_id.strip()
+            if isinstance(parent_agent_profile_id, str) and parent_agent_profile_id.strip()
+            else None
+        )
+        same_agent_delegate = target_agent_id == getattr(agent, "agent_id", "")
+        if explicit_profile_id is None and same_agent_delegate:
+            inherited_profile_id = parent_agent_profile_id
+        child_agent_profile_id = explicit_profile_id or inherited_profile_id
+        if target_agent is not None and child_agent_profile_id is not None:
+            try:
+                resolve_agent_profile(
+                    target_agent,
+                    child_agent_profile_id,
+                    source="delegate_inherited"
+                    if explicit_profile_id is None
+                    else "delegate_explicit",
+                )
+            except ValueError as exc:
+                if (
+                    not same_agent_delegate
+                    and explicit_profile_id is not None
+                    and explicit_profile_id == parent_agent_profile_id
+                ):
+                    child_agent_profile_id = None
+                else:
+                    return (
+                        ToolResult(
+                            output=json.dumps(
+                                {
+                                    "status": "error",
+                                    "mode": "delegate",
+                                    "call_id": tool_call.call_id,
+                                    "message": str(exc),
+                                },
+                                sort_keys=True,
+                            ),
+                            is_error=True,
+                            metadata={"orchestration": True, "mode": "delegate"},
+                        ),
+                        None,
+                    )
 
         try:
             effective_wait = bool(args.get("wait", False) if wait is None else wait)
@@ -1317,6 +1408,7 @@ async def handle_delegate_tool_call(
                 task_description=args.get("task", ""),
                 agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
                 effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
+                agent_profile_id=child_agent_profile_id,
                 expected_output=args.get("expected_output"),
                 workspace_root=workspace_root,
                 working_directory=working_directory,
@@ -1330,6 +1422,7 @@ async def handle_delegate_tool_call(
                             "wait": effective_wait,
                             "call_id": tool_call.call_id,
                             "session_id": child_session.session_id,
+                            "agent_profile_id": child_session.agent_profile_id,
                             "message": (
                                 "Delegation created. Waiting for completion."
                                 if effective_wait

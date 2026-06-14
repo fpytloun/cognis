@@ -10,8 +10,11 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis.api.serializers import agent_to_response
+from cognis.core.agent_profiles import normalize_agent_profile_id, resolve_agent_profile
 from cognis.core.workflow_registry import SYSTEM_WORKFLOWS
 from cognis.logging import get_logger
+from cognis.models.agent import AgentDefinition
 from cognis.models.schedule import (
     ScheduleModel,
     describe_schedule,
@@ -102,6 +105,13 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
             "agent_id": {
                 "type": "string",
                 "description": "Agent to run the task. Defaults to current agent.",
+            },
+            "agent_profile_id": {
+                "type": ["string", "null"],
+                "description": (
+                    "Optional runtime profile for the selected schedule agent. Omit or pass null "
+                    "to use that agent's default profile."
+                ),
             },
             "workflow_id": {
                 "type": "string",
@@ -277,6 +287,8 @@ async def _handle_options(
             "name": row.name,
             "display_name": getattr(row, "display_name", None),
             "status": row.status,
+            "default_agent_profile_id": getattr(row, "default_agent_profile_id", None),
+            "agent_profiles": _agent_profiles_options(row),
             "shared": grant is not None,
         }
         for row, grant in agents
@@ -354,6 +366,7 @@ async def _handle_list(
                     "schedule": describe_schedule(model),
                     "enabled": r.enabled,
                     "agent_id": r.agent_id,
+                    "agent_profile_id": getattr(r, "agent_profile_id", None),
                     "next_fire_at": _iso(r.next_fire_at),
                     "last_run_status": r.last_run_status,
                 }
@@ -427,15 +440,31 @@ async def _handle_create(
     if delivery_error is not None:
         return delivery_error
 
+    target_agent = arguments.get("agent_id") or agent_id
+    if not target_agent:
+        return ToolResult(output="'agent_id' is required.", is_error=True)
+    try:
+        target_agent_profile = normalize_agent_profile_id(arguments.get("agent_profile_id"))
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
+
     async with session_factory() as db:
         validation_error = await _validate_agent_and_workflow(
             db,
             user_email,
-            target_agent=arguments.get("agent_id") or agent_id,
+            target_agent=target_agent,
             workflow_id=arguments.get("workflow_id"),
         )
         if validation_error is not None:
             return validation_error
+        profile_error = await _validate_agent_profile(
+            db,
+            user_email,
+            target_agent=target_agent,
+            agent_profile_id=target_agent_profile,
+        )
+        if profile_error is not None:
+            return profile_error
         if delivery["mode"] == "specific_conversation":
             delivery_error = await _validate_delivery_target(
                 db, user_email, str(delivery["target"])
@@ -444,10 +473,6 @@ async def _handle_create(
                 return delivery_error
 
     task_template["delivery"] = delivery
-
-    target_agent = arguments.get("agent_id") or agent_id
-    if not target_agent:
-        return ToolResult(output="'agent_id' is required.", is_error=True)
 
     # Compute initial next_fire_at
     from cognis.core.scheduler import Scheduler
@@ -479,6 +504,7 @@ async def _handle_create(
             one_shot_at=one_shot_at,
             timezone=arguments.get("timezone", "UTC"),
             agent_id=target_agent,
+            agent_profile_id=target_agent_profile,
             workflow_id=arguments.get("workflow_id"),
             task_template=task_template,
             enabled=arguments.get("enabled", True),
@@ -536,6 +562,7 @@ async def _handle_update(
             "description",
             "timezone",
             "agent_id",
+            "agent_profile_id",
             "workflow_id",
             "enabled",
             "max_concurrent_runs",
@@ -544,7 +571,13 @@ async def _handle_update(
             "allow_silent_completion",
             "interaction_mode_override",
         ):
-            if key in arguments and arguments[key] is not None:
+            if key == "agent_profile_id":
+                if key in arguments:
+                    try:
+                        fields[key] = normalize_agent_profile_id(arguments[key])
+                    except ValueError as exc:
+                        return ToolResult(output=str(exc), is_error=True)
+            elif key in arguments and arguments[key] is not None:
                 fields[key] = arguments[key]
 
         timing_keys = {"schedule_type", "cron_expr", "interval_seconds", "one_shot_at"}
@@ -562,6 +595,17 @@ async def _handle_update(
         )
         if validation_error is not None:
             return validation_error
+        if "agent_id" in fields and "agent_profile_id" not in fields:
+            fields["agent_profile_id"] = None
+        effective_agent_id = fields.get("agent_id", existing.agent_id)
+        profile_error = await _validate_agent_profile(
+            db,
+            user_email,
+            target_agent=effective_agent_id,
+            agent_profile_id=fields.get("agent_profile_id"),
+        )
+        if profile_error is not None:
+            return profile_error
 
         template_keys = {
             "task_title",
@@ -706,6 +750,7 @@ def _row_to_model(row: Any) -> ScheduleModel:
         one_shot_at=row.one_shot_at,
         timezone=row.timezone,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         skill_id=getattr(row, "skill_id", None),
@@ -755,6 +800,7 @@ def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -
         "human_schedule": describe_schedule(model),
         "schedule": describe_schedule(model),
         "agent_id": row.agent_id,
+        "agent_profile_id": getattr(row, "agent_profile_id", None),
         "workflow_id": row.workflow_id,
         "project_id": getattr(row, "project_id", None),
         "skill_id": getattr(row, "skill_id", None),
@@ -886,6 +932,66 @@ async def _validate_delivery_target(
     conversation = await get_conversation(db, conversation_id)
     if conversation is None or conversation.user_email != user_email:
         return ToolResult(output=f"Conversation {conversation_id} not found.", is_error=True)
+    return None
+
+
+def _agent_profiles_options(row: Any) -> list[dict[str, Any]]:
+    profiles = getattr(row, "agent_profiles", None)
+    if not isinstance(profiles, dict):
+        return []
+    options: list[dict[str, Any]] = []
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile_id, str) or not profile_id:
+            continue
+        if hasattr(profile, "model_dump"):
+            profile_payload = profile.model_dump(mode="json", exclude_none=True)
+        elif isinstance(profile, dict):
+            profile_payload = dict(profile)
+        else:
+            continue
+        options.append(
+            {
+                "profile_id": profile_id,
+                "description": profile_payload.get("description"),
+                "enabled": profile_payload.get("enabled", True),
+                "is_default": profile_id == getattr(row, "default_agent_profile_id", None),
+            }
+        )
+    return options
+
+
+async def _validate_agent_profile(
+    db: Any,
+    user_email: str,
+    *,
+    target_agent: str | None,
+    agent_profile_id: str | None,
+) -> ToolResult | None:
+    if agent_profile_id is None:
+        return None
+    if not target_agent:
+        return ToolResult(
+            output="'agent_id' is required when agent_profile_id is set.", is_error=True
+        )
+    visible_agents = await list_visible_agents(db, user_email)
+    agent_row = next(
+        (
+            row
+            for row, _grant in visible_agents
+            if row.agent_id == target_agent and getattr(row, "status", "active") == "active"
+        ),
+        None,
+    )
+    if agent_row is None:
+        return ToolResult(
+            output=f"Agent {target_agent} not found or not available to this user.",
+            is_error=True,
+        )
+    agent_definition = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+    try:
+        resolve_agent_profile(agent_definition, agent_profile_id, source="manage_schedules")
+    except ValueError as exc:
+        return ToolResult(output=str(exc), is_error=True)
     return None
 
 

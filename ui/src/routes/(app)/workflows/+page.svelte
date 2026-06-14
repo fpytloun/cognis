@@ -7,6 +7,8 @@ import ArrowUp from 'lucide-svelte/icons/arrow-up';
 import MoreVertical from 'lucide-svelte/icons/more-vertical';
 
   import { api, asApiError } from '$lib/api/client';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import { loadSkillWorkflowDraft, skillToWorkflowDraft } from '$lib/skills';
@@ -819,7 +821,17 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                         <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
-                    <select bind:value={step.agentOverride} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                    <select
+                      bind:value={step.agentOverride}
+                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      disabled={!!selectedWorkflow?.is_system}
+                      onchange={() => {
+                        step.agentProfileId = normalizeSelectedAgentProfileId(
+                          secondaryAgents.find((agent) => agent.agent_id === step.agentOverride),
+                          step.agentProfileId
+                        );
+                      }}
+                    >
                       <option value="">Default (task agent)</option>
                       {#each secondaryAgents as agent}
                         <option value={agent.agent_id}>
@@ -828,6 +840,18 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       {/each}
                     </select>
                   </label>
+                  {#if step.agentOverride}
+                    <div class="mt-4">
+                      <AgentProfileSelect
+                        agents={secondaryAgents}
+                        agentId={step.agentOverride}
+                        bind:value={step.agentProfileId}
+                        label="Agent override profile"
+                        help="Leave empty to use the override agent default profile."
+                        disabled={!!selectedWorkflow?.is_system}
+                      />
+                    </div>
+                  {/if}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span>Thinking effort</span>
                     <select bind:value={step.reasoningEffort} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemWorkflowField('stepReasoning')}>

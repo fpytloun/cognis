@@ -10,7 +10,17 @@ from unittest.mock import AsyncMock, call
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.store.queries import create_agent, create_conversation, create_user, get_conversation
+from cognis.api.routes.conversations import (
+    _decode_messages_cursor,
+    _messages_cursor_anchor_event,
+)
+from cognis.store.queries import (
+    create_agent,
+    create_conversation,
+    create_session,
+    create_user,
+    get_conversation,
+)
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -95,3 +105,126 @@ def test_mark_read_emits_user_wide_unread_clear_once(
         send_to_user.assert_awaited_once()
 
         assert send_to_user.await_args_list == [call("user@example.com", payload)]
+
+
+def test_messages_cursor_anchor_event_skips_history_gap_seq_zero() -> None:
+    events = [
+        {
+            "type": "history_gap",
+            "seq": 0,
+            "data": {"reason": "stream_missing", "session_id": "sess-gap"},
+        },
+        {
+            "type": "assistant_message",
+            "seq": 42,
+            "data": {"session_id": "sess-real", "content": "hello"},
+        },
+    ]
+
+    assert _messages_cursor_anchor_event(events) == events[1]
+
+
+def test_messages_cursor_anchor_event_requires_positive_seq_and_session_id() -> None:
+    events = [
+        {"type": "history_gap", "seq": 0, "data": {"session_id": "sess-gap"}},
+        {"type": "assistant_message", "seq": 1, "data": {}},
+    ]
+
+    assert _messages_cursor_anchor_event(events) is None
+
+
+def test_conversation_messages_older_cursor_skips_history_gap_seq_zero(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-chat",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Cursor conversation",
+                )
+                await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    session_id="sess-old",
+                    intaris_session_id="intaris-old",
+                )
+                await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    session_id="sess-current",
+                    intaris_session_id="intaris-current",
+                    previous_session_id="sess-old",
+                )
+                conversation.active_session_id = "sess-current"
+                await session.commit()
+                return conversation.conversation_id
+
+        class GuardrailsStub:
+            async def read_events(self, **kwargs: Any) -> SimpleNamespace:
+                if kwargs["session_id"] == "intaris-old":
+                    return SimpleNamespace(
+                        events=[],
+                        last_seq=0,
+                        has_more=False,
+                        missing_stream_fallback_used=True,
+                    )
+                assert kwargs["session_id"] == "intaris-current"
+                return SimpleNamespace(
+                    events=[
+                        {
+                            "type": "assistant_message",
+                            "seq": 42,
+                            "data": {"session_id": "sess-current", "content": "hello"},
+                            "ts": "2026-06-11T12:00:00+00:00",
+                        }
+                    ],
+                    last_seq=42,
+                    has_more=True,
+                    missing_stream_fallback_used=False,
+                )
+
+            async def get_last_seq(self, session_id: str) -> int:
+                return 42 if session_id == "intaris-current" else 0
+
+        conversation_id = asyncio.run(_seed())
+        guardrails = GuardrailsStub()
+        monkeypatch.setattr(app.state.providers.guardrails, "read_events", guardrails.read_events)
+        monkeypatch.setattr(app.state.providers.guardrails, "get_last_seq", guardrails.get_last_seq)
+        headers = _auth_headers(app, email="user@example.com")
+
+        response = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            params={"anchor": "latest", "limit": 2},
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_more"] is True
+        assert body["older_cursor"] is not None
+        assert _decode_messages_cursor(body["older_cursor"]) == ("sess-current", 42)

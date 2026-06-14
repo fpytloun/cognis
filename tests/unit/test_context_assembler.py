@@ -11,8 +11,8 @@ from cognis.core.context import (
     ContextAssembler,
     _build_agent_work_context_info,
     _build_channel_context_info,
-    _build_direct_chat_context_info,
     _build_environment_info,
+    _build_web_main_chat_context_info,
     _load_project_instructions,
     events_to_messages,
 )
@@ -415,6 +415,19 @@ def _conversation() -> ConversationModel:
     )
 
 
+def _web_main_conversation() -> ConversationModel:
+    return ConversationModel(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="web",
+            ref="web:user:user@example.com:default",
+            memory_labels={"project": "cognis"},
+        ),
+    )
+
+
 def _signal_conversation() -> ConversationModel:
     return ConversationModel(
         conversation_id="conv-1",
@@ -492,11 +505,11 @@ def test_build_channel_context_info_is_channel_only() -> None:
     assert "create_task for durable workflow-shaped work with lifecycle" in content
 
 
-def test_build_direct_chat_context_info_is_agent_direct_only() -> None:
-    assert _build_direct_chat_context_info(ConversationContext(type="web")) is None
-    assert _build_direct_chat_context_info(ConversationContext(type="signal")) is None
+def test_build_web_main_chat_context_info_is_web_main_only() -> None:
+    assert _build_web_main_chat_context_info(ConversationContext(type="web")) is None
+    assert _build_web_main_chat_context_info(ConversationContext(type="signal")) is None
 
-    content = _build_direct_chat_context_info(
+    content = _build_web_main_chat_context_info(
         ConversationContext(
             type="web",
             ref="web:agent_direct:user@example.com:agent-1",
@@ -505,15 +518,24 @@ def test_build_direct_chat_context_info_is_agent_direct_only() -> None:
     )
 
     assert content is not None
-    assert "Direct chat context:" in content
+    assert "Web main chat context:" in content
     assert "- Channel: web" in content
-    assert "- Direct agent chat: yes" in content
-    assert "delegate(wait=false)" not in content
+    assert "- Main web chat: yes" in content
+    assert "DM-like main chat" in content
+    assert "delegate(wait=false)" in content
     assert "delegate(wait=true)" in content
-    assert "managed conversation" in content
+    assert "agent_conversation_create(wait=false)" in content
+    assert 'chat_mode="plan"' in content
+    assert 'chat_mode="build"' in content
     assert "fire-and-follow-up" in content
-    assert "do not continue the same scoped work in parallel" in content
+    assert "stop the parent turn" in content
     assert "create_task" in content
+
+    web_main_content = _build_web_main_chat_context_info(
+        ConversationContext(type="web", ref="web:user:user@example.com:default")
+    )
+    assert web_main_content is not None
+    assert "Web main chat context:" in web_main_content
 
 
 def test_build_agent_work_context_info_lists_only_valid_managed_options() -> None:
@@ -535,7 +557,8 @@ def test_build_agent_work_context_info_lists_only_valid_managed_options() -> Non
     assert "agent_conversation_create(wait=false)" not in content
     assert "Use delegate for specialist child work" in content
     assert "Avoid asynchronous delegation from managed conversations" in content
-    assert "create_task only for durable workflow-shaped work" in content
+    assert "Do not create tasks or workflows" in content
+    assert "Implement assigned coding/debugging work directly" in content
 
 
 @pytest.mark.asyncio
@@ -591,13 +614,25 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     )
     direct_messages = [str(message.get("content", "")) for message in direct_result.messages]
     direct_context_messages = [
-        message for message in direct_messages if "Direct chat context:" in message
+        message for message in direct_messages if "Web main chat context:" in message
     ]
 
-    assert any("Direct chat context:" in message for message in direct_messages)
-    assert not any("delegate(wait=false)" in message for message in direct_context_messages)
+    assert any("Web main chat context:" in message for message in direct_messages)
+    assert any("delegate(wait=false)" in message for message in direct_context_messages)
     assert any("delegate(wait=true)" in message for message in direct_context_messages)
     assert not any("Conversation channel context:" in message for message in direct_messages)
+
+    web_main_result = await assembler.assemble(
+        session=_session(),
+        conversation=_web_main_conversation(),
+        agent=_agent(),
+        user_message="please help",
+        tool_definitions=[],
+    )
+    web_main_messages = [str(message.get("content", "")) for message in web_main_result.messages]
+    assert any("Web main chat context:" in message for message in web_main_messages)
+    assert any("Keep this chat responsive" in message for message in web_main_messages)
+    assert any("agent_conversation_create(wait=false)" in message for message in web_main_messages)
 
     web_result = await assembler.assemble(
         session=_session(),
@@ -609,7 +644,7 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     web_messages = [str(message.get("content", "")) for message in web_result.messages]
 
     assert not any("Conversation channel context:" in message for message in web_messages)
-    assert not any("Direct chat context:" in message for message in web_messages)
+    assert not any("Web main chat context:" in message for message in web_messages)
     assert not any("Keep the channel unblocked" in message for message in web_messages)
     assert not any("Keep this direct chat responsive" in message for message in web_messages)
     assert not any(

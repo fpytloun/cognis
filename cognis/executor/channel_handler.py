@@ -14,6 +14,10 @@ import json
 import logging
 from typing import Any
 
+from cognis.channels.adapters.signal_cli_install import (
+    ensure_signal_cli,
+    resolve_signal_cli_runtime_config,
+)
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
@@ -62,8 +66,13 @@ class ChannelHandler:
         # Inject executor-level config into adapter settings
         settings = dict(config.get("settings", {}))
         if channel_type == "signal" and settings.get("transport") == "direct_jsonrpc":
-            signal_exec_config = self._executor_config.get("signal", {})
-            settings["_signal_cli_command"] = signal_exec_config.get("command", "signal-cli")
+            signal_cli = await ensure_signal_cli(
+                resolve_signal_cli_runtime_config(self._executor_config)
+            )
+            if not signal_cli.available or not signal_cli.command:
+                raise RuntimeError(signal_cli.error or "signal-cli runtime unavailable")
+            settings["_signal_cli_command"] = signal_cli.command
+            settings["_signal_cli_runtime"] = signal_cli.metadata()
 
         # Build a ChannelAccountConfig from the provided config dict
         account_config = ChannelAccountConfig(
@@ -113,6 +122,8 @@ class ChannelHandler:
             content=message.get("content", ""),
             reply_to_id=message.get("reply_to_id"),
             thread_id=message.get("thread_id"),
+            media=message.get("media") or [],
+            platform_data=message.get("platform_data") or {},
         )
         platform_msg_id = await adapter.send_message(outbound)
         return {"status": "sent", "platform_message_id": platform_msg_id}

@@ -35,12 +35,13 @@ from cognis.core.agent_loop import (
     ToolOutputChunkCallback,
     ToolResultCallback,
 )
+from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.chat_modes import ResolvedChatMode
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.gate_conditions import evaluate_gate_conditions_detailed
 from cognis.core.project_runtime import build_project_context_message
-from cognis.core.runtime import ResolvedStepRuntime
+from cognis.core.runtime import ResolvedStepRuntime, TransientExecutorUnavailable
 from cognis.core.session_fork import fork_session_events
 from cognis.core.step_evaluator import StepEvaluator, is_evaluator_malfunction
 from cognis.core.workflow_registry import WorkflowRegistry
@@ -71,6 +72,7 @@ from cognis.runtime_context import (
 from cognis.store.queries import (
     claim_pending_context_task_comments,
     create_step_run,
+    defer_running_task,
     fail_running_step_runs_for_task,
     get_agent_direct_conversation,
     get_conversation,
@@ -151,6 +153,18 @@ def _effective_task_session_policy(task: TaskModel, workflow: Workflow | None) -
     )
 
 
+def _short_evidence_text(value: Any, *, limit: int = 500) -> str | None:
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > limit:
+        return f"{text[:limit]}..."
+    return text
+
+
 # Prometheus metrics
 WORKFLOWS_TOTAL = Counter(
     "cognis_workflows_total",
@@ -159,6 +173,8 @@ WORKFLOWS_TOTAL = Counter(
 )
 
 DEFAULT_MAX_WORKFLOW_SECONDS = 14400.0
+TRANSIENT_EXECUTOR_BACKOFF_SECONDS = 5
+TRANSIENT_EXECUTOR_MAX_DEFERRALS = 12
 WORKFLOW_DURATION = Histogram(
     "cognis_workflow_duration_seconds",
     "Workflow duration",
@@ -482,16 +498,32 @@ class WorkflowEngine:
                         continue
 
                 # Run step
-                step_execution = await _await_with_workflow_budget(
-                    self._execute_run_step(
+                try:
+                    step_execution = await _await_with_workflow_budget(
+                        self._execute_run_step(
+                            task,
+                            step_def,
+                            state,
+                            workflow,
+                            on_progress=on_progress,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                except TransientExecutorUnavailable as exc:
+                    deferred = await self._handle_transient_executor_unavailable(
                         task,
                         step_def,
                         state,
                         workflow,
-                        on_progress=on_progress,
-                        cancel_event=cancel_event,
+                        exc,
                     )
-                )
+                    if deferred:
+                        return task
+                    state.status = "paused"
+                    task.status = TaskStatus.PAUSED
+                    await self._persist_workflow_state(task, sync_status=True)
+                    WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status=task.status).inc()
+                    return task
                 if isinstance(step_execution, tuple):
                     step_result, step_run_id = step_execution
                 else:
@@ -838,6 +870,95 @@ class WorkflowEngine:
 
         return task
 
+    async def _handle_transient_executor_unavailable(
+        self,
+        task: TaskModel,
+        step_def: StepDefinition,
+        state: WorkflowState,
+        workflow: Workflow,
+        exc: TransientExecutorUnavailable,
+    ) -> bool:
+        """Defer a task when its selected executor is temporarily unavailable.
+
+        Returns True when the task was requeued for a later run. Returns False
+        after the bounded deferral budget is exhausted; callers pause the task
+        as infrastructure-blocked instead of failing the workflow.
+        """
+
+        attempt_key = f"transient_executor_unavailable:{step_def.name}"
+        deferrals = state.loop_iterations.get(attempt_key, 0) + 1
+        state.loop_iterations[attempt_key] = deferrals
+        state.current_step_status = None
+        state.last_retry_reason = None
+        state.last_evaluation_feedback = None
+
+        if deferrals > TRANSIENT_EXECUTOR_MAX_DEFERRALS:
+            message = (
+                "Workflow paused: selected executor is still unavailable after "
+                f"{TRANSIENT_EXECUTOR_MAX_DEFERRALS} deferrals. Last error: {exc}"
+            )
+            logger.warning(
+                "Pausing workflow because selected executor stayed unavailable",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "step": step_def.name,
+                        "executor_id": exc.executor_id,
+                        "deferrals": deferrals,
+                    }
+                },
+            )
+            state.status = "paused"
+            state.current_step_status = "paused"
+            state.pending_pause_payload = {
+                "kind": "infrastructure_blocked",
+                "message": message,
+                "executor_id": exc.executor_id,
+                "step_name": step_def.name,
+                "deferrals": deferrals,
+            }
+            task.result_summary = message
+            return False
+
+        retry_after_seconds = max(1, int(exc.retry_after_seconds or 0))
+        scheduled_for = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
+        task.status = TaskStatus.READY
+        task.scheduled_for = scheduled_for
+        task.result_summary = (
+            "Workflow deferred: selected executor is not connected or not ready "
+            f"(retry {deferrals}/{TRANSIENT_EXECUTOR_MAX_DEFERRALS})."
+        )
+        state.status = "running"
+        state.pending_pause_type = None
+        state.pending_pause_payload = None
+        state.version += 1
+
+        async with self._session_factory() as db_session:
+            ok = await defer_running_task(
+                db_session,
+                task.task_id,
+                scheduled_for=scheduled_for,
+                workflow_state=state.model_dump(mode="json"),
+                result_summary=task.result_summary,
+            )
+            if not ok:
+                raise StepInterrupted(task.task_id)
+            await db_session.commit()
+
+        logger.info(
+            "Deferred workflow while selected executor reconnects",
+            extra={
+                "extra_data": {
+                    "task_id": task.task_id,
+                    "step": step_def.name,
+                    "executor_id": exc.executor_id,
+                    "deferrals": deferrals,
+                    "scheduled_for": scheduled_for.isoformat(),
+                }
+            },
+        )
+        return True
+
     async def _execute_run_step(
         self,
         task: TaskModel,
@@ -861,6 +982,13 @@ class WorkflowEngine:
                 extra={"extra_data": {"task_id": task.task_id, "step": step_def.name}},
             )
             return None, ""
+        step_agent_profile_id = step_def.agent_profile_id or task.agent_profile_id
+        resolved_step_agent_profile = resolve_agent_profile(
+            agent,
+            step_agent_profile_id,
+            source="workflow_step" if step_def.agent_profile_id else "task",
+        )
+        step_agent_profile_id = resolved_step_agent_profile.profile_id
 
         # Determine if this is a retry (re-attempt of a previously-run step)
         attempt = state.loop_iterations.get(f"attempts:{step_def.name}", 1)
@@ -880,11 +1008,19 @@ class WorkflowEngine:
         session_policy = _effective_task_session_policy(task, workflow)
         if is_retry or has_prior_run:
             conversation, session, seeded_from_prior = await self._reuse_or_create_step_session(
-                task, step_def, agent, session_policy=session_policy
+                task,
+                step_def,
+                agent,
+                agent_profile_id=step_agent_profile_id,
+                session_policy=session_policy,
             )
         else:
             conversation, session = await self._create_step_session(
-                task, step_def, agent, session_policy=session_policy
+                task,
+                step_def,
+                agent,
+                agent_profile_id=step_agent_profile_id,
+                session_policy=session_policy,
             )
 
         # For type="full" input, fork the source step's events into the new
@@ -920,6 +1056,7 @@ class WorkflowEngine:
                     step_name=step_def.name,
                     step_type=step_def.type,
                     agent_id=agent.agent_id,
+                    agent_profile_id=step_agent_profile_id,
                     attempt=attempt,
                     attempt_number=task.attempt_number,
                     step_run_id=step_run_id,
@@ -939,6 +1076,7 @@ class WorkflowEngine:
                 "workspace_root": task.workspace_root,
                 "working_directory": task.working_directory,
                 "require_deliverable": step_def.require_deliverable,
+                "agent_profile_id": step_agent_profile_id,
                 "output": None,
                 "evaluation": None,
                 "todos": persisted_todos,
@@ -1005,6 +1143,24 @@ class WorkflowEngine:
             )
             task.workspace_root = runtime_workspace_root
             task.working_directory = runtime_working_directory
+        except TransientExecutorUnavailable:
+            async with self._session_factory() as db_session:
+                await update_step_run(
+                    db_session,
+                    step_run_id,
+                    status="pending",
+                    output={
+                        "summary": "Deferred because the selected executor is not ready.",
+                    },
+                    runtime_info={
+                        "runtime_source": "unresolved",
+                        "failure_reason": "transient_executor_unavailable",
+                        "agent_id": agent.agent_id,
+                    },
+                    completed_at=None,
+                )
+                await db_session.commit()
+            raise
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             logger.warning(
@@ -1038,11 +1194,15 @@ class WorkflowEngine:
                 await db_session.commit()
             return None, step_run_id
         if runtime.runtime_info is not None:
+            runtime_info = {
+                **runtime.runtime_info,
+                **resolved_step_agent_profile.audit_metadata(),
+            }
             async with self._session_factory() as db_session:
                 await update_step_run(
                     db_session,
                     step_run_id,
-                    runtime_info=runtime.runtime_info,
+                    runtime_info=runtime_info,
                 )
                 await db_session.commit()
 
@@ -1131,7 +1291,10 @@ class WorkflowEngine:
             executor_environment=runtime.executor_environment,
             executor_pool=getattr(runtime, "executor_pool", None),
             active_executor_id=getattr(runtime, "active_executor_id", None),
-            runtime_info=runtime.runtime_info or {},
+            runtime_info={
+                **(runtime.runtime_info or {}),
+                **resolved_step_agent_profile.audit_metadata(),
+            },
             workflow_state=state,
             workflow_steps=workflow.steps,
             step_index=step_index,
@@ -1299,14 +1462,96 @@ class WorkflowEngine:
             if raw:
                 step_inputs[source_name] = StepOutput.model_validate(raw)
 
+        execution_evidence = await self._build_step_execution_evidence(step_output)
+
         return await self._step_evaluator.evaluate(
             step_definition=step_def,
             step_output=step_output,
             step_inputs=step_inputs,
             task_context=self._build_step_task_context(task, state),
-            execution_evidence=step_output.execution_evidence
-            or {"tools": [], "files_read": [], "files_written": [], "commands": []},
+            execution_evidence=execution_evidence,
         )
+
+    async def _build_step_execution_evidence(self, step_output: StepOutput) -> dict[str, Any]:
+        """Combine step-reported evidence with actual session tool events."""
+
+        base = (
+            dict(step_output.execution_evidence)
+            if isinstance(step_output.execution_evidence, dict)
+            else {"tools": [], "files_read": [], "files_written": [], "commands": []}
+        )
+        session_id = step_output.intaris_session_id or step_output.session_id
+        guardrails = getattr(self._providers, "guardrails", None)
+        if not session_id or guardrails is None or not hasattr(guardrails, "read_events"):
+            return base
+
+        try:
+            event_read = await guardrails.read_events(
+                session_id=session_id,
+                after_seq=0,
+                types=["tool_call", "tool_result"],
+                allow_missing_stream=True,
+            )
+        except TypeError:
+            event_read = await guardrails.read_events(session_id=session_id, after_seq=0)
+        except Exception:
+            logger.warning(
+                "workflow: failed to collect evaluator session evidence",
+                extra={"extra_data": {"session_id": session_id}},
+                exc_info=True,
+            )
+            base["session_events"] = {
+                "session_id": session_id,
+                "available": False,
+                "error": "failed_to_read_events",
+            }
+            return base
+
+        events = list(getattr(event_read, "events", []) or [])
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+        for raw_event in events[-100:]:
+            if not isinstance(raw_event, dict):
+                continue
+            event_type = str(raw_event.get("type") or "")
+            data = raw_event.get("data") if isinstance(raw_event.get("data"), dict) else {}
+            seq = raw_event.get("seq")
+            if event_type == "tool_call":
+                arguments = data.get("arguments")
+                tool_calls.append(
+                    {
+                        "seq": seq,
+                        "call_id": data.get("call_id"),
+                        "name": data.get("name") or data.get("tool_name"),
+                        "argument_keys": sorted(arguments) if isinstance(arguments, dict) else [],
+                    }
+                )
+            elif event_type == "tool_result":
+                result_text = (
+                    data.get("content")
+                    or data.get("result")
+                    or data.get("output")
+                    or data.get("summary")
+                )
+                tool_results.append(
+                    {
+                        "seq": seq,
+                        "call_id": data.get("call_id"),
+                        "name": data.get("name") or data.get("tool_name"),
+                        "is_error": bool(data.get("is_error") or data.get("error")),
+                        "summary": _short_evidence_text(result_text),
+                    }
+                )
+
+        base["session_events"] = {
+            "session_id": session_id,
+            "available": True,
+            "tool_call_count": len(tool_calls),
+            "tool_result_count": len(tool_results),
+            "tool_calls": tool_calls[-30:],
+            "tool_results": tool_results[-30:],
+        }
+        return base
 
     async def _handle_gate_step(
         self,
@@ -3024,6 +3269,7 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
         agent: AgentDefinition,
+        agent_profile_id: str | None = None,
         session_policy: dict[str, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Create a conversation and session for a workflow step.
@@ -3089,6 +3335,7 @@ class WorkflowEngine:
             ) = await self._session_manager.create_conversation_with_root_session(
                 user_email=task.created_by,
                 agent_id=agent.agent_id,
+                agent_profile_id=agent_profile_id,
                 context=context,
                 title=f"Task: {task.title} / Step: {step_def.name}",
                 title_source="manual",
@@ -3106,6 +3353,7 @@ class WorkflowEngine:
         task: TaskModel,
         step_def: StepDefinition,
         agent: AgentDefinition,
+        agent_profile_id: str | None = None,
         session_policy: dict[str, Any] | None = None,
     ) -> tuple[Any, Any, bool]:
         """Reuse the prior step session on retry, or create a new one.
@@ -3156,6 +3404,7 @@ class WorkflowEngine:
                                     conversation_id=session_row.conversation_id,
                                     user_email=task.created_by,
                                     agent_id=agent.agent_id,
+                                    agent_profile_id=agent_profile_id,
                                     intention=(
                                         f"Task: {task.title} — Step: {step_def.name} — "
                                         f"{step_def.description or step_def.prompt[:100]}"

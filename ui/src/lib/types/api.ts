@@ -201,6 +201,7 @@ export interface Conversation {
     conversation_id: string;
     user_email: string;
     agent_id: string;
+    agent_profile_id?: string | null;
     project_id: string | null;
     title: string | null;
     title_source: string;
@@ -228,6 +229,7 @@ export interface Conversation {
       controller_conversation_id?: string | null;
       controller_session_id?: string | null;
       target_agent_id?: string | null;
+      target_agent_profile_id?: string | null;
       conversation_state?: string | null;
       turn_state?: string | null;
       last_result_summary?: string | null;
@@ -549,6 +551,7 @@ export interface Session {
   previous_session_id: string | null;
   user_email: string;
   agent_id: string;
+  agent_profile_id?: string | null;
   delegation_mode: string | null;
   delegation_task: string | null;
   status: string;
@@ -587,6 +590,16 @@ export interface IntarisSessionDetail {
   context_usage?: ContextUsage | null;
 }
 
+export interface AgentRuntimeProfile {
+  profile_id: string;
+  description?: string;
+  provider_id?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  system_prompt_extra?: string | null;
+  enabled?: boolean;
+}
+
 export interface Agent {
   agent_id: string;
   owner_email: string;
@@ -599,6 +612,8 @@ export interface Agent {
   tools: Record<string, unknown> | null;
   permissions: Record<string, unknown> | null;
   llm_config: Record<string, unknown> | null;
+  agent_profiles?: Record<string, AgentRuntimeProfile>;
+  default_agent_profile_id?: string | null;
   execution: Record<string, unknown> | null;
   personality_synced: boolean;
   personality_sync_error: string | null;
@@ -1373,6 +1388,7 @@ export interface Task {
   priority: number;
   created_by: string;
   agent_id: string;
+  agent_profile_id?: string | null;
   created_by_agent_id: string | null;
   source_type: string;
   source_ref: string | null;
@@ -1441,6 +1457,7 @@ export interface WorkflowStep {
   description?: string;
   prompt?: string;
   agent_override?: string | null;
+  agent_profile_id?: string | null;
   reasoning_effort?: string | null;
   input?: {
     type: string;
@@ -1512,6 +1529,7 @@ export interface Schedule {
   one_shot_at: string | null;
   timezone: string;
   agent_id: string;
+  agent_profile_id?: string | null;
   workflow_id: string | null;
   project_id: string | null;
   skill_id: string | null;

@@ -413,6 +413,7 @@ class SessionManager:
         user_email: str,
         agent_id: str,
         context: ConversationContext,
+        agent_profile_id: str | None = None,
         title: str | None = None,
         title_source: str = "unset",
         conversation_id: str | None = None,
@@ -426,6 +427,7 @@ class SessionManager:
                     db_session,
                     user_email=user_email,
                     agent_id=agent_id,
+                    agent_profile_id=agent_profile_id,
                     context_type=context.type,
                     title=title,
                     title_source=title_source,
@@ -446,6 +448,8 @@ class SessionManager:
         *,
         user_email: str,
         agent_id: str,
+        agent_profile_id: str | None = None,
+        agent_profile_explicit: bool = False,
     ) -> ConversationModel:
         """Return the sticky web direct chat for a user/agent pair."""
 
@@ -496,12 +500,27 @@ class SessionManager:
                         )
                         if existing is None:
                             raise RuntimeError("Failed to reload agent direct conversation")
+                    if agent_profile_explicit and existing.agent_profile_id != agent_profile_id:
+                        await queries.set_conversation_agent_profile_id(
+                            db_session,
+                            existing.conversation_id,
+                            agent_profile_id,
+                        )
+                        await db_session.commit()
+                        existing = await queries.get_agent_direct_conversation(
+                            db_session,
+                            user_email,
+                            agent_id,
+                        )
+                        if existing is None:
+                            raise RuntimeError("Failed to reload agent direct conversation")
                     return _to_conversation_model(existing)
                 try:
                     conversation = await queries.create_conversation(
                         db_session,
                         user_email=user_email,
                         agent_id=agent_id,
+                        agent_profile_id=agent_profile_id,
                         context_type="web",
                         title=direct_title,
                         title_source="agent_direct",
@@ -533,6 +552,7 @@ class SessionManager:
         user_email: str,
         agent_id: str,
         intention: str,
+        agent_profile_id: str | None = None,
         session_id: str | None = None,
     ) -> SessionModel:
         """Create a root session and corresponding Intaris session."""
@@ -557,6 +577,7 @@ class SessionManager:
                     conversation_id=conversation_id,
                     user_email=user_email,
                     agent_id=agent_id,
+                    agent_profile_id=agent_profile_id,
                     session_id=session_id,
                 )
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
@@ -685,6 +706,7 @@ class SessionManager:
         user_email: str,
         agent_id: str,
         context: ConversationContext,
+        agent_profile_id: str | None = None,
         title: str | None = None,
         title_source: str = "unset",
         intention: str | None = None,
@@ -709,6 +731,7 @@ class SessionManager:
                     db_session,
                     user_email=user_email,
                     agent_id=agent_id,
+                    agent_profile_id=agent_profile_id,
                     context_type=context.type,
                     title=title,
                     title_source=title_source,
@@ -731,6 +754,7 @@ class SessionManager:
                     conversation_id=conversation.conversation_id,
                     user_email=user_email,
                     agent_id=agent_id,
+                    agent_profile_id=agent_profile_id,
                 )
                 resolved_intention = _normalize_intention(
                     intention or self._build_root_intention(agent, title)
@@ -1133,6 +1157,7 @@ class SessionManager:
         task_description: str,
         agent_id: str,
         effective_agent_id: str,
+        agent_profile_id: str | None = None,
         expected_output: str | None = None,
         constraints: dict[str, Any] | None = None,
         intention: str | None = None,
@@ -1149,6 +1174,7 @@ class SessionManager:
                     conversation_id=parent_session.conversation_id,
                     user_email=parent_session.user_email,
                     agent_id=agent_id,
+                    agent_profile_id=agent_profile_id,
                     parent_session_id=parent_session.session_id,
                     delegation_mode=mode,
                     delegation_task=task_description,
@@ -1166,6 +1192,7 @@ class SessionManager:
                     extra={
                         "delegated_by_agent": parent_session.agent_id,
                         "effective_agent_id": effective_agent_id,
+                        "agent_profile_id": agent_profile_id,
                         "task_description": task_description,
                         "expected_output": expected_output,
                         "constraints": constraints or {},
@@ -2038,6 +2065,7 @@ def _to_conversation_model(row: Any) -> ConversationModel:
         conversation_id=row.conversation_id,
         user_email=row.user_email,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         title=row.title,
         title_source=getattr(row, "title_source", "unset") or "unset",
         context=ConversationContext(
@@ -2068,6 +2096,7 @@ def _to_session_model(row: Any) -> SessionModel:
         previous_session_id=getattr(row, "previous_session_id", None),
         user_email=row.user_email,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
         status=row.status,

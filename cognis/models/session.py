@@ -49,6 +49,7 @@ class ConversationModel(BaseModel):
     conversation_id: str
     user_email: str
     agent_id: str
+    agent_profile_id: str | None = None
     title: str | None = None
     title_source: str = "unset"
     context: ConversationContext
@@ -77,6 +78,7 @@ class SessionModel(BaseModel):
     previous_session_id: str | None = None
     user_email: str
     agent_id: str
+    agent_profile_id: str | None = None
     delegation_mode: str | None = None
     delegation_task: str | None = None
     status: str = SessionStatus.ACTIVE

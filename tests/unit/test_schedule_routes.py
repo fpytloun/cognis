@@ -15,6 +15,7 @@ from cognis.store.queries import (
     create_task,
     create_user,
     create_workflow,
+    get_task,
     update_schedule_fire_state,
 )
 
@@ -49,6 +50,13 @@ def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path
                     owner_email="user@example.com",
                     name="Agent 1",
                     status="active",
+                    agent_profiles={
+                        "fast": {
+                            "profile_id": "fast",
+                            "description": "Fast responses",
+                            "enabled": True,
+                        }
+                    },
                 )
                 schedule = await create_schedule(
                     session,
@@ -151,6 +159,85 @@ def test_schedule_create_rejects_other_user_workflow(monkeypatch: object, tmp_pa
         )
 
         assert response.status_code == 404
+
+
+def test_schedule_agent_profile_round_trip(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                    agent_profiles={
+                        "fast": {
+                            "profile_id": "fast",
+                            "description": "Fast responses",
+                            "enabled": True,
+                        },
+                        "quality": {
+                            "profile_id": "quality",
+                            "description": "Quality responses",
+                            "enabled": True,
+                        },
+                    },
+                    default_agent_profile_id="fast",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = _auth_headers(app, email="owner@example.com")
+
+        create_response = client.post(
+            "/api/v1/schedules",
+            headers=headers,
+            json={
+                "name": "Profiled schedule",
+                "schedule_type": "cron",
+                "cron_expr": "0 9 * * *",
+                "agent_id": "agent-1",
+                "agent_profile_id": "fast",
+                "task_template": {"title": "Profiled run"},
+            },
+        )
+        assert create_response.status_code == 201
+        schedule_id = create_response.json()["schedule_id"]
+        assert create_response.json()["agent_profile_id"] == "fast"
+
+        detail_response = client.get(f"/api/v1/schedules/{schedule_id}", headers=headers)
+        assert detail_response.status_code == 200
+        assert detail_response.json()["agent_profile_id"] == "fast"
+
+        list_response = client.get("/api/v1/schedules", headers=headers)
+        assert list_response.status_code == 200
+        assert list_response.json()[0]["agent_profile_id"] == "fast"
+
+        update_response = client.put(
+            f"/api/v1/schedules/{schedule_id}",
+            headers=headers,
+            json={"agent_profile_id": "quality"},
+        )
+        assert update_response.status_code == 200
+        assert update_response.json()["agent_profile_id"] == "quality"
+
+        clear_response = client.put(
+            f"/api/v1/schedules/{schedule_id}",
+            headers=headers,
+            json={"agent_profile_id": None},
+        )
+        assert clear_response.status_code == 200
+        assert clear_response.json()["agent_profile_id"] is None
 
 
 def test_schedule_update_rejects_clearing_project_for_bound_workflow(
@@ -519,6 +606,7 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
                     interval_seconds=600,
                     timezone="UTC",
                     agent_id="agent-1",
+                    agent_profile_id="fast",
                     task_template={"title": "Triggered task"},
                     created_by="user@example.com",
                 )
@@ -537,6 +625,13 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
         assert body["task_id"].startswith("task_")
         assert body["schedule_id"] == schedule_id
         assert body["last_run_status"] in {"queued", "ready", "running"}
+
+        async def _load_task_profile(task_id: str) -> str | None:
+            async with app.state.session_factory() as session:
+                task = await get_task(session, task_id)
+                return task.agent_profile_id if task is not None else None
+
+        assert asyncio.run(_load_task_profile(body["task_id"])) == "fast"
 
 
 def test_project_response_counts_active_schedules(monkeypatch: object, tmp_path: Path) -> None:

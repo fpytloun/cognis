@@ -11,8 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from cognis.core.agent_direct import is_agent_direct_context
-from cognis.core.long_lived_chat import is_channel_context_type
+from cognis.core.long_lived_chat import is_channel_context_type, is_web_main_chat_context
 from cognis.models.session import ConversationContext
 
 
@@ -21,7 +20,7 @@ class OrchestrationSurface(StrEnum):
 
     MANAGED_AGENT_CONVERSATION = "managed_agent_conversation"
     CHANNEL = "channel"
-    AGENT_DIRECT = "agent_direct"
+    WEB_MAIN_CHAT = "web_main_chat"
     WEB_TOPIC = "web_topic"
     TASK = "task"
     OTHER = "other"
@@ -35,6 +34,9 @@ class OrchestrationSurfacePolicy:
     allow_delegate_wait_false: bool
     expose_delegate_wait_option: bool
     expose_managed_conversation_tools: bool
+    expose_task_tools: bool = True
+    expose_workflow_tools: bool = True
+    expose_compose_workflow_tool: bool = True
 
 
 _MANAGED_AGENT_CONTEXT_VALUES = frozenset({"agent_work", "managed_agent_conversation"})
@@ -60,11 +62,10 @@ def classify_orchestration_surface(context: ConversationContext | None) -> Orche
         return OrchestrationSurface.MANAGED_AGENT_CONVERSATION
 
     context_type = _normalized_string(getattr(context, "type", None))
-    platform_data = getattr(context, "platform_data", None) or {}
     if context_type == "task":
         return OrchestrationSurface.TASK
-    if is_agent_direct_context(context_type, platform_data):
-        return OrchestrationSurface.AGENT_DIRECT
+    if is_web_main_chat_context(context):
+        return OrchestrationSurface.WEB_MAIN_CHAT
     if context_type == "web":
         return OrchestrationSurface.WEB_TOPIC
     if is_channel_context_type(context_type):
@@ -89,6 +90,9 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=False,
+            expose_task_tools=False,
+            expose_workflow_tools=False,
+            expose_compose_workflow_tool=False,
         )
     if surface == OrchestrationSurface.TASK:
         return OrchestrationSurfacePolicy(
@@ -96,18 +100,28 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=False,
+            expose_task_tools=False,
+            expose_workflow_tools=False,
+            expose_compose_workflow_tool=False,
         )
-    if surface in {OrchestrationSurface.AGENT_DIRECT, OrchestrationSurface.WEB_TOPIC}:
+    if surface == OrchestrationSurface.WEB_TOPIC:
         return OrchestrationSurfacePolicy(
             surface=surface,
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=True,
         )
+    if surface in {OrchestrationSurface.WEB_MAIN_CHAT, OrchestrationSurface.CHANNEL}:
+        return OrchestrationSurfacePolicy(
+            surface=surface,
+            allow_delegate_wait_false=True,
+            expose_delegate_wait_option=True,
+            expose_managed_conversation_tools=True,
+        )
     return OrchestrationSurfacePolicy(
         surface=surface,
-        allow_delegate_wait_false=True,
-        expose_delegate_wait_option=True,
+        allow_delegate_wait_false=False,
+        expose_delegate_wait_option=False,
         expose_managed_conversation_tools=True,
     )
 

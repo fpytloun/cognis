@@ -98,6 +98,7 @@ class ComposeAndRunWorkflowArgs(BaseModel):
     interaction_mode_override: Literal["none", "explicit_gates", "step_requests"] | None = None
     persist: bool = False
     agent_id: str | None = None
+    agent_profile_id: str | None = None
     priority: int | None = None
 
 

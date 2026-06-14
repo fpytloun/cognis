@@ -13,6 +13,21 @@ from pathlib import Path
 from typing import Any
 
 
+class TransientExecutorUnavailable(RuntimeError):
+    """Selected executor is temporarily unavailable and may recover shortly."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        executor_id: str | None = None,
+        retry_after_seconds: int = 5,
+    ) -> None:
+        super().__init__(message)
+        self.executor_id = executor_id
+        self.retry_after_seconds = retry_after_seconds
+
+
 @dataclass(slots=True)
 class ExecutorEnvironmentSnapshot:
     """Observed environment information for the selected tool executor."""

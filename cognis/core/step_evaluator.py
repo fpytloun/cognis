@@ -80,6 +80,11 @@ Evaluation checklist:
 7. Only require artifacts explicitly requested by the step objective. Process
    guidance is not automatically a required output artifact.
 8. Use execution evidence to validate claims when it is relevant and available.
+   Session-derived tool_call/tool_result events are authoritative evidence that
+   the step performed live inspection, commands, or mutations. Do not request
+   a redo for "actual inspection" when those session events show relevant real
+   tool activity, even if the written deliverable summarizes rather than
+   repeats every raw result.
 9. Treat Expected output as strong guidance for output shape, tone, format, and
    level of detail, but do not fail the step solely because the assistant
    produced the minimum deliverable required by the runtime step contract.

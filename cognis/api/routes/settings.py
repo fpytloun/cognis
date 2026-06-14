@@ -44,6 +44,7 @@ from cognis.core.step_profiles import (
 from cognis.models.config import normalize_reasoning_level
 from cognis.models.workflow import StepProfileConfig
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.providers.llm.message_projection import VALID_MESSAGE_PROJECTION_POLICIES
 from cognis.settings_schema import setting_category, validate_setting_value
 from cognis.store.models import SystemWorkflowOverride, WorkflowRow
 from cognis.store.queries import (
@@ -207,6 +208,16 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
     if not isinstance(config, dict):
         return
     preset = str(config.get("preset") or "").strip().lower()
+    message_projection_policy = config.get("message_projection_policy")
+    if message_projection_policy is not None:
+        value = str(message_projection_policy).strip().lower()
+        if value not in VALID_MESSAGE_PROJECTION_POLICIES:
+            allowed = ", ".join(sorted(VALID_MESSAGE_PROJECTION_POLICIES))
+            raise api_exception(
+                400,
+                "validation_error",
+                f"message_projection_policy must be one of: {allowed}",
+            )
     codex_transport = config.get("codex_transport")
     if codex_transport is not None:
         value = str(codex_transport).strip().lower()

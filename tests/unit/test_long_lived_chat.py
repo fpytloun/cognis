@@ -4,6 +4,8 @@ from cognis.core.long_lived_chat import (
     is_agent_direct_context_ref,
     is_channel_context_type,
     is_long_lived_chat_context,
+    is_web_main_chat_context,
+    is_web_main_chat_context_ref,
 )
 from cognis.models.session import ConversationContext
 
@@ -23,6 +25,13 @@ def test_web_agent_direct_by_context_ref_is_long_lived() -> None:
     assert is_long_lived_chat_context(
         ConversationContext(type="web", ref="web:agent_direct:user@example.com:agent-1")
     )
+
+
+def test_web_main_chat_by_context_ref_is_long_lived() -> None:
+    assert is_web_main_chat_context_ref("web:user:user@example.com:default")
+    context = ConversationContext(type="web", ref="web:user:user@example.com:default")
+    assert is_web_main_chat_context(context)
+    assert is_long_lived_chat_context(context)
 
 
 def test_external_channel_context_is_long_lived() -> None:

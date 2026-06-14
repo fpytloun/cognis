@@ -52,6 +52,7 @@ from cognis.core.project_context import ProjectContextEntry
 from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
+from cognis.core.tool_router import ToolRouter
 from cognis.core.turn_scheduler import TurnResult
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.deliverable import Deliverable
@@ -66,6 +67,7 @@ from cognis.models.session import (
 from cognis.models.tool import (
     Permission,
     ToolCall,
+    ToolCapability,
     ToolDefinition,
     ToolResult,
     ToolSource,
@@ -97,7 +99,7 @@ from cognis.store.queries import (
 )
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
-from cognis.tools.registry import RegisteredTool, ToolRegistry
+from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 # ---------------------------------------------------------------------------
 # StreamAccumulator tests
@@ -748,6 +750,121 @@ def test_classified_dynamic_read_only_tool_parallelizes() -> None:
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_classified_registry_overlay_updates_guardrails_tool_context() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    raw_tool = ToolDefinition(
+        name="mcp_mfg-portal__alertmanager_alerts",
+        description="List Alertmanager alerts",
+        parameters={
+            "type": "object",
+            "properties": {"filter": {"type": "array", "items": {"type": "string"}}},
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="mcp_fddc5ac26b29",
+            server_name="mfg-portal",
+            raw_tool_name="alertmanager.alerts",
+        ),
+        category="mcp",
+        read_only=False,
+        capabilities=[ToolCapability.WRITE],
+    )
+
+    async def handler(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        del arguments, context
+        return ToolResult(output="not called")
+
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=raw_tool, handler=handler))
+    classified_tool = raw_tool.model_copy(
+        update={
+            "read_only": True,
+            "capabilities": [ToolCapability.READ],
+            "classification_status": "ready",
+            "classification_source": "llm",
+            "classification_confidence": 0.98,
+        }
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        classified_tool_definitions={stable_tool_id(raw_tool): classified_tool},
+    )
+
+    overlaid = agent_loop._get_classified_tool_registry(ctx, registry)
+    assert isinstance(overlaid, ToolRegistry)
+    raw_registered = registry.get(raw_tool.name)
+    registered = overlaid.get(raw_tool.name)
+
+    assert raw_registered is not None
+    assert registered is not None
+    assert registered.handler is handler
+    assert raw_registered.definition.read_only is False
+    assert registered.definition.read_only is True
+    assert registered.definition.capabilities == [ToolCapability.READ]
+
+    context = await ToolRouter(guardrails=None)._evaluation_context(
+        ToolCall(
+            call_id="call-1",
+            name=raw_tool.name,
+            arguments={"filter": ["alertname=RcloneAggregatorSlowDurationWarning"]},
+        ),
+        registered.definition,
+    )
+
+    assert context["tool"]["read_only"] is True
+    assert context["tool"]["capabilities"] == ["read"]
+    assert context["tool"]["classification"] == {
+        "status": "ready",
+        "source": "llm",
+        "confidence": 0.98,
+    }
+
+
+def test_classified_registry_overlay_controls_same_executor_retry_safety() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    raw_tool = ToolDefinition(
+        name="read",
+        description="Read a file",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=True,
+        capabilities=[ToolCapability.READ],
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=raw_tool))
+    classified_tool = raw_tool.model_copy(
+        update={
+            "read_only": False,
+            "capabilities": [ToolCapability.WRITE],
+            "classification_status": "ready",
+        }
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        classified_tool_definitions={stable_tool_id(raw_tool): classified_tool},
+    )
+
+    overlaid = agent_loop._get_classified_tool_registry(ctx, registry)
+    assert isinstance(overlaid, ToolRegistry)
+    raw_registered = registry.get(raw_tool.name)
+    classified_registered = overlaid.get(raw_tool.name)
+
+    assert raw_registered is not None
+    assert classified_registered is not None
+    assert agent_loop._tool_safe_for_same_executor_retry(raw_registered) is True
+    assert agent_loop._tool_safe_for_same_executor_retry(classified_registered) is False
 
 
 def test_safe_executor_mutations_parallelize_under_evaluate_permission() -> None:
@@ -4041,6 +4158,8 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
     payload = json.loads(result.output)
     assert result.is_error is False
     assert payload["status"] == "accepted"
+    assert result.metadata is not None
+    assert result.metadata["async_orchestration_spawned"] is True
     assert scheduler.notify_on_completion_at_submit is True
     assert scheduler.turn_state_at_submit == "running"
     async with session_factory() as db_session:
@@ -4189,6 +4308,8 @@ async def test_agent_conversation_send_observer_supports_mid_turn_absorb(
     payload = json.loads(result.output)
     assert result.is_error is False
     assert payload["status"] == "accepted"
+    assert result.metadata is not None
+    assert result.metadata["async_orchestration_spawned"] is True
     assert len(scheduler.submitted_observers) == 1
     assert getattr(scheduler.submitted_observers[0], "supports_mid_turn_absorb", False) is True
 
@@ -4528,7 +4649,8 @@ def test_managed_agent_conversation_hides_async_delegate_and_conversation_tools(
     assert "wait" not in delegate_schema["properties"]
     assert "agent_conversation_create" not in by_name
     assert "agent_conversation_send" not in by_name
-    assert "create_task" in by_name
+    assert "create_task" not in by_name
+    assert "compose_and_run_workflow" not in by_name
 
 
 def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conversations() -> None:
@@ -4553,6 +4675,58 @@ def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conver
     assert "wait" not in delegate_schema["properties"]
     assert "agent_conversation_create" in by_name
     assert "create_task" in by_name
+
+
+def test_web_main_chat_exposes_async_delegate_and_managed_conversations() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="web-main", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(
+                type="web",
+                ref="web:user:user@example.com:default",
+            ),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    schemas = loop._build_controller_tool_schemas(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in schemas}
+
+    delegate_schema = by_name["delegate"]["function"]["parameters"]
+    assert "wait" in delegate_schema["properties"]
+    assert "agent_conversation_create" in by_name
+    assert "create_task" in by_name
+
+
+def test_task_surface_hides_async_orchestration_tools() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="task", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-1"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    schemas = loop._build_controller_tool_schemas(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in schemas}
+
+    delegate_schema = by_name["delegate"]["function"]["parameters"]
+    assert "wait" not in delegate_schema["properties"]
+    assert "agent_conversation_create" not in by_name
+    assert "create_task" not in by_name
+    assert "compose_and_run_workflow" not in by_name
 
 
 @pytest.mark.asyncio

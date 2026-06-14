@@ -20,10 +20,13 @@ from cognis.api.models import (
     ScheduleTriggerResponse,
     UpdateScheduleRequest,
 )
+from cognis.api.serializers import agent_to_response
+from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.workflow_management import (
     get_attached_skill_workflow_source,
 )
 from cognis.core.workflow_registry import SYSTEM_WORKFLOWS
+from cognis.models.agent import AgentDefinition
 from cognis.models.schedule import ScheduleModel as _ScheduleModel
 from cognis.models.schedule import describe_schedule
 from cognis.models.workflow import CompletionDeliveryPolicy
@@ -100,6 +103,7 @@ def _row_to_response(
         one_shot_at=row.one_shot_at,
         timezone=row.timezone,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         skill_id=row.skill_id,
@@ -127,6 +131,7 @@ def _row_to_response(
         one_shot_at=row.one_shot_at,
         timezone=row.timezone,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         workflow_id=row.workflow_id,
         project_id=getattr(row, "project_id", None),
         skill_id=row.skill_id,
@@ -264,6 +269,12 @@ async def create_schedule_route(
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
+        if body.agent_profile_id is not None:
+            agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
+            try:
+                resolve_agent_profile(agent_definition, body.agent_profile_id, source="api")
+            except ValueError as exc:
+                raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
 
     async with request.app.state.session_factory() as db:
         await _validate_workflow_access(db, request, body.workflow_id, project_id=body.project_id)
@@ -334,6 +345,7 @@ async def create_schedule_route(
             one_shot_at=body.one_shot_at,
             timezone=body.timezone,
             agent_id=body.agent_id,
+            agent_profile_id=body.agent_profile_id,
             workflow_id=body.workflow_id,
             project_id=body.project_id,
             skill_id=body.skill_id,
@@ -406,12 +418,22 @@ async def update_schedule_route(
             raise api_exception(404, "agent_not_found", "Agent not found")
         await check_agent_access(request, current_agent, required="use")
 
+        effective_agent = current_agent
         # Validate agent if changing
         if body.agent_id is not None:
             agent = await get_agent(db, body.agent_id)
             if agent is None:
                 raise api_exception(404, "agent_not_found", "Agent not found")
             await check_agent_access(request, agent, required="use")
+            effective_agent = agent
+        if "agent_profile_id" in body.model_fields_set and body.agent_profile_id is not None:
+            agent_definition = AgentDefinition.model_validate(
+                agent_to_response(effective_agent).model_dump()
+            )
+            try:
+                resolve_agent_profile(agent_definition, body.agent_profile_id, source="api")
+            except ValueError as exc:
+                raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
         if body.project_id is not None:
             await _validate_project_access_in_session(db, request, body.project_id)
         effective_project_id = (
@@ -464,6 +486,8 @@ async def update_schedule_route(
                 raise api_exception(400, "invalid_cron", f"Invalid cron expression: {exc}") from exc
 
         fields = body.model_dump(exclude_unset=True)
+        if body.agent_id is not None and "agent_profile_id" not in body.model_fields_set:
+            fields["agent_profile_id"] = None
         if body.skill_id is not None:
             agent_id = body.agent_id or existing.agent_id
             agent = await request.app.state.agent_registry.get(agent_id, owner_email=user.email)

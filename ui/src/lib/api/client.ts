@@ -432,7 +432,12 @@ export const api = {
       );
     },
 
-    create(payload: { agent_id: string; title?: string | null; context?: Record<string, unknown> }): Promise<Conversation> {
+    create(payload: {
+      agent_id: string;
+      agent_profile_id?: string | null;
+      title?: string | null;
+      context?: Record<string, unknown>;
+    }): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations', {
         method: 'POST',
         body: JSON.stringify(payload)
@@ -511,7 +516,12 @@ export const api = {
       return request<Session[]>(`/api/v1/conversations/${conversationId}/delegations`);
     },
 
-    resolve(payload: { agent_id: string; context_type?: string; scope?: 'latest' | 'agent_direct' }): Promise<Conversation> {
+    resolve(payload: {
+      agent_id: string;
+      agent_profile_id?: string | null;
+      context_type?: string;
+      scope?: 'latest' | 'agent_direct';
+    }): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations/resolve', {
         method: 'POST',
         body: JSON.stringify(payload)

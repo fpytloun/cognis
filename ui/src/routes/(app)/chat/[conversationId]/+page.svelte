@@ -280,6 +280,7 @@ import X from 'lucide-svelte/icons/x';
   let lastRecoverableMessage = $state('');
   let showNewChatModal = $state(false);
   let newChatAgentId = $state('');
+  let newChatAgentProfileId = $state('');
   let newChatCreating = $state(false);
   let newChatError = $state('');
   let editingTitle = $state(false);
@@ -3215,6 +3216,7 @@ import X from 'lucide-svelte/icons/x';
   function openNewConversationModal(): void {
     newChatError = '';
     newChatAgentId = preferredNewConversationAgentId();
+    newChatAgentProfileId = '';
     // On mobile the conversation list is a sliding overlay. Hide it before
     // showing the modal or the modal is obscured by the list drawer.
     mobileListOpen = false;
@@ -3224,6 +3226,7 @@ import X from 'lucide-svelte/icons/x';
   async function openNewConversationForSelectedAgent(): Promise<void> {
     newChatError = '';
     newChatAgentId = preferredNewConversationAgentId();
+    newChatAgentProfileId = '';
     mobileListOpen = false;
     await tick();
     await createNewConversation();
@@ -3249,6 +3252,7 @@ import X from 'lucide-svelte/icons/x';
     try {
       const conversation = await api.conversations.create({
         agent_id: agentId,
+        agent_profile_id: newChatAgentProfileId || null,
         context: {
           type: 'web',
           ref: null,
@@ -3446,7 +3450,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/fork', '/undo', '/redo', '/new', '/reset', '/clear', '/stop', '/cancel', '/context', '/info', '/lsp', '/executor', '/model', '/thinking', '/help', '/retry', '/continue', '/plan', '/build', '/default'];
+  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/fork', '/undo', '/redo', '/new', '/reset', '/clear', '/stop', '/cancel', '/context', '/info', '/lsp', '/executor', '/model', '/thinking', '/profile', '/help', '/retry', '/continue', '/plan', '/build', '/default'];
 
   function normalizeSlashCommandInput(value: string): string {
     const trimmed = value.trim();
@@ -3469,6 +3473,7 @@ import X from 'lucide-svelte/icons/x';
     { command: '/help', description: 'Show available commands' },
     { command: '/model', description: 'List or switch LLM model' },
     { command: '/thinking', description: 'Set reasoning effort' },
+    { command: '/profile', description: 'List or switch agent runtime profile' },
     { command: '/context', description: 'Show context usage' },
     { command: '/info', description: 'Show session details' },
     { command: '/lsp', description: 'Show LSP diagnostics status' },
@@ -6408,6 +6413,7 @@ import X from 'lucide-svelte/icons/x';
         <NewChatModal
           agents={agents}
           bind:selectedAgentId={newChatAgentId}
+          bind:selectedAgentProfileId={newChatAgentProfileId}
           busy={newChatCreating}
           error={newChatError}
           oncancel={closeNewConversationModal}

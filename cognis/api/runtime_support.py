@@ -29,6 +29,7 @@ from cognis.core.executor_policy import (
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.core.runtime import (
     ResolvedStepRuntime,
+    TransientExecutorUnavailable,
     build_local_executor_environment,
     environment_from_metadata,
 )
@@ -89,6 +90,7 @@ from cognis.tools.skills import (
 )
 
 logger = get_logger(__name__)
+
 
 MCP_TOOL_SOURCE_TYPES = frozenset({"local_mcp", "intaris_mcp"})
 
@@ -300,6 +302,34 @@ def _raise_runtime_resolution_error(
         },
     )
     raise RuntimeError(message)
+
+
+def _raise_transient_executor_unavailable(
+    message: str,
+    *,
+    executor_config: dict[str, Any] | None,
+    selection_source: str,
+    hard_bound: bool,
+    retry_after_seconds: int = 5,
+) -> None:
+    logger.warning(
+        "executor runtime resolution transiently unavailable",
+        extra={
+            "extra_data": {
+                "executor_id": executor_config.get("executor_id") if executor_config else None,
+                "executor_type": executor_config.get("executor_type") if executor_config else None,
+                "selection_source": selection_source,
+                "hard_bound": hard_bound,
+                "reason": message,
+                "retry_after_seconds": retry_after_seconds,
+            }
+        },
+    )
+    raise TransientExecutorUnavailable(
+        message,
+        executor_id=executor_config.get("executor_id") if executor_config else None,
+        retry_after_seconds=retry_after_seconds,
+    )
 
 
 def _executor_config_from_row(
@@ -1548,7 +1578,7 @@ def build_step_runtime_factory(
                     _executor_pin_fallback_retried=True,
                 )
             message = f"Selected executor '{executor_id}' is not connected or not ready"
-            _raise_runtime_resolution_error(
+            _raise_transient_executor_unavailable(
                 message,
                 executor_config=executor_config,
                 selection_source=selection_source,

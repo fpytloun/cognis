@@ -9,6 +9,7 @@
     decodeWorkflowSourceValue
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -17,6 +18,7 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText } from '$lib/session-policy';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
@@ -83,6 +85,7 @@ import Zap from 'lucide-svelte/icons/zap';
     one_shot_at: '',
     timezone: localTimezone,
     agent_id: '',
+    agent_profile_id: '',
     workflow_source: '',
     project_id: '',
     task_title: '',
@@ -199,6 +202,7 @@ import Zap from 'lucide-svelte/icons/zap';
         const active = agents.find((a) => a.status === 'active');
         form.agent_id = active?.agent_id ?? agents[0]?.agent_id ?? '';
       }
+      form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
     } catch (e) {
       error = asApiError(e).message;
     } finally {
@@ -256,6 +260,7 @@ import Zap from 'lucide-svelte/icons/zap';
         one_shot_at: form.schedule_type === 'one_shot' ? form.one_shot_at : null,
         timezone: form.timezone,
         agent_id: form.agent_id,
+        agent_profile_id: form.agent_profile_id || null,
         workflow_id: workflowSource.workflow_id,
         skill_id: workflowSource.skill_id,
         project_id: form.project_id || null,
@@ -285,6 +290,7 @@ import Zap from 'lucide-svelte/icons/zap';
       one_shot_at: '',
       timezone: localTimezone,
       agent_id: agents.find((a) => a.status === 'active')?.agent_id ?? agents[0]?.agent_id ?? '',
+      agent_profile_id: '',
       workflow_source: '',
       project_id: '',
       task_title: '',
@@ -308,6 +314,10 @@ import Zap from 'lucide-svelte/icons/zap';
 
   $effect(() => {
     void loadWorkflowsForProject(form.project_id);
+  });
+
+  $effect(() => {
+    form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
   });
 
   function openHeartbeatPreset(): void {
@@ -711,6 +721,11 @@ import Zap from 'lucide-svelte/icons/zap';
               {/each}
             </select>
           </div>
+          <AgentProfileSelect
+            agents={agents}
+            agentId={form.agent_id}
+            bind:value={form.agent_profile_id}
+          />
           <div class="space-y-1 sm:col-span-2">
             <label for="sched-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
             <select id="sched-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">

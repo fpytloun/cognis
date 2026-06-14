@@ -147,6 +147,27 @@ class TestHtmlConversion:
         assert not result.attachments
         assert (result.metadata or {}).get("content_type") == "text/plain"
 
+    def test_format_response_result_verification_page_is_error(self) -> None:
+        response = httpx.Response(
+            200,
+            content=(
+                b"<html><head><title>Reddit - Please wait for verification</title></head>"
+                b"<body></body></html>"
+            ),
+            headers={"content-type": "text/html"},
+            request=httpx.Request(
+                "GET",
+                "https://www.reddit.com/r/quails/comments/t8r4dd/example/",
+            ),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert result.is_error
+        assert "requires verification" in result.output
+        assert (result.metadata or {}).get("direct_fetch_blocked") is True
+        assert (result.metadata or {}).get("direct_fetch_block_signal") == "verification"
+
     def test_format_response_result_image_attaches_binary_without_dumping_bytes(self) -> None:
         image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
         response = httpx.Response(
@@ -1073,7 +1094,7 @@ class TestDirectBackend:
             assert "Hello" in result.output
 
     @pytest.mark.asyncio()
-    async def test_fetch_reddit_thread_uses_json_adapter(self) -> None:
+    async def test_fetch_reddit_thread_warms_old_reddit_json_adapter(self) -> None:
         backend = DirectBackend()
         reddit_json = [
             {
@@ -1110,16 +1131,25 @@ class TestDirectBackend:
             },
         ]
 
-        request = httpx.Request(
+        warmup_request = httpx.Request(
             "GET",
-            "https://www.reddit.com/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/.json?raw_json=1",
+            "https://old.reddit.com/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/",
         )
-        response = httpx.Response(200, request=request, json=reddit_json)
+        json_request = httpx.Request(
+            "GET",
+            "https://old.reddit.com/r/quails/comments/t8r4dd/brooder_heat_plate_size_for_coturnix/.json?raw_json=1",
+        )
+        warmup_response = httpx.Response(
+            200,
+            request=warmup_request,
+            text="<html><title>old reddit</title></html>",
+        )
+        response = httpx.Response(200, request=json_request, json=reddit_json)
 
         with patch("cognis.tools.executor.web.backends.reddit.httpx.AsyncClient") as client_cls:
             client = AsyncMock()
             client.__aenter__.return_value = client
-            client.get.return_value = response
+            client.get.side_effect = [warmup_response, response]
             client_cls.return_value = client
 
             result = await backend.fetch(
@@ -1134,7 +1164,12 @@ class TestDirectBackend:
         assert isinstance(document, dict)
         assert document.get("extractor") == "reddit_json"
         assert (result.metadata or {}).get("reddit_adapter") is True
-        client.get.assert_awaited_once()
+        assert (result.metadata or {}).get("reddit_warmup_url") == str(warmup_request.url)
+        assert (result.metadata or {}).get("reddit_json_url") == str(json_request.url)
+        assert [str(call.args[0]) for call in client.get.await_args_list] == [
+            str(warmup_request.url),
+            str(json_request.url),
+        ]
 
     @pytest.mark.asyncio()
     async def test_fetch_error_result(self) -> None:

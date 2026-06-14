@@ -23,6 +23,7 @@ import Target from 'lucide-svelte/icons/target';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
@@ -44,6 +45,7 @@ import Target from 'lucide-svelte/icons/target';
     shouldClearTaskFromError
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText, policyText } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
@@ -111,6 +113,7 @@ import type {
     priority: 0,
     expected_output: '',
     agent_id: '',
+    agent_profile_id: '',
     workflow_id: '',
     project_id: '',
     delivery_mode: 'same_conversation',
@@ -156,6 +159,7 @@ import type {
   let isEditable = $derived(task != null && !TERMINAL_STATUSES.includes(task.status));
   let isCancellable = $derived(task != null && CANCELLABLE_STATUSES.includes(task.status));
   let isRerunnable = $derived(isTaskRerunnable(task));
+  let selectedEditAgent = $derived(agents.find((agent) => agent.agent_id === editForm.agent_id) ?? null);
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -966,6 +970,13 @@ import type {
     void loadProjectWorkflowOptions(editForm.project_id);
   });
 
+  $effect(() => {
+    editForm.agent_profile_id = normalizeSelectedAgentProfileId(
+      selectedEditAgent,
+      editForm.agent_profile_id
+    );
+  });
+
   let stepAttemptCounts = $derived.by(() => Object.fromEntries(stepGroups.map((group) => [group.stepName, attemptCountForGroup(group)])));
 
   let stepStateLabels = $derived.by(() => {
@@ -1212,6 +1223,7 @@ import type {
         expected_output: task.expected_output ?? '',
         priority: task.priority,
         agent_id: task.agent_id,
+        agent_profile_id: task.agent_profile_id ?? '',
         workflow_id: task.workflow_id ?? '',
         project_id: task.project_id ?? '',
         delivery_mode: task.delivery.mode,
@@ -1299,6 +1311,7 @@ import type {
         expected_output: editForm.expected_output || null,
         priority: Number(editForm.priority),
         agent_id: editForm.agent_id,
+        agent_profile_id: editForm.agent_profile_id || null,
         workflow_id: editForm.workflow_id || null,
         project_id: editForm.project_id || null,
         delivery_mode: editForm.delivery_mode,
@@ -2548,6 +2561,12 @@ import type {
               disabled={!isEditable}
             />
           </div>
+          <AgentProfileSelect
+            agents={agents.filter((a) => a.agent_type === 'primary')}
+            agentId={editForm.agent_id}
+            bind:value={editForm.agent_profile_id}
+            disabled={!isEditable}
+          />
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Workflow</span>
             <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-50">

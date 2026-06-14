@@ -65,6 +65,7 @@ class TaskModel(BaseModel):
     priority: int = 0
     created_by: str
     agent_id: str
+    agent_profile_id: str | None = None
     created_by_agent_id: str | None = None
     source_type: str = "api"  # "chat" | "api" | "scheduler" | "webhook"
     source_ref: str | None = None
@@ -106,6 +107,7 @@ class StepRunModel(BaseModel):
     attempt_number: int = 1
     superseded_by_step_run_id: str | None = None
     agent_id: str
+    agent_profile_id: str | None = None
     workspace_root: str | None = None
     working_directory: str | None = None
     session_id: str | None = None

@@ -47,12 +47,14 @@ from cognis.api.serializers import (
     serialize_event_rows,
     session_to_response,
 )
+from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.attachment_utils import hydrate_attachment_refs
 from cognis.core.conversation_state import snapshot_for_conversation
 from cognis.core.managed_conversations import last_managed_conversation_user_message_for_retry
 from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
+from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, SessionEvent, SessionModel
 from cognis.store.queries import (
     create_managed_conversation_link,
@@ -81,6 +83,10 @@ logger = get_logger(__name__)
 
 _CONVERSATION_MESSAGES_CURSOR_VERSION = 1
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
+
+
+def _agent_definition_from_row(row: object) -> AgentDefinition:
+    return AgentDefinition.model_validate(agent_to_response(row).model_dump())
 
 
 def _encode_messages_cursor(session_id: str, seq: int) -> str:
@@ -113,6 +119,18 @@ def _decode_messages_cursor(cursor: str) -> tuple[str, int]:
 def _event_seq(event: dict[str, Any]) -> int:
     seq = event.get("seq")
     return seq if isinstance(seq, int) else 0
+
+
+def _messages_cursor_anchor_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the oldest real event usable as a history cursor anchor."""
+    for event in events:
+        if _event_seq(event) <= 0:
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("session_id"), str):
+            continue
+        return event
+    return None
 
 
 def _event_timestamp(event: dict[str, Any]) -> datetime:
@@ -467,6 +485,11 @@ async def resolve_conversation(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
+        agent_definition = _agent_definition_from_row(agent)
+        try:
+            resolve_agent_profile(agent_definition, payload.agent_profile_id, source="api")
+        except ValueError as exc:
+            raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
         if payload.scope == "agent_direct":
             if payload.context_type != "web":
                 raise api_exception(
@@ -489,6 +512,8 @@ async def resolve_conversation(
             await request.app.state.session_manager.get_or_create_agent_direct_conversation(
                 user_email=user.email,
                 agent_id=payload.agent_id,
+                agent_profile_id=payload.agent_profile_id,
+                agent_profile_explicit=payload.agent_profile_id is not None,
             )
         )
     else:
@@ -496,6 +521,7 @@ async def resolve_conversation(
         conversation = await request.app.state.session_manager.create_conversation(
             user_email=user.email,
             agent_id=payload.agent_id,
+            agent_profile_id=payload.agent_profile_id,
             context=ConversationContext(
                 type=payload.context_type,
                 ref=context_ref,
@@ -520,10 +546,16 @@ async def create_conversation(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
+        agent_definition = _agent_definition_from_row(agent)
+        try:
+            resolve_agent_profile(agent_definition, payload.agent_profile_id, source="api")
+        except ValueError as exc:
+            raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
     await _validate_project_access(request, payload.project_id)
     conversation = await request.app.state.session_manager.create_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
+        agent_profile_id=payload.agent_profile_id,
         context=ConversationContext(
             type=payload.context.type,
             ref=payload.context.ref,
@@ -935,14 +967,15 @@ async def conversation_messages(
         last_seq_value = active_session_last_seq
         has_more = has_older or lineage_truncated
         if has_more and all_events:
-            first_event = all_events[0]
+            first_event = _messages_cursor_anchor_event(all_events)
             first_session_id = None
-            data = first_event.get("data")
-            if isinstance(data, dict) and isinstance(data.get("session_id"), str):
-                first_session_id = data["session_id"]
-            first_seq = _event_seq(first_event)
-            if first_session_id:
-                older_cursor = _encode_messages_cursor(first_session_id, first_seq)
+            if first_event is not None:
+                data = first_event.get("data")
+                if isinstance(data, dict) and isinstance(data.get("session_id"), str):
+                    first_session_id = data["session_id"]
+                first_seq = _event_seq(first_event)
+                if first_session_id:
+                    older_cursor = _encode_messages_cursor(first_session_id, first_seq)
         if lineage_truncated:
             history_truncated = True
             truncation_reason = "lineage_truncated"

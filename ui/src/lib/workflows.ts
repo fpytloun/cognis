@@ -30,6 +30,7 @@ export interface WorkflowStepFormState {
   type: 'run' | 'gate';
   prompt: string;
   agentOverride: string;
+  agentProfileId: string;
   reasoningEffort: string;
   requireDeliverable: boolean;
   stepProfileId: string;
@@ -94,6 +95,7 @@ export function createEmptyStep(): WorkflowStepFormState {
     type: 'run',
     prompt: '',
     agentOverride: '',
+    agentProfileId: '',
     reasoningEffort: '',
     requireDeliverable: true,
     stepProfileId: '',
@@ -473,6 +475,7 @@ export function workflowToFormState(
         type: (step.type as 'run' | 'gate') ?? 'run',
         prompt: step.prompt ?? '',
         agentOverride: step.agent_override ?? '',
+        agentProfileId: typeof step.agent_profile_id === 'string' ? step.agent_profile_id : '',
         reasoningEffort: typeof step.reasoning_effort === 'string' ? step.reasoning_effort : '',
         requireDeliverable: step.require_deliverable !== false,
         stepProfileId: typeof step.step_profile_id === 'string' ? step.step_profile_id : '',
@@ -565,6 +568,7 @@ export function formStateToWorkflowPayload(form: WorkflowFormState): Record<stri
         type: step.type,
         prompt: step.prompt,
         agent_override: step.agentOverride || null,
+        agent_profile_id: step.agentProfileId.trim() || null,
         reasoning_effort: step.reasoningEffort || undefined,
         require_deliverable: step.requireDeliverable,
         step_profile_id: step.stepProfileId.trim() || undefined,

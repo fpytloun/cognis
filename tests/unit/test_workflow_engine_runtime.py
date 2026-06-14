@@ -8,17 +8,25 @@ from typing import cast
 
 import pytest
 
+import cognis.core.workflow_engine as workflow_engine_module
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
-from cognis.core.workflow_engine import WorkflowEngine, _resolve_task_execution_paths
+from cognis.core.runtime import TransientExecutorUnavailable
+from cognis.core.workflow_engine import (
+    TRANSIENT_EXECUTOR_MAX_DEFERRALS,
+    WorkflowEngine,
+    _resolve_task_execution_paths,
+)
 from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext
-from cognis.models.task import TaskModel
+from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
+    CompletionConfig,
     GateConfig,
     GateOption,
     OutcomeRoute,
     StepDefinition,
+    StepEvaluation,
     StepOutcome,
     StepOutput,
     Workflow,
@@ -1407,6 +1415,9 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
             agent_type="primary",
             owner_email="user@example.com",
             is_system=False,
+            agent_profiles={},
+            default_agent_profile_id=None,
+            llm_config=None,
         )
         return agent, agent
 
@@ -1500,6 +1511,9 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
             agent_type="primary",
             owner_email="user@example.com",
             is_system=False,
+            agent_profiles={},
+            default_agent_profile_id=None,
+            llm_config=None,
         )
         return agent, agent
 
@@ -1728,3 +1742,212 @@ async def test_execute_workflow_exception_cleans_running_step_runs(
 
     assert result.status == "failed"
     assert fail_calls == ["task-fail-cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_defers_transient_executor_unavailable_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    state = WorkflowState()
+    task = TaskModel(
+        task_id="task-executor-race",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status=TaskStatus.RUNNING,
+        workflow_state=state,
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test",
+        steps=[
+            StepDefinition(
+                name="run",
+                type="run",
+                prompt="Do work",
+                completion=CompletionConfig(evaluate=False),
+            )
+        ],
+    )
+    deferred: list[dict[str, object]] = []
+    transient = TransientExecutorUnavailable(
+        "Selected executor 'olorin' is not connected or not ready",
+        executor_id="olorin",
+        retry_after_seconds=5,
+    )
+
+    async def _defer_running_task(_session: object, task_id: str, **kwargs: object) -> bool:
+        deferred.append({"task_id": task_id, **kwargs})
+        return True
+
+    async def _transient_step(*args: object, **kwargs: object):
+        del args, kwargs
+        raise transient
+
+    async def _successful_step(*args: object, **kwargs: object):
+        del args, kwargs
+        return StepOutput(summary="done", content="done"), "sr-1"
+
+    async def _persist_workflow_state(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(workflow_engine_module, "defer_running_task", _defer_running_task)
+    monkeypatch.setattr(engine, "_execute_run_step", _transient_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist_workflow_state)
+
+    first_result = await engine.execute_workflow(task, workflow)
+
+    assert first_result.status == TaskStatus.READY
+    assert first_result.scheduled_for is not None
+    assert deferred
+    assert state.loop_iterations["transient_executor_unavailable:run"] == 1
+    assert "attempts:run" not in state.loop_iterations
+
+    task.status = TaskStatus.RUNNING
+    monkeypatch.setattr(engine, "_execute_run_step", _successful_step)
+
+    second_result = await engine.execute_workflow(task, workflow)
+
+    assert second_result.status == TaskStatus.COMPLETED
+    assert state.step_outputs["run"]["summary"] == "done"
+    assert "attempts:run" not in state.loop_iterations
+
+
+@pytest.mark.asyncio
+async def test_evaluate_step_includes_actual_session_tool_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    captured: dict[str, object] = {}
+    task = TaskModel(
+        task_id="task-evidence",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_state=WorkflowState(),
+    )
+    step_def = StepDefinition(
+        name="maintain",
+        type="run",
+        prompt="Inspect and update weekly notes.",
+        completion=CompletionConfig(evaluate=True),
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
+    output = StepOutput(
+        summary="Updated weekly notes",
+        content="Read current notes and wrote the weekly file.",
+        execution_evidence={"files_written": ["Lumilens/Weekly/2026-W24.md"]},
+        intaris_session_id="intaris-session-1",
+    )
+
+    async def _read_events(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            events=[
+                {
+                    "seq": 10,
+                    "type": "tool_call",
+                    "data": {
+                        "call_id": "call-read",
+                        "name": "read",
+                        "arguments": {"file_path": "Lumilens/Weekly/2026-W24.md"},
+                    },
+                },
+                {
+                    "seq": 11,
+                    "type": "tool_result",
+                    "data": {
+                        "call_id": "call-read",
+                        "name": "read",
+                        "content": "Existing weekly note content",
+                    },
+                },
+                {
+                    "seq": 12,
+                    "type": "tool_call",
+                    "data": {
+                        "call_id": "call-patch",
+                        "name": "apply_patch",
+                        "arguments": {"patch": "*** Begin Patch"},
+                    },
+                },
+            ]
+        )
+
+    async def _evaluate(**kwargs: object) -> StepEvaluation:
+        captured.update(kwargs)
+        return StepEvaluation(decision="approved", reasoning="Evidence present")
+
+    engine._providers.guardrails = SimpleNamespace(read_events=_read_events)
+    monkeypatch.setattr(engine._step_evaluator, "evaluate", _evaluate, raising=False)
+
+    result = await engine._evaluate_step(step_def, output, WorkflowState(), task, workflow)
+
+    assert result.decision == "approved"
+    evidence = captured["execution_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["files_written"] == ["Lumilens/Weekly/2026-W24.md"]
+    session_events = evidence["session_events"]
+    assert session_events["session_id"] == "intaris-session-1"
+    assert session_events["tool_call_count"] == 2
+    assert session_events["tool_result_count"] == 1
+    assert [item["name"] for item in session_events["tool_calls"]] == ["read", "apply_patch"]
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_pauses_after_transient_executor_deferral_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    state = WorkflowState(
+        loop_iterations={"transient_executor_unavailable:run": TRANSIENT_EXECUTOR_MAX_DEFERRALS}
+    )
+    task = TaskModel(
+        task_id="task-executor-stuck",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status=TaskStatus.RUNNING,
+        workflow_state=state,
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Test",
+        steps=[
+            StepDefinition(
+                name="run",
+                type="run",
+                prompt="Do work",
+                completion=CompletionConfig(evaluate=False),
+            )
+        ],
+    )
+    transient = TransientExecutorUnavailable(
+        "Selected executor 'olorin' is not connected or not ready",
+        executor_id="olorin",
+        retry_after_seconds=5,
+    )
+
+    async def _transient_step(*args: object, **kwargs: object):
+        del args, kwargs
+        raise transient
+
+    async def _persist_workflow_state(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(engine, "_execute_run_step", _transient_step)
+    monkeypatch.setattr(engine, "_persist_workflow_state", _persist_workflow_state)
+
+    result = await engine.execute_workflow(task, workflow)
+
+    assert result.status == TaskStatus.PAUSED
+    assert state.status == "paused"
+    assert state.pending_pause_payload is not None
+    assert state.pending_pause_payload["kind"] == "infrastructure_blocked"
+    assert state.loop_iterations["transient_executor_unavailable:run"] == (
+        TRANSIENT_EXECUTOR_MAX_DEFERRALS + 1
+    )
+    assert "attempts:run" not in state.loop_iterations

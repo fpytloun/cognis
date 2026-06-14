@@ -297,10 +297,49 @@ def format_response_result(
         output_format=output_format,
         options=options,
     )
+    block_reason = _blocked_empty_extraction_reason(document.as_dict())
+    if block_reason:
+        return ToolResult(
+            output=(
+                "Web fetch loaded the page but extraction produced no content "
+                f"because the page appears blocked or requires verification ({block_reason})."
+            ),
+            is_error=True,
+            metadata={
+                "extracted_document": document.as_dict(),
+                "direct_fetch_blocked": True,
+                "direct_fetch_block_signal": block_reason,
+            },
+        )
     return ToolResult(
         output=document.content,
         metadata={"extracted_document": document.as_dict()},
     )
+
+
+def _blocked_empty_extraction_reason(document: dict[str, object]) -> str | None:
+    content = str(document.get("content") or "").strip()
+    if content:
+        return None
+    extractor = str(document.get("extractor") or "").lower()
+    score = document.get("extraction_score")
+    score_float = float(score) if isinstance(score, int | float) else 0.0
+    if extractor != "empty" and score_float > 0:
+        return None
+    text = " ".join(
+        str(document.get(key) or "") for key in ("title", "description", "url", "canonical_url")
+    ).lower()
+    markers = {
+        "please wait for verification": "verification",
+        "verify you are human": "human_verification",
+        "access denied": "access_denied",
+        "blocked": "blocked",
+        "just a moment": "interstitial",
+    }
+    for marker, reason in markers.items():
+        if marker in text:
+            return reason
+    return None
 
 
 def _normalize_content_type(value: str) -> str:

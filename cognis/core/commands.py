@@ -16,10 +16,12 @@ import contextlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.agent_loop import PauseResolution
+from cognis.core.agent_profiles import requested_agent_profile_id, resolve_agent_profile
 from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
 from cognis.core.compaction import CompactionModelContext
-from cognis.core.long_lived_chat import is_long_lived_chat_context
+from cognis.core.long_lived_chat import is_channel_context_type
 from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -58,6 +60,7 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/fork",
         "/model",
         "/thinking",
+        "/profile",
         "/executor",
         "/task",
         "/research",
@@ -299,6 +302,11 @@ class CommandDispatcher:
             arg = stripped[9:].strip() if len(stripped) > 9 else ""
             return await self._handle_thinking(session, arg)
 
+        # /profile [agent_profile_id]
+        if stripped == "/profile" or stripped.startswith("/profile "):
+            arg = stripped[len("/profile") :].strip() if len(stripped) > len("/profile") else ""
+            return await self._handle_profile(conversation, session, agent, arg)
+
         # /lsp
         if stripped == "/lsp":
             return await self._handle_lsp(user_email=user_email)
@@ -372,12 +380,24 @@ class CommandDispatcher:
         agent: AgentDefinition,
         user_email: str | None,
     ) -> CompactionModelContext:
+        resolved_profile = resolve_agent_profile(
+            agent,
+            requested_agent_profile_id(session),
+            source="conversation",
+        )
         model_override = self._session_cache.get_model_override(session.session_id)
         reasoning_override = self._session_cache.get_reasoning_effort_override(session.session_id)
-        explicit_model = model_override or (agent.llm_config.model if agent.llm_config else None)
-        provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        explicit_model = (
+            model_override
+            or resolved_profile.model
+            or (agent.llm_config.model if agent.llm_config else None)
+        )
+        provider_id = resolved_profile.provider_id or (
+            agent.llm_config.provider_id if agent.llm_config else None
+        )
         reasoning_effort = reasoning_override or (
-            agent.llm_config.reasoning_effort if agent.llm_config else None
+            resolved_profile.reasoning_effort
+            or (agent.llm_config.reasoning_effort if agent.llm_config else None)
         )
         if explicit_model:
             return CompactionModelContext(
@@ -501,7 +521,11 @@ class CommandDispatcher:
     ) -> CommandResult:
         """Handle /new, /reset, or /clear."""
         conversation_id = conversation.conversation_id
-        is_sticky = is_long_lived_chat_context(conversation.context)
+        context_type = str(conversation.context.type or "").strip().lower()
+        is_sticky = is_agent_direct_context(
+            context_type,
+            conversation.context.platform_data,
+        ) or is_channel_context_type(context_type)
 
         if self._turn_scheduler is not None:
             await self._turn_scheduler.cancel_turn(conversation_id)
@@ -1421,6 +1445,81 @@ class CommandDispatcher:
             text=f"Thinking effort set to: {resolved_arg}{mapped_note}\nTakes effect on next message.",
         )
 
+    async def _handle_profile(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+        arg: str,
+    ) -> CommandResult:
+        """Handle /profile [id] — list or switch the current agent runtime profile."""
+
+        current_id = requested_agent_profile_id(session, conversation)
+        current = resolve_agent_profile(agent, current_id, source="conversation")
+        if not arg:
+            lines = [
+                f"Current agent profile: {current.profile_id} ({current.source})",
+                "Available profiles:",
+            ]
+            if agent.agent_profiles:
+                for profile_id, profile in sorted(agent.agent_profiles.items()):
+                    markers: list[str] = []
+                    if profile_id == current.profile_id:
+                        markers.append("current")
+                    if profile_id == agent.default_agent_profile_id:
+                        markers.append("default")
+                    if not profile.enabled:
+                        markers.append("disabled")
+                    suffix = f" [{' / '.join(markers)}]" if markers else ""
+                    desc = f" — {profile.description}" if profile.description else ""
+                    lines.append(f"  {profile_id}{suffix}{desc}")
+            else:
+                lines.append("  default [synthetic] — derived from agent LLM configuration")
+            lines.append("\nUsage: /profile <profile_id>")
+            return CommandResult(type="system_message", text="\n".join(lines))
+
+        try:
+            resolved = resolve_agent_profile(agent, arg, source="conversation_command")
+        except ValueError as exc:
+            return CommandResult(
+                type="error", text=str(exc), data={"code": "invalid_agent_profile"}
+            )
+
+        async with self._session_factory() as db_session:
+            try:
+                from cognis.store.queries import (
+                    set_conversation_agent_profile_id,
+                    set_session_agent_profile_id,
+                )
+
+                await set_conversation_agent_profile_id(
+                    db_session,
+                    conversation.conversation_id,
+                    resolved.profile_id,
+                )
+                await set_session_agent_profile_id(
+                    db_session,
+                    session.session_id,
+                    resolved.profile_id,
+                )
+                await db_session.commit()
+            except Exception:
+                await db_session.rollback()
+                raise
+
+        conversation.agent_profile_id = resolved.profile_id
+        session.agent_profile_id = resolved.profile_id
+        self._session_cache.set_model_override(session.session_id, None)
+        self._session_cache.set_reasoning_effort_override(session.session_id, None)
+        return CommandResult(
+            type="system_message",
+            text=(
+                f"Agent profile switched to: {resolved.profile_id}\n"
+                "Cleared /model and /thinking overrides. Takes effect on next message."
+            ),
+            data=resolved.audit_metadata(),
+        )
+
     async def _handle_lsp(self, *, user_email: str | None = None) -> CommandResult:
         """Handle /lsp — display LSP diagnostics subsystem status."""
         lines: list[str] = []
@@ -1940,6 +2039,7 @@ Available commands:
   /executor [id]     Show active executor + assigned pool, or switch active
   /model [name]      List available models or switch model
   /thinking [level]  Show or set reasoning effort
+  /profile [id]      List or switch this agent's runtime profile
   /context           Show context window usage
   /info              Show session details and statistics
   /compact           Compact conversation history

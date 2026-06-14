@@ -3,7 +3,9 @@
   import Input from '$lib/components/ui/Input.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import { api } from '$lib/api/client';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText } from '$lib/session-policy';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
   import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
@@ -29,6 +31,7 @@
       title: string;
       description: string;
       agent_id: string;
+      agent_profile_id: string | null;
       workflow_id: string | null;
       project_id: string | null;
       skill_id: string | null;
@@ -60,6 +63,7 @@
     title: '',
     description: '',
     agent_id: '',
+    agent_profile_id: '',
     workflow_source: '',
     project_id: '',
     expected_output: '',
@@ -78,6 +82,7 @@
     const workflowSource = decodeWorkflowSourceValue(form.workflow_source);
     oncreate({
       agent_id: form.agent_id,
+      agent_profile_id: form.agent_profile_id || null,
       title: form.title,
       description: form.description,
       expected_output: form.expected_output || null,
@@ -124,6 +129,10 @@
     if (!form.agent_id && defaultAgentId) {
       form.agent_id = defaultAgentId;
     }
+  });
+
+  $effect(() => {
+    form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
   });
 
   $effect(() => {
@@ -188,6 +197,11 @@
             {/each}
           </select>
         </div>
+        <AgentProfileSelect
+          agents={primaryAgents}
+          agentId={form.agent_id}
+          bind:value={form.agent_profile_id}
+        />
         <div class="space-y-1">
           <label for="task-project" class="text-xs font-medium uppercase tracking-widest text-slate-400">Project</label>
           <select id="task-project" bind:value={form.project_id} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">

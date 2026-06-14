@@ -10,6 +10,7 @@
     workflowSourceValueForSelection
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -26,6 +27,7 @@
   ].filter((tz, i, arr) => arr.indexOf(tz) === i);
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText, policyText } from '$lib/session-policy';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
@@ -65,6 +67,7 @@ import Zap from 'lucide-svelte/icons/zap';
     one_shot_at: '',
     timezone: 'UTC',
     agent_id: '',
+    agent_profile_id: '',
     workflow_source: '',
     project_id: '',
     task_title: '',
@@ -151,6 +154,7 @@ import Zap from 'lucide-svelte/icons/zap';
       one_shot_at: s.one_shot_at ?? '',
       timezone: s.timezone,
       agent_id: s.agent_id,
+      agent_profile_id: s.agent_profile_id ?? '',
       workflow_source: workflowSourceValueForSelection(s.workflow_id, s.skill_id),
       project_id: s.project_id ?? '',
       task_title: (tmpl.title as string) ?? '',
@@ -195,6 +199,10 @@ import Zap from 'lucide-svelte/icons/zap';
     void loadProjectWorkflows(form.project_id);
   });
 
+  $effect(() => {
+    form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
+  });
+
   async function handleSave(): Promise<void> {
     if (!schedule) return;
     saving = true;
@@ -225,6 +233,7 @@ import Zap from 'lucide-svelte/icons/zap';
         one_shot_at: form.schedule_type === 'one_shot' ? form.one_shot_at : null,
         timezone: form.timezone,
         agent_id: form.agent_id,
+        agent_profile_id: form.agent_profile_id || null,
         workflow_id: workflowSource.workflow_id,
         skill_id: workflowSource.skill_id,
         project_id: form.project_id || null,
@@ -425,6 +434,11 @@ import Zap from 'lucide-svelte/icons/zap';
               onchange={(next) => { form.agent_id = next; }}
             />
           </div>
+          <AgentProfileSelect
+            agents={agents}
+            agentId={form.agent_id}
+            bind:value={form.agent_profile_id}
+          />
         </div>
 
         <div class="space-y-1">

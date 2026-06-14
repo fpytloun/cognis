@@ -8,6 +8,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from cognis.api.models import CreateScheduleRequest
+from cognis.api.serializers import agent_to_response
+from cognis.core.agent_profiles import resolve_agent_profile
+from cognis.models.agent import AgentDefinition
 from cognis.models.workflow import CompletionDeliveryPolicy
 from cognis.store.queries import create_schedule, get_agent, get_schedule
 
@@ -31,6 +34,16 @@ async def create_user_schedule(
         agent = await get_agent(db, request_model.agent_id)
         if agent is None or agent.owner_email != owner_email:
             raise ValueError("Agent not found")
+        if request_model.agent_profile_id is not None:
+            agent_definition = AgentDefinition.model_validate(agent_to_response(agent).model_dump())
+            try:
+                resolve_agent_profile(
+                    agent_definition,
+                    request_model.agent_profile_id,
+                    source="api",
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
 
     workflow_id = request_model.workflow_id
     if isinstance(workflow_id, str) and workflow_id.strip():
@@ -89,6 +102,7 @@ async def create_user_schedule(
             one_shot_at=request_model.one_shot_at,
             timezone=request_model.timezone,
             agent_id=request_model.agent_id,
+            agent_profile_id=request_model.agent_profile_id,
             workflow_id=request_model.workflow_id,
             task_template=task_template,
             enabled=bool(request_model.enabled),

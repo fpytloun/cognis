@@ -49,7 +49,18 @@ def reddit_json_url(url: str) -> str | None:
     if parsed.slug:
         path += f"/{parsed.slug}"
     path += "/.json"
-    return urlunparse(("https", "www.reddit.com", path, "", "raw_json=1", ""))
+    return urlunparse(("https", "old.reddit.com", path, "", "raw_json=1", ""))
+
+
+def reddit_warmup_url(url: str) -> str | None:
+    parsed = parse_reddit_comment_url(url)
+    if parsed is None:
+        return None
+    path = f"/r/{parsed.subreddit}/comments/{parsed.post_id}"
+    if parsed.slug:
+        path += f"/{parsed.slug}"
+    path += "/"
+    return urlunparse(("https", "old.reddit.com", path, "", "", ""))
 
 
 async def fetch_reddit_thread(
@@ -60,17 +71,22 @@ async def fetch_reddit_thread(
 ) -> ToolResult | None:
     """Fetch Reddit threads through the public JSON endpoint when applicable."""
     json_url = reddit_json_url(url)
-    if json_url is None:
+    warmup_url = reddit_warmup_url(url)
+    if json_url is None or warmup_url is None:
         return None
 
-    request_headers = dict(BROWSER_HEADERS)
-    request_headers["Accept"] = "application/json,text/plain;q=0.9,*/*;q=0.8"
+    warmup_headers = dict(BROWSER_HEADERS)
+    warmup_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    json_headers = dict(BROWSER_HEADERS)
+    json_headers["Accept"] = "application/json,text/html;q=0.9,*/*;q=0.8"
     async with httpx.AsyncClient(
         timeout=clamp_timeout(timeout),
         follow_redirects=True,
         max_redirects=5,
     ) as client:
-        response = await client.get(json_url, headers=request_headers)
+        warmup_response = await client.get(warmup_url, headers=warmup_headers)
+        warmup_response.raise_for_status()
+        response = await client.get(json_url, headers=json_headers)
         response.raise_for_status()
     data = response.json()
     document = _reddit_document(
@@ -83,6 +99,7 @@ async def fetch_reddit_thread(
         metadata={
             "extracted_document": document.as_dict(),
             "reddit_adapter": True,
+            "reddit_warmup_url": warmup_url,
             "reddit_json_url": json_url,
         },
     )

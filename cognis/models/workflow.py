@@ -311,6 +311,7 @@ class StepDefinition(BaseModel):
     description: str = ""
     prompt: str = ""
     agent_override: str | None = None  # Secondary agent ID for this step
+    agent_profile_id: str | None = None
     reasoning_effort: str | None = None
     input: StepInputConfig | None = None
     completion: CompletionConfig | None = None

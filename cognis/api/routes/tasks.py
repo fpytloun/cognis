@@ -42,6 +42,7 @@ from cognis.api.models import (
     WorkflowRunResponse,
 )
 from cognis.api.serializers import (
+    agent_to_response,
     deliverable_to_response,
     dependency_to_response,
     step_run_to_response,
@@ -49,6 +50,7 @@ from cognis.api.serializers import (
     task_detail_to_response,
     task_to_response,
 )
+from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.management import (
     resolve_task_pause_action,
@@ -63,6 +65,7 @@ from cognis.core.workflow_management import (
     get_attached_skill_workflow_source,
     materialize_skill_workflow,
 )
+from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, SessionEvent
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
@@ -249,6 +252,14 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         source_ref=payload.source_ref,
     )
     await _validate_agent_access(request, payload.agent_id)
+    if payload.agent_profile_id is not None:
+        agent = await request.app.state.agent_registry.get(payload.agent_id, owner_email=user.email)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        try:
+            resolve_agent_profile(agent, payload.agent_profile_id, source="api")
+        except ValueError as exc:
+            raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
     if payload.source_type in {"chat", "agent"} and payload.source_ref is not None:
         await _validate_conversation_access(request, payload.source_ref)
     if payload.delivery_target is not None:
@@ -307,6 +318,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             task = await queue.create_draft(
                 created_by=user.email,
                 agent_id=payload.agent_id,
+                agent_profile_id=payload.agent_profile_id,
                 title=payload.title,
                 description=payload.description,
                 expected_output=payload.expected_output,
@@ -326,6 +338,7 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
             task = await queue.submit(
                 created_by=user.email,
                 agent_id=payload.agent_id,
+                agent_profile_id=payload.agent_profile_id,
                 title=payload.title,
                 description=payload.description,
                 expected_output=payload.expected_output,
@@ -568,6 +581,17 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             raise api_exception(404, "not_found", "Task not found")
     if payload.agent_id is not None:
         await _validate_agent_access(request, payload.agent_id)
+    if "agent_profile_id" in payload.model_fields_set and payload.agent_profile_id is not None:
+        effective_agent_id = payload.agent_id or existing_row.agent_id
+        async with request.app.state.session_factory() as session:
+            agent_row = await get_agent(session, effective_agent_id)
+        if agent_row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        agent_definition = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+        try:
+            resolve_agent_profile(agent_definition, payload.agent_profile_id, source="api")
+        except ValueError as exc:
+            raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
     if payload.workflow_id is not None and payload.skill_id is not None:
         raise api_exception(
             400,
@@ -682,10 +706,10 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             updates = payload.model_dump(exclude_none=True)
             updates.pop("skill_id", None)
             # Preserve explicit `null` for nullable resource references so the
-            # caller can clear `workflow_id` / `project_id`.  Pydantic's
+            # caller can clear `workflow_id` / `project_id` / `agent_profile_id`.  Pydantic's
             # ``exclude_none`` strips them out, so re-introduce them when the
             # client explicitly sent ``null``.
-            for nullable_field in ("workflow_id", "project_id"):
+            for nullable_field in ("workflow_id", "project_id", "agent_profile_id"):
                 if (
                     nullable_field in payload.model_fields_set
                     and getattr(payload, nullable_field, None) is None
@@ -693,6 +717,8 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                     updates[nullable_field] = None
             if payload.skill_id is not None:
                 updates["workflow_id"] = resolved_workflow_id
+            if payload.agent_id is not None and "agent_profile_id" not in payload.model_fields_set:
+                updates["agent_profile_id"] = None
             if "delivery_mode" in updates:
                 row.delivery_mode = updates.pop("delivery_mode")
             if "delivery_target" in updates:
@@ -1414,6 +1440,7 @@ def _row_to_task(row: Any) -> TaskModel:
         priority=row.priority,
         created_by=row.created_by,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         created_by_agent_id=getattr(row, "created_by_agent_id", None),
         source_type=row.source_type,
         source_ref=row.source_ref,
