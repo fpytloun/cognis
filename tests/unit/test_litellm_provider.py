@@ -3051,6 +3051,134 @@ async def test_litellm_provider_generate_applies_anthropic_cache_hint_to_first_m
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_projects_anthropic_developer_notices_to_hidden_user(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "claude-sonnet-4-20250514",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "system", "content": "immutable prefix", "_immutable_prefix": True},
+            {"role": "developer", "content": "operator instruction"},
+            {
+                "role": "system",
+                "content": '<follow_up_event status="failed">Recover.</follow_up_event>',
+                "_follow_up_context": True,
+                "_audit_source": "follow_up_boundary",
+                "_audit_role": "developer",
+            },
+        ],
+        model="claude-sonnet-4-20250514",
+        provider_id="anthropic",
+        cache_breakpoint_index=0,
+    )
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"] == [
+        {
+            "type": "text",
+            "text": "immutable prefix",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+    ]
+    assert all(message["role"] != "developer" for message in messages)
+    projected_users = [message for message in messages if message["role"] == "user"]
+    assert len(projected_users) == 2
+    assert projected_users[0]["content"].startswith("<system-notice")
+    assert "operator instruction" in projected_users[0]["content"]
+    assert "follow_up_boundary" in projected_users[1]["content"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_explicit_anthropic_projection_for_openai_compatible_provider(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="meridian",
+                display_name="Meridian Claude",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "openai_compatible",
+                    "message_projection_policy": "anthropic_messages",
+                    "default_model": "claude-via-meridian",
+                    "base_url": "http://127.0.0.1:8090",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, object] = {}
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.update(kwargs)
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+
+    provider = LiteLLMProvider(session_factory)
+    await provider.generate(
+        messages=[
+            {"role": "developer", "content": "operator instruction"},
+            {"role": "user", "content": "hi"},
+        ],
+        model="claude-via-meridian",
+        provider_id="meridian",
+    )
+
+    assert captured["model"] == "openai/claude-via-meridian"
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert all(message["role"] != "developer" for message in messages)
+    assert messages[-2]["role"] == "user"
+    assert messages[-2]["content"].startswith("<system-notice")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_generate_skips_cache_hint_when_capability_disabled(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -3103,6 +3231,178 @@ async def test_litellm_provider_generate_skips_cache_hint_when_capability_disabl
     messages = captured["messages"]
     assert isinstance(messages, list)
     assert messages[0] == {"role": "system", "content": "immutable prefix"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_marks_anthropic_preset_schema_compatible(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="meridian",
+                display_name="Meridian",
+                location="controller",
+                backend="litellm",
+                config={"preset": "anthropic", "default_model": "local-meridian-alias"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="local-meridian-alias",
+        model_info=ModelInfo(model_id="local-meridian-alias", supports_defer_loading=False),
+        provider_id="meridian",
+        allow_tool_search=True,
+    )
+
+    assert contract.anthropic_schema_compatible is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_disables_anthropic_defer_loading_for_custom_base_url(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="meridian",
+                display_name="Meridian",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "local-meridian-alias",
+                    "base_url": "http://127.0.0.1:8090",
+                    "api_base": "http://127.0.0.1:8090",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="local-meridian-alias",
+        model_info=ModelInfo(model_id="local-meridian-alias", supports_defer_loading=True),
+        provider_id="meridian",
+        allow_tool_search=True,
+    )
+
+    assert contract.anthropic_defer_loading is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_honors_custom_base_url_explicit_anthropic_defer_loading_true(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="meridian",
+                display_name="Meridian",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "local-meridian-alias",
+                    "base_url": "http://127.0.0.1:8090",
+                    "api_base": "http://127.0.0.1:8090",
+                    "anthropic_defer_loading": True,
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="local-meridian-alias",
+        model_info=ModelInfo(model_id="local-meridian-alias", supports_defer_loading=True),
+        provider_id="meridian",
+        allow_tool_search=True,
+    )
+
+    assert contract.anthropic_defer_loading is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_respects_explicit_anthropic_defer_loading_false(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="meridian",
+                display_name="Meridian",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "local-meridian-alias",
+                    "base_url": "http://127.0.0.1:8090",
+                    "api_base": "http://127.0.0.1:8090",
+                    "anthropic_defer_loading": False,
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="local-meridian-alias",
+        model_info=ModelInfo(model_id="local-meridian-alias", supports_defer_loading=True),
+        provider_id="meridian",
+        allow_tool_search=True,
+    )
+
+    assert contract.anthropic_defer_loading is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_enables_anthropic_defer_loading_for_standard_anthropic_base_url(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "claude-sonnet-4",
+                    "base_url": "https://api.anthropic.com",
+                    "api_base": "https://api.anthropic.com",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="claude-sonnet-4",
+        model_info=ModelInfo(model_id="claude-sonnet-4", supports_defer_loading=True),
+        provider_id="anthropic",
+        allow_tool_search=True,
+    )
+
+    assert contract.anthropic_defer_loading is True
     await engine.dispose()
 
 

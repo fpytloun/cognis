@@ -88,6 +88,7 @@ from cognis.providers.llm.errors import (
     classify_llm_exception,
     reasoning_summary_rejected,
 )
+from cognis.providers.llm.message_projection import project_messages_for_provider
 from cognis.providers.llm.reasoning import (
     PreparedReasoningConfig,
     apply_reasoning_config,
@@ -454,6 +455,12 @@ def _looks_like_custom_base_url(provider: LLMProviderRow | None) -> bool:
     return not lowered.startswith("https://api.anthropic.com")
 
 
+def _uses_custom_anthropic_base_url(provider: LLMProviderRow | None) -> bool:
+    return _provider_config(provider).get("preset") == "anthropic" and _looks_like_custom_base_url(
+        provider
+    )
+
+
 def _anthropic_defer_loading_setting(provider: LLMProviderRow | None, model_id: str) -> Any:
     for key in (
         "anthropic_defer_loading",
@@ -486,8 +493,7 @@ def _anthropic_defer_loading_enabled(
     # Custom Anthropic-compatible endpoints often implement normal Messages/Tools
     # but not Anthropic beta tool-search/defer-loading headers. Keep prompt
     # caching enabled, but require explicit opt-in for defer-loading there.
-    preset = _provider_config(provider).get("preset")
-    return not (preset == "anthropic" and _looks_like_custom_base_url(provider))
+    return not _uses_custom_anthropic_base_url(provider)
 
 
 def _default_text_verbosity(
@@ -3454,25 +3460,26 @@ class LiteLLMProvider:
         discovery_mode = (
             ToolDiscoveryMode.CONTROLLER_SEARCH if allow_tool_search else ToolDiscoveryMode.NONE
         )
-
+        anthropic_defer_loading = _anthropic_defer_loading_enabled(
+            provider,
+            model_id,
+            model_info,
+            broken=provider_id is not None
+            and self._capability_is_broken(
+                self._anthropic_defer_loading_broken_keys,
+                (provider_id, model_id),
+                marker_name="anthropic_defer_loading",
+                provider=provider,
+            ),
+        )
         return ToolExposureContract(
             llm_api=llm_api,
             discovery_mode=discovery_mode,
             native_apply_patch=native_apply_patch,
             native_apply_patch_reason=native_apply_patch_reason,
             native_apply_patch_tool_type=native_apply_patch_tool_type,
-            anthropic_defer_loading=_anthropic_defer_loading_enabled(
-                provider,
-                model_id,
-                model_info,
-                broken=provider_id is not None
-                and self._capability_is_broken(
-                    self._anthropic_defer_loading_broken_keys,
-                    (provider_id, model_id),
-                    marker_name="anthropic_defer_loading",
-                    provider=provider,
-                ),
-            ),
+            anthropic_defer_loading=anthropic_defer_loading,
+            anthropic_schema_compatible=_provider_preset(provider) == "anthropic",
         )
 
     def invalidate_json_mode_cache_for_provider(self, provider_id: str) -> None:
@@ -4160,12 +4167,18 @@ class LiteLLMProvider:
         async def _generate_chat(chat_kwargs: dict[str, Any]) -> dict[str, Any]:
             chat_kwargs = dict(chat_kwargs)
             chat_kwargs.pop("cognis_llm_api", None)
+            projection = project_messages_for_provider(
+                prepared_messages,
+                provider=provider,
+                llm_api="chat_completions",
+            )
+            chat_messages = projection.messages
             if self._should_route_to_executor(provider):
                 if isinstance(retry_count, int):
                     chat_kwargs["max_retries"] = retry_count
                 return await self._executor_generate(
                     prefixed_model,
-                    prepared_messages,
+                    chat_messages,
                     provider,
                     request_kwargs=chat_kwargs,
                 )
@@ -4173,7 +4186,7 @@ class LiteLLMProvider:
                 response = await with_llm_retry(
                     self._litellm_transport.completion,
                     model=prefixed_model,
-                    messages=prepared_messages,
+                    messages=chat_messages,
                     stream=False,
                     max_retries=retry_count_int,
                     operation=f"generate({prefixed_model})",
@@ -4627,6 +4640,26 @@ class LiteLLMProvider:
                 request_kwargs["store"] = (
                     configured_store if isinstance(configured_store, bool) else False
                 )
+        projection_diagnostics: dict[str, Any] = {}
+        if not use_responses_api:
+            phase_started_at = monotonic()
+            projection = project_messages_for_provider(
+                prepared_messages,
+                provider=provider,
+                llm_api="chat_completions",
+            )
+            prepared_messages = projection.messages
+            projection_diagnostics = projection.diagnostics
+            _observe_provider_phase(
+                llm_request_id=llm_request_id,
+                provider_id=provider_id,
+                model=resolved_model,
+                llm_api="chat_completions",
+                location="controller",
+                phase="message_projection",
+                duration=monotonic() - phase_started_at,
+                extra_data=projection_diagnostics,
+            )
         request_diagnostics = _request_payload_diagnostics(
             prepared_messages,
             request_kwargs,
@@ -4636,6 +4669,7 @@ class LiteLLMProvider:
             if use_responses_api
             else "chat_completions_request",
         )
+        request_diagnostics.update(projection_diagnostics)
         llm_api_label = "responses" if use_responses_api else "chat_completions"
         _observe_provider_phase(
             llm_request_id=llm_request_id,

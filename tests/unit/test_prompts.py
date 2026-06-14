@@ -51,14 +51,18 @@ def test_chat_prompt_describes_delegate_wait_behavior() -> None:
     )
     assert "follow-up/resume notification" in instructions
     assert "Use `wait=false` by default from live/main chat" not in instructions
-    assert "prefer joined delegation, managed conversations, or tasks" in instructions
-    assert "Do not optimize for finishing the whole job inside the parent turn" in instructions
-    assert "parent chat as the command bridge" in instructions
-    assert "`delegate(wait=false)`: bounded, non-interactive worker-style lookup" in instructions
-    assert "`agent_conversation_create(wait=false)`: visible iterative work loop" in instructions
-    assert "`create_task`: durable workflow-shaped work with lifecycle" in instructions
-    assert '`chat_mode="plan"`' in instructions
-    assert '`chat_mode="build"`' in instructions
+    assert "only when they clearly fit the requested lifecycle" in instructions
+    assert "Do not optimize for finishing the whole job inside the parent turn" not in instructions
+    assert "parent chat as the command bridge" not in instructions
+    assert (
+        "`delegate(wait=false)`: bounded, non-interactive worker-style lookup" not in instructions
+    )
+    assert (
+        "`agent_conversation_create(wait=false)`: visible iterative work loop" not in instructions
+    )
+    assert "`create_task`: durable workflow-shaped work with lifecycle" not in instructions
+    assert '`chat_mode="plan"`' not in instructions
+    assert '`chat_mode="build"`' not in instructions
 
 
 def test_async_work_tool_descriptions_discourage_duplicate_parent_work() -> None:

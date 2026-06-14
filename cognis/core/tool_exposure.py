@@ -14,6 +14,27 @@ from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_VISIBLE_TOOL_NAME_LENGTH = 64
+_ANTHROPIC_PROPERTY_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+_ANTHROPIC_PROPERTY_NAME_UNSAFE_PATTERN = re.compile(r"[^a-zA-Z0-9_.-]+")
+_MAX_ANTHROPIC_PROPERTY_NAME_LENGTH = 64
+_JSON_SCHEMA_METADATA_KEYS = frozenset({"$schema", "$id", "$comment"})
+_ARGUMENT_ALIAS_ANY_PROPERTY = "*"
+_JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS = frozenset(
+    {
+        "allOf",
+        "anyOf",
+        "contains",
+        "else",
+        "if",
+        "items",
+        "not",
+        "oneOf",
+        "prefixItems",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
 
 # Tools that must always be visible when present in the inventory, regardless
 # of provider slot caps.  These are the model's essential recovery and
@@ -35,6 +56,7 @@ class ToolExposureResult:
 
     tools: list[dict[str, Any]]
     alias_map: dict[str, str]
+    argument_alias_map: dict[str, dict[str, Any]] = field(default_factory=dict)
     request_kwargs: dict[str, Any] = field(default_factory=dict)
     visible_tool_ids: set[str] = field(default_factory=set)
     hidden_searchable_tool_ids: set[str] = field(default_factory=set)
@@ -97,6 +119,7 @@ class ToolExposureContract:
     native_apply_patch_reason: str | None = None
     native_apply_patch_tool_type: str | None = None
     anthropic_defer_loading: bool = True
+    anthropic_schema_compatible: bool = False
 
 
 def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
@@ -250,7 +273,6 @@ def prepare_tool_exposure(
     use_openai_controller_search_fallback = bool(
         use_responses_api and discovery_enabled and search_tool_schema_present and has_hidden
     )
-
     if not allow_tool_search:
         filtered_controller_tool_schemas = controller_tool_schemas_without_search
     elif not use_responses_api or use_openai_controller_search_fallback:
@@ -374,11 +396,18 @@ def prepare_tool_exposure(
     final_tool_schemas = _strip_internal_schema_metadata(
         [*filtered_controller_tool_schemas, *tool_schemas]
     )
+    argument_alias_map: dict[str, dict[str, Any]] = {}
+    if edit_tool_family is EditToolFamily.ANTHROPIC or contract.anthropic_schema_compatible:
+        final_tool_schemas, argument_alias_map = _normalize_anthropic_tool_schema_arguments(
+            final_tool_schemas,
+            alias_map=alias_map,
+        )
     if not use_anthropic_defer:
         final_tool_schemas = _sort_model_facing_tool_schemas(final_tool_schemas)
     return ToolExposureResult(
         tools=final_tool_schemas,
         alias_map=alias_map,
+        argument_alias_map=argument_alias_map,
         request_kwargs=request_kwargs,
         visible_tool_ids=visible_tool_ids,
         hidden_searchable_tool_ids=hidden_searchable_tool_ids,
@@ -402,6 +431,7 @@ def prepare_tool_exposure(
             "native_apply_patch_requested": contract.native_apply_patch,
             "native_apply_patch_exposed": native_apply_patch_exposed,
             "native_apply_patch_reason": contract.native_apply_patch_reason,
+            "argument_alias_tool_count": len(argument_alias_map),
         },
     )
 
@@ -535,6 +565,268 @@ def _strip_internal_schema_metadata(tool_schemas: list[dict[str, Any]]) -> list[
             sanitized_schema["function"] = function
         sanitized.append(sanitized_schema)
     return sanitized
+
+
+def _normalize_anthropic_tool_schema_arguments(
+    tool_schemas: list[dict[str, Any]],
+    *,
+    alias_map: dict[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return Anthropic-compatible tool schemas and reverse argument aliases.
+
+    MCP and OpenAPI-derived tools can expose JSON Schema property keys such as
+    ``match[]``, ``$top`` or ``@microsoft.graph.conflictBehavior``.  Anthropic
+    rejects custom tool schemas unless every ``input_schema.properties`` key
+    matches ``^[a-zA-Z0-9_.-]{1,64}$``.  We keep the canonical tool definition
+    unchanged and expose provider-safe aliases only in the model-facing schema;
+    tool calls are translated back before canonical validation/execution.
+    """
+
+    normalized_schemas: list[dict[str, Any]] = []
+    argument_alias_map: dict[str, dict[str, Any]] = {}
+
+    for schema in tool_schemas:
+        normalized_schema = dict(schema)
+        function = normalized_schema.get("function")
+        if not isinstance(function, dict):
+            normalized_schemas.append(normalized_schema)
+            continue
+
+        visible_name = function.get("name")
+        if not isinstance(visible_name, str):
+            normalized_schemas.append(normalized_schema)
+            continue
+
+        parameters = function.get("parameters")
+        if isinstance(parameters, dict):
+            schema_refs = _collect_local_schema_refs(parameters)
+            normalized_parameters, alias_tree = _normalize_anthropic_schema_node(
+                parameters,
+                schema_refs=schema_refs,
+            )
+            function = dict(function)
+            function["parameters"] = normalized_parameters
+            normalized_schema["function"] = function
+            if alias_tree:
+                internal_name = alias_map.get(visible_name, visible_name)
+                argument_alias_map[internal_name] = alias_tree
+
+        normalized_schemas.append(normalized_schema)
+
+    return normalized_schemas, argument_alias_map
+
+
+def _collect_local_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    refs: dict[str, Any] = {}
+    for definition_key in ("$defs", "definitions"):
+        definitions = schema.get(definition_key)
+        if not isinstance(definitions, dict):
+            continue
+        for name, definition in definitions.items():
+            if isinstance(name, str):
+                refs[f"#/{definition_key}/{name}"] = definition
+    return refs
+
+
+def _normalize_anthropic_schema_node(
+    value: Any,
+    *,
+    schema_refs: dict[str, Any],
+    resolving_refs: set[str] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    if isinstance(value, list):
+        normalized_items: list[Any] = []
+        merged_alias_tree: dict[str, Any] = {}
+        for item in value:
+            normalized_item, item_alias_tree = _normalize_anthropic_schema_node(
+                item,
+                schema_refs=schema_refs,
+                resolving_refs=resolving_refs,
+            )
+            normalized_items.append(normalized_item)
+            _merge_argument_alias_tree(merged_alias_tree, item_alias_tree)
+        return normalized_items, merged_alias_tree
+
+    if not isinstance(value, dict):
+        return value, {}
+
+    normalized: dict[str, Any] = {}
+    direct_property_aliases: dict[str, str] = {}
+    current_alias_tree: dict[str, Any] = {}
+    resolving_refs = resolving_refs or set()
+
+    for key, child in value.items():
+        if key in _JSON_SCHEMA_METADATA_KEYS:
+            continue
+
+        if key == "properties" and isinstance(child, dict):
+            normalized_properties, property_alias_tree, property_aliases = (
+                _normalize_anthropic_properties(child, schema_refs=schema_refs)
+            )
+            normalized["properties"] = normalized_properties
+            _merge_argument_alias_tree(current_alias_tree, property_alias_tree)
+            direct_property_aliases = property_aliases
+            continue
+
+        normalized_child, child_alias_tree = _normalize_anthropic_schema_node(
+            child,
+            schema_refs=schema_refs,
+            resolving_refs=resolving_refs,
+        )
+        normalized[key] = normalized_child
+        if key == "$ref" and isinstance(child, str) and child not in resolving_refs:
+            ref_schema = schema_refs.get(child)
+            if ref_schema is not None:
+                _, ref_alias_tree = _normalize_anthropic_schema_node(
+                    ref_schema,
+                    schema_refs=schema_refs,
+                    resolving_refs={*resolving_refs, child},
+                )
+                _merge_argument_alias_tree(current_alias_tree, ref_alias_tree)
+        if key in _JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS:
+            _merge_argument_alias_tree(current_alias_tree, child_alias_tree)
+        elif key == "additionalProperties" and child_alias_tree:
+            current_alias_tree[_ARGUMENT_ALIAS_ANY_PROPERTY] = {
+                "original": _ARGUMENT_ALIAS_ANY_PROPERTY,
+                "properties": child_alias_tree,
+            }
+
+    required = normalized.get("required")
+    if isinstance(required, list) and direct_property_aliases:
+        normalized["required"] = [
+            direct_property_aliases.get(item, item) if isinstance(item, str) else item
+            for item in required
+        ]
+
+    return normalized, current_alias_tree
+
+
+def _normalize_anthropic_properties(
+    properties: dict[str, Any],
+    *,
+    schema_refs: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    normalized_properties: dict[str, Any] = {}
+    alias_tree: dict[str, Any] = {}
+    property_aliases: dict[str, str] = {}
+    used_names: set[str] = set()
+
+    for original_name, property_schema in properties.items():
+        safe_name = _dedupe_anthropic_property_name(
+            _sanitize_anthropic_property_name(original_name),
+            original_name,
+            used_names,
+        )
+        property_aliases[original_name] = safe_name
+        normalized_property_schema, child_alias_tree = _normalize_anthropic_schema_node(
+            property_schema,
+            schema_refs=schema_refs,
+        )
+        if safe_name != original_name:
+            normalized_property_schema = _annotate_aliased_property_schema(
+                normalized_property_schema,
+                original_name=original_name,
+            )
+        normalized_properties[safe_name] = normalized_property_schema
+        if safe_name != original_name or child_alias_tree:
+            alias_tree[safe_name] = {
+                "original": original_name,
+                "properties": child_alias_tree,
+            }
+
+    return normalized_properties, alias_tree, property_aliases
+
+
+def _sanitize_anthropic_property_name(name: str) -> str:
+    if _ANTHROPIC_PROPERTY_NAME_PATTERN.fullmatch(name):
+        return name
+    cleaned = _ANTHROPIC_PROPERTY_NAME_UNSAFE_PATTERN.sub("_", name).strip("_.-")
+    if not cleaned:
+        cleaned = "arg"
+    if len(cleaned) <= _MAX_ANTHROPIC_PROPERTY_NAME_LENGTH:
+        return cleaned
+    suffix = hashlib.sha1(name.encode()).hexdigest()[:8]
+    trimmed = cleaned[: _MAX_ANTHROPIC_PROPERTY_NAME_LENGTH - len(suffix) - 1].rstrip("_.-")
+    return f"{trimmed}_{suffix}" if trimmed else f"arg_{suffix}"
+
+
+def _dedupe_anthropic_property_name(
+    safe_name: str,
+    original_name: str,
+    used_names: set[str],
+) -> str:
+    if safe_name not in used_names:
+        used_names.add(safe_name)
+        return safe_name
+    attempt = 0
+    while True:
+        suffix_source = original_name if attempt == 0 else f"{original_name}:{attempt}"
+        suffix = hashlib.sha1(suffix_source.encode()).hexdigest()[:8]
+        trimmed = safe_name[: _MAX_ANTHROPIC_PROPERTY_NAME_LENGTH - len(suffix) - 2].rstrip("_.-")
+        deduped = f"{trimmed}__{suffix}" if trimmed else f"arg__{suffix}"
+        if deduped not in used_names:
+            used_names.add(deduped)
+            return deduped
+        attempt += 1
+
+
+def _annotate_aliased_property_schema(value: Any, *, original_name: str) -> Any:
+    if not isinstance(value, dict):
+        return value
+    annotated = dict(value)
+    note = f"Original upstream argument name: {original_name!r}."
+    description = annotated.get("description")
+    if isinstance(description, str) and description:
+        if note not in description:
+            annotated["description"] = f"{description}\n\n{note}"
+    else:
+        annotated["description"] = note
+    return annotated
+
+
+def _merge_argument_alias_tree(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, source_node in source.items():
+        if key not in target:
+            target[key] = source_node
+            continue
+        target_node = target[key]
+        if not isinstance(target_node, dict) or not isinstance(source_node, dict):
+            continue
+        target_children = target_node.setdefault("properties", {})
+        source_children = source_node.get("properties", {})
+        if isinstance(target_children, dict) and isinstance(source_children, dict):
+            _merge_argument_alias_tree(target_children, source_children)
+
+
+def reverse_tool_argument_aliases(arguments: Any, alias_tree: dict[str, Any]) -> Any:
+    """Translate provider-facing aliased argument keys back to canonical names."""
+
+    if not alias_tree:
+        return arguments
+    if isinstance(arguments, list):
+        return [reverse_tool_argument_aliases(item, alias_tree) for item in arguments]
+    if not isinstance(arguments, dict):
+        return arguments
+
+    translated: dict[str, Any] = {}
+    wildcard_node = alias_tree.get(_ARGUMENT_ALIAS_ANY_PROPERTY)
+    wildcard_children = (
+        wildcard_node.get("properties", {}) if isinstance(wildcard_node, dict) else {}
+    )
+    for key, value in arguments.items():
+        alias_node = alias_tree.get(key)
+        if isinstance(alias_node, dict):
+            original_key = alias_node.get("original", key)
+            child_alias_tree = alias_node.get("properties", {})
+            if isinstance(child_alias_tree, dict) and child_alias_tree:
+                value = reverse_tool_argument_aliases(value, child_alias_tree)
+            if isinstance(original_key, str):
+                translated[original_key] = value
+                continue
+        if isinstance(wildcard_children, dict) and wildcard_children:
+            value = reverse_tool_argument_aliases(value, wildcard_children)
+        translated[key] = value
+    return translated
 
 
 def _sort_model_facing_tool_schemas(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:

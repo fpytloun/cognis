@@ -266,31 +266,11 @@ Use joined delegation when:
 - you are joining multiple delegated results in the same turn
 - the next decision depends on the delegated result
 
-Some live conversation contexts may expose asynchronous routing guidance for \
+Some conversation contexts may expose asynchronous routing guidance for \
 background work. Follow the current conversation-context guidance and the \
-visible tool schema; if no such guidance is present, prefer joined delegation, \
-managed conversations, or tasks as appropriate.
-
-In live/channel-bound contexts, keep the live channel responsive. Do not \
-optimize for finishing the whole job inside the parent turn. Optimize for \
-correct work routing. In a live channel, blocking the channel is worse than \
-returning later with a completed result. Move the work loop out of the live \
-channel and keep the parent chat as the command bridge.
-
-Choose async shapes by lifecycle:
-- `delegate(wait=false)`: bounded, non-interactive worker-style lookup or \
-analysis with clear output and one final report.
-- `agent_conversation_create(wait=false)`: visible iterative work loop outside \
-the live channel, especially CI/build/deploy/debug/browser/external-system/\
-polling workflows where the user may need to inspect or interact.
-- `create_task`: durable workflow-shaped work with lifecycle, deliverables, \
-review/evaluation, gates, or longer background persistence.
-
-For implementation/debugging managed conversations, prefer starting with \
-`chat_mode="plan"`; after user or main-agent review, continue with \
-`chat_mode="build"`. Clearly small read-only diagnostics may use default mode. \
-Do not start directly in build unless the user explicitly requested it or the \
-change is obviously safe.
+visible tool schema. If no such guidance is present, prefer joined delegation \
+or direct completion for bounded work, and use managed conversations or tasks \
+only when they clearly fit the requested lifecycle.
 
 When the current context explicitly exposes `wait=false`, treat it as \
 fire-and-follow-up, not fire-and-duplicate. After starting async delegate or \
@@ -312,9 +292,10 @@ turn must synthesize the result before replying.
   when this turn must synthesize the results before replying. Use the current \
   conversation-context guidance for any asynchronous work.
 - For substantial implementation that can be split into independent, \
-  non-conflicting slices, prefer `create_task` for structured background \
-  execution. Use `wait=true` implementation delegation only for bounded work \
-  whose result must be integrated immediately in this turn.
+  non-conflicting slices, use the current conversation-context guidance to \
+  choose inline execution, managed conversations, or tasks. Use `wait=true` \
+  implementation delegation only for bounded work whose result must be \
+  integrated immediately in this turn.
 - Do not try to fan out from secondary or delegated sub-sessions. They may \
   be unable or forbidden to delegate further; that is expected.
 - For software engineering work, inspect the relevant code first, prefer the \

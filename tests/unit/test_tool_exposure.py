@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+
 from cognis.core.tool_exposure import (
     LLMApiMode,
     ToolDiscoveryMode,
     ToolExposureContract,
     prepare_tool_exposure,
+    reverse_tool_argument_aliases,
 )
 from cognis.models.config import ModelInfo
 from cognis.models.tool import ToolDefinition, ToolSource, sanitize_mcp_tool_name, stable_tool_id
@@ -49,12 +52,14 @@ def _contract(
     discovery_mode: ToolDiscoveryMode = ToolDiscoveryMode.CONTROLLER_SEARCH,
     native_apply_patch: bool = False,
     anthropic_defer_loading: bool = True,
+    anthropic_schema_compatible: bool = False,
 ) -> ToolExposureContract:
     return ToolExposureContract(
         llm_api=llm_api,
         discovery_mode=discovery_mode,
         native_apply_patch=native_apply_patch,
         anthropic_defer_loading=anthropic_defer_loading,
+        anthropic_schema_compatible=anthropic_schema_compatible,
     )
 
 
@@ -140,6 +145,30 @@ def test_prepare_tool_exposure_uses_generic_search_fallback_with_promoted_tools(
     assert result.debug_metadata["strategy"] == "generic_search_tools"
     assert "search_tools" in tool_names
     assert sanitize_mcp_tool_name("github", "search/issues") in tool_names
+
+
+def test_prepare_tool_exposure_uses_generic_search_for_anthropic_proxy_without_defer_loading() -> (
+    None
+):
+    mcp_tool = _mcp("github", "search/issues")
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("skill_load"), _tool("read", source_type="executor"), mcp_tool],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="local-meridian-alias", supports_defer_loading=True),
+        contract=_contract(
+            anthropic_defer_loading=False,
+            anthropic_schema_compatible=True,
+        ),
+        promoted_tool_ids=set(),
+    )
+
+    tool_names = [tool["function"]["name"] for tool in result.tools if tool["type"] == "function"]
+    assert result.debug_metadata["strategy"] == "generic_search_tools"
+    assert "search_tools" in tool_names
+    assert "skill_load" in tool_names
+    assert "read" in tool_names
+    assert sanitize_mcp_tool_name("github", "search/issues") not in tool_names
+    assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
 
 
 def test_prepare_tool_exposure_uses_responses_controller_search_for_openai() -> None:
@@ -482,6 +511,254 @@ def test_prepare_tool_exposure_sanitizes_skill_visible_names() -> None:
     )
 
     assert result.alias_map["run_release_now"] == "skill_git-release__run_release"
+
+
+def test_anthropic_tool_exposure_aliases_invalid_argument_property_names() -> None:
+    long_name = "segment." * 12
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("mfg-portal", "mimir.series"),
+        description="mimir series",
+        parameters={
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "match[]": {"type": "array", "items": {"type": "string"}},
+                "$top": {"type": "integer"},
+                "@microsoft.graph.conflictBehavior": {"type": "string"},
+                long_name: {"type": "string"},
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "settings[include_tax]": {"type": "boolean"},
+                    },
+                    "required": ["settings[include_tax]"],
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"child[]": {"type": "string"}},
+                        "required": ["child[]"],
+                    },
+                },
+            },
+            "required": ["match[]", "$top", "@microsoft.graph.conflictBehavior", long_name],
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="mfg-portal",
+            raw_tool_name="mimir.series",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-sonnet-4-6", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    schema = next(tool for tool in result.tools if tool["type"] == "function")
+    parameters = schema["function"]["parameters"]
+    properties = parameters["properties"]
+
+    assert "$schema" not in parameters
+    assert "match" in properties
+    assert "top" in properties
+    assert "microsoft.graph.conflictBehavior" in properties
+    assert all("[" not in key and "]" not in key and "$" not in key for key in properties)
+    assert all(len(key) <= 64 for key in properties)
+    assert parameters["required"][:3] == [
+        "match",
+        "top",
+        "microsoft.graph.conflictBehavior",
+    ]
+    assert properties["nested"]["required"] == ["settings_include_tax"]
+    assert properties["items"]["items"]["required"] == ["child"]
+    assert result.argument_alias_map[mcp_tool.name]["match"]["original"] == "match[]"
+
+
+def test_anthropic_schema_compatible_contract_aliases_arbitrary_model_ids() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("mfg-portal", "mimir.series"),
+        description="mimir series",
+        parameters={
+            "type": "object",
+            "properties": {"match[]": {"type": "array", "items": {"type": "string"}}},
+            "required": ["match[]"],
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="mfg-portal",
+            raw_tool_name="mimir.series",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="local-meridian-alias", max_tools=128),
+        contract=_contract(
+            discovery_mode=ToolDiscoveryMode.NONE,
+            anthropic_schema_compatible=True,
+        ),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    schema = next(tool for tool in result.tools if tool["type"] == "function")
+
+    assert schema["function"]["parameters"]["properties"].keys() == {"match"}
+    assert result.argument_alias_map[mcp_tool.name]["match"]["original"] == "match[]"
+
+
+def test_anthropic_argument_alias_dedup_handles_generated_alias_collision() -> None:
+    generated_alias = f"foo__{hashlib.sha1(b'foo[]').hexdigest()[:8]}"
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("server", "tool"),
+        description="tool",
+        parameters={
+            "type": "object",
+            "properties": {
+                "foo": {"type": "string"},
+                generated_alias: {"type": "string"},
+                "foo[]": {"type": "string"},
+            },
+        },
+        source=ToolSource(type="intaris_mcp", server_name="server", raw_tool_name="tool"),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-sonnet-4-6", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    schema = next(tool for tool in result.tools if tool["type"] == "function")
+    properties = schema["function"]["parameters"]["properties"]
+
+    assert len(properties) == 3
+    assert "foo" in properties
+    assert generated_alias in properties
+    assert any(key.startswith("foo__") and key != generated_alias for key in properties)
+
+
+def test_reverse_tool_argument_aliases_restores_canonical_mcp_arguments() -> None:
+    alias_tree = {
+        "match": {"original": "match[]", "properties": {}},
+        "top": {"original": "$top", "properties": {}},
+        "nested": {
+            "original": "nested",
+            "properties": {
+                "settings_include_tax": {
+                    "original": "settings[include_tax]",
+                    "properties": {},
+                }
+            },
+        },
+        "items": {
+            "original": "items",
+            "properties": {
+                "child": {
+                    "original": "child[]",
+                    "properties": {},
+                }
+            },
+        },
+    }
+
+    assert reverse_tool_argument_aliases(
+        {
+            "match": ["up"],
+            "top": 10,
+            "nested": {"settings_include_tax": True},
+            "items": [{"child": "a"}, {"child": "b"}],
+            "unchanged": "value",
+        },
+        alias_tree,
+    ) == {
+        "match[]": ["up"],
+        "$top": 10,
+        "nested": {"settings[include_tax]": True},
+        "items": [{"child[]": "a"}, {"child[]": "b"}],
+        "unchanged": "value",
+    }
+
+
+def test_anthropic_argument_aliases_follow_local_schema_refs() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("mfg-portal", "mimir.labels"),
+        description="mimir labels",
+        parameters={
+            "type": "object",
+            "properties": {
+                "filter": {"$ref": "#/$defs/Filter"},
+            },
+            "$defs": {
+                "Filter": {
+                    "type": "object",
+                    "properties": {"match[]": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["match[]"],
+                }
+            },
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="mfg-portal",
+            raw_tool_name="mimir.labels",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-sonnet-4-6", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    schema = next(tool for tool in result.tools if tool["type"] == "function")
+    filter_def = schema["function"]["parameters"]["$defs"]["Filter"]
+
+    assert filter_def["properties"].keys() == {"match"}
+    assert filter_def["required"] == ["match"]
+    assert reverse_tool_argument_aliases(
+        {"filter": {"match": ["up"]}},
+        result.argument_alias_map[mcp_tool.name],
+    ) == {"filter": {"match[]": ["up"]}}
+
+
+def test_reverse_tool_argument_aliases_handles_additional_property_values() -> None:
+    alias_tree = {
+        "*": {
+            "original": "*",
+            "properties": {
+                "child": {
+                    "original": "child[]",
+                    "properties": {},
+                }
+            },
+        }
+    }
+
+    assert reverse_tool_argument_aliases(
+        {"first": {"child": "a"}, "second": {"child": "b"}},
+        alias_tree,
+    ) == {"first": {"child[]": "a"}, "second": {"child[]": "b"}}
 
 
 def test_prepare_tool_exposure_visible_only_chat_without_search() -> None:

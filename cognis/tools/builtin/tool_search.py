@@ -25,8 +25,10 @@ logger = get_logger(__name__)
 SEARCH_TOOLS_TOOL = ToolDefinition(
     name="search_tools",
     description=(
-        "Search for additional tools available in this session. "
-        "Use when you need a capability not in your current tool set. "
+        "Required discovery path for additional tools available in this session. "
+        "You MUST call this tool when you need a capability that is not currently visible, "
+        "including Slack, Alertmanager, Mimir/Loki observability, skill_load, browser, "
+        "filesystem, shell, or other MCP/external-service capabilities. "
         "The optional category is only a hint; omit it unless you are confident. "
         "Examples: shell for terminal/bash tools, filesystem for file tools, "
         "mcp for external service tools."
