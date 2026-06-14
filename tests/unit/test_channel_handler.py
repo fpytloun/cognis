@@ -24,9 +24,13 @@ class FakeAdapter:
         self.stopped = False
         self.sent: list[OutboundMessage] = []
         self.on_message = None
+        self.config = None
+        self.credentials = None
 
     async def start(self, config, credentials, on_message) -> None:
         self.started = True
+        self.config = config
+        self.credentials = credentials
         self.on_message = on_message
 
     async def stop(self) -> None:
@@ -99,12 +103,26 @@ async def test_send_delegates_to_adapter(monkeypatch: pytest.MonkeyPatch) -> Non
 
     result = await handler.send(
         "acct-1",
-        {"channel_type": "signal", "chat_id": "+420", "content": "hello", "reply_to_id": "1"},
+        {
+            "channel_type": "signal",
+            "chat_id": "+420",
+            "content": "hello",
+            "reply_to_id": "1",
+            "media": [
+                {
+                    "platform_id": "remote-1",
+                    "mime_type": "image/png",
+                }
+            ],
+            "platform_data": {"format": "rich"},
+        },
     )
 
     assert result == {"status": "sent", "platform_message_id": "platform-123"}
     assert len(adapter.sent) == 1
     assert adapter.sent[0].content == "hello"
+    assert adapter.sent[0].media[0].platform_id == "remote-1"
+    assert adapter.sent[0].platform_data == {"format": "rich"}
 
 
 @pytest.mark.asyncio
@@ -203,3 +221,87 @@ async def test_stop_all(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert all(adapter.stopped for adapter in adapters)
     assert handler.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_signal_direct_uses_managed_signal_cli_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.channels.adapters.signal_cli_install import SignalCliStatus
+
+    adapter = FakeAdapter()
+    captured = {}
+    monkeypatch.delenv("COGNIS_SIGNAL_CLI_COMMAND", raising=False)
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+
+    async def fake_ensure_signal_cli(runtime_config):
+        captured["runtime_config"] = runtime_config
+        return SignalCliStatus(
+            available=True,
+            auto_install=True,
+            version="0.14.5",
+            command="/managed/signal-cli",
+            installed_from="cache",
+        )
+
+    monkeypatch.setattr(
+        "cognis.executor.channel_handler.ensure_signal_cli",
+        fake_ensure_signal_cli,
+    )
+
+    handler = ChannelHandler()
+    handler.set_executor_config({"signal": {"direct_enabled": True}})
+
+    await handler.start(
+        "acct-1",
+        "signal",
+        {"settings": {"transport": "direct_jsonrpc"}, "agent_id": "a", "user_email": "u"},
+        {"account_number": "+10000000000"},
+    )
+
+    assert captured["runtime_config"].command is None
+    assert adapter.config.settings["_signal_cli_command"] == "/managed/signal-cli"
+    assert adapter.config.settings["_signal_cli_runtime"]["installed_from"] == "cache"
+
+
+@pytest.mark.asyncio
+async def test_signal_direct_config_command_is_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.channels.adapters.signal_cli_install import SignalCliStatus
+
+    adapter = FakeAdapter()
+    captured = {}
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+
+    async def fake_ensure_signal_cli(runtime_config):
+        captured["runtime_config"] = runtime_config
+        return SignalCliStatus(
+            available=True,
+            auto_install=True,
+            version="0.14.1",
+            command="/usr/bin/signal-cli",
+            warning="explicit override",
+            installed_from="configured_command",
+        )
+
+    monkeypatch.setattr(
+        "cognis.executor.channel_handler.ensure_signal_cli",
+        fake_ensure_signal_cli,
+    )
+
+    handler = ChannelHandler()
+    handler.set_executor_config(
+        {"signal": {"direct_enabled": True, "command": "/usr/bin/signal-cli"}}
+    )
+
+    await handler.start(
+        "acct-1",
+        "signal",
+        {"settings": {"transport": "direct_jsonrpc"}, "agent_id": "a", "user_email": "u"},
+        {"account_number": "+10000000000"},
+    )
+
+    assert captured["runtime_config"].command == "/usr/bin/signal-cli"
+    assert adapter.config.settings["_signal_cli_command"] == "/usr/bin/signal-cli"
+    assert adapter.config.settings["_signal_cli_runtime"]["installed_from"] == "configured_command"

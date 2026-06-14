@@ -4,8 +4,10 @@ Two transport modes:
 - ``rest_api``: Uses an external signal-cli REST API (default, backward-compatible).
 - ``direct_jsonrpc``: Runs signal-cli directly on the executor via stdio JSON-RPC.
   Requires ``adapter_location="executor"`` and executor config with
-  ``signal.direct_enabled=true``.  The signal-cli command comes from
-  executor config (``signal.command``), never from per-account metadata.
+  ``signal.direct_enabled=true``.  The executor uses a Cognis-managed
+  certified signal-cli runtime by default.  ``signal.command`` and
+  ``COGNIS_SIGNAL_CLI_COMMAND`` are explicit advanced overrides, never
+  per-account metadata.
 
 Required credentials:
 - account_number: E.164 phone number linked to signal-cli (both modes)
@@ -102,9 +104,13 @@ class _SignalConfig:
         self.enable_typing: bool = _bool(settings.get("enable_typing", True))
         self.sync_profile: bool = _bool(settings.get("sync_profile", True))
         self.ignore_stories: bool = _bool(settings.get("ignore_stories", True))
-        # Executor-provided signal-cli command (direct mode only)
+        # Executor-provided signal-cli command (direct mode only). The channel
+        # handler resolves this from the managed runtime by default.
         self.signal_cli_command: str = str(settings.get("_signal_cli_command", "signal-cli"))
         self.signal_cli_trust_mode: str = _normalize_signal_cli_trust_mode(self.trust_mode)
+        self.signal_cli_receive_mode: str = _normalize_signal_cli_receive_mode(
+            str(settings.get("receive_mode", "on-start"))
+        )
 
     @property
     def is_direct(self) -> bool:
@@ -135,6 +141,13 @@ def _normalize_signal_cli_trust_mode(value: str) -> str:
         "never": "never",
     }
     return mapping.get(value, "on-first-use")
+
+
+def _normalize_signal_cli_receive_mode(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"on-start", "on-connection", "manual"}:
+        return normalized
+    return "on-start"
 
 
 def _infer_signal_voice_input(body: str | None, attachments: list[dict[str, Any]]) -> bool:
@@ -376,6 +389,7 @@ class SignalAdapter(BaseChannelAdapter):
             account_number=self._account_number,
             command=self._signal_config.signal_cli_command,
             trust_mode=self._signal_config.signal_cli_trust_mode,
+            receive_mode=self._signal_config.signal_cli_receive_mode,
             on_notification=self._handle_direct_notification,
         )
         try:
@@ -480,6 +494,7 @@ class SignalAdapter(BaseChannelAdapter):
         """Handle a ``receive`` notification from signal-cli JSON-RPC."""
         envelope = params.get("envelope", {})
         if not envelope:
+            self._log_direct_receive_drop("no_envelope", envelope)
             return
 
         # Ignore story messages if configured
@@ -488,13 +503,81 @@ class SignalAdapter(BaseChannelAdapter):
             and self._signal_config.ignore_stories
             and envelope.get("storyMessage")
         ):
+            self._log_direct_receive_drop("story_ignored", envelope)
             return
 
         data_message = envelope.get("dataMessage")
         if data_message is None:
+            data_message = self._data_message_from_sync_sent_message(envelope)
+        if data_message is None:
+            self._log_direct_receive_drop("no_data_message", envelope)
             return
 
         await self._process_envelope(envelope, data_message)
+
+    def _data_message_from_sync_sent_message(
+        self, envelope: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Normalize signal-cli sync sent-message notifications.
+
+        Direct JSON-RPC emits messages sent from linked devices under
+        ``envelope.syncMessage.sentMessage`` rather than ``envelope.dataMessage``.
+        The rest of the adapter expects a data-message-shaped mapping.
+        """
+        sync_message = envelope.get("syncMessage")
+        if not isinstance(sync_message, dict):
+            return None
+        sent_message = sync_message.get("sentMessage")
+        if not isinstance(sent_message, dict):
+            return None
+
+        data_message: dict[str, Any] = {
+            "timestamp": sent_message.get("timestamp") or envelope.get("timestamp"),
+            "message": sent_message.get("message") or "",
+            "attachments": sent_message.get("attachments") or [],
+            "mentions": sent_message.get("mentions") or [],
+        }
+        group_info = sent_message.get("groupInfo")
+        if isinstance(group_info, dict):
+            data_message["groupInfo"] = group_info
+
+        destination = (
+            sent_message.get("destination")
+            or sent_message.get("destinationNumber")
+            or sent_message.get("recipient")
+            or sent_message.get("recipientNumber")
+        )
+        if destination and not envelope.get("source") and not envelope.get("sourceNumber"):
+            envelope["source"] = self._account_number
+            envelope["sourceNumber"] = self._account_number
+            data_message["_cognis_chat_id"] = str(destination)
+            data_message["_cognis_chat_type"] = "direct"
+        if not envelope.get("sourceName") and sent_message.get("destinationName"):
+            data_message["_cognis_chat_name"] = str(sent_message["destinationName"])
+
+        return data_message
+
+    def _log_direct_receive_drop(self, reason: str, envelope: dict[str, Any]) -> None:
+        envelope_keys = sorted(str(key) for key in envelope) if isinstance(envelope, dict) else []
+        sync_message = envelope.get("syncMessage") if isinstance(envelope, dict) else None
+        sync_keys = (
+            sorted(str(key) for key in sync_message) if isinstance(sync_message, dict) else []
+        )
+        logger.info(
+            "signal adapter: dropped direct receive notification "
+            "(reason=%s, envelope_keys=%s, sync_keys=%s)",
+            reason,
+            envelope_keys,
+            sync_keys,
+            extra={
+                "extra_data": {
+                    "account_id": self.account_id,
+                    "reason": reason,
+                    "envelope_keys": envelope_keys,
+                    "sync_keys": sync_keys,
+                }
+            },
+        )
 
     # ------------------------------------------------------------------
     # Outbound — send message
@@ -956,9 +1039,9 @@ class SignalAdapter(BaseChannelAdapter):
             chat_type = "group"
             chat_name = group_info.get("groupName")
         else:
-            chat_id = source
-            chat_type = "direct"
-            chat_name = source_name
+            chat_id = str(data_message.get("_cognis_chat_id") or source)
+            chat_type = str(data_message.get("_cognis_chat_type") or "direct")
+            chat_name = data_message.get("_cognis_chat_name") or source_name
 
         dedupe_key = f"{source}|{chat_id}|{timestamp}"
         if self._remember_inbound_message_key(dedupe_key):

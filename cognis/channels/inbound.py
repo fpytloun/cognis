@@ -197,6 +197,8 @@ class InboundPipeline:
             )
             return
 
+        await self._mark_read(message, config, conversation_id)
+
         cmd_result = await self._try_command_dispatch(
             conversation_id=conversation_id,
             content=message.content,
@@ -320,6 +322,32 @@ class InboundPipeline:
                 }
             },
         )
+
+    async def _mark_read(
+        self,
+        message: InboundMessage,
+        config: ChannelAccountConfig,
+        conversation_id: str,
+    ) -> None:
+        """Best-effort platform read receipt after the inbound message is accepted."""
+        try:
+            manager = self._channel_manager_ref()
+            if manager is None:
+                return
+            adapter = manager.get_adapter(config.account_id)
+            await adapter.mark_read(message.chat_id, message.message_id)
+        except Exception:
+            logger.warning(
+                "channel inbound: failed to mark message as read",
+                exc_info=True,
+                extra={
+                    "extra_data": {
+                        "channel_type": message.channel_type,
+                        "account_id": message.account_id,
+                        "conversation_id": conversation_id,
+                    }
+                },
+            )
 
     def _is_voice_input(self, message: InboundMessage) -> bool:
         return bool(message.platform_data.get("voice_input"))

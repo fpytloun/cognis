@@ -62,11 +62,13 @@ class SignalCliRuntime:
         account_number: str,
         command: str = "signal-cli",
         trust_mode: str = "trust-all-known",
+        receive_mode: str = "on-start",
         on_notification: Any | None = None,
     ) -> None:
         self._account_number = account_number
         self._command = command
         self._trust_mode = trust_mode
+        self._receive_mode = self._normalize_receive_mode(receive_mode)
         self._on_notification = on_notification
 
         self._process: asyncio.subprocess.Process | None = None
@@ -109,14 +111,7 @@ class SignalCliRuntime:
         if resolved is None:
             raise SignalCliRuntimeError(f"signal-cli command not found: {self._command}")
 
-        args = [
-            resolved,
-            "--trust-new-identities",
-            self._trust_mode,
-            "-a",
-            self._account_number,
-            "jsonRpc",
-        ]
+        args = self._build_args(resolved)
 
         try:
             self._process = await asyncio.wait_for(
@@ -152,6 +147,7 @@ class SignalCliRuntime:
                     "extra_data": {
                         "account": self._account_number,
                         "version": self._version,
+                        "receive_mode": self._receive_mode,
                     }
                 },
             )
@@ -173,6 +169,25 @@ class SignalCliRuntime:
             # We assume these are available; if they fail at call time
             # we degrade gracefully.
             self._capabilities.add(method)
+
+    def _build_args(self, resolved_command: str) -> list[str]:
+        return [
+            resolved_command,
+            "--trust-new-identities",
+            self._trust_mode,
+            "-a",
+            self._account_number,
+            "jsonRpc",
+            "--receive-mode",
+            self._receive_mode,
+        ]
+
+    @staticmethod
+    def _normalize_receive_mode(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"on-start", "on-connection", "manual"}:
+            return normalized
+        return "on-start"
 
     async def stop(self) -> None:
         """Stop the subprocess and cancel in-flight requests."""
@@ -304,6 +319,14 @@ class SignalCliRuntime:
 
                 elif method == "receive":
                     # Inbound notification
+                    logger.info(
+                        "signal-cli runtime: receive notification",
+                        extra={
+                            "extra_data": {
+                                "account": self._account_number,
+                            }
+                        },
+                    )
                     if self._on_notification is not None:
                         try:
                             await self._on_notification(msg.get("params", {}))
@@ -317,6 +340,16 @@ class SignalCliRuntime:
                                 },
                                 exc_info=True,
                             )
+                elif method:
+                    logger.debug(
+                        "signal-cli runtime: ignored notification",
+                        extra={
+                            "extra_data": {
+                                "account": self._account_number,
+                                "method": str(method),
+                            }
+                        },
+                    )
 
         except asyncio.CancelledError:
             return
