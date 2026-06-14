@@ -8,7 +8,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 
 from cognis.api.common import (
@@ -34,10 +34,11 @@ from cognis.api.models import (
     CursorPage,
 )
 from cognis.api.serializers import agent_to_response
+from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition
+from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.ownership import normalize_executor_scope
 from cognis.store.models import Schedule, Task
 from cognis.store.queries import (
@@ -82,6 +83,15 @@ def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, o
         "personality_sync_error": error_detail,
         "personality_sync_checked_at": datetime.now(UTC).isoformat(),
     }
+
+
+def _validate_agent_definition_payload(payload: dict[str, object]) -> AgentDefinition:
+    try:
+        definition = AgentDefinition.model_validate(payload)
+        resolve_agent_profile(definition, None, source="agent_default")
+    except (ValidationError, ValueError) as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    return definition
 
 
 def _grant_to_response(row: object, *, include_overrides: bool = False) -> AgentGrantResponse:
@@ -265,6 +275,26 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
 
     # Use display_name as alias for name (backward compat)
     name = payload.name or payload.display_name or agent_id
+    definition_payload = {
+        "agent_id": agent_id,
+        "owner_email": user.email,
+        "name": name,
+        "display_name": name,
+        "description": payload.description,
+        "system_prompt": payload.system_prompt,
+        "personality": payload.personality,
+        "skills": payload.skills,
+        "tools": payload.tools,
+        "permissions": payload.permissions,
+        "llm_config": payload.llm_config,
+        "agent_profiles": payload.agent_profiles or {},
+        "default_agent_profile_id": payload.default_agent_profile_id,
+        "execution": payload.execution,
+        "avatar_image_id": payload.avatar_image_id,
+        "agent_type": payload.agent_type,
+        "status": payload.status,
+    }
+    definition = _validate_agent_definition_payload(definition_payload)
 
     async with request.app.state.session_factory() as session:
         existing = await get_agent(session, agent_id)
@@ -283,6 +313,8 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
             tools=payload.tools,
             permissions=payload.permissions,
             llm_config=payload.llm_config,
+            agent_profiles=payload.agent_profiles,
+            default_agent_profile_id=payload.default_agent_profile_id,
             execution=payload.execution,
             avatar_image_id=payload.avatar_image_id,
             agent_type=payload.agent_type,
@@ -291,7 +323,6 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         await session.commit()
         await session.refresh(row)
 
-    definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     try:
         replace_identity = getattr(
             request.app.state.providers.memory,
@@ -367,6 +398,10 @@ async def update_agent_route(
         identity_changed = any(
             field in updates and getattr(row, field) != updates[field] for field in identity_fields
         )
+        if {"agent_profiles", "default_agent_profile_id", "llm_config"} & updates.keys():
+            candidate = agent_to_response(row).model_dump()
+            candidate.update(updates)
+            _validate_agent_definition_payload(candidate)
         ok = await update_agent(
             session,
             agent_id,
@@ -439,7 +474,7 @@ async def _update_system_agent_route(
         raise api_exception(403, "forbidden", "This system agent cannot be overridden")
 
     updates = payload.model_dump(exclude_unset=True)
-    allowed_top_level = {"llm_config", "skills"}
+    allowed_top_level = {"llm_config", "skills", "tools", "permissions"}
     forbidden = sorted(key for key in updates if key not in allowed_top_level)
     if forbidden:
         raise api_exception(
@@ -461,6 +496,17 @@ async def _update_system_agent_route(
     raw_skills = updates.get("skills")
     if raw_skills is not None and not isinstance(raw_skills, dict):
         raise api_exception(403, "forbidden", "System agent skill overrides must be an object")
+    raw_tools = updates.get("tools")
+    if raw_tools is not None and not isinstance(raw_tools, dict):
+        raise api_exception(403, "forbidden", "System agent tool overrides must be an object")
+    raw_permissions = updates.get("permissions")
+    if raw_permissions is not None and not isinstance(raw_permissions, dict):
+        raise api_exception(403, "forbidden", "System agent permission overrides must be an object")
+    if isinstance(raw_permissions, dict):
+        try:
+            AgentPermissions.model_validate(raw_permissions)
+        except ValidationError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
 
     async with request.app.state.session_factory() as session:
         existing = await get_system_agent_override(
@@ -476,12 +522,24 @@ async def _update_system_agent_route(
             if "skills" in updates
             else (existing.skills_override if existing else None)
         )
+        tools_override_to_store = (
+            (raw_tools if isinstance(raw_tools, dict) else None)
+            if "tools" in updates
+            else (existing.tools_override if existing else None)
+        )
+        permissions_override_to_store = (
+            (raw_permissions if isinstance(raw_permissions, dict) else None)
+            if "permissions" in updates
+            else (existing.permissions_override if existing else None)
+        )
         await upsert_system_agent_override(
             session,
             owner_email=user.email,
             agent_id=agent_id,
             llm_config_override=llm_override_to_store,
             skills_override=skills_override_to_store,
+            tools_override=tools_override_to_store,
+            permissions_override=permissions_override_to_store,
             execution_override=None,
         )
         await session.commit()
@@ -540,6 +598,11 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
                 llm_config=definition.llm_config.model_dump(mode="json", exclude_none=True)
                 if definition.llm_config
                 else None,
+                agent_profiles={
+                    profile_id: profile.model_dump(mode="json", exclude_none=True)
+                    for profile_id, profile in definition.agent_profiles.items()
+                },
+                default_agent_profile_id=definition.default_agent_profile_id,
                 execution=definition.execution,
                 avatar_image_id=definition.avatar_image_id,
                 agent_type=definition.agent_type,
@@ -568,6 +631,8 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
             tools=row.tools,
             permissions=row.permissions,
             llm_config=row.llm_config,
+            agent_profiles=row.agent_profiles,
+            default_agent_profile_id=row.default_agent_profile_id,
             execution=row.execution,
             avatar_image_id=row.avatar_image_id,
             agent_type=row.agent_type,
@@ -611,6 +676,8 @@ async def disable_system_agent(request: Request, agent_id: str) -> AgentResponse
             disabled=True,
             llm_config_override=(existing.llm_config_override if existing else None),
             skills_override=(existing.skills_override if existing else None),
+            tools_override=(existing.tools_override if existing else None),
+            permissions_override=(existing.permissions_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
         )
         await session.commit()
@@ -639,6 +706,8 @@ async def enable_system_agent(request: Request, agent_id: str) -> AgentResponse:
             disabled=False,
             llm_config_override=(existing.llm_config_override if existing else None),
             skills_override=(existing.skills_override if existing else None),
+            tools_override=(existing.tools_override if existing else None),
+            permissions_override=(existing.permissions_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
         )
         await session.commit()

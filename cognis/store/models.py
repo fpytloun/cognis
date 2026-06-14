@@ -126,6 +126,8 @@ class Agent(Base):
     tools: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     permissions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     llm_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    agent_profiles: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    default_agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     execution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     sync_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=dict)
     avatar_url: Mapped[str | None] = mapped_column(String, nullable=True)  # deprecated
@@ -317,6 +319,8 @@ class SystemAgentOverride(Base):
     )
     llm_config_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     skills_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    tools_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    permissions_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     execution_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -334,6 +338,7 @@ class Conversation(Base):
     conversation_id: Mapped[str] = mapped_column(String, primary_key=True)
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     title: Mapped[str | None] = mapped_column(String, nullable=True)
     title_source: Mapped[str] = mapped_column(String, nullable=False, default="unset")
     context_type: Mapped[str] = mapped_column(String, nullable=False)
@@ -384,6 +389,7 @@ class Session(Base):
     previous_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_email: Mapped[str] = mapped_column(String, nullable=False)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_mode: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_task: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
@@ -440,6 +446,7 @@ class ManagedConversationLink(Base):
     target_agent_id: Mapped[str] = mapped_column(
         String, ForeignKey("agents.agent_id"), nullable=False
     )
+    target_agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     target_conversation_id: Mapped[str] = mapped_column(
         String, ForeignKey("conversations.conversation_id"), nullable=False
     )
@@ -638,6 +645,7 @@ class Task(Base):
     priority: Mapped[int] = mapped_column(nullable=False, default=0)
     created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     created_by_agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
     source_type: Mapped[str] = mapped_column(String, nullable=False, default="api")
     source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -765,6 +773,7 @@ class StepRun(Base):
     )
     superseded_by_step_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     workspace_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     working_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
     conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -836,6 +845,7 @@ class Schedule(Base):
     one_shot_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     timezone: Mapped[str] = mapped_column(String, nullable=False, default="UTC")
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     skill_id: Mapped[str | None] = mapped_column(String, nullable=True)

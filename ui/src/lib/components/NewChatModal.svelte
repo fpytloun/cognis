@@ -1,11 +1,14 @@
 <script lang="ts">
   import type { Agent } from '$lib/types/api';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
 
   let {
     agents,
     selectedAgentId = $bindable(''),
+    selectedAgentProfileId = $bindable(''),
     title = 'New chat',
     description = 'Choose the primary agent for the new conversation.',
     confirmLabel = 'Create conversation',
@@ -16,6 +19,7 @@
   } = $props<{
     agents: Agent[];
     selectedAgentId?: string;
+    selectedAgentProfileId?: string;
     title?: string;
     description?: string;
     confirmLabel?: string;
@@ -28,6 +32,11 @@
   const primaryAgents = $derived(
     agents.filter((agent: Agent) => agent.agent_type === 'primary' && agent.status === 'active')
   );
+  const selectedAgent = $derived(primaryAgents.find((agent: Agent) => agent.agent_id === selectedAgentId) ?? null);
+
+  $effect(() => {
+    selectedAgentProfileId = normalizeSelectedAgentProfileId(selectedAgent, selectedAgentProfileId);
+  });
 </script>
 
 <BlockingDialog label="New chat dialog" onClose={() => !busy && oncancel()} titleId="new-chat-title">
@@ -58,6 +67,14 @@
           {/each}
         </select>
       </label>
+      <div class="mt-4">
+        <AgentProfileSelect
+          agents={primaryAgents}
+          agentId={selectedAgentId}
+          bind:value={selectedAgentProfileId}
+          disabled={busy}
+        />
+      </div>
     </div>
   {/snippet}
 

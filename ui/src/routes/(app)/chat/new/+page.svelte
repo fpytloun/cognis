@@ -14,6 +14,7 @@
   let creating = false;
   let agents: Agent[] = [];
   let selectedAgentId = '';
+  let selectedAgentProfileId = '';
   let health: HealthResponse | null = null;
 
   function isLlmUnavailableForSetup(): boolean {
@@ -54,6 +55,7 @@
     try {
       const conversation = await api.conversations.create({
         agent_id: selectedAgentId,
+        agent_profile_id: selectedAgentProfileId || null,
         context: {
           type: 'web',
           ref: null,
@@ -99,6 +101,7 @@
   <NewChatModal
     {agents}
     bind:selectedAgentId
+    bind:selectedAgentProfileId
     title="Start a new chat"
     description="Pick the primary agent for this new web conversation. The current filter or your saved agent preference is preselected when possible."
     confirmLabel="Create conversation"

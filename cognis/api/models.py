@@ -201,12 +201,14 @@ class ConversationResolveRequest(BaseModel):
     """Find-or-create a conversation for a given agent and context type."""
 
     agent_id: str
+    agent_profile_id: str | None = None
     context_type: str = "web"
     scope: Literal["latest", "agent_direct"] = "latest"
 
 
 class ConversationCreateRequest(BaseModel):
     agent_id: str
+    agent_profile_id: str | None = None
     title: str | None = None
     project_id: str | None = None
     context: ConversationContextModel = Field(default_factory=ConversationContextModel)
@@ -223,6 +225,7 @@ class ConversationResponse(BaseModel):
     conversation_id: str
     user_email: str
     agent_id: str
+    agent_profile_id: str | None = None
     project_id: str | None = None
     title: str | None = None
     title_source: str = "unset"
@@ -508,6 +511,7 @@ class SessionResponse(BaseModel):
     previous_session_id: str | None = None
     user_email: str
     agent_id: str
+    agent_profile_id: str | None = None
     delegation_mode: str | None = None
     delegation_task: str | None = None
     status: str
@@ -548,6 +552,8 @@ class AgentRequestBase(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    agent_profiles: dict[str, Any] | None = None
+    default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
     avatar_image_id: str | None = None
     status: str | None = None
@@ -582,6 +588,8 @@ class AgentUpdateRequest(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    agent_profiles: dict[str, Any] | None = None
+    default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
     avatar_image_id: str | None = None
     status: str | None = None
@@ -612,6 +620,8 @@ class AgentResponse(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    agent_profiles: dict[str, Any] | None = None
+    default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
     personality_synced: bool = True
     personality_sync_error: str | None = None
@@ -888,6 +898,7 @@ class PendingPauseResponse(BaseModel):
 
 class TaskCreateRequest(BaseModel):
     agent_id: str
+    agent_profile_id: str | None = None
     title: str
     description: str = ""
     expected_output: str | None = None
@@ -910,7 +921,7 @@ class TaskCreateRequest(BaseModel):
     working_directory: str | None = None
     created_by_agent_id: str | None = None
 
-    @field_validator("workflow_id", "project_id", "skill_id", mode="before")
+    @field_validator("agent_profile_id", "workflow_id", "project_id", "skill_id", mode="before")
     @classmethod
     def _empty_optional_ids_are_none(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
@@ -932,6 +943,7 @@ class TaskUpdateRequest(BaseModel):
     expected_output: str | None = None
     priority: int | None = None
     agent_id: str | None = None
+    agent_profile_id: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None
@@ -944,7 +956,9 @@ class TaskUpdateRequest(BaseModel):
     workspace_root: str | None = None
     working_directory: str | None = None
 
-    @field_validator("agent_id", "workflow_id", "project_id", "skill_id", mode="before")
+    @field_validator(
+        "agent_id", "agent_profile_id", "workflow_id", "project_id", "skill_id", mode="before"
+    )
     @classmethod
     def _empty_optional_ids_are_none(cls, value: Any) -> Any:
         if isinstance(value, str) and not value.strip():
@@ -1040,6 +1054,7 @@ class TaskResponse(BaseModel):
     priority: int = 0
     created_by: str
     agent_id: str
+    agent_profile_id: str | None = None
     created_by_agent_id: str | None = None
     source_type: str
     source_ref: str | None = None
@@ -1163,6 +1178,7 @@ class CreateScheduleRequest(BaseModel):
     one_shot_at: datetime | None = None
     timezone: str = "UTC"
     agent_id: str
+    agent_profile_id: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None
@@ -1174,6 +1190,13 @@ class CreateScheduleRequest(BaseModel):
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = "none"
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
+
+    @field_validator("agent_profile_id", "workflow_id", "project_id", "skill_id", mode="before")
+    @classmethod
+    def _empty_optional_ids_are_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")
     def _validate_schedule_type(self) -> CreateScheduleRequest:
@@ -1202,6 +1225,7 @@ class UpdateScheduleRequest(BaseModel):
     one_shot_at: datetime | None = None
     timezone: str | None = None
     agent_id: str | None = None
+    agent_profile_id: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None
@@ -1213,6 +1237,13 @@ class UpdateScheduleRequest(BaseModel):
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
     session_policy: SessionPolicy | None = None
+
+    @field_validator("agent_profile_id", "workflow_id", "project_id", "skill_id", mode="before")
+    @classmethod
+    def _empty_optional_ids_are_none(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")
     def _strip_reserved_task_template_fields(self) -> UpdateScheduleRequest:
@@ -1231,6 +1262,7 @@ class ScheduleResponse(BaseModel):
     one_shot_at: datetime | None = None
     timezone: str = "UTC"
     agent_id: str
+    agent_profile_id: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None

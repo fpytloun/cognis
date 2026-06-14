@@ -5,7 +5,10 @@ import {
   buildSystemPromptPreview,
   createEmptyAgentForm,
   formStateToEffectiveToolsPreviewPayload,
-  formStateToPayload
+  formStateToPayload,
+  formStateToSystemOverridePayload,
+  normalizeSelectedAgentProfileId,
+  profileOptionsForAgent
 } from '$lib/agents';
 
 describe('agent payload mapping', () => {
@@ -101,6 +104,27 @@ describe('agent payload mapping', () => {
     const payload = formStateToPayload(form);
     expect(payload.tools).toMatchObject({
       disabled_mcp_servers: ['local_mcp:srv-github', 'intaris_mcp:slack']
+    });
+  });
+
+  it('includes tool and permission overrides in system agent payloads', () => {
+    const form = createEmptyAgentForm();
+    form.disabledMcpServers = ['local_mcp:mcp-arr'];
+    form.disabledTools = ['mcp:mcp-arr:arr_status'];
+    form.toolPermissions = {
+      'mcp:mcp-arr:arr_search_all': 'allow'
+    };
+
+    const payload = formStateToSystemOverridePayload(form);
+
+    expect(payload.tools).toMatchObject({
+      disabled_mcp_servers: ['local_mcp:mcp-arr'],
+      disabled_tools: ['mcp:mcp-arr:arr_status']
+    });
+    expect(payload.permissions).toMatchObject({
+      tool_permissions: {
+        'mcp:mcp-arr:arr_search_all': 'allow'
+      }
     });
   });
 
@@ -273,5 +297,124 @@ describe('agent payload mapping', () => {
     } as never);
 
     expect(next.allowedKnowledgebases).toEqual(['kb_docs']);
+  });
+
+  it('round-trips agent runtime profiles independently of base llm config', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      llm_config: {
+        provider_id: 'openai',
+        model: 'gpt-default',
+        reasoning_effort: 'medium'
+      },
+      agent_profiles: {
+        fast: {
+          profile_id: 'fast',
+          description: 'Low latency routing profile',
+          provider_id: 'openai',
+          model: 'gpt-fast',
+          reasoning_effort: 'low',
+          system_prompt_extra: 'Be concise.',
+          enabled: true,
+          metadata: { tier: 'cheap' }
+        }
+      },
+      default_agent_profile_id: 'fast'
+    } as never);
+
+    expect(form.providerId).toBe('openai');
+    expect(form.model).toBe('gpt-default');
+    expect(form.reasoningEffort).toBe('medium');
+    expect(form.agentProfiles).toEqual([
+      {
+        profileId: 'fast',
+        description: 'Low latency routing profile',
+        providerId: 'openai',
+        model: 'gpt-fast',
+        reasoningEffort: 'low',
+        systemPromptExtra: 'Be concise.',
+        enabled: true
+      }
+    ]);
+    expect(form.defaultAgentProfileId).toBe('fast');
+
+    const payload = formStateToPayload(form);
+    expect(payload.llm_config).toMatchObject({
+      provider_id: 'openai',
+      model: 'gpt-default',
+      reasoning_effort: 'medium'
+    });
+    expect(payload.agent_profiles).toEqual({
+      fast: {
+        profile_id: 'fast',
+        description: 'Low latency routing profile',
+        provider_id: 'openai',
+        model: 'gpt-fast',
+        reasoning_effort: 'low',
+        system_prompt_extra: 'Be concise.',
+        enabled: true
+      }
+    });
+    expect(payload.default_agent_profile_id).toBe('fast');
+  });
+
+  it('selects the first runtime profile as default when the selected default is invalid', () => {
+    const form = createEmptyAgentForm();
+    form.agentProfiles = [
+      {
+        profileId: 'quality',
+        description: '',
+        providerId: '',
+        model: '',
+        reasoningEffort: '',
+        systemPromptExtra: '',
+        enabled: true
+      }
+    ];
+    form.defaultAgentProfileId = 'missing';
+
+    const payload = formStateToPayload(form);
+
+    expect(payload.default_agent_profile_id).toBe('quality');
+  });
+});
+
+describe('agent runtime profile helpers', () => {
+  const agent = {
+    agent_id: 'agent-1',
+    name: 'Agent',
+    agent_type: 'primary',
+    default_agent_profile_id: 'fast',
+    agent_profiles: {
+      fast: {
+        profile_id: 'fast',
+        description: 'Fast responses',
+        enabled: true
+      },
+      disabled: {
+        profile_id: 'disabled',
+        description: 'Disabled profile',
+        enabled: false
+      }
+    }
+  } as never;
+
+  it('builds enabled profile options and marks the agent default', () => {
+    expect(profileOptionsForAgent(agent)).toEqual([
+      {
+        profileId: 'fast',
+        label: 'fast (default)',
+        description: 'Fast responses',
+        isDefault: true
+      }
+    ]);
+  });
+
+  it('clears profile selections that do not belong to the selected agent', () => {
+    expect(normalizeSelectedAgentProfileId(agent, 'fast')).toBe('fast');
+    expect(normalizeSelectedAgentProfileId(agent, 'missing')).toBe('');
+    expect(normalizeSelectedAgentProfileId(null, 'fast')).toBe('');
   });
 });

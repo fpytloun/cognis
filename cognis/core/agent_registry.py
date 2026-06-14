@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition, AgentLLMConfig
+from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentPermissions
 from cognis.ownership import normalize_executor_scope
 from cognis.store.queries import (
     get_agent,
@@ -490,7 +490,11 @@ def _system_agent(
                 "llm_config.top_p",
                 "llm_config.max_tokens",
                 "llm_config.reasoning_effort",
+                "agent_profiles",
+                "default_agent_profile_id",
                 "skills",
+                "tools",
+                "permissions",
             ]
             if allow_user_override
             else []
@@ -771,6 +775,10 @@ class AgentRegistry:
             effective.execution = {**current_execution, **execution_override}
         if isinstance(row.skills_override, dict):
             effective.skills = row.skills_override
+        if isinstance(row.tools_override, dict):
+            effective.tools = row.tools_override
+        if isinstance(row.permissions_override, dict):
+            effective.permissions = AgentPermissions.model_validate(row.permissions_override)
         return effective
 
     async def list_secondary_bindings(self, primary_agent_id: str) -> list[str]:
@@ -812,7 +820,7 @@ class AgentRegistry:
 
 def _row_to_definition(row: Any) -> AgentDefinition:
     """Convert a DB Agent row to an AgentDefinition domain model."""
-    from cognis.models.agent import AgentLLMConfig, AgentPermissions
+    from cognis.models.agent import AgentLLMConfig, AgentPermissions, AgentRuntimeProfile
 
     permissions = None
     if row.permissions:
@@ -821,6 +829,15 @@ def _row_to_definition(row: Any) -> AgentDefinition:
     llm_config = None
     if row.llm_config:
         llm_config = AgentLLMConfig.model_validate(row.llm_config)
+
+    agent_profiles: dict[str, AgentRuntimeProfile] = {}
+    raw_profiles = getattr(row, "agent_profiles", None)
+    if isinstance(raw_profiles, dict):
+        agent_profiles = {
+            profile_id: AgentRuntimeProfile.model_validate(profile)
+            for profile_id, profile in raw_profiles.items()
+            if isinstance(profile_id, str) and isinstance(profile, dict)
+        }
 
     return AgentDefinition(
         agent_id=row.agent_id,
@@ -834,6 +851,8 @@ def _row_to_definition(row: Any) -> AgentDefinition:
         tools=row.tools,
         permissions=permissions,
         llm_config=llm_config,
+        agent_profiles=agent_profiles,
+        default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
         execution=row.execution,
         avatar_url=row.avatar_url,
         avatar_image_id=getattr(row, "avatar_image_id", None),

@@ -33,3 +33,21 @@ def test_validate_llm_provider_payload_rejects_direct_codex_for_non_chatgpt() ->
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail["code"] == "validation_error"
+
+
+def test_validate_llm_provider_payload_accepts_message_projection_policy() -> None:
+    _validate_llm_provider_payload(
+        "controller",
+        {"preset": "openai_compatible", "message_projection_policy": "anthropic_messages"},
+    )
+
+
+def test_validate_llm_provider_payload_rejects_unknown_message_projection_policy() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_llm_provider_payload(
+            "controller",
+            {"preset": "openai_compatible", "message_projection_policy": "surprising"},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["code"] == "validation_error"

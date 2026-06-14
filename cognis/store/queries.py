@@ -814,6 +814,8 @@ async def create_agent(
     tools: dict[str, Any] | None = None,
     permissions: dict[str, Any] | None = None,
     llm_config: dict[str, Any] | None = None,
+    agent_profiles: dict[str, Any] | None = None,
+    default_agent_profile_id: str | None = None,
     execution: dict[str, Any] | None = None,
     avatar_url: str | None = None,
     avatar_image_id: str | None = None,
@@ -833,6 +835,8 @@ async def create_agent(
         tools=tools,
         permissions=permissions,
         llm_config=llm_config,
+        agent_profiles=agent_profiles,
+        default_agent_profile_id=default_agent_profile_id,
         execution=execution,
         avatar_url=avatar_url,
         avatar_image_id=avatar_image_id,
@@ -863,6 +867,8 @@ async def update_agent(
         "tools",
         "permissions",
         "llm_config",
+        "agent_profiles",
+        "default_agent_profile_id",
         "execution",
         "avatar_image_id",
     }
@@ -918,6 +924,8 @@ async def upsert_system_agent_override(
     disabled: bool | None = None,
     llm_config_override: dict[str, Any] | None = None,
     skills_override: dict[str, Any] | None = None,
+    tools_override: dict[str, Any] | None = None,
+    permissions_override: dict[str, Any] | None = None,
     execution_override: dict[str, Any] | None = None,
 ) -> SystemAgentOverride:
     """Create or update a per-user system-agent override row."""
@@ -934,6 +942,8 @@ async def upsert_system_agent_override(
         row.disabled = disabled
     row.llm_config_override = llm_config_override
     row.skills_override = skills_override
+    row.tools_override = tools_override
+    row.permissions_override = permissions_override
     row.execution_override = execution_override
     row.updated_at = _utcnow()
     await session.flush()
@@ -1318,6 +1328,7 @@ async def create_conversation(
     agent_id: str,
     context_type: str,
     *,
+    agent_profile_id: str | None = None,
     title: str | None = None,
     title_source: str = "unset",
     context_ref: str | None = None,
@@ -1332,6 +1343,7 @@ async def create_conversation(
         conversation_id=conversation_id or f"conv_{uuid.uuid4().hex}",
         user_email=user_email,
         agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
         title=title,
         title_source=title_source,
         context_type=context_type,
@@ -1568,6 +1580,7 @@ async def create_managed_conversation_link(
     target_conversation_id: str,
     target_session_id: str,
     title: str,
+    target_agent_profile_id: str | None = None,
     turn_state: str = "idle",
     notify_on_completion: bool = False,
 ) -> ManagedConversationLink:
@@ -1579,6 +1592,7 @@ async def create_managed_conversation_link(
         controller_conversation_id=controller_conversation_id,
         controller_session_id=controller_session_id,
         target_agent_id=target_agent_id,
+        target_agent_profile_id=target_agent_profile_id,
         target_conversation_id=target_conversation_id,
         target_session_id=target_session_id,
         title=title,
@@ -1713,6 +1727,7 @@ async def update_conversation(
     title: str | None = None,
     title_source: str | None = None,
     project_id: str | None = None,
+    agent_profile_id: str | None = None,
 ) -> bool:
     """Update mutable conversation fields."""
     row = await get_conversation(session, conversation_id)
@@ -1724,6 +1739,24 @@ async def update_conversation(
         row.title_source = title_source
     if project_id is not None:
         row.project_id = project_id
+    if agent_profile_id is not None:
+        row.agent_profile_id = agent_profile_id
+    row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
+
+
+async def set_conversation_agent_profile_id(
+    session: AsyncSession,
+    conversation_id: str,
+    agent_profile_id: str | None,
+) -> bool:
+    """Persist the selected runtime profile for a conversation."""
+
+    row = await get_conversation(session, conversation_id)
+    if row is None:
+        return False
+    row.agent_profile_id = agent_profile_id
     row.updated_at = datetime.now(UTC)
     await session.flush()
     return True
@@ -2160,6 +2193,7 @@ async def create_session(
     user_email: str,
     agent_id: str,
     *,
+    agent_profile_id: str | None = None,
     parent_session_id: str | None = None,
     previous_session_id: str | None = None,
     delegation_mode: str | None = None,
@@ -2178,6 +2212,7 @@ async def create_session(
         previous_session_id=previous_session_id,
         user_email=user_email,
         agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
         delegation_mode=delegation_mode,
         delegation_task=delegation_task,
         status=status,
@@ -2187,6 +2222,22 @@ async def create_session(
     session.add(session_row)
     await session.flush()
     return session_row
+
+
+async def set_session_agent_profile_id(
+    session: AsyncSession,
+    session_id: str,
+    agent_profile_id: str | None,
+) -> bool:
+    """Persist the selected runtime profile for a session."""
+
+    session_row = await get_session_row(session, session_id)
+    if session_row is None:
+        return False
+    session_row.agent_profile_id = agent_profile_id
+    session_row.updated_at = datetime.now(UTC)
+    await session.flush()
+    return True
 
 
 async def get_session_row(session: AsyncSession, session_id: str) -> Session | None:
@@ -2409,6 +2460,7 @@ async def create_task(
     created_by: str,
     agent_id: str,
     title: str,
+    agent_profile_id: str | None = None,
     description: str = "",
     expected_output: str | None = None,
     status: str = "draft",
@@ -2446,6 +2498,7 @@ async def create_task(
         priority=priority,
         created_by=created_by,
         agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
         created_by_agent_id=created_by_agent_id,
         source_type=source_type,
         source_ref=source_ref,
@@ -2717,6 +2770,30 @@ async def update_task_status(
     stmt = (
         update(Task).where(Task.task_id == task_id, Task.status.in_(allowed_from)).values(**values)
     )
+    result = await session.execute(stmt)
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def defer_running_task(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    scheduled_for: datetime,
+    workflow_state: dict[str, object] | None = None,
+    result_summary: str | None = None,
+) -> bool:
+    """Move a running task back to the ready queue for a scheduled retry."""
+
+    values: dict[str, object] = {
+        "status": "ready",
+        "scheduled_for": scheduled_for,
+    }
+    if workflow_state is not None:
+        values["workflow_state"] = workflow_state
+    if result_summary is not None:
+        values["result_summary"] = result_summary
+
+    stmt = update(Task).where(Task.task_id == task_id, Task.status == "running").values(**values)
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
@@ -3205,6 +3282,7 @@ async def create_step_run(
     step_name: str,
     step_type: str,
     agent_id: str,
+    agent_profile_id: str | None = None,
     attempt: int = 1,
     attempt_number: int = 1,
     step_run_id: str | None = None,
@@ -3225,6 +3303,7 @@ async def create_step_run(
         step_name=step_name,
         step_type=step_type,
         agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
         attempt=attempt,
         attempt_number=attempt_number,
         workspace_root=workspace_root,
@@ -3260,6 +3339,7 @@ async def update_step_run(
     *,
     status: str | None = None,
     attempt: int | object = _UNSET,
+    agent_profile_id: str | None | object = _UNSET,
     conversation_id: str | None | object = _UNSET,
     session_id: str | None | object = _UNSET,
     intaris_session_id: str | None | object = _UNSET,
@@ -3285,6 +3365,8 @@ async def update_step_run(
         values["status"] = status
     if attempt is not _UNSET:
         values["attempt"] = attempt
+    if agent_profile_id is not _UNSET:
+        values["agent_profile_id"] = agent_profile_id
     if conversation_id is not _UNSET:
         values["conversation_id"] = conversation_id
     if session_id is not _UNSET:
@@ -3788,6 +3870,7 @@ async def create_schedule(
     one_shot_at: datetime | None = None,
     timezone: str = "UTC",
     agent_id: str,
+    agent_profile_id: str | None = None,
     workflow_id: str | None = None,
     project_id: str | None = None,
     skill_id: str | None = None,
@@ -3812,6 +3895,7 @@ async def create_schedule(
         one_shot_at=one_shot_at,
         timezone=timezone,
         agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
         workflow_id=workflow_id,
         project_id=project_id,
         skill_id=skill_id,
@@ -3879,6 +3963,7 @@ async def update_schedule(
         "one_shot_at",
         "timezone",
         "agent_id",
+        "agent_profile_id",
         "workflow_id",
         "project_id",
         "skill_id",

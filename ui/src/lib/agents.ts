@@ -1,4 +1,4 @@
-import type { Agent, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+import type { Agent, AgentRuntimeProfile, LLMProvider, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
 export interface MCPEnvVar {
   key: string;
@@ -12,6 +12,16 @@ export interface MCPServerFormState {
   argsText: string;
   envVars: MCPEnvVar[];
   timeoutSeconds: number;
+}
+
+export interface AgentRuntimeProfileFormState {
+  profileId: string;
+  description: string;
+  providerId: string;
+  model: string;
+  reasoningEffort: string;
+  systemPromptExtra: string;
+  enabled: boolean;
 }
 
 /**
@@ -50,6 +60,8 @@ export interface AgentFormState {
   maxTokens: string;
   reasoningEffort: string;
   voice: string;
+  agentProfiles: AgentRuntimeProfileFormState[];
+  defaultAgentProfileId: string;
   availableWorkflowIds: string[];
   defaultWorkflowId: string;
   workflowSelectionMode: string;
@@ -110,6 +122,97 @@ export function slugify(text: string): string {
     .slice(0, 64) || 'unnamed';
 }
 
+function normalizeProfileId(value: string): string {
+  return value.trim();
+}
+
+export interface AgentProfileOption {
+  profileId: string;
+  label: string;
+  description: string;
+  isDefault: boolean;
+}
+
+export function profileOptionsForAgent(agent: Agent | null | undefined): AgentProfileOption[] {
+  const profiles = agent?.agent_profiles;
+  if (!profiles || typeof profiles !== 'object') return [];
+  const defaultProfileId = typeof agent?.default_agent_profile_id === 'string'
+    ? agent.default_agent_profile_id
+    : '';
+  return Object.entries(profiles)
+    .filter(([, profile]) => profile && typeof profile === 'object' && profile.enabled !== false)
+    .map(([profileId, profile]) => {
+      const normalizedProfileId =
+        typeof profile.profile_id === 'string' && profile.profile_id.trim()
+          ? profile.profile_id.trim()
+          : profileId;
+      const description = typeof profile.description === 'string' ? profile.description.trim() : '';
+      return {
+        profileId: normalizedProfileId,
+        label: normalizedProfileId === defaultProfileId
+          ? `${normalizedProfileId} (default)`
+          : normalizedProfileId,
+        description,
+        isDefault: normalizedProfileId === defaultProfileId
+      };
+    })
+    .sort((left, right) => left.profileId.localeCompare(right.profileId));
+}
+
+export function normalizeSelectedAgentProfileId(
+  agent: Agent | null | undefined,
+  selectedProfileId: string | null | undefined
+): string {
+  const profileId = typeof selectedProfileId === 'string' ? selectedProfileId.trim() : '';
+  if (!profileId) return '';
+  return profileOptionsForAgent(agent).some((option) => option.profileId === profileId)
+    ? profileId
+    : '';
+}
+
+function profileFormStateFromAgentProfiles(
+  profiles: Record<string, AgentRuntimeProfile> | undefined
+): AgentRuntimeProfileFormState[] {
+  if (!profiles || typeof profiles !== 'object') {
+    return [];
+  }
+  return Object.entries(profiles)
+    .filter(([, profile]) => profile && typeof profile === 'object')
+    .map(([profileId, profile]) => ({
+      profileId: typeof profile.profile_id === 'string' && profile.profile_id.trim()
+        ? profile.profile_id.trim()
+        : profileId,
+      description: typeof profile.description === 'string' ? profile.description : '',
+      providerId: typeof profile.provider_id === 'string' ? profile.provider_id : '',
+      model: typeof profile.model === 'string' ? profile.model : '',
+      reasoningEffort: typeof profile.reasoning_effort === 'string' ? profile.reasoning_effort : '',
+      systemPromptExtra:
+        typeof profile.system_prompt_extra === 'string' ? profile.system_prompt_extra : '',
+      enabled: profile.enabled !== false
+    }))
+    .sort((left, right) => left.profileId.localeCompare(right.profileId));
+}
+
+function serializeAgentProfiles(
+  profiles: AgentRuntimeProfileFormState[]
+): Record<string, AgentRuntimeProfile> {
+  const serialized: Record<string, AgentRuntimeProfile> = {};
+  for (const profile of profiles) {
+    const profileId = normalizeProfileId(profile.profileId);
+    if (!profileId) continue;
+    serialized[profileId] = {
+      profile_id: profileId,
+      description: profile.description.trim(),
+      provider_id: profile.providerId.trim() || null,
+      model: profile.model.trim() || null,
+      reasoning_effort: profile.reasoningEffort.trim() || null,
+      system_prompt_extra: profile.systemPromptExtra.trim() || null,
+      enabled: profile.enabled
+    };
+  }
+  return serialized;
+}
+
 export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState {
   // Pre-select all system workflows for new agents
   const systemWorkflowIds = workflows
@@ -141,6 +244,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     maxTokens: '',
     reasoningEffort: '',
     voice: '',
+    agentProfiles: [],
+    defaultAgentProfileId: '',
     availableWorkflowIds: systemWorkflowIds,
     defaultWorkflowId: 'system:direct',
     workflowSelectionMode: 'automatic',
@@ -210,6 +315,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     reasoningEffort:
       typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
     voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
+    agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
+    defaultAgentProfileId:
+      typeof agent.default_agent_profile_id === 'string' ? agent.default_agent_profile_id : '',
     availableWorkflowIds: Array.isArray(execution.available_workflow_ids)
       ? execution.available_workflow_ids.filter((value): value is string => typeof value === 'string')
       : [],
@@ -371,6 +479,11 @@ function nonEmptyLines(value: string): string[] {
 
 export function formStateToPayload(form: AgentFormState): Record<string, unknown> {
   const serializedSkillItems = skillItems(form);
+  const agentProfiles = serializeAgentProfiles(form.agentProfiles);
+  const agentProfileIds = Object.keys(agentProfiles);
+  const defaultAgentProfileId = agentProfileIds.includes(form.defaultAgentProfileId)
+    ? form.defaultAgentProfileId
+    : agentProfileIds[0] ?? null;
   const toolPermissions = Object.fromEntries(
     Object.entries(form.toolPermissions).filter(([, value]) => value.length > 0)
   );
@@ -463,6 +576,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       reasoning_effort: form.reasoningEffort || undefined,
       voice: form.voice || undefined
     },
+    agent_profiles: agentProfiles,
+    default_agent_profile_id: defaultAgentProfileId,
     execution: {
       executor_id: form.executorId || undefined,
       executor_selector:
@@ -512,7 +627,10 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
 }
 
 export function formStateToSystemOverridePayload(form: AgentFormState): Record<string, unknown> {
+  const fullPayload = formStateToPayload(form);
   return {
+    tools: fullPayload.tools,
+    permissions: fullPayload.permissions,
     skills: {
       items: skillItems(form)
     },

@@ -39,6 +39,7 @@ class ScheduleModel(BaseModel):
     one_shot_at: datetime | None = None
     timezone: str = "UTC"
     agent_id: str
+    agent_profile_id: str | None = None
     workflow_id: str | None = None
     project_id: str | None = None
     skill_id: str | None = None

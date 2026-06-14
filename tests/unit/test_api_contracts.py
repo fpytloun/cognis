@@ -29,6 +29,7 @@ from cognis.api.models import (
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
+    ScheduleResponse,
     SessionEventsResponse,
     SkillResponse,
     SkillVersionResponse,
@@ -304,11 +305,24 @@ def test_agent_response_round_trips_sharing_fields() -> None:
         granted_permission="use",
         executor_scope="owner_executor",
         is_readonly_for_caller=True,
+        agent_profiles={
+            "fast": {
+                "profile_id": "fast",
+                "description": "Low latency",
+                "provider_id": "openai",
+                "model": "gpt-fast",
+                "reasoning_effort": "low",
+                "system_prompt_extra": "Be concise.",
+            }
+        },
+        default_agent_profile_id="fast",
     )
 
     assert response.is_shared_with_me is True
     assert response.shared_by_email == "owner@example.com"
     assert response.executor_scope == "owner_executor"
+    assert response.agent_profiles["fast"]["model"] == "gpt-fast"
+    assert response.default_agent_profile_id == "fast"
 
 
 def test_agent_grant_response_round_trip() -> None:
@@ -488,12 +502,42 @@ class TestScheduleRequests:
 
         assert request.session_policy.allow_policies == ["Session may pass AWS SSO"]
 
+    def test_create_accepts_agent_profile_id(self) -> None:
+        request = CreateScheduleRequest(
+            name="Daily",
+            agent_id="agent-1",
+            agent_profile_id="fast",
+            schedule_type="interval",
+            interval_seconds=60,
+        )
+
+        assert request.agent_profile_id == "fast"
+
     def test_update_strips_task_creator_agent_marker(self) -> None:
         request = UpdateScheduleRequest(
             task_template={"title": "Task", "created_by_agent_id": "agent-2"}
         )
 
         assert request.task_template == {"title": "Task"}
+
+    def test_update_accepts_null_agent_profile_id(self) -> None:
+        request = UpdateScheduleRequest(agent_profile_id=None)
+
+        assert "agent_profile_id" in request.model_fields_set
+        assert request.agent_profile_id is None
+
+    def test_response_includes_agent_profile_id(self) -> None:
+        response = ScheduleResponse(
+            schedule_id="sched-1",
+            name="Daily",
+            schedule_type="interval",
+            interval_seconds=60,
+            agent_id="agent-1",
+            agent_profile_id="fast",
+            created_by="owner@example.com",
+        )
+
+        assert response.agent_profile_id == "fast"
 
 
 def test_task_rerun_response_round_trip() -> None:

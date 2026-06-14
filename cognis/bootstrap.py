@@ -240,6 +240,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_creator_agent_column)
         await conn.run_sync(_ensure_task_session_policy_column)
+        await conn.run_sync(_ensure_agent_profile_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
@@ -1058,6 +1059,38 @@ def _ensure_task_execution_paths(sync_conn: object) -> None:
         execute(text("ALTER TABLE tasks ADD COLUMN working_directory TEXT"))
 
 
+def _ensure_agent_profile_columns(sync_conn: object) -> None:
+    """Add per-agent runtime profile columns where execution is selected."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    def columns_for(table_name: str) -> set[str]:
+        try:
+            return {column["name"] for column in inspector.get_columns(table_name)}
+        except Exception:
+            return set()
+
+    agent_columns = columns_for("agents")
+    if agent_columns and "agent_profiles" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN agent_profiles JSON"))
+    if agent_columns and "default_agent_profile_id" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN default_agent_profile_id VARCHAR"))
+
+    for table_name in ("conversations", "sessions", "tasks", "step_runs", "schedules"):
+        columns = columns_for(table_name)
+        if columns and "agent_profile_id" not in columns:
+            execute(text(f"ALTER TABLE {table_name} ADD COLUMN agent_profile_id VARCHAR"))
+
+    managed_link_columns = columns_for("managed_conversation_links")
+    if managed_link_columns and "target_agent_profile_id" not in managed_link_columns:
+        execute(
+            text(
+                "ALTER TABLE managed_conversation_links ADD COLUMN target_agent_profile_id VARCHAR"
+            )
+        )
+
+
 def _ensure_task_completion_delivery_columns(sync_conn: object) -> None:
     """Add task completion delivery policy and applied mode columns."""
 
@@ -1182,6 +1215,10 @@ def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
 
     if "skills_override" not in columns:
         execute(text("ALTER TABLE system_agent_overrides ADD COLUMN skills_override JSON"))
+    if "tools_override" not in columns:
+        execute(text("ALTER TABLE system_agent_overrides ADD COLUMN tools_override JSON"))
+    if "permissions_override" not in columns:
+        execute(text("ALTER TABLE system_agent_overrides ADD COLUMN permissions_override JSON"))
 
 
 async def _ensure_system_user(session: AsyncSession) -> None:

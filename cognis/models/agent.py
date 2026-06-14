@@ -6,7 +6,7 @@ from datetime import datetime
 from fnmatch import fnmatchcase
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cognis.logging import get_logger
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
@@ -29,6 +29,8 @@ class AgentDefinition(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: AgentPermissions | None = None
     llm_config: AgentLLMConfig | None = None
+    agent_profiles: dict[str, AgentRuntimeProfile] = Field(default_factory=dict)
+    default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
     avatar_url: str | None = None  # deprecated — computed from avatar_image_id
     avatar_image_id: str | None = None
@@ -50,6 +52,24 @@ class AgentDefinition(BaseModel):
     status: str = "active"
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @field_validator("agent_profiles", mode="before")
+    @classmethod
+    def _none_agent_profiles_are_empty(cls, value: Any) -> Any:
+        """Normalize legacy profile config before strict profile validation."""
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {}
+            for profile_id, profile in value.items():
+                if isinstance(profile, dict):
+                    normalized[profile_id] = {
+                        key: item for key, item in profile.items() if key != "metadata"
+                    }
+                else:
+                    normalized[profile_id] = profile
+            return normalized
+        return value
 
     def compose_personality(self) -> str | None:
         """Compose structured personality fields into a text block.
@@ -132,6 +152,71 @@ class AgentLLMConfig(BaseModel):
     @classmethod
     def _validate_reasoning_effort(cls, value: str | None) -> str | None:
         """Reject reasoning_effort values outside the normalised set."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reasoning_effort must be a string or null")
+        normalized = normalize_reasoning_level(value)
+        if normalized is None:
+            if not value.strip():
+                return None
+            allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
+            raise ValueError(f"reasoning_effort must be one of {allowed}; got {value!r}")
+        return normalized
+
+
+class AgentRuntimeProfile(BaseModel):
+    """Per-agent runtime variant for provider/model/reasoning and prompt tuning."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    profile_id: str | None = None
+    description: str = ""
+    provider_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("provider_id", "provider"),
+    )
+    model: str | None = None
+    reasoning_effort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_effort", "thinking_effort"),
+    )
+    system_prompt_extra: str | None = None
+    enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strip_legacy_metadata(cls, value: Any) -> Any:
+        """Ignore stale UI/runtime-profile metadata emitted before the schema was tightened."""
+        if isinstance(value, dict) and "metadata" in value:
+            return {key: item for key, item in value.items() if key != "metadata"}
+        return value
+
+    @field_validator("profile_id")
+    @classmethod
+    def _validate_profile_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if "/" in normalized:
+            raise ValueError("agent profile IDs must not contain '/'")
+        return normalized
+
+    @field_validator("provider_id", "model", "system_prompt_extra", "description", mode="before")
+    @classmethod
+    def _empty_strings_are_none_or_empty(cls, value: Any, info: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if info.field_name == "description":
+                return stripped
+            return stripped or None
+        return value
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
         if value is None:
             return None
         if not isinstance(value, str):

@@ -124,6 +124,7 @@ def conversation_to_response(
         conversation_id=row.conversation_id,
         user_email=row.user_email,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         project_id=getattr(row, "project_id", None),
         title=row.title,
         title_source=getattr(row, "title_source", "unset"),
@@ -183,6 +184,7 @@ def session_to_response(row: Any, *, include_result_content: bool = False) -> Se
         previous_session_id=getattr(row, "previous_session_id", None),
         user_email=row.user_email,
         agent_id=row.agent_id,
+        agent_profile_id=getattr(row, "agent_profile_id", None),
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
         status=row.status,
@@ -213,6 +215,14 @@ def agent_to_response(row: Any) -> AgentResponse:
     llm_config = getattr(row, "llm_config", None)
     if hasattr(llm_config, "model_dump"):
         llm_config = llm_config.model_dump(mode="json", exclude_none=True)
+    agent_profiles = getattr(row, "agent_profiles", None) or {}
+    if isinstance(agent_profiles, dict):
+        agent_profiles = {
+            key: value.model_dump(mode="json", exclude_none=True)
+            if hasattr(value, "model_dump")
+            else value
+            for key, value in agent_profiles.items()
+        }
     permissions = getattr(row, "permissions", None)
     if hasattr(permissions, "model_dump"):
         permissions = permissions.model_dump(mode="json", exclude_none=True)
@@ -228,6 +238,8 @@ def agent_to_response(row: Any) -> AgentResponse:
         tools=row.tools,
         permissions=permissions,
         llm_config=llm_config,
+        agent_profiles=agent_profiles,
+        default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
         execution=getattr(row, "execution", None),
         personality_synced=bool(sync_metadata.get("personality_synced", True)),
         personality_sync_error=(
@@ -376,6 +388,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         priority=task.priority,
         created_by=task.created_by,
         agent_id=task.agent_id,
+        agent_profile_id=task.agent_profile_id,
         created_by_agent_id=task.created_by_agent_id,
         source_type=task.source_type,
         source_ref=task.source_ref,

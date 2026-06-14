@@ -130,3 +130,44 @@ def test_partial_system_agent_override_updates_preserve_existing_fields(
         body = second.json()
         assert body["skills"] == {"items": [{"skill_id": "cognis-task-manager", "enabled": True}]}
         assert body["llm_config"]["reasoning_effort"] == "high"
+
+
+def test_system_agent_update_accepts_tool_and_permission_overrides(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        update = client.put(
+            "/api/v1/agents/system:implement",
+            headers=headers,
+            json={
+                "tools": {
+                    "delegation_tools": True,
+                    "disabled_mcp_servers": ["local_mcp:mcp-arr"],
+                    "disabled_tools": ["mcp:mcp-arr:arr_status"],
+                },
+                "permissions": {
+                    "tool_permissions": {
+                        "mcp:mcp-arr:arr_search_all": "allow",
+                    },
+                    "can_delegate": True,
+                    "max_delegation_depth": 3,
+                },
+            },
+        )
+
+        assert update.status_code == 200
+        body = update.json()
+        assert body["has_overrides"] is True
+        assert body["tools"]["disabled_mcp_servers"] == ["local_mcp:mcp-arr"]
+        assert body["tools"]["disabled_tools"] == ["mcp:mcp-arr:arr_status"]
+        assert body["permissions"]["tool_permissions"] == {"mcp:mcp-arr:arr_search_all": "allow"}
+
+        detail = client.get("/api/v1/agents/system:implement", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["tools"]["disabled_mcp_servers"] == ["local_mcp:mcp-arr"]
+        assert detail.json()["permissions"]["tool_permissions"] == {
+            "mcp:mcp-arr:arr_search_all": "allow"
+        }

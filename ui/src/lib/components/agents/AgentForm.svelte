@@ -18,6 +18,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     formStateToSystemOverridePayload,
     slugify,
     type AdditionalExecutorEntry,
+    type AgentRuntimeProfileFormState,
     type AgentFormState
   } from '$lib/agents';
   import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
@@ -90,6 +91,14 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   function canEditField(field: string): boolean {
     if (!isSystemAsset) return !readonly;
     return editableFieldSet.has(field);
+  }
+
+  function canEditTools(): boolean {
+    return canEditField('tools');
+  }
+
+  function canEditPermissions(): boolean {
+    return canEditField('permissions');
   }
 
   function handleAvatarAccept(imageId: string, avatarUrl: string) {
@@ -269,6 +278,23 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     if (!form.name.trim()) {
       errors.name = 'Name is required.';
     }
+    const seenProfileIds = new Set<string>();
+    for (const profile of form.agentProfiles) {
+      const profileId = profile.profileId.trim();
+      if (!profileId) {
+        errors.agentProfiles = 'Each runtime profile needs a profile ID.';
+        break;
+      }
+      if (profileId.includes('/')) {
+        errors.agentProfiles = 'Runtime profile IDs must not contain "/".';
+        break;
+      }
+      if (seenProfileIds.has(profileId)) {
+        errors.agentProfiles = `Runtime profile ID "${profileId}" is duplicated.`;
+        break;
+      }
+      seenProfileIds.add(profileId);
+    }
     const stepJsonError = validateJson(form.stepAgentOverridesJson, 'Step agent overrides');
     if (stepJsonError) {
       errors.stepAgentOverridesJson = stepJsonError;
@@ -369,12 +395,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     form.systemPrompt = defaultSystemPrompt(form.name);
   }
 
-  /** Get models configured on the currently selected provider */
-  function selectedProviderModels(): string[] {
-    if (!form.providerId) {
+  function modelsForProvider(providerId: string): string[] {
+    if (!providerId) {
       return [];
     }
-    const provider = providers.find((p: LLMProvider) => p.provider_id === form.providerId);
+    const provider = providers.find((p: LLMProvider) => p.provider_id === providerId);
     if (!provider) {
       return [];
     }
@@ -392,15 +417,20 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     return models;
   }
 
-  function selectedProviderModelInfo(): ModelEntry | null {
-    if (!form.providerId) {
+  /** Get models configured on the currently selected provider */
+  function selectedProviderModels(): string[] {
+    return modelsForProvider(form.providerId);
+  }
+
+  function modelInfoForProvider(providerId: string, modelId: string): ModelEntry | null {
+    if (!providerId) {
       return null;
     }
-    const provider = providers.find((p: LLMProvider) => p.provider_id === form.providerId);
+    const provider = providers.find((p: LLMProvider) => p.provider_id === providerId);
     if (!provider) {
       return null;
     }
-    const explicitModel = form.model.trim();
+    const explicitModel = modelId.trim();
     const defaultModel = typeof provider.config?.default_model === 'string' ? provider.config.default_model : '';
     const resolvedModel = explicitModel || defaultModel;
     if (!resolvedModel) {
@@ -409,12 +439,62 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     return provider.models.find((model: ModelEntry) => model.model_id === resolvedModel) ?? null;
   }
 
+  function selectedProviderModelInfo(): ModelEntry | null {
+    return modelInfoForProvider(form.providerId, form.model);
+  }
+
   function availableThinkingEfforts(): string[] {
     const modelInfo = selectedProviderModelInfo();
     if (modelInfo) {
       return modelInfo.reasoning_efforts.length > 0 ? modelInfo.reasoning_efforts : ['default'];
     }
     return [...GENERIC_THINKING_EFFORTS];
+  }
+
+  function availableThinkingEffortsForProfile(profile: AgentRuntimeProfileFormState): string[] {
+    const modelInfo = modelInfoForProvider(profile.providerId, profile.model);
+    if (modelInfo) {
+      return modelInfo.reasoning_efforts.length > 0 ? modelInfo.reasoning_efforts : ['default'];
+    }
+    return [...GENERIC_THINKING_EFFORTS];
+  }
+
+  function addRuntimeProfile(): void {
+    const existing = new Set(
+      form.agentProfiles.map((profile: AgentRuntimeProfileFormState) => profile.profileId)
+    );
+    let base = 'fast';
+    if (existing.has(base)) {
+      base = 'profile';
+    }
+    let profileId = base;
+    let suffix = 2;
+    while (existing.has(profileId)) {
+      profileId = `${base}-${suffix}`;
+      suffix += 1;
+    }
+    const nextProfile: AgentRuntimeProfileFormState = {
+      profileId,
+      description: '',
+      providerId: '',
+      model: '',
+      reasoningEffort: '',
+      systemPromptExtra: '',
+      enabled: true
+    };
+    form.agentProfiles = [...form.agentProfiles, nextProfile];
+    if (!form.defaultAgentProfileId) {
+      form.defaultAgentProfileId = profileId;
+    }
+  }
+
+  function removeRuntimeProfile(profileId: string): void {
+    form.agentProfiles = form.agentProfiles.filter(
+      (profile: AgentRuntimeProfileFormState) => profile.profileId !== profileId
+    );
+    if (form.defaultAgentProfileId === profileId) {
+      form.defaultAgentProfileId = form.agentProfiles[0]?.profileId ?? '';
+    }
   }
 </script>
 
@@ -741,7 +821,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                   type="button"
                   class="px-3 py-1.5 rounded-lg text-sm border transition-colors {disabled ? 'bg-slate-900 border-slate-700 text-slate-400' : 'bg-emerald-500/15 border-emerald-500/40 text-emerald-200'}"
                   onclick={() => toggleCategory(category)}
-                  disabled={readonly}
+                  disabled={!canEditTools()}
                 >
                   {category}
                   <span class="ml-1 text-xs opacity-60">({toolsForCategory(category).length})</span>
@@ -763,7 +843,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     {#each categoryTools as tool}
                       <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm">
                         <label class="flex items-center gap-3 text-slate-200">
-                          <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={readonly || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
+                          <input type="checkbox" checked={!toolDisabled(toolKey(tool))} onchange={() => toggleTool(toolKey(tool))} disabled={!canEditTools() || categoryDisabled(category)} class="h-4 w-4 rounded border-slate-600 bg-slate-950" />
                           <span class="font-mono">{tool.source?.type === 'skill' && tool.source?.raw_tool_name ? tool.source.raw_tool_name : tool.name}</span>
                         </label>
                         <span class="text-xs text-slate-500">
@@ -774,7 +854,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                             </span>
                           {/if}
                         </span>
-                        <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
+                        <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={!canEditPermissions() || toolDisabled(toolKey(tool)) || categoryDisabled(category)}>
                           {#each permissionOptions as option}
                             <option value={option}>{option || 'inherit'}</option>
                           {/each}
@@ -807,7 +887,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                             type="checkbox"
                             checked={!serverDisabled}
                             onchange={() => toggleMcpServer(group)}
-                            disabled={readonly || categoryDisabled('mcp')}
+                            disabled={!canEditTools()}
                             class="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-950"
                           />
                           <span>
@@ -823,7 +903,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                                   type="checkbox"
                                   checked={!toolDisabled(toolKey(tool))}
                                   onchange={() => toggleTool(toolKey(tool))}
-                                  disabled={readonly || serverDisabled || categoryDisabled('mcp')}
+                                  disabled={!canEditTools() || serverDisabled}
                                   class="h-4 w-4 rounded border-slate-600 bg-slate-950"
                                 />
                                 <span class="font-mono">{tool.source?.raw_tool_name || tool.name}</span>
@@ -836,7 +916,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                                   </span>
                                 {/if}
                               </span>
-                              <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={readonly || serverDisabled || toolDisabled(toolKey(tool)) || categoryDisabled('mcp')}>
+                              <select bind:value={form.toolPermissions[toolKey(tool)]} class="w-32 rounded-lg border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100" disabled={!canEditPermissions() || serverDisabled || toolDisabled(toolKey(tool))}>
                                 {#each permissionOptions as option}
                                   <option value={option}>{option || 'inherit'}</option>
                                 {/each}
@@ -1001,9 +1081,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 <button
                   type="button"
                   class="px-3 py-1.5 rounded-lg text-sm border transition-colors {selected ? 'bg-sky-500/20 border-sky-500/50 text-sky-300' : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600'}"
-                  disabled={readonly}
+                  disabled={!canEditTools()}
                   onclick={() => {
-                    if (readonly) return;
+                    if (!canEditTools()) return;
                     const current = form.intarisMcpServers || [];
                     if (selected) {
                       form.intarisMcpServers = current.filter((n: string) => n !== server.name);
@@ -1082,6 +1162,144 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </label>
         </div>
       </Card>
+
+      {#if !isSystemAsset}
+      <Card class="p-5">
+        <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Runtime profiles</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Per-agent execution profiles</h2>
+            <p class="mt-1 text-sm text-slate-400">
+              Profiles tune provider, model, thinking effort, and an extra prompt snippet for this agent only.
+              They do not change identity, memory scope, ownership, permissions, tools, or workflow step profiles.
+            </p>
+          </div>
+          <Button type="button" variant="secondary" disabled={readonly} onclick={addRuntimeProfile}>Add profile</Button>
+        </div>
+
+        {#if form.agentProfiles.length > 0}
+          <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+            <span>Default runtime profile</span>
+            <select
+              bind:value={form.defaultAgentProfileId}
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              disabled={readonly}
+            >
+              {#each form.agentProfiles as profile}
+                {#if profile.profileId.trim()}
+                  <option value={profile.profileId}>{profile.profileId}</option>
+                {/if}
+              {/each}
+            </select>
+            <span class="block text-xs text-slate-400">Used when no explicit <code>agent_profile_id</code> is requested.</span>
+          </label>
+
+          <div class="mt-5 space-y-4">
+            {#each form.agentProfiles as profile, index (index)}
+              <div class="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <p class="text-sm font-semibold text-slate-100">{profile.profileId || 'New profile'}</p>
+                    <p class="mt-1 text-xs text-slate-500">Canonical audit keeps <code>agent_id</code> and <code>agent_profile_id</code> as separate fields.</p>
+                  </div>
+                  <div class="flex items-center gap-3">
+                    <label class="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        bind:checked={profile.enabled}
+                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        disabled={readonly}
+                      />
+                      Enabled
+                    </label>
+                    <Button type="button" variant="ghost" disabled={readonly} onclick={() => removeRuntimeProfile(profile.profileId)}>Remove</Button>
+                  </div>
+                </div>
+
+                <div class="mt-4 grid gap-4 md:grid-cols-2">
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Profile ID</span>
+                    <Input bind:value={profile.profileId} placeholder="fast" disabled={readonly} />
+                    <span class="block text-xs text-slate-400">Agent-local ID used as <code>agent_profile_id</code>; do not include <code>/</code>.</span>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Description / routing guidance</span>
+                    <Input bind:value={profile.description} placeholder="Low-latency responses for simple tasks" disabled={readonly} />
+                    <span class="block text-xs text-slate-400">Used later by automatic routing to choose this profile.</span>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Provider</span>
+                    <select
+                      bind:value={profile.providerId}
+                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      disabled={readonly}
+                    >
+                      <option value="">Use agent/default provider</option>
+                      {#each providers as provider}
+                        <option value={provider.provider_id}>{provider.display_name}{provider.is_default ? ' ⭐' : ''}</option>
+                      {/each}
+                    </select>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Model</span>
+                    {#if modelsForProvider(profile.providerId).length > 0}
+                      <select
+                        bind:value={profile.model}
+                        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        disabled={readonly}
+                      >
+                        <option value="">Use provider/agent default</option>
+                        {#each modelsForProvider(profile.providerId) as modelId}
+                          <option value={modelId}>{modelId}</option>
+                        {/each}
+                      </select>
+                    {:else}
+                      <Input bind:value={profile.model} placeholder="Use provider/agent default" disabled={readonly} />
+                    {/if}
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Thinking effort</span>
+                    <select
+                      bind:value={profile.reasoningEffort}
+                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      disabled={readonly}
+                    >
+                      <option value="">Default</option>
+                      {#each availableThinkingEffortsForProfile(profile).filter((value: string) => value !== 'default') as value}
+                        <option value={value}>{thinkingEffortLabel(value)}</option>
+                      {/each}
+                    </select>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
+                    <span>System prompt extra</span>
+                    <textarea
+                      bind:value={profile.systemPromptExtra}
+                      class="min-h-28 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      placeholder="Extra behavior tuning injected only when this profile is active."
+                      disabled={readonly}
+                    ></textarea>
+                    <span class="block text-xs text-slate-400">This snippet tunes runtime behavior only; it must not redefine identity, memory scope, ownership, permissions, or tool rights.</span>
+                  </label>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="mt-4 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-400">
+            No explicit runtime profiles. The agent will use the safe default derived from its base LLM configuration.
+          </div>
+        {/if}
+
+        {#if errors.agentProfiles}
+          <p class="mt-3 text-sm text-rose-300">{errors.agentProfiles}</p>
+        {/if}
+      </Card>
+      {/if}
 
       <!-- Secondary Agent Bindings (primary only) -->
       {#if form.agentType === 'primary' && !readonly && secondaryAgents.length > 0}
