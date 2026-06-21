@@ -69,6 +69,7 @@ from cognis.core.followups import (
     truncate_follow_up_text,
 )
 from cognis.core.long_lived_chat import is_long_lived_chat_context
+from cognis.core.runtime_metadata import assistant_message_runtime_metadata
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
 from cognis.core.tool_output_presentation import build_transport_tool_output_preview
 from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
@@ -273,6 +274,7 @@ class TurnResult:
     partial: bool = False
     finish_reason: str | None = None
     managed_continuation_pending: bool = False
+    runtime: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -1139,6 +1141,10 @@ class TurnScheduler:
             data={
                 "content": stream.content,
                 "turn_id": turn_id,
+                "runtime": assistant_message_runtime_metadata(
+                    agent,
+                    self._session_cache.get_tool_runtime_info(session.session_id) or {},
+                ),
                 "partial": True,
                 "cancelled": True,
                 "finish_reason": "user_cancelled",
@@ -3057,6 +3063,10 @@ class TurnScheduler:
                     last_seq = cached.last_event_seq
 
             context_usage = self._session_cache.get_context_usage(session.session_id)
+            runtime = assistant_message_runtime_metadata(
+                agent,
+                self._session_cache.get_tool_runtime_info(session.session_id) or {},
+            )
 
             await self._adopt_late_intaris_title(conversation, session)
             latest_title = await self._load_visible_conversation_title(
@@ -3111,6 +3121,7 @@ class TurnScheduler:
                 chat_mode=resolved_chat_mode.mode,
                 chat_mode_source=resolved_chat_mode.source,
                 managed_continuation_pending=queued_continuation_pending,
+                runtime=runtime,
             )
             turn_control.settled = True
             await self._publish_turn_completed(result, turn_observers=turn_observers)
@@ -3170,6 +3181,10 @@ class TurnScheduler:
                     chat_mode_source=resolved_chat_mode.source,
                     partial=True,
                     finish_reason="user_cancelled",
+                    runtime=assistant_message_runtime_metadata(
+                        agent,
+                        self._session_cache.get_tool_runtime_info(session.session_id) or {},
+                    ),
                 )
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
             error = TurnError(

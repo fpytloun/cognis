@@ -66,6 +66,25 @@ class User(Base):
     disabled_by: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
+class UserUiState(Base):
+    """Per-user UI state persisted by the web application."""
+
+    __tablename__ = "user_ui_state"
+    __table_args__ = (Index("ix_user_ui_state_user_email", "user_email"),)
+
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class ApiKey(Base):
     """API keys for programmatic access."""
 

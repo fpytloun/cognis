@@ -128,7 +128,7 @@ async def resolve_notification(
     ):
         raise HTTPException(
             status_code=400,
-            detail="OAuth authorization challenges are completed by callback only",
+            detail="OAuth authorization challenges are completed by the provider authorization flow",
         )
 
     if notification.notification_type == "step_question" and notification.task_id is None:

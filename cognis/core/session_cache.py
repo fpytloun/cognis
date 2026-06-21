@@ -862,6 +862,12 @@ class SessionCache:
         max_input_tokens: int | None = None,
         available_prompt_tokens: int | None = None,
         provider_id: str | None = None,
+        reasoning_effort: str | None = None,
+        agent_id: str | None = None,
+        agent_profile_id: str | None = None,
+        requested_agent_profile_id: str | None = None,
+        agent_profile_source: str | None = None,
+        agent_profile_synthetic: bool | None = None,
         reserve_output_tokens: int | None = None,
         effective_reserve_output_tokens: int | None = None,
         compaction_threshold: float | None = None,
@@ -879,6 +885,21 @@ class SessionCache:
                 entry.available_prompt_tokens = available_prompt_tokens
             entry.context_model = model
             entry.context_provider_id = provider_id
+            runtime_metadata = {
+                "reasoning_effort": reasoning_effort,
+                "agent_id": agent_id,
+                "agent_profile_id": agent_profile_id,
+                "requested_agent_profile_id": requested_agent_profile_id,
+                "agent_profile_source": agent_profile_source,
+                "agent_profile_synthetic": (
+                    bool(agent_profile_synthetic) if agent_profile_synthetic is not None else None
+                ),
+            }
+            for key, value in runtime_metadata.items():
+                if value is None:
+                    entry.context_metadata.pop(key, None)
+                else:
+                    entry.context_metadata[key] = value
             if reserve_output_tokens is not None:
                 entry.reserve_output_tokens = reserve_output_tokens
             if effective_reserve_output_tokens is not None:
@@ -911,7 +932,14 @@ class SessionCache:
             "percentage": round(entry.last_prompt_tokens / entry.max_context_tokens * 100, 1),
             "model": entry.context_model,
             "provider_id": entry.context_provider_id,
-            "reasoning_effort": entry.reasoning_effort_override,
+            "reasoning_effort": entry.context_metadata.get(
+                "reasoning_effort", entry.reasoning_effort_override
+            ),
+            "agent_id": entry.context_metadata.get("agent_id"),
+            "agent_profile_id": entry.context_metadata.get("agent_profile_id"),
+            "requested_agent_profile_id": entry.context_metadata.get("requested_agent_profile_id"),
+            "agent_profile_source": entry.context_metadata.get("agent_profile_source"),
+            "agent_profile_synthetic": entry.context_metadata.get("agent_profile_synthetic"),
             "reserve_output_tokens": entry.reserve_output_tokens,
             "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
             "reserve_output_tokens_clamped": (

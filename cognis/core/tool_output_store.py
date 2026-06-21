@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
@@ -114,6 +115,54 @@ def _parse_inline_anchors(content: str) -> list[OutputAnchor]:
             )
         )
     return anchors
+
+
+def _augment_with_markdown_heading_anchors(
+    content: str,
+    anchors: list[OutputAnchor],
+) -> list[OutputAnchor]:
+    """Add Markdown heading anchors to stored output anchor metadata."""
+
+    heading_anchors = markdown_heading_anchors(
+        content,
+        existing_anchors=[
+            {
+                "anchor": item.anchor,
+                "label": item.label,
+                "kind": item.kind,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+            }
+            for item in anchors
+        ],
+    )
+    if not heading_anchors:
+        return anchors
+    result = list(anchors)
+    for item in heading_anchors:
+        anchor = item.get("anchor")
+        kind = item.get("kind")
+        start_line = item.get("start_line")
+        end_line = item.get("end_line")
+        if (
+            not isinstance(anchor, str)
+            or not isinstance(kind, str)
+            or not isinstance(start_line, int)
+            or not isinstance(end_line, int)
+        ):
+            continue
+        label = item.get("label")
+        result.append(
+            OutputAnchor(
+                anchor=anchor,
+                label=label if isinstance(label, str) else None,
+                kind=kind,
+                start_line=start_line,
+                end_line=end_line,
+                artifact_candidate=None,
+            )
+        )
+    return result
 
 
 def _anchor_kind(anchor: str) -> str:
@@ -651,7 +700,7 @@ class ToolOutputStore:
             return None
         raw = await self._backend.load_anchors(call_id)
         if raw is None:
-            return _parse_inline_anchors(content)
+            return _augment_with_markdown_heading_anchors(content, _parse_inline_anchors(content))
         anchors: list[OutputAnchor] = []
         for item in raw:
             if not isinstance(item, dict):
@@ -677,7 +726,9 @@ class ToolOutputStore:
                     else None,
                 )
             )
-        return anchors or _parse_inline_anchors(content)
+        if not anchors:
+            anchors = _parse_inline_anchors(content)
+        return _augment_with_markdown_heading_anchors(content, anchors)
 
     async def read_anchor(
         self,

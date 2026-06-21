@@ -65,6 +65,7 @@ from cognis.store.models import (
     ToolClassificationRow,
     TtsCacheRow,
     User,
+    UserUiState,
     WorkflowRow,
 )
 
@@ -112,6 +113,40 @@ def _agent_direct_clause(user_email: str, agent_id: str) -> sa.ColumnElement[boo
             Conversation.context_data["kind"].as_string() == "agent_direct",
         ),
     )
+
+
+def _conversation_list_filters(
+    user_email: str,
+    *,
+    context_type: str | None = None,
+    agent_id: str | None = None,
+    status: str = "active",
+    project_id: str | None = None,
+    include_agent_direct: bool = True,
+) -> list[Any]:
+    filters: list[Any] = [Conversation.user_email == user_email]
+    if status == "active":
+        filters.append(Conversation.status == "active")
+    elif status == "archived":
+        filters.append(Conversation.status == "archived")
+    elif status == "starred":
+        filters.extend(
+            [
+                Conversation.starred_at.is_not(None),
+                Conversation.status == "active",
+            ]
+        )
+    elif status != "all":
+        raise ValueError(f"Unsupported conversation status filter: {status}")
+    if context_type is not None:
+        filters.append(Conversation.context_type == context_type)
+    if agent_id is not None:
+        filters.append(Conversation.agent_id == agent_id)
+    if project_id is not None:
+        filters.append(Conversation.project_id == project_id)
+    if not include_agent_direct:
+        filters.append(_exclude_agent_direct_clause())
+    return filters
 
 
 def tool_classification_scope(owner_email: str | None) -> str:
@@ -465,6 +500,88 @@ async def touch_browser_session(
         session_row.expires_at = expires_at
     await session.flush()
     return session_row
+
+
+# --- User UI state ---
+
+
+async def get_user_ui_state(
+    session: AsyncSession,
+    user_email: str,
+    key: str,
+) -> UserUiState | None:
+    result = await session.execute(
+        select(UserUiState).where(
+            UserUiState.user_email == user_email,
+            UserUiState.key == key,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_user_ui_state_value(
+    session: AsyncSession,
+    user_email: str,
+    key: str,
+) -> dict[str, Any] | None:
+    row = await get_user_ui_state(session, user_email, key)
+    return dict(row.value or {}) if row is not None else None
+
+
+async def upsert_user_ui_state(
+    session: AsyncSession,
+    user_email: str,
+    key: str,
+    value: dict[str, Any] | None,
+) -> UserUiState:
+    now = _utcnow()
+    normalized_value = dict(value or {})
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name in {"postgresql", "sqlite"}:
+        if dialect_name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+
+        stmt = (
+            insert(UserUiState)
+            .values(
+                user_email=user_email,
+                key=key,
+                value=normalized_value,
+                created_at=now,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["user_email", "key"],
+                set_={
+                    "value": normalized_value,
+                    "updated_at": now,
+                },
+            )
+            .returning(UserUiState)
+        )
+        result = await session.execute(stmt)
+        row = result.scalar_one()
+        await session.flush()
+        return row
+
+    existing = await get_user_ui_state(session, user_email, key)
+    if existing is not None:
+        existing.value = normalized_value
+        existing.updated_at = now
+        await session.flush()
+        return existing
+    row = UserUiState(
+        user_email=user_email,
+        key=key,
+        value=normalized_value,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(row)
+    await session.flush()
+    return row
 
 
 # --- Settings ---
@@ -1417,46 +1534,97 @@ async def list_conversations(
     status: str = "active",
     project_id: str | None = None,
     include_agent_direct: bool = True,
+    cursor_id: str | None = None,
+    limit: int | None = None,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
 
     Ordered by the latest accepted conversation activity. Conversations with
     no messages fall back to creation time and deterministic ID ordering.
+    When ``cursor_id`` and ``limit`` are provided, pagination is applied in SQL
+    before hydration so callers can avoid loading the full conversation set.
     """
     ordering_activity = sa.func.coalesce(
         Conversation.last_message_at,
         Conversation.created_at,
     )
+    filters = _conversation_list_filters(
+        user_email,
+        context_type=context_type,
+        agent_id=agent_id,
+        status=status,
+        project_id=project_id,
+        include_agent_direct=include_agent_direct,
+    )
     query = (
         select(Conversation)
-        .where(Conversation.user_email == user_email)
+        .where(*filters)
         .order_by(
             ordering_activity.desc(),
             Conversation.created_at.desc(),
             Conversation.conversation_id.asc(),
         )
     )
-    if status == "active":
-        query = query.where(Conversation.status == "active")
-    elif status == "archived":
-        query = query.where(Conversation.status == "archived")
-    elif status == "starred":
-        query = query.where(
-            Conversation.starred_at.is_not(None),
-            Conversation.status == "active",
+
+    if cursor_id:
+        cursor_result = await session.execute(
+            select(
+                Conversation.conversation_id,
+                ordering_activity.label("ordering_activity"),
+                Conversation.created_at,
+            ).where(*filters, Conversation.conversation_id == cursor_id)
         )
-    elif status != "all":
-        raise ValueError(f"Unsupported conversation status filter: {status}")
-    if context_type is not None:
-        query = query.where(Conversation.context_type == context_type)
-    if agent_id is not None:
-        query = query.where(Conversation.agent_id == agent_id)
-    if project_id is not None:
-        query = query.where(Conversation.project_id == project_id)
-    if not include_agent_direct:
-        query = query.where(_exclude_agent_direct_clause())
+        cursor_row = cursor_result.one_or_none()
+        if cursor_row is not None:
+            _cursor_id, cursor_activity, cursor_created_at = cursor_row
+            query = query.where(
+                sa.or_(
+                    ordering_activity < cursor_activity,
+                    sa.and_(
+                        ordering_activity == cursor_activity,
+                        Conversation.created_at < cursor_created_at,
+                    ),
+                    sa.and_(
+                        ordering_activity == cursor_activity,
+                        Conversation.created_at == cursor_created_at,
+                        Conversation.conversation_id > cursor_id,
+                    ),
+                )
+            )
+
+    if limit is not None:
+        query = query.limit(limit)
+
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_conversation_context_types(
+    session: AsyncSession,
+    user_email: str,
+    *,
+    status: str = "active",
+    include_agent_direct: bool = False,
+) -> list[str]:
+    """Return distinct conversation context types for sidebar filter projection."""
+
+    filters = _conversation_list_filters(
+        user_email,
+        status=status,
+        include_agent_direct=include_agent_direct,
+    )
+
+    result = await session.execute(
+        select(Conversation.context_type)
+        .where(*filters)
+        .distinct()
+        .order_by(Conversation.context_type.asc())
+    )
+    return [
+        str(context_type).lower()
+        for context_type in result.scalars().all()
+        if context_type is not None
+    ]
 
 
 async def list_sessions_by_ids(
@@ -1669,6 +1837,85 @@ async def list_managed_conversation_links(
     ).limit(max(1, min(limit, 100)))
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_inactive_managed_conversation_links(
+    session: AsyncSession,
+    *,
+    older_than: datetime,
+    limit: int = 100,
+) -> list[ManagedConversationLink]:
+    """Return non-closed managed conversation links inactive before ``older_than``."""
+
+    capped_limit = max(1, min(int(limit), 1000))
+    result = await session.execute(
+        select(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.conversation_state != "closed",
+            ManagedConversationLink.updated_at < older_than,
+        )
+        .order_by(ManagedConversationLink.updated_at.asc())
+        .limit(capped_limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_inactive_managed_conversation_link(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    older_than: datetime,
+) -> ManagedConversationLink | None:
+    """Return one non-closed inactive managed conversation link if still stale."""
+
+    result = await session.execute(
+        select(ManagedConversationLink).where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.conversation_state != "closed",
+            ManagedConversationLink.updated_at < older_than,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def close_managed_conversation_link_for_retention(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    reason: str,
+    closed_at: datetime | None = None,
+    older_than: datetime | None = None,
+    expected_active_turn_id: str | None = None,
+) -> ManagedConversationLink | None:
+    """Close a managed conversation link during retention cleanup."""
+
+    row = await get_managed_conversation_link(session, link_id)
+    if row is None or row.conversation_state == "closed":
+        return row
+    if older_than is not None:
+        row_updated_at = row.updated_at
+        if row_updated_at.tzinfo is None:
+            row_updated_at = row_updated_at.replace(tzinfo=UTC)
+        cutoff = older_than
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=UTC)
+        if row_updated_at >= cutoff:
+            return None
+    if expected_active_turn_id is not None and row.active_turn_id not in {
+        None,
+        expected_active_turn_id,
+    }:
+        return None
+    now = closed_at or datetime.now(UTC)
+    row.conversation_state = "closed"
+    row.turn_state = "idle"
+    row.active_turn_id = None
+    row.notify_on_completion = False
+    row.last_error = reason
+    row.closed_at = now
+    row.updated_at = now
+    await session.flush()
+    return row
 
 
 async def update_managed_conversation_link(
@@ -5096,6 +5343,24 @@ async def get_mcp_oauth_transaction(
     transaction_id: str,
 ) -> MCPOAuthTransactionRow | None:
     return await session.get(MCPOAuthTransactionRow, transaction_id)
+
+
+async def list_pending_mcp_oauth_transactions(
+    session: AsyncSession,
+    *,
+    user_email: str | None = None,
+    mcp_server_id: str | None = None,
+) -> list[MCPOAuthTransactionRow]:
+    stmt = select(MCPOAuthTransactionRow).where(
+        MCPOAuthTransactionRow.status == "pending",
+        MCPOAuthTransactionRow.expires_at > _utcnow(),
+    )
+    if user_email is not None:
+        stmt = stmt.where(MCPOAuthTransactionRow.user_email == user_email)
+    if mcp_server_id is not None:
+        stmt = stmt.where(MCPOAuthTransactionRow.mcp_server_id == mcp_server_id)
+    result = await session.execute(stmt.order_by(MCPOAuthTransactionRow.created_at.desc()))
+    return list(result.scalars().all())
 
 
 async def create_mcp_oauth_transaction(

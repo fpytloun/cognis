@@ -204,12 +204,18 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
             items.append(
                 {
                     "role": role,
-                    "content": _normalize_message_content(content),
+                    "content": _normalize_message_content(
+                        content,
+                        allow_native_attachments=role == "user",
+                    ),
                 }
             )
             continue
         if role == "assistant":
-            normalized_content = _normalize_message_content(content)
+            normalized_content = _normalize_message_content(
+                content,
+                allow_native_attachments=False,
+            )
             if normalized_content not in (None, "", []):
                 items.append({"role": "assistant", "content": normalized_content})
             for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
@@ -287,7 +293,15 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                     },
                 )
             continue
-        items.append({"role": role, "content": _normalize_message_content(content)})
+        items.append(
+            {
+                "role": role,
+                "content": _normalize_message_content(
+                    content,
+                    allow_native_attachments=role == "user",
+                ),
+            }
+        )
     return items
 
 
@@ -491,6 +505,7 @@ async def responses_stream_to_chat_chunks(
     """Normalize Responses streaming events into chat-like delta chunks."""
 
     state = _ResponsesStreamState()
+    last_error_event_details: dict[str, Any] | None = None
     try:
         async for raw_event in stream:
             event = _to_dict(raw_event)
@@ -753,8 +768,18 @@ async def responses_stream_to_chat_chunks(
                     "response_instructions": response_payload.get("instructions"),
                 }
                 continue
+            if event_type == "error":
+                last_error_event_details = _response_error_event_details(event)
+                yield provider_liveness_chunk
+                continue
             if event_type == "response.failed":
                 failure_details = _response_failure_details(event)
+                if last_error_event_details:
+                    failure_details = _merge_prior_error_event_details(
+                        failure_details,
+                        last_error_event_details,
+                    )
+                    last_error_event_details = None
                 failure_payload = classify_response_failure(failure_details)
                 message = failure_details.get("message")
                 logger.warning(
@@ -803,6 +828,36 @@ def _response_failure_details(event: dict[str, Any]) -> dict[str, Any]:
     if "details" in error:
         details["details"] = _truncate_response_failure_value(error.get("details"))
     return {key: value for key, value in details.items() if value not in (None, "")}
+
+
+def _response_error_event_details(event: dict[str, Any]) -> dict[str, Any]:
+    """Return safe details from a raw Responses ``error`` stream event."""
+
+    details = _response_failure_details(event)
+    for key in ("code", "message", "param"):
+        if key in event and key not in details:
+            details[key] = _truncate_response_failure_value(event.get(key))
+    error_type = event.get("error_type")
+    if error_type is not None and "type" not in details:
+        details["type"] = _truncate_response_failure_value(error_type)
+    event_details = event.get("details")
+    if event_details is not None and "details" not in details:
+        details["details"] = _truncate_response_failure_value(event_details)
+    return {key: value for key, value in details.items() if value not in (None, "")}
+
+
+def _merge_prior_error_event_details(
+    failure_details: dict[str, Any],
+    prior_error_details: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach the preceding raw ``error`` event to a later ``response.failed`` event."""
+
+    merged = dict(failure_details)
+    for key in ("type", "code", "message", "param", "details", "response_id", "response_status"):
+        if key not in merged and key in prior_error_details:
+            merged[key] = prior_error_details[key]
+    merged["previous_error_event"] = dict(prior_error_details)
+    return merged
 
 
 class _ResponsesStreamState:
@@ -1608,17 +1663,51 @@ def _extract_text_value(value: Any) -> str:
     return ""
 
 
-def _normalize_message_content(content: Any) -> Any:
+def _non_user_attachment_content_text(part: dict[str, Any]) -> str:
+    part_type = str(part.get("type") or "")
+    if part_type in {"input_image", "image_url"}:
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        if isinstance(image_url, str) and image_url:
+            return f"[Image attachment omitted from non-user message: {image_url}]"
+        return "[Image attachment omitted from non-user message.]"
+    if part_type in {"input_file", "file"}:
+        file_url = part.get("file_url")
+        file_id = part.get("file_id")
+        filename = part.get("filename")
+        file_data = part.get("file")
+        if isinstance(file_data, dict):
+            file_url = file_data.get("file_url", file_url)
+            file_id = file_data.get("file_id", file_id)
+            filename = file_data.get("filename", filename)
+        refs = [
+            str(value)
+            for value in (filename, file_id, file_url)
+            if isinstance(value, str) and value
+        ]
+        if refs:
+            return "[File attachment omitted from non-user message: " + ", ".join(refs) + "]"
+        return "[File attachment omitted from non-user message.]"
+    return "[Attachment omitted from non-user message.]"
+
+
+def _normalize_message_content(content: Any, *, allow_native_attachments: bool = True) -> Any:
     if isinstance(content, list):
         normalized: list[dict[str, Any]] = []
         for part in content:
             if not isinstance(part, dict):
                 continue
             part_type = str(part.get("type") or "")
-            if part_type in {"input_text", "input_image"}:
+            if part_type == "input_text":
                 normalized.append(part)
                 continue
             if part_type == "input_file":
+                if not allow_native_attachments:
+                    normalized.append(
+                        {"type": "input_text", "text": _non_user_attachment_content_text(part)}
+                    )
+                    continue
                 item = {"type": "input_file"}
                 if isinstance(part.get("file_id"), str) and part["file_id"]:
                     item["file_id"] = part["file_id"]
@@ -1627,10 +1716,23 @@ def _normalize_message_content(content: Any) -> Any:
                 if len(item) > 1:
                     normalized.append(item)
                 continue
+            if part_type == "input_image":
+                if allow_native_attachments:
+                    normalized.append(part)
+                else:
+                    normalized.append(
+                        {"type": "input_text", "text": _non_user_attachment_content_text(part)}
+                    )
+                continue
             if part_type == "text":
                 normalized.append({"type": "input_text", "text": str(part.get("text") or "")})
                 continue
             if part_type == "image_url":
+                if not allow_native_attachments:
+                    normalized.append(
+                        {"type": "input_text", "text": _non_user_attachment_content_text(part)}
+                    )
+                    continue
                 image_url = part.get("image_url")
                 detail = part.get("detail")
                 if isinstance(image_url, dict):
@@ -1645,6 +1747,11 @@ def _normalize_message_content(content: Any) -> Any:
                     normalized.append(item)
                 continue
             if part_type == "file":
+                if not allow_native_attachments:
+                    normalized.append(
+                        {"type": "input_text", "text": _non_user_attachment_content_text(part)}
+                    )
+                    continue
                 file_data = part.get("file")
                 if isinstance(file_data, dict):
                     item = {"type": "input_file"}

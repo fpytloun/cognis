@@ -30,6 +30,7 @@ VALID_MESSAGE_PROJECTION_POLICIES = frozenset(
 _TURN_CONTROLLER_AUDIT_SOURCES = frozenset(
     {
         "follow_up_boundary",
+        "current_turn_system_message",
     }
 )
 

@@ -11,6 +11,7 @@ class MidStreamErrorCategory(StrEnum):
     """Stable categories for provider stream failures."""
 
     RATE_LIMIT = "rate_limit"
+    QUOTA_EXHAUSTED = "quota_exhausted"
     CONTEXT_OVERFLOW = "context_overflow"
     ARTIFACT_FETCH = "artifact_fetch"
     PROVIDER_5XX = "provider_5xx"
@@ -143,6 +144,8 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.REASONING_SUMMARY_REJECTED
     elif "context" in lowered and any(token in lowered for token in ("window", "length", "token")):
         category = MidStreamErrorCategory.CONTEXT_OVERFLOW
+    elif _looks_like_quota_exhaustion(lowered, code):
+        category = MidStreamErrorCategory.QUOTA_EXHAUSTED
     elif status == 429 or "rate limit" in lowered or "too many requests" in lowered:
         category = MidStreamErrorCategory.RATE_LIMIT
     elif _looks_like_artifact_fetch_error(lowered, param):
@@ -184,6 +187,8 @@ def classify_response_failure(details: dict[str, Any]) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.REASONING_SUMMARY_REJECTED
     elif _looks_like_artifact_fetch_error(lowered, str(param) if param is not None else None):
         category = MidStreamErrorCategory.ARTIFACT_FETCH
+    elif _looks_like_quota_exhaustion(lowered, str(code) if code is not None else None):
+        category = MidStreamErrorCategory.QUOTA_EXHAUSTED
     elif "rate" in lowered and "limit" in lowered:
         category = MidStreamErrorCategory.RATE_LIMIT
     elif any(marker in lowered for marker in ("server_error", "internal_error", "5xx")):
@@ -235,6 +240,22 @@ def _looks_like_artifact_fetch_error(message: str, param: str | None) -> bool:
         param in {"url", "image_url", "file_url"}
         and any(marker in message for marker in ("download", "fetch", "timeout", "timed out"))
     ) or bool("timeout while downloading" in message and "url" in message)
+
+
+def _looks_like_quota_exhaustion(message: str, code: str | None) -> bool:
+    code_text = (code or "").lower()
+    haystack = f"{message} {code_text}"
+    return any(
+        marker in haystack
+        for marker in (
+            "usage_limit_reached",
+            "insufficient_quota",
+            "quota exceeded",
+            "quota_exceeded",
+            "billing hard limit",
+            "exceeded your current quota",
+        )
+    )
 
 
 def _artifact_refs_from_exception(exc: BaseException) -> tuple[list[str], list[str]]:

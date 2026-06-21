@@ -61,6 +61,7 @@ from cognis.models.tool import (
     MCPServerConfig,
     ToolCapability,
     ToolDefinition,
+    ToolSource,
     effective_mcp_auth_config,
     stable_tool_id,
     tool_display_name,
@@ -83,6 +84,11 @@ from cognis.store.queries import (
 )
 from cognis.store.queries import (
     list_mcp_servers as list_global_mcp_servers,
+)
+from cognis.tools.builtin.workflow import (
+    STEP_REQUEST_QUESTIONS_TOOL,
+    STEP_TODO_LIST_TOOL,
+    STEP_TODO_WRITE_TOOL,
 )
 from cognis.tools.classification import resolve_tool_classifications
 from cognis.tools.executor.definitions import executor_tool_definitions
@@ -111,6 +117,69 @@ def _coerce_positive_int(value: object, default: int) -> int:
 
 def _sanitize_mcp_error(error: Exception) -> str:
     return f"{error.__class__.__name__}: {str(error)[:300]}"
+
+
+def _controller_catalog_tools() -> list[ToolDefinition]:
+    """Return core controller tools for catalog display.
+
+    These are not normal assignable executor tools. They are exposed by the
+    agent loop according to context policy, but the catalog should still show
+    their canonical names and chat/workflow aliases.
+    """
+
+    return [
+        ToolDefinition(
+            name=STEP_REQUEST_QUESTIONS_TOOL.name,
+            description=STEP_REQUEST_QUESTIONS_TOOL.description,
+            parameters=STEP_REQUEST_QUESTIONS_TOOL.parameters,
+            source=ToolSource(type="controller"),
+            category="workflow",
+            profile_group="system",
+            read_only=False,
+            configurable=False,
+            canonical_name=STEP_REQUEST_QUESTIONS_TOOL.name,
+            primary_name=STEP_REQUEST_QUESTIONS_TOOL.name,
+            aliases=[{"name": "request_user_input", "surface": "direct_chat"}],
+            surfaces={
+                "workflow_step": STEP_REQUEST_QUESTIONS_TOOL.name,
+                "direct_chat": "request_user_input",
+            },
+        ),
+        ToolDefinition(
+            name=STEP_TODO_WRITE_TOOL.name,
+            description=STEP_TODO_WRITE_TOOL.description,
+            parameters=STEP_TODO_WRITE_TOOL.parameters,
+            source=ToolSource(type="controller"),
+            category="workflow",
+            profile_group="system",
+            read_only=False,
+            configurable=False,
+            canonical_name=STEP_TODO_WRITE_TOOL.name,
+            primary_name=STEP_TODO_WRITE_TOOL.name,
+            aliases=[{"name": "todo_write", "surface": "direct_chat"}],
+            surfaces={
+                "workflow_step": STEP_TODO_WRITE_TOOL.name,
+                "direct_chat": "todo_write",
+            },
+        ),
+        ToolDefinition(
+            name=STEP_TODO_LIST_TOOL.name,
+            description=STEP_TODO_LIST_TOOL.description,
+            parameters=STEP_TODO_LIST_TOOL.parameters,
+            source=ToolSource(type="controller"),
+            category="workflow",
+            profile_group="system",
+            read_only=True,
+            configurable=False,
+            canonical_name=STEP_TODO_LIST_TOOL.name,
+            primary_name=STEP_TODO_LIST_TOOL.name,
+            aliases=[{"name": "todo_list", "surface": "direct_chat"}],
+            surfaces={
+                "workflow_step": STEP_TODO_LIST_TOOL.name,
+                "direct_chat": "todo_list",
+            },
+        ),
+    ]
 
 
 def _mcp_is_shared(row: Any) -> bool:
@@ -161,8 +230,18 @@ async def _discover_local_mcp_tools(
 async def list_tools(request: Request) -> list[ToolResponse]:
     require_current_user(request)
     kb_enabled = bool(getattr(request.app.state, "knowledgebase_enabled", False))
+    controller_tool_names = {
+        STEP_REQUEST_QUESTIONS_TOOL.name,
+        STEP_TODO_WRITE_TOOL.name,
+        STEP_TODO_LIST_TOOL.name,
+    }
+    static_tools = [
+        tool
+        for tool in select_static_tools(knowledgebase_enabled=kb_enabled)
+        if tool.name not in controller_tool_names
+    ]
     tools = await resolve_tool_classifications(
-        select_static_tools(knowledgebase_enabled=kb_enabled),
+        [*_controller_catalog_tools(), *static_tools],
         session_factory=request.app.state.session_factory,
         owner_email=None,
         queue=getattr(request.app.state, "tool_classification_queue", None),

@@ -6,14 +6,17 @@ receive short-lived bearer access tokens injected into MCP HTTP headers.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
@@ -33,6 +36,7 @@ from cognis.store.queries import (
     get_mcp_oauth_token_for_server,
     get_mcp_oauth_transaction,
     get_mcp_server,
+    list_pending_mcp_oauth_transactions,
     mark_mcp_oauth_token_status,
     mcp_oauth_resource_key,
     upsert_mcp_oauth_token,
@@ -46,6 +50,7 @@ _STATE_TTL_SECONDS = 15 * 60
 _MAX_METADATA_BYTES = 128 * 1024
 _REFRESH_SKEW_SECONDS = 60
 _DYNAMIC_CLIENT_NAME = "Cognis MCP"
+_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 _RESERVED_AUTHORIZATION_PARAMS = {
     "client_id",
     "code_challenge",
@@ -81,6 +86,11 @@ class AuthorizationStart:
     issuer: str
     authorization_server: str
     scopes: list[str]
+    flow: str = "authorization_code"
+    verification_uri: str | None = None
+    verification_uri_complete: str | None = None
+    user_code: str | None = None
+    interval: int | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,10 @@ class TokenInjectionResult:
     authorization_url: str | None = None
     transaction_id: str | None = None
     authorization_expires_at: datetime | None = None
+    flow: str | None = None
+    verification_uri: str | None = None
+    verification_uri_complete: str | None = None
+    user_code: str | None = None
 
 
 def oauth_required_mcp_status(
@@ -106,6 +120,10 @@ def oauth_required_mcp_status(
     reason: str | None,
     transaction_id: str | None = None,
     authorization_url: str | None = None,
+    flow: str | None = None,
+    verification_uri: str | None = None,
+    verification_uri_complete: str | None = None,
+    user_code: str | None = None,
 ) -> dict[str, Any]:
     """Return safe runtime metadata for an MCP server awaiting OAuth authorization."""
 
@@ -119,6 +137,10 @@ def oauth_required_mcp_status(
         "transaction_id": transaction_id,
         "authorization_url": authorization_url,
         "authorization_url_available": bool(authorization_url),
+        "flow": flow,
+        "verification_uri": verification_uri,
+        "verification_uri_complete": verification_uri_complete,
+        "user_code": user_code,
     }
 
 
@@ -142,6 +164,29 @@ def _b64url(data: bytes) -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _safe_provider_error(response: httpx.Response, *, operation: str) -> str:
+    """Build a sanitized provider-error message without credential payloads."""
+
+    parts = [f"{operation} failed (HTTP {response.status_code})"]
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        description = payload.get("error_description")
+        if isinstance(error, str) and error:
+            parts.append(error[:120])
+        if isinstance(description, str) and description:
+            sanitized = re.sub(
+                r"(?i)\b(access_token|refresh_token|client_secret|code|device_code|password|authorization)=([^,\s&]+)",
+                r"\1=[redacted]",
+                description,
+            )
+            parts.append(sanitized[:500])
+    return ": ".join(parts)
 
 
 def _safe_url(url: str, *, allow_http_localhost: bool = True) -> str:
@@ -211,12 +256,31 @@ class MCPOAuthService:
         key_path: str,
         public_base_url: str,
         notification_service: NotificationService | None = None,
+        on_authorization_completed: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._public_base_url = public_base_url.rstrip("/")
         self._notification_service = notification_service
+        self._on_authorization_completed = on_authorization_completed
+        self._refresh_locks: dict[tuple[str, str, str, str], asyncio.Lock] = {}
+        self._device_poll_tasks: dict[str, asyncio.Task[None]] = {}
         with open(key_path, "rb") as key_file:
             self._key = base64.urlsafe_b64decode(key_file.read())
+
+    def _refresh_lock(
+        self,
+        *,
+        user_email: str,
+        server_id: str,
+        issuer: str,
+        resource: str | None,
+    ) -> asyncio.Lock:
+        key = (user_email, server_id, issuer, mcp_oauth_resource_key(resource))
+        lock = self._refresh_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._refresh_locks[key] = lock
+        return lock
 
     def _encrypt(self, payload: dict[str, Any]) -> bytes:
         nonce = os.urandom(12)
@@ -321,9 +385,10 @@ class MCPOAuthService:
         metadata: dict[str, Any],
         configured_client_id: str | None,
         configured_client_secret: str | None,
-        redirect_uri: str,
+        redirect_uri: str | None,
         scopes: list[str],
         client_metadata_document_url: str | None,
+        flow: str = "authorization_code",
     ) -> OAuthClientRegistration:
         if configured_client_id:
             return OAuthClientRegistration(
@@ -341,23 +406,31 @@ class MCPOAuthService:
             redirect_uri=redirect_uri,
             scopes=scopes,
             client_metadata_document_url=client_metadata_document_url,
+            flow=flow,
         )
 
     async def _register_dynamic_client(
         self,
         *,
         registration_endpoint: str,
-        redirect_uri: str,
+        redirect_uri: str | None,
         scopes: list[str],
         client_metadata_document_url: str | None,
+        flow: str = "authorization_code",
     ) -> OAuthClientRegistration:
         payload: dict[str, Any] = {
             "client_name": _DYNAMIC_CLIENT_NAME,
-            "redirect_uris": [redirect_uri],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
             "token_endpoint_auth_method": "none",
         }
+        if flow == "device_code":
+            payload["redirect_uris"] = []
+            payload["grant_types"] = [_DEVICE_GRANT_TYPE, "refresh_token"]
+        else:
+            if not redirect_uri:
+                raise MCPOAuthError("OAuth redirect URI is required for authorization-code flow")
+            payload["redirect_uris"] = [redirect_uri]
+            payload["grant_types"] = ["authorization_code", "refresh_token"]
+            payload["response_types"] = ["code"]
         if scopes:
             payload["scope"] = " ".join(scopes)
         if client_metadata_document_url:
@@ -368,8 +441,29 @@ class MCPOAuthService:
                 json=payload,
                 headers={"Accept": "application/json"},
             )
+            if flow == "device_code" and response.status_code == 400:
+                fallback_payload = dict(payload)
+                fallback_payload.pop("redirect_uris", None)
+                response = await client.post(
+                    _safe_url(registration_endpoint),
+                    json=fallback_payload,
+                    headers={"Accept": "application/json"},
+                )
         if response.status_code >= 400:
-            raise MCPOAuthError("OAuth dynamic client registration failed")
+            message = _safe_provider_error(
+                response,
+                operation="OAuth dynamic client registration",
+            )
+            logger.warning(
+                "mcp oauth: dynamic client registration failed",
+                extra={
+                    "extra_data": {
+                        "status_code": response.status_code,
+                        "provider_error": message,
+                    }
+                },
+            )
+            raise MCPOAuthError(message)
         data = response.json()
         if not isinstance(data, dict) or not isinstance(data.get("client_id"), str):
             raise MCPOAuthError("OAuth dynamic client registration response missing client_id")
@@ -377,6 +471,171 @@ class MCPOAuthService:
         return OAuthClientRegistration(
             client_id=str(data["client_id"]),
             client_secret=str(client_secret) if client_secret else None,
+        )
+
+    def _select_flow(
+        self, *, requested_flow: str, auth_config: Any, metadata: dict[str, Any]
+    ) -> str:
+        if requested_flow == "authorization_code":
+            return "authorization_code"
+        device_endpoint = metadata.get("device_authorization_endpoint")
+        if requested_flow == "device_code":
+            if not isinstance(device_endpoint, str) or not device_endpoint:
+                raise MCPOAuthError(
+                    "OAuth device-code flow is not available because the authorization server "
+                    "does not advertise device_authorization_endpoint"
+                )
+            return "device_code"
+        if auth_config.client_id or auth_config.redirect_uri:
+            return "authorization_code"
+        if isinstance(device_endpoint, str) and device_endpoint:
+            return "device_code"
+        return "authorization_code"
+
+    async def _start_device_authorization(
+        self,
+        *,
+        session: Any,
+        server: MCPServerRow,
+        metadata: dict[str, Any],
+        user_email: str,
+        conversation_id: str | None,
+        task_id: str | None,
+        step_name: str | None,
+        step_run_id: str | None,
+        session_id: str | None,
+        delivery_mode: str | None,
+    ) -> AuthorizationStart:
+        auth_config = effective_mcp_auth_config(server.auth_config, server.headers)
+        issuer = str(metadata["issuer"]).rstrip("/")
+        device_endpoint = _safe_url(str(metadata.get("device_authorization_endpoint") or ""))
+        token_endpoint = _safe_url(str(metadata.get("token_endpoint") or ""))
+        scopes = list(dict.fromkeys(auth_config.scopes))
+        client = await self._resolve_client_registration(
+            metadata=metadata,
+            configured_client_id=auth_config.client_id,
+            configured_client_secret=None,
+            redirect_uri=None,
+            scopes=scopes,
+            client_metadata_document_url=auth_config.client_metadata_document_url,
+            flow="device_code",
+        )
+        device_response = await self._request_device_authorization(
+            device_endpoint=device_endpoint,
+            client_id=client.client_id,
+            client_secret=client.client_secret,
+            scopes=scopes,
+            resource=auth_config.resource or server.url,
+        )
+        device_code = device_response.get("device_code")
+        user_code = device_response.get("user_code")
+        verification_uri = device_response.get("verification_uri") or device_response.get(
+            "verification_url"
+        )
+        if not (
+            isinstance(device_code, str)
+            and device_code
+            and isinstance(user_code, str)
+            and user_code
+            and isinstance(verification_uri, str)
+            and verification_uri
+        ):
+            raise MCPOAuthError("OAuth device authorization response missing required fields")
+        verification_uri_complete = device_response.get("verification_uri_complete")
+        if not isinstance(verification_uri_complete, str):
+            verification_uri_complete = None
+        expires_in = device_response.get("expires_in")
+        expires_at = _utcnow() + timedelta(
+            seconds=int(expires_in) if isinstance(expires_in, int) and expires_in > 0 else 900
+        )
+        interval_value = device_response.get("interval")
+        interval = (
+            int(interval_value) if isinstance(interval_value, int) and interval_value > 0 else 5
+        )
+        transaction_id = f"mcpoauth_{uuid.uuid4().hex[:16]}"
+        resource = auth_config.resource or server.url
+        row = await create_mcp_oauth_transaction(
+            session,
+            transaction_id=transaction_id,
+            user_email=user_email,
+            mcp_server_id=server.server_id,
+            issuer=issuer,
+            authorization_server=issuer,
+            resource=resource,
+            scopes=scopes,
+            redirect_uri="",
+            client_id=client.client_id,
+            code_challenge="",
+            state_hash="",
+            encrypted_payload=self._encrypt(
+                {
+                    "flow": "device_code",
+                    "device_code": device_code,
+                    "client_secret": client.client_secret,
+                    "token_endpoint": token_endpoint,
+                    "verification_uri": verification_uri,
+                    "verification_uri_complete": verification_uri_complete,
+                    "user_code": user_code,
+                    "interval": interval,
+                }
+            ),
+            expires_at=expires_at,
+            task_id=task_id,
+            step_name=step_name,
+            step_run_id=step_run_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+        )
+        notification_id = None
+        authorization_url = verification_uri_complete or verification_uri
+        if self._notification_service is not None:
+            notification_conversation_id = conversation_id or f"mcp_oauth:{transaction_id}"
+            notification = await self._notification_service.create(
+                notification_type=NotificationType.AUTH_CHALLENGE,
+                user_email=user_email,
+                conversation_id=notification_conversation_id,
+                task_id=task_id,
+                step_name=step_name,
+                step_run_id=step_run_id,
+                session_id=session_id,
+                payload={
+                    "kind": "oauth_authorization",
+                    "label": "Authorize MCP server",
+                    "message": "Authorize this MCP server using the provider verification page.",
+                    "required_fields": [],
+                    "metadata": {
+                        "flow": "device_code",
+                        "authorization_url": authorization_url,
+                        "verification_uri": verification_uri,
+                        "verification_uri_complete": verification_uri_complete,
+                        "user_code": user_code,
+                        "transaction_id": transaction_id,
+                        "provider": "mcp",
+                        "subject_id": server.server_id,
+                        "scopes": scopes,
+                        "authorization_server": issuer,
+                        "expires_at": expires_at.isoformat(),
+                        "callback_only": True,
+                    },
+                },
+                suppress_event=delivery_mode == "silent",
+            )
+            notification_id = notification.notification_id
+            row.notification_id = notification_id
+        await session.commit()
+        self._ensure_device_poll_task(transaction_id)
+        return AuthorizationStart(
+            authorization_url=authorization_url,
+            transaction_id=transaction_id,
+            expires_at=expires_at,
+            issuer=issuer,
+            authorization_server=issuer,
+            scopes=scopes,
+            flow="device_code",
+            verification_uri=verification_uri,
+            verification_uri_complete=verification_uri_complete,
+            user_code=user_code,
+            interval=interval,
         )
 
     async def start_authorization(
@@ -401,6 +660,24 @@ class MCPOAuthService:
             if auth_config.type != "oauth2":
                 raise MCPOAuthError("MCP server is not configured for OAuth")
             metadata = await self.discover_metadata(server)
+            flow = self._select_flow(
+                requested_flow=auth_config.flow,
+                auth_config=auth_config,
+                metadata=metadata,
+            )
+            if flow == "device_code":
+                return await self._start_device_authorization(
+                    session=session,
+                    server=server,
+                    metadata=metadata,
+                    user_email=user_email,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    step_name=step_name,
+                    step_run_id=step_run_id,
+                    session_id=session_id,
+                    delivery_mode=delivery_mode,
+                )
             authorization_endpoint = _safe_url(str(metadata.get("authorization_endpoint") or ""))
             issuer = str(metadata["issuer"]).rstrip("/")
             redirect_uri = auth_config.redirect_uri or self.redirect_uri()
@@ -411,6 +688,7 @@ class MCPOAuthService:
                 redirect_uri=redirect_uri,
                 scopes=auth_config.scopes,
                 client_metadata_document_url=auth_config.client_metadata_document_url,
+                flow="authorization_code",
             )
             verifier = _b64url(secrets.token_bytes(48))
             challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
@@ -510,6 +788,7 @@ class MCPOAuthService:
             issuer=issuer,
             authorization_server=issuer,
             scopes=scopes,
+            flow="authorization_code",
         )
 
     async def start_authorization_for_server(
@@ -588,6 +867,14 @@ class MCPOAuthService:
             authorization_url=authorization.authorization_url if authorization else None,
             transaction_id=authorization.transaction_id if authorization else None,
             authorization_expires_at=authorization.expires_at if authorization else None,
+            flow=getattr(authorization, "flow", None) if authorization else None,
+            verification_uri=getattr(authorization, "verification_uri", None)
+            if authorization
+            else None,
+            verification_uri_complete=getattr(authorization, "verification_uri_complete", None)
+            if authorization
+            else None,
+            user_code=getattr(authorization, "user_code", None) if authorization else None,
         )
 
     async def complete_callback(self, *, state: str, code: str) -> str:
@@ -618,6 +905,8 @@ class MCPOAuthService:
                 if server is None:
                     raise MCPOAuthError("MCP server not found")
                 metadata = await self.discover_metadata(server)
+                if payload.get("flow") == "device_code":
+                    raise MCPOAuthError("OAuth callback is not valid for device-code transactions")
                 token_endpoint = _safe_url(str(metadata.get("token_endpoint") or ""))
                 token_response = await self._exchange_code(
                     token_endpoint=token_endpoint,
@@ -631,6 +920,8 @@ class MCPOAuthService:
                     resource=row.resource,
                 )
                 token_response["token_endpoint"] = token_endpoint
+                if payload.get("client_secret"):
+                    token_response["client_secret"] = payload.get("client_secret")
                 expires_at = None
                 if isinstance(token_response.get("expires_in"), int):
                     expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
@@ -669,7 +960,239 @@ class MCPOAuthService:
                 "completed",
                 {"transaction_id": transaction_id, "provider": "mcp"},
             )
+        if self._on_authorization_completed is not None:
+            await self._on_authorization_completed(transaction_id)
         return transaction_id
+
+    async def _request_device_authorization(
+        self,
+        *,
+        device_endpoint: str,
+        client_id: str,
+        client_secret: str | None,
+        scopes: list[str],
+        resource: str | None,
+    ) -> dict[str, Any]:
+        data = {"client_id": client_id}
+        if client_secret:
+            data["client_secret"] = client_secret
+        if scopes:
+            data["scope"] = " ".join(scopes)
+        if resource:
+            data["resource"] = resource
+        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+            response = await client.post(device_endpoint, data=data)
+        if response.status_code >= 400:
+            raise MCPOAuthError(
+                _safe_provider_error(response, operation="OAuth device authorization")
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise MCPOAuthError("OAuth device authorization response was not valid JSON")
+        return payload
+
+    async def _exchange_device_code(
+        self,
+        *,
+        token_endpoint: str,
+        device_code: str,
+        client_id: str,
+        client_secret: str | None,
+        resource: str | None,
+    ) -> dict[str, Any]:
+        data = {
+            "grant_type": _DEVICE_GRANT_TYPE,
+            "device_code": device_code,
+            "client_id": client_id,
+        }
+        if client_secret:
+            data["client_secret"] = client_secret
+        if resource:
+            data["resource"] = resource
+        async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
+            response = await client.post(token_endpoint, data=data)
+        if response.status_code >= 400:
+            error_value = None
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = None
+            if isinstance(error_payload, dict) and isinstance(error_payload.get("error"), str):
+                error_value = str(error_payload["error"])
+            if error_value in {
+                "authorization_pending",
+                "slow_down",
+                "access_denied",
+                "expired_token",
+                "temporarily_unavailable",
+            }:
+                raise MCPOAuthError(error_value, reason=error_value)
+            if response.status_code >= 500:
+                raise MCPOAuthError(
+                    _safe_provider_error(response, operation="OAuth device token exchange"),
+                    reason="transient_provider_error",
+                )
+            raise MCPOAuthError(
+                _safe_provider_error(response, operation="OAuth device token exchange")
+            )
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("access_token"):
+            raise MCPOAuthError("OAuth token response missing access token")
+        return payload
+
+    def _ensure_device_poll_task(self, transaction_id: str) -> None:
+        task = self._device_poll_tasks.get(transaction_id)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._poll_device_authorization(transaction_id))
+        self._device_poll_tasks[transaction_id] = task
+        task.add_done_callback(lambda _: self._device_poll_tasks.pop(transaction_id, None))
+
+    async def recover_pending_device_authorizations(self) -> None:
+        async with self._session_factory() as session:
+            rows = await list_pending_mcp_oauth_transactions(session)
+            for row in rows:
+                try:
+                    payload = self._decrypt(row.encrypted_payload)
+                except Exception:
+                    continue
+                if payload.get("flow") == "device_code":
+                    self._ensure_device_poll_task(row.transaction_id)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._device_poll_tasks.values())
+        self._device_poll_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _poll_device_authorization(self, transaction_id: str) -> None:
+        interval = 5
+        while True:
+            async with self._session_factory() as session:
+                row = await get_mcp_oauth_transaction(session, transaction_id)
+                if row is None or row.status != "pending":
+                    return
+                now = _utcnow()
+                if row.expires_at <= now:
+                    row.status = "expired"
+                    row.error_code = "expired_token"
+                    row.error_description = "OAuth device authorization expired"
+                    await session.commit()
+                    if row.notification_id and self._notification_service is not None:
+                        await self._notification_service.resolve_internal(
+                            row.notification_id,
+                            "failed",
+                            {"transaction_id": transaction_id, "provider": "mcp"},
+                        )
+                    return
+                payload = self._decrypt(row.encrypted_payload)
+                if payload.get("flow") != "device_code":
+                    return
+                interval = int(payload.get("interval") or interval)
+                sleep_for = min(max(interval, 1), max((row.expires_at - now).total_seconds(), 0))
+            await asyncio.sleep(sleep_for)
+            async with self._session_factory() as session:
+                row = await get_mcp_oauth_transaction(session, transaction_id)
+                if row is None or row.status != "pending":
+                    return
+                now = _utcnow()
+                if row.expires_at <= now:
+                    row.status = "expired"
+                    row.error_code = "expired_token"
+                    row.error_description = "OAuth device authorization expired"
+                    await session.commit()
+                    if row.notification_id and self._notification_service is not None:
+                        await self._notification_service.resolve_internal(
+                            row.notification_id,
+                            "failed",
+                            {"transaction_id": transaction_id, "provider": "mcp"},
+                        )
+                    return
+                payload = self._decrypt(row.encrypted_payload)
+                device_code = payload.get("device_code")
+                token_endpoint = payload.get("token_endpoint")
+                if not isinstance(device_code, str) or not isinstance(token_endpoint, str):
+                    row.status = "failed"
+                    row.error_code = "invalid_device_transaction"
+                    row.error_description = "OAuth device transaction payload is invalid"
+                    await session.commit()
+                    return
+                try:
+                    token_response = await self._exchange_device_code(
+                        token_endpoint=_safe_url(token_endpoint),
+                        device_code=device_code,
+                        client_id=row.client_id,
+                        client_secret=payload.get("client_secret")
+                        if isinstance(payload.get("client_secret"), str)
+                        else None,
+                        resource=row.resource,
+                    )
+                except MCPOAuthError as exc:
+                    if exc.reason == "authorization_pending":
+                        continue
+                    if exc.reason == "slow_down":
+                        interval += 5
+                        payload["interval"] = interval
+                        row.encrypted_payload = self._encrypt(payload)
+                        await session.commit()
+                        continue
+                    if exc.reason in {"temporarily_unavailable", "transient_provider_error"}:
+                        logger.warning(
+                            "mcp oauth: transient device token provider failure",
+                            extra={"extra_data": {"transaction_id": transaction_id}},
+                        )
+                        continue
+                    row.status = "failed"
+                    row.error_code = exc.reason or "token_exchange_failed"
+                    row.error_description = str(exc)[:500]
+                    await session.commit()
+                    if row.notification_id and self._notification_service is not None:
+                        await self._notification_service.resolve_internal(
+                            row.notification_id,
+                            "failed",
+                            {"transaction_id": transaction_id, "provider": "mcp"},
+                        )
+                    return
+                except httpx.HTTPError:
+                    logger.warning(
+                        "mcp oauth: transient device token polling failure",
+                        extra={"extra_data": {"transaction_id": transaction_id}},
+                        exc_info=True,
+                    )
+                    continue
+                token_response["token_endpoint"] = token_endpoint
+                if payload.get("client_secret"):
+                    token_response["client_secret"] = payload.get("client_secret")
+                expires_at = None
+                if isinstance(token_response.get("expires_in"), int):
+                    expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
+                token_response = _record_absolute_refresh_token_expiry(token_response, now)
+                await upsert_mcp_oauth_token(
+                    session,
+                    user_email=row.user_email,
+                    mcp_server_id=row.mcp_server_id,
+                    issuer=row.issuer,
+                    resource=row.resource,
+                    client_id=row.client_id,
+                    scopes=row.scopes or [],
+                    token_type=str(token_response.get("token_type") or "Bearer"),
+                    expires_at=expires_at,
+                    encrypted_payload=self._encrypt(token_response),
+                )
+                row.status = "completed"
+                row.used_at = now
+                await session.commit()
+                if row.notification_id and self._notification_service is not None:
+                    await self._notification_service.resolve_internal(
+                        row.notification_id,
+                        "completed",
+                        {"transaction_id": transaction_id, "provider": "mcp"},
+                    )
+                if self._on_authorization_completed is not None:
+                    await self._on_authorization_completed(transaction_id)
+                return
 
     async def _exchange_code(
         self,
@@ -707,6 +1230,7 @@ class MCPOAuthService:
         *,
         token_endpoint: str,
         client_id: str,
+        client_secret: str | None = None,
         refresh_token: str,
         resource: str | None,
     ) -> dict[str, Any]:
@@ -715,6 +1239,8 @@ class MCPOAuthService:
             "client_id": client_id,
             "refresh_token": refresh_token,
         }
+        if client_secret:
+            data["client_secret"] = client_secret
         if resource:
             data["resource"] = resource
         try:
@@ -836,6 +1362,16 @@ class MCPOAuthService:
                     authorization_url=authorization.authorization_url if authorization else None,
                     transaction_id=authorization.transaction_id if authorization else None,
                     authorization_expires_at=authorization.expires_at if authorization else None,
+                    flow=getattr(authorization, "flow", None) if authorization else None,
+                    verification_uri=getattr(authorization, "verification_uri", None)
+                    if authorization
+                    else None,
+                    verification_uri_complete=getattr(
+                        authorization, "verification_uri_complete", None
+                    )
+                    if authorization
+                    else None,
+                    user_code=getattr(authorization, "user_code", None) if authorization else None,
                 )
             payload = self._decrypt(row.encrypted_payload)
             now = _utcnow()
@@ -843,78 +1379,138 @@ class MCPOAuthService:
                 seconds=_REFRESH_SKEW_SECONDS
             )
             if should_refresh:
-                refresh_token = payload.get("refresh_token")
-                if not isinstance(refresh_token, str) or not refresh_token:
-                    return await self._mark_token_invalid_and_start_authorization(
-                        session,
-                        token_id=row.token_id,
-                        headers=headers,
-                        context=challenge_context,
-                        reason="refresh_token_missing",
-                    )
-                try:
-                    token_endpoint = payload.get("token_endpoint")
-                    if not isinstance(token_endpoint, str) or not token_endpoint:
-                        metadata = await self.discover_metadata(server)
-                        token_endpoint = str(metadata.get("token_endpoint") or "")
-                    refreshed = await self._refresh_token(
-                        token_endpoint=_safe_url(token_endpoint),
-                        client_id=row.client_id
-                        or auth_config.client_id
-                        or f"cognis-mcp-{server.server_id}",
-                        refresh_token=refresh_token,
-                        resource=resource,
-                    )
-                except MCPOAuthError as exc:
-                    if not exc.authorization_required:
-                        raise
-                    logger.warning(
-                        "mcp oauth: refresh token invalid; token marked invalid",
-                        extra={
-                            "extra_data": {
-                                "server_id": server.server_id,
-                                "token_id": row.token_id,
-                                "reason": exc.reason or "refresh_failed",
-                            }
-                        },
-                    )
-                    return await self._mark_token_invalid_and_start_authorization(
-                        session,
-                        token_id=row.token_id,
-                        reason=exc.reason or "refresh_failed",
-                        headers=headers,
-                        context=challenge_context,
-                    )
-                if not refreshed.get("refresh_token"):
-                    refreshed["refresh_token"] = refresh_token
-                if not _has_refresh_token_expiry_metadata(refreshed):
-                    for key in (
-                        "refresh_token_expires_at",
-                        "refresh_expires_at",
-                        "authorization_expires_at",
-                    ):
-                        if key in payload:
-                            refreshed[key] = payload[key]
-                refreshed["token_endpoint"] = token_endpoint
-                refreshed = _record_absolute_refresh_token_expiry(refreshed, now)
-                expires_at = None
-                if isinstance(refreshed.get("expires_in"), int):
-                    expires_at = now + timedelta(seconds=int(refreshed["expires_in"]))
-                await upsert_mcp_oauth_token(
-                    session,
+                async with self._refresh_lock(
                     user_email=user_email,
-                    mcp_server_id=server.server_id,
+                    server_id=server.server_id,
                     issuer=issuer,
                     resource=resource,
-                    client_id=row.client_id or auth_config.client_id,
-                    scopes=row.scopes or auth_config.scopes,
-                    token_type=str(refreshed.get("token_type") or row.token_type or "Bearer"),
-                    expires_at=expires_at,
-                    encrypted_payload=self._encrypt(refreshed),
-                )
-                row.last_refresh_at = now
-                await session.commit()
-                payload = refreshed
+                ):
+                    refresh_row = getattr(session, "refresh", None)
+                    if callable(refresh_row):
+                        await refresh_row(row)
+                    if row.status != "active":
+                        authorization = await self.start_authorization_for_server(
+                            user_email=user_email,
+                            server=server,
+                            conversation_id=conversation_id,
+                            task_id=task_id,
+                            step_name=step_name,
+                            step_run_id=step_run_id,
+                            session_id=session_id,
+                            delivery_mode=delivery_mode,
+                        )
+                        return TokenInjectionResult(
+                            headers=headers,
+                            authorization_required=True,
+                            reason="authorization_required",
+                            authorization_url=authorization.authorization_url
+                            if authorization
+                            else None,
+                            transaction_id=authorization.transaction_id if authorization else None,
+                            authorization_expires_at=authorization.expires_at
+                            if authorization
+                            else None,
+                            flow=getattr(authorization, "flow", None) if authorization else None,
+                            verification_uri=getattr(authorization, "verification_uri", None)
+                            if authorization
+                            else None,
+                            verification_uri_complete=getattr(
+                                authorization, "verification_uri_complete", None
+                            )
+                            if authorization
+                            else None,
+                            user_code=getattr(authorization, "user_code", None)
+                            if authorization
+                            else None,
+                        )
+                    payload = self._decrypt(row.encrypted_payload)
+                    now = _utcnow()
+                    should_refresh = (
+                        row.expires_at is not None
+                        and row.expires_at <= now + timedelta(seconds=_REFRESH_SKEW_SECONDS)
+                    )
+                    if should_refresh:
+                        refresh_token = payload.get("refresh_token")
+                        if not isinstance(refresh_token, str) or not refresh_token:
+                            return await self._mark_token_invalid_and_start_authorization(
+                                session,
+                                token_id=row.token_id,
+                                headers=headers,
+                                context=challenge_context,
+                                reason="refresh_token_missing",
+                            )
+                        try:
+                            token_endpoint = payload.get("token_endpoint")
+                            if not isinstance(token_endpoint, str) or not token_endpoint:
+                                metadata = await self.discover_metadata(server)
+                                token_endpoint = str(metadata.get("token_endpoint") or "")
+                            refresh_kwargs = {
+                                "token_endpoint": _safe_url(token_endpoint),
+                                "client_id": row.client_id
+                                or auth_config.client_id
+                                or f"cognis-mcp-{server.server_id}",
+                                "refresh_token": refresh_token,
+                                "resource": resource,
+                            }
+                            if isinstance(payload.get("client_secret"), str):
+                                refresh_kwargs["client_secret"] = payload["client_secret"]
+                            refreshed = await self._refresh_token(**refresh_kwargs)
+                        except MCPOAuthError as exc:
+                            if not exc.authorization_required:
+                                raise
+                            logger.warning(
+                                "mcp oauth: refresh token invalid; token marked invalid",
+                                extra={
+                                    "extra_data": {
+                                        "server_id": server.server_id,
+                                        "token_id": row.token_id,
+                                        "reason": exc.reason or "refresh_failed",
+                                    }
+                                },
+                            )
+                            return await self._mark_token_invalid_and_start_authorization(
+                                session,
+                                token_id=row.token_id,
+                                reason=exc.reason or "refresh_failed",
+                                headers=headers,
+                                context=challenge_context,
+                            )
+                        if not refreshed.get("refresh_token"):
+                            refreshed["refresh_token"] = refresh_token
+                        if isinstance(payload.get("client_secret"), str) and not refreshed.get(
+                            "client_secret"
+                        ):
+                            refreshed["client_secret"] = payload["client_secret"]
+                        if not _has_refresh_token_expiry_metadata(refreshed):
+                            for key in (
+                                "refresh_token_expires_at",
+                                "refresh_expires_at",
+                                "authorization_expires_at",
+                            ):
+                                if key in payload:
+                                    refreshed[key] = payload[key]
+                        refreshed["token_endpoint"] = token_endpoint
+                        refreshed = _record_absolute_refresh_token_expiry(refreshed, now)
+                        expires_at = None
+                        if isinstance(refreshed.get("expires_in"), int):
+                            expires_at = now + timedelta(seconds=int(refreshed["expires_in"]))
+                        await upsert_mcp_oauth_token(
+                            session,
+                            user_email=user_email,
+                            mcp_server_id=server.server_id,
+                            issuer=issuer,
+                            resource=resource,
+                            client_id=row.client_id or auth_config.client_id,
+                            scopes=row.scopes or auth_config.scopes,
+                            token_type=str(
+                                refreshed.get("token_type") or row.token_type or "Bearer"
+                            ),
+                            expires_at=expires_at,
+                            encrypted_payload=self._encrypt(refreshed),
+                        )
+                        row.last_refresh_at = now
+                        await session.commit()
+                        payload = refreshed
         access_token = payload.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             return TokenInjectionResult(

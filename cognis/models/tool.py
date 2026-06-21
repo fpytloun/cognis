@@ -60,6 +60,11 @@ class ToolDefinition(BaseModel):
     non_bypassable: bool = False
     max_result_size: int = 50_000
     risk_level: str | None = None
+    aliases: list[dict[str, Any]] = Field(default_factory=list)
+    canonical_name: str | None = None
+    primary_name: str | None = None
+    configurable: bool = True
+    surfaces: dict[str, str] = Field(default_factory=dict)
     # Runtime-only metadata for executable skill tools (recipe, assets, etc.)
     # Not sent to the LLM — used by executor handlers for execution.
     execution_metadata: dict[str, Any] | None = None
@@ -134,6 +139,8 @@ def stable_tool_id(tool: ToolDefinition) -> str:
         skill_id = tool.source.skill_id or "unknown"
         raw_name = tool.source.raw_tool_name or tool.name
         return f"skill:{skill_id}:{raw_name}"
+    if tool.source.type == "controller":
+        return f"controller:{tool.name}"
     return f"builtin:{tool.name}"
 
 
@@ -219,6 +226,7 @@ class MCPOAuth2Config(BaseModel):
     client_id: str | None = None
     client_secret_ref: str | None = None
     redirect_uri: str | None = None
+    flow: Literal["auto", "authorization_code", "device_code"] = "auto"
     dynamic_client_registration: bool = False
     client_metadata_document_url: str | None = None
     authorization_params: dict[str, str] = Field(default_factory=dict)
@@ -235,6 +243,7 @@ class MCPAuthConfig(BaseModel):
     client_id: str | None = None
     client_secret_ref: str | None = None
     redirect_uri: str | None = None
+    flow: Literal["auto", "authorization_code", "device_code"] = "auto"
     dynamic_client_registration: bool = False
     client_metadata_document_url: str | None = None
     authorization_params: dict[str, str] = Field(default_factory=dict)

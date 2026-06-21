@@ -59,6 +59,11 @@ _SOURCE_REWRITE_ADVISORY = (
     "Prefer dedicated edit tools for rewriting source files. "
     "Use shell redirection only when it is necessary and intentional."
 )
+_BACKGROUND_SHELL_OUTPUT_REMINDER = (
+    "Completion reminder: the parent conversation will be notified/resumed when this "
+    "background command finishes. If there is nothing else independently actionable, "
+    "end this turn now instead of polling or duplicating the same work."
+)
 _SOURCE_REWRITE_ADVISORY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
     re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
@@ -94,6 +99,7 @@ class _BackgroundShellSession:
     exit_code: int | None = None
     completion_reason: str | None = None
     completion_notified: bool = False
+    completion_notify_in_progress: bool = False
     completion_notify_enabled: bool = True
     done: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -247,6 +253,15 @@ class _BackgroundShellManager:
             await _kill_process_tree(session.process)
             await self._finalize_session(session, reason="cleanup")
 
+    def set_completion_callback(self, callback: BackgroundShellCompletionCallback | None) -> None:
+        for session in self._sessions.values():
+            session.completion_callback = callback
+
+    async def notify_pending_completions(self) -> None:
+        for session in list(self._sessions.values()):
+            if session.done.is_set():
+                await self._notify_completion(session)
+
     async def list_statuses(self, *, include_completed: bool = False) -> list[dict[str, Any]]:
         now = time()
         statuses: list[dict[str, Any]] = []
@@ -294,16 +309,39 @@ class _BackgroundShellManager:
         session.exit_code = session.process.returncode
         session.completion_reason = reason
         session.done.set()
-        if (
-            session.completion_notify_enabled
-            and not session.completion_notified
-            and session.completion_callback is not None
-        ):
-            session.completion_notified = True
-            try:
-                await session.completion_callback(await session.status_snapshot())
-            except Exception:
+        await self._notify_completion(session)
+
+    async def _notify_completion(self, session: _BackgroundShellSession) -> None:
+        async with session.lock:
+            if (
+                not session.completion_notify_enabled
+                or session.completion_notified
+                or session.completion_notify_in_progress
+                or session.completion_callback is None
+            ):
                 return
+            callback = session.completion_callback
+            session.completion_notify_in_progress = True
+        failed = False
+        try:
+            await callback(await session.status_snapshot())
+        except Exception:
+            failed = True
+        else:
+            async with session.lock:
+                session.completion_notified = True
+        finally:
+            async with session.lock:
+                session.completion_notify_in_progress = False
+        if failed:
+            async with session.lock:
+                should_retry = (
+                    not session.completion_notified
+                    and session.completion_callback is not None
+                    and session.completion_callback is not callback
+                )
+            if should_retry:
+                await self._notify_completion(session)
 
 
 def _shell_name(path: str) -> str:
@@ -408,6 +446,17 @@ def set_background_shell_completion_callback(
         runtime_metadata.pop(_BACKGROUND_COMPLETION_CALLBACK_KEY, None)
     else:
         runtime_metadata[_BACKGROUND_COMPLETION_CALLBACK_KEY] = callback
+    manager = runtime_metadata.get(SHELL_MANAGER_KEY)
+    if isinstance(manager, _BackgroundShellManager):
+        manager.set_completion_callback(callback)
+
+
+async def notify_pending_background_shell_completions(runtime_metadata: dict[str, Any]) -> None:
+    """Retry completion notifications that could not be sent while disconnected."""
+
+    manager = runtime_metadata.get(SHELL_MANAGER_KEY)
+    if isinstance(manager, _BackgroundShellManager):
+        await manager.notify_pending_completions()
 
 
 async def _create_process(
@@ -614,6 +663,7 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
                 f"Status: {status}\n"
                 f"{description_line}"
                 f"Use bash_output with shell_id='{shell_id}' to read output and bash_kill to stop it.\n\n"
+                f"{_BACKGROUND_SHELL_OUTPUT_REMINDER}\n\n"
                 f"Initial output:\n{preview}"
             ),
             is_error=done and exit_code not in {None, 0},

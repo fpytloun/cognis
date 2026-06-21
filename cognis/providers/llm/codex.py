@@ -20,6 +20,18 @@ CODEX_CLIENT_VERSION = "0.124.0"
 CODEX_MODEL_CACHE_TTL_SECONDS = 300.0
 
 _CODEX_CATALOG: dict[str, dict[str, Any]] | None = None
+_CODEX_MODEL_INFO_OVERRIDES: dict[str, dict[str, int]] = {
+    # Spark is not present in the upstream Codex catalog and the ChatGPT
+    # Responses backend currently rejects requests just above 128k input
+    # tokens with context_length_exceeded. Keep this as a Cognis runtime
+    # correction rather than changing the upstream-derived catalog file.
+    "gpt-5.3-codex-spark": {
+        "context_window": 272_000,
+        "max_input_tokens": 128_000,
+        "max_context_window": 272_000,
+        "max_output_tokens": 128_000,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -213,7 +225,7 @@ def _codex_model_info_from_entry(
     max_context_window = _positive_int(item.get("max_context_window"), max_input_tokens)
     context_window = max_input_tokens + max_output_tokens
     max_total_context_window = max_context_window + max_output_tokens
-    return {
+    info = {
         "model_id": slug,
         "display_name": item.get("display_name") or slug,
         "context_window": context_window,
@@ -245,6 +257,8 @@ def _codex_model_info_from_entry(
         "supported_in_api": item.get("supported_in_api"),
         "available_in_plans": item.get("available_in_plans") or [],
     }
+    info.update(_CODEX_MODEL_INFO_OVERRIDES.get(slug, {}))
+    return info
 
 
 def _reasoning_efforts_from_catalog(item: dict[str, Any]) -> list[str]:

@@ -9,20 +9,23 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from cognis.api.common import (
     api_exception,
     check_agent_access,
     check_project_access,
+    decode_cursor,
+    encode_cursor,
     forbid_mutation_for_viewer,
-    paginate_items,
     require_current_user,
     require_resource_owner,
 )
 from cognis.api.models import (
     AgentDirectChatResponse,
     ConversationCreateRequest,
+    ConversationOpenRequest,
     ConversationResolveRequest,
     ConversationResponse,
     ConversationTitleSuggestionResponse,
@@ -30,6 +33,7 @@ from cognis.api.models import (
     CursorPage,
     ManagedConversationActionRequest,
     ManagedConversationActionResponse,
+    MessageEventResponse,
     MessageHistoryResponse,
     QueuedMessageResponse,
     QueuedMessagesResponse,
@@ -37,6 +41,8 @@ from cognis.api.models import (
     SendMessageResponse,
     SessionEventsResponse,
     SessionResponse,
+    SidebarProjectionResponse,
+    TimelineProjectionResponse,
     ToolOutputChunkResponse,
     ToolOutputPageResponse,
     UpdateQueuedMessageRequest,
@@ -68,6 +74,8 @@ from cognis.store.queries import (
     get_root_session_chain,
     get_root_session_chain_page,
     get_session_row,
+    get_user_ui_state_value,
+    list_conversation_context_types,
     list_conversation_sessions,
     list_conversations,
     list_pending_notification_types_by_conversation,
@@ -77,12 +85,14 @@ from cognis.store.queries import (
     mark_conversation_read,
     update_conversation_context_data,
     update_managed_conversation_link,
+    upsert_user_ui_state,
 )
 
 logger = get_logger(__name__)
 
 _CONVERSATION_MESSAGES_CURSOR_VERSION = 1
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
+_CHAT_LAST_OPENED_UI_STATE_PREFIX = "chat.last_opened"
 
 
 def _agent_definition_from_row(row: object) -> AgentDefinition:
@@ -131,6 +141,866 @@ def _messages_cursor_anchor_event(events: list[dict[str, Any]]) -> dict[str, Any
             continue
         return event
     return None
+
+
+def _timeline_event_identity(event: MessageEventResponse) -> tuple[str | None, int | None, str]:
+    session_id = event.data.get("session_id")
+    sid = session_id if isinstance(session_id, str) and session_id else None
+    seq = event.seq
+    eid = f"{sid}:{seq}" if sid else str(seq)
+    return sid, seq, eid
+
+
+def _project_event_attachments(data: dict[str, Any]) -> list[Any]:
+    attachments = data.get("attachments")
+    return attachments if isinstance(attachments, list) else []
+
+
+def _project_event_turn_id(data: dict[str, Any]) -> str | None:
+    turn_id = data.get("turn_id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
+def _project_visible_system_message(data: dict[str, Any]) -> bool:
+    if isinstance(data.get("notice_id"), str) and data["notice_id"]:
+        return True
+    if data.get("kind") == "turn_initiated":
+        return True
+    return data.get("event") == "turn_initiated"
+
+
+def _project_number(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int | float) else None
+
+
+def _next_assistant_phase_index(items: list[dict[str, Any]], turn_id: str | None) -> int | None:
+    if not turn_id:
+        return None
+    highest = -1
+    matching = 0
+    for item in items:
+        if item.get("kind") != "message" or item.get("role") != "assistant":
+            continue
+        if item.get("turnId") != turn_id:
+            continue
+        matching += 1
+        phase = item.get("assistantPhaseIndex")
+        if isinstance(phase, int):
+            highest = max(highest, phase)
+    return highest + 1 if highest >= 0 else matching
+
+
+def _strip_none_values(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if value is not None}
+
+
+def _project_timeline_events(
+    events: list[MessageEventResponse],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    tool_index_by_call_id: dict[str, int] = {}
+    system_notice_index_by_id: dict[str, int] = {}
+    open_assistant_index_by_turn: dict[str, int] = {}
+
+    def close_assistant_phase(turn_id: str | None) -> None:
+        if turn_id:
+            open_assistant_index_by_turn.pop(turn_id, None)
+        else:
+            open_assistant_index_by_turn.clear()
+
+    def append_notice(
+        *,
+        item_id: str,
+        title: str,
+        description: str,
+        timestamp: Any,
+        tone: str = "info",
+    ) -> None:
+        close_assistant_phase(turn_id)
+        items.append(
+            {
+                "id": item_id,
+                "kind": "notice",
+                "title": title,
+                "description": description,
+                "tone": tone,
+                "timestamp": timestamp,
+            }
+        )
+
+    def upsert_delegation(item: dict[str, Any]) -> None:
+        def status_rank(status: Any) -> int:
+            return {
+                "queued": 0,
+                "started": 1,
+                "running": 2,
+                "paused": 3,
+                "completed": 4,
+                "failed": 4,
+                "cancelled": 4,
+            }.get(str(status or ""), -1)
+
+        def is_generic_label(label: Any) -> bool:
+            return str(label or "") in {"", "Sub-session", "Background task"}
+
+        close_assistant_phase(turn_id)
+        item_id = item.get("id")
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(items)
+                if existing.get("id") == item_id and existing.get("kind") == "delegation"
+            ),
+            None,
+        )
+        if existing_index is None:
+            items.append(_strip_none_values(item))
+            return
+        existing = dict(items[existing_index])
+        incoming = _strip_none_values(item)
+        existing_status = existing.get("status")
+        incoming_status = incoming.get("status")
+        existing_is_terminal = status_rank(existing_status) >= 4
+        incoming_is_non_terminal = status_rank(incoming_status) < 4
+        for key, value in incoming.items():
+            if key == "status":
+                if status_rank(incoming_status) >= status_rank(existing_status):
+                    existing[key] = value
+                continue
+            if key == "result" and status_rank(existing_status) >= 4 and not value:
+                continue
+            if key == "taskLabel":
+                if (
+                    is_generic_label(existing.get("taskLabel")) and not is_generic_label(value)
+                ) or not existing.get("taskLabel"):
+                    existing[key] = value
+                continue
+            if existing_is_terminal and incoming_is_non_terminal:
+                if key in {"agentId", "usedAgentId"} and not existing.get(key):
+                    existing[key] = value
+                continue
+            existing[key] = value
+        items[existing_index] = _strip_none_values(existing)
+
+    def shift_projected_indices(insert_index: int) -> None:
+        for index_by_id in (
+            tool_index_by_call_id,
+            system_notice_index_by_id,
+            open_assistant_index_by_turn,
+        ):
+            for key, index in list(index_by_id.items()):
+                if index >= insert_index:
+                    index_by_id[key] = index + 1
+
+    def find_open_thinking_index(message_id: str) -> int | None:
+        for index in range(len(items) - 1, -1, -1):
+            item = items[index]
+            if item.get("kind") == "thinking" and item.get("messageId") == message_id:
+                return index
+            if item.get("kind") == "message" and item.get("role") == "assistant":
+                if item.get("messageId") != message_id:
+                    return None
+                continue
+            if item.get("kind") == "tool_call":
+                return None
+        return None
+
+    def append_thinking_item(item: dict[str, Any], *, turn_id: str | None) -> None:
+        message_id = item.get("messageId")
+        existing_index = find_open_thinking_index(str(message_id)) if message_id else None
+        if existing_index is not None:
+            existing_blocks = items[existing_index].setdefault("blocks", [])
+            new_blocks = item.get("blocks")
+            if isinstance(existing_blocks, list) and isinstance(new_blocks, list):
+                existing_blocks.extend(new_blocks)
+            return
+        assistant_index = open_assistant_index_by_turn.get(turn_id or "") if turn_id else None
+        if assistant_index is not None and 0 <= assistant_index < len(items):
+            items.insert(assistant_index, _strip_none_values(item))
+            shift_projected_indices(assistant_index)
+            return
+        items.append(_strip_none_values(item))
+
+    for event in events:
+        data = event.data or {}
+        sid, seq, eid = _timeline_event_identity(event)
+        timestamp = event.timestamp
+        turn_id = _project_event_turn_id(data)
+        content = data.get("content") if isinstance(data.get("content"), str) else ""
+        attachments = _project_event_attachments(data)
+
+        if event.type == "user_message":
+            close_assistant_phase(turn_id)
+            item: dict[str, Any] = {
+                "id": f"event:{eid}:user",
+                "kind": "message",
+                "sessionId": sid,
+                "role": "user",
+                "content": content,
+                "seq": seq,
+                "timestamp": timestamp,
+                "turnId": turn_id,
+                "attachments": attachments,
+            }
+            if isinstance(data.get("chat_mode"), str):
+                item["chatMode"] = data["chat_mode"]
+            if isinstance(data.get("chat_mode_source"), str):
+                item["chatModeSource"] = data["chat_mode_source"]
+            items.append(_strip_none_values(item))
+            continue
+
+        if event.type == "assistant_message":
+            if content.strip() or attachments:
+                message_id = (
+                    data.get("message_id") if isinstance(data.get("message_id"), str) else turn_id
+                )
+                existing_index = open_assistant_index_by_turn.get(turn_id or "")
+                existing = (
+                    items[existing_index]
+                    if existing_index is not None
+                    and 0 <= existing_index < len(items)
+                    and items[existing_index].get("kind") == "message"
+                    and items[existing_index].get("role") == "assistant"
+                    else None
+                )
+                if existing is not None and existing.get("messageId") == message_id:
+                    existing_content = existing.get("content")
+                    if isinstance(existing_content, str) and existing_content:
+                        existing["content"] = (
+                            content
+                            if content.startswith(existing_content)
+                            else f"{existing_content}\n\n{content}"
+                        )
+                    else:
+                        existing["content"] = content
+                    existing["seq"] = seq
+                    existing["timestamp"] = timestamp
+                    existing["attachments"] = attachments or existing.get("attachments", [])
+                    if isinstance(data.get("runtime"), dict):
+                        existing["runtime"] = data["runtime"]
+                    if isinstance(data.get("finish_reason"), str):
+                        existing["finishReason"] = data["finish_reason"]
+                    existing["partial"] = data.get("partial") is True
+                    continue
+
+                phase = _next_assistant_phase_index(items, turn_id)
+                item = {
+                    "id": f"event:{eid}:assistant",
+                    "kind": "message",
+                    "sessionId": sid,
+                    "role": "assistant",
+                    "content": content,
+                    "seq": seq,
+                    "timestamp": timestamp,
+                    "turnId": turn_id,
+                    "messageId": message_id,
+                    "attachments": attachments,
+                    "partial": data.get("partial") is True,
+                    "finishReason": data.get("finish_reason")
+                    if isinstance(data.get("finish_reason"), str)
+                    else None,
+                    "assistantPhaseIndex": phase,
+                }
+                if isinstance(data.get("chat_mode"), str):
+                    item["chatMode"] = data["chat_mode"]
+                if isinstance(data.get("chat_mode_source"), str):
+                    item["chatModeSource"] = data["chat_mode_source"]
+                if isinstance(data.get("runtime"), dict):
+                    item["runtime"] = data["runtime"]
+                items.append(_strip_none_values(item))
+                if turn_id:
+                    open_assistant_index_by_turn[turn_id] = len(items) - 1
+            continue
+
+        if event.type == "system_message":
+            close_assistant_phase(turn_id)
+            if not _project_visible_system_message(data):
+                continue
+            message = content or data.get("text")
+            if isinstance(message, str) and message:
+                notice_id = (
+                    data.get("notice_id") if isinstance(data.get("notice_id"), str) else None
+                )
+                item = _strip_none_values(
+                    {
+                        "id": f"system:{notice_id}" if notice_id else f"system:{eid}",
+                        "kind": "system_message",
+                        "text": message,
+                        "noticeId": notice_id,
+                        "noticeKind": data.get("kind")
+                        if isinstance(data.get("kind"), str)
+                        else None,
+                        "noticeScope": data.get("scope")
+                        if isinstance(data.get("scope"), str)
+                        else None,
+                        "timestamp": timestamp,
+                    }
+                )
+                if notice_id and notice_id in system_notice_index_by_id:
+                    items[system_notice_index_by_id[notice_id]] = item
+                else:
+                    if notice_id:
+                        system_notice_index_by_id[notice_id] = len(items)
+                    items.append(item)
+            continue
+
+        if event.type == "tool_call":
+            close_assistant_phase(turn_id)
+            tool_name = str(data.get("name") or data.get("tool_name") or "unknown")
+            if tool_name in {"delegate", "fork"}:
+                continue
+            call_id = str(data.get("call_id") or f"tc-{eid}")
+            arguments = data.get("arguments")
+            visible_name = data.get("visible_name")
+            canonical_name = data.get("canonical_name")
+            item = {
+                "id": f"tool:{call_id}",
+                "kind": "tool_call",
+                "callId": call_id,
+                "sessionId": sid,
+                "turnId": turn_id,
+                "toolName": tool_name,
+                "status": data.get("status") if isinstance(data.get("status"), str) else "started",
+                "timestamp": timestamp,
+            }
+            if isinstance(visible_name, str) and visible_name:
+                item["displayToolName"] = visible_name
+            if isinstance(canonical_name, str) and canonical_name:
+                item["canonicalToolName"] = canonical_name
+            if isinstance(arguments, dict):
+                item["arguments"] = arguments
+            elif isinstance(arguments, str):
+                try:
+                    parsed_arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    parsed_arguments = None
+                item["arguments"] = (
+                    parsed_arguments if isinstance(parsed_arguments, dict) else {"_raw": arguments}
+                )
+            tool_index_by_call_id[call_id] = len(items)
+            items.append(_strip_none_values(item))
+            continue
+
+        if event.type == "tool_result":
+            close_assistant_phase(turn_id)
+            call_id = str(data.get("call_id") or f"tc-{eid}")
+            existing_index = tool_index_by_call_id.get(call_id)
+            base: dict[str, Any]
+            if existing_index is not None and 0 <= existing_index < len(items):
+                base = dict(items[existing_index])
+            else:
+                base = {
+                    "id": f"tool:{call_id}",
+                    "kind": "tool_call",
+                    "callId": call_id,
+                    "sessionId": sid,
+                    "toolName": str(data.get("name") or data.get("tool_name") or "unknown"),
+                    "timestamp": timestamp,
+                    "reconstructed": True,
+                }
+                tool_index_by_call_id[call_id] = len(items)
+                items.append(base)
+                existing_index = len(items) - 1
+            base.update(
+                {
+                    "turnId": base.get("turnId") or turn_id,
+                    "sessionId": base.get("sessionId") or sid,
+                    "status": "failed" if data.get("is_error") else "completed",
+                    "result": data.get("result") if isinstance(data.get("result"), str) else None,
+                    "isError": data.get("is_error")
+                    if isinstance(data.get("is_error"), bool)
+                    else None,
+                    "durationMs": _project_number(data.get("duration_ms")),
+                    "attachments": _project_event_attachments(data) or base.get("attachments"),
+                    "fileDiffs": data.get("file_diffs")
+                    if isinstance(data.get("file_diffs"), list)
+                    else base.get("fileDiffs"),
+                    "outputSize": data.get("output_size")
+                    if isinstance(data.get("output_size"), int)
+                    else None,
+                    "truncated": data.get("truncated")
+                    if isinstance(data.get("truncated"), bool)
+                    else None,
+                    "agentVisibleTruncated": data.get("agent_visible_truncated")
+                    if isinstance(data.get("agent_visible_truncated"), bool)
+                    else None,
+                    "transportTruncated": data.get("transport_truncated")
+                    if isinstance(data.get("transport_truncated"), bool)
+                    else None,
+                    "hasFullOutput": data.get("has_full_output")
+                    if isinstance(data.get("has_full_output"), bool)
+                    else None,
+                    "recoveryCallId": data.get("recovery_call_id")
+                    if isinstance(data.get("recovery_call_id"), str)
+                    else None,
+                    "toolOutputArtifactId": data.get("tool_output_artifact_id")
+                    if isinstance(data.get("tool_output_artifact_id"), str)
+                    else None,
+                    "anchorsAvailable": data.get("anchors_available")
+                    if isinstance(data.get("anchors_available"), bool)
+                    else None,
+                    "anchorCount": data.get("anchor_count")
+                    if isinstance(data.get("anchor_count"), int)
+                    else None,
+                    "evaluation": data.get("evaluation")
+                    if isinstance(data.get("evaluation"), dict)
+                    else None,
+                    "tool_output_presentation": data.get("tool_output_presentation")
+                    if isinstance(data.get("tool_output_presentation"), dict)
+                    else None,
+                }
+            )
+            items[existing_index] = _strip_none_values(base)
+            continue
+
+        if event.type == "history_gap":
+            close_assistant_phase(turn_id)
+            reason = str(data.get("reason") or "unknown")
+            descriptions = {
+                "stream_missing": "A session event stream was missing in Intaris, so part of this history could not be loaded.",
+                "read_failed": "A session event stream could not be read from Intaris, so part of this history may be incomplete.",
+                "lineage_truncated": "Older conversation lineage was truncated during history bootstrap. Load the session directly for more detail.",
+                "bootstrap_cap_reached": "History bootstrap reached the configured safety cap. Refresh or inspect the session directly to load more.",
+            }
+            items.append(
+                {
+                    "id": f"history-gap:{eid}:{reason}",
+                    "kind": "notice",
+                    "title": "History incomplete",
+                    "description": descriptions.get(
+                        reason,
+                        "Some persisted history could not be loaded completely.",
+                    ),
+                    "tone": "warning",
+                    "timestamp": timestamp,
+                }
+            )
+            continue
+
+        if event.type == "compaction_summary":
+            close_assistant_phase(turn_id)
+            marker_role = (
+                data.get("marker_role") if isinstance(data.get("marker_role"), str) else None
+            )
+            method = data.get("method") if isinstance(data.get("method"), str) else "unknown"
+            if (
+                data.get("timeline_visible") is False
+                or marker_role == "context_seed"
+                or method == "rotation"
+            ):
+                continue
+            summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+            session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else sid
+            source_session_id = (
+                data.get("source_session_id")
+                if isinstance(data.get("source_session_id"), str)
+                else None
+            )
+            items.append(
+                _strip_none_values(
+                    {
+                        "id": f"compaction:{source_session_id}:{session_id}"
+                        if session_id and source_session_id
+                        else f"compaction:{eid}",
+                        "kind": "compaction",
+                        "status": "compacted",
+                        "sessionId": session_id,
+                        "previousSessionId": source_session_id,
+                        "summaryPreview": summary[:500],
+                        "summary": summary,
+                        "method": method,
+                        "turnsCompacted": data.get("turns_compacted")
+                        if isinstance(data.get("turns_compacted"), int)
+                        else 0,
+                        "trigger": data.get("trigger")
+                        if isinstance(data.get("trigger"), str)
+                        else None,
+                        "reason": data.get("reason")
+                        if isinstance(data.get("reason"), str)
+                        else None,
+                        "previousUsagePercentage": _project_number(
+                            data.get("previous_usage_percentage")
+                        ),
+                        "effectiveUsagePercentage": _project_number(
+                            data.get("effective_usage_percentage")
+                        ),
+                        "hardPressureExceeded": data.get("hard_pressure_exceeded") is True,
+                        "usedTimeoutFallback": data.get("used_timeout_fallback") is True,
+                        "timestamp": timestamp,
+                    }
+                )
+            )
+            continue
+
+        if event.type in {
+            "workflow_composed",
+        }:
+            close_assistant_phase(turn_id)
+            workflow_id = str(data.get("workflow_id") or "")
+            items.append(
+                _strip_none_values(
+                    {
+                        "id": f"workflow-composed:{eid}",
+                        "kind": "workflow_composed",
+                        "workflowId": workflow_id,
+                        "workflowName": str(data.get("workflow_name") or workflow_id or "Workflow"),
+                        "lifecycle": str(data.get("lifecycle") or "ephemeral"),
+                        "taskId": data.get("task_id")
+                        if isinstance(data.get("task_id"), str)
+                        else None,
+                        "scheduleId": data.get("schedule_id")
+                        if isinstance(data.get("schedule_id"), str)
+                        else None,
+                        "steps": [step for step in data.get("steps", []) if isinstance(step, str)]
+                        if isinstance(data.get("steps"), list)
+                        else [],
+                        "timestamp": timestamp,
+                    }
+                )
+            )
+            continue
+
+        if event.type == "assistant_thinking":
+            thinking_content = data.get("content") if isinstance(data.get("content"), str) else ""
+            thinking_source = (
+                data.get("reasoning_source")
+                if isinstance(data.get("reasoning_source"), str)
+                else "summary"
+            )
+            thinking_title = (
+                data.get("title")
+                if isinstance(data.get("title"), str) and data.get("title")
+                else "Thinking"
+            )
+            if (
+                thinking_source == "reasoning"
+                and thinking_title == "Reasoning"
+                and thinking_content.lstrip().startswith("User message")
+            ):
+                continue
+            message_id = (
+                data.get("message_id")
+                if isinstance(data.get("message_id"), str)
+                else turn_id or eid
+            )
+            block_id = (
+                data.get("block_id") if isinstance(data.get("block_id"), str) else f"thk_{eid}"
+            )
+            append_thinking_item(
+                _strip_none_values(
+                    {
+                        "id": f"thinking:{message_id}:{block_id}",
+                        "kind": "thinking",
+                        "sessionId": sid,
+                        "messageId": message_id,
+                        "turnId": turn_id,
+                        "blocks": [
+                            _strip_none_values(
+                                {
+                                    "block_id": block_id,
+                                    "title": thinking_title,
+                                    "content": thinking_content,
+                                    "source": thinking_source,
+                                    "complete": True,
+                                    "startedAt": data.get("started_at")
+                                    if isinstance(data.get("started_at"), str)
+                                    else None,
+                                    "completedAt": data.get("completed_at")
+                                    if isinstance(data.get("completed_at"), str)
+                                    else None,
+                                    "durationMs": _project_number(data.get("duration_ms")),
+                                    "providerBlockIndex": data.get("provider_block_index")
+                                    if isinstance(data.get("provider_block_index"), int)
+                                    else None,
+                                }
+                            )
+                        ],
+                        "streaming": False,
+                        "activeTitle": None,
+                        "timestamp": timestamp,
+                    }
+                ),
+                turn_id=turn_id,
+            )
+            continue
+
+        if event.type == "reasoning":
+            # Generic Intaris reasoning records are searchable diagnostics, not
+            # assistant-visible thinking. Provider/model thinking is persisted
+            # as assistant_thinking and projected above.
+            continue
+
+        if event.type == "developer_message":
+            continue
+
+        if event.type == "context_snapshot":
+            continue
+
+        if event.type == "delegation":
+            child_id = str(data.get("child_session_id") or data.get("call_id") or f"del-{eid}")
+            status = str(data.get("status") or "started")
+            if status == "success":
+                status = "completed"
+            elif status not in {
+                "queued",
+                "started",
+                "running",
+                "completed",
+                "failed",
+                "cancelled",
+                "paused",
+            }:
+                status = "started"
+            result = None
+            if status == "completed":
+                result = data.get("result_summary") or data.get("result_content")
+            elif status == "failed":
+                result = data.get("error") or "Failed"
+            upsert_delegation(
+                {
+                    "id": f"delegation:{child_id}",
+                    "kind": "delegation",
+                    "taskId": child_id,
+                    "taskLabel": str(
+                        data.get("label")
+                        or data.get("title")
+                        or data.get("task_title")
+                        or data.get("task")
+                        or "Sub-session"
+                    ),
+                    "agentId": data.get("agent_id")
+                    if isinstance(data.get("agent_id"), str)
+                    else None,
+                    "usedAgentId": data.get("used_agent_id")
+                    if isinstance(data.get("used_agent_id"), str)
+                    else None,
+                    "status": status,
+                    "result": str(result) if result else None,
+                    "timestamp": timestamp,
+                    "todos": data.get("todos") if isinstance(data.get("todos"), list) else None,
+                    "toolCallCount": data.get("tool_call_count")
+                    if isinstance(data.get("tool_call_count"), int)
+                    else data.get("toolCallCount")
+                    if isinstance(data.get("toolCallCount"), int)
+                    else None,
+                    "maxToolCalls": data.get("max_tool_calls")
+                    if isinstance(data.get("max_tool_calls"), int)
+                    else data.get("maxToolCalls")
+                    if isinstance(data.get("maxToolCalls"), int)
+                    else None,
+                    "lastTool": data.get("last_tool")
+                    if isinstance(data.get("last_tool"), str)
+                    else data.get("lastTool")
+                    if isinstance(data.get("lastTool"), str)
+                    else None,
+                }
+            )
+            continue
+
+        if event.type in {"task_result", "task_failed", "task_cancelled"}:
+            task_id = str(data.get("task_id") or eid)
+            status = {
+                "task_result": "completed",
+                "task_failed": "failed",
+                "task_cancelled": "cancelled",
+            }[event.type]
+            upsert_delegation(
+                {
+                    "id": f"delegation:{task_id}",
+                    "kind": "delegation",
+                    "taskId": task_id,
+                    "taskLabel": str(
+                        data.get("task_title") or data.get("task_id") or "Background task"
+                    ),
+                    "agentId": data.get("agent_id")
+                    if isinstance(data.get("agent_id"), str)
+                    else None,
+                    "usedAgentId": data.get("used_agent_id")
+                    if isinstance(data.get("used_agent_id"), str)
+                    else None,
+                    "status": status,
+                    "result": data.get("result_summary")
+                    if isinstance(data.get("result_summary"), str)
+                    else None,
+                    "toolCallCount": data.get("tool_call_count")
+                    if isinstance(data.get("tool_call_count"), int)
+                    else data.get("toolCallCount")
+                    if isinstance(data.get("toolCallCount"), int)
+                    else None,
+                    "maxToolCalls": data.get("max_tool_calls")
+                    if isinstance(data.get("max_tool_calls"), int)
+                    else data.get("maxToolCalls")
+                    if isinstance(data.get("maxToolCalls"), int)
+                    else None,
+                    "lastTool": data.get("last_tool")
+                    if isinstance(data.get("last_tool"), str)
+                    else data.get("lastTool")
+                    if isinstance(data.get("lastTool"), str)
+                    else None,
+                    "timestamp": timestamp,
+                }
+            )
+            continue
+
+        if event.type == "lifecycle":
+            lifecycle_event = str(data.get("event") or "")
+            if lifecycle_event in {"task_result", "task_failed", "task_cancelled"}:
+                task_id = str(data.get("task_id") or eid)
+                status = {
+                    "task_result": "completed",
+                    "task_failed": "failed",
+                    "task_cancelled": "cancelled",
+                }[lifecycle_event]
+                upsert_delegation(
+                    {
+                        "id": f"delegation:{task_id}",
+                        "kind": "delegation",
+                        "taskId": task_id,
+                        "taskLabel": str(
+                            data.get("title")
+                            or data.get("task_title")
+                            or data.get("task_id")
+                            or "Background task"
+                        ),
+                        "agentId": data.get("agent_id")
+                        if isinstance(data.get("agent_id"), str)
+                        else None,
+                        "usedAgentId": data.get("used_agent_id")
+                        if isinstance(data.get("used_agent_id"), str)
+                        else None,
+                        "status": status,
+                        "result": data.get("result_summary")
+                        if isinstance(data.get("result_summary"), str)
+                        else None,
+                        "timestamp": timestamp,
+                    }
+                )
+            elif lifecycle_event == "system_notice":
+                message = data.get("message") if isinstance(data.get("message"), str) else ""
+                if message:
+                    close_assistant_phase(turn_id)
+                    notice_id = (
+                        data.get("notice_id") if isinstance(data.get("notice_id"), str) else None
+                    )
+                    item = _strip_none_values(
+                        {
+                            "id": f"system:{notice_id}" if notice_id else f"system:{eid}",
+                            "kind": "system_message",
+                            "text": message,
+                            "noticeId": notice_id,
+                            "noticeKind": data.get("kind")
+                            if isinstance(data.get("kind"), str)
+                            else None,
+                            "noticeScope": data.get("scope")
+                            if isinstance(data.get("scope"), str)
+                            else None,
+                            "timestamp": timestamp,
+                        }
+                    )
+                    if notice_id and notice_id in system_notice_index_by_id:
+                        items[system_notice_index_by_id[notice_id]] = item
+                    else:
+                        if notice_id:
+                            system_notice_index_by_id[notice_id] = len(items)
+                        items.append(item)
+            elif lifecycle_event == "workflow_composed":
+                close_assistant_phase(turn_id)
+                workflow_id = str(data.get("workflow_id") or "")
+                items.append(
+                    _strip_none_values(
+                        {
+                            "id": f"workflow-composed:{eid}",
+                            "kind": "workflow_composed",
+                            "workflowId": workflow_id,
+                            "workflowName": str(
+                                data.get("workflow_name") or workflow_id or "Workflow"
+                            ),
+                            "lifecycle": str(data.get("lifecycle") or "ephemeral"),
+                            "taskId": data.get("task_id")
+                            if isinstance(data.get("task_id"), str)
+                            else None,
+                            "scheduleId": data.get("schedule_id")
+                            if isinstance(data.get("schedule_id"), str)
+                            else None,
+                            "steps": [
+                                step for step in data.get("steps", []) if isinstance(step, str)
+                            ]
+                            if isinstance(data.get("steps"), list)
+                            else [],
+                            "timestamp": timestamp,
+                        }
+                    )
+                )
+            elif lifecycle_event in {
+                "intention_updated",
+                "intention_cleared",
+                "session_created",
+                "session_status_changed",
+                "tool_discovery",
+            }:
+                continue
+            else:
+                append_notice(
+                    item_id=f"event-notice:{eid}",
+                    title="Conversation event",
+                    description=f"Lifecycle event: {lifecycle_event or 'unknown'}",
+                    timestamp=timestamp,
+                )
+            continue
+
+        if event.type == "evaluation":
+            eval_event = str(data.get("event") or "")
+            if eval_event == "evaluation_feedback":
+                decision = str(data.get("decision") or "unknown")
+                feedback = str(data.get("feedback") or "")
+                attempt = data.get("attempt") if data.get("attempt") is not None else "?"
+                tone = (
+                    "info"
+                    if decision in {"approved", "approve"}
+                    else "error"
+                    if decision in {"failed", "reject"}
+                    else "warning"
+                )
+                append_notice(
+                    item_id=f"eval:{eid}",
+                    title=f"Step Evaluation (attempt {attempt})",
+                    description=f"{decision} — {feedback}",
+                    timestamp=timestamp,
+                    tone=tone,
+                )
+            else:
+                continue
+            continue
+
+        if event.type == "session_recovered":
+            close_assistant_phase(turn_id)
+            session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else eid
+            items.append(
+                {
+                    "id": f"session-recovered:{session_id}",
+                    "kind": "system_message",
+                    "text": "The controller recovered this conversation after a restart.",
+                    "timestamp": timestamp,
+                }
+            )
+            continue
+
+        append_notice(
+            item_id=f"event-notice:{eid}",
+            title="Conversation event",
+            description=f"Unsupported persisted event: {event.type}",
+            timestamp=timestamp,
+        )
+
+    return items
+
+
+def project_timeline_events(events: list[MessageEventResponse]) -> list[dict[str, Any]]:
+    """Project message events into canonical timeline items."""
+
+    return _project_timeline_events(events)
 
 
 def _event_timestamp(event: dict[str, Any]) -> datetime:
@@ -253,7 +1123,11 @@ async def _conversation_response(
     async with request.app.state.session_factory() as session:
         if getattr(row, "active_session_id", None):
             active_session = await get_session_row(session, row.active_session_id)
-        if getattr(row, "context_type", None) in {"agent_work", "managed_agent_conversation"}:
+        row_platform_data = getattr(row, "context_data", None) or {}
+        if getattr(row, "context_type", None) in {
+            "agent_work",
+            "managed_agent_conversation",
+        } or row_platform_data.get("kind") in {"agent_work", "managed_agent_conversation"}:
             managed_link = await get_managed_conversation_link_for_target(
                 session,
                 row.conversation_id,
@@ -326,6 +1200,256 @@ def _agent_direct_sort_key(item: AgentDirectChatResponse) -> datetime:
     )
 
 
+async def _conversation_page_projection(
+    request: Request,
+    *,
+    user_email: str,
+    cursor: str | None = None,
+    limit: int,
+    context_type: str | None = None,
+    agent_id: str | None = None,
+    project_id: str | None = None,
+    status: str = "active",
+    include_agent_direct: bool = False,
+) -> CursorPage[ConversationResponse]:
+    cursor_payload = decode_cursor(cursor)
+    cursor_id = str(cursor_payload.get("id", "")) if cursor_payload is not None else None
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    async with request.app.state.session_factory() as session:
+        rows = await list_conversations(
+            session,
+            user_email,
+            context_type=context_type,
+            agent_id=agent_id,
+            project_id=project_id,
+            status=status,
+            include_agent_direct=include_agent_direct,
+            cursor_id=cursor_id,
+            limit=limit + 1,
+        )
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        active_sessions, pending_notifications = await _conversation_attention_context(
+            session,
+            page_rows,
+            user_email,
+        )
+        active_turn_states = (
+            {
+                row.conversation_id: turn_scheduler.running_turn_state(row.conversation_id)
+                for row in page_rows
+            }
+            if turn_scheduler is not None
+            else {row.conversation_id: None for row in page_rows}
+        )
+        conversation_states = {}
+        managed_links = {}
+        for row in page_rows:
+            if active_turn_states.get(row.conversation_id) is not None:
+                snapshot = await snapshot_for_conversation(
+                    session,
+                    user_email=user_email,
+                    conversation_id=row.conversation_id,
+                    turn_scheduler=turn_scheduler,
+                )
+                if snapshot is not None:
+                    conversation_states[row.conversation_id] = snapshot
+            if (row.context_data or {}).get("kind") in {"agent_work", "managed_agent_conversation"}:
+                link = await get_managed_conversation_link_for_target(
+                    session,
+                    row.conversation_id,
+                    user_email=user_email,
+                )
+                if link is not None:
+                    managed_links[row.conversation_id] = link
+    items: list[ConversationResponse] = []
+    for row in page_rows:
+        active_turn_state = active_turn_states.get(row.conversation_id)
+        items.append(
+            conversation_to_response(
+                row,
+                has_active_turn=active_turn_state is not None,
+                active_session=active_sessions.get(row.active_session_id),
+                active_turn_state=active_turn_state,
+                pending_notification_types=pending_notifications.get(row.conversation_id, []),
+                conversation_state=conversation_states.get(row.conversation_id),
+                managed_link=managed_links.get(row.conversation_id),
+            )
+        )
+    next_cursor = encode_cursor({"id": items[-1].conversation_id}) if has_more and items else None
+    return CursorPage(items=items, cursor=next_cursor, has_more=has_more)
+
+
+def _is_openable_chat_conversation(
+    conversation: Any,
+    *,
+    user_email: str,
+    agent_id: str,
+    context_type: str,
+    agent_profile_id: str | None = None,
+) -> bool:
+    platform_data = conversation.context_data or {}
+    return (
+        conversation.user_email == user_email
+        and conversation.agent_id == agent_id
+        and (agent_profile_id is None or conversation.agent_profile_id == agent_profile_id)
+        and conversation.status == "active"
+        and conversation.context_type == context_type
+        and platform_data.get("kind") != "agent_direct"
+    )
+
+
+def _chat_last_opened_scope_key(
+    *,
+    agent_id: str,
+    context_type: str,
+    agent_profile_id: str | None,
+) -> str:
+    return f"{agent_id}\x1f{agent_profile_id or ''}\x1f{context_type}"
+
+
+def _chat_last_opened_state_key(
+    *,
+    agent_id: str,
+    context_type: str,
+    agent_profile_id: str | None,
+) -> str:
+    return (
+        f"{_CHAT_LAST_OPENED_UI_STATE_PREFIX}:"
+        f"{_chat_last_opened_scope_key(agent_id=agent_id, context_type=context_type, agent_profile_id=agent_profile_id)}"
+    )
+
+
+def _chat_last_opened_conversation_id(state: dict[str, Any] | None) -> str | None:
+    if not state:
+        return None
+    conversation_id = state.get("conversation_id")
+    return conversation_id if isinstance(conversation_id, str) and conversation_id else None
+
+
+async def _remember_chat_last_opened(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    agent_id: str,
+    context_type: str,
+    agent_profile_id: str | None,
+    conversation_id: str,
+) -> None:
+    scope_keys = [
+        _chat_last_opened_state_key(
+            agent_id=agent_id,
+            context_type=context_type,
+            agent_profile_id=agent_profile_id,
+        )
+    ]
+    if agent_profile_id is not None:
+        scope_keys.append(
+            _chat_last_opened_state_key(
+                agent_id=agent_id,
+                context_type=context_type,
+                agent_profile_id=None,
+            )
+        )
+    for scope_key in scope_keys:
+        await upsert_user_ui_state(
+            session,
+            user_email,
+            scope_key,
+            {
+                "conversation_id": conversation_id,
+                "agent_id": agent_id,
+                "agent_profile_id": agent_profile_id,
+                "context_type": context_type,
+            },
+        )
+
+
+async def _agent_direct_chat_projection(
+    request: Request,
+    *,
+    user_email: str,
+    agent_id: str | None = None,
+    status: str = "active",
+) -> list[AgentDirectChatResponse]:
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    rows: list[tuple[Any, Any]] = []
+    async with request.app.state.session_factory() as session:
+        visible_agents = await list_visible_agents(session, user_email)
+        for agent, _grant in visible_agents:
+            if agent.agent_type != "primary" or agent.status != "active":
+                continue
+            if agent_id is not None and agent.agent_id != agent_id:
+                continue
+            existing = await get_agent_direct_conversation(session, user_email, agent.agent_id)
+            rows.append((agent, existing))
+        active_sessions, pending_notifications = await _conversation_attention_context(
+            session,
+            [conversation for _agent, conversation in rows if conversation is not None],
+            user_email,
+        )
+        active_turn_states = (
+            {
+                conversation.conversation_id: turn_scheduler.running_turn_state(
+                    conversation.conversation_id
+                )
+                for _agent, conversation in rows
+                if conversation is not None
+            }
+            if turn_scheduler is not None
+            else {
+                conversation.conversation_id: None
+                for _agent, conversation in rows
+                if conversation is not None
+            }
+        )
+        conversation_states = {}
+        for _agent, conversation in rows:
+            if conversation is None:
+                continue
+            if active_turn_states.get(conversation.conversation_id) is None:
+                continue
+            snapshot = await snapshot_for_conversation(
+                session,
+                user_email=user_email,
+                conversation_id=conversation.conversation_id,
+                turn_scheduler=turn_scheduler,
+            )
+            if snapshot is not None:
+                conversation_states[conversation.conversation_id] = snapshot
+
+    responses: list[AgentDirectChatResponse] = []
+    for agent, conversation in rows:
+        if conversation is None:
+            continue
+        if status == "active" and conversation.status != "active":
+            continue
+        if status == "archived" and conversation.status != "archived":
+            continue
+        if status == "starred" and not conversation.starred_at:
+            continue
+        active_turn_state = active_turn_states.get(conversation.conversation_id)
+        responses.append(
+            AgentDirectChatResponse(
+                agent=agent_to_response(agent),
+                conversation=conversation_to_response(
+                    conversation,
+                    has_active_turn=active_turn_state is not None,
+                    active_session=active_sessions.get(conversation.active_session_id),
+                    active_turn_state=active_turn_state,
+                    pending_notification_types=pending_notifications.get(
+                        conversation.conversation_id,
+                        [],
+                    ),
+                    conversation_state=conversation_states.get(conversation.conversation_id),
+                ),
+            )
+        )
+
+    responses.sort(key=_agent_direct_sort_key, reverse=True)
+    return responses
+
+
 async def _hydrate_event_attachments(
     request: Request,
     events: list[dict[str, Any]],
@@ -366,45 +1490,34 @@ async def conversation_list(
     include_agent_direct: bool = Query(default=False),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
-    async with request.app.state.session_factory() as session:
-        rows = await list_conversations(
-            session,
-            user.email,
-            context_type=context_type,
-            agent_id=agent_id,
-            project_id=project_id,
-            status=status,
-            include_agent_direct=include_agent_direct,
-        )
-        active_sessions, pending_notifications = await _conversation_attention_context(
-            session,
-            rows,
-            user.email,
-        )
-    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    items: list[ConversationResponse] = []
-    for row in rows:
-        active_turn_state = (
-            turn_scheduler.running_turn_state(row.conversation_id)
-            if turn_scheduler is not None
-            else None
-        )
-        items.append(
-            conversation_to_response(
-                row,
-                has_active_turn=active_turn_state is not None,
-                active_session=active_sessions.get(row.active_session_id),
-                active_turn_state=active_turn_state,
-                pending_notification_types=pending_notifications.get(row.conversation_id, []),
-            )
-        )
-    page_items, next_cursor, has_more = paginate_items(
-        items,
-        limit=limit,
+    return await _conversation_page_projection(
+        request,
+        user_email=user.email,
         cursor=cursor,
-        get_item_id=lambda item: item.conversation_id,
+        limit=limit,
+        context_type=context_type,
+        agent_id=agent_id,
+        project_id=project_id,
+        status=status,
+        include_agent_direct=include_agent_direct,
     )
-    return CursorPage(items=page_items, cursor=next_cursor, has_more=has_more)
+
+
+@router.get("/context-types", response_model=list[str])
+async def conversation_context_types(
+    request: Request,
+    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+) -> list[str]:
+    """Return distinct conversation context types for sidebar filters."""
+
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        return await list_conversation_context_types(
+            session,
+            user.email,
+            status=status,
+            include_agent_direct=False,
+        )
 
 
 @router.get("/agent-direct", response_model=list[AgentDirectChatResponse])
@@ -416,56 +1529,186 @@ async def agent_direct_chats(
     """Return sticky web direct chats for visible primary agents."""
 
     user = require_current_user(request)
-    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    rows: list[tuple[Any, Any]] = []
+    return await _agent_direct_chat_projection(
+        request,
+        user_email=user.email,
+        agent_id=agent_id,
+        status=status,
+    )
+
+
+@router.get("/sidebar", response_model=SidebarProjectionResponse)
+async def sidebar_projection(
+    request: Request,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    context_type: str | None = Query(default=None),
+    agent_id: str | None = Query(default=None),
+    project_id: str | None = Query(default=None),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+) -> SidebarProjectionResponse:
+    """Return the UI-shaped sidebar projection in one request."""
+
+    user = require_current_user(request)
+    agents = [
+        agent_to_response(agent)
+        for agent in await request.app.state.agent_registry.list_all(
+            owner_email=user.email,
+            include_hidden=False,
+            include_system=True,
+            include_disabled=False,
+        )
+    ]
+    conversations = await _conversation_page_projection(
+        request,
+        user_email=user.email,
+        cursor=cursor,
+        limit=limit,
+        context_type=context_type,
+        agent_id=agent_id,
+        project_id=project_id,
+        status=status,
+        include_agent_direct=False,
+    )
+    direct_chats = (
+        await _agent_direct_chat_projection(
+            request,
+            user_email=user.email,
+            agent_id=agent_id,
+            status="active",
+        )
+        if context_type in {None, "web"}
+        else []
+    )
     async with request.app.state.session_factory() as session:
-        visible_agents = await list_visible_agents(session, user.email)
-        for agent, _grant in visible_agents:
-            if agent.agent_type != "primary" or agent.status != "active":
-                continue
-            if agent_id is not None and agent.agent_id != agent_id:
-                continue
-            existing = await get_agent_direct_conversation(session, user.email, agent.agent_id)
-            rows.append((agent, existing))
-        active_sessions, pending_notifications = await _conversation_attention_context(
+        context_types = await list_conversation_context_types(
             session,
-            [conversation for _agent, conversation in rows if conversation is not None],
             user.email,
+            status=status,
+            include_agent_direct=False,
         )
+    return SidebarProjectionResponse(
+        agents=agents,
+        agent_direct_chats=direct_chats,
+        conversations=conversations,
+        context_types=context_types,
+    )
 
-    responses: list[AgentDirectChatResponse] = []
-    for agent, conversation in rows:
-        if conversation is None:
-            continue
-        if status == "active" and conversation.status != "active":
-            continue
-        if status == "archived" and conversation.status != "archived":
-            continue
-        if status == "starred" and not conversation.starred_at:
-            continue
-        active_turn_state = (
-            turn_scheduler.running_turn_state(conversation.conversation_id)
-            if turn_scheduler is not None
-            else None
-        )
-        responses.append(
-            AgentDirectChatResponse(
-                agent=agent_to_response(agent),
-                conversation=conversation_to_response(
-                    conversation,
-                    has_active_turn=active_turn_state is not None,
-                    active_session=active_sessions.get(conversation.active_session_id),
-                    active_turn_state=active_turn_state,
-                    pending_notification_types=pending_notifications.get(
-                        conversation.conversation_id,
-                        [],
-                    ),
-                ),
-            )
-        )
 
-    responses.sort(key=_agent_direct_sort_key, reverse=True)
-    return responses
+@router.post("/open", response_model=ConversationResponse)
+async def open_conversation(
+    request: Request,
+    payload: ConversationOpenRequest,
+) -> ConversationResponse:
+    """Resolve the best chat conversation to open for the selected agent/channel.
+
+    Browser-local last-opened IDs are treated only as ordered hints. The server
+    validates each hint against ownership, selected agent, context, active
+    status, and direct-chat exclusion before falling back to latest/create.
+    """
+    user = require_current_user(request)
+    context_type = payload.context_type or "web"
+    async with request.app.state.session_factory() as session:
+        agent = await get_agent(session, payload.agent_id)
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        await check_agent_access(request, agent, required="use")
+        agent_definition = _agent_definition_from_row(agent)
+        try:
+            resolve_agent_profile(agent_definition, payload.agent_profile_id, source="api")
+        except ValueError as exc:
+            raise api_exception(400, "invalid_agent_profile", str(exc)) from exc
+
+        async def return_opened(conversation: Any) -> ConversationResponse:
+            if user.role != "viewer":
+                await _remember_chat_last_opened(
+                    session,
+                    user_email=user.email,
+                    agent_id=payload.agent_id,
+                    context_type=context_type,
+                    agent_profile_id=payload.agent_profile_id,
+                    conversation_id=conversation.conversation_id,
+                )
+                await session.commit()
+            return await _conversation_response(request, conversation)
+
+        seen_candidates: set[str] = set()
+        persisted_state_key = _chat_last_opened_state_key(
+            agent_id=payload.agent_id,
+            context_type=context_type,
+            agent_profile_id=payload.agent_profile_id,
+        )
+        persisted_state = await get_user_ui_state_value(
+            session,
+            user.email,
+            persisted_state_key,
+        )
+        candidate_conversation_ids: list[str] = []
+        persisted_conversation_id = _chat_last_opened_conversation_id(persisted_state)
+        if persisted_conversation_id:
+            candidate_conversation_ids.append(persisted_conversation_id)
+        candidate_conversation_ids.extend(payload.candidate_conversation_ids)
+
+        for conversation_id in candidate_conversation_ids[:10]:
+            conversation_id = conversation_id.strip()
+            if not conversation_id or conversation_id in seen_candidates:
+                continue
+            seen_candidates.add(conversation_id)
+            candidate = await get_conversation(session, conversation_id)
+            if candidate is None:
+                continue
+            if _is_openable_chat_conversation(
+                candidate,
+                user_email=user.email,
+                agent_id=payload.agent_id,
+                context_type=context_type,
+                agent_profile_id=payload.agent_profile_id,
+            ):
+                return await return_opened(candidate)
+
+        fallback_rows = await list_conversations(
+            session,
+            user.email,
+            context_type=context_type,
+            agent_id=payload.agent_id,
+            status="active",
+            include_agent_direct=False,
+            limit=1 if payload.agent_profile_id is None else None,
+        )
+        for existing in fallback_rows:
+            if _is_openable_chat_conversation(
+                existing,
+                user_email=user.email,
+                agent_id=payload.agent_id,
+                context_type=context_type,
+                agent_profile_id=payload.agent_profile_id,
+            ):
+                return await return_opened(existing)
+
+    forbid_mutation_for_viewer(request)
+    context_ref = f"{context_type}:user:{user.email}:default"
+    conversation = await request.app.state.session_manager.create_conversation(
+        user_email=user.email,
+        agent_id=payload.agent_id,
+        agent_profile_id=payload.agent_profile_id,
+        context=ConversationContext(
+            type=context_type,
+            ref=context_ref,
+            platform_data={},
+            memory_labels={},
+        ),
+    )
+    async with request.app.state.session_factory() as session:
+        await _remember_chat_last_opened(
+            session,
+            user_email=user.email,
+            agent_id=payload.agent_id,
+            context_type=context_type,
+            agent_profile_id=payload.agent_profile_id,
+            conversation_id=conversation.conversation_id,
+        )
+        await session.commit()
+    return await _conversation_response(request, conversation)
 
 
 @router.post("/resolve", response_model=ConversationResponse)
@@ -574,6 +1817,34 @@ async def conversation_detail(request: Request, conversation_id: str) -> Convers
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
     row = _require_visible_conversation(request, row)
+    return await _conversation_response(request, row)
+
+
+@router.post("/{conversation_id}/opened", response_model=ConversationResponse)
+async def remember_opened_conversation(
+    request: Request,
+    conversation_id: str,
+) -> ConversationResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_conversation(session, conversation_id)
+        row = _require_visible_conversation(request, row)
+        if user.role != "viewer" and _is_openable_chat_conversation(
+            row,
+            user_email=user.email,
+            agent_id=row.agent_id,
+            context_type=row.context_type,
+            agent_profile_id=row.agent_profile_id,
+        ):
+            await _remember_chat_last_opened(
+                session,
+                user_email=user.email,
+                agent_id=row.agent_id,
+                context_type=row.context_type,
+                agent_profile_id=row.agent_profile_id,
+                conversation_id=row.conversation_id,
+            )
+            await session.commit()
     return await _conversation_response(request, row)
 
 
@@ -1114,6 +2385,30 @@ async def conversation_messages(
         history_truncated=history_truncated,
         truncation_reason=truncation_reason,
         state_snapshot=state_snapshot,
+    )
+
+
+@router.get("/{conversation_id}/timeline", response_model=TimelineProjectionResponse)
+async def conversation_timeline(
+    request: Request,
+    conversation_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    anchor: Literal["oldest", "latest"] = Query(default="oldest"),
+    before: str | None = Query(default=None),
+) -> TimelineProjectionResponse:
+    history = await conversation_messages(
+        request,
+        conversation_id,
+        after_seq=after_seq,
+        limit=limit,
+        anchor=anchor,
+        before=before,
+    )
+    timeline_items = _project_timeline_events(history.items)
+    return TimelineProjectionResponse(
+        **history.model_dump(),
+        timeline_items=timeline_items,
     )
 
 

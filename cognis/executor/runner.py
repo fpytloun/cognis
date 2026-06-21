@@ -53,8 +53,11 @@ from cognis.tools.executor.project_context import (
     handle_project_context_probe,
 )
 from cognis.tools.executor.shell import (
+    SHELL_MANAGER_KEY,
+    BackgroundShellCompletionCallback,
     cleanup_shell_manager,
     list_background_shell_statuses,
+    notify_pending_background_shell_completions,
     set_background_shell_completion_callback,
 )
 from cognis.tools.mcp import (
@@ -189,6 +192,7 @@ class ExecutorRunner:
         self._inference_handler: Any | None = None
         self._channel_handler: Any | None = None
         self._runtime_metadata: dict[str, Any] = {}
+        self._background_shell_completion_callback: BackgroundShellCompletionCallback | None = None
         self._started_at = perf_counter()
         self._ws_send_lock = asyncio.Lock()
 
@@ -311,15 +315,18 @@ class ExecutorRunner:
                     ),
                 )
 
+            self._background_shell_completion_callback = _background_shell_completed
             set_background_shell_completion_callback(
                 self._runtime_metadata,
-                _background_shell_completed,
+                self._background_shell_completion_callback,
             )
+            await notify_pending_background_shell_completions(self._runtime_metadata)
 
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
                 await self._message_loop(ws)
             finally:
+                self._background_shell_completion_callback = None
                 set_background_shell_completion_callback(self._runtime_metadata, None)
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -509,6 +516,7 @@ class ExecutorRunner:
         previous_tool_definitions = list(self._configured_tool_definitions)
         previous_runtime_metadata = dict(self._runtime_metadata)
         previous_lsp_manager = previous_runtime_metadata.get(LSP_MANAGER_KEY)
+        previous_shell_manager = previous_runtime_metadata.get(SHELL_MANAGER_KEY)
 
         try:
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
@@ -641,6 +649,14 @@ class ExecutorRunner:
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
             }
+            if previous_shell_manager is not None:
+                self._runtime_metadata[SHELL_MANAGER_KEY] = previous_shell_manager
+            if self._background_shell_completion_callback is not None:
+                set_background_shell_completion_callback(
+                    self._runtime_metadata,
+                    self._background_shell_completion_callback,
+                )
+                await notify_pending_background_shell_completions(self._runtime_metadata)
             if new_browser_manager is not None:
                 self._runtime_metadata[BROWSER_MANAGER_KEY] = new_browser_manager
             get_file_freshness_tracker(self._runtime_metadata)
@@ -1556,6 +1572,8 @@ class ExecutorRunner:
         metadata.pop("skill_manifests", None)
         metadata.pop(BROWSER_MANAGER_KEY, None)
         metadata.pop(LSP_MANAGER_KEY, None)
+        metadata.pop(SHELL_MANAGER_KEY, None)
+        metadata.pop("background_shell_completion_callback", None)
         metadata.pop(_FILE_FRESHNESS_KEY, None)
         return metadata
 

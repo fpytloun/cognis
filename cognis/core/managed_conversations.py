@@ -12,6 +12,33 @@ from cognis.store import queries
 logger = get_logger(__name__)
 
 
+_SYSTEM_AGENT_PREFIX = "system:"
+
+
+def is_allowed_managed_conversation_target(agent_id: str | None) -> bool:
+    """Return whether an agent may own a managed conversation.
+
+    Managed conversations are durable, visible main conversations owned by a
+    target agent. System agents are specialist secondary agents and must be
+    used via delegate() instead of owning managed conversations.
+    """
+
+    normalized = str(agent_id or "").strip()
+    return bool(normalized) and not normalized.startswith(_SYSTEM_AGENT_PREFIX)
+
+
+def managed_conversation_target_error(agent_id: str | None) -> str:
+    """Return the user-facing rejection message for invalid managed targets."""
+
+    normalized = str(agent_id or "").strip()
+    if normalized.startswith(_SYSTEM_AGENT_PREFIX):
+        return (
+            "Managed conversations require a primary/user agent. Use delegate() "
+            "for system specialist agents (`system:*`) available in this agent session."
+        )
+    return "Managed conversations require a primary/user agent."
+
+
 @dataclass(frozen=True, slots=True)
 class _SessionCandidate:
     session_id: str

@@ -157,6 +157,9 @@ def is_retryable_error(exc: Exception) -> bool:
     exc_name = type(exc).__name__
     exc_msg = str(exc).lower()
 
+    if _looks_like_quota_exhaustion(exc):
+        return False
+
     # LiteLLM-specific error types (check class name to avoid import dependency)
     non_retryable_names = {
         "AuthenticationError",
@@ -214,6 +217,29 @@ def is_retryable_error(exc: Exception) -> bool:
 
     # asyncio-level errors
     return isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError))
+
+
+def _looks_like_quota_exhaustion(exc: Exception) -> bool:
+    message = str(exc).lower()
+    body = getattr(exc, "body", None)
+    if body is not None:
+        message = f"{message} {body!s}".lower()
+        if isinstance(body, dict):
+            error = body.get("error") if isinstance(body.get("error"), dict) else body
+            code = error.get("code") or error.get("type")
+            if code:
+                message = f"{message} {code!s}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "usage_limit_reached",
+            "insufficient_quota",
+            "quota exceeded",
+            "quota_exceeded",
+            "billing hard limit",
+            "exceeded your current quota",
+        )
+    )
 
 
 async def with_llm_retry[T](

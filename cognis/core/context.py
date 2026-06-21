@@ -31,7 +31,10 @@ from cognis.core.attachment_utils import (
 from cognis.core.attachment_utils import (
     attachment_placeholder_text as _attachment_placeholder_text,
 )
-from cognis.core.context_budget import resolve_context_budget
+from cognis.core.context_budget import (
+    prompt_serialization_margin_ratio_for_model,
+    resolve_context_budget,
+)
 from cognis.core.context_projection import (
     ProjectionPolicy,
     build_compacted_tool_result_placeholder,
@@ -279,6 +282,60 @@ def _current_turn_attachment_message(
         if content or user_message_role != "system":
             return {"role": user_message_role, "content": content}
     return None
+
+
+def _current_turn_attachment_messages(
+    *,
+    user_message: str,
+    user_message_role: str,
+    user_attachments: list[dict[str, Any]] | None,
+    model_info: Any,
+    include_user_message: bool,
+    disabled_artifact_urls: set[str] | None = None,
+    disabled_artifact_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    attachments = user_attachments or []
+    if attachments and user_message_role != "user":
+        attachment_blocks, _unsupported = _native_attachment_blocks(
+            attachments,
+            model_info,
+            disabled_artifact_urls=disabled_artifact_urls,
+            disabled_artifact_ids=disabled_artifact_ids,
+        )
+        if attachment_blocks:
+            messages: list[dict[str, Any]] = []
+            if include_user_message and (user_message or user_message_role != "system"):
+                split_message: dict[str, Any] = {
+                    "role": user_message_role,
+                    "content": user_message,
+                }
+                if user_message_role == "system":
+                    split_message[AUDIT_SOURCE] = "current_turn_system_message"
+                    split_message[AUDIT_ROLE] = "system"
+                messages.append(split_message)
+            attachment_message = _current_turn_attachment_message(
+                user_message="",
+                user_message_role="user",
+                user_attachments=attachments,
+                model_info=model_info,
+                include_user_message=False,
+                disabled_artifact_urls=disabled_artifact_urls,
+                disabled_artifact_ids=disabled_artifact_ids,
+            )
+            if attachment_message is not None:
+                messages.append(attachment_message)
+            return messages
+
+    message = _current_turn_attachment_message(
+        user_message=user_message,
+        user_message_role=user_message_role,
+        user_attachments=user_attachments,
+        model_info=model_info,
+        include_user_message=include_user_message,
+        disabled_artifact_urls=disabled_artifact_urls,
+        disabled_artifact_ids=disabled_artifact_ids,
+    )
+    return [message] if message is not None else []
 
 
 def _build_environment_info(
@@ -1012,6 +1069,10 @@ class ContextAssembler:
             max_input_tokens=model_info.max_input_tokens,
             agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
             model_max_output_tokens=model_info.max_output_tokens,
+            prompt_serialization_margin_ratio=prompt_serialization_margin_ratio_for_model(
+                model_info,
+                resolved_model,
+            ),
         )
         max_context_tokens = budget.max_context_tokens
         immutable_prefix = self._compose_immutable_prefix(
@@ -1224,7 +1285,7 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            current_turn_message = _current_turn_attachment_message(
+            current_turn_messages = _current_turn_attachment_messages(
                 user_message=user_message,
                 user_message_role=user_message_role,
                 user_attachments=user_attachments,
@@ -1233,8 +1294,7 @@ class ContextAssembler:
                 disabled_artifact_urls=disabled_artifact_urls,
                 disabled_artifact_ids=disabled_artifact_ids,
             )
-            if current_turn_message is not None:
-                messages.append(current_turn_message)
+            messages.extend(current_turn_messages)
         elif already_in_history:
             # Prompt already recorded in history; still surface any
             # turn-local signals that were meant to accompany it. The
@@ -1272,7 +1332,7 @@ class ContextAssembler:
                     }
                 )
             if not _history_tail_has_native_attachment(history_messages):
-                current_turn_attachments = _current_turn_attachment_message(
+                current_turn_attachments = _current_turn_attachment_messages(
                     user_message=user_message,
                     user_message_role=user_message_role,
                     user_attachments=user_attachments,
@@ -1281,8 +1341,7 @@ class ContextAssembler:
                     disabled_artifact_urls=disabled_artifact_urls,
                     disabled_artifact_ids=disabled_artifact_ids,
                 )
-                if current_turn_attachments is not None:
-                    messages.append(current_turn_attachments)
+                messages.extend(current_turn_attachments)
 
         projection = project_messages(
             messages,
@@ -1464,6 +1523,10 @@ class ContextAssembler:
             max_input_tokens=model_info.max_input_tokens,
             agent_max_tokens=(agent.llm_config.max_tokens if agent.llm_config else None),
             model_max_output_tokens=model_info.max_output_tokens,
+            prompt_serialization_margin_ratio=prompt_serialization_margin_ratio_for_model(
+                model_info,
+                resolved_model,
+            ),
         )
         max_context_tokens = budget.max_context_tokens
         prefix_entries = await self._ensure_immutable_prefix(
@@ -1642,7 +1705,7 @@ class ContextAssembler:
                         "_audit_role": "user",
                     }
                 )
-            current_turn_message = _current_turn_attachment_message(
+            current_turn_messages = _current_turn_attachment_messages(
                 user_message=user_message,
                 user_message_role=user_message_role,
                 user_attachments=user_attachments,
@@ -1651,8 +1714,7 @@ class ContextAssembler:
                 disabled_artifact_urls=disabled_artifact_urls,
                 disabled_artifact_ids=disabled_artifact_ids,
             )
-            if current_turn_message is not None:
-                messages.append(current_turn_message)
+            messages.extend(current_turn_messages)
         elif already_in_history:
             if routing_reminder:
                 messages.append(
@@ -1683,7 +1745,7 @@ class ContextAssembler:
                     }
                 )
             if not _history_tail_has_native_attachment(history_messages):
-                current_turn_attachments = _current_turn_attachment_message(
+                current_turn_attachments = _current_turn_attachment_messages(
                     user_message=user_message,
                     user_message_role=user_message_role,
                     user_attachments=user_attachments,
@@ -1692,8 +1754,7 @@ class ContextAssembler:
                     disabled_artifact_urls=disabled_artifact_urls,
                     disabled_artifact_ids=disabled_artifact_ids,
                 )
-                if current_turn_attachments is not None:
-                    messages.append(current_turn_attachments)
+                messages.extend(current_turn_attachments)
 
         projection = project_messages(
             messages,
@@ -2493,6 +2554,16 @@ def _attachment_content_message(
                 "content": f"{content}\n\n{_assistant_attachment_context(attachments)}",
             }
         return {"role": role, "content": f"{content}\n\n{_attachment_note(attachments)}"}
+    if role != "user":
+        HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_unsupported").inc(
+            len(attachments)
+        )
+        if role == "assistant":
+            return {
+                "role": role,
+                "content": f"{content}\n\n{_assistant_attachment_context(attachments)}",
+            }
+        return {"role": role, "content": f"{content}\n\n{_attachment_note(attachments)}"}
 
     attachment_blocks, unsupported = _native_attachment_blocks(
         attachments,
@@ -2622,7 +2693,11 @@ def events_to_messages(
             event_data = event.data
 
         if event_type == "tool_call":
-            tool_name = event_data.get("tool_name") or event_data.get("name")
+            tool_name = (
+                event_data.get("visible_name")
+                or event_data.get("tool_name")
+                or event_data.get("name")
+            )
             call_id = event_data.get("call_id", "")
             arguments = event_data.get("arguments")
             if isinstance(tool_name, str):

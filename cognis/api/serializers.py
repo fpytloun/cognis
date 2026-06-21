@@ -34,6 +34,7 @@ from cognis.api.models import (
     WorkflowResponse,
     WorkflowRunResponse,
 )
+from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.logging import get_logger
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskModel
@@ -69,6 +70,7 @@ def _session_result_anchors(content: str | None) -> list[dict[str, Any]]:
     if current is not None:
         current["end_line"] = len(lines)
         anchors.append(current)
+    anchors.extend(markdown_heading_anchors(content, existing_anchors=anchors))
     return anchors
 
 
@@ -662,6 +664,11 @@ def tool_to_response(row: Any) -> ToolResponse:
         else row.source,
         timeout_seconds=row.timeout_seconds,
         non_bypassable=row.non_bypassable,
+        aliases=list(getattr(row, "aliases", []) or []),
+        canonical_name=getattr(row, "canonical_name", None),
+        primary_name=getattr(row, "primary_name", None),
+        configurable=bool(getattr(row, "configurable", True)),
+        surfaces=dict(getattr(row, "surfaces", {}) or {}),
     )
 
 

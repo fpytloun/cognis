@@ -35,8 +35,9 @@ _INSTALL_LOCK = asyncio.Lock()
 class SignalCliRuntimeConfig:
     """Executor-level signal-cli runtime settings.
 
-    ``command`` is an explicit advanced override. When it is unset, Cognis
-    materializes and uses the certified managed signal-cli distribution.
+    Cognis materializes and uses the certified managed signal-cli distribution
+    by default. ``command`` is honored only when ``use_external_command`` is
+    explicitly enabled as an escape hatch for advanced operators.
     """
 
     auto_install: bool = True
@@ -44,6 +45,7 @@ class SignalCliRuntimeConfig:
     command: str | None = None
     cache_dir: Path | None = None
     command_source: str | None = None
+    use_external_command: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,11 +77,17 @@ def resolve_signal_cli_runtime_config(config: dict[str, Any] | None) -> SignalCl
     if not isinstance(raw, dict):
         raw = {}
 
-    command_raw = raw.get("command")
-    command_source = "configured_command" if command_raw else None
-    if not command_raw:
-        command_raw = os.environ.get("COGNIS_SIGNAL_CLI_COMMAND")
-        command_source = "env_command" if command_raw else None
+    use_external_command = _bool(
+        raw.get("use_external_command", os.environ.get("COGNIS_SIGNAL_CLI_USE_EXTERNAL", "false"))
+    )
+    command_raw = None
+    command_source = None
+    if use_external_command:
+        command_raw = raw.get("command")
+        command_source = "configured_command" if command_raw else None
+        if not command_raw:
+            command_raw = os.environ.get("COGNIS_SIGNAL_CLI_COMMAND")
+            command_source = "env_command" if command_raw else None
 
     command = str(command_raw).strip() if command_raw else None
     cache_raw = raw.get("cache_dir") or os.environ.get("COGNIS_SIGNAL_CLI_CACHE_DIR")
@@ -93,6 +101,7 @@ def resolve_signal_cli_runtime_config(config: dict[str, Any] | None) -> SignalCl
         command=command or None,
         cache_dir=Path(str(cache_raw)).expanduser() if cache_raw else None,
         command_source=command_source,
+        use_external_command=use_external_command,
     )
 
 
@@ -100,7 +109,7 @@ async def ensure_signal_cli(config: SignalCliRuntimeConfig | None = None) -> Sig
     config = config or SignalCliRuntimeConfig()
     expected_version = (config.version or SIGNAL_CLI_CERTIFIED_VERSION).strip()
 
-    if config.command:
+    if config.use_external_command and config.command:
         resolved = await asyncio.to_thread(shutil.which, config.command)
         source = config.command_source or "override"
         if not resolved:

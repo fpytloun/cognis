@@ -36,6 +36,7 @@ from cognis.store.queries import (
     delete_schedule,
     get_agent,
     get_schedule,
+    get_task,
     list_due_schedules,
     list_schedules,
     update_schedule,
@@ -85,6 +86,9 @@ class Scheduler:
         self._max_missed_on_startup = max_missed_on_startup
         self._missed_stagger_seconds = missed_stagger_seconds
         self._max_consecutive_errors = max_consecutive_errors
+        event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_task_terminal_event)
+        event_bus.subscribe(EventType.TASK_FAILED, self._handle_task_terminal_event)
+        event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_task_terminal_event)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -294,6 +298,7 @@ class Scheduler:
                 project_id=getattr(sched, "project_id", None),
                 workspace_root=workspace_root,
                 working_directory=working_directory,
+                scheduled_for=now,
             )
             created_task_id = task.task_id
 
@@ -303,17 +308,23 @@ class Scheduler:
                 task.task_id,
             )
 
-            # Update fire state — success
-            next_fire = self._compute_next_fire(sched, now)
             async with self._db_session() as db:
-                await update_schedule_fire_state(
-                    db,
-                    schedule_id,
-                    last_fired_at=now,
-                    next_fire_at=next_fire,
-                    last_run_status="success",
-                    consecutive_errors=0,
+                current_task = await get_task(db, task.task_id)
+                current_task_status = (
+                    str(getattr(current_task, "status", "") or "").lower()
+                    if current_task is not None
+                    else ""
                 )
+                if current_task_status not in {"completed", "failed", "cancelled"}:
+                    next_fire = self._compute_next_fire(sched, now)
+                    await update_schedule_fire_state(
+                        db,
+                        schedule_id,
+                        last_fired_at=now,
+                        next_fire_at=next_fire,
+                        last_run_status="success",
+                        consecutive_errors=sched.consecutive_errors,
+                    )
                 # Auto-delete one-shot schedules
                 if sched.delete_after_run and sched.schedule_type == "one_shot":
                     await delete_schedule(db, schedule_id)
@@ -394,6 +405,120 @@ class Scheduler:
                     )
                 )
             return None
+
+    async def _handle_task_terminal_event(self, event: Event) -> None:
+        """Propagate terminal scheduler-created task status back to the schedule."""
+
+        task_id = event.data.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return
+
+        async with self._db_session() as db:
+            task = await get_task(db, task_id)
+            if task is None or task.source_type != "scheduler" or not task.source_ref:
+                return
+            schedule_id = str(task.source_ref)
+            sched = await get_schedule(db, schedule_id)
+            if sched is None:
+                return
+
+        fire_at = _task_fire_at(task)
+        if _task_terminal_event_is_stale(fire_at, sched.last_fired_at):
+            logger.info(
+                "Ignoring stale terminal event for scheduled task %s",
+                task_id,
+                extra={
+                    "extra_data": {
+                        "schedule_id": schedule_id,
+                        "task_fire_at": fire_at.isoformat()
+                        if isinstance(fire_at, datetime)
+                        else None,
+                        "last_fired_at": sched.last_fired_at.isoformat()
+                        if isinstance(sched.last_fired_at, datetime)
+                        else None,
+                    }
+                },
+            )
+            return
+
+        status = str(getattr(task, "status", "") or "").lower()
+        recorded_fire_at = fire_at if isinstance(fire_at, datetime) else datetime.now(UTC)
+        if status == "completed":
+            next_fire = (
+                None
+                if sched.schedule_type == "one_shot"
+                else self._compute_next_fire(sched, recorded_fire_at)
+            )
+            async with self._db_session() as db:
+                await update_schedule_fire_state(
+                    db,
+                    schedule_id,
+                    last_fired_at=recorded_fire_at,
+                    next_fire_at=next_fire,
+                    last_run_status="success",
+                    consecutive_errors=0,
+                )
+                await db.commit()
+            return
+
+        if status not in {"failed", "cancelled"}:
+            return
+
+        now = datetime.now(UTC)
+        errors = int(sched.consecutive_errors or 0) + 1
+        disabled = errors >= self._max_consecutive_errors
+        backoff = self._compute_backoff_delay(errors)
+        disabled_reason = f"Auto-disabled after {errors} consecutive errors" if disabled else None
+        async with self._db_session() as db:
+            await update_schedule_fire_state(
+                db,
+                schedule_id,
+                last_fired_at=recorded_fire_at,
+                next_fire_at=now + timedelta(seconds=backoff) if not disabled else None,
+                last_run_status="failed",
+                consecutive_errors=errors,
+                disabled_reason=disabled_reason,
+                enabled=False if disabled else None,
+            )
+            await db.commit()
+
+        if disabled:
+            logger.warning(
+                "Schedule %s auto-disabled after task %s failed",
+                schedule_id,
+                task_id,
+            )
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.SCHEDULE_DISABLED,
+                    data={
+                        "schedule_id": schedule_id,
+                        "reason": disabled_reason,
+                        "created_by": sched.created_by,
+                        "agent_id": sched.agent_id,
+                        "schedule_name": sched.name,
+                        "task_id": task_id,
+                        "error": task.result_summary,
+                    },
+                )
+            )
+            return
+
+        await self._event_bus.publish(
+            Event(
+                type=EventType.SCHEDULE_ERROR,
+                data={
+                    "schedule_id": schedule_id,
+                    "consecutive_errors": errors,
+                    "next_retry_seconds": backoff,
+                    "created_by": sched.created_by,
+                    "agent_id": sched.agent_id,
+                    "schedule_name": sched.name,
+                    "task_id": task_id,
+                    "error": task.result_summary,
+                },
+            )
+        )
 
     # ------------------------------------------------------------------
     # Schedule computation
@@ -511,6 +636,32 @@ class Scheduler:
         """Yield an async DB session."""
         async with self._session_factory() as session:
             yield session
+
+
+def _task_fire_at(task: Any) -> datetime | None:
+    """Return the schedule fire timestamp carried by a scheduler-created task."""
+
+    scheduled_for = getattr(task, "scheduled_for", None)
+    if isinstance(scheduled_for, datetime):
+        return scheduled_for
+    created_at = getattr(task, "created_at", None)
+    if isinstance(created_at, datetime):
+        return created_at
+    return None
+
+
+def _task_terminal_event_is_stale(
+    task_fire_at: Any,
+    schedule_last_fired_at: Any,
+) -> bool:
+    """Return true when a terminal task event predates the latest schedule fire."""
+
+    if not isinstance(task_fire_at, datetime) or not isinstance(schedule_last_fired_at, datetime):
+        return False
+    try:
+        return task_fire_at < schedule_last_fired_at
+    except TypeError:
+        return False
 
 
 def _resolve_tz(name: str) -> timezone | ZoneInfo:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -53,6 +53,40 @@ router = APIRouter(tags=["schedules"])
 
 
 _VALID_SCHEDULE_RUN_STATUSES = {"success", "failed", "skipped"}
+_ACTIVE_TASK_RUN_STATUSES = {"queued", "ready", "running", "paused"}
+SCHEDULE_EXPIRATION_GRACE = timedelta(hours=24)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Normalize DB timestamps to aware UTC for stable comparisons."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _schedule_expiration(row: Any, now: datetime) -> tuple[bool, datetime | None]:
+    """Return terminal one-shot schedule expiration status and grace cutoff."""
+    now = _as_utc(now) or datetime.now(UTC)
+    next_fire_at = _as_utc(row.next_fire_at)
+    if next_fire_at is not None:
+        return False, None
+
+    reference = _as_utc(row.last_fired_at)
+    if reference is None:
+        if row.schedule_type != "one_shot":
+            return False, None
+        one_shot_at = _as_utc(row.one_shot_at)
+        if one_shot_at is None or one_shot_at > now:
+            return False, None
+        reference = one_shot_at
+
+    if row.schedule_type != "one_shot":
+        return False, None
+
+    grace_until = reference + SCHEDULE_EXPIRATION_GRACE
+    return now >= grace_until, grace_until
 
 
 def _coerce_schedule_run_status(value: Any) -> str | None:
@@ -91,8 +125,14 @@ def _effective_last_run_status(
 def _row_to_response(
     row: Any,
     latest_task_run: tuple[str, datetime | None] | None = None,
+    *,
+    now: datetime | None = None,
 ) -> ScheduleResponse:
     """Convert a Schedule ORM row to an API response."""
+    is_expired, expiration_grace_until = _schedule_expiration(row, now or datetime.now(UTC))
+    if latest_task_run is not None and latest_task_run[0] in _ACTIVE_TASK_RUN_STATUSES:
+        is_expired = False
+        expiration_grace_until = None
     model = _ScheduleModel(
         schedule_id=row.schedule_id,
         name=row.name,
@@ -152,6 +192,8 @@ def _row_to_response(
         created_at=row.created_at,
         updated_at=row.updated_at,
         human_schedule=describe_schedule(model),
+        is_expired=is_expired,
+        expiration_grace_until=expiration_grace_until,
     )
 
 
@@ -245,7 +287,8 @@ async def list_schedules_route(
             [row.schedule_id for row in rows],
             created_by=user.email,
         )
-    return [_row_to_response(r, latest_runs.get(r.schedule_id)) for r in rows]
+    now = datetime.now(UTC)
+    return [_row_to_response(r, latest_runs.get(r.schedule_id), now=now) for r in rows]
 
 
 @router.post("/api/v1/schedules", response_model=ScheduleResponse, status_code=201)

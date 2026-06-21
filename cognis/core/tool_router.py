@@ -21,6 +21,7 @@ from prometheus_client import Counter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.artifacts.store import sanitize_artifact_filename
+from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.core.chat_modes import is_plan_hidden_tool
 from cognis.core.content_refs import (
     continuation_scope_task_id,
@@ -127,6 +128,10 @@ def _mcp_oauth_authorization_required_result(
     transaction_id: str | None,
     authorization_url: str | None,
     authorization_expires_at: datetime | None,
+    flow: str | None = None,
+    verification_uri: str | None = None,
+    verification_uri_complete: str | None = None,
+    user_code: str | None = None,
 ) -> ToolResult:
     if not authorization_url:
         return _mcp_oauth_setup_failed_result(
@@ -139,11 +144,20 @@ def _mcp_oauth_authorization_required_result(
         )
     expires_at = authorization_expires_at.isoformat() if authorization_expires_at else None
     expires_text = f"\nThe authorization link expires at {expires_at}." if expires_at else ""
+    if flow == "device_code":
+        instruction = (
+            "Open the provider verification page and enter the user code:\n"
+            f"{authorization_url}\nCode: {user_code or ''}{expires_text}\n"
+        )
+    else:
+        instruction = (
+            "Open this controller-generated URL to authorize the MCP server:\n"
+            f"{authorization_url}{expires_text}\n"
+        )
     return ToolResult(
         output=(
             f"MCP authorization is required for {server_name}.\n"
-            f"Open this controller-generated URL to authorize the MCP server:\n"
-            f"{authorization_url}{expires_text}\n"
+            f"{instruction}"
             "After completing authorization, retry the tool call."
         ),
         is_error=True,
@@ -154,6 +168,10 @@ def _mcp_oauth_authorization_required_result(
             "transaction_id": transaction_id,
             "authorization_url": authorization_url,
             "authorization_expires_at": expires_at,
+            "flow": flow,
+            "verification_uri": verification_uri,
+            "verification_uri_complete": verification_uri_complete,
+            "user_code": user_code,
             "reason": reason,
             "retryable": False,
         },
@@ -1362,6 +1380,10 @@ class ToolRouter:
                 transaction_id=token_result.transaction_id,
                 authorization_url=token_result.authorization_url,
                 authorization_expires_at=getattr(token_result, "authorization_expires_at", None),
+                flow=token_result.flow,
+                verification_uri=token_result.verification_uri,
+                verification_uri_complete=token_result.verification_uri_complete,
+                user_code=token_result.user_code,
             )
 
         if isinstance(tool_timeout_raw, int | float | str):
@@ -2673,6 +2695,22 @@ def _extract_output_anchor_names(
             stripped = line.strip()
             if stripped.startswith("[[") and stripped.endswith("]]") and len(stripped) > 4:
                 _add(stripped[2:-2])
+
+    if raw_output:
+        existing_anchor_refs: list[dict[str, Any]] = []
+        if metadata is not None and isinstance(metadata.get("output_anchors"), list):
+            for entry in metadata["output_anchors"]:
+                if isinstance(entry, dict):
+                    existing_anchor_refs.append(entry)
+                elif isinstance(entry, str):
+                    existing_anchor_refs.append({"anchor": entry})
+        else:
+            existing_anchor_refs = [{"anchor": name} for name in names]
+        for entry in markdown_heading_anchors(
+            raw_output,
+            existing_anchors=existing_anchor_refs,
+        ):
+            _add(entry.get("anchor"))
 
     return names
 

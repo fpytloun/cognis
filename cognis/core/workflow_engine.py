@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import (
     CHAT_POLICY,
+    CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
     AgentLoop,
@@ -328,6 +329,7 @@ class WorkflowEngine:
             orchestration_mode=OrchestrationMode.FULL,
             turn_id=turn_id,
             chat_mode=chat_mode,
+            controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
             consume_boundary_batch=consume_boundary_batch,
         )
         ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
@@ -3716,23 +3718,32 @@ class WorkflowEngine:
         self, task: TaskModel, state: WorkflowState
     ) -> tuple[str, str | None]:
         last_output = self._last_step_output(state)
+        final_notification = last_output.notification if last_output is not None else None
         if (
             task.status == TaskStatus.COMPLETED
-            and last_output is not None
-            and last_output.notification is not None
-            and last_output.notification.mode == "silent"
+            and final_notification is not None
+            and final_notification.mode == "silent"
         ):
-            return "silent", last_output.notification.reason
+            return "silent", final_notification.reason
         if (
             task.status == TaskStatus.COMPLETED
-            and last_output is not None
-            and last_output.notification is not None
-            and last_output.notification.mode == "direct"
+            and final_notification is not None
+            and final_notification.mode == "direct"
         ):
-            return "direct", last_output.notification.reason
+            return "direct", final_notification.reason
 
         policy = task.completion_delivery or CompletionDeliveryPolicy()
-        if policy.completion_mode_family == "direct":
+        if (
+            task.status == TaskStatus.COMPLETED
+            and policy.allow_silent_completion
+            and final_notification is None
+        ):
+            return (
+                "silent",
+                "Auto-silent completion: allow_silent_completion=true and no explicit notification override was requested.",
+            )
+
+        if task.status == TaskStatus.COMPLETED and policy.completion_mode_family == "direct":
             if isinstance(task.result_data, dict):
                 final_content = task.result_data.get("final_content")
                 if isinstance(final_content, str) and final_content.strip():

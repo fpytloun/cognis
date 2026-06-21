@@ -1935,6 +1935,12 @@ async def _resolve_executor_mcp_servers(
                             reason=result.reason,
                             transaction_id=result.transaction_id,
                             authorization_url=result.authorization_url,
+                            flow=getattr(result, "flow", None),
+                            verification_uri=getattr(result, "verification_uri", None),
+                            verification_uri_complete=getattr(
+                                result, "verification_uri_complete", None
+                            ),
+                            user_code=getattr(result, "user_code", None),
                         )
                     )
                     logger.warning(

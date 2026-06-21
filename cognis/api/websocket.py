@@ -28,11 +28,13 @@ from prometheus_client import Counter, Gauge
 from sqlalchemy import select
 
 from cognis.api.models import (
+    MessageEventResponse,
     WebSocketAuthenticated,
     WebSocketChunkGap,
     WebSocketError,
     WebSocketPong,
 )
+from cognis.api.routes.conversations import project_timeline_events
 from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.conversation_state import (
     build_state_delta,
@@ -78,6 +80,13 @@ def _is_visible_persisted_system_message(data: dict[str, Any]) -> bool:
     return data.get("event") == "turn_initiated"
 
 
+def _assistant_runtime_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return persisted assistant runtime metadata when it has the expected shape."""
+
+    runtime = data.get("runtime")
+    return runtime if isinstance(runtime, dict) else None
+
+
 _NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
 
@@ -101,6 +110,114 @@ DEFAULT_INBOUND_RATE_LIMIT = 10
 DEFAULT_OUTBOUND_BUFFER = 100
 DEFAULT_REPLAY_LIMIT = 200
 COOKIE_NAME = "cognis_session"
+_TIMELINE_PATCH_WITH_LEGACY_SIDE_EFFECT_EVENTS = {
+    EventType.TASK_COMPLETED,
+    EventType.TASK_FAILED,
+    EventType.TASK_CANCELLED,
+    EventType.DELEGATION_COMPLETED,
+    EventType.DELEGATION_FAILED,
+}
+
+
+def _timeline_patch_payload(
+    conversation_id: str,
+    events: list[MessageEventResponse],
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    """Project backend events into canonical timeline patch items."""
+
+    items = project_timeline_events(events)
+    if not items:
+        return None
+    return {
+        "type": "timeline_patch",
+        "conversation_id": conversation_id,
+        "source": source,
+        "items": items,
+        "last_seq": max((event.seq or 0 for event in events), default=0),
+    }
+
+
+def _timeline_patch_for_raw_event(
+    conversation_id: str,
+    *,
+    event_type: str,
+    data: dict[str, Any],
+    timestamp: str | None,
+    source: str,
+) -> dict[str, Any] | None:
+    """Project one raw persisted-event-shaped payload into a timeline patch."""
+
+    return _timeline_patch_payload(
+        conversation_id,
+        [MessageEventResponse(seq=None, type=event_type, data=data, timestamp=timestamp)],
+        source=source,
+    )
+
+
+def _timeline_patch_for_bus_event(event: Event, conversation_id: str) -> dict[str, Any] | None:
+    """Return a canonical timeline patch for visible non-stream EventBus events."""
+
+    timestamp = event.timestamp.isoformat() if event.timestamp else None
+    data = dict(event.data)
+    event_type: str | None = None
+
+    if event.type == EventType.SYSTEM_NOTICE:
+        event_type = "system_message"
+        data = {
+            **data,
+            "content": data.get("message") or data.get("content"),
+        }
+    elif event.type == EventType.WORKFLOW_COMPOSED:
+        event_type = "workflow_composed"
+    elif event.type == EventType.WORKFLOW_PROGRESS and data.get("event") in {
+        "tool_call_started",
+        "tool_call_completed",
+    }:
+        event_type = "tool_result" if data.get("event") == "tool_call_completed" else "tool_call"
+        if event_type == "tool_call":
+            data = {**data, "status": "started"}
+    elif event.type == EventType.TASK_COMPLETED:
+        event_type = "task_result"
+    elif event.type == EventType.TASK_FAILED:
+        event_type = "task_failed"
+    elif event.type == EventType.TASK_CANCELLED:
+        event_type = "task_cancelled"
+    elif event.type == EventType.DELEGATION_STARTED:
+        event_type = "delegation"
+        data = {**data, "status": "started"}
+    elif event.type == EventType.DELEGATION_PROGRESS:
+        event_type = "delegation"
+        data = {**data, "status": data.get("status") or "running"}
+    elif event.type == EventType.DELEGATION_COMPLETED:
+        event_type = "delegation"
+        data = {
+            **data,
+            "status": "completed",
+            "result_summary": data.get("result_summary") or data.get("result"),
+        }
+    elif event.type == EventType.DELEGATION_FAILED:
+        event_type = "delegation"
+        data = {**data, "status": "failed", "error": data.get("reason")}
+    elif event.type == EventType.SESSION_RECOVERED:
+        event_type = "session_recovered"
+
+    if event_type is None:
+        return None
+    payload = _timeline_patch_for_raw_event(
+        conversation_id,
+        event_type=event_type,
+        data=data,
+        timestamp=timestamp,
+        source=f"live.{event.type.value}",
+    )
+    if payload is not None and event_type == "workflow_composed" and payload.get("items"):
+        workflow_id = str(data.get("workflow_id") or "")
+        task_or_schedule_id = str(data.get("task_id") or data.get("schedule_id") or "")
+        stable_id = workflow_id or task_or_schedule_id or event.type.value
+        payload["items"][0]["id"] = f"workflow-composed:{stable_id}"
+    return payload
 
 
 def _workflow_composed_payload(conversation_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -300,19 +417,25 @@ class WebSocketTurnObserver:
         arguments: dict[str, Any] | None,
         turn_id: str | None,
     ) -> None:
-        payload: dict[str, Any] = {
-            "type": "tool_call",
-            "conversation_id": conversation_id,
+        timestamp = datetime.now(UTC).isoformat()
+        data: dict[str, Any] = {
             "session_id": session_id,
             "call_id": call_id,
             "tool_name": tool_name,
             "status": "started",
-            "timestamp": datetime.now(UTC).isoformat(),
             "turn_id": turn_id,
         }
         if arguments is not None:
-            payload["arguments"] = arguments
-        await self._manager.send_to_conversation(conversation_id, payload)
+            data["arguments"] = arguments
+        payload = _timeline_patch_for_raw_event(
+            conversation_id,
+            event_type="tool_call",
+            data=data,
+            timestamp=timestamp,
+            source="live.tool_call",
+        )
+        if payload is not None:
+            await self._manager.send_to_conversation(conversation_id, payload)
 
     async def on_tool_progress(
         self,
@@ -352,27 +475,34 @@ class WebSocketTurnObserver:
         turn_id: str | None = None,
         presentation: dict[str, Any] | None = None,
     ) -> None:
-        payload: dict[str, Any] = {
-            "type": "tool_result",
-            "conversation_id": conversation_id,
+        timestamp = datetime.now(UTC).isoformat()
+        data: dict[str, Any] = {
             "session_id": session_id,
             "call_id": call_id,
             "tool_name": tool_name,
             "result": result,
             "is_error": is_error,
             "duration_ms": duration_ms,
-            "timestamp": datetime.now(UTC).isoformat(),
             "turn_id": turn_id,
         }
         if evaluation:
-            payload["evaluation"] = evaluation
+            data["evaluation"] = evaluation
         if attachments:
-            payload["attachments"] = strip_attachment_payload_bytes(attachments)
+            data["attachments"] = strip_attachment_payload_bytes(attachments)
         if file_diffs:
-            payload["file_diffs"] = file_diffs
+            data["file_diffs"] = file_diffs
         if presentation:
-            payload.update(presentation)
-        await self._manager.send_to_conversation(conversation_id, payload)
+            data.update(presentation)
+            data["tool_output_presentation"] = presentation
+        payload = _timeline_patch_for_raw_event(
+            conversation_id,
+            event_type="tool_result",
+            data=data,
+            timestamp=timestamp,
+            source="live.tool_result",
+        )
+        if payload is not None:
+            await self._manager.send_to_conversation(conversation_id, payload)
 
     async def on_tool_output_chunk(
         self,
@@ -448,6 +578,7 @@ class WebSocketTurnObserver:
             "chat_mode_source": result.chat_mode_source,
             "partial": result.partial,
             "finish_reason": result.finish_reason,
+            "runtime": result.runtime,
         }
         if result.delegated:
             payload["delegated"] = True
@@ -694,6 +825,72 @@ class WebSocketConnectionManager:
             }
         )
 
+    async def _conversation_runtime_snapshot(
+        self,
+        conversation_id: str,
+        *,
+        active_session_id: str | None,
+    ) -> dict[str, Any]:
+        """Return authoritative volatile runtime state for a conversation."""
+
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        queued_messages: list[dict[str, Any]] = []
+        active_streams: list[dict[str, Any]] = []
+        active_tool_outputs: list[dict[str, Any]] = []
+        active_turn_state: dict[str, Any] | None = None
+        if turn_scheduler is not None:
+            queued_messages = turn_scheduler.queued_messages(conversation_id)
+            active_streams = await turn_scheduler.active_stream_snapshots(conversation_id)
+            active_tool_outputs = await turn_scheduler.active_tool_output_snapshots(conversation_id)
+            active_turn_state = (
+                turn_scheduler.running_turn_state(conversation_id)
+                if hasattr(turn_scheduler, "running_turn_state")
+                else None
+            )
+
+        active_thinking: list[dict[str, Any]] = []
+        session_cache = getattr(self.app.state, "session_cache", None)
+        if (
+            active_session_id
+            and session_cache is not None
+            and hasattr(session_cache, "active_thinking_snapshots")
+        ):
+            active_thinking = session_cache.active_thinking_snapshots(active_session_id)
+
+        return {
+            "queued_messages": queued_messages,
+            "queued_count": len(queued_messages),
+            "has_active_turn": active_turn_state is not None,
+            "active_turn_chat_mode": (
+                active_turn_state.get("chat_mode") if active_turn_state else None
+            ),
+            "active_turn_chat_mode_source": (
+                active_turn_state.get("chat_mode_source") if active_turn_state else None
+            ),
+            "active_streams": active_streams,
+            "active_tool_outputs": active_tool_outputs,
+            "active_thinking": active_thinking,
+        }
+
+    async def _send_conversation_runtime_snapshot(
+        self,
+        connection: AuthenticatedWebSocket,
+        conversation_id: str,
+        *,
+        active_session_id: str | None,
+    ) -> None:
+        runtime = await self._conversation_runtime_snapshot(
+            conversation_id,
+            active_session_id=active_session_id,
+        )
+        await connection.send_json(
+            {
+                "type": "conversation_runtime_snapshot",
+                "conversation_id": conversation_id,
+                **runtime,
+            }
+        )
+
     def _unsubscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Unsubscribe a connection from a conversation."""
         connection.subscriptions.discard(conversation_id)
@@ -727,6 +924,47 @@ class WebSocketConnectionManager:
             return
         coroutines = []
         for cid in list(connection_ids):
+            conn = self._connections.get(cid)
+            if conn is not None:
+                coroutines.append(conn.send_json(payload))
+        if coroutines:
+            await asyncio.gather(*coroutines, return_exceptions=True)
+
+    async def send_sidebar_update_to_owner(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Fan out sidebar metadata to the conversation owner outside subscribers.
+
+        Conversation streams are subscription-scoped, but sidebar rows are user-scoped.
+        Tabs opened on other conversations must still receive low-volume activity
+        corrections so spinners and ordering do not stay stale.
+        """
+
+        session_factory = getattr(self.app.state, "session_factory", None)
+        if session_factory is None:
+            return
+        try:
+            async with session_factory() as db_session:
+                conversation = await get_conversation(db_session, conversation_id)
+        except Exception as exc:
+            logger.debug(
+                "Unable to resolve conversation owner for sidebar fanout",
+                extra={"conversation_id": conversation_id, "error": str(exc)},
+            )
+            return
+        if conversation is None:
+            return
+
+        conversation_connection_ids = self._by_conversation.get(conversation_id, set())
+        owner_connection_ids = self._by_user.get(conversation.user_email, set())
+        target_connection_ids = set(owner_connection_ids) - set(conversation_connection_ids)
+        if not target_connection_ids:
+            return
+
+        coroutines = []
+        for cid in list(target_connection_ids):
             conn = self._connections.get(cid)
             if conn is not None:
                 coroutines.append(conn.send_json(payload))
@@ -784,13 +1022,22 @@ class WebSocketConnectionManager:
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
             return
-        payload = _event_to_payload(event, conversation_id)
-        if payload is None:
-            return
-        await self.send_to_conversation(conversation_id, payload)
+        timeline_patch = _timeline_patch_for_bus_event(event, conversation_id)
+        if timeline_patch is not None:
+            await self.send_to_conversation(conversation_id, timeline_patch)
+            if event.type in _TIMELINE_PATCH_WITH_LEGACY_SIDE_EFFECT_EVENTS:
+                payload = _event_to_payload(event, conversation_id)
+                if payload is not None:
+                    await self.send_to_conversation(conversation_id, payload)
+        else:
+            payload = _event_to_payload(event, conversation_id)
+            if payload is None:
+                return
+            await self.send_to_conversation(conversation_id, payload)
         activity_payload = self._conversation_activity_payload(event, conversation_id)
         if activity_payload is not None:
             await self.send_to_conversation(conversation_id, activity_payload)
+            await self.send_sidebar_update_to_owner(conversation_id, activity_payload)
         attention_payload = await self._notification_attention_payload(event, conversation_id)
         if attention_payload is not None:
             await self.send_to_user(attention_payload["user_email"], attention_payload["payload"])
@@ -896,14 +1143,13 @@ class WebSocketConnectionManager:
                 changed_paths=changed_paths,
                 replace={"state": snapshot.model_dump(mode="json")},
             )
-            await self.send_to_conversation(
-                conversation_id,
-                {
-                    "type": "conversation_state_delta",
-                    "conversation_id": conversation_id,
-                    **delta.model_dump(mode="json"),
-                },
-            )
+            payload = {
+                "type": "conversation_state_delta",
+                "conversation_id": conversation_id,
+                **delta.model_dump(mode="json"),
+            }
+            await self.send_to_conversation(conversation_id, payload)
+            await self.send_sidebar_update_to_owner(conversation_id, payload)
 
     def _conversation_activity_payload(
         self,
@@ -911,6 +1157,22 @@ class WebSocketConnectionManager:
         conversation_id: str,
     ) -> dict[str, Any] | None:
         """Build an authoritative sidebar activity correction payload."""
+
+        if event.type == EventType.TURN_STARTED:
+            started_at = event.data.get("started_at") or (
+                event.timestamp.isoformat() if event.timestamp else None
+            )
+            payload = {
+                "type": "conversation_updated",
+                "conversation_id": conversation_id,
+                "has_active_turn": True,
+                "active_turn_chat_mode": event.data.get("chat_mode"),
+                "active_turn_chat_mode_source": event.data.get("chat_mode_source"),
+            }
+            if started_at is not None:
+                payload["last_message_at"] = started_at
+                payload["updated_at"] = started_at
+            return payload
 
         if event.type == EventType.TURN_COMPLETED:
             completed_at = event.data.get("completed_at") or (
@@ -1143,6 +1405,7 @@ class WebSocketConnectionManager:
                             "finish_reason": data.get("finish_reason")
                             if isinstance(data.get("finish_reason"), str)
                             else None,
+                            "runtime": _assistant_runtime_payload(data),
                         }
                     )
                     replayed += 1
@@ -1400,6 +1663,11 @@ class WebSocketConnectionManager:
             connection,
             conversation_id,
             active_session_last_seq=result.last_seq,
+        )
+        await self._send_conversation_runtime_snapshot(
+            connection,
+            conversation_id,
+            active_session_id=session.session_id,
         )
 
         await connection.send_json(
@@ -2666,6 +2934,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "call_id": event.data.get("call_id"),
+            "tool_call_id": event.data.get("tool_call_id"),
             "tool_name": event.data.get("tool_name"),
             "risk": event.data.get("risk"),
             "reasoning": event.data.get("reasoning"),
@@ -2761,6 +3030,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "conversation_id": conversation_id,
                 "session_id": event.data.get("session_id"),
                 "call_id": payload.get("call_id"),
+                "tool_call_id": payload.get("tool_call_id"),
                 "tool_name": payload.get("tool_name"),
                 "risk": payload.get("risk"),
                 "reasoning": payload.get("reasoning"),

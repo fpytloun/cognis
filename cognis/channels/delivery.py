@@ -635,8 +635,20 @@ class ChannelDeliveryService:
         metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         if payload.get("kind") == "oauth_authorization" and isinstance(metadata, dict):
             authorization_url = str(metadata.get("authorization_url") or "")
+            flow = str(metadata.get("flow") or "authorization_code")
             lines = [f"*[auth]* {label}", message]
-            if authorization_url:
+            if flow == "device_code":
+                verification_uri = str(metadata.get("verification_uri") or authorization_url)
+                verification_uri_complete = str(metadata.get("verification_uri_complete") or "")
+                user_code = str(metadata.get("user_code") or "")
+                if verification_uri_complete:
+                    lines.append(f"Open verification link: {verification_uri_complete}")
+                elif verification_uri:
+                    lines.append(f"Open verification page: {verification_uri}")
+                if user_code:
+                    lines.append(f"Enter code: {user_code}")
+                lines.append("Cognis will complete automatically after provider authorization.")
+            elif authorization_url:
                 lines.append(f"Authorize here: {authorization_url}")
             lines.append("Replies will not complete OAuth; use the authorization link.")
             return "\n\n".join(lines)

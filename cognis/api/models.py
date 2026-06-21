@@ -206,6 +206,15 @@ class ConversationResolveRequest(BaseModel):
     scope: Literal["latest", "agent_direct"] = "latest"
 
 
+class ConversationOpenRequest(BaseModel):
+    """Resolve the best conversation to open for the chat landing page."""
+
+    agent_id: str
+    agent_profile_id: str | None = None
+    context_type: str = "web"
+    candidate_conversation_ids: list[str] = Field(default_factory=list)
+
+
 class ConversationCreateRequest(BaseModel):
     agent_id: str
     agent_profile_id: str | None = None
@@ -397,6 +406,13 @@ class MessageHistoryResponse(BaseModel):
     state_snapshot: ConversationStateEnvelope | None = Field(
         default=None,
         description="Authoritative backend-projected conversation state at history load time.",
+    )
+
+
+class TimelineProjectionResponse(MessageHistoryResponse):
+    timeline_items: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Backend-projected canonical timeline items for initial/refresh rendering.",
     )
 
 
@@ -650,6 +666,13 @@ class AgentResponse(BaseModel):
 class AgentDirectChatResponse(BaseModel):
     agent: AgentResponse
     conversation: ConversationResponse
+
+
+class SidebarProjectionResponse(BaseModel):
+    agents: list[AgentResponse] = Field(default_factory=list)
+    agent_direct_chats: list[AgentDirectChatResponse] = Field(default_factory=list)
+    conversations: CursorPage[ConversationResponse]
+    context_types: list[str] = Field(default_factory=list)
 
 
 class AgentCardResponse(BaseModel):
@@ -1284,6 +1307,8 @@ class ScheduleResponse(BaseModel):
     updated_at: datetime | None = None
     # Computed fields
     human_schedule: str | None = None
+    is_expired: bool = False
+    expiration_grace_until: datetime | None = None
 
 
 class ScheduleTriggerResponse(ScheduleResponse):
@@ -1443,6 +1468,11 @@ class ToolResponse(BaseModel):
     source: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: int = 30
     non_bypassable: bool = False
+    aliases: list[dict[str, Any]] = Field(default_factory=list)
+    canonical_name: str | None = None
+    primary_name: str | None = None
+    configurable: bool = True
+    surfaces: dict[str, str] = Field(default_factory=dict)
 
 
 class EffectiveToolItemResponse(BaseModel):
@@ -1462,6 +1492,11 @@ class EffectiveToolItemResponse(BaseModel):
     disabled_reason: str | None = None
     timeout_seconds: int = 30
     non_bypassable: bool = False
+    aliases: list[dict[str, Any]] = Field(default_factory=list)
+    canonical_name: str | None = None
+    primary_name: str | None = None
+    configurable: bool = True
+    surfaces: dict[str, str] = Field(default_factory=dict)
     # Stage 36: list of assigned executor ids that observe this tool. Empty
     # for non-executor tools. Helps UIs render a per-executor matrix.
     available_on: list[str] = Field(default_factory=list)
