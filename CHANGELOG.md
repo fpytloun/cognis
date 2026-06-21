@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2026-06-21
+
+### Added
+
+- Added MCP OAuth device-code flow support with token refresh serialization and regression coverage.
+- Added contextual controller aliases for tools and deterministic workflow step specifications.
+- Added backend filtering for expired one-shot schedules and UI grouping for conversation history by activity date.
+- Added markdown output anchors and recovery support for large tool-output navigation.
+
+### Changed
+
+- Improved chat timeline projection, live-state reconciliation, sidebar projection loading, and conversation open performance.
+- Refined structured question prompts, inline answers, pagination, and pending-question collapse behavior.
+- Tuned workflow and software-development prompts, delegated language guidance, and background activity reminders.
+- Improved managed-conversation maintenance, stale conversation cleanup, and reusable managed-chat reminders.
+
+### Fixed
+
+- Fixed streamed context overflow recovery, native attachment preservation, and retained assistant/user timeline state across replay and refresh.
+- Fixed MCP OAuth redirect URI handling and token refresh serialization.
+- Fixed runtime completion notifications, stale managed conversations, and delegated specialist/system-agent selection safeguards.
+- Fixed markdown output anchor deduplication and tool-output recovery anchors.
+
 ## [0.9.0] - 2026-06-14
 
 ### Added

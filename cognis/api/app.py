@@ -29,7 +29,12 @@ from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
 from cognis.api.routes.knowledgebases import router as knowledgebases_router
-from cognis.api.routes.mcp_oauth import router as mcp_oauth_router
+from cognis.api.routes.mcp_oauth import (
+    router as mcp_oauth_router,
+)
+from cognis.api.routes.mcp_oauth import (
+    schedule_mcp_executor_reconfigure_for_app,
+)
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
@@ -534,11 +539,16 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             providers=providers,
         )
+
+        async def _on_mcp_oauth_completed(transaction_id: str) -> None:
+            await schedule_mcp_executor_reconfigure_for_app(app, transaction_id=transaction_id)
+
         mcp_oauth_service = MCPOAuthService(
             session_factory=session_factory,
             key_path=str(config_runtime.secrets_key_path),
             public_base_url=config_runtime.public_base_url,
             notification_service=notification_service,
+            on_authorization_completed=_on_mcp_oauth_completed,
         )
         providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
         tool_router._mcp_oauth_service = mcp_oauth_service  # noqa: SLF001
@@ -557,6 +567,7 @@ def create_app() -> FastAPI:
         # Reconcile pending notifications from before restart (re-registers
         # PauseWaiters from DB so gates/escalations/step-questions survive).
         await notification_service.reconcile_pending()
+        await mcp_oauth_service.recover_pending_device_authorizations()
 
         # TurnScheduler — core-layer turn orchestration, no WebSocket dependency.
         # Must be registered BEFORE task_queue.start() so recovered tasks
@@ -581,6 +592,15 @@ def create_app() -> FastAPI:
             tool_output_spool=tool_output_spool,
         )
         agent_loop.set_turn_scheduler(turn_scheduler)
+
+        from cognis.core.managed_conversation_maintenance import (
+            ManagedConversationMaintenanceService,
+        )
+
+        managed_conversation_maintenance = ManagedConversationMaintenanceService(
+            session_factory=session_factory,
+            turn_scheduler=turn_scheduler,
+        )
 
         # CommandDispatcher — transport-agnostic slash command handling.
         from cognis.core.commands import CommandDispatcher
@@ -645,6 +665,7 @@ def create_app() -> FastAPI:
         )
         await scheduler.start()
         tool_router._scheduler = scheduler
+        await managed_conversation_maintenance.start()
 
         app.state.config = config_runtime
         app.state.engine = engine
@@ -664,6 +685,7 @@ def create_app() -> FastAPI:
         app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
         app.state.artifact_maintenance = artifact_maintenance
+        app.state.managed_conversation_maintenance = managed_conversation_maintenance
         app.state.knowledgebase_enabled = knowledgebase_backend_enabled
         app.state.knowledgebase_service = knowledgebase_service
         app.state.knowledgebase_indexer = knowledgebase_indexer
@@ -790,9 +812,11 @@ def create_app() -> FastAPI:
             session_lock_sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await session_lock_sweeper_task
+        await managed_conversation_maintenance.stop()
         await knowledgebase_indexer.stop()
         await artifact_maintenance.stop()
         await channel_delivery.stop()
+        await mcp_oauth_service.shutdown()
         await channel_manager.stop_all()
         await scheduler.stop()
         await task_queue.stop()
@@ -805,7 +829,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.9.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.10.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
