@@ -41,7 +41,7 @@ def test_signal_cli_cache_path_uses_cognis_data_dir(
     )
 
 
-def test_signal_cli_runtime_config_supports_explicit_overrides(
+def test_signal_cli_runtime_config_uses_managed_runtime_by_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -58,7 +58,8 @@ def test_signal_cli_runtime_config_supports_explicit_overrides(
 
     assert config.auto_install is False
     assert config.version == SIGNAL_CLI_CERTIFIED_VERSION
-    assert config.command == "/usr/local/bin/signal-cli"
+    assert config.command is None
+    assert config.use_external_command is False
     assert config.cache_dir == tmp_path / "cache"
 
     monkeypatch.setenv("COGNIS_SIGNAL_CLI_COMMAND", "/env/bin/signal-cli")
@@ -70,8 +71,36 @@ def test_signal_cli_runtime_config_supports_explicit_overrides(
 
     assert env_config.auto_install is False
     assert env_config.version == "9.9.9"
-    assert env_config.command == "/env/bin/signal-cli"
+    assert env_config.command is None
+    assert env_config.use_external_command is False
     assert env_config.cache_dir == tmp_path / "env-cache"
+
+
+def test_signal_cli_runtime_config_supports_external_command_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = resolve_signal_cli_runtime_config(
+        {
+            "signal": {
+                "use_external_command": True,
+                "command": "/usr/local/bin/signal-cli",
+                "cache_dir": str(tmp_path / "cache"),
+            }
+        }
+    )
+
+    assert config.command == "/usr/local/bin/signal-cli"
+    assert config.command_source == "configured_command"
+    assert config.use_external_command is True
+
+    monkeypatch.setenv("COGNIS_SIGNAL_CLI_USE_EXTERNAL", "1")
+    monkeypatch.setenv("COGNIS_SIGNAL_CLI_COMMAND", "/env/bin/signal-cli")
+    env_config = resolve_signal_cli_runtime_config({})
+
+    assert env_config.command == "/env/bin/signal-cli"
+    assert env_config.command_source == "env_command"
+    assert env_config.use_external_command is True
 
 
 @pytest.mark.asyncio
@@ -84,7 +113,7 @@ async def test_signal_cli_rejects_uncertified_managed_version() -> None:
 
 
 @pytest.mark.asyncio
-async def test_signal_cli_explicit_command_bypasses_managed_install(
+async def test_signal_cli_external_command_opt_in_bypasses_managed_install(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -101,13 +130,44 @@ async def test_signal_cli_explicit_command_bypasses_managed_install(
     monkeypatch.setattr(signal_cli_install, "_probe_version", fake_probe_version)
     monkeypatch.setattr(signal_cli_install, "_download_to_cache", fail_download)
 
-    status = await ensure_signal_cli(SignalCliRuntimeConfig(command=str(command)))
+    status = await ensure_signal_cli(
+        SignalCliRuntimeConfig(command=str(command), use_external_command=True)
+    )
 
     assert status.available is True
     assert status.command == str(command)
     assert status.version == "0.14.1"
     assert status.installed_from == "override"
     assert "certified managed version" in (status.warning or "")
+
+
+@pytest.mark.asyncio
+async def test_signal_cli_configured_command_is_ignored_without_external_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = SignalCliRuntimeConfig(
+        command="/opt/signal-cli-old/bin/signal-cli", cache_dir=tmp_path
+    )
+    command = _cache_command_path(config)
+    command.parent.mkdir(parents=True)
+    command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    command.chmod(command.stat().st_mode | stat.S_IXUSR)
+
+    async def fake_probe_version(path: Path) -> str | None:
+        return SIGNAL_CLI_CERTIFIED_VERSION if path == command else None
+
+    async def fail_download(*_: object) -> Path:
+        raise AssertionError("valid cached managed signal-cli must not be downloaded")
+
+    monkeypatch.setattr(signal_cli_install, "_probe_version", fake_probe_version)
+    monkeypatch.setattr(signal_cli_install, "_download_to_cache", fail_download)
+
+    status = await ensure_signal_cli(config)
+
+    assert status.available is True
+    assert status.command == str(command)
+    assert status.installed_from == "cache"
 
 
 @pytest.mark.asyncio

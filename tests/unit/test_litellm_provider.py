@@ -118,6 +118,28 @@ def test_classify_llm_exception_reasoning_summary_rejection() -> None:
     assert payload["category"] == MidStreamErrorCategory.REASONING_SUMMARY_REJECTED.value
 
 
+def test_classify_llm_exception_usage_limit_reached_is_quota_exhausted() -> None:
+    exc = _ProviderError(
+        "HTTP 429 usage_limit_reached",
+        status_code=429,
+        body={"error": {"code": "usage_limit_reached", "message": "Usage limit reached"}},
+    )
+
+    payload = classify_llm_exception(exc)
+
+    assert payload["category"] == MidStreamErrorCategory.QUOTA_EXHAUSTED.value
+
+
+def test_usage_limit_reached_is_not_pre_stream_retryable() -> None:
+    exc = _ProviderError(
+        "HTTP 429 usage_limit_reached",
+        status_code=429,
+        body={"error": {"code": "usage_limit_reached", "message": "Usage limit reached"}},
+    )
+
+    assert llm_retry.is_retryable_error(exc) is False
+
+
 def test_chatgpt_responses_defaults_omit_prompt_cache_key_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1323,6 +1345,10 @@ async def test_chatgpt_unknown_codex_model_defaults_apply_patch_subtype_to_freef
     model_info = await provider.get_model_info("gpt-5.3-codex-spark", provider_id="chatgpt")
 
     assert model_info.model_id == "gpt-5.3-codex-spark"
+    assert model_info.context_window == 272_000
+    assert model_info.max_context_window == 272_000
+    assert model_info.max_input_tokens == 128_000
+    assert model_info.max_output_tokens == 128_000
     assert model_info.supports_responses_api is True
     assert model_info.supports_openai_apply_patch is True
     assert model_info.openai_apply_patch_tool_type == "freeform"

@@ -97,6 +97,41 @@ async def test_responses_stream_failed_event_includes_safe_error_details() -> No
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_failed_event_preserves_prior_error_event() -> None:
+    async def _stream():
+        yield {
+            "type": "error",
+            "code": "internal_error",
+            "message": "backend stream crashed",
+            "param": "tools",
+            "details": "tool schema exploded",
+        }
+        yield {
+            "type": "response.failed",
+            "response": {"id": "resp_123", "status": "failed"},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert len(chunks) == 2
+    assert chunks[0]["provider_event_type"] == "error"
+    failure_chunk = chunks[1]
+    assert failure_chunk["mid_stream_failure"] is True
+    assert failure_chunk["error"] == "backend stream crashed"
+    response_error = failure_chunk["response_error"]
+    assert response_error["category"] == "provider_5xx"
+    assert response_error["code"] == "internal_error"
+    assert response_error["response_id"] == "resp_123"
+    assert response_error["details"]["previous_error_event"] == {
+        "event_type": "error",
+        "code": "internal_error",
+        "message": "backend stream crashed",
+        "param": "tools",
+        "details": "tool schema exploded",
+    }
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_suppresses_unbound_text_delta() -> None:
     async def _stream():
         yield {"type": "response.output_text.delta", "delta": "hello"}
@@ -233,6 +268,86 @@ def test_messages_to_responses_input_normalizes_multimodal_blocks() -> None:
                 {
                     "type": "input_file",
                     "file_url": "https://example.com/report.pdf",
+                },
+            ],
+        }
+    ]
+
+
+def test_messages_to_responses_input_downgrades_non_user_multimodal_blocks() -> None:
+    messages = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "Continue the interrupted turn."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.jpg", "detail": "high"},
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "file_url": "https://example.com/report.pdf",
+                        "filename": "report.pdf",
+                    },
+                },
+            ],
+        }
+    ]
+
+    result = messages_to_responses_input(messages)
+
+    assert result == [
+        {
+            "role": "system",
+            "content": [
+                {"type": "input_text", "text": "Continue the interrupted turn."},
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[Image attachment omitted from non-user message: "
+                        "https://example.com/image.jpg]"
+                    ),
+                },
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[File attachment omitted from non-user message: "
+                        "report.pdf, https://example.com/report.pdf]"
+                    ),
+                },
+            ],
+        }
+    ]
+
+
+def test_messages_to_responses_input_downgrades_developer_multimodal_blocks() -> None:
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "developer",
+                "content": [
+                    {"type": "text", "text": "Internal note."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/internal.png"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert result == [
+        {
+            "role": "developer",
+            "content": [
+                {"type": "input_text", "text": "Internal note."},
+                {
+                    "type": "input_text",
+                    "text": (
+                        "[Image attachment omitted from non-user message: "
+                        "https://example.com/internal.png]"
+                    ),
                 },
             ],
         }

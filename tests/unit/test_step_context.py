@@ -342,6 +342,25 @@ def test_events_to_messages_handles_tool_call_with_name_field() -> None:
     assert messages[1]["tool_call_id"] == "c1"
 
 
+def test_events_to_messages_replays_visible_tool_alias() -> None:
+    events = [
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "step_request_questions",
+                "visible_name": "request_user_input",
+                "canonical_name": "step_request_questions",
+                "call_id": "c1",
+            },
+        },
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "question answered"}},
+    ]
+
+    messages = events_to_messages(events)
+    assert messages[0]["tool_calls"][0]["function"]["name"] == "request_user_input"
+    assert messages[1]["tool_call_id"] == "c1"
+
+
 def test_events_to_messages_preserves_tool_result_error_flag() -> None:
     events = [
         {"type": "tool_call", "data": {"name": "apply_patch", "call_id": "c1"}},

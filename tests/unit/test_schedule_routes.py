@@ -7,6 +7,8 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.api.routes.schedules import _row_to_response, _schedule_expiration
+from cognis.store.models import Schedule
 from cognis.store.queries import (
     attach_project_workflow,
     create_agent,
@@ -29,6 +31,137 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
 def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, str]:
     token = app.state.auth_provider.sign_access_token(email, email.split("@")[0].title(), role)  # type: ignore[attr-defined]
     return {"Authorization": f"Bearer {token}"}
+
+
+def _schedule_row(**overrides: object) -> Schedule:
+    values: dict[str, object] = {
+        "schedule_id": "sched-test",
+        "name": "Test schedule",
+        "description": None,
+        "schedule_type": "one_shot",
+        "cron_expr": None,
+        "interval_seconds": None,
+        "one_shot_at": datetime(2025, 1, 1, 12, tzinfo=UTC),
+        "timezone": "UTC",
+        "agent_id": "agent-1",
+        "agent_profile_id": None,
+        "workflow_id": None,
+        "project_id": None,
+        "skill_id": None,
+        "task_template": {},
+        "enabled": True,
+        "max_concurrent_runs": 1,
+        "delete_after_run": False,
+        "completion_mode_family": "default",
+        "allow_silent_completion": False,
+        "interaction_mode_override": "none",
+        "last_fired_at": None,
+        "next_fire_at": None,
+        "last_run_status": None,
+        "consecutive_errors": 0,
+        "disabled_reason": None,
+        "created_by": "user@example.com",
+        "created_at": datetime(2025, 1, 1, tzinfo=UTC),
+        "updated_at": datetime(2025, 1, 1, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return Schedule(**values)
+
+
+def test_schedule_expiration_applies_24_hour_grace_after_last_fire() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+    last_fired_at = now - timedelta(hours=25)
+
+    is_expired, grace_until = _schedule_expiration(
+        _schedule_row(last_fired_at=last_fired_at),
+        now,
+    )
+
+    assert is_expired is True
+    assert grace_until == last_fired_at + timedelta(hours=24)
+
+
+def test_schedule_expiration_keeps_recent_one_shot_visible() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+
+    is_expired, grace_until = _schedule_expiration(
+        _schedule_row(last_fired_at=now - timedelta(hours=23)),
+        now,
+    )
+
+    assert is_expired is False
+    assert grace_until == now + timedelta(hours=1)
+
+
+def test_schedule_expiration_keeps_future_and_overdue_runs_active() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+
+    future = _schedule_expiration(
+        _schedule_row(schedule_type="interval", next_fire_at=now + timedelta(minutes=5)),
+        now,
+    )
+    overdue = _schedule_expiration(
+        _schedule_row(schedule_type="interval", next_fire_at=now - timedelta(minutes=5)),
+        now,
+    )
+
+    assert future == (False, None)
+    assert overdue == (False, None)
+
+
+def test_schedule_expiration_does_not_hide_disabled_recurring_schedule() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+
+    is_expired, grace_until = _schedule_expiration(
+        _schedule_row(
+            schedule_type="interval",
+            interval_seconds=3600,
+            enabled=False,
+            last_fired_at=now - timedelta(days=7),
+        ),
+        now,
+    )
+
+    assert is_expired is False
+    assert grace_until is None
+
+
+def test_schedule_expiration_uses_past_one_shot_time_when_never_fired() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+    one_shot_at = now - timedelta(hours=25)
+
+    is_expired, grace_until = _schedule_expiration(
+        _schedule_row(last_fired_at=None, one_shot_at=one_shot_at),
+        now,
+    )
+
+    assert is_expired is True
+    assert grace_until == one_shot_at + timedelta(hours=24)
+
+
+def test_schedule_response_includes_expiration_fields() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+    last_fired_at = now - timedelta(hours=25)
+
+    response = _row_to_response(_schedule_row(last_fired_at=last_fired_at), now=now)
+
+    assert response.is_expired is True
+    assert response.expiration_grace_until == last_fired_at + timedelta(hours=24)
+
+
+def test_schedule_response_keeps_active_latest_run_visible_after_grace() -> None:
+    now = datetime(2025, 1, 2, 12, tzinfo=UTC)
+    last_fired_at = now - timedelta(hours=25)
+
+    response = _row_to_response(
+        _schedule_row(last_fired_at=last_fired_at),
+        latest_task_run=("running", last_fired_at),
+        now=now,
+    )
+
+    assert response.is_expired is False
+    assert response.expiration_grace_until is None
+    assert response.last_run_status == "running"
 
 
 def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path: Path) -> None:

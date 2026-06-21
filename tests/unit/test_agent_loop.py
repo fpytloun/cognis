@@ -16,8 +16,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from cognis.core.agent_loop import (
     _DELEGATION_RESULT_MAX_CHARS,
     _MAX_TOOL_CALL_ARGUMENT_CHARS,
+    _RECOVERY_NON_RETRYABLE_CATEGORIES,
     CHAT_POLICY,
+    CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+    CONTROLLER_TOOL_SURFACE_WORKFLOW,
     DELEGATION_POLICY,
+    DIRECT_CHAT_DELEGATION_POLICY,
     SECONDARY_AGENT_DELEGATION_POLICY,
     SECONDARY_POLICY,
     WORKFLOW_POLICY,
@@ -82,7 +86,11 @@ from cognis.models.workflow import (
     StepOutput,
     WorkflowState,
 )
-from cognis.providers.llm.errors import ToolArgumentParseFailure
+from cognis.providers.llm.errors import (
+    LLMStreamProviderError,
+    MidStreamErrorCategory,
+    ToolArgumentParseFailure,
+)
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.llm.retry import LLMContextOverflowError
 from cognis.runtime_context import scoped_runtime_context
@@ -183,6 +191,26 @@ async def test_llm_stream_idle_timeout_stops_on_cancel_event() -> None:
     assert closed is True
 
 
+@pytest.mark.asyncio
+async def test_llm_stream_provider_error_preserves_quota_payload() -> None:
+    class _UsageLimitReached(Exception):
+        status_code = 429
+        body = {"error": {"code": "usage_limit_reached", "message": "Usage limit reached"}}
+
+    async def _stream():
+        raise _UsageLimitReached("HTTP 429 usage_limit_reached")
+        yield {}  # pragma: no cover
+
+    with pytest.raises(LLMStreamProviderError) as exc_info:
+        async for _chunk in _iterate_llm_stream_with_idle_timeout(
+            _stream(),
+            idle_timeout_seconds=30,
+        ):
+            pass
+
+    assert exc_info.value.to_payload()["category"] == MidStreamErrorCategory.QUOTA_EXHAUSTED.value
+
+
 def test_idle_timeout_failure_can_start_auto_continuation() -> None:
     assert _should_auto_continue_after_mid_stream_failure(
         "LLM stream produced no meaningful activity for 90s"
@@ -202,6 +230,14 @@ def test_exhausted_idle_timeout_can_auto_continue() -> None:
         "Provider disconnected while streaming",
         {"category": "connection"},
     )
+    assert not _should_continue_after_exhausted_mid_stream_failure(
+        "HTTP 429 usage_limit_reached",
+        {"category": "quota_exhausted"},
+    )
+
+
+def test_context_overflow_mid_stream_failures_are_not_retried() -> None:
+    assert MidStreamErrorCategory.CONTEXT_OVERFLOW.value in _RECOVERY_NON_RETRYABLE_CATEGORIES
 
 
 @pytest.mark.asyncio
@@ -3791,6 +3827,70 @@ async def test_background_work_reminder_prioritizes_warnings_and_caps_items(
 
 
 @pytest.mark.asyncio
+async def test_background_work_reminder_includes_recent_completed_open_managed_conversations(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'background-reusable-managed.db'}"
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    now = datetime.now(UTC)
+    async with session_factory() as db_session:
+        for index in range(6):
+            link = await _create_managed_link_for_background_work(
+                db_session,
+                controller.conversation_id,
+                title=f"Reusable completed work {index}",
+                target_conversation_id=f"conv-reusable-{index}",
+            )
+            link.turn_state = "completed"
+            link.completed_at = now - timedelta(minutes=index)
+            link.updated_at = now - timedelta(minutes=index)
+
+        closed_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Closed completed work",
+            target_conversation_id="conv-closed-completed",
+        )
+        closed_link.conversation_state = "closed"
+        closed_link.turn_state = "completed"
+        closed_link.completed_at = now
+        closed_link.updated_at = now
+        await db_session.commit()
+
+    agent_loop = _background_work_agent_loop(session_factory)
+    reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx(controller.conversation_id)
+    )
+
+    assert reminder is not None
+    content = reminder["content"]
+    assert "recent_completed_open_managed_conversations:" in content
+    assert (
+        "Prefer agent_conversation_get or agent_conversation_send when continuing related work "
+        "instead of starting a new managed conversation." in content
+    )
+    for index in range(5):
+        assert f"Reusable completed work {index}" in content
+    assert "Reusable completed work 5" not in content
+    assert (
+        "1 additional completed-open managed conversations omitted, ids: conv-reusable-5" in content
+    )
+    assert (
+        "recommended_action: use agent_conversation_get to inspect context; "
+        "agent_conversation_send to continue related work; "
+        "agent_conversation_close if obsolete"
+    ) in content
+    assert "Closed completed work" not in content
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_background_work_reminder_includes_delegated_sessions_and_suppresses_child_context(
     tmp_path: Path,
 ) -> None:
@@ -4158,6 +4258,8 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
     payload = json.loads(result.output)
     assert result.is_error is False
     assert payload["status"] == "accepted"
+    assert "notified/resumed" in payload["reminder"]
+    assert "end this turn now" in payload["reminder"]
     assert result.metadata is not None
     assert result.metadata["async_orchestration_spawned"] is True
     assert scheduler.notify_on_completion_at_submit is True
@@ -4169,6 +4271,170 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
         assert link.conversation_state == "completed"
         assert link.notify_on_completion is False
         assert link.last_result_summary == "done"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_fork_sets_completion_notification_before_submit(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-fork-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        source_conversation = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+            conversation_id="conv-source",
+        )
+        source_session = await create_session(
+            db_session,
+            source_conversation.conversation_id,
+            "user@example.com",
+            "target-agent",
+            session_id="sess-source",
+        )
+        await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=source_conversation.conversation_id,
+            target_session_id=source_session.session_id,
+            title="Source work",
+        )
+        await db_session.commit()
+
+    class _ForkSessionManager:
+        def __init__(self, factory) -> None:
+            self.session_factory = factory
+
+        async def fork_into_new_conversation(self, **kwargs: object):
+            async with self.session_factory() as db_session:
+                conversation = await create_conversation(
+                    db_session,
+                    user_email=str(kwargs["user_email"]),
+                    agent_id=kwargs["agent"].agent_id,
+                    context_type=kwargs["context"].type,
+                    title=str(kwargs["title"]),
+                    title_source="managed_agent",
+                    context_ref=kwargs["context"].ref,
+                    context_data=dict(kwargs["context"].platform_data),
+                    memory_labels=dict(kwargs["context"].memory_labels),
+                    conversation_id="conv-forked",
+                )
+                session = await create_session(
+                    db_session,
+                    conversation.conversation_id,
+                    str(kwargs["user_email"]),
+                    kwargs["agent"].agent_id,
+                    session_id="sess-forked",
+                )
+                await db_session.commit()
+                return (
+                    SimpleNamespace(
+                        conversation_id=conversation.conversation_id,
+                        project_id=conversation.project_id,
+                        title=conversation.title,
+                    ),
+                    SimpleNamespace(
+                        session_id=session.session_id,
+                        intaris_session_id=session.session_id,
+                        user_email=session.user_email,
+                        agent_id=session.agent_id,
+                    ),
+                    True,
+                )
+
+    class _ForkCompletesDuringSubmitScheduler:
+        def __init__(self) -> None:
+            self.notify_on_completion_at_submit: bool | None = None
+            self.turn_state_at_submit: str | None = None
+
+        def active_turn_checkpoint(self, conversation_id: str) -> None:
+            assert conversation_id == "conv-source"
+            return None
+
+        def active_turn_id(self, conversation_id: str) -> str | None:
+            assert conversation_id == "conv-forked"
+            return None
+
+        async def submit_turn(
+            self, conversation_id: str, *_args: object, **_kwargs: object
+        ) -> None:
+            assert conversation_id == "conv-forked"
+            async with session_factory() as db_session:
+                link = await get_managed_conversation_link_for_target(
+                    db_session,
+                    conversation_id,
+                )
+                assert link is not None
+                self.notify_on_completion_at_submit = link.notify_on_completion
+                self.turn_state_at_submit = link.turn_state
+                await update_managed_conversation_link(
+                    db_session,
+                    link.link_id,
+                    conversation_state="completed",
+                    turn_state="completed",
+                    clear_active_turn_id=True,
+                    notify_on_completion=False,
+                    last_result_summary="fork done",
+                    completed=True,
+                )
+                await db_session.commit()
+            return None
+
+    scheduler = _ForkCompletesDuringSubmitScheduler()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_ForkSessionManager(session_factory),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    agent_loop.set_turn_scheduler(scheduler)
+
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_fork",
+            arguments={
+                "conversation_id": "conv-source",
+                "message": "Continue in fork.",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "forked"
+    assert "notified/resumed" in payload["reminder"]
+    assert "end this turn now" in payload["reminder"]
+    assert result.metadata is not None
+    assert result.metadata["async_orchestration_spawned"] is True
+    assert scheduler.notify_on_completion_at_submit is True
+    assert scheduler.turn_state_at_submit == "running"
+    async with session_factory() as db_session:
+        link = await get_managed_conversation_link_for_target(db_session, "conv-forked")
+        assert link is not None
+        assert link.turn_state == "completed"
+        assert link.conversation_state == "completed"
+        assert link.notify_on_completion is False
+        assert link.last_result_summary == "fork done"
 
     await engine.dispose()
 
@@ -4308,6 +4574,8 @@ async def test_agent_conversation_send_observer_supports_mid_turn_absorb(
     payload = json.loads(result.output)
     assert result.is_error is False
     assert payload["status"] == "accepted"
+    assert "notified/resumed" in payload["reminder"]
+    assert "end this turn now" in payload["reminder"]
     assert result.metadata is not None
     assert result.metadata["async_orchestration_spawned"] is True
     assert len(scheduler.submitted_observers) == 1
@@ -4417,6 +4685,8 @@ async def test_agent_conversation_retry_replays_recorded_target_user_message(
     payload = json.loads(result.output)
     assert result.is_error is False
     assert payload["status"] == "accepted"
+    assert "notified/resumed" in payload["reminder"]
+    assert "end this turn now" in payload["reminder"]
     assert scheduler.submissions == [
         {
             "conversation_id": "conv-target",
@@ -4677,6 +4947,104 @@ def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conver
     assert "create_task" in by_name
 
 
+def test_direct_chat_controller_tools_use_chat_aliases() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt="", allow_questions=True),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        interaction_mode="step_requests",
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+
+    assert "request_user_input" in by_name
+    assert "todo_write" in by_name
+    assert "todo_list" in by_name
+    assert "step_request_questions" not in by_name
+    assert "step_todo_write" not in by_name
+    assert "step_todo_list" not in by_name
+    assert "step_complete" not in by_name
+    assert "write_deliverable" not in by_name
+    assert exposure.alias_map == {
+        "request_user_input": "step_request_questions",
+        "todo_write": "step_todo_write",
+        "todo_list": "step_todo_list",
+    }
+
+
+def test_workflow_controller_tools_keep_step_names() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="plan", type="run", prompt="", allow_questions=True),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-1"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        interaction_mode="step_requests",
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_WORKFLOW,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+
+    assert "step_request_questions" in by_name
+    assert "step_todo_write" in by_name
+    assert "step_todo_list" in by_name
+    assert "step_complete" in by_name
+    assert "request_user_input" not in by_name
+    assert "todo_write" not in by_name
+    assert "todo_list" not in by_name
+    assert exposure.alias_map == {}
+
+
+def test_direct_chat_delegation_policy_hides_workflow_finalization_tools() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="delegation", type="run", prompt="", allow_questions=False
+        ),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=DIRECT_CHAT_DELEGATION_POLICY,
+        interaction_mode="explicit_gates",
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+
+    assert "request_user_input" not in by_name
+    assert "todo_write" in by_name
+    assert "todo_list" in by_name
+    assert "step_complete" not in by_name
+    assert "write_deliverable" not in by_name
+    assert exposure.alias_map == {
+        "todo_write": "step_todo_write",
+        "todo_list": "step_todo_list",
+    }
+
+
 def test_web_main_chat_exposes_async_delegate_and_managed_conversations() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
@@ -4798,6 +5166,40 @@ class _ContextOverflowThenTextLLM:
                 model_id="model-1",
                 reason="context_length_exceeded",
             )
+        yield {"choices": [{"delta": {"content": "Recovered after compaction."}}]}
+
+
+class _StreamProviderContextOverflowThenTextLLM(_ContextOverflowThenTextLLM):
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            raise LLMStreamProviderError(
+                "context_length_exceeded",
+                payload={
+                    "category": MidStreamErrorCategory.CONTEXT_OVERFLOW.value,
+                    "code": "context_length_exceeded",
+                    "message": "context_length_exceeded",
+                },
+            )
+        yield {"choices": [{"delta": {"content": "Recovered after compaction."}}]}
+
+
+class _StreamFailureChunkContextOverflowThenTextLLM(_ContextOverflowThenTextLLM):
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.calls == 1:
+            yield {
+                "mid_stream_failure": True,
+                "error": "context_length_exceeded",
+                "response_error": {
+                    "category": MidStreamErrorCategory.CONTEXT_OVERFLOW.value,
+                    "code": "context_length_exceeded",
+                    "message": "context_length_exceeded",
+                },
+            }
+            return
         yield {"choices": [{"delta": {"content": "Recovered after compaction."}}]}
 
 
@@ -7346,6 +7748,122 @@ async def test_direct_context_overflow_compacts_rotates_and_replays() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_provider_context_overflow_compacts_without_mid_stream_retry() -> None:
+    fake_llm = _StreamProviderContextOverflowThenTextLLM()
+    session_manager = _NoopSessionManager()
+    compaction_strategy = _SuccessfulCompactionStrategy()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=session_manager,
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=compaction_strategy,
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=3,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-provider-overflow",
+            intaris_session_id="sess-provider-overflow",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-provider-overflow"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-provider-overflow",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after compaction."
+    assert fake_llm.calls == 2
+    assert compaction_strategy.calls == ["provider_context_overflow"]
+    assert len(session_manager.rotations) == 1
+    assert ctx.runtime_info["provider_overflow_recoveries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_chunk_context_overflow_compacts_without_mid_stream_retry() -> None:
+    fake_llm = _StreamFailureChunkContextOverflowThenTextLLM()
+    session_manager = _NoopSessionManager()
+    compaction_strategy = _SuccessfulCompactionStrategy()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=session_manager,
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=compaction_strategy,
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=3,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-chunk-overflow",
+            intaris_session_id="sess-chunk-overflow",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-chunk-overflow"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="sr-chunk-overflow",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.error is None
+    assert output.summary == "Recovered after compaction."
+    assert fake_llm.calls == 2
+    assert compaction_strategy.calls == ["provider_context_overflow"]
+    assert len(session_manager.rotations) == 1
+    assert ctx.runtime_info["provider_overflow_recoveries"] == 1
+
+
+@pytest.mark.asyncio
 async def test_direct_token_callback_errors_are_not_retried_as_model_errors() -> None:
     fake_llm = _EmptyThenTextDirectLLM()
     agent_loop = AgentLoop(
@@ -7817,6 +8335,23 @@ def test_delegation_result_anchors_match_truncated_content() -> None:
     assert sections[0]["content"].startswith("[[message:1]]")
 
 
+def test_delegation_result_adds_markdown_heading_anchors() -> None:
+    result = _build_delegation_message_result(
+        ["### Summary\nDone\n\n### Must Fix\n- Repair the anchor path."]
+    )
+
+    assert [anchor["anchor"] for anchor in result.anchors] == [
+        "message:1",
+        "heading:summary",
+        "heading:must-fix",
+    ]
+    assert result.anchors[1]["kind"] == "markdown_heading"
+    sections = _result_sections_from_content(result.content, result.anchors)
+    must_fix = next(section for section in sections if section["anchor"] == "heading:must-fix")
+    assert "### Must Fix" in must_fix["content"]
+    assert "Repair the anchor path" in must_fix["content"]
+
+
 def test_select_delegation_result_aggregates_all_meta_messages() -> None:
     """Even meta-only messages are preserved in chronological order."""
     agent_loop = object.__new__(AgentLoop)
@@ -7926,6 +8461,67 @@ def test_select_delegation_result_prefers_deliverable_content() -> None:
         monkeypatch.undo()
     assert result.content == "Canonical deliverable body"
     assert result.source == "deliverable"
+    assert [anchor["anchor"] for anchor in result.anchors] == ["deliverable"]
+
+
+def test_select_delegation_result_preserves_deliverable_and_markdown_anchors() -> None:
+    agent_loop = object.__new__(AgentLoop)
+
+    class _SessionFactory:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    agent_loop.session_manager = SimpleNamespace(  # type: ignore[attr-defined]
+        session_factory=lambda: _SessionFactory()
+    )
+    child = SimpleNamespace(session_id="child-1", intaris_session_id="child-1")
+
+    async def _get_deliverable(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            content="## Summary\nCanonical deliverable body\n\n## Verdict\nApproved",
+            status="approved",
+        )
+
+    async def _run(monkeypatch: pytest.MonkeyPatch) -> object:
+        monkeypatch.setattr("cognis.core.agent_loop.get_deliverable", _get_deliverable)
+        return await agent_loop._select_delegation_result_content(
+            child_session=child,
+            step_output=StepOutput(
+                summary="summary",
+                content="fallback",
+                deliverable_id="dlv_real",
+                deliverable_title="Report",
+            ),
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        result = asyncio.run(_run(monkeypatch))
+    finally:
+        monkeypatch.undo()
+    assert result.source == "deliverable"
+    assert [anchor["anchor"] for anchor in result.anchors] == [
+        "deliverable",
+        "heading:summary",
+        "heading:verdict",
+    ]
+
+
+def test_truncated_delegation_result_only_advertises_retained_markdown_headings() -> None:
+    content = "## Visible\n" + ("x" * 130) + "\n## Hidden\n" + ("y" * 200)
+
+    truncated, anchors, was_truncated, _original_length = (
+        AgentLoop._truncate_delegation_result_content(content, [], max_chars=180)
+    )
+
+    assert was_truncated
+    assert "## Visible" in truncated
+    assert "## Hidden" not in truncated
+    assert [anchor["anchor"] for anchor in anchors] == ["heading:visible"]
 
 
 def test_get_subsession_returns_durable_result_content(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8294,7 +8890,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
         orchestration_mode=OrchestrationMode.FULL,
     )
 
-    await agent_loop._handle_delegate(
+    result = await agent_loop._handle_delegate(
         ToolCall(
             call_id="call-1",
             name="delegate",
@@ -8303,6 +8899,10 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
         ctx=ctx,
         events_to_record=[],
     )
+    payload = json.loads(result.output)
+    assert payload["result"] == "result"
+    assert "result_content" not in payload
+    assert "result_sections" not in payload
 
     assert captured_callback, "_run_child_session was not called with on_tool_result"
     cb = captured_callback[0]
@@ -10479,8 +11079,8 @@ def test_context_pressure_snapshot_clamps_oversized_output_reserve() -> None:
     assert snapshot.reserve_clamped is True
     assert snapshot.reserve_output_tokens == 500_000
     assert snapshot.effective_reserve_output_tokens == 31_250
-    assert snapshot.available_prompt_tokens == 218_750
-    assert snapshot.threshold_prompt_tokens == 207_812
+    assert snapshot.available_prompt_tokens == 201_250
+    assert snapshot.threshold_prompt_tokens == 191_187
     assert snapshot.exceeded is False
 
 

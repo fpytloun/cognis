@@ -484,6 +484,154 @@ async def test_explicit_direct_notification_overrides_default_policy(tmp_path: o
 
 
 @pytest.mark.asyncio
+async def test_allow_silent_completion_auto_applies_silent_on_success_without_override(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    task = TaskModel(
+        task_id="task-auto-silent",
+        title="Scheduled check",
+        description="",
+        status=TaskStatus.COMPLETED,
+        priority=0,
+        created_by="user@example.com",
+        agent_id="agent-1",
+        source_type="scheduler",
+        source_ref="schedule-1",
+        delivery=TaskDelivery(mode="preferred_channel"),
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="direct",
+            allow_silent_completion=True,
+        ),
+        result_data={"final_content": "No actionable findings."},
+    )
+    state = WorkflowState(
+        current_step="investigate",
+        step_outputs={
+            "investigate": {
+                "summary": "No actionable findings.",
+                "content": "No actionable findings.",
+            }
+        },
+    )
+
+    applied_mode, applied_reason = workflow_engine._resolve_applied_completion(task, state)
+
+    assert applied_mode == "silent"
+    assert applied_reason == (
+        "Auto-silent completion: allow_silent_completion=true and no explicit notification "
+        "override was requested."
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_allow_silent_completion_does_not_suppress_failed_task(tmp_path: object) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    task = TaskModel(
+        task_id="task-failed-not-silent",
+        title="Scheduled check",
+        description="",
+        status=TaskStatus.FAILED,
+        priority=0,
+        created_by="user@example.com",
+        agent_id="agent-1",
+        source_type="scheduler",
+        source_ref="schedule-1",
+        delivery=TaskDelivery(mode="preferred_channel"),
+        completion_delivery=CompletionDeliveryPolicy(
+            completion_mode_family="direct",
+            allow_silent_completion=True,
+        ),
+        result_data={"final_content": "Failure details"},
+    )
+    state = WorkflowState(
+        status="failed",
+        current_step="investigate",
+        step_outputs={
+            "investigate": {
+                "summary": "Investigation failed.",
+                "error": "executor unavailable",
+            }
+        },
+    )
+
+    applied_mode, applied_reason = workflow_engine._resolve_applied_completion(task, state)
+
+    assert applied_mode == "default"
+    assert applied_reason is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_direct_notification_overrides_auto_silent_policy(tmp_path: object) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+    )
+
+    task = TaskModel(
+        task_id="task-direct-override",
+        title="Scheduled report",
+        description="",
+        status=TaskStatus.COMPLETED,
+        priority=0,
+        created_by="user@example.com",
+        agent_id="agent-1",
+        source_type="scheduler",
+        source_ref="schedule-1",
+        delivery=TaskDelivery(mode="preferred_channel"),
+        completion_delivery=CompletionDeliveryPolicy(allow_silent_completion=True),
+        result_data={"final_content": "Important report"},
+    )
+    state = WorkflowState(
+        current_step="publish",
+        step_outputs={
+            "publish": {
+                "summary": "Prepared important report.",
+                "content": "Important report",
+                "notification": {"mode": "direct"},
+            }
+        },
+    )
+
+    applied_mode, applied_reason = workflow_engine._resolve_applied_completion(task, state)
+
+    assert applied_mode == "direct"
+    assert applied_reason is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_failed_workflow_summary_uses_current_failed_step_output(tmp_path: object) -> None:
     engine, session_factory = await _runtime(tmp_path)
     workflow_engine = WorkflowEngine(

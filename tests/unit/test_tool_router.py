@@ -978,6 +978,40 @@ def test_extract_output_anchor_names_falls_back_to_inline_scan() -> None:
     assert names == ["result:1", "result:2"]
 
 
+def test_extract_output_anchor_names_includes_markdown_headings() -> None:
+    raw_output = "# Summary\nBody\n\n### Must Fix\nDetails\n\n#### Too Deep\nIgnored\n"
+
+    names = _extract_output_anchor_names({}, raw_output)
+
+    assert names == ["heading:summary", "heading:must-fix"]
+
+
+def test_extract_output_anchor_names_does_not_duplicate_stored_markdown_headings() -> None:
+    raw_output = "# Summary\nBody\n\n## Verdict\nDone\n"
+    metadata = {
+        "output_anchors": [
+            {
+                "anchor": "heading:summary",
+                "label": "Summary",
+                "kind": "markdown_heading",
+                "start_line": 1,
+                "end_line": 3,
+            },
+            {
+                "anchor": "heading:verdict",
+                "label": "Verdict",
+                "kind": "markdown_heading",
+                "start_line": 4,
+                "end_line": 5,
+            },
+        ]
+    }
+
+    names = _extract_output_anchor_names(metadata, raw_output)
+
+    assert names == ["heading:summary", "heading:verdict"]
+
+
 def test_extract_output_anchor_names_handles_missing_metadata() -> None:
     assert _extract_output_anchor_names(None, "no anchors here") == []
 

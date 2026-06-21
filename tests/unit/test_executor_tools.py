@@ -2093,6 +2093,8 @@ class TestBashTool:
         )
 
         assert not start.is_error
+        assert "notified/resumed" in start.output
+        assert "end this turn now" in start.output
         shell_id = str((start.metadata or {}).get("shell_id"))
         assert shell_id.startswith("shell_")
 

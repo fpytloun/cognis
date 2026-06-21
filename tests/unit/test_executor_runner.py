@@ -23,6 +23,7 @@ from cognis.models.tool import (
     ToolSource,
 )
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
+from cognis.tools.executor.shell import set_background_shell_completion_callback
 from cognis.tools.mcp import MCPClientError
 
 
@@ -139,6 +140,116 @@ async def test_handle_configure_filters_tools() -> None:
     assert "read" in caps_tools
     assert "glob" in caps_tools
     assert "environment" in ws.sent[-1]["result"]
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_preserves_background_shell_completion_callback() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    completed: list[dict[str, object]] = []
+
+    async def _background_shell_completed(status: dict[str, object]) -> None:
+        completed.append(status)
+
+    runner._background_shell_completion_callback = _background_shell_completed
+    set_background_shell_completion_callback(
+        runner._runtime_metadata,
+        _background_shell_completed,
+    )
+
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": ["bash"], "enabled_tool_groups": [], "config": {}},
+    )
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": {
+                "command": "printf background-done",
+                "description": "background completion test",
+                "timeout": 1,
+                "run_in_background": True,
+            },
+        },
+    )
+
+    for _ in range(20):
+        if completed:
+            break
+        await asyncio.sleep(0.05)
+
+    assert completed
+    assert completed[-1]["status"] == "completed"
+    assert completed[-1]["description"] == "background completion test"
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_retries_pending_background_shell_completion() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    stale_attempts: list[dict[str, object]] = []
+    delivered: list[dict[str, object]] = []
+
+    async def _stale_background_shell_completed(status: dict[str, object]) -> None:
+        stale_attempts.append(status)
+        raise ConnectionError("websocket closed")
+
+    async def _fresh_background_shell_completed(status: dict[str, object]) -> None:
+        delivered.append(status)
+
+    runner._background_shell_completion_callback = _stale_background_shell_completed
+    set_background_shell_completion_callback(
+        runner._runtime_metadata,
+        _stale_background_shell_completed,
+    )
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {"enabled_tools": ["bash"], "enabled_tool_groups": [], "config": {}},
+    )
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "bash",
+            "arguments": {
+                "command": "printf pending-completion",
+                "description": "pending completion retry test",
+                "timeout": 1,
+                "run_in_background": True,
+            },
+        },
+    )
+
+    for _ in range(20):
+        if stale_attempts:
+            break
+        await asyncio.sleep(0.05)
+    assert stale_attempts
+    assert delivered == []
+
+    runner._background_shell_completion_callback = _fresh_background_shell_completed
+    await runner._handle_configure(
+        ws,
+        "cfg-2",
+        {"enabled_tools": ["bash"], "enabled_tool_groups": [], "config": {}},
+    )
+
+    for _ in range(20):
+        if delivered:
+            break
+        await asyncio.sleep(0.05)
+
+    assert delivered
+    assert delivered[-1]["status"] == "completed"
+    assert delivered[-1]["description"] == "pending completion retry test"
 
 
 @pytest.mark.asyncio

@@ -146,6 +146,18 @@ def test_chat_prompt_preserves_diacritics_in_user_facing_prose() -> None:
     assert "Preserve correct orthography and diacritics" in rules
 
 
+def test_delegation_prompt_resolves_language_from_task_not_account_context() -> None:
+    instructions = build_system_instructions(PromptContext.DELEGATION, agent_id="system:explore")
+    rules = build_critical_rules(agent_id="system:explore")
+    assert instructions is not None
+    assert rules is not None
+    assert "Use the language of the delegated task or latest user message" in instructions
+    assert "Do not infer language from account, caller, or memory preferences" in instructions
+    assert "default to English if the task language is ambiguous" in instructions
+    assert "resolve the user's language from the delegated task or latest user message" in rules
+    assert "not from account, caller, or memory preferences" in rules
+
+
 def test_chat_prompt_includes_workspace_hygiene() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None

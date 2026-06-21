@@ -265,7 +265,50 @@ async def test_signal_direct_uses_managed_signal_cli_by_default(
 
 
 @pytest.mark.asyncio
-async def test_signal_direct_config_command_is_explicit_override(
+async def test_signal_direct_config_command_requires_external_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.channels.adapters.signal_cli_install import SignalCliStatus
+
+    adapter = FakeAdapter()
+    captured = {}
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+
+    async def fake_ensure_signal_cli(runtime_config):
+        captured["runtime_config"] = runtime_config
+        return SignalCliStatus(
+            available=True,
+            auto_install=True,
+            version="0.14.5",
+            command="/managed/signal-cli",
+            installed_from="cache",
+        )
+
+    monkeypatch.setattr(
+        "cognis.executor.channel_handler.ensure_signal_cli",
+        fake_ensure_signal_cli,
+    )
+
+    handler = ChannelHandler()
+    handler.set_executor_config(
+        {"signal": {"direct_enabled": True, "command": "/usr/bin/signal-cli"}}
+    )
+
+    await handler.start(
+        "acct-1",
+        "signal",
+        {"settings": {"transport": "direct_jsonrpc"}, "agent_id": "a", "user_email": "u"},
+        {"account_number": "+10000000000"},
+    )
+
+    assert captured["runtime_config"].command is None
+    assert captured["runtime_config"].use_external_command is False
+    assert adapter.config.settings["_signal_cli_command"] == "/managed/signal-cli"
+    assert adapter.config.settings["_signal_cli_runtime"]["installed_from"] == "cache"
+
+
+@pytest.mark.asyncio
+async def test_signal_direct_config_command_can_opt_in_to_external_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.channels.adapters.signal_cli_install import SignalCliStatus
@@ -292,7 +335,13 @@ async def test_signal_direct_config_command_is_explicit_override(
 
     handler = ChannelHandler()
     handler.set_executor_config(
-        {"signal": {"direct_enabled": True, "command": "/usr/bin/signal-cli"}}
+        {
+            "signal": {
+                "direct_enabled": True,
+                "use_external_command": True,
+                "command": "/usr/bin/signal-cli",
+            }
+        }
     )
 
     await handler.start(
@@ -303,5 +352,6 @@ async def test_signal_direct_config_command_is_explicit_override(
     )
 
     assert captured["runtime_config"].command == "/usr/bin/signal-cli"
+    assert captured["runtime_config"].use_external_command is True
     assert adapter.config.settings["_signal_cli_command"] == "/usr/bin/signal-cli"
     assert adapter.config.settings["_signal_cli_runtime"]["installed_from"] == "configured_command"

@@ -42,6 +42,44 @@ async def test_list_tool_output_anchors_returns_saved_anchors(store: ToolOutputS
 
 
 @pytest.mark.asyncio
+async def test_list_tool_output_anchors_does_not_duplicate_saved_markdown_anchors(
+    store: ToolOutputStore,
+) -> None:
+    content = "# Summary\nBody\n\n## Verdict\nDone\n"
+    await store.save(
+        "call_markdown",
+        content,
+        anchors=[
+            {
+                "anchor": "heading:summary",
+                "label": "Summary",
+                "kind": "markdown_heading",
+                "start_line": 1,
+                "end_line": 3,
+            },
+            {
+                "anchor": "heading:verdict",
+                "label": "Verdict",
+                "kind": "markdown_heading",
+                "start_line": 4,
+                "end_line": 5,
+            },
+        ],
+    )
+
+    result = await handle_tool_output_tool(
+        "list_tool_output_anchors",
+        {"call_id": "call_markdown"},
+        store,
+    )
+
+    assert not result.is_error
+    assert result.output.count("heading:summary") == 1
+    assert result.output.count("heading:verdict") == 1
+    assert "heading:summary-2" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_read_tool_output_anchor_returns_only_requested_section(
     store: ToolOutputStore,
 ) -> None:

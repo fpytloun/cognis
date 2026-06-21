@@ -466,6 +466,12 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
         available_prompt_tokens=6_000,
         model="gpt-5.4",
         provider_id="proxy",
+        reasoning_effort="high",
+        agent_id="agent-1",
+        agent_profile_id="build",
+        requested_agent_profile_id="build",
+        agent_profile_source="conversation",
+        agent_profile_synthetic=False,
         reserve_output_tokens=1_000,
         effective_reserve_output_tokens=1_000,
         compaction_threshold=0.85,
@@ -491,6 +497,12 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
 
     assert usage is not None
     assert usage["provider_id"] == "proxy"
+    assert usage["reasoning_effort"] == "high"
+    assert usage["agent_id"] == "agent-1"
+    assert usage["agent_profile_id"] == "build"
+    assert usage["requested_agent_profile_id"] == "build"
+    assert usage["agent_profile_source"] == "conversation"
+    assert usage["agent_profile_synthetic"] is False
     assert usage["max_input_tokens"] == 6_000
     assert usage["available_prompt_tokens"] == 6_000
     assert usage["effective_prompt_budget"] == 6_000
@@ -508,6 +520,23 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
         "cache_read_input_tokens": 900,
         "cache_creation_input_tokens": 124,
     }
+
+    cache.update_context_usage(
+        session,
+        prompt_tokens=1_000,
+        max_context_tokens=8_000,
+        model="gpt-5.4",
+        provider_id="proxy",
+    )
+    cleared_usage = cache.get_context_usage(session.session_id)
+
+    assert cleared_usage is not None
+    assert cleared_usage["reasoning_effort"] is None
+    assert cleared_usage["agent_id"] is None
+    assert cleared_usage["agent_profile_id"] is None
+    assert cleared_usage["requested_agent_profile_id"] is None
+    assert cleared_usage["agent_profile_source"] is None
+    assert cleared_usage["agent_profile_synthetic"] is None
 
 
 @pytest.mark.asyncio

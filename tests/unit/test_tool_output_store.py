@@ -210,3 +210,53 @@ async def test_list_anchors_falls_back_to_inline_markers(store: ToolOutputStore)
     assert anchors is not None
     assert [item.anchor for item in anchors] == ["result:1", "result:2"]
     assert anchors[0].kind == "search_result"
+
+
+@pytest.mark.asyncio
+async def test_list_anchors_derives_markdown_headings(store: ToolOutputStore) -> None:
+    await store.save(
+        "call_markdown",
+        "# Summary\nTop-level text\n\n```md\n## Ignored\n```\n\n## Must Fix\nDetails\n\n#### Too Deep\nIgnored\n\n## Verdict\nDone",
+        anchors=[],
+    )
+
+    anchors = await store.list_anchors("call_markdown")
+    assert anchors is not None
+    assert [item.anchor for item in anchors] == [
+        "heading:summary",
+        "heading:must-fix",
+        "heading:verdict",
+    ]
+    assert anchors[0].kind == "markdown_heading"
+    assert anchors[0].start_line == 1
+    assert anchors[0].end_line == 15
+    assert anchors[1].start_line == 8
+
+    result = await store.read_anchor("call_markdown", "heading:must-fix")
+    assert result is not None
+    assert "8: ## Must Fix" in result.content
+    assert "9: Details" in result.content
+    assert "14: ## Verdict" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_list_anchors_supplements_explicit_anchors_with_markdown(
+    store: ToolOutputStore,
+) -> None:
+    await store.save(
+        "call_explicit_markdown",
+        "[[message:1]]\n--- Assistant message 1 ---\n### Summary\nBody",
+        anchors=[
+            {
+                "anchor": "message:1",
+                "label": "Assistant message 1",
+                "kind": "section",
+                "start_line": 1,
+                "end_line": 4,
+            }
+        ],
+    )
+
+    anchors = await store.list_anchors("call_explicit_markdown")
+    assert anchors is not None
+    assert [item.anchor for item in anchors] == ["message:1", "heading:summary"]

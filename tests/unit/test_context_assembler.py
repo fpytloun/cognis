@@ -1665,6 +1665,57 @@ async def test_context_assembler_includes_artifact_ids_with_native_image_blocks(
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_keeps_native_attachments_on_user_role_for_system_turns() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Continue the interrupted turn.",
+        user_message_role="system",
+        user_attachments=[
+            {
+                "artifact_id": "att_1",
+                "kind": "image",
+                "mime_type": "image/png",
+                "filename": "photo.png",
+                "size_bytes": 123,
+                "url": "https://example.test/photo.png",
+            }
+        ],
+        tool_definitions=[],
+    )
+
+    system_messages = [
+        message
+        for message in result.messages
+        if message.get("role") == "system"
+        and message.get("content") == "Continue the interrupted turn."
+    ]
+    assert system_messages
+
+    attachment_messages = [
+        message
+        for message in result.messages
+        if message.get("role") == "user" and isinstance(message.get("content"), list)
+    ]
+    assert attachment_messages
+    current_turn = attachment_messages[-1]
+    assert current_turn["content"][0]["type"] == "text"
+    assert "artifact_id=att_1" in current_turn["content"][0]["text"]
+    assert current_turn["content"][1]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_includes_composed_identity_prompt() -> None:
     assembler = ContextAssembler(
         memory=_Memory(),

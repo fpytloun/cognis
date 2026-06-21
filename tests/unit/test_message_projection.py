@@ -115,6 +115,45 @@ def test_anthropic_projection_converts_terminal_system_turn_without_follow_up() 
     assert result.diagnostics["final_projected_non_system_role"] == "user"
 
 
+def test_anthropic_projection_wraps_split_current_turn_system_message() -> None:
+    provider = SimpleNamespace(config={"preset": "anthropic"})
+
+    result = project_messages_for_provider(
+        [
+            {"role": "system", "content": "immutable prefix", "_immutable_prefix": True},
+            {
+                "role": "system",
+                "content": "Continue the interrupted turn.",
+                "_audit_source": "current_turn_system_message",
+                "_audit_role": "system",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Attachments: photo.png (image, artifact_id=att_1)"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/photo.png"},
+                    },
+                ],
+            },
+        ],
+        provider=provider,
+        llm_api="chat_completions",
+    )
+
+    assert [message["role"] for message in result.messages] == [
+        "system",
+        "system",
+        "user",
+        "user",
+    ]
+    assert result.messages[1]["content"] == SYSTEM_NOTICE_INSTRUCTION
+    assert "Continue the interrupted turn." in result.messages[2]["content"]
+    assert result.messages[3]["content"][1]["type"] == "image_url"
+    assert result.diagnostics["controller_notices_converted"] == 1
+
+
 def test_anthropic_projection_escapes_system_notice_closing_tags() -> None:
     provider = SimpleNamespace(config={"preset": "anthropic"})
 

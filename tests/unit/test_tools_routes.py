@@ -39,6 +39,9 @@ def test_list_tools_includes_executor_and_controller_tools(
     assert "artifact_get_url" in names
     assert "artifact_publish" in names
     assert "artifact_save" in names
+    assert "step_request_questions" in names
+    assert "step_todo_write" in names
+    assert "step_todo_list" in names
     sources = {tool["name"]: tool["source"]["type"] for tool in tools}
     assert sources["artifact_read"] == "builtin"
     assert sources["artifact_list_recent"] == "builtin"
@@ -47,3 +50,9 @@ def test_list_tools_includes_executor_and_controller_tools(
     assert sources["artifact_get_url"] == "builtin"
     assert sources["artifact_publish"] == "executor"
     assert sources["artifact_save"] == "executor"
+    assert sources["step_request_questions"] == "controller"
+    question_tool = next(tool for tool in tools if tool["name"] == "step_request_questions")
+    assert question_tool["configurable"] is False
+    assert question_tool["aliases"] == [{"name": "request_user_input", "surface": "direct_chat"}]
+    assert question_tool["surfaces"]["workflow_step"] == "step_request_questions"
+    assert question_tool["surfaces"]["direct_chat"] == "request_user_input"

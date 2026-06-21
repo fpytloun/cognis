@@ -12,13 +12,15 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.api.middleware import AuthenticatedUser
-from cognis.api.models import TaskCreateRequest
+from cognis.api.models import MessageEventResponse, TaskCreateRequest
+from cognis.api.routes.conversations import _project_timeline_events
 from cognis.api.routes.tasks import task_create
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketConnectionManager,
     _handle_step_response,
 )
+from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_loop import PendingPause
 from cognis.core.decision import DecisionResult
 from cognis.core.task_queue import TaskRerunResult
@@ -46,6 +48,7 @@ from cognis.store.queries import (
     create_task,
     create_user,
     get_conversation,
+    get_user_ui_state_value,
     set_session_intaris_session_id,
     set_session_status,
     touch_conversation,
@@ -63,6 +66,572 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
 def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, str]:
     token = app.state.auth_provider.sign_access_token(email, email.split("@")[0].title(), role)  # type: ignore[attr-defined]
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_timeline_projection_keeps_tool_delimited_assistant_phases() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_message",
+                data={"session_id": "sess_a", "turn_id": "turn_1", "content": "First"},
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="tool_call",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "visible_name": "cat_file",
+                    "canonical_name": "read",
+                    "arguments": '{"file_path":"README.md"}',
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                type="tool_result",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "call_id": "call_1",
+                    "result": "ok",
+                },
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+            MessageEventResponse(
+                seq=4,
+                type="assistant_message",
+                data={"session_id": "sess_a", "turn_id": "turn_1", "content": "Second"},
+                timestamp="2026-01-01T00:00:04Z",
+            ),
+        ]
+    )
+
+    assistant_messages = [
+        item for item in items if item.get("kind") == "message" and item.get("role") == "assistant"
+    ]
+
+    assert [item["content"] for item in assistant_messages] == ["First", "Second"]
+    assert [item["assistantPhaseIndex"] for item in assistant_messages] == [0, 1]
+    assert items[1]["arguments"] == {"file_path": "README.md"}
+    assert items[1]["sessionId"] == "sess_a"
+    assert items[1]["toolName"] == "read"
+    assert items[1]["displayToolName"] == "cat_file"
+    assert items[1]["canonicalToolName"] == "read"
+
+
+def test_timeline_projection_replaces_duplicate_system_notices() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="system_message",
+                data={
+                    "session_id": "sess_a",
+                    "notice_id": "turn-start",
+                    "kind": "turn_initiated",
+                    "content": "Starting",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="system_message",
+                data={
+                    "session_id": "sess_a",
+                    "notice_id": "turn-start",
+                    "kind": "turn_initiated",
+                    "content": "Started",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+        ]
+    )
+
+    assert items == [
+        {
+            "id": "system:turn-start",
+            "kind": "system_message",
+            "text": "Started",
+            "noticeId": "turn-start",
+            "noticeKind": "turn_initiated",
+            "timestamp": "2026-01-01T00:00:02Z",
+        }
+    ]
+
+
+def test_timeline_projection_groups_thinking_before_assistant_answer() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "Answer",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="assistant_thinking",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "block_1",
+                    "content": "first",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                type="assistant_thinking",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "block_2",
+                    "content": "second",
+                },
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["thinking", "message"]
+    assert items[0]["messageId"] == "msg_1"
+    assert items[0]["sessionId"] == "sess_a"
+    assert [block["content"] for block in items[0]["blocks"]] == ["first", "second"]
+    assert items[1]["content"] == "Answer"
+
+
+def test_timeline_projection_hides_user_message_reasoning_echo() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_thinking",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "block_1",
+                    "title": "Reasoning",
+                    "content": "User message: check current repo state",
+                    "reasoning_source": "reasoning",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "Answer",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["message"]
+    assert items[0]["content"] == "Answer"
+
+
+def test_timeline_projection_uses_unique_thinking_ids_across_tool_boundaries() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_thinking",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "block_1",
+                    "content": "Before tool",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="tool_call",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "call_id": "call_1",
+                    "tool_name": "read",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                type="assistant_thinking",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "block_2",
+                    "content": "After tool",
+                },
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+        ]
+    )
+
+    thinking_items = [item for item in items if item["kind"] == "thinking"]
+    assert len(thinking_items) == 2
+    assert thinking_items[0]["id"] != thinking_items[1]["id"]
+
+
+def test_timeline_projection_hides_generic_reasoning_diagnostics() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                session_id="sess_a",
+                type="reasoning",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "block_id": "reason_1",
+                    "summary": "The model considered alternatives.",
+                    "source": "summary",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                session_id="sess_a",
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "Final answer",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["message"]
+    assert items[0]["content"] == "Final answer"
+
+
+def test_timeline_projection_hides_internal_audit_events() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                session_id="sess_a",
+                type="developer_message",
+                data={"content": "Internal context only"},
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                session_id="sess_a",
+                type="lifecycle",
+                data={"event": "intention_updated", "intention": "debug issue"},
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                session_id="sess_a",
+                type="lifecycle",
+                data={"event": "session_status_changed", "status": "completed"},
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+            MessageEventResponse(
+                seq=4,
+                session_id="sess_a",
+                type="lifecycle",
+                data={"event": "session_created", "session_id": "sess_child"},
+                timestamp="2026-01-01T00:00:04Z",
+            ),
+            MessageEventResponse(
+                seq=5,
+                session_id="sess_a",
+                type="context_snapshot",
+                data={"event": "context_snapshot", "summary": "internal context"},
+                timestamp="2026-01-01T00:00:05Z",
+            ),
+            MessageEventResponse(
+                seq=6,
+                session_id="sess_a",
+                type="evaluation",
+                data={},
+                timestamp="2026-01-01T00:00:06Z",
+            ),
+            MessageEventResponse(
+                seq=7,
+                session_id="sess_a",
+                type="lifecycle",
+                data={"event": "tool_discovery", "session_id": "sess_a"},
+                timestamp="2026-01-01T00:00:07Z",
+            ),
+        ]
+    )
+
+    assert items == []
+
+
+def test_timeline_projection_closes_assistant_phase_before_lifecycle_notice() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "Before",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="lifecycle",
+                data={
+                    "session_id": "sess_a",
+                    "event": "system_notice",
+                    "message": "Notice",
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "After",
+                },
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["message", "system_message", "message"]
+    assert items[0]["content"] == "Before"
+    assert items[2]["content"] == "After"
+
+
+def test_timeline_projection_closes_assistant_phase_before_session_recovery() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "Before",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="session_recovered",
+                data={"session_id": "sess_a"},
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+            MessageEventResponse(
+                seq=3,
+                type="assistant_message",
+                data={
+                    "session_id": "sess_a",
+                    "turn_id": "turn_1",
+                    "message_id": "msg_1",
+                    "content": "After",
+                },
+                timestamp="2026-01-01T00:00:03Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["message", "system_message", "message"]
+    assert items[0]["content"] == "Before"
+    assert items[2]["content"] == "After"
+
+
+def test_timeline_projection_projects_delegation_without_fallback() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="user_message",
+                data={"session_id": "sess_a", "content": "Hi"},
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="delegation",
+                data={"session_id": "sess_a", "child_session_id": "sess_child"},
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+        ]
+    )
+
+    assert [item["kind"] for item in items] == ["message", "delegation"]
+    assert items[1] == {
+        "id": "delegation:sess_child",
+        "kind": "delegation",
+        "taskId": "sess_child",
+        "taskLabel": "Sub-session",
+        "status": "started",
+        "timestamp": "2026-01-01T00:00:02Z",
+    }
+
+
+def test_timeline_projection_uses_persisted_delegation_title() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="delegation",
+                data={
+                    "session_id": "sess_a",
+                    "child_session_id": "sess_child",
+                    "title": "Explore project",
+                    "status": "completed",
+                    "result_summary": "done",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+        ]
+    )
+
+    assert items[0]["taskLabel"] == "Explore project"
+
+
+def test_timeline_projection_preserves_terminal_delegation_state() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="delegation",
+                data={
+                    "session_id": "sess_a",
+                    "child_session_id": "sess_child",
+                    "title": "Explore project",
+                    "status": "completed",
+                    "result_summary": "done",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+            MessageEventResponse(
+                seq=2,
+                type="delegation",
+                data={
+                    "session_id": "sess_a",
+                    "child_session_id": "sess_child",
+                    "status": "running",
+                    "todos": [{"content": "stale", "status": "pending"}],
+                },
+                timestamp="2026-01-01T00:00:02Z",
+            ),
+        ]
+    )
+
+    assert len(items) == 1
+    assert items[0]["taskLabel"] == "Explore project"
+    assert items[0]["status"] == "completed"
+    assert items[0]["result"] == "done"
+    assert items[0]["timestamp"] == "2026-01-01T00:00:01Z"
+    assert "todos" not in items[0]
+
+
+def test_timeline_projection_projects_lifecycle_workflow_composed() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="lifecycle",
+                data={
+                    "session_id": "sess_a",
+                    "event": "workflow_composed",
+                    "workflow_id": "wf_1",
+                    "workflow_name": "Workflow",
+                    "steps": ["plan", "build"],
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+        ]
+    )
+
+    assert items == [
+        {
+            "id": "workflow-composed:sess_a:1",
+            "kind": "workflow_composed",
+            "workflowId": "wf_1",
+            "workflowName": "Workflow",
+            "lifecycle": "ephemeral",
+            "steps": ["plan", "build"],
+            "timestamp": "2026-01-01T00:00:01Z",
+        }
+    ]
+
+
+def test_timeline_projection_uses_lifecycle_task_title() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="lifecycle",
+                data={
+                    "session_id": "sess_a",
+                    "event": "task_result",
+                    "task_id": "task_1",
+                    "task_title": "Build projection",
+                    "result_summary": "done",
+                },
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+        ]
+    )
+
+    assert items[0]["kind"] == "delegation"
+    assert items[0]["taskLabel"] == "Build projection"
+    assert items[0]["status"] == "completed"
+
+
+def test_timeline_projection_projects_unknown_events_as_notices() -> None:
+    items = _project_timeline_events(
+        [
+            MessageEventResponse(
+                seq=1,
+                type="future_event",
+                data={"session_id": "sess_a", "value": 1},
+                timestamp="2026-01-01T00:00:01Z",
+            ),
+        ]
+    )
+
+    assert items == [
+        {
+            "id": "event-notice:sess_a:1",
+            "kind": "notice",
+            "title": "Conversation event",
+            "description": "Unsupported persisted event: future_event",
+            "tone": "info",
+            "timestamp": "2026-01-01T00:00:01Z",
+        }
+    ]
 
 
 def test_viewer_cannot_create_task(monkeypatch: object, tmp_path: Path) -> None:
@@ -1608,6 +2177,672 @@ def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path)
         assert [item["conversation_id"] for item in body["items"]] == [second_id]
         assert body["items"][0]["agent_id"] == "agent-2"
         assert first_id != second_id
+
+
+def test_conversation_list_paginates_before_attention_hydration(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> list[str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                conversations = []
+                for index in range(3):
+                    conversation = await create_conversation(
+                        session,
+                        user_email="user@example.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                        title=f"Conversation {index}",
+                    )
+                    conversation.last_message_at = base + timedelta(minutes=index)
+                    conversations.append(conversation)
+                await session.commit()
+                return [conversation.conversation_id for conversation in conversations]
+
+        conversation_ids = asyncio.run(_seed())
+        hydration_batch_sizes: list[int] = []
+
+        async def _fake_attention_context(
+            _session: object,
+            conversations: list[object],
+            _user_email: str,
+        ) -> tuple[dict[str, object], dict[str, list[str]]]:
+            hydration_batch_sizes.append(len(conversations))
+            return {}, {}
+
+        from cognis.api.routes import conversations as conversation_routes
+
+        monkeypatch.setattr(
+            conversation_routes,
+            "_conversation_attention_context",
+            _fake_attention_context,
+        )
+
+        first_response = client.get(
+            "/api/v1/conversations?limit=2",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert first_response.status_code == 200
+        first_body = first_response.json()
+        assert [item["conversation_id"] for item in first_body["items"]] == [
+            conversation_ids[2],
+            conversation_ids[1],
+        ]
+        assert first_body["has_more"] is True
+        assert first_body["cursor"]
+
+        second_response = client.get(
+            f"/api/v1/conversations?limit=2&cursor={first_body['cursor']}",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert second_response.status_code == 200
+        second_body = second_response.json()
+        assert [item["conversation_id"] for item in second_body["items"]] == [
+            conversation_ids[0],
+        ]
+        assert second_body["has_more"] is False
+        assert hydration_batch_sizes == [2, 1]
+
+
+def test_conversation_list_ignores_metadata_updated_at_for_activity_ordering(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                updated_activity = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Updated activity",
+                )
+                updated_activity.last_message_at = base + timedelta(minutes=1)
+                updated_activity.updated_at = base + timedelta(minutes=10)
+
+                newer_message = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Newer message",
+                )
+                newer_message.last_message_at = base + timedelta(minutes=5)
+                newer_message.updated_at = base + timedelta(minutes=5)
+                await session.commit()
+                return updated_activity.conversation_id, newer_message.conversation_id
+
+        metadata_updated_id, message_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/conversations",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert [item["conversation_id"] for item in response.json()["items"][:2]] == [
+            message_id,
+            metadata_updated_id,
+        ]
+
+
+def test_conversation_context_types_projection(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Web",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Signal",
+                )
+                archived = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="slack",
+                    title="Archived Slack",
+                )
+                archived.status = "archived"
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        active_response = client.get(
+            "/api/v1/conversations/context-types",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert active_response.status_code == 200
+        assert active_response.json() == ["signal", "web"]
+
+        archived_response = client.get(
+            "/api/v1/conversations/context-types?status=archived",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert archived_response.status_code == 200
+        assert archived_response.json() == ["slack"]
+
+
+def test_conversation_open_prefers_valid_selected_agent_candidate(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-2",
+                    owner_email="user@example.com",
+                    name="Agent 2",
+                    status="active",
+                )
+                selected = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Selected Agent",
+                )
+                other_agent = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-2",
+                    context_type="web",
+                    title="Other Agent",
+                )
+                await session.commit()
+                return selected.conversation_id, other_agent.conversation_id
+
+        selected_id, other_agent_id = asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/conversations/open",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "agent_id": "agent-1",
+                "context_type": "web",
+                "candidate_conversation_ids": [other_agent_id, selected_id],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["conversation_id"] == selected_id
+
+
+def test_conversation_open_allows_viewer_to_open_existing_candidate(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="viewer@example.com",
+                    name="Viewer",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="viewer",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="viewer@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="viewer@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Viewer Conversation",
+                )
+                await session.commit()
+                return conversation.conversation_id
+
+        conversation_id = asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/conversations/open",
+            headers=_auth_headers(app, email="viewer@example.com", role="viewer"),
+            json={
+                "agent_id": "agent-1",
+                "context_type": "web",
+                "candidate_conversation_ids": [conversation_id],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["conversation_id"] == conversation_id
+
+        async def _state() -> dict[str, object] | None:
+            async with app.state.session_factory() as session:
+                return await get_user_ui_state_value(
+                    session,
+                    "viewer@example.com",
+                    "chat.last_opened:viewer-agent\x1f\x1fweb",
+                )
+
+        assert asyncio.run(_state()) is None
+
+
+def test_conversation_open_honors_requested_agent_profile(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                    agent_profiles={
+                        "fast": {"profile_id": "fast", "description": "Fast"},
+                        "quality": {"profile_id": "quality", "description": "Quality"},
+                    },
+                    default_agent_profile_id="fast",
+                )
+                fast = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Fast",
+                )
+                fast.agent_profile_id = "fast"
+                quality = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Quality",
+                )
+                quality.agent_profile_id = "quality"
+                await session.commit()
+                return fast.conversation_id, quality.conversation_id
+
+        fast_id, quality_id = asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/conversations/open",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "agent_id": "agent-1",
+                "agent_profile_id": "quality",
+                "context_type": "web",
+                "candidate_conversation_ids": [fast_id, quality_id],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["conversation_id"] == quality_id
+
+
+def test_conversation_open_fallback_finds_latest_matching_profile(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                    agent_profiles={
+                        "fast": {"profile_id": "fast", "description": "Fast"},
+                        "quality": {"profile_id": "quality", "description": "Quality"},
+                    },
+                    default_agent_profile_id="fast",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                quality = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Quality",
+                )
+                quality.agent_profile_id = "quality"
+                quality.last_message_at = base
+                fast = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Fast",
+                )
+                fast.agent_profile_id = "fast"
+                fast.last_message_at = base + timedelta(minutes=1)
+                await session.commit()
+                return quality.conversation_id, fast.conversation_id
+
+        quality_id, fast_id = asyncio.run(_seed())
+
+        response = client.post(
+            "/api/v1/conversations/open",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={
+                "agent_id": "agent-1",
+                "agent_profile_id": "quality",
+                "context_type": "web",
+                "candidate_conversation_ids": [],
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["conversation_id"] == quality_id
+        assert response.json()["conversation_id"] != fast_id
+
+
+def test_conversation_open_uses_server_persisted_last_opened(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                older = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Older",
+                )
+                older.last_message_at = base
+                newer = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Newer",
+                )
+                newer.last_message_at = base + timedelta(minutes=1)
+                await session.commit()
+                return older.conversation_id, newer.conversation_id
+
+        older_id, newer_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        first = client.post(
+            "/api/v1/conversations/open",
+            headers=headers,
+            json={
+                "agent_id": "agent-1",
+                "context_type": "web",
+                "candidate_conversation_ids": [older_id],
+            },
+        )
+        assert first.status_code == 200
+        assert first.json()["conversation_id"] == older_id
+
+        second = client.post(
+            "/api/v1/conversations/open",
+            headers=headers,
+            json={
+                "agent_id": "agent-1",
+                "context_type": "web",
+                "candidate_conversation_ids": [],
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["conversation_id"] == older_id
+        assert second.json()["conversation_id"] != newer_id
+
+
+def test_conversation_opened_endpoint_persists_direct_open(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                opened = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Opened",
+                )
+                opened.last_message_at = base
+                latest = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Latest",
+                )
+                latest.last_message_at = base + timedelta(minutes=1)
+                await session.commit()
+                return opened.conversation_id, latest.conversation_id
+
+        opened_id, latest_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        opened = client.post(f"/api/v1/conversations/{opened_id}/opened", headers=headers)
+        assert opened.status_code == 200
+        assert opened.json()["conversation_id"] == opened_id
+
+        resolved = client.post(
+            "/api/v1/conversations/open",
+            headers=headers,
+            json={
+                "agent_id": "agent-1",
+                "context_type": "web",
+                "candidate_conversation_ids": [],
+            },
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["conversation_id"] == opened_id
+        assert resolved.json()["conversation_id"] != latest_id
+
+
+def test_conversation_sidebar_projection_returns_shaped_sidebar_payload(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-2",
+                    owner_email="user@example.com",
+                    name="Agent 2",
+                    status="active",
+                )
+                web = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Web",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="signal",
+                    title="Signal",
+                )
+                direct = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    context_ref=agent_direct_context_ref("user@example.com", "agent-1"),
+                    context_data={"kind": AGENT_DIRECT_KIND},
+                    title="Agent direct",
+                    title_source="agent_direct",
+                )
+                await session.commit()
+                return web.conversation_id, direct.conversation_id
+
+        web_id, direct_id = asyncio.run(_seed())
+
+        response = client.get(
+            "/api/v1/conversations/sidebar?context_type=web&agent_id=agent-1&limit=10",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert {agent["agent_id"] for agent in body["agents"]} >= {"agent-1", "agent-2"}
+        assert body["context_types"] == ["signal", "web"]
+        assert [item["conversation_id"] for item in body["conversations"]["items"]] == [web_id]
+        assert body["conversations"]["has_more"] is False
+        assert [item["conversation"]["conversation_id"] for item in body["agent_direct_chats"]] == [
+            direct_id
+        ]
+
+        signal_response = client.get(
+            "/api/v1/conversations/sidebar?context_type=signal&agent_id=agent-1&limit=10",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert signal_response.status_code == 200
+        assert signal_response.json()["agent_direct_chats"] == []
 
 
 def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_path: Path) -> None:
@@ -3810,10 +5045,10 @@ def test_websocket_queues_second_message_while_turn_active(
             for _ in range(5):
                 payload = ws.receive_json()
                 seen_types.add(payload["type"])
-                if payload["type"] == "queued":
+                if payload["type"] in {"queued", "queued_messages_updated"}:
                     break
 
-            assert "queued" in seen_types
+            assert seen_types & {"queued", "queued_messages_updated"}
             for _ in range(5):
                 payload = ws.receive_json()
                 if payload["type"] == "message_complete":

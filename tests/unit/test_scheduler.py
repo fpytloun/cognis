@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from cognis.core.events import EventBus, EventType
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.scheduler import Scheduler
 from cognis.models.schedule import (
     ScheduleModel,
@@ -322,6 +322,7 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_submit: dict[str, Any] = {}
+    updates: list[dict[str, Any]] = []
 
     class _TaskQueue:
         async def submit(self, **kwargs: Any) -> SimpleNamespace:
@@ -340,7 +341,11 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
 
     async def _get_schedule(_db: object, schedule_id: str) -> Any:
         assert schedule_id == "sched_1"
-        return _schedule_row(task_template={"title": "Scheduled task"})
+        return _schedule_row(task_template={"title": "Scheduled task"}, consecutive_errors=2)
+
+    async def _get_task(_db: object, task_id: str) -> Any:
+        assert task_id == "task_1"
+        return SimpleNamespace(status="ready")
 
     async def _count_active_tasks_for_schedule(*_args: Any, **_kwargs: Any) -> int:
         return 0
@@ -352,14 +357,15 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
     scheduler._max_concurrent_runs = 1  # type: ignore[attr-defined]
     scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
-    async def _update_schedule_fire_state(*_args: Any, **_kwargs: Any) -> None:
-        return None
+    async def _update_schedule_fire_state(_db: object, _schedule_id: str, **kwargs: Any) -> None:
+        updates.append(kwargs)
 
     monkeypatch.setattr(
         "cognis.core.scheduler.update_schedule_fire_state",
         _update_schedule_fire_state,
     )
     monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
+    monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
     monkeypatch.setattr(
         "cognis.core.scheduler.count_active_tasks_for_schedule",
         _count_active_tasks_for_schedule,
@@ -372,6 +378,8 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
     assert isinstance(delivery, TaskDelivery)
     assert delivery.mode == "preferred_channel"
     assert captured_submit["source_type"] == "scheduler"
+    assert captured_submit["scheduled_for"] is not None
+    assert updates[0]["consecutive_errors"] == 2
 
 
 @pytest.mark.asyncio
@@ -437,6 +445,121 @@ async def test_fire_schedule_error_publishes_schedule_context(
     assert event.data["agent_id"] == "agent_1"
     assert event.data["schedule_name"] == "Daily check"
     assert event.data["error"] == "RuntimeError: boom"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_task_failure_propagates_to_schedule_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_row = SimpleNamespace(
+        task_id="task_1",
+        source_type="scheduler",
+        source_ref="sched_1",
+        status="failed",
+        result_summary="LLMStreamProviderError: usage_limit_reached",
+        created_at=datetime(2026, 5, 4, 7, 1, tzinfo=UTC),
+    )
+    sched_row = _schedule_row(consecutive_errors=1)
+    updates: list[dict[str, Any]] = []
+    events: list[Event] = []
+    bus = EventBus()
+
+    async def _capture(event: Event) -> None:
+        events.append(event)
+
+    async def _get_task(_db: object, task_id: str) -> Any:
+        assert task_id == "task_1"
+        return task_row
+
+    async def _get_schedule(_db: object, schedule_id: str) -> Any:
+        assert schedule_id == "sched_1"
+        return sched_row
+
+    async def _update_schedule_fire_state(_db: object, schedule_id: str, **kwargs: Any) -> None:
+        assert schedule_id == "sched_1"
+        updates.append(kwargs)
+
+    bus.subscribe_all(_capture)
+    monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
+    monkeypatch.setattr(
+        "cognis.core.scheduler.update_schedule_fire_state",
+        _update_schedule_fire_state,
+    )
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
+    scheduler._event_bus = bus  # type: ignore[attr-defined]
+    scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
+
+    await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
+        Event(type=EventType.TASK_FAILED, data={"task_id": "task_1"})
+    )
+
+    assert len(updates) == 1
+    assert updates[0]["last_run_status"] == "failed"
+    assert updates[0]["consecutive_errors"] == 2
+    assert updates[0]["next_fire_at"] is not None
+    assert events[-1].type == EventType.SCHEDULE_ERROR
+    assert events[-1].data["schedule_id"] == "sched_1"
+    assert events[-1].data["consecutive_errors"] == 2
+    assert events[-1].data["task_id"] == "task_1"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_ignores_stale_task_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_row = SimpleNamespace(
+        task_id="task_old",
+        source_type="scheduler",
+        source_ref="sched_1",
+        status="failed",
+        result_summary="old failure",
+        created_at=datetime(2026, 5, 4, 7, 0, tzinfo=UTC),
+    )
+    sched_row = _schedule_row(
+        last_fired_at=datetime(2026, 5, 4, 8, 0, tzinfo=UTC),
+        consecutive_errors=0,
+    )
+    updates: list[dict[str, Any]] = []
+    events: list[Event] = []
+    bus = EventBus()
+
+    async def _capture(event: Event) -> None:
+        events.append(event)
+
+    async def _get_task(_db: object, task_id: str) -> Any:
+        assert task_id == "task_old"
+        return task_row
+
+    async def _get_schedule(_db: object, schedule_id: str) -> Any:
+        assert schedule_id == "sched_1"
+        return sched_row
+
+    async def _update_schedule_fire_state(_db: object, schedule_id: str, **kwargs: Any) -> None:
+        assert schedule_id == "sched_1"
+        updates.append(kwargs)
+
+    bus.subscribe_all(_capture)
+    monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
+    monkeypatch.setattr(
+        "cognis.core.scheduler.update_schedule_fire_state",
+        _update_schedule_fire_state,
+    )
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
+    scheduler._event_bus = bus  # type: ignore[attr-defined]
+    scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
+
+    await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
+        Event(type=EventType.TASK_FAILED, data={"task_id": "task_old"})
+    )
+
+    assert updates == []
+    assert events == []
 
 
 # ---------------------------------------------------------------------------

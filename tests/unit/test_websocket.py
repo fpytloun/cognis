@@ -23,11 +23,13 @@ from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketConnectionManager,
     WebSocketTurnObserver,
+    _assistant_runtime_payload,
     _event_to_payload,
     _handle_cancel_queued_message,
     _handle_message,
     _handle_update_queued_message,
     _is_visible_persisted_system_message,
+    _timeline_patch_for_bus_event,
     _workflow_composed_payload,
 )
 from cognis.core.events import Event, EventType
@@ -70,6 +72,7 @@ class _RecordingManager:
         self.snapshots: list[str] = []
         self.subscriptions: list[str] = []
         self.payloads: list[tuple[str, dict[str, object]]] = []
+        self.sidebar_payloads: list[tuple[str, dict[str, object]]] = []
         self.app: Any = SimpleNamespace(state=SimpleNamespace())
 
     async def send_error(self, _: object, **kwargs: object) -> None:
@@ -85,8 +88,57 @@ class _RecordingManager:
         self.snapshots.append(f"event:{conversation_id}:{payload.get('type')}")
         self.payloads.append((conversation_id, payload))
 
+    async def send_sidebar_update_to_owner(
+        self, conversation_id: str, payload: dict[str, object]
+    ) -> None:
+        self.sidebar_payloads.append((conversation_id, payload))
+
     def has_tts_enabled_subscribers(self, _conversation_id: str) -> bool:
         return False
+
+
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, object]] = []
+
+    async def send_json(self, payload: dict[str, object]) -> None:
+        self.payloads.append(payload)
+
+
+class _RuntimeSnapshotScheduler:
+    def queued_messages(self, conversation_id: str) -> list[dict[str, object]]:
+        assert conversation_id == "conv-1"
+        return [{"queue_id": "queue-1", "content": "queued"}]
+
+    async def active_stream_snapshots(self, conversation_id: str) -> list[dict[str, object]]:
+        assert conversation_id == "conv-1"
+        return [{"message_id": "msg-1", "content": "stream"}]
+
+    async def active_tool_output_snapshots(self, conversation_id: str) -> list[dict[str, object]]:
+        assert conversation_id == "conv-1"
+        return [{"call_id": "call-1", "chunk": "output"}]
+
+    def running_turn_state(self, conversation_id: str) -> dict[str, object]:
+        assert conversation_id == "conv-1"
+        return {"chat_mode": "build", "chat_mode_source": "user"}
+
+
+class _RuntimeSnapshotSessionCache:
+    def active_thinking_snapshots(self, session_id: str) -> list[dict[str, object]]:
+        assert session_id == "sess-1"
+        return [{"message_id": "msg-1", "blocks": [{"content": "thought"}]}]
+
+
+class _RecordingWebSocketManager(WebSocketConnectionManager):
+    def __init__(self) -> None:
+        super().__init__(SimpleNamespace(state=SimpleNamespace()))
+        self.sent_payloads: list[tuple[str, dict[str, Any]]] = []
+
+    async def send_to_conversation(self, conversation_id: str, payload: dict[str, Any]) -> None:
+        self.sent_payloads.append((conversation_id, payload))
+
+    async def _resolve_conversation_id(self, event: Event) -> str | None:  # noqa: SLF001
+        return str(event.data.get("conversation_id") or "conv-1")
 
 
 async def _seed_conversation(app: Any, *, owner: str = "owner@example.com") -> str:
@@ -397,6 +449,158 @@ async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_websocket_turn_observer_sends_tool_call_as_timeline_patch() -> None:
+    manager = _RecordingManager()
+    observer = WebSocketTurnObserver(manager)  # type: ignore[arg-type]
+
+    await observer.on_tool_call(
+        "conv-1",
+        "sess-1",
+        "call-1",
+        "bash",
+        {"command": "true"},
+        turn_id="turn-1",
+    )
+
+    assert manager.payloads[0][0] == "conv-1"
+    payload = cast(dict[str, Any], manager.payloads[0][1])
+    assert payload["type"] == "timeline_patch"
+    assert payload["conversation_id"] == "conv-1"
+    assert payload["source"] == "live.tool_call"
+    assert payload["items"][0] == {
+        "id": "tool:call-1",
+        "kind": "tool_call",
+        "callId": "call-1",
+        "turnId": "turn-1",
+        "toolName": "bash",
+        "status": "started",
+        "timestamp": payload["items"][0]["timestamp"],
+        "arguments": {"command": "true"},
+    }
+
+
+def test_event_bus_delegation_started_projects_to_timeline_patch() -> None:
+    event = Event(
+        type=EventType.DELEGATION_STARTED,
+        data={
+            "conversation_id": "conv-1",
+            "session_id": "sess-1",
+            "child_session_id": "child-1",
+            "title": "Explore project",
+            "tool_call_count": 2,
+            "max_tool_calls": 5,
+            "last_tool": "grep",
+        },
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    payload = _timeline_patch_for_bus_event(event, "conv-1")
+
+    assert payload is not None
+    assert payload["type"] == "timeline_patch"
+    assert payload["source"] == "live.delegation_started"
+    assert payload["items"] == [
+        {
+            "id": "delegation:child-1",
+            "kind": "delegation",
+            "taskId": "child-1",
+            "taskLabel": "Explore project",
+            "status": "started",
+            "toolCallCount": 2,
+            "maxToolCalls": 5,
+            "lastTool": "grep",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+        }
+    ]
+
+
+def test_event_bus_workflow_composed_projects_stable_timeline_patch_id() -> None:
+    event = Event(
+        type=EventType.WORKFLOW_COMPOSED,
+        data={
+            "conversation_id": "conv-1",
+            "workflow_id": "wf-1",
+            "task_id": "task-1",
+            "title": "Run workflow",
+        },
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    payload = _timeline_patch_for_bus_event(event, "conv-1")
+
+    assert payload is not None
+    assert payload["type"] == "timeline_patch"
+    assert payload["source"] == "live.workflow_composed"
+    assert payload["items"][0]["id"] == "workflow-composed:wf-1"
+    assert payload["items"][0]["workflowId"] == "wf-1"
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_sends_timeline_patch_and_legacy_side_effect_frame() -> None:
+    manager = _RecordingWebSocketManager()
+    event = Event(
+        type=EventType.DELEGATION_COMPLETED,
+        data={
+            "conversation_id": "conv-1",
+            "session_id": "sess-1",
+            "child_session_id": "child-1",
+            "title": "Explore project",
+            "result": "done",
+        },
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    await manager._handle_event(event)  # noqa: SLF001
+
+    assert [payload["type"] for _, payload in manager.sent_payloads] == [
+        "timeline_patch",
+        "delegation_completed",
+    ]
+    assert manager.sent_payloads[0][1]["items"][0] == {
+        "id": "delegation:child-1",
+        "kind": "delegation",
+        "taskId": "child-1",
+        "taskLabel": "Explore project",
+        "status": "completed",
+        "result": "done",
+        "timestamp": "2026-01-01T00:00:00+00:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_websocket_manager_sends_authoritative_runtime_snapshot() -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            turn_scheduler=_RuntimeSnapshotScheduler(),
+            session_cache=_RuntimeSnapshotSessionCache(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)  # type: ignore[arg-type]
+    connection = _RecordingConnection()
+
+    await manager._send_conversation_runtime_snapshot(  # noqa: SLF001
+        connection,  # type: ignore[arg-type]
+        "conv-1",
+        active_session_id="sess-1",
+    )
+
+    assert connection.payloads == [
+        {
+            "type": "conversation_runtime_snapshot",
+            "conversation_id": "conv-1",
+            "queued_messages": [{"queue_id": "queue-1", "content": "queued"}],
+            "queued_count": 1,
+            "has_active_turn": True,
+            "active_turn_chat_mode": "build",
+            "active_turn_chat_mode_source": "user",
+            "active_streams": [{"message_id": "msg-1", "content": "stream"}],
+            "active_tool_outputs": [{"call_id": "call-1", "chunk": "output"}],
+            "active_thinking": [{"message_id": "msg-1", "blocks": [{"content": "thought"}]}],
+        }
+    ]
+
+
 def test_visible_persisted_system_message_filter_allows_explicit_notices() -> None:
     assert _is_visible_persisted_system_message(
         {"notice_id": "turn-init:fup_task_failed", "kind": "turn_initiated"}
@@ -411,6 +615,14 @@ def test_visible_persisted_system_message_filter_rejects_internal_context() -> N
     assert not _is_visible_persisted_system_message(
         {"content": "Additional tools may be available but hidden by the current step profile."}
     )
+
+
+def test_assistant_runtime_payload_accepts_only_dict_metadata() -> None:
+    runtime = {"agent_id": "laforge", "model": "gpt-5.1", "reasoning_effort": "high"}
+
+    assert _assistant_runtime_payload({"runtime": runtime}) == runtime
+    assert _assistant_runtime_payload({"runtime": "invalid"}) is None
+    assert _assistant_runtime_payload({}) is None
 
 
 def test_conversation_updated_payload_includes_read_state_fields() -> None:
@@ -721,6 +933,120 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_started_event_emits_activity_correction() -> None:
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            turn_scheduler=SimpleNamespace(
+                add_observer=lambda _conversation_id, _observer: None,
+                running_turn_state=lambda _conversation_id: None,
+            ),
+            session_factory=lambda: _NullSession(),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws = AsyncMock()
+    connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    manager.subscribe(connection, "conv-1")
+
+    started_at = "2026-01-02T03:03:00+00:00"
+    await manager._handle_event(
+        Event(
+            type=EventType.TURN_STARTED,
+            data={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "message_id": "msg-1",
+                "started_at": started_at,
+                "chat_mode": "plan",
+                "chat_mode_source": "user",
+            },
+        )
+    )
+
+    payloads = [call.args[0] for call in user_ws.send_json.await_args_list]
+    assert payloads[0]["type"] == "turn_started"
+    assert payloads[1] == {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "has_active_turn": True,
+        "active_turn_chat_mode": "plan",
+        "active_turn_chat_mode_source": "user",
+        "last_message_at": started_at,
+        "updated_at": started_at,
+    }
+
+
+@pytest.mark.asyncio
+async def test_turn_error_event_fans_out_sidebar_correction_to_owner_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _conversation(_session: object, conversation_id: str) -> SimpleNamespace | None:
+        if conversation_id == "conv-error":
+            return SimpleNamespace(user_email="user@example.com")
+        return None
+
+    monkeypatch.setattr("cognis.api.websocket.get_conversation", _conversation)
+
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=lambda: _NullSession()))
+    manager = WebSocketConnectionManager(app)
+    sidebar_ws = AsyncMock()
+    await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
+
+    await manager._handle_event(
+        Event(
+            type=EventType.TURN_ERROR,
+            data={"conversation_id": "conv-error"},
+        )
+    )
+
+    sidebar_ws.send_json.assert_awaited_once_with(
+        {
+            "type": "conversation_updated",
+            "conversation_id": "conv-error",
+            "has_active_turn": False,
+            "active_turn_chat_mode": None,
+            "active_turn_chat_mode_source": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_sidebar_update_fans_out_to_owner_windows_outside_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=lambda: _NullSession()))
+    manager = WebSocketConnectionManager(app)
+    subscribed_ws = AsyncMock()
+    sidebar_ws = AsyncMock()
+    other_user_ws = AsyncMock()
+    subscribed = await manager.connect(
+        subscribed_ws,
+        claims={"sub": "user@example.com", "role": "user"},
+    )
+    await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
+    await manager.connect(other_user_ws, claims={"sub": "other@example.com", "role": "user"})
+    manager.subscribe(subscribed, "conv-1")
+
+    async def _fake_get_conversation(_session: Any, conversation_id: str) -> Any:
+        assert conversation_id == "conv-1"
+        return SimpleNamespace(user_email="user@example.com")
+
+    monkeypatch.setattr("cognis.api.websocket.get_conversation", _fake_get_conversation)
+
+    payload = {
+        "type": "conversation_updated",
+        "conversation_id": "conv-1",
+        "has_active_turn": False,
+    }
+    await manager.send_sidebar_update_to_owner("conv-1", payload)
+
+    subscribed_ws.send_json.assert_not_awaited()
+    sidebar_ws.send_json.assert_awaited_once_with(payload)
+    other_user_ws.send_json.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_notification_attention_refresh_preserves_running_turn_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -786,6 +1112,7 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
             session_id="sess-1",
             message_id="msg-1",
             final_content="Final answer",
+            runtime={"agent_id": "laforge", "model": "gpt-5.1", "reasoning_effort": "high"},
             attachments=[
                 {
                     "artifact_id": "img_1",
@@ -801,6 +1128,11 @@ async def test_turn_observer_strips_attachment_payload_bytes() -> None:
 
     payload = manager.send_to_conversation.await_args_list[0].args[1]
     assert payload["content"] == "Final answer"
+    assert payload["runtime"] == {
+        "agent_id": "laforge",
+        "model": "gpt-5.1",
+        "reasoning_effort": "high",
+    }
     assert payload["attachments"] == [
         {
             "artifact_id": "img_1",
