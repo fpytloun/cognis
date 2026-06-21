@@ -1,7 +1,7 @@
 import { createMarkdownStreamer, renderMarkdown, stripMarkdown, type MarkdownStreamer } from '$lib/markdown';
 import { normalizeFileDiffs, type FileDiff } from '$lib/diff';
 import { parseTodoSnapshot, type TodoSnapshotItem } from '$lib/todos';
-import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, ActiveToolOutputSnapshot, AttachmentRef, ChatMode, ChatModeSource, CognisWebSocketEvent, MessageEvent, ToolOutputPresentationMetadata } from '$lib/types/api';
+import type { ActiveStreamSnapshot, ActiveThinkingSnapshot, ActiveToolOutputSnapshot, AttachmentRef, ChatMode, ChatModeSource, CognisWebSocketEvent, MessageEvent, MessageRuntimeMetadata, QueuedMessage, QuestionSetReply, TimelineProjectionItem, ToolOutputPresentationMetadata } from '$lib/types/api';
 
 /**
  * Per-message markdown streamers. Streaming assistant replies accumulate
@@ -28,8 +28,8 @@ type ToolOutputChunkEvent = Extract<CognisWebSocketEvent, { type: 'tool_result_c
   text?: string;
   stream?: string | null;
   is_error?: boolean;
-  chunk_index?: number;
-  content_offset?: number;
+  chunk_index?: number | null;
+  content_offset?: number | null;
   session_id?: string;
 };
 
@@ -256,6 +256,7 @@ export interface ThinkingBlock {
 export interface ThinkingTimelineItem {
   id: string;
   kind: 'thinking';
+  sessionId?: string | null;
   /** Transport message id for the thinking turn */
   messageId: string;
   turnId?: string | null;
@@ -282,6 +283,7 @@ export interface MessageTimelineItem {
   streaming?: boolean;
   attachments?: AttachmentRef[];
   optimistic?: boolean;
+  deliveryStatus?: 'sending' | 'queued' | 'failed';
   clientMessageId?: string | null;
   queueId?: string | null;
   streamChunkCount?: number;
@@ -290,6 +292,13 @@ export interface MessageTimelineItem {
   chatModeSource?: ChatModeSource;
   partial?: boolean;
   finishReason?: string | null;
+  runtime?: MessageRuntimeMetadata | null;
+  /**
+   * Stable assistant phase number within a turn. One assistant turn can emit
+   * multiple user-visible assistant messages separated by tool calls; message
+   * ids and turn ids alone are not enough to distinguish those phases.
+   */
+  assistantPhaseIndex?: number;
 }
 
 export interface ToolCallEvaluation {
@@ -305,6 +314,8 @@ export interface ToolCallTimelineItem {
   kind: 'tool_call';
   callId: string;
   toolName: string;
+  displayToolName?: string;
+  canonicalToolName?: string;
   status: string;
   timestamp: string | null;
   turnId?: string | null;
@@ -353,6 +364,24 @@ export { parseTodoSnapshot, type TodoSnapshotItem };
 
 function normalizeToolName(name: string): string {
   return name.toLowerCase().replace(/_/g, '');
+}
+
+function isUserMessageReasoningDiagnostic(
+  source: string | null | undefined,
+  title: string | null | undefined,
+  content: string | null | undefined,
+): boolean {
+  return (source ?? '') === 'reasoning'
+    && (title ?? 'Reasoning') === 'Reasoning'
+    && (content ?? '').trimStart().startsWith('User message');
+}
+
+export function isTerminalToolStatus(status: string | null | undefined): boolean {
+  return ['completed', 'failed', 'cancelled'].includes(status ?? '');
+}
+
+export function isActiveToolStatus(status: string | null | undefined): boolean {
+  return !isTerminalToolStatus(status);
 }
 
 function parsedToolResult(item: ToolCallTimelineItem): Record<string, unknown> | null {
@@ -562,6 +591,42 @@ function createSystemMessageItem(
   };
 }
 
+function formatTokenCount(value: unknown): string | null {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.round(value).toLocaleString('en-US')
+    : null;
+}
+
+function createToolCallContextPressureNotice(
+  id: string,
+  data: Record<string, unknown>,
+  timestamp: string | null,
+): NoticeTimelineItem {
+  const promptTokens = formatTokenCount(data.prompt_tokens);
+  const availablePromptTokens = formatTokenCount(data.available_prompt_tokens);
+  const thresholdPromptTokens = formatTokenCount(data.loop_pressure_threshold_prompt_tokens);
+  const toolCallCount = formatTokenCount(data.tool_call_count);
+  const stepName = typeof data.step_name === 'string' && data.step_name ? data.step_name : null;
+  const parts = [
+    'Context window is critically full; this turn was stopped before more tool calls.',
+    promptTokens && availablePromptTokens
+      ? `Usage is ${promptTokens}/${availablePromptTokens} prompt-budget tokens.`
+      : null,
+    thresholdPromptTokens ? `Threshold is ${thresholdPromptTokens}.` : null,
+    toolCallCount ? `Tool calls this turn: ${toolCallCount}.` : null,
+    stepName ? `Step: ${stepName}.` : null,
+  ].filter((part): part is string => Boolean(part));
+
+  return {
+    id,
+    kind: 'notice',
+    title: 'Tool-call context pressure',
+    description: parts.join(' '),
+    tone: 'warning',
+    timestamp,
+  };
+}
+
 function isVisiblePersistedSystemMessage(data: Record<string, unknown>): boolean {
   const noticeId = data.notice_id;
   if (typeof noticeId === 'string' && noticeId.length > 0) return true;
@@ -590,6 +655,7 @@ function createMessageItem(
   streamChunkCount = streaming && content ? 1 : 0,
   clientMessageId: string | null = null,
   queueId: string | null = null,
+  assistantPhaseIndex?: number,
 ): MessageTimelineItem {
   return {
     id,
@@ -605,11 +671,753 @@ function createMessageItem(
     streaming,
     attachments,
     optimistic,
+    deliveryStatus: optimistic ? 'sending' : undefined,
     clientMessageId,
     queueId,
     streamChunkCount,
     streamContentOffset: content.length,
+    assistantPhaseIndex,
   };
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function normalizeMessageRuntime(value: unknown): MessageRuntimeMetadata | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const runtime: MessageRuntimeMetadata = {
+    agent_id: stringOrNull(raw.agent_id) ?? undefined,
+    agent_name: stringOrNull(raw.agent_name) ?? undefined,
+    agent_display_name: stringOrNull(raw.agent_display_name),
+    requested_agent_profile_id: stringOrNull(raw.requested_agent_profile_id),
+    agent_profile_id: stringOrNull(raw.agent_profile_id),
+    agent_profile_source: stringOrNull(raw.agent_profile_source),
+    agent_profile_synthetic: typeof raw.agent_profile_synthetic === 'boolean' ? raw.agent_profile_synthetic : null,
+    provider_id: stringOrNull(raw.provider_id),
+    model: stringOrNull(raw.model),
+    reasoning_effort: stringOrNull(raw.reasoning_effort),
+  };
+  return Object.values(runtime).some((item) => item !== null && item !== undefined) ? runtime : null;
+}
+
+function nextAssistantPhaseIndex(items: TimelineItem[], turnId: string | null): number | undefined {
+  if (!turnId) return undefined;
+  let highestExplicitPhase = -1;
+  let matchingAssistantMessages = 0;
+  for (const item of items) {
+    if (item.kind !== 'message' || item.role !== 'assistant' || item.turnId !== turnId) continue;
+    matchingAssistantMessages += 1;
+    if (typeof item.assistantPhaseIndex === 'number') {
+      highestExplicitPhase = Math.max(highestExplicitPhase, item.assistantPhaseIndex);
+    }
+  }
+  return highestExplicitPhase >= 0 ? highestExplicitPhase + 1 : matchingAssistantMessages;
+}
+
+export function timelineItemKey(item: TimelineItem): string {
+  if (item.kind === 'message') {
+    const sessionId = item.sessionId ?? 'unknown-session';
+    if (item.role === 'assistant') {
+      const turnId = item.turnId ?? item.messageId ?? null;
+      if (turnId && item.messageId && typeof item.assistantPhaseIndex === 'number') {
+        return `assistant-phase:${sessionId}:${turnId}:${item.messageId}:${item.assistantPhaseIndex}`;
+      }
+      if (item.seq !== null) return `message-seq:assistant:${sessionId}:${item.seq}`;
+      if (item.messageId) return `message:assistant:${sessionId}:${item.messageId}:${item.id}`;
+      return `message:assistant:${item.id}`;
+    }
+    if (item.clientMessageId) return `client-message:${item.clientMessageId}`;
+    if (item.queueId) return `queue-message:${item.queueId}`;
+    if (item.seq !== null) return `message-seq:${item.role}:${sessionId}:${item.seq}`;
+    if (item.messageId) return `message:${item.role}:${sessionId}:${item.messageId}`;
+  }
+  return `${item.kind}:${item.id}`;
+}
+
+function projectionString(item: Record<string, unknown>, key: string): string | null {
+  const value = item[key];
+  return typeof value === 'string' ? value : null;
+}
+
+function projectionNumber(item: Record<string, unknown>, key: string): number | null {
+  const value = item[key];
+  return typeof value === 'number' ? value : null;
+}
+
+function projectionBoolean(item: Record<string, unknown>, key: string): boolean | undefined {
+  const value = item[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function projectionArray<T>(item: Record<string, unknown>, key: string): T[] {
+  const value = item[key];
+  return Array.isArray(value) ? value as T[] : [];
+}
+
+function projectionObject(item: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = item[key];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+export function timelineFromProjection(projectedItems: TimelineProjectionItem[]): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  for (const projected of projectedItems) {
+    const kind = projectionString(projected, 'kind');
+    const id = projectionString(projected, 'id');
+    if (!kind || !id) continue;
+
+    if (kind === 'message') {
+      const role = projectionString(projected, 'role');
+      if (role !== 'user' && role !== 'assistant' && role !== 'system') continue;
+      const content = projectionString(projected, 'content') ?? '';
+      const item: MessageTimelineItem = {
+        id,
+        kind: 'message',
+        sessionId: projectionString(projected, 'sessionId'),
+        role,
+        content,
+        html: role !== 'system' ? renderMarkdown(content) : '',
+        seq: projectionNumber(projected, 'seq'),
+        timestamp: projectionString(projected, 'timestamp'),
+        turnId: projectionString(projected, 'turnId'),
+        messageId: projectionString(projected, 'messageId') ?? undefined,
+        streaming: projectionBoolean(projected, 'streaming'),
+        attachments: projectionArray<AttachmentRef>(projected, 'attachments'),
+        optimistic: projectionBoolean(projected, 'optimistic'),
+        clientMessageId: projectionString(projected, 'clientMessageId'),
+        queueId: projectionString(projected, 'queueId'),
+        streamChunkCount: projectionNumber(projected, 'streamChunkCount') ?? undefined,
+        streamContentOffset: projectionNumber(projected, 'streamContentOffset') ?? content.length,
+        chatMode: normalizeChatMode(projected.chatMode),
+        chatModeSource: normalizeChatModeSource(projected.chatModeSource),
+        partial: projectionBoolean(projected, 'partial'),
+        finishReason: projectionString(projected, 'finishReason'),
+        runtime: normalizeMessageRuntime(projected.runtime),
+        assistantPhaseIndex: projectionNumber(projected, 'assistantPhaseIndex') ?? undefined,
+      };
+      const deliveryStatus = projectionString(projected, 'deliveryStatus');
+      if (deliveryStatus === 'sending' || deliveryStatus === 'queued' || deliveryStatus === 'failed') {
+        item.deliveryStatus = deliveryStatus;
+      }
+      items.push(item);
+      continue;
+    }
+
+    if (kind === 'tool_call') {
+      const callId = projectionString(projected, 'callId');
+      const toolName = projectionString(projected, 'toolName');
+      if (!callId || !toolName) continue;
+      const toolItem: ToolCallTimelineItem = {
+        id,
+        kind: 'tool_call',
+        callId,
+        toolName,
+        status: projectionString(projected, 'status') ?? 'started',
+        timestamp: projectionString(projected, 'timestamp'),
+        sessionId: projectionString(projected, 'sessionId'),
+        turnId: projectionString(projected, 'turnId'),
+        arguments: projectionObject(projected, 'arguments'),
+        result: projectionString(projected, 'result') ?? undefined,
+        isError: projectionBoolean(projected, 'isError'),
+        durationMs: projectionNumber(projected, 'durationMs') ?? undefined,
+        attachments: projectionArray<AttachmentRef>(projected, 'attachments'),
+        fileDiffs: normalizeFileDiffs(projected.fileDiffs),
+        outputSize: projectionNumber(projected, 'outputSize') ?? undefined,
+        truncated: projectionBoolean(projected, 'truncated'),
+        agentVisibleTruncated: projectionBoolean(projected, 'agentVisibleTruncated'),
+        transportTruncated: projectionBoolean(projected, 'transportTruncated'),
+        hasFullOutput: projectionBoolean(projected, 'hasFullOutput'),
+        recoveryCallId: projectionString(projected, 'recoveryCallId'),
+        toolOutputArtifactId: projectionString(projected, 'toolOutputArtifactId'),
+        anchorsAvailable: projectionBoolean(projected, 'anchorsAvailable'),
+        anchorCount: projectionNumber(projected, 'anchorCount') ?? undefined,
+        reconstructed: projectionBoolean(projected, 'reconstructed'),
+        evaluation: projectionObject(projected, 'evaluation') as ToolCallTimelineItem['evaluation'],
+      };
+      const presentation = projectionObject(projected, 'tool_output_presentation');
+      items.push(presentation ? mergeToolPresentation(toolItem, presentation) : toolItem);
+      continue;
+    }
+
+    if (kind === 'system_message') {
+      items.push({
+        id,
+        kind: 'system_message',
+        text: projectionString(projected, 'text') ?? '',
+        noticeId: projectionString(projected, 'noticeId'),
+        noticeKind: projectionString(projected, 'noticeKind'),
+        noticeScope: projectionString(projected, 'noticeScope'),
+        timestamp: projectionString(projected, 'timestamp'),
+      });
+      continue;
+    }
+
+    if (kind === 'notice') {
+      const tone = projectionString(projected, 'tone');
+      items.push({
+        id,
+        kind: 'notice',
+        title: projectionString(projected, 'title') ?? 'Notice',
+        description: projectionString(projected, 'description') ?? '',
+        tone: tone === 'warning' || tone === 'error' ? tone : 'info',
+        timestamp: projectionString(projected, 'timestamp'),
+      });
+      continue;
+    }
+
+    if (kind === 'workflow_composed') {
+      items.push({
+        id,
+        kind: 'workflow_composed',
+        workflowId: projectionString(projected, 'workflowId') ?? '',
+        workflowName: projectionString(projected, 'workflowName') ?? 'Workflow',
+        lifecycle: projectionString(projected, 'lifecycle') ?? 'ephemeral',
+        taskId: projectionString(projected, 'taskId'),
+        scheduleId: projectionString(projected, 'scheduleId'),
+        steps: projectionArray<string>(projected, 'steps'),
+        timestamp: projectionString(projected, 'timestamp'),
+      });
+      continue;
+    }
+
+    if (kind === 'thinking') {
+      const messageId = projectionString(projected, 'messageId');
+      if (!messageId) continue;
+      const blocks = projectionArray<Record<string, unknown>>(projected, 'blocks')
+        .map((block): ThinkingBlock | null => {
+          const blockId = projectionString(block, 'block_id');
+          if (!blockId) return null;
+          const content = projectionString(block, 'content') ?? '';
+          return {
+            block_id: blockId,
+            title: projectionString(block, 'title') ?? 'Thinking',
+            content,
+            html: renderMarkdown(content),
+            source: projectionString(block, 'source') ?? 'summary',
+            complete: projectionBoolean(block, 'complete') ?? true,
+            startedAt: projectionString(block, 'startedAt'),
+            completedAt: projectionString(block, 'completedAt'),
+            durationMs: projectionNumber(block, 'durationMs'),
+            providerBlockIndex: projectionNumber(block, 'providerBlockIndex'),
+          };
+        })
+        .filter((block): block is ThinkingBlock => block !== null);
+      items.push({
+        id,
+        kind: 'thinking',
+        sessionId: projectionString(projected, 'sessionId'),
+        messageId,
+        turnId: projectionString(projected, 'turnId'),
+        blocks,
+        streaming: projectionBoolean(projected, 'streaming') ?? false,
+        activeTitle: projectionString(projected, 'activeTitle'),
+        timestamp: projectionString(projected, 'timestamp'),
+      });
+      continue;
+    }
+
+    if (kind === 'delegation') {
+      const taskId = projectionString(projected, 'taskId');
+      if (!taskId) continue;
+      items.push({
+        id,
+        kind: 'delegation',
+        taskId,
+        taskLabel: projectionString(projected, 'taskLabel') ?? 'Sub-session',
+        agentId: projectionString(projected, 'agentId'),
+        usedAgentId: projectionString(projected, 'usedAgentId'),
+        status: normalizeDelegationStatus(projectionString(projected, 'status')),
+        result: projectionString(projected, 'result'),
+        timestamp: projectionString(projected, 'timestamp'),
+        toolCallCount: projectionNumber(projected, 'toolCallCount') ?? undefined,
+        maxToolCalls: projectionNumber(projected, 'maxToolCalls') ?? undefined,
+        lastTool: projectionString(projected, 'lastTool') ?? undefined,
+        todos: parseTodoSnapshot(projectionArray<Record<string, unknown>>(projected, 'todos')),
+      });
+      continue;
+    }
+
+    if (kind === 'compaction') {
+      const status = projectionString(projected, 'status');
+      items.push({
+        id,
+        kind: 'compaction',
+        status: status === 'running' || status === 'failed' || status === 'skipped'
+          ? status
+          : 'compacted',
+        sessionId: projectionString(projected, 'sessionId') ?? undefined,
+        previousSessionId: projectionString(projected, 'previousSessionId') ?? undefined,
+        summaryPreview: projectionString(projected, 'summaryPreview') ?? '',
+        summary: projectionString(projected, 'summary') ?? undefined,
+        method: projectionString(projected, 'method') ?? 'unknown',
+        turnsCompacted: projectionNumber(projected, 'turnsCompacted') ?? 0,
+        trigger: projectionString(projected, 'trigger') ?? undefined,
+        reason: projectionString(projected, 'reason') ?? undefined,
+        previousUsagePercentage: projectionNumber(projected, 'previousUsagePercentage'),
+        effectiveUsagePercentage: projectionNumber(projected, 'effectiveUsagePercentage'),
+        hardPressureExceeded: projectionBoolean(projected, 'hardPressureExceeded'),
+        usedTimeoutFallback: projectionBoolean(projected, 'usedTimeoutFallback'),
+        timestamp: projectionString(projected, 'timestamp'),
+      });
+    }
+  }
+  return items;
+}
+
+function timelinePatchMergeIndex(items: TimelineItem[], patch: TimelineItem): number {
+  const byId = items.findIndex((item) => item.id === patch.id);
+  if (byId >= 0) return byId;
+  if (patch.kind === 'tool_call') {
+    return items.findIndex((item) => item.kind === 'tool_call' && item.callId === patch.callId);
+  }
+  if (patch.kind === 'message') {
+    return items.findIndex((item) => (
+      item.kind === 'message'
+      && item.role === patch.role
+      && Boolean(item.messageId)
+      && item.messageId === patch.messageId
+      && (item.turnId ?? null) === (patch.turnId ?? null)
+    ));
+  }
+  if (patch.kind === 'delegation') {
+    return items.findIndex((item) => item.kind === 'delegation' && item.taskId === patch.taskId);
+  }
+  if (patch.kind === 'system_message' && patch.noticeId) {
+    return items.findIndex((item) => item.kind === 'system_message' && item.noticeId === patch.noticeId);
+  }
+  return -1;
+}
+
+function mergeTimelinePatchItem(existing: TimelineItem, patch: TimelineItem): TimelineItem {
+  if (existing.kind === 'message' && patch.kind === 'message') {
+    return {
+      ...existing,
+      ...patch,
+      html: patch.role !== 'system' ? renderMarkdown(patch.content) : existing.html,
+      streaming: patch.streaming ?? false,
+    };
+  }
+  if (existing.kind === 'tool_call' && patch.kind === 'tool_call') {
+    const keepExistingStreamedResult = Boolean(existing.liveOutputAvailable)
+      && Boolean(existing.streamedOutput)
+      && typeof patch.result === 'string'
+      && (patch.transportTruncated === true || patch.truncated === true || patch.agentVisibleTruncated === true)
+      && (existing.streamedOutput?.length ?? 0) > patch.result.length;
+    return {
+      ...existing,
+      ...patch,
+      arguments: patch.arguments ?? existing.arguments,
+      result: keepExistingStreamedResult ? existing.streamedOutput : patch.result ?? existing.result,
+      streamedOutput: existing.streamedOutput ?? patch.streamedOutput,
+      liveOutputAvailable: existing.liveOutputAvailable ?? patch.liveOutputAvailable,
+      attachments: patch.attachments?.length ? patch.attachments : existing.attachments,
+      fileDiffs: patch.fileDiffs?.length ? patch.fileDiffs : existing.fileDiffs,
+    };
+  }
+  if (existing.kind === 'delegation' && patch.kind === 'delegation') {
+    return mergeDelegationItem(existing, patch);
+  }
+  return patch;
+}
+
+function isTerminalCompactionNotice(text: string | null | undefined): boolean {
+  const normalized = (text ?? '').trim().toLowerCase();
+  return normalized.startsWith('automatic compaction completed.')
+    || normalized.startsWith('automatic compaction found no older history to compact.')
+    || normalized.startsWith('automatic compaction was requested, but there was not enough')
+    || normalized.startsWith('automatic compaction was recommended, but there is no older')
+    || normalized.startsWith('context window is critically full, but there is no older');
+}
+
+function removeRunningCompactionItems(items: TimelineItem[], sessionId?: string | null): TimelineItem[] {
+  if (!sessionId) {
+    const runningCount = items.filter((item) => item.kind === 'compaction' && item.status === 'running').length;
+    if (runningCount !== 1) return items;
+  }
+  return items.filter((item) => {
+    if (item.kind !== 'compaction' || item.status !== 'running') return true;
+    if (!sessionId) return false;
+    return item.sessionId !== sessionId && item.previousSessionId !== sessionId;
+  });
+}
+
+export function applyTimelinePatch(
+  items: TimelineItem[],
+  projectedItems: TimelineProjectionItem[],
+  options: { includeItem?: (item: TimelineItem) => boolean } = {},
+): TimelineItem[] {
+  const next = [...items];
+  for (const patch of timelineFromProjection(projectedItems)) {
+    if (options.includeItem && !options.includeItem(patch)) continue;
+    const index = timelinePatchMergeIndex(next, patch);
+    if (index >= 0) {
+      next[index] = mergeTimelinePatchItem(next[index], patch);
+    } else {
+      next.push(patch);
+    }
+  }
+  return next;
+}
+
+export interface RuntimeTimelineOverlay {
+  items: TimelineItem[];
+}
+
+export function createRuntimeTimelineOverlay(items: TimelineItem[] = []): RuntimeTimelineOverlay {
+  return { items };
+}
+
+export function isRuntimeTimelineEvent(event: CognisWebSocketEvent): boolean {
+  return [
+    'chunk',
+    'assistant_stream_snapshot',
+    'assistant_thinking_chunk',
+    'assistant_thinking_block',
+    'tool_progress',
+    'tool_result_chunk',
+    'tool_output_chunk',
+  ].includes(event.type);
+}
+
+export function applyRuntimeTimelineEvent(
+  overlay: RuntimeTimelineOverlay,
+  event: CognisWebSocketEvent,
+): RuntimeTimelineOverlay {
+  if (!isRuntimeTimelineEvent(event)) return overlay;
+  if (event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk') {
+    return { items: applyRuntimeToolOutputChunk(overlay.items, event) };
+  }
+  return { items: applyWebSocketEvent(overlay.items, event) };
+}
+
+function applyRuntimeToolOutputChunk(
+  items: TimelineItem[],
+  event: ToolOutputChunkEvent,
+): TimelineItem[] {
+  const callId = event.call_id ?? '';
+  if (!callId) return items;
+  const delta = typeof event.delta === 'string'
+    ? event.delta
+    : typeof event.content === 'string'
+      ? event.content
+      : typeof event.text === 'string'
+        ? event.text
+        : '';
+  if (!delta) return items;
+
+  const itemId = `tool:${callId}`;
+  const index = items.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+  const contentOffset = typeof event.content_offset === 'number' ? event.content_offset : null;
+  const chunkIndex = typeof event.chunk_index === 'number' ? event.chunk_index : undefined;
+  if (index >= 0) {
+    const existing = items[index] as ToolCallTimelineItem;
+    const current = existing.streamedOutput ?? existing.result ?? '';
+    if (contentOffset !== null) {
+      if (contentOffset < current.length) {
+        return current.slice(contentOffset, contentOffset + delta.length) === delta ? items : items;
+      }
+      if (contentOffset > current.length) return items;
+    }
+    const next = [...items];
+    next[index] = {
+      ...existing,
+      status: isTerminalToolStatus(existing.status) ? existing.status : existing.status || 'started',
+      streamedOutput: `${current}${delta}`,
+      result: `${current}${delta}`,
+      isError: event.is_error ?? existing.isError,
+      streamChunkCount: chunkIndex !== undefined ? chunkIndex + 1 : (existing.streamChunkCount ?? 0) + 1,
+      streamContentOffset: current.length + delta.length,
+      sessionId: event.session_id ?? existing.sessionId,
+      liveOutputAvailable: true,
+      timestamp: existing.timestamp ?? new Date().toISOString(),
+    };
+    return next;
+  }
+
+  if (contentOffset !== null && contentOffset > 0) return items;
+  return [
+    ...items,
+    {
+      id: itemId,
+      kind: 'tool_call',
+      callId,
+      toolName: event.tool_name ?? 'unknown',
+      turnId: normalizeEventTurnId(event.turn_id),
+      sessionId: event.session_id ?? null,
+      status: 'started',
+      timestamp: new Date().toISOString(),
+      streamedOutput: delta,
+      result: delta,
+      isError: event.is_error,
+      streamChunkCount: chunkIndex !== undefined ? chunkIndex + 1 : 1,
+      streamContentOffset: delta.length,
+      liveOutputAvailable: true,
+      reconstructed: true,
+    } satisfies ToolCallTimelineItem,
+  ];
+}
+
+export function hydrateMessageCompleteFromRuntimeOverlay(
+  event: CognisWebSocketEvent,
+  overlay: RuntimeTimelineOverlay,
+): CognisWebSocketEvent {
+  if (event.type !== 'message_complete') return event;
+  if (typeof event.content === 'string' && event.content.length > 0) return event;
+  const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+  const match = overlay.items.find((item) => (
+    item.kind === 'message'
+    && item.role === 'assistant'
+    && item.messageId === event.message_id
+    && (item.turnId ?? null) === (turnId ?? null)
+    && item.content.length > 0
+  )) as MessageTimelineItem | undefined;
+  return match ? { ...event, content: match.content } : event;
+}
+
+function insertRuntimeAssistantBeforeTurnTools(items: TimelineItem[], item: MessageTimelineItem): TimelineItem[] {
+  const next = [...items];
+  const itemTime = item.timestamp ? Date.parse(item.timestamp) : NaN;
+  const insertIndex = next.findIndex((candidate) => (
+    candidate.kind === 'tool_call'
+    && (candidate.turnId ?? null) === (item.turnId ?? null)
+    && (
+      Number.isNaN(itemTime)
+      || !candidate.timestamp
+      || Number.isNaN(Date.parse(candidate.timestamp))
+      || Date.parse(candidate.timestamp) >= itemTime
+    )
+  ));
+  if (insertIndex >= 0) {
+    next.splice(insertIndex, 0, item);
+  } else {
+    next.push(item);
+  }
+  return next;
+}
+
+export function promoteRuntimeOverlayForCanonicalEvent(
+  canonical: TimelineItem[],
+  overlay: RuntimeTimelineOverlay,
+  event: CognisWebSocketEvent,
+): TimelineItem[] {
+  if (overlay.items.length === 0) return canonical;
+  if (event.type === 'message_complete') {
+    const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+    const overlayMessage = overlay.items.find((item) => (
+      item.kind === 'message'
+      && item.role === 'assistant'
+      && item.messageId === event.message_id
+      && (item.turnId ?? null) === (turnId ?? null)
+    )) as MessageTimelineItem | undefined;
+    if (!overlayMessage) return canonical;
+    if (timelinePatchMergeIndex(canonical, overlayMessage) >= 0) return canonical;
+    const content = typeof event.content === 'string' ? event.content : overlayMessage.content;
+    const turnMode = chatModeForTurn(canonical, turnId);
+    const eventChatMode = normalizeChatMode(event.chat_mode) ?? turnMode.chatMode;
+    const eventChatModeSource = normalizeChatModeSource(event.chat_mode_source) ?? turnMode.chatModeSource;
+    const runtime = normalizeMessageRuntime(event.runtime);
+    const streamer = getStreamer(overlayMessage.id);
+    const html = streamer.finalize(content);
+    releaseStreamer(overlayMessage.id);
+    clearPendingChunks(event.message_id, turnId);
+    return insertRuntimeAssistantBeforeTurnTools(canonical, {
+      ...overlayMessage,
+      content,
+      html,
+      seq: event.seq,
+      streaming: false,
+      partial: event.partial === true,
+      finishReason: event.finish_reason ?? overlayMessage.finishReason ?? null,
+      chatMode: eventChatMode ?? overlayMessage.chatMode,
+      chatModeSource: eventChatModeSource ?? overlayMessage.chatModeSource,
+      runtime: runtime ?? overlayMessage.runtime,
+      attachments: normalizeEventAttachments(event.attachments).length > 0
+        ? normalizeEventAttachments(event.attachments)
+        : overlayMessage.attachments,
+      streamChunkCount: undefined,
+      streamContentOffset: undefined,
+    });
+  }
+  if (event.type === 'tool_result') {
+    const overlayTool = overlay.items.find((item) => (
+      item.kind === 'tool_call' && item.callId === event.call_id
+    )) as ToolCallTimelineItem | undefined;
+    if (!overlayTool) return canonical;
+    const index = timelinePatchMergeIndex(canonical, overlayTool);
+    if (index >= 0) {
+      const next = [...canonical];
+      next[index] = mergeTimelinePatchItem(next[index], overlayTool);
+      return next;
+    }
+    return [...canonical, overlayTool];
+  }
+  if (event.type === 'timeline_patch') {
+    let next = canonical;
+    for (const patch of timelineFromProjection(event.items)) {
+      if (patch.kind !== 'tool_call' || !isTerminalToolStatus(patch.status)) continue;
+      const overlayTool = overlay.items.find((item) => (
+        item.kind === 'tool_call' && item.callId === patch.callId
+      )) as ToolCallTimelineItem | undefined;
+      if (!overlayTool) continue;
+      const index = timelinePatchMergeIndex(next, overlayTool);
+      if (index >= 0) {
+        const copy = [...next];
+        copy[index] = mergeTimelinePatchItem(copy[index], overlayTool);
+        next = copy;
+      } else {
+        next = [...next, overlayTool];
+      }
+    }
+    return next;
+  }
+  return canonical;
+}
+
+export function applyRuntimeSnapshotOverlay(
+  overlay: RuntimeTimelineOverlay,
+  snapshot: {
+    active_streams: ActiveStreamSnapshot[];
+    active_tool_outputs: ActiveToolOutputSnapshot[];
+    active_thinking: ActiveThinkingSnapshot[];
+    has_active_turn?: boolean;
+  },
+): RuntimeTimelineOverlay {
+  let items = clearActiveRuntimeTimelineItems(overlay.items, {
+    streams: true,
+    toolOutputs: false,
+    thinking: false,
+    retainStreamedAssistantMessages: snapshot.has_active_turn !== false,
+  });
+  items = applyActiveStreamSnapshots(items, snapshot.active_streams);
+  items = clearActiveRuntimeTimelineItems(items, {
+    streams: false,
+    toolOutputs: true,
+    thinking: false,
+    retainActiveToolCalls: snapshot.has_active_turn !== false,
+  });
+  items = applyActiveToolOutputSnapshots(items, snapshot.active_tool_outputs);
+  items = clearActiveRuntimeTimelineItems(items, {
+    streams: false,
+    toolOutputs: false,
+    thinking: true,
+  });
+  items = applyActiveThinkingSnapshots(items, snapshot.active_thinking);
+  return { items };
+}
+
+function runtimeOverlayItemSupersededByCanonical(canonical: TimelineItem[], overlayItem: TimelineItem): boolean {
+  const index = timelinePatchMergeIndex(canonical, overlayItem);
+  if (index < 0) return false;
+  const existing = canonical[index];
+  if (existing.kind === 'message' && overlayItem.kind === 'message') {
+    return existing.role === 'assistant'
+      && existing.streaming !== true
+      && (existing.seq != null || existing.finishReason != null || overlayItem.streaming === true);
+  }
+  if (existing.kind === 'tool_call' && overlayItem.kind === 'tool_call') {
+    return isTerminalToolStatus(existing.status);
+  }
+  if (existing.kind === 'thinking' && overlayItem.kind === 'thinking') {
+    return existing.streaming !== true && overlayItem.streaming === true;
+  }
+  return false;
+}
+
+export function projectDisplayTimeline(
+  canonical: TimelineItem[],
+  overlay: RuntimeTimelineOverlay,
+): TimelineItem[] {
+  if (overlay.items.length === 0) return canonical;
+  let next = [...canonical];
+  for (const overlayItem of overlay.items) {
+    if (runtimeOverlayItemSupersededByCanonical(next, overlayItem)) continue;
+    const index = timelinePatchMergeIndex(next, overlayItem);
+    if (index >= 0) {
+      next[index] = mergeTimelinePatchItem(next[index], overlayItem);
+      continue;
+    }
+    if (overlayItem.kind === 'thinking') {
+      insertBeforeOpenPhaseAssistant(next, overlayItem, overlayItem.turnId ?? null);
+    } else if (overlayItem.kind === 'message' && overlayItem.role === 'assistant') {
+      next = insertRuntimeAssistantBeforeTurnTools(next, overlayItem);
+    } else {
+      next.push(overlayItem);
+    }
+  }
+  return next;
+}
+
+export function clearRuntimeOverlayForCanonicalEvent(
+  overlay: RuntimeTimelineOverlay,
+  event: CognisWebSocketEvent,
+): RuntimeTimelineOverlay {
+  if (overlay.items.length === 0) return overlay;
+  if (
+    event.type === 'turn_settled'
+    || event.type === 'task_paused'
+    || event.type === 'session_reset'
+    || event.type === 'history_rebased'
+  ) {
+    return createRuntimeTimelineOverlay();
+  }
+  if (event.type === 'message_complete') {
+    const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
+    return {
+      items: overlay.items.filter((item) => !(
+        item.kind === 'message'
+        && item.role === 'assistant'
+        && item.messageId === event.message_id
+        && (item.turnId ?? null) === (turnId ?? null)
+      )),
+    };
+  }
+  if (event.type === 'tool_result') {
+    return {
+      items: overlay.items.filter((item) => !(item.kind === 'tool_call' && item.callId === event.call_id)),
+    };
+  }
+  if (event.type === 'timeline_patch') {
+    const patches = timelineFromProjection(event.items);
+    return {
+      items: overlay.items.filter((item) => {
+        return !patches.some((patch) => {
+          if (item.kind === 'message' && patch.kind === 'message') {
+            return item.role === patch.role
+              && item.messageId === patch.messageId
+              && (item.turnId ?? null) === (patch.turnId ?? null);
+          }
+          if (item.kind === 'tool_call' && patch.kind === 'tool_call') {
+            return item.callId === patch.callId && isTerminalToolStatus(patch.status);
+          }
+          if (item.kind === 'thinking' && patch.kind === 'thinking') {
+            return item.messageId === patch.messageId && (item.turnId ?? null) === (patch.turnId ?? null);
+          }
+          return false;
+        });
+      }),
+    };
+  }
+  return overlay;
+}
+
+export function timelinePatchContainsActiveWork(projectedItems: TimelineProjectionItem[]): boolean {
+  return projectedItems.some((item) => {
+    if (item.kind === 'message') {
+      return item.role === 'assistant' && item.partial === true;
+    }
+    if (item.kind === 'tool_call' || item.kind === 'delegation') {
+      const status = typeof item.status === 'string' ? item.status : '';
+      return status === 'started' || status === 'running' || status === 'pending' || status === 'paused';
+    }
+    if (item.kind === 'thinking') {
+      return item.streaming === true;
+    }
+    return false;
+  });
 }
 
 function eventSessionId(event: MessageEvent): string | null {
@@ -1092,6 +1900,7 @@ function upsertAssistantTurnMessage(
     partial = false,
     finishReason = null,
     streaming = false,
+    runtime = null,
   }: {
     id: string;
     sessionId?: string | null;
@@ -1106,6 +1915,7 @@ function upsertAssistantTurnMessage(
     partial?: boolean;
     finishReason?: string | null;
     streaming?: boolean;
+    runtime?: MessageRuntimeMetadata | null;
   },
 ): void {
   const existingIndex = findMergeableAssistantIndex(items, turnId, messageId);
@@ -1128,15 +1938,34 @@ function upsertAssistantTurnMessage(
       chatModeSource: chatModeSource ?? existing.chatModeSource,
       partial: partial || existing.partial,
       finishReason: finishReason ?? existing.finishReason,
+      runtime: runtime ?? existing.runtime,
+      assistantPhaseIndex: existing.assistantPhaseIndex,
     } satisfies MessageTimelineItem;
     return;
   }
 
-  const item = createMessageItem(id, sessionId ?? null, 'assistant', content, timestamp, seq, messageId, streaming, attachments, false, turnId);
+  const item = createMessageItem(
+    id,
+    sessionId ?? null,
+    'assistant',
+    content,
+    timestamp,
+    seq,
+    messageId,
+    streaming,
+    attachments,
+    false,
+    turnId,
+    undefined,
+    null,
+    null,
+    nextAssistantPhaseIndex(items, turnId),
+  );
   item.chatMode = chatMode;
   item.chatModeSource = chatModeSource;
   item.partial = partial;
   item.finishReason = finishReason;
+  item.runtime = runtime;
   items.push(item);
 }
 
@@ -1232,11 +2061,25 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
   const existingIndex = findOpenPhaseAssistantIndex(items, turnId);
   if (existingIndex >= 0 && items[existingIndex]?.kind === 'message') {
     const existing = items[existingIndex] as MessageTimelineItem;
+    const canRefreshRetainedLiveStream = existing.seq == null && !existing.finishReason;
+    if (!existing.streaming && !canRefreshRetainedLiveStream) {
+      return items;
+    }
     if (
-      existing.streaming
-      && snapshot.chunk_count <= (existing.streamChunkCount ?? 0)
+      snapshot.chunk_count <= (existing.streamChunkCount ?? 0)
       && content.length <= existing.content.length
     ) {
+      if (!existing.streaming && canRefreshRetainedLiveStream) {
+        const next = [...items];
+        next[existingIndex] = {
+          ...existing,
+          streaming: true,
+          sessionId: snapshot.session_id ?? existing.sessionId,
+          turnId,
+          timestamp: existing.timestamp ?? snapshot.updated_at ?? new Date().toISOString(),
+        } satisfies MessageTimelineItem;
+        return next;
+      }
       return items;
     }
     if (!existing.streaming && existing.content === content) {
@@ -1257,6 +2100,7 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
       chatMode: existing.chatMode ?? turnMode.chatMode,
       chatModeSource: existing.chatModeSource ?? turnMode.chatModeSource,
       timestamp: existing.timestamp ?? snapshot.updated_at ?? new Date().toISOString(),
+      assistantPhaseIndex: existing.assistantPhaseIndex,
     } satisfies MessageTimelineItem, turnId);
     return next;
   }
@@ -1274,6 +2118,9 @@ function applyActiveStreamSnapshot(items: TimelineItem[], snapshot: ActiveStream
     false,
     turnId,
     snapshot.chunk_count,
+    null,
+    null,
+    nextAssistantPhaseIndex(items, turnId),
   );
   item.chatMode = turnMode.chatMode;
   item.chatModeSource = turnMode.chatModeSource;
@@ -1401,6 +2248,7 @@ export function applyActiveThinkingSnapshots(
     const item: ThinkingTimelineItem = {
       id: `thinking:${turnId}:active`,
       kind: 'thinking',
+      sessionId: snapshot.session_id,
       messageId: snapshot.message_id,
       turnId,
       blocks,
@@ -1415,6 +2263,45 @@ export function applyActiveThinkingSnapshots(
     }
   }
   return next;
+}
+
+export function clearActiveRuntimeTimelineItems(
+  items: TimelineItem[],
+  options: {
+    streams?: boolean;
+    toolOutputs?: boolean;
+    thinking?: boolean;
+    retainStreamedAssistantMessages?: boolean;
+    retainActiveToolCalls?: boolean;
+  } = {},
+): TimelineItem[] {
+  const clearStreams = options.streams ?? true;
+  const clearToolOutputs = options.toolOutputs ?? true;
+  const clearThinking = options.thinking ?? true;
+  const retainStreamedAssistantMessages = options.retainStreamedAssistantMessages ?? false;
+  const retainActiveToolCalls = options.retainActiveToolCalls ?? false;
+  const cleared: TimelineItem[] = [];
+  for (const item of items) {
+    if (item.kind === 'message' && item.role === 'assistant') {
+      if (clearStreams && item.partial && !retainStreamedAssistantMessages) continue;
+      cleared.push(clearStreams && item.streaming ? { ...item, streaming: false } : item);
+      continue;
+    }
+    if (item.kind === 'thinking') {
+      if (clearThinking && item.streaming) continue;
+      cleared.push(item);
+      continue;
+    }
+    if (item.kind === 'tool_call') {
+      const status = item.status ?? '';
+      const isActiveStatus = status === '' || status === 'started' || status === 'running' || status === 'pending';
+      if (clearToolOutputs && isActiveStatus && !retainActiveToolCalls) continue;
+      cleared.push(item);
+      continue;
+    }
+    cleared.push(item);
+  }
+  return cleared;
 }
 
 export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
@@ -1451,6 +2338,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
           chatModeSource: normalizeChatModeSource(event.data.chat_mode_source),
           partial: event.data.partial === true,
           finishReason: typeof event.data.finish_reason === 'string' ? event.data.finish_reason : null,
+          runtime: normalizeMessageRuntime(event.data.runtime),
         });
       }
       continue;
@@ -1527,6 +2415,7 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         insertBeforeOpenPhaseAssistant(items, {
           id: `thinking:${eid}:${blockId}`,
           kind: 'thinking',
+          sessionId: typeof event.data.session_id === 'string' ? event.data.session_id : null,
           messageId,
           turnId,
           blocks: [block],
@@ -1540,6 +2429,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
 
     if (event.type === 'tool_call') {
       const toolName = String(event.data.name ?? event.data.tool_name ?? 'unknown');
+      const visibleToolName = typeof event.data.visible_name === 'string' ? event.data.visible_name : null;
+      const canonicalToolName = typeof event.data.canonical_name === 'string' ? event.data.canonical_name : toolName;
       // Orchestration tools are displayed as delegation cards, not tool blocks
       if (['delegate', 'fork'].includes(toolName)) continue;
       const callId = String(event.data.call_id ?? `tc-${eid}`);
@@ -1555,6 +2446,8 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
         callId,
         turnId,
         toolName,
+        displayToolName: visibleToolName ?? toolName,
+        canonicalToolName,
         status: typeof event.data.status === 'string' ? event.data.status : 'started',
         timestamp: event.timestamp,
         arguments: args
@@ -1816,6 +2709,12 @@ export function normalizeHistory(events: MessageEvent[]): TimelineItem[] {
             items.push(systemMessage);
           }
         }
+      } else if (lifecycleEvent === 'tool_call_context_pressure') {
+        items.push(createToolCallContextPressureNotice(
+          `notice:tool-call-context-pressure:${eid}`,
+          event.data,
+          event.timestamp
+        ));
       }
       continue;
     }
@@ -1876,6 +2775,63 @@ export function appendOptimisticUserMessage(
       clientMessageId
     )
   ];
+}
+
+export function upsertQueuedUserMessage(items: TimelineItem[], queued: QueuedMessage): TimelineItem[] {
+  const queueId = normalizeIdentifier(queued.queue_id);
+  if (!queueId) return items;
+  const clientMessageId = normalizeIdentifier(queued.client_message_id);
+  const content = queued.content;
+  const attachments = queued.attachments ?? [];
+  const timestamp = queued.created_at ?? queued.updated_at ?? new Date().toISOString();
+  const correlatedIndex = findUserMessageByCorrelationIndex(items, clientMessageId, queueId);
+  const fallbackIndex = correlatedIndex >= 0
+    ? correlatedIndex
+    : findOptimisticUserMessageIndex(items, content, attachments);
+  if (fallbackIndex >= 0) {
+    const existing = items[fallbackIndex];
+    if (existing?.kind !== 'message' || existing.role !== 'user') return items;
+    if (!existing.optimistic && existing.deliveryStatus !== 'queued') return items;
+    const next = [...items];
+    next[fallbackIndex] = {
+      ...existing,
+      content,
+      html: renderMarkdown(content),
+      timestamp: existing.timestamp ?? timestamp,
+      attachments,
+      optimistic: true,
+      deliveryStatus: 'queued',
+      clientMessageId: clientMessageId ?? existing.clientMessageId,
+      queueId,
+    };
+    return next;
+  }
+  const item = createMessageItem(
+    `queued-user:${queueId}`,
+    null,
+    'user',
+    content,
+    timestamp,
+    null,
+    undefined,
+    false,
+    attachments,
+    true,
+    null,
+    0,
+    clientMessageId,
+    queueId
+  );
+  item.deliveryStatus = 'queued';
+  return [...items, item];
+}
+
+export function pruneStaleQueuedUserMessages(items: TimelineItem[], liveQueueIds: Set<string>): TimelineItem[] {
+  return items.filter((item) => {
+    if (item.kind !== 'message' || item.role !== 'user') return true;
+    if (item.deliveryStatus !== 'queued' || !item.optimistic || !item.queueId) return true;
+    return liveQueueIds.has(item.queueId);
+  });
 }
 
 export function removeQueuedOptimisticUserMessage(
@@ -1973,7 +2929,7 @@ export function annotateStepRequestInputWithNotification(
 export function optimisticallyResolveStepRequestInput(
   items: TimelineItem[],
   toolId: string,
-  response: string,
+  response: string | QuestionSetReply,
 ): TimelineItem[] {
   return items.map((item) => {
     if (item.id !== toolId || item.kind !== 'tool_call') return item;
@@ -1985,7 +2941,9 @@ export function optimisticallyResolveStepRequestInput(
       isError: false,
       result: JSON.stringify(
         normalizedToolName(tool.toolName) === 'steprequestquestions'
-          ? { mode: 'plain_text', answers: [{ question_id: 'q1', selected_option_ids: [], custom_answer: response }] }
+          ? typeof response === 'string'
+            ? { mode: 'plain_text', answers: [{ question_id: 'q1', selected_option_ids: [], custom_answer: response }] }
+            : response
           : { response: '<redacted>' },
       ),
     } satisfies ToolCallTimelineItem;
@@ -1994,6 +2952,45 @@ export function optimisticallyResolveStepRequestInput(
 
 export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocketEvent): TimelineItem[] {
   let next = [...items];
+
+  if (event.type === 'timeline_patch') {
+    return applyTimelinePatch(next, event.items);
+  }
+
+  if (event.type === 'escalation') {
+    const toolCallId = event.tool_call_id ?? event.call_id;
+    if (!toolCallId) return next;
+    const itemId = `tool:${toolCallId}`;
+    const index = next.findIndex((item) => item.id === itemId && item.kind === 'tool_call');
+    const toolName = event.tool_name ?? 'unknown';
+    const patch: ToolCallTimelineItem = {
+      id: itemId,
+      kind: 'tool_call',
+      callId: toolCallId,
+      toolName,
+      status: 'started',
+      timestamp: new Date().toISOString(),
+      sessionId: event.session_id ?? null,
+      evaluation: {
+        decision: 'escalate',
+        reasoning: event.reasoning ?? undefined,
+        risk: event.risk ?? undefined,
+      },
+    };
+    if (index >= 0) {
+      const existing = next[index] as ToolCallTimelineItem;
+      next[index] = {
+        ...existing,
+        evaluation: existing.evaluation ?? patch.evaluation,
+        sessionId: existing.sessionId ?? patch.sessionId,
+        toolName: existing.toolName || toolName,
+        status: isTerminalToolStatus(existing.status) ? existing.status : existing.status || 'started',
+      };
+      return next;
+    }
+    next.push(patch);
+    return next;
+  }
 
   if (event.type === 'user_message') {
     const attachments = normalizeEventAttachments(event.attachments);
@@ -2019,7 +3016,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         chatModeSource,
         clientMessageId: event.client_message_id ?? existing.clientMessageId,
         queueId: event.queue_id ?? existing.queueId,
-        optimistic: false
+        optimistic: false,
+        deliveryStatus: undefined,
       };
       return applyChatModeToTurnMessages(next, turnId, chatMode, chatModeSource);
     }
@@ -2106,6 +3104,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       false,
       turnId,
       chunkIndex !== null ? chunkIndex + 1 : 1,
+      null,
+      null,
+      nextAssistantPhaseIndex(next, turnId),
     );
     item.chatMode = eventChatMode;
     item.chatModeSource = eventChatModeSource;
@@ -2126,6 +3127,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const index = findMergeableAssistantIndex(next, turnId, event.message_id);
     const attachments = normalizeEventAttachments(event.attachments);
     const finalContent = typeof event.content === 'string' ? event.content : null;
+    const runtime = normalizeMessageRuntime(event.runtime);
     if (index >= 0) {
       const message = next[index] as MessageTimelineItem;
       const completeContent = reconcileCompletedAssistantContent(message.content, finalContent);
@@ -2144,10 +3146,12 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         attachments: attachments.length > 0 ? attachments : message.attachments,
         chatMode: eventChatMode ?? message.chatMode,
         chatModeSource: eventChatModeSource ?? message.chatModeSource,
-        partial: event.partial === true || message.partial,
+        partial: event.partial === true,
         finishReason: event.finish_reason ?? message.finishReason ?? null,
+        runtime: runtime ?? message.runtime,
         streamChunkCount: undefined,
         streamContentOffset: undefined,
+        assistantPhaseIndex: message.assistantPhaseIndex,
       };
       return next;
     }
@@ -2167,6 +3171,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         chatModeSource: eventChatModeSource,
         partial: event.partial === true,
         finishReason: event.finish_reason ?? null,
+        runtime,
       });
       return next;
     }
@@ -2179,6 +3184,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
     const blockId = event.block_id;
     const delta = event.delta ?? '';
+    if (isUserMessageReasoningDiagnostic(event.source, event.title, delta)) {
+      return next;
+    }
     const index = findThinkingItemIndexByBlockId(next, blockId, turnId);
     if (index >= 0) {
       const existing = next[index] as ThinkingTimelineItem;
@@ -2259,6 +3267,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         insertBeforeOpenPhaseAssistant(next, {
           id: `thinking:${turnId}:${blockId}`,
           kind: 'thinking',
+          sessionId: event.session_id ?? null,
           messageId: event.message_id,
           turnId,
           blocks: [block],
@@ -2275,6 +3284,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     const turnId = normalizeEventTurnId(event.turn_id) ?? event.message_id;
     const messageId = event.message_id;
     const blockId = event.block_id;
+    if (isUserMessageReasoningDiagnostic(event.source, event.title, event.content ?? null)) {
+      return next;
+    }
     const index = findThinkingItemIndexByBlockId(next, blockId, turnId);
 
     if (event.content) {
@@ -2315,6 +3327,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
           insertBeforeOpenPhaseAssistant(next, {
             id: `thinking:${turnId}:${blockId}`,
             kind: 'thinking',
+            sessionId: event.session_id ?? null,
             messageId,
             turnId,
             blocks: [block],
@@ -2372,6 +3385,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         insertBeforeOpenPhaseAssistant(next, {
           id: `thinking:${turnId}:${blockId}`,
           kind: 'thinking',
+          sessionId: event.session_id ?? null,
           messageId,
           turnId,
           blocks: [fallbackBlock],
@@ -2403,6 +3417,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       callId: event.call_id,
       toolName: event.tool_name,
       turnId,
+      sessionId: event.session_id ?? null,
       status: event.status,
       timestamp: event.timestamp ?? new Date().toISOString(),
       arguments: event.arguments
@@ -2420,6 +3435,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         evaluation: existing.evaluation,
         attachments: existing.attachments,
         turnId: toolItem.turnId ?? existing.turnId,
+        sessionId: existing.sessionId ?? toolItem.sessionId,
       }));
       return next;
     }
@@ -2457,6 +3473,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
         ...patch,
         status: existing.status === 'completed' || existing.status === 'failed' ? existing.status : 'started',
         turnId: existing.turnId ?? turnId,
+        sessionId: existing.sessionId ?? rawEvent.session_id ?? null,
       };
       return next;
     }
@@ -2466,6 +3483,7 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       callId,
       toolName: rawEvent.tool_name ?? 'unknown',
       turnId,
+      sessionId: rawEvent.session_id ?? null,
       status: 'started',
       timestamp: rawEvent.timestamp ?? new Date().toISOString(),
       ...patch,
@@ -2511,8 +3529,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       next[index] = appendToolOutputChunk(existing, {
         delta,
         isError: isErrorChunk,
-        chunkIndex: rawEvent.chunk_index,
-        contentOffset: rawEvent.content_offset,
+        chunkIndex: rawEvent.chunk_index ?? undefined,
+        contentOffset: rawEvent.content_offset ?? undefined,
         sessionId: rawEvent.session_id,
       });
       return next;
@@ -2520,8 +3538,8 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
     bufferPendingToolOutputChunk(key, {
       delta,
       isError: isErrorChunk,
-      chunkIndex: rawEvent.chunk_index,
-      contentOffset: rawEvent.content_offset,
+      chunkIndex: rawEvent.chunk_index ?? undefined,
+      contentOffset: rawEvent.content_offset ?? undefined,
       sessionId: rawEvent.session_id,
     });
     return next;
@@ -2750,14 +3768,17 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'session_compacted') {
-    const itemId = `compaction:${event.previous_session_id}:${event.session_id}`;
-    const runningId = `compaction:running:${event.previous_session_id}`;
+    const previousSessionId = event.previous_session_id ?? undefined;
+    const itemId = previousSessionId
+      ? `compaction:${previousSessionId}:${event.session_id}`
+      : `compaction:${event.session_id}`;
+    const runningId = `compaction:running:${previousSessionId}`;
     const item: CompactionTimelineItem = {
       id: itemId,
       kind: 'compaction',
       status: 'compacted',
       sessionId: event.session_id,
-      previousSessionId: event.previous_session_id,
+      previousSessionId,
       summaryPreview: event.summary_preview?.slice(0, 500) ?? '',
       summary: event.summary_preview ?? '',
       method: event.method ?? 'unknown',
@@ -2775,6 +3796,26 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
       next[runningIndex] = item;
       return next;
     }
+    const fallbackRunningIndex = next.findIndex((existing) => (
+      existing.kind === 'compaction'
+      && existing.status === 'running'
+      && (
+        existing.sessionId === previousSessionId
+        || existing.previousSessionId === previousSessionId
+      )
+    ));
+    if (fallbackRunningIndex >= 0) {
+      next[fallbackRunningIndex] = item;
+      return next;
+    }
+    const runningCompactionIndexes = next
+      .map((existing, index) => ({ existing, index }))
+      .filter(({ existing }) => existing.kind === 'compaction' && existing.status === 'running')
+      .map(({ index }) => index);
+    if (runningCompactionIndexes.length === 1) {
+      next[runningCompactionIndexes[0]] = item;
+      return next;
+    }
     const existingIndex = next.findIndex((existing) => existing.id === itemId && existing.kind === 'compaction');
     if (existingIndex >= 0) {
       next[existingIndex] = item;
@@ -2785,6 +3826,9 @@ export function applyWebSocketEvent(items: TimelineItem[], event: CognisWebSocke
   }
 
   if (event.type === 'system_message') {
+    if (isTerminalCompactionNotice(event.text)) {
+      next = removeRunningCompactionItems(next, event.session_id);
+    }
     const itemId =
       typeof event.notice_id === 'string' && event.notice_id.length > 0
         ? `sysmsg:${event.notice_id}`

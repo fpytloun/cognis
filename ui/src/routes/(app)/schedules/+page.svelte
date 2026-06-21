@@ -20,6 +20,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText } from '$lib/session-policy';
+  import { matchesScheduleVisibility, type ScheduleVisibilityFilter } from '$lib/schedules';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Project, Schedule, Skill, Workflow } from '$lib/types/api';
@@ -47,6 +48,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let filterType = $state<string>('');
   let filterEnabled = $state<string>('');
   let filterProjectId = $state<string>('');
+  let filterVisibility = $state<ScheduleVisibilityFilter>('active');
   let showCreateModal = $state(false);
   let creating = $state(false);
   let lastAutoProjectWorkflow = $state('');
@@ -128,6 +130,7 @@ import Zap from 'lucide-svelte/icons/zap';
   let filtered = $derived(
     schedules.filter((s) => {
       if (search && !s.name.toLowerCase().includes(search.toLowerCase())) return false;
+      if (!matchesScheduleVisibility(s, filterVisibility)) return false;
       if (filterType && s.schedule_type !== filterType) return false;
       if (filterEnabled === 'enabled' && !s.enabled) return false;
       if (filterEnabled === 'disabled' && s.enabled) return false;
@@ -403,6 +406,15 @@ import Zap from 'lucide-svelte/icons/zap';
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
+  function formatDateTime(iso: string): string {
+    return new Date(iso).toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  }
+
   // Cron presets for the UI
   const cronPresets = [
     { label: 'Every minute', value: '* * * * *' },
@@ -494,6 +506,14 @@ import Zap from 'lucide-svelte/icons/zap';
           <option value={project.project_id}>{project.name}</option>
         {/each}
       </select>
+      <select
+        bind:value={filterVisibility}
+        class="rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+      >
+        <option value="active">Active and recent</option>
+        <option value="expired">Expired</option>
+        <option value="all">All schedules</option>
+      </select>
     </div>
 
     <!-- Schedule list -->
@@ -520,6 +540,9 @@ import Zap from 'lucide-svelte/icons/zap';
                     <h3 class="break-words font-medium text-white lg:truncate lg:group-hover:whitespace-normal lg:group-focus-within:whitespace-normal" title={schedule.name}>{schedule.name}</h3>
                     {#if !schedule.enabled}
                       <Badge class="bg-slate-700/50 text-slate-400">Disabled</Badge>
+                    {/if}
+                    {#if schedule.is_expired}
+                      <Badge class="bg-amber-500/15 text-amber-300">Expired</Badge>
                     {/if}
                     {#if schedule.completion_mode_family === 'direct'}
                       <Badge class="bg-cyan-500/20 text-cyan-300">Direct delivery</Badge>
@@ -555,7 +578,11 @@ import Zap from 'lucide-svelte/icons/zap';
                       {schedule.last_run_status}
                     </span>
                   {/if}
-                  {#if schedule.next_fire_at && schedule.enabled}
+                  {#if schedule.is_expired}
+                    <div class="mt-1">Expired</div>
+                  {:else if !schedule.next_fire_at && schedule.expiration_grace_until}
+                    <div class="mt-1">Visible until: {formatDateTime(schedule.expiration_grace_until)}</div>
+                  {:else if schedule.next_fire_at && schedule.enabled}
                     <div class="mt-1">Next: {formatNextFire(schedule.next_fire_at)}</div>
                   {/if}
                 </div>

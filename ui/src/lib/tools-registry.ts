@@ -43,6 +43,8 @@ export function getSourceLabel(sourceType: string): string {
       return 'Intaris MCP';
     case 'skill':
       return 'Skill';
+    case 'controller':
+      return 'Controller';
     default:
       return sourceType;
   }
@@ -74,7 +76,11 @@ export function filterTools(tools: ToolDefinitionSummary[], filters: ToolsFilter
   return tools.filter((tool) => {
     const matchesSearch = !query
       || tool.name.toLowerCase().includes(query)
-      || tool.description.toLowerCase().includes(query);
+      || tool.description.toLowerCase().includes(query)
+      || (tool.aliases || []).some((alias) => {
+        const name = alias.name;
+        return typeof name === 'string' && name.toLowerCase().includes(query);
+      });
     const matchesCategory = filters.categoryFilter === 'all' || tool.category === filters.categoryFilter;
     return matchesSearch && matchesCategory;
   });

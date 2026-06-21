@@ -9,7 +9,7 @@
   <div class="flex items-center justify-between gap-4">
     <div>
       <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Tool call</p>
-      <h3 class="mt-1 text-base font-semibold text-white" title={item.toolName}>{displayToolName(item.toolName)}</h3>
+      <h3 class="mt-1 text-base font-semibold text-white" title={item.toolName}>{displayToolName(item.displayToolName ?? item.toolName)}</h3>
     </div>
     <span class="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200">
       {item.status}

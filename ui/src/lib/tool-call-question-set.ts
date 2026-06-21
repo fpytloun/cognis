@@ -91,7 +91,15 @@ export function formatStepQuestionResponse(
   item: Pick<ToolCallTimelineItem, 'arguments'>,
   parsed: Record<string, unknown> | null,
 ): string {
-  const answers = parsed?.answers;
+  const response = parsed?.response;
+  const reply = parsed?.reply;
+  const answers = Array.isArray(parsed?.answers)
+    ? parsed.answers
+    : reply && typeof reply === 'object' && Array.isArray((reply as Record<string, unknown>).answers)
+      ? (reply as Record<string, unknown>).answers
+      : response && typeof response === 'object' && Array.isArray((response as Record<string, unknown>).answers)
+        ? (response as Record<string, unknown>).answers
+        : null;
   if (Array.isArray(answers)) {
     const questions = normalizeStepQuestions(item);
     return answers
@@ -109,12 +117,12 @@ export function formatStepQuestionResponse(
           ? record.custom_answer.trim()
           : '';
         const parts = [...selected, custom].filter((part) => part.length > 0);
+        if (parts.length === 0) return '';
         const label = question?.header || question?.question || questionId || 'Question';
-        return `${label}: ${parts.length > 0 ? parts.join(', ') : '(no answer)'}`;
+        return `${label}: ${parts.join(', ')}`;
       })
       .filter((line) => line.length > 0)
       .join('\n');
   }
-  const response = parsed?.response;
   return typeof response === 'string' ? response : '';
 }

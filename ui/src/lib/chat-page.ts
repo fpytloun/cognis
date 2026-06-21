@@ -1,4 +1,4 @@
-import type { ChatMode, ChatModeSource, Conversation } from '$lib/types/api';
+import type { ChatMode, ChatModeSource, Conversation, QuestionSetQuestion, SidebarProjection } from '$lib/types/api';
 
 export interface ConversationRetryScope {
   sessions: boolean;
@@ -9,6 +9,15 @@ export type ConversationStatusFilter = 'active' | 'starred' | 'archived';
 export type ConversationAttentionTone = 'default' | 'amber' | 'rose';
 export type ChatModeTone = 'default' | 'plan' | 'build';
 export type PendingDirectQuestionKind = 'question' | 'auth_challenge';
+export const DEFAULT_INITIAL_TIMELINE_LIMIT = 200;
+export const DIRECT_CHAT_INITIAL_SESSION_LIMIT = 20;
+export const DIRECT_CHAT_INITIAL_TIMELINE_LIMIT = 80;
+
+export interface SidebarProjectionFilter {
+  selectedChannel: string;
+  selectedAgentId: string;
+  selectedConversationStatus: ConversationStatusFilter;
+}
 
 export interface PendingDirectQuestion {
   notificationId: string;
@@ -16,9 +25,187 @@ export interface PendingDirectQuestion {
   question: string;
   questionId?: string;
   options: string[];
+  questions?: QuestionSetQuestion[];
   context: string;
   kind?: PendingDirectQuestionKind;
   structured?: boolean;
+}
+
+export interface ConversationInitialLoadPolicy {
+  historyLimit: number;
+  sessionOptions?: {
+    rootOnly: boolean;
+    order: 'asc' | 'desc';
+    limit: number;
+  };
+}
+
+function timestampValue(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+export function conversationActivityValue(conversation: Pick<Conversation, 'created_at' | 'last_message_at'>): number {
+  return Math.max(
+    timestampValue(conversation.last_message_at),
+    timestampValue(conversation.created_at)
+  );
+}
+
+export interface ConversationActivitySection<T extends Pick<Conversation, 'created_at' | 'last_message_at'>> {
+  key: string;
+  label: string;
+  conversations: T[];
+}
+
+function localDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, '0');
+  const day = `${date.getDate()}`.padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function localDayNumber(date: Date): number {
+  return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000;
+}
+
+function conversationActivityDate(conversation: Pick<Conversation, 'created_at' | 'last_message_at'>): Date | null {
+  const activity = conversationActivityValue(conversation);
+  if (activity <= 0) return null;
+  const date = new Date(activity);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function conversationActivitySectionLabel(
+  date: Date | null,
+  now = new Date(),
+  locale?: Intl.LocalesArgument,
+): string {
+  if (!date) return 'No activity';
+  const dayDelta = localDayNumber(now) - localDayNumber(date);
+  if (dayDelta === 0) return 'Today';
+  if (dayDelta === 1) return 'Yesterday';
+  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium' }).format(date);
+}
+
+export function groupConversationsByActivity<T extends Pick<Conversation, 'created_at' | 'last_message_at'>>(
+  conversations: T[],
+  now = new Date(),
+  locale?: Intl.LocalesArgument,
+): ConversationActivitySection<T>[] {
+  const sections: ConversationActivitySection<T>[] = [];
+  const sectionByKey = new Map<string, ConversationActivitySection<T>>();
+
+  for (const conversation of conversations) {
+    const date = conversationActivityDate(conversation);
+    const key = date ? `date:${localDateKey(date)}` : 'no-activity';
+    let section = sectionByKey.get(key);
+    if (!section) {
+      section = {
+        key,
+        label: conversationActivitySectionLabel(date, now, locale),
+        conversations: [],
+      };
+      sectionByKey.set(key, section);
+      sections.push(section);
+    }
+    section.conversations.push(conversation);
+  }
+
+  return sections;
+}
+
+function maxTimestampValue<T extends string | null | undefined>(left: T, right: T): T {
+  return timestampValue(right) > timestampValue(left) ? right : left;
+}
+
+export function mergeConversationPreservingActivity(
+  existing: Conversation | null | undefined,
+  incoming: Conversation,
+): Conversation {
+  if (!existing) return incoming;
+  return {
+    ...existing,
+    ...incoming,
+    last_message_at: maxTimestampValue(existing.last_message_at, incoming.last_message_at),
+    updated_at: maxTimestampValue(existing.updated_at, incoming.updated_at),
+  };
+}
+
+export function cloneSidebarProjection(projection: SidebarProjection): SidebarProjection {
+  return {
+    agents: projection.agents.map((agent) => ({ ...agent })),
+    agent_direct_chats: projection.agent_direct_chats.map((item) => ({
+      agent: { ...item.agent },
+      conversation: { ...item.conversation },
+    })),
+    conversations: {
+      items: projection.conversations.items.map((conversation) => ({ ...conversation })),
+      cursor: projection.conversations.cursor,
+      has_more: projection.conversations.has_more,
+    },
+    context_types: [...projection.context_types],
+  };
+}
+
+export function rememberSidebarProjectionSnapshot(
+  cache: Map<string, SidebarProjection>,
+  key: string,
+  projection: SidebarProjection,
+  limit: number,
+): void {
+  cache.delete(key);
+  cache.set(key, cloneSidebarProjection(projection));
+  while (cache.size > limit) {
+    const oldestKey = cache.keys().next().value;
+    if (!oldestKey) break;
+    cache.delete(oldestKey);
+  }
+}
+
+export function isAgentDirectConversationSummary(conversation: Conversation | null | undefined): boolean {
+  return conversation?.context?.type === 'web'
+    && conversation.context.platform_data?.kind === 'agent_direct';
+}
+
+export function conversationInitialLoadPolicy(
+  conversation: Conversation | null | undefined,
+): ConversationInitialLoadPolicy {
+  if (!isAgentDirectConversationSummary(conversation)) {
+    return { historyLimit: DEFAULT_INITIAL_TIMELINE_LIMIT };
+  }
+  return {
+    historyLimit: DIRECT_CHAT_INITIAL_TIMELINE_LIMIT,
+    sessionOptions: {
+      rootOnly: true,
+      order: 'desc',
+      limit: DIRECT_CHAT_INITIAL_SESSION_LIMIT,
+    },
+  };
+}
+
+export function conversationMatchesSidebarProjectionFilter(
+  conversation: Conversation,
+  filter: SidebarProjectionFilter,
+): boolean {
+  if (filter.selectedAgentId !== 'all' && conversation.agent_id !== filter.selectedAgentId) {
+    return false;
+  }
+
+  const contextType = conversation.context?.type?.toLowerCase() ?? 'unknown';
+  if (isAgentDirectConversationSummary(conversation)) {
+    const channelMatches = filter.selectedChannel === 'all' || filter.selectedChannel === 'web';
+    return channelMatches && conversation.status === 'active';
+  }
+
+  if (filter.selectedChannel !== 'all' && contextType !== filter.selectedChannel.toLowerCase()) {
+    return false;
+  }
+
+  if (filter.selectedConversationStatus === 'active') return conversation.status === 'active';
+  if (filter.selectedConversationStatus === 'archived') return conversation.status === 'archived';
+  return conversation.status === 'active' && Boolean(conversation.starred_at);
 }
 
 export interface FailedTurnRetryTailItem {
@@ -55,6 +242,8 @@ const ROOT_SESSION_TIMELINE_EVENT_TYPES = new Set<string>([
   'assistant_thinking_block',
   'assistant_thinking_chunk',
   'chunk',
+  'escalation',
+  'escalation_resolved',
   'message_complete',
   'session_compaction_finished',
   'session_compaction_started',
@@ -478,15 +667,6 @@ export function isRestorableChatConversation(conversation: {
   return conversation?.status === 'active'
     && (conversation.context?.type ?? '').toLowerCase() === 'web'
     && conversation.context?.platform_data?.kind !== 'agent_direct';
-}
-
-export function shouldRestoreLastOpenedConversation(conversation: {
-  agent_id?: string | null;
-  status?: string | null;
-  context?: { type?: string | null; platform_data?: Record<string, unknown> | null } | null;
-} | null | undefined, selectedAgentId: string | null | undefined): boolean {
-  return isRestorableChatConversation(conversation)
-    && (!selectedAgentId || conversation?.agent_id === selectedAgentId);
 }
 
 export function isPreSessionChatConversation(conversation: {

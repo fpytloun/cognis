@@ -5,19 +5,880 @@ import {
   applyActiveStreamSnapshots,
   applyActiveThinkingSnapshots,
   applyActiveToolOutputSnapshots,
+  applyRuntimeSnapshotOverlay,
+  applyRuntimeTimelineEvent,
   appendOptimisticUserMessage,
+  applyTimelinePatch,
   applyWebSocketEvent,
+  clearActiveRuntimeTimelineItems,
+  clearRuntimeOverlayForCanonicalEvent,
+  createRuntimeTimelineOverlay,
   findPendingStepRequestInputCall,
+  hydrateMessageCompleteFromRuntimeOverlay,
+  projectDisplayTimeline,
+  promoteRuntimeOverlayForCanonicalEvent,
   latestTodoSnapshot,
   normalizeHistory,
+  pruneStaleQueuedUserMessages,
   removeQueuedOptimisticUserMessage,
   optimisticallyResolveStepRequestInput,
+  timelineFromProjection,
+  timelinePatchContainsActiveWork,
+  timelineItemKey,
+  upsertQueuedUserMessage,
+  type TimelineItem,
   type MessageTimelineItem,
   type ThinkingTimelineItem,
   type ToolCallTimelineItem
 } from '$lib/chat';
 
 describe('chat timeline helpers', () => {
+  it('converts backend-projected timeline items into renderable chat items', () => {
+    const items = timelineFromProjection([
+      {
+        id: 'event:sess_a:1:user',
+        kind: 'message',
+        sessionId: 'sess_a',
+        role: 'user',
+        content: 'Hello',
+        seq: 1,
+        timestamp: '2026-01-01T00:00:01Z',
+        attachments: []
+      },
+      {
+        id: 'event:sess_a:2:assistant',
+        kind: 'message',
+        sessionId: 'sess_a',
+        role: 'assistant',
+        content: '**Hi**',
+        seq: 2,
+        timestamp: '2026-01-01T00:00:02Z',
+        turnId: 'turn_1',
+        messageId: 'turn_1',
+        assistantPhaseIndex: 0,
+        runtime: { model: 'gpt-test' }
+      },
+      {
+        id: 'tool:call_1',
+        kind: 'tool_call',
+        callId: 'call_1',
+        toolName: 'read',
+        status: 'completed',
+        result: 'ok',
+        timestamp: '2026-01-01T00:00:03Z',
+        evaluation: { score: 1 },
+        tool_output_presentation: { output_size: 42, anchors_available: true }
+      },
+      {
+        id: 'workflow-composed:sess_a:4',
+        kind: 'workflow_composed',
+        workflowId: 'wf_1',
+        workflowName: 'Review workflow',
+        lifecycle: 'ephemeral',
+        taskId: 'task_1',
+        scheduleId: null,
+        steps: ['plan', 'review'],
+        timestamp: '2026-01-01T00:00:04Z'
+      },
+      {
+        id: 'thinking:sess_a:5:block_1',
+        kind: 'thinking',
+        messageId: 'msg_1',
+        turnId: 'turn_1',
+        blocks: [
+          {
+            block_id: 'block_1',
+            title: 'Thinking',
+            content: '**Reasoning**',
+            source: 'summary',
+            complete: true
+          }
+        ],
+        streaming: false,
+        activeTitle: null,
+        timestamp: '2026-01-01T00:00:05Z'
+      },
+      {
+        id: 'delegation:sess_child',
+        kind: 'delegation',
+        taskId: 'sess_child',
+        taskLabel: 'Sub-session',
+        agentId: 'system:explore',
+        usedAgentId: null,
+        status: 'running',
+        result: null,
+        timestamp: '2026-01-01T00:00:06Z',
+        todos: [{ content: 'inspect', status: 'in_progress' }]
+      }
+    ]);
+
+    expect(items).toHaveLength(6);
+    expect(items[1]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: '**Hi**',
+      assistantPhaseIndex: 0,
+      runtime: { model: 'gpt-test' }
+    });
+    expect((items[1] as MessageTimelineItem).html).toContain('<strong>Hi</strong>');
+    expect(items[2]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      status: 'completed',
+      result: 'ok',
+      evaluation: { score: 1 },
+      outputSize: 42,
+      anchorsAvailable: true
+    });
+    expect(items[3]).toMatchObject({
+      kind: 'workflow_composed',
+      workflowId: 'wf_1',
+      workflowName: 'Review workflow',
+      steps: ['plan', 'review']
+    });
+    expect(items[4]).toMatchObject({
+      kind: 'thinking',
+      messageId: 'msg_1',
+      blocks: [
+        expect.objectContaining({
+          block_id: 'block_1',
+          content: '**Reasoning**'
+        })
+      ]
+    });
+    expect((items[4] as ThinkingTimelineItem).blocks[0].html).toContain('<strong>Reasoning</strong>');
+    expect(items[5]).toMatchObject({
+      kind: 'delegation',
+      taskId: 'sess_child',
+      agentId: 'system:explore',
+      status: 'running',
+      todos: [{ content: 'inspect', status: 'in_progress' }]
+    });
+  });
+
+  it('applies canonical timeline patches idempotently by tool call id', () => {
+    const started = applyTimelinePatch([], [
+      {
+        id: 'tool:call_1',
+        kind: 'tool_call',
+        callId: 'call_1',
+        toolName: 'bash',
+        status: 'started',
+        arguments: { command: 'true' }
+      }
+    ]);
+
+    const completed = applyTimelinePatch(started, [
+      {
+        id: 'tool:call_1',
+        kind: 'tool_call',
+        callId: 'call_1',
+        toolName: 'bash',
+        status: 'completed',
+        result: 'ok'
+      }
+    ]);
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      status: 'completed',
+      arguments: { command: 'true' },
+      result: 'ok'
+    });
+  });
+
+  it('clears stale active runtime items when an authoritative snapshot is empty', () => {
+    const items = timelineFromProjection([
+      {
+        id: 'message:sess_a:turn_1:assistant',
+        kind: 'message',
+        role: 'assistant',
+        content: 'partial',
+        partial: true,
+        streaming: true
+      },
+      {
+        id: 'message:sess_a:turn_1:assistant-progress',
+        kind: 'message',
+        role: 'assistant',
+        content: 'progress',
+        partial: false,
+        streaming: true
+      },
+      {
+        id: 'thinking:msg_1:block_1',
+        kind: 'thinking',
+        messageId: 'msg_1',
+        blocks: [{ id: 'block_1', content: 'thinking', isComplete: false }],
+        streaming: true
+      },
+      {
+        id: 'tool:call_1',
+        kind: 'tool_call',
+        callId: 'call_1',
+        toolName: 'bash',
+        status: 'running'
+      },
+      {
+        id: 'tool:call_2',
+        kind: 'tool_call',
+        callId: 'call_2',
+        toolName: 'bash',
+        status: 'completed',
+        result: 'ok'
+      }
+    ]);
+
+    expect(clearActiveRuntimeTimelineItems(items)).toHaveLength(2);
+    expect(clearActiveRuntimeTimelineItems(items)[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'progress',
+      streaming: false
+    });
+    expect(clearActiveRuntimeTimelineItems(items)[1]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_2',
+      status: 'completed'
+    });
+
+    const withoutToolOutputs = clearActiveRuntimeTimelineItems(items, {
+      streams: false,
+      toolOutputs: true,
+      thinking: false
+    });
+    expect(withoutToolOutputs).toHaveLength(4);
+    expect(withoutToolOutputs.some((item) => item.kind === 'message' && item.role === 'assistant' && item.partial)).toBe(true);
+    expect(withoutToolOutputs.some((item) => item.kind === 'thinking' && item.streaming)).toBe(true);
+    expect(withoutToolOutputs.some((item) => item.kind === 'tool_call' && item.callId === 'call_1')).toBe(false);
+
+    const retainedStreams = clearActiveRuntimeTimelineItems(items, {
+      streams: true,
+      toolOutputs: false,
+      thinking: false,
+      retainStreamedAssistantMessages: true
+    });
+    expect(retainedStreams.some((item) => item.kind === 'message' && item.role === 'assistant' && item.content === 'partial')).toBe(true);
+    expect(retainedStreams.find((item) => item.kind === 'message' && item.role === 'assistant' && item.content === 'partial')).toMatchObject({
+      streaming: false,
+      partial: true
+    });
+  });
+
+  it('retains active tool cards while refreshing runtime tool output snapshots', () => {
+    const items = normalizeHistory([
+      {
+        seq: 1,
+        type: 'tool_call',
+        timestamp: '2024-01-01T00:00:00Z',
+        data: {
+          call_id: 'call_1',
+          name: 'bash',
+          status: 'started'
+        }
+      }
+    ] as any);
+
+    const retained = clearActiveRuntimeTimelineItems(items, {
+      streams: false,
+      toolOutputs: true,
+      thinking: false,
+      retainActiveToolCalls: true
+    });
+
+    expect(retained).toHaveLength(1);
+    expect(retained[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      status: 'started'
+    });
+
+    const cleared = clearActiveRuntimeTimelineItems(items, {
+      streams: false,
+      toolOutputs: true,
+      thinking: false,
+      retainActiveToolCalls: false
+    });
+    expect(cleared).toHaveLength(0);
+  });
+
+  it('projects runtime thinking overlays without mutating canonical timeline', () => {
+    const canonical = normalizeHistory([
+      {
+        seq: 1,
+        type: 'user_message',
+        timestamp: '2024-01-01T00:00:00Z',
+        data: { content: 'check', message_id: 'user_1', turn_id: 'turn_1' }
+      }
+    ] as any);
+    const overlay = applyRuntimeSnapshotOverlay(createRuntimeTimelineOverlay(), {
+      active_streams: [],
+      active_tool_outputs: [],
+      active_thinking: [
+        {
+          session_id: 'sess_1',
+          message_id: 'think_1',
+          turn_id: 'turn_1',
+          blocks: [
+            {
+              block_id: 'block_1',
+              title: 'Thinking',
+              content: 'Inspecting',
+              source: 'summary',
+              complete: false
+            }
+          ]
+        }
+      ]
+    });
+
+    const displayed = projectDisplayTimeline(canonical, overlay);
+    expect(canonical).toHaveLength(1);
+    expect(displayed).toHaveLength(2);
+    expect(displayed[1]).toMatchObject({ kind: 'thinking', streaming: true });
+
+    const clearedOverlay = applyRuntimeSnapshotOverlay(overlay, {
+      active_streams: [],
+      active_tool_outputs: [],
+      active_thinking: [],
+      has_active_turn: true
+    });
+    expect(projectDisplayTimeline(canonical, clearedOverlay)).toHaveLength(1);
+    expect(canonical).toHaveLength(1);
+  });
+
+  it('clears runtime assistant overlay when canonical completion arrives', () => {
+    let overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'live',
+      index: 0,
+      content_offset: 0
+    } as any);
+    const canonical: TimelineItem[] = [];
+    expect(projectDisplayTimeline(canonical, overlay)).toHaveLength(1);
+
+    const completion = {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'live',
+      seq: 7,
+      partial: false
+    } as any;
+    overlay = clearRuntimeOverlayForCanonicalEvent(overlay, completion);
+    const completed = applyWebSocketEvent(canonical, completion);
+
+    expect(overlay.items).toHaveLength(0);
+    expect(projectDisplayTimeline(completed, overlay)).toHaveLength(1);
+    expect(projectDisplayTimeline(completed, overlay)[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      streaming: false,
+      seq: 7
+    });
+  });
+
+  it('hydrates contentless assistant completion from runtime overlay before clearing it', () => {
+    let overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'streamed answer',
+      index: 0,
+      content_offset: 0
+    } as any);
+    const completion = {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      seq: 8,
+      partial: false
+    } as any;
+
+    const hydrated = hydrateMessageCompleteFromRuntimeOverlay(completion, overlay);
+    overlay = clearRuntimeOverlayForCanonicalEvent(overlay, hydrated);
+    const canonical = applyWebSocketEvent([], hydrated);
+
+    expect(overlay.items).toHaveLength(0);
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'streamed answer',
+      streaming: false,
+      seq: 8
+    });
+  });
+
+  it('does not leak runtime tool output buffers into canonical tool calls', () => {
+    const overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'tool_result_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      delta: 'runtime output',
+      stream: 'stdout',
+      content_offset: 0,
+      chunk_index: 0
+    } as any);
+
+    const canonical = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      arguments: {}
+    } as any);
+
+    expect(canonical[0]).toMatchObject({ kind: 'tool_call', callId: 'call_1' });
+    expect((canonical[0] as ToolCallTimelineItem).result).toBeUndefined();
+    const displayed = projectDisplayTimeline(canonical, overlay);
+    expect(displayed[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      result: 'runtime output',
+      liveOutputAvailable: true
+    });
+  });
+
+  it('promotes streamed assistant overlay before same-turn tools on contentless completion', () => {
+    let overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'assistant before tool',
+      index: 0,
+      content_offset: 0
+    } as any);
+    let canonical = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      turn_id: 'turn_1'
+    } as any);
+    const completion = hydrateMessageCompleteFromRuntimeOverlay({
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      seq: 9,
+      partial: false
+    } as any, overlay);
+
+    const beforePromotion = canonical;
+    canonical = promoteRuntimeOverlayForCanonicalEvent(canonical, overlay, completion);
+    const promoted = canonical !== beforePromotion;
+    overlay = clearRuntimeOverlayForCanonicalEvent(overlay, completion);
+    if (!promoted) {
+      canonical = applyWebSocketEvent(canonical, completion);
+    }
+
+    expect(overlay.items).toHaveLength(0);
+    expect(canonical.map((item) => item.kind)).toEqual(['message', 'tool_call']);
+    expect(canonical[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'assistant before tool',
+      streaming: false,
+      seq: 9
+    });
+  });
+
+  it('projects streamed assistant overlay before same-turn canonical tool calls before completion', () => {
+    const overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'assistant before tool',
+      index: 0,
+      content_offset: 0
+    } as any);
+    const canonical = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      turn_id: 'turn_1'
+    } as any);
+
+    const displayed = projectDisplayTimeline(canonical, overlay);
+
+    expect(displayed.map((item) => item.kind)).toEqual(['message', 'tool_call']);
+    expect(displayed[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'assistant before tool',
+      streaming: true
+    });
+    expect(displayed[1]).toMatchObject({ kind: 'tool_call', callId: 'call_1' });
+  });
+
+  it('promotes runtime tool output before truncated canonical tool result', () => {
+    const overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'tool_result_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      delta: 'long runtime output',
+      stream: 'stdout',
+      content_offset: 0,
+      chunk_index: 0
+    } as any);
+    let canonical = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      turn_id: 'turn_1'
+    } as any);
+    const result = {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      result: 'short',
+      is_error: false,
+      duration_ms: 10,
+      turn_id: 'turn_1',
+      transport_truncated: true
+    } as any;
+
+    canonical = promoteRuntimeOverlayForCanonicalEvent(canonical, overlay, result);
+    const completed = applyWebSocketEvent(canonical, result);
+
+    expect(completed[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      result: 'long runtime output',
+      streamedOutput: 'long runtime output',
+      status: 'completed'
+    });
+  });
+
+  it('promotes runtime tool output before truncated terminal timeline patch', () => {
+    let canonical = applyWebSocketEvent([], {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_patch',
+      tool_name: 'bash',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      status: 'started'
+    } as any);
+    let overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'tool_result_chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_patch',
+      delta: 'complete streamed output',
+      chunk_index: 0,
+      content_offset: 0,
+      is_error: false
+    } as any);
+    const patchEvent = {
+      type: 'timeline_patch',
+      conversation_id: 'conv_1',
+      items: [
+        {
+          id: 'tool:call_patch',
+          kind: 'tool_call',
+          callId: 'call_patch',
+          toolName: 'bash',
+          status: 'completed',
+          result: 'short',
+          transportTruncated: true,
+          timestamp: '2026-01-01T00:00:01.000Z'
+        }
+      ]
+    } as any;
+
+    canonical = promoteRuntimeOverlayForCanonicalEvent(canonical, overlay, patchEvent);
+    overlay = clearRuntimeOverlayForCanonicalEvent(overlay, patchEvent);
+    canonical = applyTimelinePatch(canonical, patchEvent.items);
+
+    expect(overlay.items).toHaveLength(0);
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_patch',
+      status: 'completed',
+      result: 'complete streamed output',
+      streamedOutput: 'complete streamed output',
+      liveOutputAvailable: true
+    });
+  });
+
+  it('keeps later streamed assistant overlay after same-turn tool activity', () => {
+    let canonical: TimelineItem[] = [];
+    let overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_first',
+      turn_id: 'turn_1',
+      content: 'before tool',
+      index: 0,
+      content_offset: 0,
+      timestamp: '2026-01-01T00:00:00.000Z'
+    } as any);
+    const firstComplete = hydrateMessageCompleteFromRuntimeOverlay({
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_first',
+      turn_id: 'turn_1',
+      seq: 1,
+      partial: false,
+      timestamp: '2026-01-01T00:00:00.100Z'
+    } as any, overlay);
+    canonical = promoteRuntimeOverlayForCanonicalEvent(canonical, overlay, firstComplete);
+    overlay = clearRuntimeOverlayForCanonicalEvent(overlay, firstComplete);
+    canonical = applyWebSocketEvent(canonical, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      status: 'started',
+      turn_id: 'turn_1',
+      timestamp: '2026-01-01T00:00:01.000Z'
+    } as any);
+    canonical = applyWebSocketEvent(canonical, {
+      type: 'tool_result',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'bash',
+      result: 'ok',
+      is_error: false,
+      turn_id: 'turn_1',
+      timestamp: '2026-01-01T00:00:02.000Z'
+    } as any);
+    overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_second',
+      turn_id: 'turn_1',
+      content: 'after tool',
+      index: 0,
+      content_offset: 0,
+      timestamp: '2026-01-01T00:00:03.000Z'
+    } as any);
+
+    const displayed = projectDisplayTimeline(canonical, overlay);
+
+    expect(displayed.map((item) => item.kind)).toEqual(['message', 'tool_call', 'message']);
+    expect(displayed[0]).toMatchObject({ kind: 'message', content: 'before tool' });
+    expect(displayed[1]).toMatchObject({ kind: 'tool_call', callId: 'call_1' });
+    expect(displayed[2]).toMatchObject({ kind: 'message', content: 'after tool', streaming: true });
+  });
+
+  it('copies runtime metadata when promoting streamed message completion', () => {
+    const overlay = applyRuntimeTimelineEvent(createRuntimeTimelineOverlay(), {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_runtime',
+      turn_id: 'turn_1',
+      content: 'streamed',
+      index: 0,
+      content_offset: 0
+    } as any);
+    const completion = hydrateMessageCompleteFromRuntimeOverlay({
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_runtime',
+      turn_id: 'turn_1',
+      seq: 2,
+      partial: false,
+      chat_mode: 'build',
+      chat_mode_source: 'one_shot',
+      runtime: {
+        agent_id: 'laforge',
+        model: 'gpt-5.5',
+        provider_id: 'openai',
+        reasoning_effort: 'high'
+      }
+    } as any, overlay);
+
+    const canonical = promoteRuntimeOverlayForCanonicalEvent([], overlay, completion);
+
+    expect(canonical[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'streamed',
+      chatMode: 'build',
+      chatModeSource: 'one_shot',
+      runtime: {
+        agent_id: 'laforge',
+        model: 'gpt-5.5',
+        provider_id: 'openai',
+        reasoning_effort: 'high'
+      }
+    });
+  });
+
+  it('only treats timeline patches with active work as active turns', () => {
+    expect(timelinePatchContainsActiveWork([
+      {
+        id: 'tool:call_done',
+        kind: 'tool_call',
+        callId: 'call_done',
+        toolName: 'bash',
+        status: 'completed'
+      }
+    ])).toBe(false);
+
+    expect(timelinePatchContainsActiveWork([
+      {
+        id: 'tool:call_running',
+        kind: 'tool_call',
+        callId: 'call_running',
+        toolName: 'bash',
+        status: 'running'
+      }
+    ])).toBe(true);
+  });
+
+  it('applies timeline_patch websocket events through the canonical projection path', () => {
+    const timeline = applyWebSocketEvent([], {
+      type: 'timeline_patch',
+      conversation_id: 'conv_1',
+      source: 'live.tool_call',
+      items: [
+        {
+          id: 'tool:call_1',
+          kind: 'tool_call',
+          callId: 'call_1',
+          toolName: 'bash',
+          status: 'started'
+        }
+      ]
+    });
+
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0]).toMatchObject({
+      kind: 'tool_call',
+      callId: 'call_1',
+      status: 'started'
+    });
+  });
+
+  it('filters canonical timeline patch items before applying them', () => {
+    const timeline = applyTimelinePatch([], [
+      {
+        id: 'tool:child_call',
+        kind: 'tool_call',
+        sessionId: 'sess_child',
+        callId: 'child_call',
+        toolName: 'bash',
+        status: 'started'
+      },
+      {
+        id: 'tool:root_call',
+        kind: 'tool_call',
+        sessionId: 'sess_root',
+        callId: 'root_call',
+        toolName: 'read',
+        status: 'started'
+      }
+    ], {
+      includeItem: (item) => item.kind !== 'tool_call' || item.sessionId === 'sess_root'
+    });
+
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0]).toMatchObject({ kind: 'tool_call', callId: 'root_call', sessionId: 'sess_root' });
+  });
+
+  it('preserves rich delegation metadata when a generic live patch arrives later', () => {
+    const started = applyTimelinePatch([], [
+      {
+        id: 'delegation:sess_child',
+        kind: 'delegation',
+        taskId: 'sess_child',
+        taskLabel: 'Investigate alert',
+        agentId: 'system:explore',
+        usedAgentId: 'system:explore',
+        status: 'started'
+      }
+    ]);
+    const patched = applyTimelinePatch(started, [
+      {
+        id: 'delegation:sess_child',
+        kind: 'delegation',
+        taskId: 'sess_child',
+        taskLabel: 'Sub-session',
+        agentId: null,
+        usedAgentId: null,
+        status: 'running'
+      }
+    ]);
+
+    expect(patched[0]).toMatchObject({
+      kind: 'delegation',
+      taskLabel: 'Investigate alert',
+      agentId: 'system:explore',
+      usedAgentId: 'system:explore',
+      status: 'running'
+    });
+  });
+
+  it('backfills a visible tool call when escalation arrives before the tool event', () => {
+    const timeline = applyWebSocketEvent([], {
+      type: 'escalation',
+      conversation_id: 'conv_1',
+      session_id: 'sess_root',
+      call_id: 'intaris_eval_1',
+      tool_call_id: 'call_model_1',
+      tool_name: 'bash',
+      risk: 'high',
+      reasoning: 'Needs approval',
+      timeout_seconds: 300
+    });
+
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0]).toMatchObject({
+      kind: 'tool_call',
+      id: 'tool:call_model_1',
+      callId: 'call_model_1',
+      toolName: 'bash',
+      status: 'started',
+      sessionId: 'sess_root',
+      evaluation: { decision: 'escalate', risk: 'high', reasoning: 'Needs approval' }
+    });
+  });
+
   it('shows running compaction and replaces it when compaction completes', () => {
     const running = applyWebSocketEvent([], {
       type: 'session_compaction_started',
@@ -82,6 +943,166 @@ describe('chat timeline helpers', () => {
     });
 
     expect(finished).toHaveLength(0);
+  });
+
+  it('clears running compaction when terminal compaction notice arrives', () => {
+    const running = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old',
+      status: 'running'
+    });
+
+    const finished = applyWebSocketEvent(running, {
+      type: 'system_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old',
+      text: 'Automatic compaction completed. Continuing your turn in a fresh compacted session.',
+      seq: 12
+    } as any);
+
+    expect(finished.some((item) => item.kind === 'compaction' && item.status === 'running')).toBe(false);
+    expect(finished.some((item) => item.kind === 'system_message')).toBe(true);
+  });
+
+  it('does not clear multiple running compactions when terminal notice lacks session id', () => {
+    const first = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old_1',
+      status: 'running'
+    });
+    const running = applyWebSocketEvent(first, {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old_2',
+      status: 'running'
+    });
+
+    const finished = applyWebSocketEvent(running, {
+      type: 'system_message',
+      conversation_id: 'conv_1',
+      text: 'Automatic compaction completed. Continuing your turn in a fresh compacted session.',
+      seq: 12
+    });
+
+    expect(finished.filter((item) => item.kind === 'compaction' && item.status === 'running')).toHaveLength(2);
+  });
+
+  it('replaces running compaction when compacted event lacks previous session id', () => {
+    const running = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old',
+      status: 'running'
+    });
+
+    const compacted = applyWebSocketEvent(running, {
+      type: 'session_compacted',
+      conversation_id: 'conv_1',
+      session_id: 'sess_new',
+      previous_session_id: null,
+      summary_preview: 'Compacted summary',
+      method: 'llm',
+      turns_compacted: 3,
+      status: 'compacted'
+    } as any);
+
+    expect(compacted).toHaveLength(1);
+    expect(compacted[0]).toMatchObject({
+      kind: 'compaction',
+      status: 'compacted',
+      sessionId: 'sess_new',
+      summaryPreview: 'Compacted summary',
+      turnsCompacted: 3
+    });
+  });
+
+  it('does not replace unrelated running compactions when compacted event lacks previous session id', () => {
+    const first = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old_1',
+      status: 'running'
+    });
+    const running = applyWebSocketEvent(first, {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_old_2',
+      status: 'running'
+    });
+
+    const compacted = applyWebSocketEvent(running, {
+      type: 'session_compacted',
+      conversation_id: 'conv_1',
+      session_id: 'sess_new',
+      previous_session_id: null,
+      summary_preview: 'Compacted summary',
+      method: 'llm',
+      turns_compacted: 3,
+      status: 'compacted'
+    });
+
+    expect(compacted.filter((item) => item.kind === 'compaction' && item.status === 'running')).toHaveLength(2);
+    expect(compacted.some((item) => item.kind === 'compaction' && item.status === 'compacted')).toBe(true);
+  });
+
+  it('does not match running compaction by compacted event new session id', () => {
+    const first = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_new',
+      status: 'running'
+    });
+    const running = applyWebSocketEvent(first, {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_other_running',
+      status: 'running'
+    });
+
+    const compacted = applyWebSocketEvent(running, {
+      type: 'session_compacted',
+      conversation_id: 'conv_1',
+      session_id: 'sess_new',
+      previous_session_id: 'sess_wrong_old',
+      summary_preview: 'Compacted summary',
+      method: 'llm',
+      turns_compacted: 3,
+      status: 'compacted'
+    });
+
+    expect(compacted.filter((item) => item.kind === 'compaction' && item.status === 'running')).toHaveLength(2);
+    expect(compacted.some((item) => item.kind === 'compaction' && item.status === 'compacted')).toBe(true);
+  });
+
+  it('replaces the only running compaction when compacted previous session id is mismatched', () => {
+    const running = applyWebSocketEvent([], {
+      type: 'session_compaction_started',
+      conversation_id: 'conv_1',
+      session_id: 'sess_actual_old',
+      status: 'running'
+    });
+
+    const compacted = applyWebSocketEvent(running, {
+      type: 'session_compacted',
+      conversation_id: 'conv_1',
+      session_id: 'sess_new',
+      previous_session_id: 'sess_wrong_old',
+      summary_preview: 'Compacted summary',
+      method: 'llm',
+      turns_compacted: 3,
+      status: 'compacted'
+    });
+
+    expect(compacted).toHaveLength(1);
+    expect(compacted[0]).toMatchObject({
+      kind: 'compaction',
+      status: 'compacted',
+      sessionId: 'sess_new',
+      previousSessionId: 'sess_wrong_old',
+      summaryPreview: 'Compacted summary'
+    });
   });
 
   it('reconstructs a durable compacted card from persisted compaction summary history', () => {
@@ -225,6 +1246,118 @@ describe('chat timeline helpers', () => {
         }
       ]
     });
+  });
+
+  it('keeps assistant messages in separate tool-delimited phases distinct', () => {
+    const timeline = normalizeHistory([
+      {
+        seq: 1,
+        session_id: 'sess_1',
+        type: 'assistant_message',
+        data: {
+          content: 'Let me inspect the code first.',
+          turn_id: 'turn_1'
+        },
+        timestamp: '2026-03-28T00:00:00Z'
+      },
+      {
+        seq: 2,
+        session_id: 'sess_1',
+        type: 'tool_call',
+        data: {
+          call_id: 'call_1',
+          tool_name: 'grep',
+          status: 'completed',
+          turn_id: 'turn_1'
+        },
+        timestamp: '2026-03-28T00:00:01Z'
+      },
+      {
+        seq: 3,
+        session_id: 'sess_1',
+        type: 'assistant_message',
+        data: {
+          content: 'Now I found the relevant file.',
+          turn_id: 'turn_1'
+        },
+        timestamp: '2026-03-28T00:00:02Z'
+      }
+    ]);
+
+    const assistantMessages = timeline.filter(
+      (item): item is MessageTimelineItem => item.kind === 'message' && item.role === 'assistant'
+    );
+
+    expect(assistantMessages).toHaveLength(2);
+    expect(assistantMessages[0]).toMatchObject({
+      content: 'Let me inspect the code first.',
+      assistantPhaseIndex: 0
+    });
+    expect(assistantMessages[1]).toMatchObject({
+      content: 'Now I found the relevant file.',
+      assistantPhaseIndex: 1
+    });
+    expect(new Set(assistantMessages.map(timelineItemKey)).size).toBe(2);
+  });
+
+  it('finalizes the current assistant phase after a tool call without modifying the previous phase', () => {
+    let timeline = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'First assistant phase.',
+      index: 0,
+      content_offset: 0
+    });
+
+    timeline = applyWebSocketEvent(timeline, {
+      type: 'tool_call',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      call_id: 'call_1',
+      tool_name: 'grep',
+      status: 'started',
+      turn_id: 'turn_1',
+      arguments: {}
+    });
+
+    timeline = applyWebSocketEvent(timeline, {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      content: 'Second assistant phase.',
+      index: 0,
+      content_offset: 0
+    });
+
+    timeline = applyWebSocketEvent(timeline, {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_1',
+      turn_id: 'turn_1',
+      seq: 3,
+      content: 'Second assistant phase.',
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0,
+      attachments: []
+    });
+
+    const assistantMessages = timeline.filter(
+      (item): item is MessageTimelineItem => item.kind === 'message' && item.role === 'assistant'
+    );
+
+    expect(assistantMessages.map((item) => item.content)).toEqual([
+      'First assistant phase.',
+      'Second assistant phase.'
+    ]);
+    expect(assistantMessages.map((item) => item.assistantPhaseIndex)).toEqual([0, 1]);
+    expect(new Set(assistantMessages.map(timelineItemKey)).size).toBe(2);
   });
 
   it('keeps history messages with duplicate seq values from different sessions distinct', () => {
@@ -480,6 +1613,7 @@ describe('chat timeline helpers', () => {
       role: 'user',
       content: 'queued hello edited',
       optimistic: false,
+      deliveryStatus: undefined,
       clientMessageId: 'cmsg_test',
       queueId: 'qmsg_test'
     });
@@ -495,6 +1629,130 @@ describe('chat timeline helpers', () => {
     });
 
     expect(duplicate).toHaveLength(1);
+  });
+
+  it('keeps optimistic user messages visible when they become queued', () => {
+    const initial = appendOptimisticUserMessage([], 'queued hello', [], 'cmsg_test');
+    const queued = upsertQueuedUserMessage(initial, {
+      queue_id: 'qmsg_test',
+      client_message_id: 'cmsg_test',
+      content: 'queued hello',
+      attachments: [],
+      created_at: '2026-03-28T00:00:01Z',
+      updated_at: null,
+      position: 1,
+    });
+
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      content: 'queued hello',
+      optimistic: true,
+      deliveryStatus: 'queued',
+      clientMessageId: 'cmsg_test',
+      queueId: 'qmsg_test',
+    });
+
+    const accepted = applyWebSocketEvent(queued, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'queued hello',
+      client_message_id: 'cmsg_test',
+      queue_id: 'qmsg_test',
+      attachments: [],
+    });
+
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      optimistic: false,
+      deliveryStatus: undefined,
+      clientMessageId: 'cmsg_test',
+      queueId: 'qmsg_test',
+    });
+  });
+
+  it('creates a visible queued user message from queue snapshots after reload', () => {
+    const queued = upsertQueuedUserMessage([], {
+      queue_id: 'qmsg_reload',
+      client_message_id: null,
+      content: 'still queued after reload',
+      attachments: [],
+      created_at: '2026-03-28T00:00:01Z',
+      updated_at: null,
+      position: 1,
+    });
+
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      id: 'queued-user:qmsg_reload',
+      content: 'still queued after reload',
+      optimistic: true,
+      deliveryStatus: 'queued',
+      queueId: 'qmsg_reload',
+    });
+  });
+
+  it('does not regress accepted user messages when a stale queue snapshot arrives late', () => {
+    const queued = upsertQueuedUserMessage(
+      appendOptimisticUserMessage([], 'queued hello', [], 'cmsg_test'),
+      {
+        queue_id: 'qmsg_test',
+        client_message_id: 'cmsg_test',
+        content: 'queued hello',
+        attachments: [],
+        created_at: '2026-03-28T00:00:01Z',
+        updated_at: null,
+        position: 1,
+      }
+    );
+    const accepted = applyWebSocketEvent(queued, {
+      type: 'user_message',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      content: 'queued hello',
+      client_message_id: 'cmsg_test',
+      queue_id: 'qmsg_test',
+      attachments: [],
+    });
+    const afterStaleQueueSnapshot = upsertQueuedUserMessage(accepted, {
+      queue_id: 'qmsg_test',
+      client_message_id: 'cmsg_test',
+      content: 'queued hello',
+      attachments: [],
+      created_at: '2026-03-28T00:00:01Z',
+      updated_at: null,
+      position: 1,
+    });
+
+    expect(afterStaleQueueSnapshot).toHaveLength(1);
+    expect(afterStaleQueueSnapshot[0]).toMatchObject({
+      kind: 'message',
+      role: 'user',
+      optimistic: false,
+      deliveryStatus: undefined,
+      clientMessageId: 'cmsg_test',
+      queueId: 'qmsg_test',
+    });
+  });
+
+  it('prunes visible queued user messages that are absent from the latest queue snapshot', () => {
+    const queued = upsertQueuedUserMessage([], {
+      queue_id: 'qmsg_stale',
+      client_message_id: null,
+      content: 'stale queued text',
+      attachments: [],
+      created_at: '2026-03-28T00:00:01Z',
+      updated_at: null,
+      position: 1,
+    });
+
+    expect(pruneStaleQueuedUserMessages(queued, new Set())).toHaveLength(0);
   });
 
   it('rekeys optimistic user messages to stable server ids without merging with prior assistant content', () => {
@@ -563,10 +1821,21 @@ describe('chat timeline helpers', () => {
   });
 
   it('removes a deleted queued optimistic user message by stable id', () => {
-    const timeline = appendOptimisticUserMessage([], 'queued text', [], 'client-queued-1');
+    const timeline = upsertQueuedUserMessage(
+      appendOptimisticUserMessage([], 'queued text', [], 'client-queued-1'),
+      {
+        queue_id: 'queue-queued-1',
+        client_message_id: 'client-queued-1',
+        content: 'queued text',
+        attachments: [],
+        created_at: '2026-03-28T00:00:01Z',
+        updated_at: null,
+        position: 1,
+      }
+    );
     const removed = removeQueuedOptimisticUserMessage(
       timeline,
-      null,
+      'queue-queued-1',
       'client-queued-1',
       'queued text',
       []
@@ -700,6 +1969,251 @@ describe('chat timeline helpers', () => {
       streaming: false,
       partial: true,
       finishReason: 'user_cancelled'
+    });
+  });
+
+  it('clears retained live-only partial state on canonical non-partial completion', () => {
+    const retained = clearActiveRuntimeTimelineItems(timelineFromProjection([
+      {
+        id: 'message:msg_complete:live',
+        kind: 'message',
+        role: 'assistant',
+        messageId: 'msg_complete',
+        turnId: 'turn_1',
+        content: 'completed reply',
+        partial: true,
+        streaming: true
+      }
+    ]), {
+      streams: true,
+      toolOutputs: false,
+      thinking: false,
+      retainStreamedAssistantMessages: true
+    });
+
+    const completed = applyWebSocketEvent(retained, {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_complete',
+      turn_id: 'turn_1',
+      content: 'completed reply',
+      seq: 7,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0
+    });
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'completed reply',
+      streaming: false,
+      partial: false
+    });
+  });
+
+  it('does not let stale active stream snapshots reopen canonical completed assistant messages', () => {
+    const completed = applyWebSocketEvent([], {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_complete',
+      turn_id: 'turn_1',
+      content: 'completed reply',
+      seq: 8,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0
+    });
+
+    const withStaleSnapshot = applyActiveStreamSnapshots(completed, [
+      {
+        conversation_id: 'conv_1',
+        message_id: 'msg_complete',
+        turn_id: 'turn_1',
+        session_id: 'sess_1',
+        content: 'completed',
+        chunk_count: 1,
+        content_offset: 9,
+        updated_at: '2026-06-16T12:00:00Z'
+      }
+    ]);
+
+    expect(withStaleSnapshot).toHaveLength(1);
+    expect(withStaleSnapshot[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'completed reply',
+      streaming: false,
+      partial: false
+    });
+  });
+
+  it('does not let stale active stream snapshots reopen canonical cancelled partial messages', () => {
+    const completed = applyWebSocketEvent([], {
+      type: 'message_complete',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_cancelled',
+      turn_id: 'turn_1',
+      content: 'cancelled reply',
+      seq: 9,
+      token_usage: null,
+      context_usage: null,
+      queued_count: 0,
+      partial: true,
+      finish_reason: 'user_cancelled'
+    });
+
+    const withStaleSnapshot = applyActiveStreamSnapshots(completed, [
+      {
+        conversation_id: 'conv_1',
+        message_id: 'msg_cancelled',
+        turn_id: 'turn_1',
+        session_id: 'sess_1',
+        content: 'cancelled',
+        chunk_count: 1,
+        content_offset: 9,
+        updated_at: '2026-06-16T12:00:00Z'
+      }
+    ]);
+
+    expect(withStaleSnapshot).toHaveLength(1);
+    expect(withStaleSnapshot[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'cancelled reply',
+      streaming: false,
+      partial: true,
+      finishReason: 'user_cancelled'
+    });
+  });
+
+  it('keeps retained streamed assistant content and marks it active with stale active stream snapshots', () => {
+    const retained = clearActiveRuntimeTimelineItems(timelineFromProjection([
+      {
+        id: 'message:msg_retained:live',
+        kind: 'message',
+        role: 'assistant',
+        messageId: 'msg_retained',
+        turnId: 'turn_1',
+        content: 'longer retained reply',
+        partial: true,
+        streaming: true,
+        streamChunkCount: 4
+      }
+    ]), {
+      streams: true,
+      toolOutputs: false,
+      thinking: false,
+      retainStreamedAssistantMessages: true
+    });
+
+    const withStaleSnapshot = applyActiveStreamSnapshots(retained, [
+      {
+        conversation_id: 'conv_1',
+        message_id: 'msg_retained',
+        turn_id: 'turn_1',
+        session_id: 'sess_1',
+        content: 'short',
+        chunk_count: 2,
+        content_offset: 5,
+        updated_at: '2026-06-16T12:00:00Z'
+      }
+    ]);
+
+    expect(withStaleSnapshot).toHaveLength(1);
+    expect(withStaleSnapshot[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'longer retained reply',
+      streaming: true,
+      partial: true,
+      streamChunkCount: 4
+    });
+  });
+
+  it('refreshes retained non-partial live assistant streams from newer active stream snapshots', () => {
+    const streamed = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      turn_id: 'turn_1',
+      content: 'hello',
+      index: 0,
+      content_offset: 0
+    });
+    const retained = clearActiveRuntimeTimelineItems(streamed, {
+      streams: true,
+      toolOutputs: false,
+      thinking: false,
+      retainStreamedAssistantMessages: true
+    });
+
+    const refreshed = applyActiveStreamSnapshots(retained, [
+      {
+        conversation_id: 'conv_1',
+        message_id: 'msg_live',
+        turn_id: 'turn_1',
+        session_id: 'sess_1',
+        content: 'hello world',
+        chunk_count: 2,
+        content_offset: 11,
+        updated_at: '2026-06-16T12:00:00Z'
+      }
+    ]);
+
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'hello world',
+      streaming: true,
+      streamChunkCount: 2
+    });
+  });
+
+  it('does not shorten retained non-partial live assistant streams with stale active snapshots', () => {
+    const streamed = applyWebSocketEvent([], {
+      type: 'chunk',
+      conversation_id: 'conv_1',
+      session_id: 'sess_1',
+      message_id: 'msg_live',
+      turn_id: 'turn_1',
+      content: 'hello world',
+      index: 1,
+      content_offset: 0
+    });
+    const retained = clearActiveRuntimeTimelineItems(streamed, {
+      streams: true,
+      toolOutputs: false,
+      thinking: false,
+      retainStreamedAssistantMessages: true
+    });
+
+    const refreshed = applyActiveStreamSnapshots(retained, [
+      {
+        conversation_id: 'conv_1',
+        message_id: 'msg_live',
+        turn_id: 'turn_1',
+        session_id: 'sess_1',
+        content: 'hello',
+        chunk_count: 1,
+        content_offset: 5,
+        updated_at: '2026-06-16T12:00:00Z'
+      }
+    ]);
+
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0]).toMatchObject({
+      kind: 'message',
+      role: 'assistant',
+      content: 'hello world',
+      streaming: true,
+      streamChunkCount: 2
     });
   });
 
@@ -2537,6 +4051,35 @@ describe('chat timeline helpers', () => {
     });
   });
 
+  it('renders tool-call context pressure lifecycle events as warning notices', () => {
+    const timeline = normalizeHistory([
+      {
+        seq: 1,
+        type: 'lifecycle',
+        data: {
+          event: 'tool_call_context_pressure',
+          tool_call_count: 12,
+          step_name: 'build',
+          prompt_tokens: 112018,
+          available_prompt_tokens: 117760,
+          loop_pressure_threshold_prompt_tokens: 111872
+        },
+        timestamp: '2026-03-28T00:00:00Z'
+      }
+    ]);
+
+    expect(timeline).toHaveLength(1);
+    expect(timeline[0]).toMatchObject({
+      kind: 'notice',
+      title: 'Tool-call context pressure',
+      tone: 'warning',
+      description: expect.stringContaining('Usage is 112,018/117,760 prompt-budget tokens.')
+    });
+    expect(timeline[0]).toMatchObject({
+      description: expect.stringContaining('Tool calls this turn: 12.')
+    });
+  });
+
   it('renders plain user text without backticks or code markup', () => {
     const timeline = normalizeHistory([
       {
@@ -2702,6 +4245,34 @@ describe('chat timeline helpers', () => {
       const final = authoritative.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
       expect(final.status).toBe('completed');
       expect(final.durationMs).toBe(1200);
+    });
+
+    it('optimistically resolves a step_request_questions tool call with structured answers', () => {
+      const timeline = applyWebSocketEvent([], {
+        type: 'tool_call',
+        conversation_id: 'conv_1',
+        session_id: 'sess_1',
+        call_id: 'call_1',
+        tool_name: 'step_request_questions',
+        status: 'started',
+        arguments: {
+          questions: [
+            { id: 'architecture', question: 'Architecture?' },
+            { id: 'validation', question: 'Validation?' }
+          ]
+        }
+      });
+      const tool = timeline.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      const reply = {
+        mode: 'structured' as const,
+        answers: [
+          { question_id: 'architecture', selected_option_ids: ['small_refactor'], custom_answer: null },
+          { question_id: 'validation', selected_option_ids: [], custom_answer: 'Run UI checks' }
+        ]
+      };
+      const resolved = optimisticallyResolveStepRequestInput(timeline, tool.id, reply);
+      const updated = resolved.find((item) => item.kind === 'tool_call') as ToolCallTimelineItem;
+      expect(updated.result).toBe(JSON.stringify(reply));
     });
   });
 });

@@ -2,7 +2,7 @@
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
-  import type { ToolCallTimelineItem } from '$lib/chat';
+  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/chat';
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
@@ -18,7 +18,7 @@
   import { displayToolName } from '$lib/tools-display';
   import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
 
-  let { item } = $props<{ item: ToolCallTimelineItem }>();
+  let { item, live = false } = $props<{ item: ToolCallTimelineItem; live?: boolean }>();
 
   type StructuredEntry = { key: string; value: unknown };
 
@@ -43,7 +43,8 @@
   const BASH_AUTO_EXPAND_DELAY_MS = 450;
   const BASH_AUTO_COLLAPSE_DELAY_MS = 4000;
   const startsExpanded = $derived(
-    ['steprequestquestions', 'requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, ''))
+    (isQuestionRequestTool() && item.status !== 'started')
+      || ['requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, ''))
       || ['writedeliverable', 'stepcomplete'].includes(item.toolName.toLowerCase().replace(/_/g, '')) && workflowToolPresentation(item) !== null
   );
 
@@ -180,8 +181,13 @@
     return Array.from(files);
   }
 
+  function isQuestionRequestTool(): boolean {
+    const name = normalizedToolName();
+    return name === 'steprequestquestions' || name === 'requestuserinput';
+  }
+
   function isStepRequestInput(): boolean {
-    return normalizedToolName() === 'steprequestquestions';
+    return isQuestionRequestTool();
   }
 
   function isRichWorkflowTool(): boolean {
@@ -527,13 +533,13 @@
   >
     <span class="text-xs text-slate-500">{expanded ? '\u25BC' : '\u25B6'}</span>
     <span class="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
-      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]" title={item.toolName}>{displayToolName(item.toolName)}</span>
+      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]" title={item.toolName}>{displayToolName(item.displayToolName ?? item.toolName)}</span>
       {#if subtitle()}
         <span class="min-w-0 text-xs text-slate-400 sm:flex-1 sm:truncate">{subtitle()}</span>
       {/if}
     </span>
     <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
-      {#if item.status === 'started'}
+      {#if isActiveToolStatus(item.status) && live}
         <span class="inline-block h-3 w-3 animate-spin rounded-full border border-sky-400 border-t-transparent"></span>
         <span>{isPreparingPatch() ? 'preparing' : 'running'}</span>
       {:else}
@@ -557,66 +563,100 @@
       {/if}
       {#if isStepRequestInput()}
         <div>
-          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Questions</p>
-          <div class="space-y-3 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
-            {#if stepRequestContext()}
-              <p class="text-xs leading-5 text-sky-100/80">{stepRequestContext()}</p>
-            {/if}
-            {#if normalizeStepQuestions(item).length > 0}
-              {#each normalizeStepQuestions(item) as question, index}
-                <section class="rounded-xl border border-sky-400/15 bg-slate-950/35 px-3 py-2.5">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="rounded-full border border-sky-400/25 px-2 py-0.5 text-[10px] font-medium uppercase tracking-widest text-sky-100/80">#{index + 1}</span>
-                    {#if question.header}
-                      <span class="text-xs font-semibold uppercase tracking-widest text-sky-200">{question.header}</span>
-                    {/if}
-                    {#if question.multiple}
-                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">multi-select</span>
-                    {/if}
-                    {#if question.required}
-                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">required</span>
-                    {/if}
-                    {#if question.allow_custom}
-                      <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">custom</span>
-                    {/if}
-                  </div>
-                  <p class="mt-2 leading-6">{question.question}</p>
-                  {#if question.options.length > 0}
-                    <div class="mt-3 flex flex-wrap gap-2">
-                      {#each question.options as option}
-                        <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100" title={option.description ?? ''}>{option.label}</span>
-                      {/each}
-                    </div>
-                  {/if}
-                </section>
-              {/each}
-            {:else}
-              <p class="leading-6">The agent requested more input.</p>
-            {/if}
-          </div>
-        </div>
-
-        <div>
-          <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Resolution</p>
           {#if item.status === 'started'}
-            <div class="rounded-2xl border border-slate-800/60 bg-slate-950/60 px-4 py-3">
-              <LiveDots label="Waiting for user input" size="sm" inline={true} />
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Questions</p>
+            <div class="space-y-3 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
+              {#if stepRequestContext()}
+                <p class="text-xs leading-5 text-sky-100/80">{stepRequestContext()}</p>
+              {/if}
+              {#if normalizeStepQuestions(item).length > 0}
+                {#each normalizeStepQuestions(item) as question, index}
+                  <section class="rounded-xl border border-sky-400/15 bg-slate-950/35 px-3 py-2.5">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="rounded-full border border-sky-400/25 px-2 py-0.5 text-[10px] font-medium uppercase tracking-widest text-sky-100/80">#{index + 1}</span>
+                      {#if question.header}
+                        <span class="text-xs font-semibold uppercase tracking-widest text-sky-200">{question.header}</span>
+                      {/if}
+                      {#if question.multiple}
+                        <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">multi-select</span>
+                      {/if}
+                      {#if question.required}
+                        <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">required</span>
+                      {/if}
+                      {#if question.allow_custom}
+                        <span class="rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-300">custom</span>
+                      {/if}
+                    </div>
+                    <p class="mt-2 leading-6">{question.question}</p>
+                    {#if question.options.length > 0}
+                      <div class="mt-3 flex flex-wrap gap-2">
+                        {#each question.options as option}
+                          <span class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-[11px] text-sky-100" title={option.description ?? ''}>{option.label}</span>
+                        {/each}
+                      </div>
+                    {/if}
+                  </section>
+                {/each}
+              {:else}
+                <p class="leading-6">The agent requested more input.</p>
+              {/if}
+              <div class="rounded-2xl border border-slate-800/60 bg-slate-950/60 px-4 py-3">
+                <LiveDots label="Waiting for user input" size="sm" inline={true} />
+              </div>
             </div>
           {:else if stepRequestError()}
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Resolution</p>
             <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
               {stepRequestError()}
             </div>
           {:else if stepRequestResponse()}
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Submitted answers</p>
             <div class="rounded-2xl border border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-50">
-              <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">User answer</p>
-              <p class="mt-2 whitespace-pre-wrap leading-6">{stepRequestResponse()}</p>
+              <p class="whitespace-pre-wrap leading-6">{stepRequestResponse()}</p>
             </div>
           {:else}
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Resolution</p>
             <div class="rounded-2xl border border-slate-800/60 bg-slate-950/60 px-4 py-3 text-sm text-slate-400">
               No resolution was recorded for this input request.
             </div>
           {/if}
         </div>
+
+        {#if hasRawPayload()}
+          {@const rawOutputText = cleanResult(item.result)}
+          {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+          <div>
+            <button
+              class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+              onclick={() => { rawExpanded = !rawExpanded; }}
+              type="button"
+            >
+              <span>{rawExpanded ? '▼' : '▶'}</span>
+              <span>Raw payload</span>
+            </button>
+            {#if rawExpanded}
+              <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                {#if item.arguments && Object.keys(item.arguments).length > 0}
+                  <div>
+                    <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                  </div>
+                {/if}
+                {#if item.result != null}
+                  <div>
+                    <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                    <div class="relative">
+                      <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                      <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                        {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
 
       {:else}
         {#if workflowToolPresentation(item)}

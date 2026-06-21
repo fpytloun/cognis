@@ -4,7 +4,6 @@
   import { onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { fade } from 'svelte/transition';
-  import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 import ArrowUp from 'lucide-svelte/icons/arrow-up';
 import Paperclip from 'lucide-svelte/icons/paperclip';
@@ -28,21 +27,18 @@ import X from 'lucide-svelte/icons/x';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
-  import ChatMessage from '$lib/components/ChatMessage.svelte';
   import ChatSearchBar from '$lib/components/ChatSearchBar.svelte';
-  import CompactionCard from '$lib/components/CompactionCard.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
-  import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import ConversationMode from '$lib/components/ConversationMode.svelte';
   import MicRecorderButton from '$lib/components/MicRecorderButton.svelte';
-  import DelegationCard from '$lib/components/DelegationCard.svelte';
-  import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
-  import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
+  import TimelineList from '$lib/components/timeline/TimelineList.svelte';
+  import TimelineTodoDrawer from '$lib/components/timeline/TimelineTodoDrawer.svelte';
+  import TimelineViewport from '$lib/components/timeline/TimelineViewport.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -54,10 +50,13 @@ import X from 'lucide-svelte/icons/x';
     buildConversationUrl,
     CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
     CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
+    cloneSidebarProjection,
+    conversationMatchesSidebarProjectionFilter,
     conversationAttentionDotClass,
     conversationAttentionLabel,
     conversationAttentionOrbitClass,
     conversationAttentionTone,
+    conversationActivityValue,
     conversationShowsAttentionDot,
     conversationStatusFilterForConversation,
     conversationTurnModeTone,
@@ -65,19 +64,24 @@ import X from 'lucide-svelte/icons/x';
     distanceFromScrollBottom,
     getConversationRetryScope,
     hasRetryableFailedTurnTail,
+    groupConversationsByActivity,
     managedConversationTurnState,
+    mergeConversationPreservingActivity,
     getNextHistoryAfterSeq,
     isNearScrollBottom,
     isMissingSessionError,
     isCurrentConversationLoad,
     isForeignSessionTimelineEvent,
     isLastOpenedConversationStorageKey,
+    isAgentDirectConversationSummary,
+    conversationInitialLoadPolicy,
     lastOpenedConversationStorageKey,
     nextChatScrollState,
     normalizeChatModeTone,
     optimisticConversationTurnPatch,
     pendingDirectQuestionFromAuthChallengeEvent,
     parseConversationStatusFilter,
+    rememberSidebarProjectionSnapshot,
     isPreSessionChatConversation,
     pendingNotificationTypesFromNotifications,
     setConversationStatusSearchParam,
@@ -90,10 +94,9 @@ import X from 'lucide-svelte/icons/x';
     type ConversationStatusFilter,
     type PendingDirectQuestion,
     CHAT_STORAGE_KEYS,
-    SESSION_LOG_BOOTSTRAP_MAX_PAGES,
-    SESSION_LOG_PAGE_SIZE,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
+  import { loadSessionLog, refreshSessionLog, type SessionLogState } from '$lib/session-log';
   import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
   import { confirmAction } from '$lib/stores/confirm';
@@ -127,22 +130,33 @@ import X from 'lucide-svelte/icons/x';
   } from '$lib/chat-search';
   import {
     annotateStepRequestInputWithNotification,
-    applyActiveStreamSnapshots,
-    applyActiveToolOutputSnapshots,
-    applyActiveThinkingSnapshots,
+    applyRuntimeSnapshotOverlay,
+    applyRuntimeTimelineEvent,
+    applyTimelinePatch,
     applyWebSocketEvent,
     appendOptimisticUserMessage,
+    clearRuntimeOverlayForCanonicalEvent,
+    createRuntimeTimelineOverlay,
     findPendingStepRequestInputCall,
+    hydrateMessageCompleteFromRuntimeOverlay,
+    isActiveToolStatus,
+    isRuntimeTimelineEvent,
     latestTodoSnapshot,
     parseTodoSnapshot,
-    removeQueuedOptimisticUserMessage,
+    projectDisplayTimeline,
+    promoteRuntimeOverlayForCanonicalEvent,
     optimisticallyResolveStepRequestInput,
     normalizeHistory,
+    removeQueuedOptimisticUserMessage,
+    type MessageTimelineItem,
+    timelineFromProjection,
+    timelinePatchContainsActiveWork,
+    timelineItemKey,
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
-  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetQuestion, Session } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
   let initializing = $state(true);
@@ -165,6 +179,7 @@ import X from 'lucide-svelte/icons/x';
   let conversationSearchLoading = $state(false);
   let conversationSearchSubmitted = $state('');
   let conversationSearchError = $state('');
+  let historySectionNow = $state(new Date());
   let expandedSearchSessionIds = $state<string[]>([]);
   let searchEnabled = $state(true);
   let isWindowMode = $derived(page.url.searchParams.get('window') === '1');
@@ -235,7 +250,7 @@ import X from 'lucide-svelte/icons/x';
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
   let mobileListOverlayCleanup: (() => void) | null = null;
-  let mobileFilterOpen = $state(false);
+  let conversationFiltersOpen = $state(false);
   // Unified flag for the expanded header info panel. Replaces the older
   // pair of `sessionInfoOpen` (desktop popover) + `mobileHeaderDetailsOpen`
   // (mobile-only panel) with one state so the Info button has a single,
@@ -253,6 +268,7 @@ import X from 'lucide-svelte/icons/x';
   let queueEditContent = $state('');
   let queueExpandedIds = $state<string[]>([]);
   let timeline = $state<TimelineItem[]>([]);
+  let runtimeOverlay = $state(createRuntimeTimelineOverlay());
 
   let visibleStartIndex = $state(0);
   let activeConversationId = '';
@@ -261,6 +277,8 @@ import X from 'lucide-svelte/icons/x';
   let olderMessagesCursor = $state<string | null>(null);
   let hasOlderMessages = $state(false);
   const CONVERSATION_VIEW_CACHE_LIMIT = 8;
+  const SIDEBAR_PROJECTION_CACHE_LIMIT = 8;
+  const sidebarProjectionCache = new Map<string, SidebarProjection>();
   const escalationTimeoutSeconds = 300;
   let escalations = $state<Escalation[]>([]);
   let escalationBusyCallId = $state<string | null>(null);
@@ -292,12 +310,14 @@ import X from 'lucide-svelte/icons/x';
   let subSessionPanelOpen = $state(false);
   let subSessionClosing = $state(false);
   let subSessionId = $state('');
-  let subSessionEvents = $state<MessageEvent[]>([]);
   let subSessionTimeline = $state<TimelineItem[]>([]);
+  let subSessionLog = $state<SessionLogState | null>(null);
   let subSessionLoading = $state(false);
   let subSessionError = $state('');
-  let subSessionLastSeq = $state(0);
   let subSessionPollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
+  let subSessionTimelineEl = $state<HTMLDivElement | null>(null);
+  let subSessionTimelineContentEl = $state<HTMLDivElement | null>(null);
+  let subSessionUserScrolledUp = $state(false);
   let timelineEl = $state<HTMLDivElement | null>(null);
   let timelineContentEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
@@ -414,6 +434,8 @@ import X from 'lucide-svelte/icons/x';
     const policy = usage.projection_policy;
     const lines = [
       `Prompt usage: ${formatTokenCount(usage.prompt_tokens)} / ${formatTokenCount(usage.max_context_tokens)} tokens (${formatPercent(contextWindowUsagePercentage(usage))})`,
+      usage.agent_id ? `Agent: ${usage.agent_id}` : null,
+      contextUsageProfileLabel(usage) ? `Agent profile: ${contextUsageProfileLabel(usage)}` : null,
       `Model: ${usage.model}`,
       usage.reasoning_effort ? `Reasoning effort: ${usage.reasoning_effort}` : null,
       usage.max_input_tokens ? `Max input: ${formatTokenCount(usage.max_input_tokens)} tokens` : null,
@@ -425,6 +447,12 @@ import X from 'lucide-svelte/icons/x';
       policy?.burst_target_tokens ? `Within-turn burst target: ${formatTokenCount(policy.burst_target_tokens)} tokens` : null
     ].filter(Boolean);
     return lines.join('\n');
+  }
+
+  function contextUsageProfileLabel(usage: ContextUsage | null): string | null {
+    if (!usage?.agent_profile_id) return null;
+    if (usage.agent_profile_synthetic || usage.agent_profile_id === 'default') return null;
+    return usage.agent_profile_id;
   }
 
   function activeContextUsage(): ContextUsage | null {
@@ -612,20 +640,48 @@ import X from 'lucide-svelte/icons/x';
   function applyQueuedMessageSnapshot(messages: QueuedMessage[], count = messages.length): void {
     queuedMessages = messages;
     queuedCount = count;
+    for (const message of messages) {
+      timeline = removeQueuedOptimisticUserMessage(
+        timeline,
+        message.queue_id,
+        message.client_message_id,
+        message.content,
+        message.attachments,
+      );
+    }
     const liveQueueIds = new Set(messages.map((message) => message.queue_id));
     queueExpandedIds = queueExpandedIds.filter((queueId) => liveQueueIds.has(queueId));
     if (queueEditingId && !liveQueueIds.has(queueEditingId)) {
       queueEditingId = null;
       queueEditContent = '';
     }
-    for (const queued of messages) {
-      timeline = removeQueuedOptimisticUserMessage(
-        timeline,
-        queued.queue_id,
-        queued.client_message_id,
-        queued.content,
-        queued.attachments
-      );
+  }
+
+  function applyConversationRuntimeSnapshot(
+    event: Extract<CognisWebSocketEvent, { type: 'conversation_runtime_snapshot' }>
+  ): void {
+    applyQueuedMessageSnapshot(event.queued_messages, event.queued_count);
+    const hasRuntimeActivity = (
+      event.active_streams.length > 0
+      || event.active_tool_outputs.length > 0
+      || event.active_thinking.length > 0
+    );
+    runtimeOverlay = applyRuntimeSnapshotOverlay(runtimeOverlay, event);
+    const hasActiveTurn = event.has_active_turn ?? currentConversation?.has_active_turn ?? turnInProgress;
+    turnInProgress = hasRuntimeActivity || hasActiveTurn;
+    if (typeof event.has_active_turn === 'boolean' && currentConversation) {
+      patchConversationInList(currentConversation.conversation_id, {
+        has_active_turn: event.has_active_turn,
+        active_turn_chat_mode: event.active_turn_chat_mode ?? null,
+        active_turn_chat_mode_source: event.active_turn_chat_mode_source ?? null,
+      });
+      activeTurnChatMode = event.has_active_turn
+        ? normalizeChatModeTone(event.active_turn_chat_mode)
+        : 'default';
+    }
+    setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
+    if (turnInProgress) {
+      awaitingAssistantStart = false;
     }
   }
 
@@ -645,26 +701,14 @@ import X from 'lucide-svelte/icons/x';
     if (!conversation) return;
     const conversationId = conversation.conversation_id;
     const previous = queuedMessages;
-    const queued = queuedMessages.find((item) => item.queue_id === queueId);
-    const previousTimeline = timeline;
     queueBusyId = queueId;
     queuedMessages = queuedMessages.filter((item) => item.queue_id !== queueId);
     queuedCount = queuedMessages.length;
-    if (queued) {
-      timeline = removeQueuedOptimisticUserMessage(
-        timeline,
-        queued.queue_id,
-        queued.client_message_id,
-        queued.content,
-        queued.attachments
-      );
-    }
     try {
       await api.conversations.deleteQueuedMessage(conversationId, queueId);
     } catch (caughtError) {
       queuedMessages = previous;
       queuedCount = previous.length;
-      timeline = previousTimeline;
       addToast(asApiError(caughtError).message, 'error');
       await refreshQueuedMessages();
     } finally {
@@ -731,6 +775,9 @@ import X from 'lucide-svelte/icons/x';
   type ChatTodo = TodoSnapshotItem;
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
+  let directQuestionAnswers = $state<Record<string, { selected: string[]; custom: string }>>({});
+  let directQuestionPageIndex = $state(0);
+  let directQuestionCollapsed = $state(false);
   let pendingCredentialRequest = $state<Notification | null>(null);
   let directQuestionSubmitting = $state(false);
   let chatTodoDrawerOpen = $state(true);
@@ -747,11 +794,13 @@ import X from 'lucide-svelte/icons/x';
   let pageShowHandler: ((event: PageTransitionEvent) => void) | null = null;
   let onlineHandler: (() => void) | null = null;
   let foregroundSyncTimer: number | null = null;
+  let historySectionDayTimer: number | null = null;
   let conversationLoadRequestId = 0;
   let mobileDrawerPreviouslyFocused: HTMLElement | null = null;
   let initialLoadTimeoutTimer: number | null = null;
 
   const CHAT_INITIAL_LOAD_TIMEOUT_MS = 10000;
+  const emptySearchMatchedIds = new Set<string>();
 
   function isLlmUnavailableForSetup(): boolean {
     const llmDetails = JSON.stringify($workspaceHealth.health?.providers?.llm ?? {}).toLowerCase();
@@ -833,7 +882,6 @@ import X from 'lucide-svelte/icons/x';
   }
 
   const BLOCKED_SESSION_STATES = new Set(['terminated', 'failed', 'cancelled', 'suspended']);
-
   function activeSessionStatus(): string | null {
     if (!currentConversation?.active_session_id) return null;
     const root = sessions.find((s) => s.session_id === currentConversation?.active_session_id);
@@ -938,8 +986,149 @@ import X from 'lucide-svelte/icons/x';
       typeof firstQuestion?.id === 'string' ? firstQuestion.id : undefined,
       'question',
     );
+    pending.questions = items;
     pending.structured = items.length > 1 || items.some((item) => Array.isArray(item.options) && item.options.length > 0);
     return pending;
+  }
+
+  function directQuestionItems(): QuestionSetQuestion[] {
+    if (pendingDirectQuestion?.questions && pendingDirectQuestion.questions.length > 0) {
+      return pendingDirectQuestion.questions;
+    }
+    if (!pendingDirectQuestion) return [];
+    return [{
+      id: pendingDirectQuestion.questionId ?? 'q1',
+      question: pendingDirectQuestion.question,
+      header: null,
+      options: pendingDirectQuestion.options.map((option, index) => ({
+        id: option,
+        label: option,
+        description: null
+      })),
+      multiple: false,
+      allow_custom: true,
+      required: true
+    }];
+  }
+
+  let directQuestionVisibleItems = $derived.by(() => directQuestionItems());
+  let directQuestionCurrentIndex = $derived.by(() => directQuestionClampedPageIndex(directQuestionVisibleItems));
+  let currentDirectQuestion = $derived.by(() => directQuestionVisibleItems[directQuestionCurrentIndex] ?? null);
+
+  function directQuestionClampedPageIndex(questions = directQuestionItems()): number {
+    if (questions.length === 0) return 0;
+    return Math.min(Math.max(directQuestionPageIndex, 0), questions.length - 1);
+  }
+
+  function visibleDirectQuestion(): QuestionSetQuestion | null {
+    return currentDirectQuestion;
+  }
+
+  function directQuestionState(questionId: string): { selected: string[]; custom: string } {
+    return directQuestionAnswers[questionId] ?? { selected: [], custom: '' };
+  }
+
+  function setDirectQuestionCustom(questionId: string, value: string): void {
+    const current = directQuestionState(questionId);
+    directQuestionAnswers = {
+      ...directQuestionAnswers,
+      [questionId]: { ...current, custom: value }
+    };
+  }
+
+  function buildDirectQuestionReply(
+    questions: QuestionSetQuestion[],
+    composerCustomAnswer = '',
+    override?: QuestionSetAnswer
+  ): QuestionSetReply {
+    const trimmedComposerAnswer = composerCustomAnswer.trim();
+    const answers = questions.map((question, index) => {
+      if (override && override.question_id === question.id) return override;
+      const current = directQuestionState(question.id);
+      const custom = current.custom.trim() || (questions.length === 1 && index === 0 ? trimmedComposerAnswer : '');
+      return {
+        question_id: question.id,
+        selected_option_ids: current.selected,
+        custom_answer: custom ? custom : null
+      };
+    });
+    return { mode: 'structured', answers };
+  }
+
+  function directQuestionAnswerSummary(reply: QuestionSetReply, questions: QuestionSetQuestion[]): string {
+    const labelsByQuestion = new Map(
+      questions.map((question) => [
+        question.id,
+        new Map(question.options.map((option) => [option.id, option.label]))
+      ])
+    );
+    return reply.answers
+      .map((answer) => {
+        const selected = answer.selected_option_ids
+          .map((optionId) => labelsByQuestion.get(answer.question_id)?.get(optionId) ?? optionId)
+          .filter(Boolean);
+        const parts = [...selected];
+        if (answer.custom_answer) parts.push(answer.custom_answer);
+        return parts.join(', ');
+      })
+      .filter((part) => part.length > 0)
+      .join('\n');
+  }
+
+  function directQuestionReplyHasAnswer(reply: QuestionSetReply): boolean {
+    return reply.answers.some((answer) => answer.selected_option_ids.length > 0 || Boolean(answer.custom_answer?.trim()));
+  }
+
+  function directQuestionReplySatisfiesRequired(questions: QuestionSetQuestion[], reply: QuestionSetReply): boolean {
+    const answersById = new Map(reply.answers.map((answer) => [answer.question_id, answer]));
+    return questions.every((question) => {
+      if (!question.required) return true;
+      const answer = answersById.get(question.id);
+      return Boolean(answer && (answer.selected_option_ids.length > 0 || answer.custom_answer?.trim()));
+    });
+  }
+
+  function directQuestionAnswerSatisfies(question: QuestionSetQuestion): boolean {
+    if (!question.required) return true;
+    const current = directQuestionState(question.id);
+    return current.selected.length > 0 || Boolean(current.custom.trim());
+  }
+
+  function directQuestionOptionSelected(questionId: string, optionId: string): boolean {
+    return directQuestionState(questionId).selected.includes(optionId);
+  }
+
+  function currentDirectQuestionReplyHasAnswer(): boolean {
+    const questions = directQuestionItems();
+    const reply = buildDirectQuestionReply(questions);
+    return directQuestionReplyHasAnswer(reply) && directQuestionReplySatisfiesRequired(questions, reply);
+  }
+
+  function canGoToNextDirectQuestion(): boolean {
+    const question = visibleDirectQuestion();
+    return question !== null && directQuestionAnswerSatisfies(question);
+  }
+
+  function goToPreviousDirectQuestion(): void {
+    directQuestionPageIndex = Math.max(0, directQuestionCurrentIndex - 1);
+  }
+
+  function goToNextDirectQuestion(): void {
+    if (!canGoToNextDirectQuestion()) {
+      addToast('Answer this required question before continuing.', 'error');
+      return;
+    }
+    directQuestionPageIndex = Math.min(directQuestionCurrentIndex + 1, Math.max(0, directQuestionVisibleItems.length - 1));
+  }
+
+  async function submitCurrentDirectQuestionReply(): Promise<void> {
+    const questions = directQuestionItems();
+    const reply = buildDirectQuestionReply(questions);
+    if (!directQuestionReplySatisfiesRequired(questions, reply)) {
+      addToast('Answer all required questions before sending.', 'error');
+      return;
+    }
+    await submitDirectQuestionReply(reply);
   }
 
   function pendingDirectQuestionFromNotification(notification: Notification): PendingDirectQuestion | null {
@@ -965,26 +1154,6 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
-  /**
-   * Compact status indicator for a todo row. Returns the background
-   * colour for a tiny dot rendered next to the todo content — we drop
-   * the old bordered pill + coloured bubble in favour of a single
-   * line-of-text representation where the status reads at a glance
-   * from the colour of a 6px dot.
-   */
-  function todoStatusDot(status: string): string {
-    if (status === 'completed') return 'bg-emerald-400';
-    if (status === 'cancelled') return 'bg-slate-600';
-    if (status === 'in_progress') return 'bg-sky-400';
-    return 'bg-sky-400';
-  }
-
-  function todoPriorityClass(priority: string): string {
-    if (priority === 'high') return 'text-rose-300';
-    if (priority === 'low') return 'text-slate-500';
-    return 'text-slate-400';
-  }
-
   function sortEscalations(items: Escalation[]): Escalation[] {
     return [...items].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
   }
@@ -1002,6 +1171,9 @@ import X from 'lucide-svelte/icons/x';
       window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
       window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
       window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
+      void api.conversations.rememberOpened(conversation.conversation_id).catch((error) => {
+        console.debug('Failed to persist opened conversation', error);
+      });
     }
   }
 
@@ -1108,7 +1280,7 @@ import X from 'lucide-svelte/icons/x';
       && hasIncompleteTodo(todos);
   }
 
-  function todoSnapshotFromSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): TodoSnapshotItem[] {
+  function todoSnapshotFromSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): TodoSnapshotItem[] | null {
     if (event.type === 'tool_call' && event.tool_name === 'step_todo_write') {
       return parseTodoSnapshot(event.arguments?.todos);
     }
@@ -1117,10 +1289,10 @@ import X from 'lucide-svelte/icons/x';
         const parsed = JSON.parse(event.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
         return parseTodoSnapshot((parsed as Record<string, unknown>)?.todos);
       } catch {
-        return [];
+        return null;
       }
     }
-    return [];
+    return null;
   }
 
   function backendTodoSnapshot(state: ConversationStateEnvelope | null): TodoSnapshotItem[] | null {
@@ -1150,14 +1322,20 @@ import X from 'lucide-svelte/icons/x';
     return patch;
   }
 
-  function applyConversationStateSnapshot(state: ConversationStateEnvelope | null | undefined): void {
+  function applyConversationStateSnapshot(
+    state: ConversationStateEnvelope | null | undefined,
+    options: { patchConversationRows?: boolean } = {},
+  ): void {
     if (!state) return;
+    const { patchConversationRows = true } = options;
     const conversationId = state.conversation_id;
     if (conversationId === currentConversation?.conversation_id) {
       backendConversationState = state;
+      turnInProgress = state.active_turn?.has_active_turn ?? turnInProgress;
     }
-    patchConversationInList(conversationId, conversationStateConversationPatch(state));
-    turnInProgress = state.active_turn?.has_active_turn ?? turnInProgress;
+    if (patchConversationRows) {
+      patchConversationInList(conversationId, conversationStateConversationPatch(state));
+    }
     const todos = backendTodoSnapshot(state);
     if (todos !== null) {
       setConversationTodoSnapshot(conversationId, todos);
@@ -1180,8 +1358,7 @@ import X from 'lucide-svelte/icons/x';
   }
   let showTurnProgress = $derived.by(() =>
     turnInProgress
-      && !timeline.some((item) => item.kind === 'message' && item.role === 'assistant' && item.streaming)
-      && !timeline.some((item) => item.kind === 'thinking' && item.streaming)
+      && liveTailTimelineItemKey === null
   );
 
   $effect(() => {
@@ -1245,16 +1422,28 @@ import X from 'lucide-svelte/icons/x';
     return Number.isNaN(parsed) ? 0 : parsed;
   }
 
-  function conversationActivityValue(conversation: Conversation): number {
-    return (
-      timestampValue(conversation.last_message_at)
-      || timestampValue(conversation.created_at)
-    );
+  function millisecondsUntilNextLocalDay(now = new Date()): number {
+    const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    return Math.max(1000, nextDay.getTime() - now.getTime() + 1000);
+  }
+
+  function stopHistorySectionDayTimer(): void {
+    if (historySectionDayTimer === null || typeof window === 'undefined') return;
+    window.clearTimeout(historySectionDayTimer);
+    historySectionDayTimer = null;
+  }
+
+  function scheduleHistorySectionDayRefresh(): void {
+    if (typeof window === 'undefined') return;
+    stopHistorySectionDayTimer();
+    historySectionDayTimer = window.setTimeout(() => {
+      historySectionNow = new Date();
+      scheduleHistorySectionDayRefresh();
+    }, millisecondsUntilNextLocalDay());
   }
 
   function isAgentDirectConversation(conversation: Conversation | null | undefined): boolean {
-    return conversation?.context?.type === 'web'
-      && conversation.context.platform_data?.kind === 'agent_direct';
+    return isAgentDirectConversationSummary(conversation);
   }
 
   function canStarConversation(conversation: Conversation): boolean {
@@ -1283,8 +1472,9 @@ import X from 'lucide-svelte/icons/x';
     const next = reset ? [] : conversations.filter((conversation) => !isAgentDirectConversation(conversation));
     const indexById = new Map(next.map((conversation, index) => [conversation.conversation_id, index]));
     for (const conversation of items) {
+      applyConversationStateSnapshot(conversation.conversation_state, { patchConversationRows: false });
       if (currentConversation?.conversation_id === conversation.conversation_id) {
-        currentConversation = conversation;
+        currentConversation = mergeConversationPreservingActivity(currentConversation, conversation);
         turnInProgress = conversation.has_active_turn;
         activeTurnChatMode = conversation.has_active_turn
           ? normalizeChatModeTone(conversation.active_turn_chat_mode)
@@ -1299,7 +1489,7 @@ import X from 'lucide-svelte/icons/x';
         indexById.set(conversation.conversation_id, next.length);
         next.push(conversation);
       } else {
-        next[index] = conversation;
+        next[index] = mergeConversationPreservingActivity(next[index], conversation);
       }
     }
     conversations = sortConversationsByActivity(next);
@@ -1315,7 +1505,14 @@ import X from 'lucide-svelte/icons/x';
   function mergeAgentDirectChats(items: AgentDirectChat[]): void {
     const merged = new Map(agentDirectChats.map((item) => [item.agent.agent_id, item]));
     for (const item of items) {
-      merged.set(item.agent.agent_id, item);
+      applyConversationStateSnapshot(item.conversation.conversation_state, { patchConversationRows: false });
+      const existing = merged.get(item.agent.agent_id);
+      merged.set(item.agent.agent_id, existing
+        ? {
+            agent: item.agent,
+            conversation: mergeConversationPreservingActivity(existing.conversation, item.conversation),
+          }
+        : item);
     }
     agentDirectChats = sortAgentDirectChats([...merged.values()]);
   }
@@ -1340,6 +1537,7 @@ import X from 'lucide-svelte/icons/x';
         if (currentConversation?.conversation_id === conversationId) {
           currentConversation = { ...currentConversation, ...updatedDirectConversation };
         }
+        rememberSidebarProjection();
       }
       return;
     }
@@ -1357,6 +1555,7 @@ import X from 'lucide-svelte/icons/x';
     if (currentConversation?.conversation_id === conversationId) {
       currentConversation = { ...currentConversation, ...updated };
     }
+    rememberSidebarProjection();
   }
 
   function syncConversationActiveSession(activeSessionId: string | null | undefined): void {
@@ -1389,20 +1588,30 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  function setConversationTurnIndicator(conversationId: string | null | undefined, active: boolean): void {
+  function setConversationTurnIndicator(
+    conversationId: string | null | undefined,
+    active: boolean,
+    options: { touchLastMessageAt?: boolean } = {}
+  ): void {
     if (!conversationId) return;
-    patchConversationInList(conversationId, { has_active_turn: active });
-    if (!active && conversationTodoSnapshots[conversationId]) {
-      const { [conversationId]: _removed, ...remaining } = conversationTodoSnapshots;
-      conversationTodoSnapshots = remaining;
-    }
+    patchConversationInList(
+      conversationId,
+      {
+        has_active_turn: active,
+        ...(options.touchLastMessageAt ? { last_message_at: new Date().toISOString() } : {}),
+      },
+      { touchUpdatedAt: false }
+    );
   }
 
   function recordTodoSnapshotFromSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
     const conversationId = 'conversation_id' in event && typeof event.conversation_id === 'string'
       ? event.conversation_id
       : currentConversation?.conversation_id;
-    setConversationTodoSnapshot(conversationId, todoSnapshotFromSocketEvent(event));
+    const todos = todoSnapshotFromSocketEvent(event);
+    if (todos !== null) {
+      setConversationTodoSnapshot(conversationId, todos);
+    }
   }
 
   function copyTimelineItems(items: TimelineItem[]): TimelineItem[] {
@@ -1450,6 +1659,7 @@ import X from 'lucide-svelte/icons/x';
     currentConversation = { ...entry.conversation };
     sessions = entry.sessions.map((session) => ({ ...session }));
     timeline = copyTimelineItems(entry.timeline);
+    runtimeOverlay = createRuntimeTimelineOverlay();
     queuedCount = entry.queuedCount;
     queuedMessages = entry.queuedMessages.map((message) => ({ ...message }));
     contextUsage = entry.contextUsage;
@@ -1479,6 +1689,7 @@ import X from 'lucide-svelte/icons/x';
     sessions = [];
     sessionIds.clear();
     timeline = [];
+    runtimeOverlay = createRuntimeTimelineOverlay();
     visibleStartIndex = 0;
     activeSessionLastSeq = 0;
     olderMessagesCursor = null;
@@ -1491,6 +1702,8 @@ import X from 'lucide-svelte/icons/x';
     awaitingAssistantStart = false;
     pendingDirectQuestion = null;
     pendingCredentialRequest = null;
+    directQuestionPageIndex = 0;
+    directQuestionCollapsed = false;
     directQuestionSubmitting = false;
     escalations = [];
     escalationError = '';
@@ -1500,16 +1713,6 @@ import X from 'lucide-svelte/icons/x';
     subSessionPanelOpen = false;
     userScrolledUp = false;
     lastTimelineScrollTop = 0;
-  }
-
-  function timelineItemKey(item: TimelineItem): string {
-    if (item.kind === 'message') {
-      if (item.messageId) return `message:${item.role}:${item.sessionId ?? 'unknown-session'}:${item.messageId}`;
-      if (item.clientMessageId) return `client-message:${item.clientMessageId}`;
-      if (item.queueId) return `queue-message:${item.queueId}`;
-      if (item.seq !== null) return `message-seq:${item.role}:${item.sessionId ?? 'unknown-session'}:${item.seq}`;
-    }
-    return `${item.kind}:${item.id}`;
   }
 
   function isLiveOnlyTimelineItem(item: TimelineItem): boolean {
@@ -1603,6 +1806,93 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
+  function sidebarProjectionCacheKey(): string {
+    return JSON.stringify({
+      channel: selectedChannel,
+      agent: selectedAgentId,
+      status: selectedConversationStatus,
+    });
+  }
+
+  function currentSidebarProjectionFilter() {
+    return {
+      selectedChannel,
+      selectedAgentId,
+      selectedConversationStatus,
+    };
+  }
+
+  function rememberSidebarProjection(key = sidebarProjectionCacheKey()): void {
+    rememberSidebarProjectionSnapshot(
+      sidebarProjectionCache,
+      key,
+      {
+        agents,
+        agent_direct_chats: agentDirectChats,
+        conversations: {
+          items: conversations,
+          cursor: conversationCursor,
+          has_more: conversationsHasMore,
+        },
+        context_types: availableChannelTypes,
+      },
+      SIDEBAR_PROJECTION_CACHE_LIMIT,
+    );
+  }
+
+  function applySidebarProjection(projection: SidebarProjection): void {
+    agents = projection.agents;
+    agentDirectChats = projection.agent_direct_chats;
+    applyAvailableChannelTypes(projection.context_types);
+    mergeConversationList(projection.conversations.items, { reset: true });
+    conversationCursor = projection.conversations.cursor;
+    conversationsHasMore = projection.conversations.has_more;
+  }
+
+  function applyCachedSidebarProjection(key = sidebarProjectionCacheKey()): boolean {
+    const cached = sidebarProjectionCache.get(key);
+    if (!cached) return false;
+    applySidebarProjection(cloneSidebarProjection(cached));
+    return true;
+  }
+
+  function applyAvailableChannelTypes(contextTypes: string[]): void {
+    const types = new Set(contextTypes.map((contextType) => contextType.toLowerCase()));
+    if (selectedChannel && selectedChannel !== 'all') {
+      types.add(selectedChannel.toLowerCase());
+    }
+    availableChannelTypes = [...types].sort();
+  }
+
+  async function loadSidebarProjection(): Promise<void> {
+    conversationListLoadCount += 1;
+    const initialKey = sidebarProjectionCacheKey();
+    const hadCachedProjection = applyCachedSidebarProjection(initialKey);
+    conversationListLoading = conversationListLoadCount > 1 || !hadCachedProjection;
+    const load = () => api.conversations.sidebar(null, {
+      contextType: selectedChannel !== 'all' ? selectedChannel : null,
+      agentId: selectedAgentId !== 'all' ? selectedAgentId : null,
+      status: selectedConversationStatus,
+    });
+    try {
+      let response = await load();
+      if (initialKey !== sidebarProjectionCacheKey()) return;
+      agents = response.agents;
+      if (restoreSelectedAgent()) {
+        const restoredKey = sidebarProjectionCacheKey();
+        response = await load();
+        if (restoredKey !== sidebarProjectionCacheKey()) return;
+        agents = response.agents;
+        restoreSelectedAgent();
+      }
+      applySidebarProjection(response);
+      rememberSidebarProjection();
+    } finally {
+      conversationListLoadCount = Math.max(0, conversationListLoadCount - 1);
+      conversationListLoading = conversationListLoadCount > 0;
+    }
+  }
+
   async function loadAgentDirectChats(): Promise<void> {
     if (selectedChannel !== 'all' && selectedChannel !== 'web') {
       agentDirectChats = [];
@@ -1627,14 +1917,16 @@ import X from 'lucide-svelte/icons/x';
     enterToSend = window.localStorage.getItem(CHAT_STORAGE_KEYS.enterToSend) === '1';
   }
 
-  function restoreSelectedAgent(): void {
-    if (typeof window === 'undefined') return;
+  function restoreSelectedAgent(): boolean {
+    const previous = selectedAgentId;
+    if (typeof window === 'undefined') return false;
     const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
     if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
       selectedAgentId = stored;
     } else {
       selectedAgentId = 'all';
     }
+    return selectedAgentId !== previous;
   }
 
   function persistSelectedAgent(): void {
@@ -1760,6 +2052,14 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationAgent(conversation: Conversation): Agent | undefined {
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
+  }
+
+  function messageAgent(item: MessageTimelineItem): Agent | null {
+    const runtimeAgentId = item.runtime?.agent_id;
+    if (runtimeAgentId) {
+      return agents.find((agent) => agent.agent_id === runtimeAgentId) ?? null;
+    }
+    return currentConversation ? conversationAgent(currentConversation) ?? null : null;
   }
 
   async function refreshCurrentConversationMetadata(): Promise<void> {
@@ -2063,6 +2363,7 @@ import X from 'lucide-svelte/icons/x';
       }
       if (selectedConversationStatus === 'starred' && !updated.starred_at) {
         conversations = conversations.filter((item) => item.conversation_id !== conversationId);
+        rememberSidebarProjection();
       }
     } catch (caughtError) {
       if (selectedConversationStatus === 'starred' && previousStarredAt) {
@@ -2193,47 +2494,19 @@ import X from 'lucide-svelte/icons/x';
 
   async function loadHistory(
     conversationId: string,
-  ): Promise<import('$lib/types/api').MessageHistoryResponse> {
-    return loadConversationHistoryPage(conversationId);
+    limit = 200,
+  ): Promise<import('$lib/types/api').TimelineProjectionResponse> {
+    return loadConversationHistoryPage(conversationId, null, limit);
   }
 
-  async function loadSessionHistory(
-    conversationId: string,
-    sessionId: string,
-  ): Promise<{ events: MessageEvent[]; lastSeq: number; truncated: boolean; activeThinking: ActiveThinkingSnapshot[] }> {
-    const events: MessageEvent[] = [];
-    let afterSeq = 0;
-    let pageCount = 0;
-    let lastSeq = 0;
-
-    while (pageCount < SESSION_LOG_BOOTSTRAP_MAX_PAGES) {
-      const response = await api.conversations.sessionEvents(conversationId, sessionId, afterSeq, SESSION_LOG_PAGE_SIZE);
-      events.push(...(response.items ?? []));
-      lastSeq = response.last_seq;
-      pageCount += 1;
-      if (!response.has_more || response.items.length === 0) {
-        return { events, lastSeq, truncated: false, activeThinking: response.active_thinking ?? [] };
-      }
-      afterSeq = getNextHistoryAfterSeq(response);
-      if (afterSeq === 0) {
-        return { events, lastSeq, truncated: false, activeThinking: response.active_thinking ?? [] };
-      }
-    }
-
-    events.push({
-      seq: null,
-      type: 'history_gap',
-      data: { reason: 'bootstrap_cap_reached', session_id: sessionId },
-      timestamp: new Date().toISOString()
-    });
-    return { events, lastSeq, truncated: true, activeThinking: [] };
+  function projectedTimelineItems(
+    response: import('$lib/types/api').TimelineProjectionResponse,
+  ): TimelineItem[] {
+    return timelineFromProjection(response.timeline_items);
   }
 
   async function refreshSidebarData(): Promise<void> {
-    [agents] = await Promise.all([api.agents.listAll()]);
-    restoreSelectedAgent();
-    await refreshAvailableChannelTypes();
-    await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
+    await loadSidebarProjection();
   }
 
   async function forceRefreshConversationHistory(): Promise<void> {
@@ -2248,17 +2521,10 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function refreshAvailableChannelTypes(): Promise<void> {
-    const allConversations = await api.conversations.listAll({
-      contextType: null,
+    const contextTypes = await api.conversations.contextTypes({
       status: selectedConversationStatus
     });
-    const types = new Set(
-      allConversations.map((conversation) => conversation.context?.type?.toLowerCase() ?? 'unknown')
-    );
-    if (selectedChannel && selectedChannel !== 'all') {
-      types.add(selectedChannel.toLowerCase());
-    }
-    availableChannelTypes = [...types].sort();
+    applyAvailableChannelTypes(contextTypes);
   }
 
   function resetSessionFilter(): void {
@@ -2345,9 +2611,17 @@ import X from 'lucide-svelte/icons/x';
         .filter((item) => item.task_id === null)
         .map((item) => pendingDirectQuestionFromNotification(item))
         .find((item): item is PendingDirectQuestion => item !== null) ?? null;
+      if (directQuestion?.notificationId !== pendingDirectQuestion?.notificationId) {
+        directQuestionAnswers = {};
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
+      }
       pendingDirectQuestion = directQuestion;
       if (directQuestion === null) {
         directQuestionSubmitting = false;
+        directQuestionAnswers = {};
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
       }
     } catch {
       // Ignore notification refresh failures here — they should not block chat.
@@ -2739,11 +3013,12 @@ import X from 'lucide-svelte/icons/x';
     const shouldPreserveScroll = options.preserveScroll === true && userScrolledUp && timelineEl !== null;
     const preservedScrollTop = shouldPreserveScroll ? timelineEl?.scrollTop ?? 0 : 0;
     const preservedVisibleStartIndex = visibleStartIndex;
+    const initialLoadPolicy = conversationInitialLoadPolicy(currentConversation);
 
     const [sessionResult, historyResult] = await Promise.allSettled([
-      reloadSessions ? api.conversations.sessions(conversationId) : Promise.resolve(sessions),
+      reloadSessions ? api.conversations.sessions(conversationId, initialLoadPolicy.sessionOptions) : Promise.resolve(sessions),
       reloadHistory
-        ? loadHistory(conversationId)
+        ? loadHistory(conversationId, initialLoadPolicy.historyLimit)
         : Promise.resolve({
             items: [],
             last_seq: 0,
@@ -2755,7 +3030,8 @@ import X from 'lucide-svelte/icons/x';
             active_session_last_seq: 0,
             history_truncated: false,
             truncation_reason: null,
-            state_snapshot: null
+            state_snapshot: null,
+            timeline_items: []
           }),
     ]);
 
@@ -2790,15 +3066,15 @@ import X from 'lucide-svelte/icons/x';
       applyConversationStateSnapshot(historyResult.value.state_snapshot);
       olderMessagesCursor = messageHistoryOlderCursor(historyResult.value);
       hasOlderMessages = Boolean(historyResult.value.has_more && olderMessagesCursor);
-      timeline = applyActiveToolOutputSnapshots(
-        applyActiveStreamSnapshots(
-          shouldMergeTimeline
-            ? mergeTimelineRefresh(normalizeHistory(historyResult.value.items), timeline)
-            : normalizeHistory(historyResult.value.items),
-          historyResult.value.active_streams,
-        ),
-        historyResult.value.active_tool_outputs,
-      );
+      timeline = shouldMergeTimeline
+        ? mergeTimelineRefresh(projectedTimelineItems(historyResult.value), timeline)
+        : projectedTimelineItems(historyResult.value);
+      runtimeOverlay = applyRuntimeSnapshotOverlay(createRuntimeTimelineOverlay(), {
+        active_streams: historyResult.value.active_streams ?? [],
+        active_tool_outputs: historyResult.value.active_tool_outputs ?? [],
+        active_thinking: [],
+        has_active_turn: historyResult.value.has_active_turn,
+      });
       turnInProgress = historyResult.value.has_active_turn ?? hasActiveTurnTimelineItem();
       setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
       if (turnInProgress) {
@@ -2864,17 +3140,16 @@ import X from 'lucide-svelte/icons/x';
       escalationError = '';
       pendingDirectQuestion = null;
       pendingCredentialRequest = null;
+      directQuestionPageIndex = 0;
+      directQuestionCollapsed = false;
       directQuestionSubmitting = false;
     }
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         if (shouldPreserveScroll && timelineEl) {
-          programmaticScroll = true;
           timelineEl.scrollTop = preservedScrollTop;
-          lastTimelineScrollTop = timelineEl.scrollTop;
           userScrolledUp = true;
-          programmaticScroll = false;
           return;
         }
         scrollToBottom(true);
@@ -2917,18 +3192,61 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function hasActiveTurnTimelineItem(): boolean {
-    return timeline.some((item) => {
+    const lastItem = projectedTimeline[projectedTimeline.length - 1];
+    return Boolean(lastItem && isInlineLiveTimelineItem(lastItem));
+  }
+
+  function hasAnyActiveTurnTimelineItem(): boolean {
+    return projectedTimeline.some((item) => {
       if (item.kind === 'message') {
         return item.role === 'assistant' && item.streaming === true;
       }
+      if (item.kind === 'thinking') {
+        return item.streaming === true;
+      }
       if (item.kind === 'tool_call') {
-        return !['completed', 'failed', 'cancelled'].includes(item.status);
+        return isActiveToolStatus(item.status);
       }
       if (item.kind === 'delegation') {
-        return item.status === 'started' || item.status === 'running' || item.status === 'paused';
+        return ['started', 'running', 'pending'].includes(item.status ?? '');
       }
       return false;
     });
+  }
+
+  function timelinePatchHasActiveWork(event: CognisWebSocketEvent): boolean {
+    if (event.type !== 'timeline_patch') return false;
+    return timelinePatchContainsActiveWork(
+      event.items.filter((item) => timelinePatchItemBelongsToActiveSessionFromProjection(item))
+    );
+  }
+
+  function isInlineLiveTimelineItem(item: TimelineItem): boolean {
+    if (item.kind === 'message') {
+      return item.role === 'assistant' && item.streaming === true;
+    }
+    if (item.kind === 'thinking') {
+      return item.streaming === true;
+    }
+    if (item.kind === 'tool_call') {
+      return isActiveToolStatus(item.status);
+    }
+    return false;
+  }
+
+  function timelinePatchItemBelongsToActiveSession(item: TimelineItem): boolean {
+    if (item.kind !== 'message' && item.kind !== 'tool_call' && item.kind !== 'thinking') return true;
+    const sessionId = item.sessionId ?? null;
+    const activeSessionId = currentConversation?.active_session_id ?? null;
+    return !sessionId || !activeSessionId || sessionId === activeSessionId;
+  }
+
+  function timelinePatchItemBelongsToActiveSessionFromProjection(item: import('$lib/types/api').TimelineProjectionItem): boolean {
+    const kind = typeof item.kind === 'string' ? item.kind : '';
+    if (kind !== 'message' && kind !== 'tool_call' && kind !== 'thinking') return true;
+    const sessionId = typeof item.sessionId === 'string' ? item.sessionId : null;
+    const activeSessionId = currentConversation?.active_session_id ?? null;
+    return !sessionId || !activeSessionId || sessionId === activeSessionId;
   }
 
   async function reconcileActiveConversation(): Promise<void> {
@@ -3152,6 +3470,8 @@ import X from 'lucide-svelte/icons/x';
       escalationResolutionPending = null;
       pendingDirectQuestion = null;
       pendingCredentialRequest = null;
+      directQuestionPageIndex = 0;
+      directQuestionCollapsed = false;
       directQuestionSubmitting = false;
       sessionIds.clear();
       conversationSubloadsLoading = false;
@@ -3536,6 +3856,68 @@ import X from 'lucide-svelte/icons/x';
     input.value = '';
   }
 
+  async function resolveDirectQuestionNotificationId(pendingStepTool: ReturnType<typeof findPendingStepRequestInputCall>): Promise<string> {
+    let notificationId = pendingStepTool?.notificationId ?? pendingDirectQuestion?.notificationId ?? '';
+    if (!notificationId && currentConversation) {
+      try {
+        const list = await api.notifications.list(currentConversation.conversation_id);
+        const match = list.find(
+          (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
+        );
+        if (match) notificationId = match.notification_id;
+      } catch {
+        // Fall through — caller decides whether to fall back to a normal message.
+      }
+    }
+    return notificationId;
+  }
+
+  async function submitDirectQuestionReply(reply: QuestionSetReply): Promise<boolean> {
+    if (!pendingDirectQuestion) return false;
+    const pendingStepTool = findPendingStepRequestInputCall(timeline);
+    const notificationId = await resolveDirectQuestionNotificationId(pendingStepTool);
+    if (!notificationId) return false;
+
+    directQuestionSubmitting = true;
+    if (pendingStepTool) {
+      timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, reply);
+    }
+    syncVisibleWindow();
+    userScrolledUp = false;
+    scrollToBottom();
+    const stepName =
+      typeof pendingStepTool?.arguments?.step_name === 'string'
+        ? (pendingStepTool.arguments.step_name as string)
+        : pendingDirectQuestion.stepName;
+    haptic.success();
+    wsClient.respondStepQuestion(notificationId, reply, stepName);
+    return true;
+  }
+
+  function submitDirectQuestionOption(question: QuestionSetQuestion, optionId: string): void {
+    if (!pendingDirectQuestion || directQuestionSubmitting) return;
+    toggleDirectQuestionOption(question, optionId);
+  }
+
+  function toggleDirectQuestionOption(question: QuestionSetQuestion, optionId: string): void {
+    const current = directQuestionState(question.id);
+    const selected = new Set(current.selected);
+    if (question.multiple) {
+      if (selected.has(optionId)) {
+        selected.delete(optionId);
+      } else {
+        selected.add(optionId);
+      }
+    } else {
+      selected.clear();
+      selected.add(optionId);
+    }
+    directQuestionAnswers = {
+      ...directQuestionAnswers,
+      [question.id]: { ...current, selected: Array.from(selected) }
+    };
+  }
+
   function focusActiveComposer(): void {
     composerElement?.focus();
   }
@@ -3604,11 +3986,14 @@ import X from 'lucide-svelte/icons/x';
       addToast('Attachments are not supported for clarification responses.', 'error');
       return;
     }
-    if (isStepInputReply && pendingDirectQuestion?.structured && pendingDirectQuestion.kind !== 'auth_challenge') {
-      addToast('This question set needs structured answers. Open the task view to answer it.', 'error');
-      return;
+    if (isStepInputReply && pendingDirectQuestion?.kind !== 'auth_challenge') {
+      const questions = directQuestionItems();
+      const reply = buildDirectQuestionReply(questions, content);
+      if (!directQuestionReplySatisfiesRequired(questions, reply)) {
+        addToast('Answer all required questions before sending.', 'error');
+        return;
+      }
     }
-
     // Optimistic UI. When the message is a step_request_questions reply we do
     // not append a separate user bubble — the tool call block will show the
     // user's answer inline as the resolution. Adding a bubble too would
@@ -3617,7 +4002,9 @@ import X from 'lucide-svelte/icons/x';
       ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
       : null;
 
-    if (!isSlashCommand && !isStepInputReply) {
+    const willQueueBehindActiveTurn = !isSlashCommand && !isStepInputReply && turnInProgress;
+
+    if (!isSlashCommand && !isStepInputReply && !willQueueBehindActiveTurn) {
       timeline = appendOptimisticUserMessage(timeline, content, composerAttachments, clientMessageId);
     }
     if (!isSlashCommand) {
@@ -3653,18 +4040,7 @@ import X from 'lucide-svelte/icons/x';
       //   1. The tool call's own annotation (authoritative if present).
       //   2. `pendingDirectQuestion.notificationId` from the WS event.
       //   3. A fresh fetch of pending input/challenge notifications.
-      let notificationId = pendingStepTool?.notificationId ?? pendingDirectQuestion?.notificationId ?? '';
-      if (!notificationId && currentConversation) {
-        try {
-          const list = await api.notifications.list(currentConversation.conversation_id);
-          const match = list.find(
-            (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
-          );
-          if (match) notificationId = match.notification_id;
-        } catch {
-          // Fall through — we'll send as a regular message below if lookup fails.
-        }
-      }
+      const notificationId = await resolveDirectQuestionNotificationId(pendingStepTool);
 
       if (notificationId) {
         directQuestionSubmitting = true;
@@ -3672,7 +4048,11 @@ import X from 'lucide-svelte/icons/x';
           // Show the user's answer inside the tool call block immediately
           // so the Resolution section stops saying "Waiting for user input"
           // even before the backend tool_result arrives.
-          timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, content);
+          if (pendingDirectQuestion?.kind === 'auth_challenge') {
+            timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, content);
+          } else {
+            timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, buildDirectQuestionReply(directQuestionItems(), content));
+          }
         }
         syncVisibleWindow();
         userScrolledUp = false;
@@ -3685,20 +4065,14 @@ import X from 'lucide-svelte/icons/x';
         if (pendingDirectQuestion?.kind === 'auth_challenge') {
           wsClient.respondAuthChallenge(notificationId, content, stepName);
         } else {
-          wsClient.respondStepQuestion(
-            notificationId,
-            {
-              mode: 'structured',
-              answers: [
-                {
-                  question_id: pendingDirectQuestion?.questionId ?? 'q1',
-                  selected_option_ids: [],
-                  custom_answer: content
-                }
-              ]
-            },
-            stepName
-          );
+          const questions = directQuestionItems();
+          const reply = buildDirectQuestionReply(questions, content);
+          if (!directQuestionReplySatisfiesRequired(questions, reply)) {
+            directQuestionSubmitting = false;
+            addToast('Answer all required questions before sending.', 'error');
+            return;
+          }
+          wsClient.respondStepQuestion(notificationId, reply, stepName);
         }
         return;
       }
@@ -3883,7 +4257,6 @@ import X from 'lucide-svelte/icons/x';
     const previousScrollHeight = timelineEl.scrollHeight;
     const previousScrollTop = timelineEl.scrollTop;
     loadingOlderMessages = true;
-    programmaticScroll = true;
 
     try {
       if (visibleStartIndex > 0) {
@@ -3894,7 +4267,7 @@ import X from 'lucide-svelte/icons/x';
           currentConversation.conversation_id,
           olderMessagesCursor,
         );
-        timeline = prependOlderTimelinePage(timeline, normalizeHistory(response.items));
+        timeline = prependOlderTimelinePage(timeline, projectedTimelineItems(response));
         olderMessagesCursor = messageHistoryOlderCursor(response);
         hasOlderMessages = Boolean(response.has_more && olderMessagesCursor);
         visibleStartIndex = 0;
@@ -3924,15 +4297,16 @@ import X from 'lucide-svelte/icons/x';
   async function loadConversationHistoryPage(
     conversationId: string,
     before: string | null = null,
-  ): Promise<import('$lib/types/api').MessageHistoryResponse> {
+    limit = 200,
+  ): Promise<import('$lib/types/api').TimelineProjectionResponse> {
     const conversationsApi = api.conversations as typeof api.conversations & {
-      historyPage(
+      timelinePage(
         conversationId: string,
         limit?: number,
         before?: string | null,
-      ): Promise<import('$lib/types/api').MessageHistoryResponse>;
+      ): Promise<import('$lib/types/api').TimelineProjectionResponse>;
     };
-    return conversationsApi.historyPage(conversationId, 200, before);
+    return conversationsApi.timelinePage(conversationId, limit, before);
   }
 
   async function openCreatedConversation(conversationId: string): Promise<void> {
@@ -3968,6 +4342,20 @@ import X from 'lucide-svelte/icons/x';
       });
   }
 
+  async function patchCreatedConversationRow(conversationId: string): Promise<void> {
+    try {
+      const createdConversation = await api.conversations.detail(conversationId);
+      if (!conversationMatchesSidebarProjectionFilter(createdConversation, currentSidebarProjectionFilter())) {
+        return;
+      }
+      mergeConversationList([createdConversation]);
+      patchAgentDirectChat(createdConversation);
+      rememberSidebarProjection();
+    } catch {
+      await refreshSidebarData();
+    }
+  }
+
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
     const currentId = conversationIdFromRoute();
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
@@ -3979,7 +4367,7 @@ import X from 'lucide-svelte/icons/x';
       event.type === 'conversation_updated'
       && typeof (event as { created_conversation_id?: unknown }).created_conversation_id === 'string'
     ) {
-      void refreshSidebarData();
+      void patchCreatedConversationRow((event as { created_conversation_id: string }).created_conversation_id);
     }
 
     if ('conversation_id' in event && event.conversation_id && event.conversation_id !== currentId) {
@@ -4016,7 +4404,11 @@ import X from 'lucide-svelte/icons/x';
           });
         }
       } else if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'delegation_started') {
-        setConversationTurnIndicator(otherConvId, true);
+        setConversationTurnIndicator(
+          otherConvId,
+          true,
+          event.type === 'turn_started' ? { touchLastMessageAt: true } : {}
+        );
         if (event.type === 'turn_started') {
           patchConversationInList(otherConvId, {
             active_turn_chat_mode: normalizeChatModeTone(event.chat_mode),
@@ -4185,6 +4577,8 @@ import X from 'lucide-svelte/icons/x';
         clearConversationTurnState(currentConversation?.conversation_id);
         directQuestionSubmitting = false;
         pendingDirectQuestion = null;
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
         if (escalationBusyCallId) {
           escalationBusyCallId = null;
           escalationResolutionPending = null;
@@ -4232,7 +4626,12 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'delegation_started') {
+    if (event.type === 'conversation_runtime_snapshot') {
+      applyConversationRuntimeSnapshot(event);
+      return;
+    }
+
+    if (timelinePatchHasActiveWork(event) || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'delegation_started') {
       awaitingAssistantStart = false;
       turnInProgress = true;
       setConversationTurnIndicator(currentConversation?.conversation_id, true);
@@ -4281,6 +4680,8 @@ import X from 'lucide-svelte/icons/x';
       );
       if (directQuestionSubmitting) {
         pendingDirectQuestion = null;
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
       }
       directQuestionSubmitting = false;
       // Update context usage from message_complete
@@ -4316,6 +4717,8 @@ import X from 'lucide-svelte/icons/x';
 
     // Escalation push events
     if (event.type === 'escalation') {
+      timeline = applyWebSocketEvent(timeline, event);
+      syncVisibleWindow();
       const existing = escalations.find((e) => e.call_id === event.call_id);
       if (!existing && escalationResolutionPending?.call_id !== event.call_id) {
         escalations = sortEscalations([...escalations, {
@@ -4387,6 +4790,7 @@ import X from 'lucide-svelte/icons/x';
       olderMessagesCursor = null;
       hasOlderMessages = false;
       setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      runtimeOverlay = createRuntimeTimelineOverlay();
       timeline = applyWebSocketEvent([], {
         type: 'system_message',
         conversation_id: event.conversation_id,
@@ -4418,9 +4822,12 @@ import X from 'lucide-svelte/icons/x';
       directQuestionSubmitting = false;
       pendingDirectQuestion = null;
       pendingCredentialRequest = null;
+      directQuestionPageIndex = 0;
+      directQuestionCollapsed = false;
       escalationBusyCallId = null;
       escalationResolutionPending = null;
       setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      runtimeOverlay = createRuntimeTimelineOverlay();
       if (event.session_id) {
         syncConversationActiveSession(event.session_id);
       }
@@ -4442,7 +4849,7 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'reconnected') {
       const previousTurnInProgress = turnInProgress;
       awaitingAssistantStart = false;
-      turnInProgress = event.has_active_turn ?? hasActiveTurnTimelineItem();
+      turnInProgress = event.has_active_turn ?? hasAnyActiveTurnTimelineItem();
       setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
       if (
         currentConversation &&
@@ -4479,6 +4886,9 @@ import X from 'lucide-svelte/icons/x';
           event.questions,
           event.context,
         );
+        directQuestionAnswers = {};
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
         directQuestionSubmitting = false;
         awaitingAssistantStart = false;
         turnInProgress = false;
@@ -4490,6 +4900,8 @@ import X from 'lucide-svelte/icons/x';
       timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
       if (!event.task_id) {
         pendingDirectQuestion = pendingDirectQuestionFromAuthChallengeEvent(event);
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
         directQuestionSubmitting = false;
         awaitingAssistantStart = false;
         turnInProgress = false;
@@ -4504,6 +4916,9 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'workflow_step_question_resolved' || event.type === 'auth_challenge_resolved') {
       if (pendingDirectQuestion && event.notification_id === pendingDirectQuestion.notificationId) {
         pendingDirectQuestion = null;
+        directQuestionAnswers = {};
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
       }
       directQuestionSubmitting = false;
     }
@@ -4532,8 +4947,42 @@ import X from 'lucide-svelte/icons/x';
       void refreshPendingDirectQuestion();
     }
 
-    timeline = applyWebSocketEvent(timeline, event);
-    const eventSeq = (event as { seq?: unknown }).seq;
+    if (isRuntimeTimelineEvent(event)) {
+      runtimeOverlay = applyRuntimeTimelineEvent(runtimeOverlay, event);
+      const runtimeEventSeq = (event as { seq?: unknown; last_seq?: unknown }).seq
+        ?? (event as { last_seq?: unknown }).last_seq;
+      if (typeof runtimeEventSeq === 'number') {
+        activeSessionLastSeq = Math.max(activeSessionLastSeq, runtimeEventSeq);
+      }
+      if (event.type !== 'tool_progress' && event.type !== 'tool_result_chunk' && event.type !== 'tool_output_chunk') {
+        syncVisibleWindow();
+      }
+      if (
+        event.type === 'chunk'
+        || event.type === 'assistant_stream_snapshot'
+        || event.type === 'assistant_thinking_chunk'
+        || event.type === 'assistant_thinking_block'
+        || event.type === 'tool_progress'
+        || event.type === 'tool_result_chunk'
+        || event.type === 'tool_output_chunk'
+      ) {
+        scrollToBottom();
+      }
+      return;
+    }
+
+    const canonicalEvent = hydrateMessageCompleteFromRuntimeOverlay(event, runtimeOverlay);
+    const beforePromotion = timeline;
+    timeline = promoteRuntimeOverlayForCanonicalEvent(timeline, runtimeOverlay, canonicalEvent);
+    const messageCompletionPromoted = canonicalEvent.type === 'message_complete' && timeline !== beforePromotion;
+    runtimeOverlay = clearRuntimeOverlayForCanonicalEvent(runtimeOverlay, canonicalEvent);
+    if (!messageCompletionPromoted) {
+      timeline = canonicalEvent.type === 'timeline_patch'
+        ? applyTimelinePatch(timeline, canonicalEvent.items, { includeItem: timelinePatchItemBelongsToActiveSession })
+        : applyWebSocketEvent(timeline, canonicalEvent);
+    }
+    const eventSeq = (event as { seq?: unknown; last_seq?: unknown }).seq
+      ?? (event as { last_seq?: unknown }).last_seq;
     if (typeof eventSeq === 'number') {
       activeSessionLastSeq = Math.max(activeSessionLastSeq, eventSeq);
     }
@@ -4587,17 +5036,20 @@ import X from 'lucide-svelte/icons/x';
     subSessionPanelOpen = true;
     subSessionLoading = true;
     subSessionError = '';
-    subSessionEvents = [];
     subSessionTimeline = [];
-    subSessionLastSeq = 0;
+    subSessionLog = null;
     subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
+    subSessionUserScrolledUp = false;
     subSessionInfo = null;
     subSessionInfoOpen = false;
     try {
-      const result = await loadSessionHistory(currentConversation.conversation_id, sessionId);
-      subSessionEvents = result.events;
-      subSessionTimeline = applyActiveThinkingSnapshots(normalizeHistory(result.events), result.activeThinking);
-      subSessionLastSeq = result.lastSeq;
+      const conversationId = currentConversation.conversation_id;
+      const result = await loadSessionLog(
+        sessionId,
+        (afterSeq, limit) => api.conversations.sessionEvents(conversationId, sessionId, afterSeq, limit),
+      );
+      subSessionLog = result;
+      subSessionTimeline = result.timeline;
     } catch (err) {
       subSessionError = asApiError(err)?.message ?? 'Failed to load session events';
     } finally {
@@ -4613,17 +5065,14 @@ import X from 'lucide-svelte/icons/x';
         if (document.hidden || !subSessionPanelOpen || !subSessionId || !currentConversation) {
           return;
         }
-        const result = await api.conversations.sessionEvents(
-          currentConversation.conversation_id,
-          subSessionId,
-          subSessionLastSeq,
-          SESSION_LOG_PAGE_SIZE
+        if (!subSessionLog) return;
+        const conversationId = currentConversation.conversation_id;
+        const result = await refreshSessionLog(
+          subSessionLog,
+          (afterSeq, limit) => api.conversations.sessionEvents(conversationId, subSessionId, afterSeq, limit),
         );
-        if ((result.items ?? []).length > 0) {
-          subSessionEvents = [...subSessionEvents, ...(result.items ?? [])];
-        }
-        subSessionTimeline = applyActiveThinkingSnapshots(normalizeHistory(subSessionEvents), result.active_thinking ?? []);
-        subSessionLastSeq = result.last_seq;
+        subSessionLog = result;
+        subSessionTimeline = result.timeline;
         subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
       } catch {
         subSessionPollDelayMs = nextPollDelayMs(subSessionPollDelayMs);
@@ -4654,9 +5103,9 @@ import X from 'lucide-svelte/icons/x';
       subSessionPanelOpen = false;
       subSessionClosing = false;
       subSessionId = '';
-      subSessionEvents = [];
       subSessionTimeline = [];
-      subSessionLastSeq = 0;
+      subSessionLog = null;
+      subSessionUserScrolledUp = false;
       subSessionInfo = null;
       subSessionInfoOpen = false;
     }, 250);
@@ -4811,11 +5260,17 @@ import X from 'lucide-svelte/icons/x';
     }
     return sortConversationsByActivity(list);
   });
+  let visibleConversationSections = $derived.by(() => groupConversationsByActivity(visibleConversationList, historySectionNow));
 
   let visibleAgentDirectChats = $derived.by(() => {
     return sortAgentDirectChats(agentDirectChats);
   });
-  let displayedTimeline = $derived(timeline.slice(visibleStartIndex));
+  let projectedTimeline = $derived.by(() => projectDisplayTimeline(timeline, runtimeOverlay));
+  let displayedTimeline = $derived(projectedTimeline.slice(visibleStartIndex));
+  let liveTailTimelineItemKey = $derived.by(() => {
+    const lastItem = projectedTimeline[projectedTimeline.length - 1];
+    return lastItem && isInlineLiveTimelineItem(lastItem) ? timelineItemKey(lastItem) : null;
+  });
   const canRetryFailedTurn = $derived.by(() =>
     Boolean(currentConversation)
       && !turnInProgress
@@ -4893,6 +5348,7 @@ import X from 'lucide-svelte/icons/x';
     window.addEventListener('pageshow', pageShowHandler);
     window.addEventListener('online', onlineHandler);
     startNotificationRefreshPolling();
+    scheduleHistorySectionDayRefresh();
     void reconcileChatNotifications();
     void refreshSearchHealth();
 
@@ -4927,6 +5383,7 @@ import X from 'lucide-svelte/icons/x';
       if (currentDraftKey) writeDraft(currentDraftKey, composer);
       stopEscalationCountdown();
       stopNotificationRefreshPolling();
+      stopHistorySectionDayTimer();
       if (visibilityHandler) {
         document.removeEventListener('visibilitychange', visibilityHandler);
       }
@@ -5003,17 +5460,17 @@ import X from 'lucide-svelte/icons/x';
     >
       <!-- Static top: filters -->
       <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
-        <div class="flex items-center justify-between lg:hidden">
+        <div class="flex items-center justify-between">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
           <div class="flex items-center gap-2">
-            <Button aria-label="Toggle filters" size="sm" variant="secondary" onclick={() => (mobileFilterOpen = !mobileFilterOpen)}>
-              {#if mobileFilterOpen}
+            <Button aria-expanded={conversationFiltersOpen} aria-label="Toggle filters" size="sm" variant="secondary" onclick={() => (conversationFiltersOpen = !conversationFiltersOpen)}>
+              {#if conversationFiltersOpen}
                 <ChevronUp class="h-4 w-4" />
               {:else}
                 <ChevronDown class="h-4 w-4" />
               {/if}
             </Button>
-            <Button aria-label="Close conversation list" size="sm" variant="secondary" onclick={closeMobileList}>Close</Button>
+            <Button aria-label="Close conversation list" class="lg:hidden" size="sm" variant="secondary" onclick={closeMobileList}>Close</Button>
           </div>
         </div>
 
@@ -5030,7 +5487,7 @@ import X from 'lucide-svelte/icons/x';
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
         {:else}
-          <div class={`space-y-3 ${mobileFilterOpen ? 'block' : 'hidden lg:block'}`}>
+          <div class={`space-y-3 ${conversationFiltersOpen ? 'block' : 'hidden'}`}>
           <AgentSelect
             label="Agent"
             agents={agents.filter((a) => a.status === 'active' && a.agent_type === 'primary')}
@@ -5273,65 +5730,70 @@ import X from 'lucide-svelte/icons/x';
               No conversations found.
             </p>
             {:else}
-            {#each visibleConversationList as conversation}
-              {@const agent = conversationAgent(conversation)}
-              {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
-              {@const unread = conversation.has_unread && !isActive}
-              {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
-              {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
-              {@const attentionDescription = conversationAttentionDescription(conversation)}
-              {@const turnMode = conversationChatMode(conversation)}
-              {@const rowTodoProgressTodos = conversationTodoProgressTodos(conversation)}
-              <a
-                class={`group flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
-                href={conversationUrl(conversation.conversation_id)}
-                onclick={closeMobileList}
-                title={conversationTitle(conversation)}
-              >
-                <div class="relative grid h-9 w-9 shrink-0 place-items-center">
-                  {#if inProgress}
-                    <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
-                  {/if}
-                  <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                  {#if showAttentionDot}
-                    <span class={`absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
-                  {/if}
-                </div>
-                <div class="min-w-0 flex-1">
-                  <p class="break-words text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
-                  <div class="mt-0.5 flex items-center gap-2">
-                    <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
-                    {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}
-                      <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-slate-500">
-                        {contextTypeBadge(conversation)}
-                      </span>
-                    {/if}
-                  </div>
-                </div>
-                <div class="relative z-10 mt-1 flex shrink-0 flex-col items-center gap-1">
-                  {#if canStarConversation(conversation)}
-                    <button
-                      aria-label={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                      class={`rounded-lg p-1 transition hover:bg-slate-800 ${conversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-600 hover:text-slate-200'}`}
-                      disabled={starringConversationId === conversation.conversation_id}
-                      onclick={(event) => { event.preventDefault(); event.stopPropagation(); void toggleConversationStar(conversation); }}
-                      title={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                      type="button"
-                    >
-                      <Star class={`h-4 w-4 ${conversation.starred_at ? 'fill-current' : ''}`} />
-                    </button>
-                  {/if}
-                  {#if shouldShowConversationTodoProgress(conversation)}
-                    <TodoProgressPopover
-                      todos={rowTodoProgressTodos}
-                      size="sm"
-                      placement="bottom-right"
-                      class="text-emerald-300"
-                      label="Conversation todo progress"
-                    />
-                  {/if}
-                </div>
-              </a>
+            {#each visibleConversationSections as section (section.key)}
+              <section class="space-y-1" aria-labelledby={`history-section-${section.key}`}>
+                <p id={`history-section-${section.key}`} class="sticky top-0 z-10 rounded-lg bg-slate-950/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500 backdrop-blur first:mt-0">{section.label}</p>
+                {#each section.conversations as conversation (conversation.conversation_id)}
+                  {@const agent = conversationAgent(conversation)}
+                  {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
+                  {@const unread = conversation.has_unread && !isActive}
+                  {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+                  {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
+                  {@const attentionDescription = conversationAttentionDescription(conversation)}
+                  {@const turnMode = conversationChatMode(conversation)}
+                  {@const rowTodoProgressTodos = conversationTodoProgressTodos(conversation)}
+                  <a
+                    class={`group flex items-start gap-3 rounded-xl px-3 py-2.5 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-200 hover:bg-slate-900/60'}`}
+                    href={conversationUrl(conversation.conversation_id)}
+                    onclick={closeMobileList}
+                    title={conversationTitle(conversation)}
+                  >
+                    <div class="relative grid h-9 w-9 shrink-0 place-items-center">
+                      {#if inProgress}
+                        <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
+                      {/if}
+                      <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
+                      {#if showAttentionDot}
+                        <span class={`absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
+                      {/if}
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <p class="break-words text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
+                      <div class="mt-0.5 flex items-center gap-2">
+                        <span class="truncate text-xs text-slate-400">{agent?.display_name ?? agent?.name ?? conversation.agent_id}</span>
+                        {#if (conversation.context?.type ?? 'web').toLowerCase() !== 'web'}
+                          <span class="shrink-0 rounded-full border border-slate-700 bg-slate-800/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-slate-500">
+                            {contextTypeBadge(conversation)}
+                          </span>
+                        {/if}
+                      </div>
+                    </div>
+                    <div class="relative z-10 mt-1 flex shrink-0 flex-col items-center gap-1">
+                      {#if canStarConversation(conversation)}
+                        <button
+                          aria-label={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                          class={`rounded-lg p-1 transition hover:bg-slate-800 ${conversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-600 hover:text-slate-200'}`}
+                          disabled={starringConversationId === conversation.conversation_id}
+                          onclick={(event) => { event.preventDefault(); event.stopPropagation(); void toggleConversationStar(conversation); }}
+                          title={conversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
+                          type="button"
+                        >
+                          <Star class={`h-4 w-4 ${conversation.starred_at ? 'fill-current' : ''}`} />
+                        </button>
+                      {/if}
+                      {#if shouldShowConversationTodoProgress(conversation)}
+                        <TodoProgressPopover
+                          todos={rowTodoProgressTodos}
+                          size="sm"
+                          placement="bottom-right"
+                          class="text-emerald-300"
+                          label="Conversation todo progress"
+                        />
+                      {/if}
+                    </div>
+                  </a>
+                {/each}
+              </section>
             {/each}
             {/if}
           {/if}
@@ -5486,6 +5948,23 @@ import X from 'lucide-svelte/icons/x';
                       <Copy class="h-3 w-3" />
                     {/if}
                   </button>
+                {/if}
+
+                {@const usage = activeContextUsage()}
+                {#if usage?.model}
+                  <span class="max-w-[18rem] truncate rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-300" title={usage?.provider_id ? `${usage.model} (${usage.provider_id})` : usage.model}>
+                    {usage.model}
+                  </span>
+                  {#if usage.reasoning_effort}
+                    <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Thinking effort">
+                      thinking {usage.reasoning_effort}
+                    </span>
+                  {/if}
+                  {#if contextUsageProfileLabel(usage)}
+                    <span class="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 text-[10px] font-medium text-sky-100" title="Agent profile">
+                      profile {contextUsageProfileLabel(usage)}
+                    </span>
+                  {/if}
                 {/if}
 
                 {#if conversationTaskId(currentConversation)}
@@ -5743,7 +6222,11 @@ import X from 'lucide-svelte/icons/x';
                       {formatTokenCount(panelContextUsage.prompt_tokens)} / {formatTokenCount(panelContextUsage.max_context_tokens)}
                       <span class={contextUsageColor(panelContextUsage)}>({formatPercent(contextWindowUsagePercentage(panelContextUsage))})</span>
                     </p>
-                    <p class="mt-0.5 text-xs text-slate-500">{panelContextUsage.model}{panelContextUsage.reasoning_effort ? ` · reasoning ${panelContextUsage.reasoning_effort}` : ''}</p>
+                    <p class="mt-0.5 text-xs text-slate-500">
+                      {panelContextUsage.model}
+                      {panelContextUsage.reasoning_effort ? ` · thinking ${panelContextUsage.reasoning_effort}` : ''}
+                      {contextUsageProfileLabel(panelContextUsage) ? ` · profile ${contextUsageProfileLabel(panelContextUsage)}` : ''}
+                    </p>
                   </div>
                 </div>
                 <div class="grid gap-2 text-xs text-slate-400 xl:grid-cols-[minmax(0,1fr)_minmax(16rem,0.45fr)]">
@@ -5995,19 +6478,24 @@ import X from 'lucide-svelte/icons/x';
         {/if}
 
         <!-- Timeline -->
-        <div
+        <TimelineViewport
+          items={displayedTimeline}
+          agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
+          bind:viewportElement={timelineEl}
+          bind:contentElement={timelineContentEl}
+          bind:userScrolledUp
           class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-1.5 sm:p-4"
-          bind:this={timelineEl}
-          onscroll={handleTimelineScroll}
-          onwheel={handleTimelineWheel}
-          ontouchstart={handleTimelineTouchStart}
-          ontouchmove={handleTimelineTouchMove}
-          ontouchend={handleTimelineTouchEnd}
-          onkeydown={handleTimelineKeydown}
-          onpointerdown={closeHeaderInfo}
-          tabindex="-1"
+          contentClass="space-y-3"
+          onScroll={handleTimelineScroll}
+          onWheel={handleTimelineWheel}
+          onTouchStart={handleTimelineTouchStart}
+          onTouchMove={handleTimelineTouchMove}
+          onTouchEnd={handleTimelineTouchEnd}
+          onKeydown={handleTimelineKeydown}
+          onPointerDown={closeHeaderInfo}
+          onViewSession={handleViewSession}
+          followPausedLabel="Scroll to bottom"
         >
-          <div bind:this={timelineContentEl} class="space-y-3">
             {#if hasOlderMessages && visibleStartIndex === 0 && !loadingOlderMessages}
               <button
                 class="mx-auto block rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/50 hover:text-sky-100"
@@ -6017,7 +6505,6 @@ import X from 'lucide-svelte/icons/x';
                 Load older messages
               </button>
             {/if}
-
             {#if loadingOlderMessages}
               <p class="px-4 py-2 text-center text-xs text-slate-500">Loading older messages…</p>
             {/if}
@@ -6045,38 +6532,14 @@ import X from 'lucide-svelte/icons/x';
                 </p>
               {/if}
             {:else}
-              {#each displayedTimeline as item (item.id)}
-                {#if item.kind === 'message'}
-                  {@const isSearchMatched = chatSearchOpen && chatSearchMatchedMessageIds.has(item.id)}
-                  {@const isSelectedSearchMatch = isSearchMatched && selectedChatSearchTargetId === item.id}
-                  <div data-message-id={item.id} class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <ChatMessage
-                      {item}
-                      agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
-                      searchQuery={chatSearchQuery}
-                      searchActive={isSearchMatched}
-                      searchSelected={isSelectedSearchMatch}
-                    />
-                  </div>
-                {:else if item.kind === 'thinking'}
-                  <div><ThinkingBlock item={item} /></div>
-                {:else if item.kind === 'tool_call'}
-                  <div><ToolCallBlock {item} /></div>
-                {:else if item.kind === 'delegation'}
-                  <div><DelegationCard {item} onViewSession={handleViewSession} /></div>
-                {:else if item.kind === 'workflow_composed'}
-                  <div><WorkflowComposedCard {item} /></div>
-                {:else if item.kind === 'compaction'}
-                  <div><CompactionCard {item} onViewPreviousSession={handleViewSession} /></div>
-                {:else if item.kind === 'system_message'}
-                  <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
-                {:else}
-                  <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
-                    <h3 class="font-semibold">{item.title}</h3>
-                    <p class="mt-2 leading-6">{item.description}</p>
-                  </article>
-                {/if}
-              {/each}
+              <TimelineList
+                items={displayedTimeline}
+                agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
+                searchQuery={chatSearchQuery}
+                searchMatchedIds={chatSearchOpen ? chatSearchMatchedMessageIds : emptySearchMatchedIds}
+                searchSelectedId={selectedChatSearchTargetId}
+                onViewSession={handleViewSession}
+              />
             {/if}
 
             <!-- Escalation prompts (sequential: show one at a time) -->
@@ -6109,57 +6572,11 @@ import X from 'lucide-svelte/icons/x';
                 <LiveDots tone={activeTurnChatMode === 'plan' ? 'emerald' : activeTurnChatMode === 'build' ? 'amber' : 'sky'} />
               </div>
             {/if}
-          </div>
-
-          <!-- Scroll to bottom button -->
-          {#if userScrolledUp}
-            <button
-              class="sticky bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-full border border-slate-700 bg-slate-900/90 p-2 shadow-lg transition hover:bg-slate-800"
-              onclick={jumpToBottom}
-              type="button"
-              title="Scroll to bottom"
-            >
-              <ArrowDown class="h-4 w-4 text-slate-300" />
-            </button>
-          {/if}
-        </div>
+        </TimelineViewport>
 
         <div bind:this={footerChromeEl} class="shrink-0 space-y-3">
           {#if shouldShowChatTodoDrawer}
-            <div class="rounded-xl border border-slate-800/60 bg-slate-900/40">
-              <button
-                class="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-sm transition hover:bg-slate-800/40"
-                onclick={() => { chatTodoDrawerOpen = !chatTodoDrawerOpen; }}
-                type="button"
-              >
-                <span class="truncate text-slate-300">
-                  <span class="font-medium text-slate-200">Todos</span>
-                  <span class="text-slate-500"> · {activeChatTodos.length} active{#if chatTodoCounts.inProgress > 0} · {chatTodoCounts.inProgress} in progress{/if}{#if chatTodoCounts.pending > 0} · {chatTodoCounts.pending} pending{/if}</span>
-                </span>
-                {#if chatTodoDrawerOpen}
-                  <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                {:else}
-                  <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-                {/if}
-              </button>
-              {#if chatTodoDrawerOpen}
-                <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
-                  {#each chatTodos as todo}
-                    <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
-                      <span
-                        class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
-                        aria-label={todo.status.replace('_', ' ')}
-                        title={todo.status.replace('_', ' ')}
-                      ></span>
-                      <span class="min-w-0 flex-1 truncate">{todo.content}</span>
-                      {#if todo.priority !== 'medium'}
-                        <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
-                      {/if}
-                    </li>
-                  {/each}
-                </ul>
-              {/if}
-            </div>
+            <TimelineTodoDrawer todos={chatTodos} bind:open={chatTodoDrawerOpen} />
           {/if}
 
           <!-- Composer or read-only banner -->
@@ -6249,34 +6666,146 @@ import X from 'lucide-svelte/icons/x';
             {/if}
 
             {#if pendingDirectQuestion}
-              <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-50">
-                <div class="flex items-center justify-between gap-3">
-                  <p class="font-semibold">Assistant requested more input</p>
-                  {#if directQuestionSubmitting}
-                    <LiveDots inline={true} size="sm" label="Answering" />
+              <div id="pending-direct-question-panel" class="flex max-h-[min(58vh,calc(var(--app-viewport-height,100dvh)-9.5rem))] min-h-0 flex-col overflow-hidden rounded-2xl border border-sky-500/30 bg-sky-500/10 text-sm text-sky-50 shadow-lg sm:max-h-[min(50vh,calc(var(--app-viewport-height,100dvh)-12rem))]">
+                <div class="shrink-0 border-b border-sky-400/15 px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      class="flex min-w-0 flex-1 items-center gap-2 rounded-xl text-left transition hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-300/35"
+                      aria-expanded={!directQuestionCollapsed}
+                      aria-controls="pending-direct-question-panel"
+                      onclick={() => { directQuestionCollapsed = !directQuestionCollapsed; }}
+                    >
+                      {#if directQuestionCollapsed}
+                        <ChevronDown class="h-4 w-4 shrink-0 text-sky-200/80" />
+                      {:else}
+                        <ChevronUp class="h-4 w-4 shrink-0 text-sky-200/80" />
+                      {/if}
+                      <span class="truncate font-semibold">Assistant requested more input</span>
+                    </button>
+                    <div class="flex shrink-0 items-center gap-2">
+                      {#if directQuestionSubmitting}
+                        <LiveDots inline={true} size="sm" label="Answering" />
+                      {:else if directQuestionVisibleItems.length > 1}
+                        <span class="rounded-full border border-sky-300/25 bg-slate-950/40 px-2 py-0.5 font-mono text-[11px] text-sky-100">
+                          {directQuestionCurrentIndex + 1}/{directQuestionVisibleItems.length}
+                        </span>
+                      {/if}
+                    </div>
+                  </div>
+                  {#if pendingDirectQuestion.context && !directQuestionCollapsed}
+                    <p class="mt-2 max-h-16 overflow-y-auto overscroll-contain text-xs leading-5 text-sky-100/80">{pendingDirectQuestion.context}</p>
                   {/if}
                 </div>
-                <p class="mt-1 leading-6">{pendingDirectQuestion.question}</p>
-                {#if pendingDirectQuestion.context}
-                  <p class="mt-2 text-xs text-sky-100/80">{pendingDirectQuestion.context}</p>
-                {/if}
-                {#if pendingDirectQuestion.options.length > 0}
-                  <div class="mt-3 flex flex-wrap gap-2">
-                    {#each pendingDirectQuestion.options as option}
-                      <button
-                        class="rounded-full border border-sky-400/30 bg-sky-400/10 px-3 py-1 text-xs text-sky-100 transition hover:bg-sky-400/20"
-                        type="button"
+                {#if directQuestionCollapsed}
+                  <p class="px-4 py-3 text-xs text-sky-100/70">
+                    Question prompt collapsed. Expand it to answer.
+                  </p>
+                {:else}
+                <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3">
+                  {#if currentDirectQuestion}
+                    {#key `${currentDirectQuestion.id}:${directQuestionCurrentIndex}`}
+                    <div class="rounded-2xl border border-sky-400/20 bg-slate-950/30 p-3">
+                      {#if currentDirectQuestion.header}
+                        <p class="text-xs uppercase tracking-[0.2em] text-sky-100/70">{currentDirectQuestion.header}</p>
+                      {/if}
+                      <p class="text-sm font-medium text-sky-50">{currentDirectQuestion.question}</p>
+                      {#if currentDirectQuestion.required}
+                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-sky-100/55">Required</p>
+                      {:else}
+                        <p class="mt-1 text-[11px] uppercase tracking-[0.18em] text-sky-100/45">Optional</p>
+                      {/if}
+                      {#if currentDirectQuestion.options.length > 0}
+                        <div class="mt-3 space-y-2">
+                          {#each currentDirectQuestion.options as option (option.id)}
+                            <button
+                              class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs transition ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-sky-300/70 bg-sky-300/20 text-white' : 'border-sky-400/30 bg-sky-400/10 text-sky-100 hover:bg-sky-400/20'}`}
+                              type="button"
+                              disabled={directQuestionSubmitting}
+                              onclick={() => { submitDirectQuestionOption(currentDirectQuestion, option.id); }}
+                            >
+                              <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${currentDirectQuestion.multiple ? 'rounded' : 'rounded-full'} ${directQuestionOptionSelected(currentDirectQuestion.id, option.id) ? 'border-sky-200 bg-sky-300 text-slate-950' : 'border-sky-300/50 bg-slate-950/40'}`}>
+                                {#if directQuestionOptionSelected(currentDirectQuestion.id, option.id)}
+                                  {#if currentDirectQuestion.multiple}
+                                    ✓
+                                  {:else}
+                                    <span class="h-1.5 w-1.5 rounded-full bg-slate-950"></span>
+                                  {/if}
+                                {/if}
+                              </span>
+                              <span class="min-w-0">
+                                <span class="block font-medium">{option.label}</span>
+                                {#if option.description}
+                                  <span class="mt-0.5 block text-sky-100/60">{option.description}</span>
+                                {/if}
+                              </span>
+                            </button>
+                          {/each}
+                        </div>
+                      {/if}
+                      {#if currentDirectQuestion.allow_custom}
+                        <textarea
+                          value={directQuestionState(currentDirectQuestion.id).custom}
+                          oninput={(event) => setDirectQuestionCustom(currentDirectQuestion.id, event.currentTarget.value)}
+                          class="mt-3 min-h-[72px] w-full rounded-2xl border border-sky-400/20 bg-slate-950/60 px-3 py-2 text-sm text-sky-50 placeholder:text-sky-100/50"
+                          placeholder={currentDirectQuestion.options.length > 0 ? 'Optional custom answer' : 'Type your answer'}
+                          disabled={directQuestionSubmitting}
+                        ></textarea>
+                      {/if}
+                    </div>
+                    {/key}
+                  {:else}
+                    <p class="rounded-2xl border border-sky-400/20 bg-slate-950/30 p-3 text-sky-100/80">Waiting for question details…</p>
+                  {/if}
+                  {#if currentDirectQuestion?.options.length}
+                    <p class="mt-2 text-xs text-sky-100/55">Selecting an option only updates this answer. Use Next or Submit to continue.</p>
+                  {/if}
+                  {#if directQuestionVisibleItems.length > 1}
+                    <div class="mt-3 grid gap-1" style={`grid-template-columns: repeat(${Math.min(directQuestionVisibleItems.length, 7)}, minmax(0, 1fr));`} aria-hidden="true">
+                      {#each directQuestionVisibleItems as item, index (item.id)}
+                        <span class={`h-1.5 rounded-full ${index === directQuestionCurrentIndex ? 'bg-sky-200' : directQuestionAnswerSatisfies(item) && (directQuestionState(item.id).selected.length > 0 || directQuestionState(item.id).custom.trim()) ? 'bg-sky-400/60' : 'bg-sky-900/70'}`}></span>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+                {#if currentDirectQuestion}
+                  <div class="flex shrink-0 items-center gap-2 border-t border-sky-400/15 bg-slate-950/90 px-4 py-3 backdrop-blur">
+                    {#if directQuestionVisibleItems.length > 1 && directQuestionCurrentIndex > 0}
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        class="min-w-10 px-2"
+                        aria-label="Previous question"
                         disabled={directQuestionSubmitting}
-                        onclick={() => { composer = option; syncComposerHeight(); focusActiveComposer(); }}
+                        onclick={goToPreviousDirectQuestion}
                       >
-                        {option}
-                      </button>
-                    {/each}
+                        ←
+                      </Button>
+                    {/if}
+                    {#if directQuestionCurrentIndex < directQuestionVisibleItems.length - 1}
+                      <Button
+                        size="sm"
+                        class="ml-auto"
+                        disabled={directQuestionSubmitting || !canGoToNextDirectQuestion()}
+                        onclick={goToNextDirectQuestion}
+                      >
+                        Next →
+                      </Button>
+                    {:else}
+                      <Button
+                        size="sm"
+                        class="ml-auto"
+                        disabled={directQuestionSubmitting || !currentDirectQuestionReplyHasAnswer()}
+                        onclick={() => { void submitCurrentDirectQuestionReply(); }}
+                      >
+                        Submit
+                      </Button>
+                    {/if}
                   </div>
                 {/if}
+                {/if}
               </div>
-            {/if}
-            {#if pendingCredentialRequest}
+            {:else if pendingCredentialRequest}
               <CredentialRequestForm
                 compact={true}
                 notification={pendingCredentialRequest}
@@ -6285,7 +6814,7 @@ import X from 'lucide-svelte/icons/x';
                   await refreshPendingDirectQuestion();
                 }}
               />
-            {/if}
+            {:else}
             {#if voiceTranscribing}
               <div class="flex items-center gap-2 rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-100" aria-live="polite">
                 <span class="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-300"></span>
@@ -6404,6 +6933,7 @@ import X from 'lucide-svelte/icons/x';
                 />
               {/if}
             </div>
+            {/if}
           </form>
           {/if}
         </div>
@@ -6446,7 +6976,7 @@ import X from 'lucide-svelte/icons/x';
               <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
               <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
               <div class="mt-2">
-                <LiveDots inline={true} size="sm" label="Following latest" />
+                <LiveDots inline={true} size="sm" tone={subSessionUserScrolledUp ? 'slate' : 'sky'} label={subSessionUserScrolledUp ? 'Live follow paused' : 'Following latest'} />
               </div>
             </div>
             <button
@@ -6495,38 +7025,18 @@ import X from 'lucide-svelte/icons/x';
             </div>
           {/if}
 
-          <div class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-            {#if subSessionLoading}
-              <LoadingState />
-            {:else if subSessionError}
-              <p class="text-sm text-rose-400">{subSessionError}</p>
-            {:else if subSessionTimeline.length === 0}
-              <p class="text-sm text-slate-500">No events recorded yet.</p>
-            {:else}
-              {#each subSessionTimeline as item (item.id)}
-                {#if item.kind === 'message'}
-                  <div class={`flex min-w-0 ${item.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <ChatMessage {item} agent={subSessionAgent() ?? null} />
-                  </div>
-                {:else if item.kind === 'thinking'}
-                  <ThinkingBlock item={item} />
-                {:else if item.kind === 'tool_call'}
-                  <ToolCallBlock {item} />
-                {:else if item.kind === 'delegation'}
-                  <DelegationCard {item} onViewSession={handleViewSession} />
-                {:else if item.kind === 'workflow_composed'}
-                  <WorkflowComposedCard {item} />
-                {:else if item.kind === 'system_message'}
-                  <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
-                {:else if item.kind === 'notice'}
-                  <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 px-3 py-2 text-xs text-slate-400">
-                    <p class="font-medium">{item.title}</p>
-                    {#if item.description}<p class="mt-1 opacity-75">{item.description}</p>{/if}
-                  </div>
-                {/if}
-              {/each}
-            {/if}
-          </div>
+          <TimelineViewport
+            items={subSessionTimeline}
+            agent={subSessionAgent() ?? null}
+            loading={subSessionLoading}
+            error={subSessionError}
+            emptyLabel="No events recorded yet."
+            live={!subSessionLoading && !subSessionError}
+            bind:viewportElement={subSessionTimelineEl}
+            bind:contentElement={subSessionTimelineContentEl}
+            bind:userScrolledUp={subSessionUserScrolledUp}
+            onViewSession={handleViewSession}
+          />
         </aside>
       {/if}
     </section>

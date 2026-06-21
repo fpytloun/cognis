@@ -106,7 +106,7 @@ import Server from 'lucide-svelte/icons/server';
     staticTools,
     intarisMcpTools,
     observedLocalMcpTools
-  ]).filter((tool) => tool.source?.type !== 'skill');
+  ]).filter((tool) => tool.source?.type !== 'skill' && tool.configurable !== false);
   $: filteredSkills = skills
     .filter((skill) => {
       const query = skillsSearch.trim().toLowerCase();
@@ -318,6 +318,23 @@ import Server from 'lucide-svelte/icons/server';
 
   function classificationPending(tool: ToolDefinitionSummary): boolean {
     return (tool.classification_status || 'ready') !== 'ready';
+  }
+
+  function toolAliases(tool: ToolDefinitionSummary): Array<Record<string, unknown>> {
+    return Array.isArray(tool.aliases) ? tool.aliases : [];
+  }
+
+  function aliasName(alias: Record<string, unknown>): string {
+    return typeof alias.name === 'string' ? alias.name : '';
+  }
+
+  function aliasSurface(alias: Record<string, unknown>): string {
+    return typeof alias.surface === 'string' ? alias.surface : '';
+  }
+
+  function toolSurfaces(tool: ToolDefinitionSummary): Array<[string, string]> {
+    const surfaces = tool.surfaces || {};
+    return Object.entries(surfaces).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
   }
 
   $: filteredBuiltinTools = filterTools(staticTools, { searchQuery: builtinSearch, categoryFilter: builtinCategoryFilter });
@@ -810,6 +827,12 @@ import Server from 'lucide-svelte/icons/server';
       <Badge class={getSourceType(tool) === 'executor' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-sky-500/30 bg-sky-500/10 text-sky-300'}>
         {getSourceLabel(getSourceType(tool))}
       </Badge>
+      {#if tool.configurable === false}
+        <Badge class="border-purple-500/30 bg-purple-500/10 text-purple-300">core</Badge>
+      {/if}
+      {#if toolAliases(tool).length > 0}
+        <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">aliases: {toolAliases(tool).length}</Badge>
+      {/if}
       <span class="text-sm text-zinc-400 truncate flex-1">{tool.description}</span>
       <div class="flex items-center gap-2 shrink-0">
         {#if tool.read_only}<Badge>read-only</Badge>{/if}
@@ -860,6 +883,9 @@ import Server from 'lucide-svelte/icons/server';
         <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">{capability}</Badge>
       {/each}
       <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{tool.classification_source || 'heuristic'}</Badge>
+      {#if tool.configurable === false}
+        <Badge class="border-purple-500/30 bg-purple-500/10 text-purple-300">core / not assignable</Badge>
+      {/if}
       {#if tool.classification_confidence != null}
         <Badge class="border-zinc-700 bg-zinc-800 text-zinc-300">{Math.round(tool.classification_confidence * 100)}%</Badge>
       {/if}
@@ -867,6 +893,35 @@ import Server from 'lucide-svelte/icons/server';
         <Badge class="border-sky-500/30 bg-sky-500/10 text-sky-300">pending refinement</Badge>
       {/if}
     </div>
+    {#if toolAliases(tool).length > 0 || toolSurfaces(tool).length > 0}
+      <div class="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
+        <span class="text-zinc-500 text-xs uppercase tracking-wider">Names and aliases</span>
+        <div class="mt-2 flex flex-wrap gap-2 text-xs">
+          <span class="rounded bg-zinc-800 px-2 py-1 font-mono text-zinc-200">canonical: {tool.canonical_name || tool.name}</span>
+          {#if tool.primary_name}
+            <span class="rounded bg-zinc-800 px-2 py-1 font-mono text-zinc-300">primary: {tool.primary_name}</span>
+          {/if}
+          {#each toolAliases(tool) as alias}
+            {@const name = aliasName(alias)}
+            {@const surface = aliasSurface(alias)}
+            {#if name}
+              <span class="rounded border border-sky-500/30 bg-sky-500/10 px-2 py-1 font-mono text-sky-200">
+                alias: {name}{#if surface}<span class="ml-1 font-sans text-sky-300/80">({surface})</span>{/if}
+              </span>
+            {/if}
+          {/each}
+        </div>
+        {#if toolSurfaces(tool).length > 0}
+          <div class="mt-2 flex flex-wrap gap-2 text-xs">
+            {#each toolSurfaces(tool) as [surface, name]}
+              <span class="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-300">
+                <span class="text-zinc-500">{surface}:</span> <span class="font-mono">{name}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
     {#if tool.parameters?.properties && Object.keys(tool.parameters.properties).length > 0}
       <div>
         <span class="text-zinc-500 text-xs uppercase tracking-wider">Parameters</span>

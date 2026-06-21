@@ -5,7 +5,7 @@
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
   import Brain from 'lucide-svelte/icons/brain';
 
-  let { item } = $props<{ item: ThinkingTimelineItem; compact?: boolean }>();
+  let { item, live = false } = $props<{ item: ThinkingTimelineItem; compact?: boolean; live?: boolean }>();
 
   let expanded = $state(false);
 
@@ -64,7 +64,7 @@
    * After completion: use the title of the last block.
    */
   const headerTitle = $derived.by(() => {
-    if (item.streaming && item.activeTitle) {
+    if (item.streaming && live && item.activeTitle) {
       return displayTitle(item.activeTitle);
     }
     if (item.blocks.length > 0) {
@@ -83,12 +83,12 @@
     aria-expanded={expanded}
   >
     <Brain
-      class="mt-0.5 h-3.5 w-3.5 shrink-0 {item.streaming
+      class="mt-0.5 h-3.5 w-3.5 shrink-0 {item.streaming && live
         ? 'text-cyan-400 animate-pulse'
         : 'text-cyan-500/70'}"
     />
     <span class="min-w-0 flex-1 truncate font-medium text-cyan-300/80">
-      {#if item.streaming && item.blocks.length === 0}
+      {#if item.streaming && live && item.blocks.length === 0}
         Thinking…
       {:else}
         Thinking: {headerTitle}
@@ -97,7 +97,7 @@
     {#if durationLabel}
       <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
     {/if}
-    {#if item.streaming}
+    {#if item.streaming && live}
       <LiveDots inline={true} size="sm" tone="sky" label="Thinking" />
     {:else}
       {#if expanded}

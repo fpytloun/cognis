@@ -75,4 +75,18 @@ describe('tool-call question sets', () => {
       'Architecture: Shared interaction primitive\nValidation: Backend API contract, Web UI rendering',
     );
   });
+
+  it('formats nested structured replies and skips unanswered questions', () => {
+    const formatted = formatStepQuestionResponse(questionToolItem(), {
+      reply: {
+        mode: 'structured',
+        answers: [
+          { question_id: 'architecture', selected_option_ids: ['workflow'], custom_answer: null },
+          { question_id: 'validation', selected_option_ids: [], custom_answer: null },
+        ],
+      },
+    });
+
+    expect(formatted).toBe('Architecture: Workflow-only interaction');
+  });
 });

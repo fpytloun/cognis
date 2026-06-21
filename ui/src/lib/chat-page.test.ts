@@ -3,6 +3,10 @@ import { describe, expect, it } from 'vitest';
 import {
   buildConversationUrl,
   CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+  cloneSidebarProjection,
+  conversationActivityValue,
+  conversationInitialLoadPolicy,
+  conversationMatchesSidebarProjectionFilter,
   conversationAttentionDotClass,
   conversationAttentionLabel,
   conversationAttentionOrbitClass,
@@ -11,14 +15,19 @@ import {
   conversationStatusFilterForConversation,
   conversationTurnModeTone,
   conversationUpdatedRowPatch,
+  DEFAULT_INITIAL_TIMELINE_LIMIT,
+  DIRECT_CHAT_INITIAL_SESSION_LIMIT,
+  DIRECT_CHAT_INITIAL_TIMELINE_LIMIT,
   distanceFromScrollBottom,
   getNextHistoryAfterSeq,
   getConversationRetryScope,
+  groupConversationsByActivity,
   isNearScrollBottom,
   isForeignSessionTimelineEvent,
   isMissingSessionError,
   isLastOpenedConversationStorageKey,
   lastOpenedConversationStorageKey,
+  mergeConversationPreservingActivity,
   normalizeChatModeTone,
   nextChatScrollState,
   isPreSessionChatConversation,
@@ -26,6 +35,7 @@ import {
   optimisticConversationTurnPatch,
   pendingDirectQuestionFromAuthChallengeEvent,
   pendingNotificationTypesFromNotifications,
+  rememberSidebarProjectionSnapshot,
   hasRetryableFailedTurnTail,
   managedConversationTurnState,
   shouldAdoptConversationSessionId,
@@ -35,11 +45,209 @@ import {
   setConversationStatusSearchParam,
   nextPollDelayMs,
   nextConversationLoadId,
-  shouldRestoreLastOpenedConversation,
   shouldReconcileAfterReconnect
 } from '$lib/chat-page';
+import type { SidebarProjection } from '$lib/types/api';
 
 describe('chat page helpers', () => {
+  it('uses the default initial timeline size for topic conversations', () => {
+    expect(conversationInitialLoadPolicy({
+      conversation_id: 'conv-topic',
+      context: { type: 'web' },
+    } as never)).toEqual({
+      historyLimit: DEFAULT_INITIAL_TIMELINE_LIMIT,
+    });
+  });
+
+  it('bounds initial sessions and timeline for agent direct conversations', () => {
+    expect(conversationInitialLoadPolicy({
+      conversation_id: 'conv-direct',
+      context: { type: 'web', platform_data: { kind: 'agent_direct' } },
+    } as never)).toEqual({
+      historyLimit: DIRECT_CHAT_INITIAL_TIMELINE_LIMIT,
+      sessionOptions: {
+        rootOnly: true,
+        order: 'desc',
+        limit: DIRECT_CHAT_INITIAL_SESSION_LIMIT,
+      },
+    });
+  });
+
+  it('ignores metadata-only updated_at when computing conversation activity', () => {
+    const activity = conversationActivityValue(({
+      created_at: '2026-01-01T00:00:00.000Z',
+      last_message_at: '2026-01-01T00:01:00.000Z',
+      updated_at: '2026-01-01T00:02:00.000Z',
+    } as unknown) as Parameters<typeof conversationActivityValue>[0]);
+
+    expect(activity).toBe(Date.parse('2026-01-01T00:01:00.000Z'));
+  });
+
+  it('preserves newer activity timestamps when stale conversation details are merged', () => {
+    const existing = {
+      conversation_id: 'conv-a',
+      last_message_at: '2026-01-01T00:05:00.000Z',
+      updated_at: '2026-01-01T00:05:01.000Z',
+      title: 'Fresh',
+    } as never;
+    const incoming = {
+      conversation_id: 'conv-a',
+      last_message_at: '2026-01-01T00:01:00.000Z',
+      updated_at: '2026-01-01T00:01:01.000Z',
+      title: 'Loaded detail',
+    } as never;
+
+    expect(mergeConversationPreservingActivity(existing, incoming)).toMatchObject({
+      title: 'Loaded detail',
+      last_message_at: '2026-01-01T00:05:00.000Z',
+      updated_at: '2026-01-01T00:05:01.000Z',
+    });
+  });
+
+  it('groups conversation history by last message activity date', () => {
+    const sections = groupConversationsByActivity([
+      {
+        conversation_id: 'conv-today',
+        created_at: '2026-01-10T07:00:00.000Z',
+        last_message_at: '2026-01-10T08:00:00.000Z',
+      },
+      {
+        conversation_id: 'conv-yesterday',
+        created_at: '2026-01-09T07:00:00.000Z',
+        last_message_at: '2026-01-09T08:00:00.000Z',
+      },
+      {
+        conversation_id: 'conv-older-a',
+        created_at: '2026-01-08T07:00:00.000Z',
+        last_message_at: '2026-01-08T08:00:00.000Z',
+      },
+      {
+        conversation_id: 'conv-older-b',
+        created_at: '2026-01-08T06:00:00.000Z',
+        last_message_at: null,
+      },
+    ], new Date('2026-01-10T12:00:00.000Z'), 'en-US');
+
+    expect(sections.map((section) => ({
+      label: section.label,
+      ids: section.conversations.map((conversation) => conversation.conversation_id),
+    }))).toEqual([
+      { label: 'Today', ids: ['conv-today'] },
+      { label: 'Yesterday', ids: ['conv-yesterday'] },
+      { label: 'Jan 8, 2026', ids: ['conv-older-a', 'conv-older-b'] },
+    ]);
+  });
+
+  it('clones sidebar projections before caching them', () => {
+    const projection = {
+      agents: [{ agent_id: 'agent-a', name: 'Agent A', display_name: 'Agent A', description: null, status: 'active' }],
+      agent_direct_chats: [],
+      conversations: {
+        items: [{
+          conversation_id: 'conv-a',
+          user_email: 'user@example.test',
+          agent_id: 'agent-a',
+          project_id: null,
+          title: 'Original',
+          title_source: 'manual',
+          context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+          active_session_id: null,
+          active_executor_id: null,
+          active_executor_assigned_at: null,
+          active_executor_expires_at: null,
+          active_executor_source: null,
+          active_session_status: null,
+          active_session_completion_reason: null,
+          active_turn_chat_mode: null,
+          active_turn_chat_mode_source: null,
+          pending_notification_types: [],
+          starred_at: null,
+          status: 'active',
+          last_message_at: null,
+          last_read_at: null,
+          has_unread: false,
+          has_active_turn: false,
+          created_at: null,
+          updated_at: null,
+        }],
+        cursor: 'next',
+        has_more: true,
+      },
+      context_types: ['web'],
+    } as unknown as SidebarProjection;
+
+    const cloned = cloneSidebarProjection(projection);
+    projection.conversations.items[0].title = 'Mutated';
+    projection.context_types.push('slack');
+
+    expect(cloned.conversations.items[0].title).toBe('Original');
+    expect(cloned.context_types).toEqual(['web']);
+  });
+
+  it('stores sidebar projection cache snapshots with LRU eviction', () => {
+    const cache = new Map<string, SidebarProjection>();
+    const projection = {
+      agents: [],
+      agent_direct_chats: [],
+      conversations: { items: [], cursor: null, has_more: false },
+      context_types: [] as string[],
+    } as unknown as SidebarProjection;
+
+    rememberSidebarProjectionSnapshot(cache, 'a', projection, 2);
+    rememberSidebarProjectionSnapshot(cache, 'b', projection, 2);
+    rememberSidebarProjectionSnapshot(cache, 'c', projection, 2);
+
+    expect([...cache.keys()]).toEqual(['b', 'c']);
+    projection.context_types.push('web');
+    expect(cache.get('c')?.context_types).toEqual([]);
+  });
+
+  it('matches conversations against active sidebar projection filters', () => {
+    const conversation = {
+      conversation_id: 'conv-a',
+      user_email: 'user@example.test',
+      agent_id: 'agent-a',
+      project_id: null,
+      title: 'Conversation',
+      title_source: 'manual',
+      context: { type: 'slack', ref: null, platform_data: {}, memory_labels: {} },
+      active_session_id: null,
+      active_executor_id: null,
+      active_executor_assigned_at: null,
+      active_executor_expires_at: null,
+      active_executor_source: null,
+      active_session_status: null,
+      active_session_completion_reason: null,
+      active_turn_chat_mode: null,
+      active_turn_chat_mode_source: null,
+      pending_notification_types: [],
+      starred_at: null,
+      status: 'active',
+      last_message_at: null,
+      last_read_at: null,
+      has_unread: false,
+      has_active_turn: false,
+      created_at: null,
+      updated_at: null,
+    } as unknown as SidebarProjection['conversations']['items'][number];
+
+    expect(conversationMatchesSidebarProjectionFilter(conversation, {
+      selectedChannel: 'slack',
+      selectedAgentId: 'agent-a',
+      selectedConversationStatus: 'active',
+    })).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(conversation, {
+      selectedChannel: 'web',
+      selectedAgentId: 'agent-a',
+      selectedConversationStatus: 'active',
+    })).toBe(false);
+    expect(conversationMatchesSidebarProjectionFilter({ ...conversation, starred_at: '2026-01-01T00:00:00Z' }, {
+      selectedChannel: 'slack',
+      selectedAgentId: 'agent-a',
+      selectedConversationStatus: 'starred',
+    })).toBe(true);
+  });
+
   it('increments and validates conversation load ids', () => {
     const first = nextConversationLoadId(0);
     const second = nextConversationLoadId(first);
@@ -371,18 +579,6 @@ describe('chat page helpers', () => {
     expect(isRestorableChatConversation({ status: 'archived', context: { type: 'web' } })).toBe(false);
     expect(isRestorableChatConversation({ status: 'active', context: { type: 'slack' } })).toBe(false);
     expect(isRestorableChatConversation({ status: 'active', context: { type: 'web', platform_data: { kind: 'agent_direct' } } })).toBe(false);
-  });
-
-  it('restores last opened conversations only for the selected agent', () => {
-    const conversation = {
-      agent_id: 'miroslav',
-      status: 'active',
-      context: { type: 'web' },
-    };
-
-    expect(shouldRestoreLastOpenedConversation(conversation, 'miroslav')).toBe(true);
-    expect(shouldRestoreLastOpenedConversation(conversation, 'laforge')).toBe(false);
-    expect(shouldRestoreLastOpenedConversation(conversation, null)).toBe(true);
   });
 
   it('scopes last opened conversation storage keys per agent', () => {

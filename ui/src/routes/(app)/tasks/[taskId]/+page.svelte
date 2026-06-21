@@ -1149,6 +1149,45 @@ import type {
     });
   }
 
+  function stepQuestionOptionSelected(questionId: string, optionId: string): boolean {
+    return stepQuestionState(questionId).selected.includes(optionId);
+  }
+
+  function stepQuestionAnswersSatisfyRequired(
+    questions: QuestionSetQuestion[],
+    answers: QuestionSetAnswer[]
+  ): boolean {
+    const answersById = new Map(answers.map((answer) => [answer.question_id, answer]));
+    return questions.every((question) => {
+      if (!question.required) return true;
+      const answer = answersById.get(question.id);
+      return Boolean(answer && (answer.selected_option_ids.length > 0 || answer.custom_answer?.trim()));
+    });
+  }
+
+  function currentStepQuestionReplyValid(): boolean {
+    const questions = activeStepQuestions;
+    const answers = buildStepQuestionReply(questions);
+    return answers.some((answer) => answer.selected_option_ids.length > 0 || answer.custom_answer?.trim())
+      && stepQuestionAnswersSatisfyRequired(questions, answers);
+  }
+
+  function buildStepQuestionReplyWithOverride(
+    questions: QuestionSetQuestion[],
+    override: QuestionSetAnswer
+  ): QuestionSetAnswer[] {
+    return questions.map((question) => {
+      if (question.id === override.question_id) return override;
+      const current = stepQuestionState(question.id);
+      const custom = current.custom.trim();
+      return {
+        question_id: question.id,
+        selected_option_ids: current.selected,
+        custom_answer: custom ? custom : null
+      };
+    });
+  }
+
   let dependencyTasks = $derived.by(() => {
     if (!task) return [] as Array<{ taskId: string; title: string; status: string }>;
     return task.dependencies.map((dependency) => {
@@ -1379,13 +1418,18 @@ import type {
     }
   }
 
-  async function respondToStepQuestion(): Promise<void> {
+  async function respondToStepQuestion(answersOverride?: QuestionSetAnswer[]): Promise<void> {
     if (!task) return;
     const questions = task.pending_pause?.questions ?? [];
+    const answers = answersOverride ?? buildStepQuestionReply(questions);
+    if (!stepQuestionAnswersSatisfyRequired(questions, answers)) {
+      error = 'Answer all required questions before sending.';
+      return;
+    }
     try {
       await api.tasks.stepResponse(task.task_id, {
         mode: 'structured',
-        answers: buildStepQuestionReply(questions)
+        answers
       });
       stepResponse = '';
       stepQuestionAnswers = {};
@@ -1393,6 +1437,20 @@ import type {
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     }
+  }
+
+  async function submitStepQuestionOption(question: QuestionSetQuestion, optionId: string): Promise<void> {
+    if (!task) return;
+    if (activeStepQuestions.length !== 1 || question.multiple) {
+      toggleStepQuestionOption(question, optionId);
+      return;
+    }
+    const custom = stepQuestionState(question.id).custom.trim();
+    await respondToStepQuestion(buildStepQuestionReplyWithOverride(activeStepQuestions, {
+      question_id: question.id,
+      selected_option_ids: [optionId],
+      custom_answer: custom ? custom : null
+    }));
   }
 
   async function respondToEscalation(notificationId: string, decision: 'approve' | 'deny'): Promise<void> {
@@ -1774,18 +1832,28 @@ import type {
                       {/if}
                       <p class="mt-2 text-sm font-medium text-slate-100">{question.question}</p>
                       {#if question.options.length > 0}
-                        <div class="mt-3 flex flex-wrap gap-2">
+                        <div class="mt-3 space-y-2">
                           {#each question.options as option (option.id)}
-                            {@const selected = answerState.selected.includes(option.id)}
                             <button
                               type="button"
-                              class={`rounded-full border px-3 py-1.5 text-xs transition ${selected ? 'border-sky-400/60 bg-sky-500/20 text-sky-100' : 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white'}`}
-                              onclick={() => toggleStepQuestionOption(question, option.id)}
+                              class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs transition ${stepQuestionOptionSelected(question.id, option.id) ? 'border-sky-400/70 bg-sky-500/20 text-sky-50' : 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white'}`}
+                              onclick={() => { void submitStepQuestionOption(question, option.id); }}
                             >
-                              {option.label}
-                              {#if option.description}
-                                <span class="ml-1 text-slate-400">— {option.description}</span>
-                              {/if}
+                              <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${question.multiple ? 'rounded' : 'rounded-full'} ${stepQuestionOptionSelected(question.id, option.id) ? 'border-sky-200 bg-sky-300 text-slate-950' : 'border-slate-500 bg-slate-950/40'}`}>
+                                {#if stepQuestionOptionSelected(question.id, option.id)}
+                                  {#if question.multiple}
+                                    ✓
+                                  {:else}
+                                    <span class="h-1.5 w-1.5 rounded-full bg-slate-950"></span>
+                                  {/if}
+                                {/if}
+                              </span>
+                              <span class="min-w-0">
+                                <span class="block font-medium">{option.label}</span>
+                                {#if option.description}
+                                  <span class="mt-0.5 block text-slate-400">{option.description}</span>
+                                {/if}
+                              </span>
                             </button>
                           {/each}
                         </div>
@@ -1804,7 +1872,7 @@ import type {
                     <p class="rounded-2xl border border-rose-500/20 bg-rose-500/5 p-4 text-sm text-rose-200">This step question has no question-set payload and cannot be answered from the task view.</p>
                   {/if}
                   <div class="flex flex-wrap gap-2">
-                    <Button size="sm" disabled={activeStepQuestions.length === 0} onclick={() => respondToStepQuestion()}>Send response</Button>
+                    <Button size="sm" disabled={activeStepQuestions.length === 0 || !currentStepQuestionReplyValid()} onclick={() => respondToStepQuestion()}>Send response</Button>
                   </div>
                 </div>
               {/if}

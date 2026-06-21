@@ -10,6 +10,7 @@
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import Popover from '$lib/components/ui/Popover.svelte';
   import { audioPlayer } from '$lib/stores/audio-player';
   import { addToast } from '$lib/stores/toasts';
   import { now as nowStore } from '$lib/stores/now';
@@ -22,7 +23,8 @@
     compact = false,
     searchQuery = '',
     searchActive = false,
-    searchSelected = false
+    searchSelected = false,
+    live = false
   } = $props<{
     item: MessageTimelineItem;
     agent?: Agent | null;
@@ -37,10 +39,17 @@
     searchQuery?: string;
     searchActive?: boolean;
     searchSelected?: boolean;
+    live?: boolean;
   }>();
 
+  const runtimeAgentName = $derived(
+    item.runtime?.agent_display_name
+      ?? item.runtime?.agent_name
+      ?? item.runtime?.agent_id
+      ?? null
+  );
   const agentName = $derived(
-    agent ? (agent.display_name ?? agent.name) : 'Assistant'
+    agent ? (agent.display_name ?? agent.name) : runtimeAgentName ?? 'Assistant'
   );
   const agentAvatarUrl = $derived(agent?.avatar_url ?? null);
 
@@ -96,6 +105,25 @@
   const explicitChatMode = $derived(
     item.chatMode && item.chatMode !== 'default' && item.chatMode !== agentDefaultChatMode ? item.chatMode : undefined
   );
+  const runtimeProfileLabel = $derived.by(() => {
+    const runtime = item.runtime;
+    if (!runtime?.agent_profile_id) return null;
+    if (runtime.agent_profile_synthetic || runtime.agent_profile_id === 'default') return null;
+    return runtime.agent_profile_id;
+  });
+  const runtimeTooltip = $derived.by(() => {
+    const runtime = item.runtime;
+    const lines = [`Agent: ${agentName}`];
+    if (runtimeProfileLabel) lines.push(`Agent profile: ${runtimeProfileLabel}`);
+    if (runtime?.model) lines.push(`Model: ${runtime.model}`);
+    if (runtime?.reasoning_effort) lines.push(`Thinking effort: ${runtime.reasoning_effort}`);
+    return lines.join('\n');
+  });
+  const deliveryStatusLabel = $derived(
+    item.role === 'user' && item.deliveryStatus
+      ? item.deliveryStatus
+      : undefined
+  );
 
   function modeBadgeClass(): string {
     return explicitChatMode === 'build'
@@ -107,6 +135,12 @@
     if (explicitChatMode === 'plan') return 'border-l-4 border-l-sky-300/60 bg-sky-300/[0.025]';
     if (explicitChatMode === 'build') return 'border-l-4 border-l-amber-300/85 bg-amber-300/[0.055]';
     return '';
+  }
+
+  function deliveryStatusClass(): string {
+    if (deliveryStatusLabel === 'queued') return 'border-sky-200/40 bg-sky-200/10 text-sky-50';
+    if (deliveryStatusLabel === 'failed') return 'border-rose-200/50 bg-rose-300/15 text-rose-50';
+    return 'border-slate-100/30 bg-white/10 text-slate-50';
   }
 
   function proseClass(): string {
@@ -424,7 +458,9 @@
       <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3">
         <div class="flex min-w-0 items-center gap-1.5">
           <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-4 w-4 rounded-md text-[9px]" />
-          <span class="truncate font-medium text-slate-200">{agentName}</span>
+          <Popover text={runtimeTooltip} placement="top">
+            <span class="truncate font-medium text-slate-200">{agentName}</span>
+          </Popover>
           {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
             <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
           {/if}
@@ -490,11 +526,14 @@
     {/if}
 
     <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5">
+      {#if deliveryStatusLabel}
+        <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${deliveryStatusClass()}`}>{deliveryStatusLabel}</span>
+      {/if}
       {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
         <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
       {/if}
       <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
-      {#if item.streaming}
+      {#if item.streaming && live}
         <LiveDots inline={true} size="sm" tone="slate" />
         <span class="sr-only">Streaming</span>
       {/if}

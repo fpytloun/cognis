@@ -245,6 +245,20 @@ export interface AgentDirectChat {
   conversation: Conversation;
 }
 
+export interface SidebarProjection {
+  agents: Agent[];
+  agent_direct_chats: AgentDirectChat[];
+  conversations: CursorPage<Conversation>;
+  context_types: string[];
+}
+
+export interface ConversationOpenRequest {
+  agent_id: string;
+  agent_profile_id?: string | null;
+  context_type?: string;
+  candidate_conversation_ids?: string[];
+}
+
 export interface ConversationTitleSuggestion {
   title: string | null;
   source: string;
@@ -359,6 +373,19 @@ export interface ActiveStreamSnapshot {
   updated_at?: string | null;
 }
 
+export interface MessageRuntimeMetadata {
+  agent_id?: string;
+  agent_name?: string;
+  agent_display_name?: string | null;
+  requested_agent_profile_id?: string | null;
+  agent_profile_id?: string | null;
+  agent_profile_source?: string | null;
+  agent_profile_synthetic?: boolean | null;
+  provider_id?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+}
+
 export interface ToolOutputPresentationMetadata {
   output_size?: number;
   truncated?: boolean;
@@ -449,6 +476,15 @@ export interface MessageHistoryResponse {
   history_truncated?: boolean;
   truncation_reason?: string | null;
   state_snapshot?: ConversationStateEnvelope | null;
+}
+
+export type TimelineProjectionItem = Record<string, unknown> & {
+  id: string;
+  kind: string;
+};
+
+export interface TimelineProjectionResponse extends MessageHistoryResponse {
+  timeline_items: TimelineProjectionItem[];
 }
 
 export type SearchKind = 'reasoning' | 'intention' | 'summary';
@@ -695,6 +731,11 @@ export interface ToolDefinitionSummary {
   source: ToolSource;
   timeout_seconds: number;
   non_bypassable: boolean;
+  aliases?: Array<Record<string, unknown>>;
+  canonical_name?: string | null;
+  primary_name?: string | null;
+  configurable?: boolean;
+  surfaces?: Record<string, string>;
 }
 
 export interface ToolSource {
@@ -724,6 +765,11 @@ export interface EffectiveToolItem {
   disabled_reason?: string | null;
   timeout_seconds: number;
   non_bypassable: boolean;
+  aliases?: Array<Record<string, unknown>>;
+  canonical_name?: string | null;
+  primary_name?: string | null;
+  configurable?: boolean;
+  surfaces?: Record<string, string>;
   /**
    * Stage 36: ids of assigned executors that observe this tool. Empty
    * for non-executor (controller) tools.
@@ -1550,6 +1596,8 @@ export interface Schedule {
   created_at: string | null;
   updated_at: string | null;
   human_schedule: string | null;
+  is_expired: boolean;
+  expiration_grace_until: string | null;
 }
 
 export interface ScheduleTriggerResponse extends Schedule {
@@ -1935,6 +1983,11 @@ export interface ContextUsage {
   percentage: number;
   model: string;
   reasoning_effort: string | null;
+  agent_id?: string | null;
+  agent_profile_id?: string | null;
+  requested_agent_profile_id?: string | null;
+  agent_profile_source?: string | null;
+  agent_profile_synthetic?: boolean | null;
   provider_id?: string | null;
   available_prompt_tokens?: number;
   effective_prompt_budget?: number;
@@ -1981,6 +2034,7 @@ export interface WebSocketMessageCompleteEvent {
   chat_mode_source?: ChatModeSource;
   partial?: boolean;
   finish_reason?: string | null;
+  runtime?: MessageRuntimeMetadata | null;
 }
 
 export interface WebSocketTurnStartedEvent {
@@ -2282,6 +2336,27 @@ export interface WebSocketConversationStateDeltaEvent extends ConversationStateD
   conversation_id: string;
 }
 
+export interface WebSocketTimelinePatchEvent {
+  type: 'timeline_patch';
+  conversation_id: string;
+  source?: string | null;
+  last_seq?: number | null;
+  items: TimelineProjectionItem[];
+}
+
+export interface WebSocketConversationRuntimeSnapshotEvent {
+  type: 'conversation_runtime_snapshot';
+  conversation_id: string;
+  queued_count: number;
+  queued_messages: QueuedMessage[];
+  has_active_turn?: boolean;
+  active_turn_chat_mode?: ChatMode | null;
+  active_turn_chat_mode_source?: ChatModeSource | null;
+  active_streams: ActiveStreamSnapshot[];
+  active_tool_outputs: ActiveToolOutputSnapshot[];
+  active_thinking: ActiveThinkingSnapshot[];
+}
+
 export interface WebSocketToolResultEvent {
   type: 'tool_result';
   conversation_id?: string;
@@ -2385,6 +2460,7 @@ export interface WebSocketPongEvent {
 export interface WebSocketSystemMessageEvent {
   type: 'system_message';
   conversation_id?: string;
+  session_id?: string | null;
   seq?: number;
   notice_id?: string | null;
   kind?: string | null;
@@ -2410,6 +2486,7 @@ export interface WebSocketEscalationEvent {
   session_id?: string;
   task_id?: string;
   call_id: string;
+  tool_call_id?: string | null;
   tool_name: string | null;
   risk: string | null;
   reasoning: string | null;
@@ -2428,7 +2505,7 @@ export interface WebSocketSessionCompactedEvent {
   type: 'session_compacted';
   conversation_id: string;
   session_id: string;
-  previous_session_id: string;
+  previous_session_id?: string | null;
   summary_preview: string;
   method: string;
   turns_compacted: number;
@@ -2546,6 +2623,8 @@ export type CognisWebSocketEvent =
   | WebSocketConversationUpdatedEvent
   | WebSocketConversationStateSnapshotEvent
   | WebSocketConversationStateDeltaEvent
+  | WebSocketTimelinePatchEvent
+  | WebSocketConversationRuntimeSnapshotEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
   | WebSocketDelegationCompletedEvent

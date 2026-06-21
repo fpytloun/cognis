@@ -18,6 +18,7 @@ import type {
   BootstrapStatusResponse,
   Conversation,
   ConversationFlatSearchResponse,
+  ConversationOpenRequest,
   ConversationSearchResponse,
   ConversationTitleSuggestion,
   CursorPage,
@@ -68,6 +69,7 @@ import type {
     SecretMetadata,
   Session,
   SessionEventsResponse,
+  SidebarProjection,
   Setting,
   SettingsCategory,
   Skill,
@@ -86,6 +88,7 @@ import type {
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
+  TimelineProjectionResponse,
   ToolOutputPageResponse,
   ToolDefinitionSummary,
   TtsSynthesizeRequest,
@@ -423,6 +426,29 @@ export const api = {
       return collectCursorPages((cursor) => this.list(cursor, filters));
     },
 
+    sidebar(
+      cursor: string | null = null,
+      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
+    ): Promise<SidebarProjection> {
+      return request<SidebarProjection>(
+        `/api/v1/conversations/sidebar${encodeQuery({
+          cursor,
+          limit: 50,
+          context_type: filters.contextType,
+          agent_id: filters.agentId,
+          status: filters.status
+        })}`
+      );
+    },
+
+    contextTypes(params: { status?: string | null } = {}): Promise<string[]> {
+      return request<string[]>(
+        `/api/v1/conversations/context-types${encodeQuery({
+          status: params.status
+        })}`
+      );
+    },
+
     agentDirect(params: { agentId?: string | null; status?: string | null } = {}): Promise<AgentDirectChat[]> {
       return request<AgentDirectChat[]>(
         `/api/v1/conversations/agent-direct${encodeQuery({
@@ -446,6 +472,12 @@ export const api = {
 
     detail(conversationId: string): Promise<Conversation> {
       return request<Conversation>(`/api/v1/conversations/${conversationId}`);
+    },
+
+    rememberOpened(conversationId: string): Promise<Conversation> {
+      return request<Conversation>(`/api/v1/conversations/${conversationId}/opened`, {
+        method: 'POST'
+      });
     },
 
     titleSuggestion(conversationId: string): Promise<ConversationTitleSuggestion> {
@@ -479,6 +511,15 @@ export const api = {
     historyPage(conversationId: string, limit = 200, before: string | null = null): Promise<MessageHistoryResponse> {
       return request<MessageHistoryResponse>(
         `/api/v1/conversations/${conversationId}/messages${encodeQuery(conversationMessagesQuery(0, limit, {
+          anchor: 'latest',
+          before
+        }))}`
+      );
+    },
+
+    timelinePage(conversationId: string, limit = 200, before: string | null = null): Promise<TimelineProjectionResponse> {
+      return request<TimelineProjectionResponse>(
+        `/api/v1/conversations/${conversationId}/timeline${encodeQuery(conversationMessagesQuery(0, limit, {
           anchor: 'latest',
           before
         }))}`
@@ -523,6 +564,13 @@ export const api = {
       scope?: 'latest' | 'agent_direct';
     }): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations/resolve', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    open(payload: ConversationOpenRequest): Promise<Conversation> {
+      return request<Conversation>('/api/v1/conversations/open', {
         method: 'POST',
         body: JSON.stringify(payload)
       });
