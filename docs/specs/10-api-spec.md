@@ -450,6 +450,13 @@ GET    /api/v1/agents/:id/effective-tools       → Effective tool set for saved
 POST   /api/v1/agents/effective-tools/preview   → Effective tool preview for unsaved agent draft
 ```
 
+MCP OAuth start/status responses include the selected flow. Authorization-code
+starts return a browser authorization URL. Device-code starts return only safe
+operator fields such as the provider verification URI, optional complete
+verification URI, user code, expiry, and polling interval; they must not expose
+the device code, access tokens, refresh tokens, client secrets, or raw credential
+headers.
+
 ### Secrets
 
 ```

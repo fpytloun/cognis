@@ -19,6 +19,7 @@ This spec defines:
 - ephemeral workflow lifecycle and promotion to persistent workflows
 - skill compatibility with official `SKILL.md` plus Cognis step extensions
 - the initial coding workflow family used as the flagship composition domain
+- deterministic workflow-step authoring guidance
 
 ## Related Specs
 
@@ -30,6 +31,7 @@ This spec defines:
 - [`20-auto-routing-implementation-plan.md`](20-auto-routing-implementation-plan.md)
 - [`21-workflow-deliverables.md`](21-workflow-deliverables.md)
 - [`22-step-profiles.md`](22-step-profiles.md)
+- [`34-deterministic-workflows.md`](34-deterministic-workflows.md)
 
 ## Motivation
 
@@ -301,6 +303,43 @@ Optional `workflow_templates:` blocks let a skill publish one or more complete
 workflow skeletons. This is useful when a skill genuinely represents a full
 process, not just one step.
 
+## Deterministic Workflow Authoring
+
+Workflow composition should use deterministic steps when they make the workflow
+cheaper, clearer, or safer without requiring judgment.
+
+Preferred pattern:
+
+```text
+deterministic fetch/check
+  → deterministic condition/skip
+  → run step only if judgment or writing is needed
+  → deterministic complete for silent no-op when appropriate
+```
+
+Composer guidance:
+
+- use `tool_call` for one mechanical Cognis tool call, especially read-only
+  fetches such as Slack history, Alertmanager alerts, Mimir/Loki queries, file
+  existence checks, or deterministic render/validation tools;
+- use `when` to skip any step whose precondition is mechanically false;
+- use `condition` for explicit branching to named workflow steps;
+- use `complete` for deterministic success/no-op endings, including
+  `delivery_mode_override: silent`;
+- reserve `run` for ambiguous interpretation, root-cause analysis, synthesis,
+  natural-language writing, coding, research, and other judgment-heavy work;
+- reserve `gate` for human approval or caller decision, not mechanical
+  branching.
+
+Initial deterministic-workflow v1 intentionally defers `notify` and
+`transform`. Until those step types exist, composed workflows should either
+route to a `run` step for user-facing interpretation/notification, or terminate
+with deterministic `complete` when no user-facing response is needed.
+
+The composer must not generate arbitrary scripts or templates that require
+secret values. Deterministic workflow rendering exposes only the safe context
+defined in [`34-deterministic-workflows.md`](34-deterministic-workflows.md).
+
 ## UI and API Surface
 
 This spec introduces the following user-visible changes:
@@ -310,6 +349,8 @@ This spec introduces the following user-visible changes:
 - task detail action to open the workflow editor from an ephemeral workflow
 - skill editor action to suggest step decomposition from an instruction-only
   skill
+- workflow composer and workflow-management tool examples for deterministic
+  `tool_call`, `condition`, `when`, and silent `complete` steps
 
 The REST API remains centered on workflows, tasks, and schedules. There is no
 requirement for a public REST endpoint that mirrors `compose_and_run_workflow`;

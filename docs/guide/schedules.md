@@ -18,6 +18,8 @@ Each schedule acts as a task factory: when it fires, Cognis creates a normal tas
 - `Tasks` shows the tasks created by those schedules
 - `Workflows` provides the reusable execution template a schedule runs
 
+The Schedules page shows active and recently completed one-shot schedules by default. One-shot schedules with no future run move to `Expired` after a 24-hour grace period.
+
 ## Creating a schedule
 
 Open `Schedules` and define:

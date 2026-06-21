@@ -100,9 +100,18 @@ is set to `oauth2`. Cognis starts an authorization challenge, stores the
 resulting tokens encrypted per user/server/provider/resource, refreshes them on
 the controller, and sends only a bearer access token to the executor. OAuth is
 available only for HTTP MCP transports; stdio servers still use command,
-arguments, environment, and secrets. Do not configure a static `Authorization`
-header on an OAuth MCP server. Non-auth headers such as feature flags or tenant
-IDs may still be configured.
+arguments, environment, and secrets.
+
+MCP OAuth supports authorization-code + PKCE for providers that accept the
+Cognis callback URL, and OAuth device-code flow for providers that advertise a
+`device_authorization_endpoint`. Leave the flow on `auto` unless a provider
+requires a specific mode. Device-code challenges show a verification URL and
+user code; after the operator authorizes in the provider browser page, Cognis
+polls the provider, stores the resulting token, and resumes MCP configuration
+without requiring a public redirect URI.
+
+Do not configure a static `Authorization` header on an OAuth MCP server. Non-auth
+headers such as feature flags or tenant IDs may still be configured.
 
 This is separate from the top-level `Tools` workspace:
 

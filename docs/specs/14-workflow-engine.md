@@ -12,6 +12,7 @@ This document covers:
 - step types and execution semantics
 - explicit step completion and evaluation
 - gate/pause steps
+- deterministic controller-owned steps
 - review loops and iteration limits
 - Intaris session mapping
 - interaction modes
@@ -260,8 +261,8 @@ Schedules are a task factory, not a task type.
 ```
 ┌─────────────────────────────────────────────────┐
 │ Workflow Engine (between-step orchestration)     │
-│   step sequencing, gates, review loops,          │
-│   pause/resume, attempt tracking                 │
+│   step sequencing, deterministic steps, gates,   │
+│   review loops, pause/resume, attempt tracking   │
 ├─────────────────────────────────────────────────┤
 │ Step Runner (within-step execution)              │
 │   agent loop, tool calls, sub-agents,            │
@@ -272,9 +273,11 @@ Schedules are a task factory, not a task type.
 └─────────────────────────────────────────────────┘
 ```
 
-The workflow engine manages transitions between steps. The step runner
-executes each step as a full agentic session. The step evaluator verifies
-completion before the workflow advances.
+The workflow engine manages transitions between steps. `run` steps execute as a
+full agentic session. Deterministic steps are executed directly by the
+controller inside the same task/executor/tool envelope without calling an LLM
+provider. The step evaluator verifies `run` completion before the workflow
+advances.
 
 ## Entities
 
@@ -315,9 +318,13 @@ A single step within a workflow.
 ```python
 class StepDefinition:
     name: str
-    type: StepType             # "run" | "gate"
+    type: StepType             # "run" | "gate" | deterministic step type
     description: str
     prompt: str                # objective for the step runner
+
+    # Optional deterministic precondition for any step type.
+    when: str | None = None
+    on_skip: DeterministicOutputConfig | None = None
 
     # Context from previous steps (see Step Input Context Model below)
     input: StepInputConfig | None = None
@@ -332,7 +339,25 @@ class StepDefinition:
 
     # Gate configuration (gate steps only)
     gate: GateConfig | None
+
+    # Deterministic configurations (controller-executed, no LLM provider call)
+    tool_call: ToolCallStepConfig | None = None
+    condition: ConditionStepConfig | None = None
+    complete: CompleteStepConfig | None = None
 ```
+
+Current shipped workflows use `run` and `gate`. The planned deterministic step
+types are specified in
+[`34-deterministic-workflows.md`](34-deterministic-workflows.md):
+
+- `tool_call` — render typed arguments and execute one Cognis tool through the
+  existing tool router and executor envelope.
+- `condition` — evaluate a deterministic expression and route to a named step or
+  continue.
+- `complete` — finish the task/workflow without an LLM, including silent no-op
+  completion.
+
+Deferred deterministic types include `notify` and `transform`.
 
 ### StepInputConfig
 
@@ -463,7 +488,7 @@ class StepRun:
     step_run_id: str
     task_id: str
     step_name: str
-    step_type: str              # "run" | "gate"
+    step_type: str              # "run" | "gate" | deterministic step type
     status: StepRunStatus       # pending, running, evaluating, approved, rejected, paused, failed
     attempt: int                # current attempt number
     agent_id: str               # resolved agent for this step
@@ -477,7 +502,8 @@ class StepRun:
 
 ### StepOutput
 
-What a step produces when the agent calls `step_complete`.
+What a step produces when the agent calls `step_complete`, or what the
+controller produces when it completes a deterministic step.
 
 ```python
 class StepOutput:
@@ -485,6 +511,10 @@ class StepOutput:
     outputs: dict               # structured outputs (plan, artifacts, etc.)
     claims: list[str]           # what the agent claims it accomplished
 ```
+
+Deterministic steps should use `claims=[]` and set metadata such as
+`deterministic_step=true`, `step_type`, branch, skip, render, and output
+reference details.
 
 ### StepEvaluation
 
@@ -626,6 +656,72 @@ Exception for managed external runtimes:
 This is intended mainly for planning and research steps where ambiguity may
 appear during execution. Formal approvals should still be modeled as gate
 steps between workflow steps.
+
+## Deterministic Steps
+
+Deterministic steps are controller-executed workflow steps that do not call the
+LLM provider. They are intended for mechanical operations: fetching data,
+evaluating simple conditions, skipping no-op work, and completing silently.
+
+The normative design is in
+[`34-deterministic-workflows.md`](34-deterministic-workflows.md). This section
+summarizes how deterministic steps fit into the workflow engine.
+
+### Execution flow
+
+```text
+Workflow reaches deterministic step
+  │
+  ▼
+Create/update StepRun
+  │
+  ▼
+Render deterministic fields with constrained workflow renderer
+  │
+  ├── render failure → fail/continue/skip/gate according to on_error
+  │
+  ▼
+Execute deterministic operation
+  │
+  ├── tool_call → existing ToolRouter/executor path
+  ├── condition → select branch
+  └── complete → finalize task/workflow
+  │
+  ▼
+Persist StepOutput and StepRun terminal state
+  │
+  ▼
+Advance workflow state
+```
+
+Deterministic steps bypass `step_complete` because there is no agent inside the
+step. The controller still owns completion and must persist the same durable
+output contract before advancing.
+
+### Skip conditions
+
+Any step may define a deterministic `when` expression. If it evaluates false,
+the controller records a skipped `StepRun`, writes the configured `on_skip`
+output or default skip metadata, and advances without executing that step.
+
+This allows workflows to avoid LLM turns when earlier deterministic checks show
+that no work is needed.
+
+### Restart safety
+
+Deterministic steps must be persisted in an order that prevents duplicate side
+effects:
+
+1. create `StepRun`;
+2. persist render state and redacted argument summary;
+3. execute the operation;
+4. persist raw output references and normalized `StepOutput`;
+5. mark the `StepRun` terminal;
+6. advance `WorkflowState`.
+
+Read-only deterministic tool calls may be retried after restart. Side-effecting
+tool calls must not be silently retried unless the tool exposes an idempotency
+contract and the same idempotency key can be reused safely.
 
 ### Step-local cognition tools
 

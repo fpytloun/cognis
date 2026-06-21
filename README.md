@@ -41,6 +41,12 @@ Desktop workspace:
   <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
 </p>
 
+Realtime tool call rendering:
+
+<p align="center">
+  <img src="docs/assets/screenshots/realtime-tool-rendering.png" alt="Cognis chat showing realtime bash tool output rendering with validation results and todos" />
+</p>
+
 <p align="center">
   <img src="docs/assets/screenshots/executor-browser-tools.png" alt="Executor configuration with browser automation tools" width="49%" />
   <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="49%" />
